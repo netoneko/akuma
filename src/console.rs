@@ -1,3 +1,6 @@
+use alloc::vec::Vec;
+use crate::alloc::string::ToString;
+
 const UART0_BASE: usize = 0x0900_0000;
 const UART0_DR: *mut u8 = UART0_BASE as *mut u8; // Data register (offset 0x00)
 const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32; // Flag register (offset 0x18)
@@ -39,30 +42,17 @@ pub fn getchar() -> u8 {
 
 const BUFFER_SIZE: usize = 100;
 
-pub fn read_line(buffer: &mut [u8; BUFFER_SIZE]) -> usize {
-    let mut i: usize = 0;
-    while i < BUFFER_SIZE {
-        buffer[i] = getchar(); // Blocks until input is available
-        if buffer[i] == b'\n' || buffer[i] == b'\r' {
-            break;
+pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
+    loop {
+        if has_char() {
+            let c: u8 = getchar();
+            buffer.push(c);
+            if with_echo {
+                print(&(c as char).to_string());
+            }
+            if c == b'\n' || c == b'\r' {
+                return buffer.len();
+            }
         }
-        i += 1;
     }
-    i
 }
-
-// pub fn read_line() -> Box<str> {
-//     let buffer = &mut [0u8; BUFFER_SIZE];
-//     let mut i: usize = 0;
-//     let user_input = String::new();
-//     while has_char() && i < BUFFER_SIZE {
-//         let c: u8 = getchar();
-//         if c == b'\n' {
-//             break;
-//         }
-//         buffer[i] = c;
-//         i += 1;
-//         user_input.push(c as char);
-//     }
-//     user_input.into_boxed_str().leak()
-// }
