@@ -1,29 +1,36 @@
 #![no_std]
 #![no_main]
 
-mod console;  // Declare the console module
+extern crate alloc;
 
+mod allocator;
+mod boot;
+mod console;
+
+use alloc::string::String;
 use core::panic::PanicInfo;
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-#[unsafe(no_mangle)] // don't mangle the name of this function
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    // this function is the entry point, since the linker looks for a function
-    // named `_start` by default
-    let promt = "Akuma >: ";
-    console::print(promt);
+    allocator::init();
+
+    console::print("Hello from bare metal!\n");
+    console::print("Allocator initialized!\n");
+    console::print("Akuma >: ");
+
     loop {
-        // let mut buffer = [0u8; 100];
-        // let len = console::read_line(&mut buffer);
-        // // Convert &[u8] to &str
-        // if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
-        //     console::print(text);
-        // } else {
-        //     console::print("Invalid input\n");
-        // }
-        // console::print(promt);
+        let mut buffer = [0u8; 100];
+        let len = console::read_line(&mut buffer);
+        console::print("\nYou typed: ");
+        if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
+            console::print(text);
+            // Test allocator - create a String
+            let _allocated = String::from(text);
+        }
+        console::print("\nAkuma >: ");
     }
 }

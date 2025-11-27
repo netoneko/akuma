@@ -2,6 +2,6 @@
 target = "aarch64-unknown-none"
 
 [target.aarch64-unknown-none]
-runner = "qemu-system-aarch64 -machine virt -cpu cortex-a72 -nographic -kernel"
+runner = "qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 32M -smp 1 -nographic -kernel"
 rustflags = ["-C", "link-arg=-Tlinker.ld"]
 

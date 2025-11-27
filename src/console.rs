@@ -1,5 +1,5 @@
 const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR: *mut u8 = UART0_BASE as *mut u8;           // Data register (offset 0x00)
+const UART0_DR: *mut u8 = UART0_BASE as *mut u8; // Data register (offset 0x00)
 const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32; // Flag register (offset 0x18)
 const RXFE: u32 = 1 << 4; // Receive FIFO empty flag
 const TXFF: u32 = 1 << 5; // Transmit FIFO full flag
@@ -23,7 +23,7 @@ pub fn print(s: &str) {
 pub fn has_char() -> bool {
     unsafe {
         let flags = UART0_FR.read_volatile();
-        (flags & RXFE) == 0  // If RXFE is 0, data is available
+        (flags & RXFE) == 0 // If RXFE is 0, data is available
     }
 }
 
@@ -42,7 +42,7 @@ const BUFFER_SIZE: usize = 100;
 pub fn read_line(buffer: &mut [u8; BUFFER_SIZE]) -> usize {
     let mut i: usize = 0;
     while i < BUFFER_SIZE {
-        buffer[i] = getchar();  // Blocks until input is available
+        buffer[i] = getchar(); // Blocks until input is available
         if buffer[i] == b'\n' || buffer[i] == b'\r' {
             break;
         }

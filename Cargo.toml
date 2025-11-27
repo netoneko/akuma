@@ -15,3 +15,5 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
+talc = "4"
+spinning_top = "0.3"
