@@ -1,19 +1,28 @@
 use spinning_top::Spinlock;
 use talc::ErrOnOom;
 use talc::{Span, Talc};
+
 #[global_allocator]
 static ALLOCATOR: Talck = Talck;
 
-const HEAP_SIZE: usize = 1024 * 1024; // 1MB
-static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
-pub fn init() {
-    unsafe {
-        TALC.lock()
-            .claim(Span::from_array(&raw mut HEAP_MEM))
-            .unwrap();
+pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
+    if heap_size == 0 {
+        return Err("Heap size cannot be zero");
     }
+    
+    if heap_start == 0 {
+        return Err("Invalid heap start address");
+    }
+    
+    unsafe {
+        let heap_ptr = heap_start as *mut u8;
+        let span = Span::from_base_size(heap_ptr, heap_size);
+        TALC.lock().claim(span).map_err(|_| "Failed to claim heap memory")?;
+    }
+    
+    Ok(())
 }
 
 struct Talck;
