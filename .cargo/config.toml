@@ -2,6 +2,25 @@
 target = "aarch64-unknown-none"
 
 [target.aarch64-unknown-none]
-runner = "qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 32M -smp 1 -nographic -kernel"
-rustflags = ["-C", "link-arg=-Tlinker.ld"]
+# Default runner with user-mode networking (works on macOS)
+# Guest is accessible from host via port forwarding
+runner = """qemu-system-aarch64 \
+  -machine virt \
+  -cpu cortex-a72 \
+  -m 128M \
+  -nographic \
+  -serial mon:stdio \
+  -netdev user,id=net0,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443,hostfwd=tcp::2222-:22 \
+  -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
+  -kernel"""
 
+# To disable networking, comment out the above and uncomment below:
+# runner = """qemu-system-aarch64 \
+#   -machine virt \
+#   -cpu cortex-a72 \
+#   -m 128M \
+#   -nographic \
+#   -serial mon:stdio \
+#   -kernel"""
+
+rustflags = ["-C", "link-arg=-Tlinker.ld"]

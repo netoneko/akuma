@@ -6,6 +6,9 @@ extern crate alloc;
 mod allocator;
 mod boot;
 mod console;
+mod executor;
+mod network;
+mod timer;
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -61,8 +64,41 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     console::print(&(heap_size / 1024 / 1024).to_string());
     console::print(" MB\n");
 
+    // // Initialize async executor
+    // executor::init();
+    // console::print("Async executor initialized\n");
+
+    // // Initialize timer
+    // timer::init();
+    // console::print("Timer initialized\n");
+
+    // // Set UTC time to a known value (example: 2025-11-28 12:00:00 UTC)
+    // // In a real system, you'd get this from NTP or RTC
+    // let example_utc_us = 1732795200_000000u64; // 2025-11-28 12:00:00 UTC
+    // timer::set_utc_time_us(example_utc_us);
+
+    // console::print("Current UTC time: ");
+    // console::print(&timer::utc_iso8601());
+    // console::print("\n");
+
+    // console::print("Uptime: ");
+    // console::print(&(timer::uptime_us() / 1_000_000).to_string());
+    // console::print(" seconds\n");
+
+    // // Initialize network stack
+    // network::init();
+    // console::print("Network stack initialized\n");
+
+    // // Spawn example async tasks
+    // executor::spawn(async_example_task());
+    // executor::spawn(async_network_task());
+
     let mut should_exit = false;
     while should_exit == false {
+        // Run async tasks
+        // executor::run_once();
+        // network::poll();
+
         console::print(PROMPT);
 
         let mut buffer = Vec::new();
@@ -79,6 +115,29 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
                 }
                 "meow" => {
                     console::print_as_akuma("Meow");
+                }
+                "time" => {
+                    console::print("UTC: ");
+                    console::print(&timer::utc_iso8601());
+                    console::print("\nUptime: ");
+                    console::print(&(timer::uptime_us() / 1_000_000).to_string());
+                    console::print(" seconds\n");
+                }
+                "uptime" => {
+                    let uptime_sec = timer::uptime_us() / 1_000_000;
+                    let days = uptime_sec / 86400;
+                    let hours = (uptime_sec % 86400) / 3600;
+                    let minutes = (uptime_sec % 3600) / 60;
+                    let seconds = uptime_sec % 60;
+                    console::print("Uptime: ");
+                    console::print(&days.to_string());
+                    console::print(" days, ");
+                    console::print(&hours.to_string());
+                    console::print(":");
+                    console::print(&minutes.to_string());
+                    console::print(":");
+                    console::print(&seconds.to_string());
+                    console::print("\n");
                 }
                 _ => {
                     console::print_as_akuma("pffft");
@@ -113,5 +172,28 @@ fn detect_memory_size(dtb_addr: usize) -> Result<usize, &'static str> {
                 FdtError::BufferTooSmall => "Buffer too small",
             }),
         }
+    }
+}
+
+// Example async task - prints every 5 seconds
+async fn async_example_task() {
+    let mut counter = 0;
+    loop {
+        executor::sleep_sec(5).await;
+        counter += 1;
+        console::print("[Async] Heartbeat #");
+        console::print(&counter.to_string());
+        console::print(" at ");
+        console::print(&timer::utc_iso8601_simple());
+        console::print("\n");
+    }
+}
+
+// Example network async task - polls every 100ms
+async fn async_network_task() {
+    loop {
+        executor::sleep_ms(100).await;
+        // Poll network stack
+        network::poll();
     }
 }
