@@ -78,10 +78,6 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     console::print(&freq.to_string());
     console::print(" Hz\n");
     
-    if freq == 0 {
-        console::print("WARNING: Timer frequency is 0! Time-based features won't work.\n");
-    }
-    
     // Set UTC time to a known value (example: 2025-11-28 12:00:00 UTC)
     // In a real system, you'd get this from NTP or RTC
     let example_utc_us = 1732795200_000000u64; // 2025-11-28 12:00:00 UTC
@@ -100,17 +96,8 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     // console::print("Network stack initialized\n");
 
     // Spawn example async tasks
-    console::print("Spawning async task...\n");
-    
-    executor::spawn(async {
-        console::print("[Async] Before sleep\n");
-        executor::sleep_sec(1).await;
-        console::print("[Async] After sleep\n");
-    });
-    console::print("Task spawned\n");
+    executor::spawn(async_example_task());
     // executor::spawn(async_network_task());
-
-    console::print("Starting main loop...\n");
     let mut should_exit = false;
     let mut buffer = Vec::new();
     let mut prompt_shown = false;
