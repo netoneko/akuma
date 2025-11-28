@@ -41,7 +41,7 @@ pub fn read_counter() -> u64 {
     counter
 }
 
-// Read the timer frequency
+// Read the timer frequency (public for debugging)
 pub fn read_frequency() -> u64 {
     let freq: u64;
     unsafe {

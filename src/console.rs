@@ -31,11 +31,18 @@ pub fn has_char() -> bool {
 }
 
 // blocking read
-pub fn getchar() -> u8 {
+fn _getchar_blocking() -> u8 {
     unsafe {
         // Wait until data is available
         while !has_char() {}
         // Read the character
+        UART0_DR.read_volatile()
+    }
+}
+
+// non-blocking read (only call if has_char() is true!)
+pub fn getchar() -> u8 {
+    unsafe {
         UART0_DR.read_volatile()
     }
 }

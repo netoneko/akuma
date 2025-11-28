@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -8,7 +8,7 @@ use spinning_top::Spinlock;
 static EXECUTOR: Spinlock<Option<Executor>> = Spinlock::new(None);
 
 pub struct Executor {
-    task_queue: VecDeque<Task>,
+    task_queue: Vec<Task>,  // Changed from VecDeque to Vec
 }
 
 struct Task {
@@ -18,7 +18,7 @@ struct Task {
 impl Executor {
     pub fn new() -> Self {
         Self {
-            task_queue: VecDeque::new(),
+            task_queue: Vec::new(),
         }
     }
 
@@ -26,11 +26,12 @@ impl Executor {
         let task = Task {
             future: Box::pin(future),
         };
-        self.task_queue.push_back(task);
+        self.task_queue.push(task);
     }
 
     pub fn run(&mut self) {
-        while let Some(mut task) = self.task_queue.pop_front() {
+        while !self.task_queue.is_empty() {
+            let mut task = self.task_queue.remove(0);
             let waker = dummy_waker();
             let mut context = Context::from_waker(&waker);
 
@@ -40,30 +41,41 @@ impl Executor {
                 }
                 Poll::Pending => {
                     // Re-queue the task
-                    self.task_queue.push_back(task);
+                    self.task_queue.push(task);
                 }
             }
         }
     }
 
     pub fn run_once(&mut self) -> bool {
-        if let Some(mut task) = self.task_queue.pop_front() {
-            let waker = dummy_waker();
-            let mut context = Context::from_waker(&waker);
+        if self.task_queue.is_empty() {
+            return false;
+        }
+        
+        // Poll all tasks in round-robin fashion without removing/moving them
+        // This avoids the Vec::remove() hang issue
+        let waker = dummy_waker();
+        let mut context = Context::from_waker(&waker);
 
+        let mut completed_indices = Vec::new();
+        
+        for (i, task) in self.task_queue.iter_mut().enumerate() {
             match task.future.as_mut().poll(&mut context) {
                 Poll::Ready(()) => {
-                    // Task completed
+                    completed_indices.push(i);
                 }
                 Poll::Pending => {
-                    // Re-queue the task
-                    self.task_queue.push_back(task);
+                    // Task still pending, leave it in the queue
                 }
             }
-            true
-        } else {
-            false
         }
+        
+        // Remove completed tasks in reverse order to avoid index shifting issues
+        for i in completed_indices.iter().rev() {
+            self.task_queue.swap_remove(*i);
+        }
+        
+        !self.task_queue.is_empty()
     }
 
     pub fn has_tasks(&self) -> bool {
@@ -135,8 +147,9 @@ impl Future for Timer {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = crate::timer::uptime_us();
-        // Handle wraparound correctly
-        if now.wrapping_sub(self.deadline_us) < u64::MAX / 2 {
+        
+        // Check if current time has reached or passed the deadline
+        if now >= self.deadline_us {
             Poll::Ready(())
         } else {
             Poll::Pending

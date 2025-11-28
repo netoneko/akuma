@@ -64,84 +64,121 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     console::print(&(heap_size / 1024 / 1024).to_string());
     console::print(" MB\n");
 
-    // // Initialize async executor
-    // executor::init();
-    // console::print("Async executor initialized\n");
+    // Initialize async executor
+    executor::init();
+    console::print("Async executor initialized\n");
 
-    // // Initialize timer
-    // timer::init();
-    // console::print("Timer initialized\n");
+    // Initialize timer
+    timer::init();
+    console::print("Timer initialized\n");
+    
+    // Check timer hardware
+    let freq = timer::read_frequency();
+    console::print("Timer frequency: ");
+    console::print(&freq.to_string());
+    console::print(" Hz\n");
+    
+    if freq == 0 {
+        console::print("WARNING: Timer frequency is 0! Time-based features won't work.\n");
+    }
+    
+    // Set UTC time to a known value (example: 2025-11-28 12:00:00 UTC)
+    // In a real system, you'd get this from NTP or RTC
+    let example_utc_us = 1732795200_000000u64; // 2025-11-28 12:00:00 UTC
+    timer::set_utc_time_us(example_utc_us);
+    
+    console::print("Current UTC time: ");
+    console::print(&timer::utc_iso8601());
+    console::print("\n");
+    
+    console::print("Uptime: ");
+    console::print(&(timer::uptime_us() / 1_000_000).to_string());
+    console::print(" seconds\n");
 
-    // // Set UTC time to a known value (example: 2025-11-28 12:00:00 UTC)
-    // // In a real system, you'd get this from NTP or RTC
-    // let example_utc_us = 1732795200_000000u64; // 2025-11-28 12:00:00 UTC
-    // timer::set_utc_time_us(example_utc_us);
-
-    // console::print("Current UTC time: ");
-    // console::print(&timer::utc_iso8601());
-    // console::print("\n");
-
-    // console::print("Uptime: ");
-    // console::print(&(timer::uptime_us() / 1_000_000).to_string());
-    // console::print(" seconds\n");
-
-    // // Initialize network stack
+    // Initialize network stack
     // network::init();
     // console::print("Network stack initialized\n");
 
-    // // Spawn example async tasks
-    // executor::spawn(async_example_task());
+    // Spawn example async tasks
+    console::print("Spawning async task...\n");
+    
+    executor::spawn(async {
+        console::print("[Async] Before sleep\n");
+        executor::sleep_sec(1).await;
+        console::print("[Async] After sleep\n");
+    });
+    console::print("Task spawned\n");
     // executor::spawn(async_network_task());
 
+    console::print("Starting main loop...\n");
     let mut should_exit = false;
+    let mut buffer = Vec::new();
+    let mut prompt_shown = false;
+    
     while should_exit == false {
-        // Run async tasks
-        // executor::run_once();
+        // Run async tasks (non-blocking)
+        executor::run_once();
+        
         // network::poll();
 
-        console::print(PROMPT);
-
-        let mut buffer = Vec::new();
-        let len = console::read_line(&mut buffer, true);
-        if len == 0 {
-            continue;
+        // Show prompt if we're ready for input
+        if !prompt_shown && buffer.is_empty() {
+            console::print(PROMPT);
+            prompt_shown = true;
         }
-        if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
-            console::print("\n");
-            match text.trim().to_lowercase().as_str() {
-                "exit" => {
-                    console::print_as_akuma("MEOWWWW!");
-                    should_exit = true;
+
+        // Check for input (non-blocking)
+        if console::has_char() {
+            let c = console::getchar();
+            buffer.push(c);
+            console::print(&(c as char).to_string());
+            
+            // Process line when Enter is pressed
+            if c == b'\n' || c == b'\r' {
+                console::print("\n");
+                prompt_shown = false;
+                
+                if let Ok(text) = core::str::from_utf8(&buffer[..buffer.len() - 1]) {
+                    match text.trim().to_lowercase().as_str() {
+                        "exit" => {
+                            console::print_as_akuma("MEOWWWW!");
+                            should_exit = true;
+                        }
+                        "meow" => {
+                            console::print_as_akuma("Meow");
+                        }
+                        "time" => {
+                            console::print("UTC: ");
+                            console::print(&timer::utc_iso8601());
+                            console::print("\nUptime: ");
+                            console::print(&(timer::uptime_us() / 1_000_000).to_string());
+                            console::print(" seconds\n");
+                        }
+                        "uptime" => {
+                            let uptime_sec = timer::uptime_us() / 1_000_000;
+                            let days = uptime_sec / 86400;
+                            let hours = (uptime_sec % 86400) / 3600;
+                            let minutes = (uptime_sec % 3600) / 60;
+                            let seconds = uptime_sec % 60;
+                            console::print("Uptime: ");
+                            console::print(&days.to_string());
+                            console::print(" days, ");
+                            console::print(&hours.to_string());
+                            console::print(":");
+                            console::print(&minutes.to_string());
+                            console::print(":");
+                            console::print(&seconds.to_string());
+                            console::print("\n");
+                        }
+                        "" => {
+                            // Empty line, just show prompt again
+                        }
+                        _ => {
+                            console::print_as_akuma("pffft");
+                        }
+                    }
                 }
-                "meow" => {
-                    console::print_as_akuma("Meow");
-                }
-                "time" => {
-                    console::print("UTC: ");
-                    console::print(&timer::utc_iso8601());
-                    console::print("\nUptime: ");
-                    console::print(&(timer::uptime_us() / 1_000_000).to_string());
-                    console::print(" seconds\n");
-                }
-                "uptime" => {
-                    let uptime_sec = timer::uptime_us() / 1_000_000;
-                    let days = uptime_sec / 86400;
-                    let hours = (uptime_sec % 86400) / 3600;
-                    let minutes = (uptime_sec % 3600) / 60;
-                    let seconds = uptime_sec % 60;
-                    console::print("Uptime: ");
-                    console::print(&days.to_string());
-                    console::print(" days, ");
-                    console::print(&hours.to_string());
-                    console::print(":");
-                    console::print(&minutes.to_string());
-                    console::print(":");
-                    console::print(&seconds.to_string());
-                    console::print("\n");
-                }
-                _ => {
-                    console::print_as_akuma("pffft");
-                }
+                buffer.clear();
             }
         }
     }
