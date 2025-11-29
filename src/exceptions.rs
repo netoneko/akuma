@@ -127,10 +127,14 @@ pub fn init() {
 extern "C" fn rust_irq_handler() {
     // Acknowledge the interrupt and get IRQ number
     if let Some(irq) = crate::gic::acknowledge_irq() {
-        // Call registered handler
-        crate::irq::dispatch_irq(irq);
-
-        // Signal end of interrupt
-        crate::gic::end_of_interrupt(irq);
+        // Special handling for scheduler SGI
+        if irq == crate::gic::SGI_SCHEDULER {
+            // SGI handler calls EOI itself before context switching
+            crate::threading::sgi_scheduler_handler(irq);
+        } else {
+            // Normal IRQs: call handler then EOI
+            crate::irq::dispatch_irq(irq);
+            crate::gic::end_of_interrupt(irq);
+        }
     }
 }

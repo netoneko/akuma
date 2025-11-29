@@ -42,18 +42,19 @@ pub fn enable_timer_interrupts(interval_us: u64) {
     }
 }
 
-// Timer interrupt handler - called from IRQ handler
-pub fn timer_irq_handler() {
+// Timer interrupt handler - called from IRQ handler  
+pub fn timer_irq_handler(_irq: u32) {
     // Acknowledge interrupt by setting next compare value
     let freq = read_frequency();
     let interval_ticks = (freq * 10_000) / 1_000_000; // 10ms for preemption
-
+    
     unsafe {
         asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
     }
-
-    // Perform preemptive thread scheduling
-    crate::threading::schedule();
+    
+    // Trigger SGI for scheduling (instead of switching directly)
+    // This allows the timer IRQ to complete normally
+    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 
 pub fn tick() {

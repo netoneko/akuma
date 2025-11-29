@@ -14,12 +14,16 @@ const GICD_ISENABLER: usize = GICD_BASE + 0x100; // Interrupt Set-Enable Registe
 const GICD_ICENABLER: usize = GICD_BASE + 0x180; // Interrupt Clear-Enable Registers
 const GICD_IPRIORITYR: usize = GICD_BASE + 0x400; // Interrupt Priority Registers
 const GICD_ITARGETSR: usize = GICD_BASE + 0x800; // Interrupt Processor Targets
+const GICD_SGIR: usize = GICD_BASE + 0xF00; // Software Generated Interrupt Register
 
 // GIC CPU Interface registers
 const GICC_CTLR: usize = GICC_BASE + 0x000; // CPU Interface Control Register
 const GICC_PMR: usize = GICC_BASE + 0x004; // Interrupt Priority Mask Register
 const GICC_IAR: usize = GICC_BASE + 0x00C; // Interrupt Acknowledge Register
 const GICC_EOIR: usize = GICC_BASE + 0x010; // End of Interrupt Register
+
+// SGI numbers (0-15)
+pub const SGI_SCHEDULER: u32 = 0; // SGI 0 for scheduling
 
 /// Initialize the GIC
 pub fn init() {
@@ -95,6 +99,26 @@ pub fn acknowledge_irq() -> Option<u32> {
 pub fn end_of_interrupt(irq: u32) {
     unsafe {
         write_volatile(GICC_EOIR as *mut u32, irq);
+    }
+}
+
+/// Trigger a Software Generated Interrupt (SGI)
+/// 
+/// SGI 0-15 are available. This sends the interrupt to the current CPU.
+pub fn trigger_sgi(sgi_id: u32) {
+    if sgi_id > 15 {
+        return; // Invalid SGI ID
+    }
+    
+    // GICD_SGIR format:
+    // [25:24] = TargetListFilter (0b10 = send to requesting CPU only)
+    // [23:16] = CPUTargetList (ignored when filter=0b10)
+    // [15] = NSATT (0 = secure)
+    // [3:0] = SGIINTID (SGI number 0-15)
+    let value = (0b10 << 24) | sgi_id;
+    
+    unsafe {
+        write_volatile(GICD_SGIR as *mut u32, value);
     }
 }
 

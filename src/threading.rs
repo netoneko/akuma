@@ -9,6 +9,7 @@ global_asm!(
     r#"
 .section .text
 .global switch_context
+.global thread_start
 
 // void switch_context(Context* old, const Context* new)
 // x0 = pointer to old context (save here)
@@ -26,6 +27,10 @@ switch_context:
     mov x9, sp
     str x9, [x0, #96]
     
+    // Save DAIF (interrupt mask)
+    mrs x9, daif
+    str x9, [x0, #104]
+    
     // Load new context
     ldp x19, x20, [x1, #0]
     ldp x21, x22, [x1, #16]
@@ -38,8 +43,25 @@ switch_context:
     ldr x9, [x1, #96]
     mov sp, x9
     
+    // Load DAIF (restore interrupt mask)
+    ldr x9, [x1, #104]
+    msr daif, x9
+    
     // Return (will jump to x30 - the new thread's entry point or return address)
     ret
+
+// Thread entry trampoline
+// x19 holds the actual thread entry function
+thread_start:
+    // Enable IRQs
+    msr daifclr, #2
+    
+    // Call the thread entry function (in x19)
+    blr x19
+    
+    // Thread returned (shouldn't happen!) - loop forever
+1:  wfi
+    b 1b
 
 "#
 );
@@ -50,6 +72,7 @@ const MAX_THREADS: usize = 8;
 // External assembly functions
 unsafe extern "C" {
     fn switch_context(old: *mut Context, new: *const Context);
+    fn thread_start() -> !;
 }
 
 /// CPU context saved during context switch
@@ -70,6 +93,7 @@ pub struct Context {
     pub x29: u64, // Frame pointer
     pub x30: u64, // Link register (return address)
     pub sp: u64,  // Stack pointer
+    pub daif: u64, // Interrupt mask (IMPORTANT!)
 }
 
 impl Context {
@@ -88,6 +112,7 @@ impl Context {
             x29: 0,
             x30: 0,
             sp: 0,
+            daif: 0, // IRQs enabled by default
         }
     }
 }
@@ -126,11 +151,12 @@ impl Thread {
         let entry_addr = entry as *const () as u64;
 
         // Initialize context
-        // When we context switch, ret will jump to x30
-        // So we set x30 to the entry point directly
+        // x30 points to thread_start trampoline, x19 holds actual entry function
+        // thread_start will call the entry with blr x19, enabling proper preemption
         let mut context = Context::zero();
         context.sp = sp;
-        context.x30 = entry_addr;
+        context.x19 = entry_addr; // Pass entry function in x19
+        context.x30 = thread_start as *const () as u64; // Jump to trampoline
         context.x29 = 0; // Frame pointer = 0 for new thread
 
         Thread {
@@ -194,7 +220,8 @@ impl Scheduler {
     }
 
     /// Select next ready thread (round-robin)
-    pub fn schedule(&mut self) -> Option<(&mut Context, &Context)> {
+    /// Returns (old_idx, new_idx)
+    pub fn schedule_indices(&mut self) -> Option<(usize, usize)> {
         // Skip if only one thread
         if self.threads.len() <= 1 {
             return None;
@@ -203,17 +230,27 @@ impl Scheduler {
         let current_idx = self.current_idx;
         let thread_count = self.threads.len();
 
-        // Find next ready thread (including Running threads for round-robin)
+        // Find next ready thread (skip idle thread 0)
+        // Start from thread 1 if we'd wrap to 0
         let mut next_idx = (current_idx + 1) % thread_count;
+        if next_idx == 0 {
+            next_idx = 1; // Skip idle
+        }
         let start_idx = next_idx;
 
         loop {
-            let state = self.threads[next_idx].state;
-            if state == ThreadState::Ready || state == ThreadState::Running {
-                break;
+            // Skip idle thread (thread 0)
+            if next_idx != 0 {
+                let state = self.threads[next_idx].state;
+                if state == ThreadState::Ready || state == ThreadState::Running {
+                    break;
+                }
             }
 
             next_idx = (next_idx + 1) % thread_count;
+            if next_idx == 0 {
+                next_idx = 1; // Skip idle
+            }
 
             // Wrapped around - no ready threads
             if next_idx == start_idx {
@@ -234,12 +271,16 @@ impl Scheduler {
 
         self.current_idx = next_idx;
 
-        // Return (old_context, new_context) for switching
-        unsafe {
-            let old_ptr = &mut self.threads[current_idx].context as *mut Context;
-            let new_ptr = &self.threads[next_idx].context as *const Context;
-            Some((&mut *old_ptr, &*new_ptr))
-        }
+        Some((current_idx, next_idx))
+    }
+    
+    /// Get direct pointers to thread contexts (unsafe - caller must ensure no aliasing)
+    pub unsafe fn get_context_ptrs(&mut self, old_idx: usize, new_idx: usize) 
+        -> (*mut Context, *const Context) 
+    {
+        let old_ptr = &mut self.threads[old_idx].context as *mut Context;
+        let new_ptr = &self.threads[new_idx].context as *const Context;
+        (old_ptr, new_ptr)
     }
 }
 
@@ -262,20 +303,52 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
     }
 }
 
-/// Called from timer IRQ to perform preemptive context switch
-pub fn schedule() {
-    // Skip if scheduler not initialized yet
-    if let Some(mut sched) = SCHEDULER.try_lock() {
-        if let Some(scheduler) = sched.as_mut() {
-            if let Some((old_ctx, new_ctx)) = scheduler.schedule() {
-                // Perform context switch
-                unsafe {
-                    switch_context(old_ctx, new_ctx);
-                }
-            }
+/// SGI handler for scheduling - called when scheduler SGI fires
+/// This is the only place where context switching happens
+pub fn sgi_scheduler_handler(irq: u32) {
+    static mut SGI_COUNT: usize = 0;
+    unsafe {
+        SGI_COUNT += 1;
+        if SGI_COUNT <= 5 || SGI_COUNT % 100 == 1 {
+            crate::console::print("S");
         }
     }
-    // If we can't get lock or scheduler not ready, just return
+    
+    // Signal EOI BEFORE context switching
+    // This allows new interrupts to be accepted even if we don't return
+    crate::gic::end_of_interrupt(irq);
+    
+    // Get indices and raw scheduler pointer, then release lock
+    let (switch_info, sched_ptr) = {
+        let mut sched = SCHEDULER.lock();
+        
+        let info = if let Some(scheduler) = sched.as_mut() {
+            let ptr = scheduler as *mut Scheduler;
+            (scheduler.schedule_indices(), Some(ptr))
+        } else {
+            (None, None)
+        };
+        
+        info
+        // Lock released here
+    };
+    
+    // Now context switch WITHOUT holding lock, using raw pointer
+    if let (Some((old_idx, new_idx)), Some(sched_ptr)) = (switch_info, sched_ptr) {
+        unsafe { 
+            if SGI_COUNT <= 5 {
+                crate::console::print(&alloc::format!("[{}->{}]X", old_idx, new_idx));
+            }
+            
+            // SAFETY: Pointer is valid as long as scheduler exists (static lifetime)
+            // and threads vector doesn't reallocate (we reserve MAX_THREADS at init)
+            let scheduler = &mut *sched_ptr;
+            let (old_ptr, new_ptr) = scheduler.get_context_ptrs(old_idx, new_idx);
+            
+            // Context switch - saves current state directly to old thread's context
+            switch_context(old_ptr, new_ptr);
+        }
+    }
 }
 
 // (switch_context declared in extern block above)

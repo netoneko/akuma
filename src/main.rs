@@ -125,13 +125,18 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     threading::init();
     console::print("Threading system initialized\n");
 
-    // Enable timer-driven preemptive multitasking
-    // Timer IRQ is PPI 14, which maps to IRQ 30 (16 + 14)
+    // Enable timer-driven preemptive multitasking via SGI
+    // 1. Enable SGI 0 for scheduling (SGIs are always enabled, but register a dummy handler)
+    console::print("Configuring scheduler SGI...\n");
+    gic::enable_irq(gic::SGI_SCHEDULER);
+    
+    // 2. Timer IRQ (PPI 14, maps to IRQ 30) will trigger the SGI
     console::print("Registering timer IRQ...\n");
-    irq::register_handler(30, |_| timer::timer_irq_handler());
+    irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
+    
     console::print("Enabling timer...\n");
     timer::enable_timer_interrupts(10_000); // 10ms intervals
-    console::print("Preemptive scheduling enabled (10ms timer)\n");
+    console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
 
     // Test allocator
     let mut test_vec: Vec<u32> = Vec::new();
@@ -145,46 +150,36 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
 
     // Heartbeat thread
     extern "C" fn heartbeat_thread() -> ! {
-        // Make sure IRQs are enabled
         unsafe {
-            core::arch::asm!("msr daifclr, #2");
-        }
-
-        let mut count = 0u32;
-        loop {
-            // Wait using busy-wait (will be preempted by timer IRQ)
-            for _ in 0..50_000_000 {
-                unsafe { core::arch::asm!("nop") };
+            const UART_BASE: *mut u8 = 0x0900_0000 as *mut u8;
+            UART_BASE.write_volatile(b'H');
+            UART_BASE.write_volatile(b'!');
+            
+            loop {
+                for _ in 0..10_000_000 {
+                    core::arch::asm!("nop");
+                }
+                UART_BASE.write_volatile(b'H');
             }
-
-            count += 1;
-            console::print("[Heartbeat #");
-            console::print(&count.to_string());
-            console::print(" at ");
-            console::print(&timer::utc_iso8601_simple());
-            console::print("]\n");
         }
     }
 
-    // Network initialization thread
+    // Network initialization thread  
     extern "C" fn network_thread() -> ! {
-        console::print("[NetThread] Starting network initialization...\n");
-
-        // Small delay to let system stabilize
-        for _ in 0..1000000 {
-            unsafe { core::arch::asm!("nop") };
-        }
-
-        // Try to initialize network (will use busy-waiting, but timer will preempt us!)
+        console::print("\n[Net] Starting network initialization...\n");
+        
+        // Try network init (busy-waits will be preempted)
         match network::init(0) {
-            Ok(()) => console::print("[NetThread] Network initialized successfully!\n"),
+            Ok(()) => console::print("[Net] SUCCESS!\n"),
             Err(e) => {
-                console::print("[NetThread] Network init failed: ");
+                console::print("[Net] Failed: ");
                 console::print(e);
                 console::print("\n");
             }
         }
-
+        
+        console::print("[Net] Thread done, entering idle loop\n");
+        
         loop {
             unsafe { core::arch::asm!("wfi") };
         }
@@ -193,10 +188,10 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     // Spawn threads
     threading::spawn(heartbeat_thread).expect("Failed to spawn heartbeat thread");
     console::print("Heartbeat thread spawned\n");
-
-    // TODO: Network thread disabled for now (virtio-drivers still uses busy-waiting)
-    // threading::spawn(network_thread).expect("Failed to spawn network thread");
-    // console::print("Network thread spawned\n");
+    
+    // Network thread - now works with preemptive threading!
+    threading::spawn(network_thread).expect("Failed to spawn network thread");
+    console::print("Network thread spawned\n");
 
     let mut should_exit = false;
     let mut buffer = Vec::new();
