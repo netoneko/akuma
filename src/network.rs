@@ -162,16 +162,13 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
         }
     }
     
-    // Dummy device works! smoltcp no-alloc is functional
-    // Skip virtio for now - VirtIONetRaw::new() hangs
+    // Dummy works! Now try virtio (with alloc disabled for both smoltcp AND virtio-drivers)
     unsafe {
         const UART: *mut u8 = 0x0900_0000 as *mut u8;
         for c in b"[Net] smoltcp OK!\n" { UART.write_volatile(*c); }
-        for c in b"[Net] (virtio disabled)\n" { UART.write_volatile(*c); }
+        for c in b"[Net] Now virtio (no-alloc)...\n" { UART.write_volatile(*c); }
     }
-    return Err("smoltcp OK, virtio disabled");
     
-    #[allow(unreachable_code)]
     let virtio_addrs = find_virtio_mmio_devices(0)?;
     
     for (idx, addr) in virtio_addrs.iter().enumerate() {
