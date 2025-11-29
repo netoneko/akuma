@@ -11,6 +11,7 @@ mod executor;
 mod gic;
 mod irq;
 mod network;
+mod tests;
 mod threading;
 mod timer;
 mod virtio_hal;
@@ -135,7 +136,7 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
     
     console::print("Enabling timer...\n");
-    timer::enable_timer_interrupts(10_000); // 10ms intervals
+    timer::enable_timer_interrupts(10_000); // 10ms intervals (cleanup every tick)
     console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
 
     // Test allocator
@@ -147,6 +148,14 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     test_vec.insert(0, 99);
     drop(test_vec);
     console::print("Allocator OK\n");
+
+    // Run system tests
+    if !tests::run_all() {
+        console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
+        loop {
+            unsafe { core::arch::asm!("wfi"); }
+        }
+    }
 
     // Heartbeat thread
     extern "C" fn heartbeat_thread() -> ! {
@@ -189,9 +198,9 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     threading::spawn(heartbeat_thread).expect("Failed to spawn heartbeat thread");
     console::print("Heartbeat thread spawned\n");
     
-    // Network thread - now works with preemptive threading!
-    threading::spawn(network_thread).expect("Failed to spawn network thread");
-    console::print("Network thread spawned\n");
+    // Network thread - cooperative (only yields voluntarily)
+    threading::spawn_cooperative(network_thread).expect("Failed to spawn network thread");
+    console::print("Network thread spawned (cooperative)\n");
 
     let mut should_exit = false;
     let mut buffer = Vec::new();

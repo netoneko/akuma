@@ -28,8 +28,13 @@ pub fn init() {
 }
 
 // Enable timer interrupts for preemptive scheduling
+// Store configured interval for use in handler
+static mut TIMER_INTERVAL_US: u64 = 10_000; // Default 10ms
+
 // interval_us: interval in microseconds between interrupts
 pub fn enable_timer_interrupts(interval_us: u64) {
+    unsafe { TIMER_INTERVAL_US = interval_us; }
+    
     let freq = read_frequency();
     let ticks = (freq * interval_us) / 1_000_000;
 
@@ -42,18 +47,33 @@ pub fn enable_timer_interrupts(interval_us: u64) {
     }
 }
 
+/// How often to run thread cleanup (in timer ticks)
+/// Set to 1 to clean up every timer tick (every ~100ms with current config)
+const CLEANUP_INTERVAL_TICKS: u32 = 1;
+
 // Timer interrupt handler - called from IRQ handler  
 pub fn timer_irq_handler(_irq: u32) {
+    static mut TICK_COUNTER: u32 = 0;
+    
     // Acknowledge interrupt by setting next compare value
     let freq = read_frequency();
-    let interval_ticks = (freq * 10_000) / 1_000_000; // 10ms for preemption
+    let interval_us = unsafe { TIMER_INTERVAL_US };
+    let interval_ticks = (freq * interval_us) / 1_000_000;
     
     unsafe {
         asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
     }
     
-    // Trigger SGI for scheduling (instead of switching directly)
-    // This allows the timer IRQ to complete normally
+    // Periodic cleanup of terminated threads
+    unsafe {
+        TICK_COUNTER += 1;
+        if TICK_COUNTER >= CLEANUP_INTERVAL_TICKS {
+            TICK_COUNTER = 0;
+            let _ = crate::threading::cleanup_terminated();
+        }
+    }
+    
+    // Trigger SGI for scheduling - scheduler will decide if switch is needed
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 

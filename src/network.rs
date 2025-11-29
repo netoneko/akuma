@@ -115,13 +115,62 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
     log(b"[Net] init\n");
     
     // Register lo0 (loopback)
-    log(b"[Net] lo0: loopback\n");
+    log(b"[Net] lo0: UP\n");
     register_interface(b"lo0", 1, [0; 6]);
-    log(b"[Net] lo0 registered\n");
     
-    // TODO: ethernet scan disabled - causes hang with preemptive threading
-    // The virtio-drivers crate has blocking behavior that conflicts with our scheduler
-    log(b"[Net] eth0: disabled\n");
+    // Scan for ethernet
+    log(b"[Net] Scanning...\n");
+    let addrs: [usize; 8] = [
+        0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600,
+        0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
+    ];
+    
+    for &addr in addrs.iter() {
+        
+        unsafe {
+            let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
+            if device_id != 1 { continue; }
+            
+            log(b"[Net] found!\n");
+            
+            let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
+                Some(p) => p,
+                None => continue,
+            };
+            
+            let transport = match MmioTransport::new(header_ptr) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            
+            // Delay for device
+            for _ in 0..50_000_000 { core::arch::asm!("nop"); }
+            
+            log(b"[Net] virtio\n");
+            let net = match VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport) {
+                Ok(n) => n,
+                Err(_) => { log(b"[Net] fail\n"); continue; }
+            };
+            
+            let mac = net.mac_address();
+            let mut dev = VirtioNetDevice { inner: net };
+            
+            log(b"[Net] smoltcp\n");
+            let hw = EthernetAddress::from_bytes(&mac);
+            let cfg = Config::new(HardwareAddress::Ethernet(hw));
+            let _iface = Interface::new(cfg, &mut dev, Instant::ZERO);
+            
+            log(b"[Net] eth0: ");
+            for (i, &b) in mac.iter().enumerate() {
+                if i > 0 { log(b":"); }
+                log_hex_byte(b);
+            }
+            log(b" UP\n");
+            
+            register_interface(b"eth0", 2, mac.into());
+            break;
+        }
+    }
     
     log(b"[Net] Ready\n");
     Ok(())

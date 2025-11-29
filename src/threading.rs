@@ -4,6 +4,13 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use spinning_top::Spinlock;
 
+/// Default timeout for cooperative threads in microseconds (5 seconds)
+/// If 0, timeout is never enforced
+pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
+
+/// Short timeout for test threads (500ms)
+pub const TEST_TIMEOUT_US: u64 = 500_000;
+
 // Assembly context switch implementation
 global_asm!(
     r#"
@@ -31,6 +38,14 @@ switch_context:
     mrs x9, daif
     str x9, [x0, #104]
     
+    // Save ELR_EL1 (exception return address)
+    mrs x9, elr_el1
+    str x9, [x0, #112]
+    
+    // Save SPSR_EL1 (exception saved processor state)
+    mrs x9, spsr_el1
+    str x9, [x0, #120]
+    
     // Load new context
     ldp x19, x20, [x1, #0]
     ldp x21, x22, [x1, #16]
@@ -43,11 +58,19 @@ switch_context:
     ldr x9, [x1, #96]
     mov sp, x9
     
-    // Load DAIF (restore interrupt mask)
+    // Load DAIF
     ldr x9, [x1, #104]
     msr daif, x9
     
-    // Return (will jump to x30 - the new thread's entry point or return address)
+    // Load ELR_EL1
+    ldr x9, [x1, #112]
+    msr elr_el1, x9
+    
+    // Load SPSR_EL1
+    ldr x9, [x1, #120]
+    msr spsr_el1, x9
+    
+    // Return
     ret
 
 // Thread entry trampoline
@@ -90,10 +113,12 @@ pub struct Context {
     pub x26: u64,
     pub x27: u64,
     pub x28: u64,
-    pub x29: u64, // Frame pointer
-    pub x30: u64, // Link register (return address)
-    pub sp: u64,  // Stack pointer
-    pub daif: u64, // Interrupt mask (IMPORTANT!)
+    pub x29: u64,  // Frame pointer
+    pub x30: u64,  // Link register (return address)
+    pub sp: u64,   // Stack pointer
+    pub daif: u64, // Interrupt mask
+    pub elr: u64,  // Exception Link Register (return address for eret)
+    pub spsr: u64, // Saved Program Status Register
 }
 
 impl Context {
@@ -112,7 +137,9 @@ impl Context {
             x29: 0,
             x30: 0,
             sp: 0,
-            daif: 0, // IRQs enabled by default
+            daif: 0,  // IRQs enabled
+            elr: 0,   // Exception return address
+            spsr: 0,  // Processor state
         }
     }
 }
@@ -130,11 +157,15 @@ pub struct Thread {
     pub stack_ptr: usize,  // Raw pointer to allocated stack (0 for idle thread)
     pub stack_size: usize, // Size of allocated stack (0 for idle thread)
     pub state: ThreadState,
+    pub cooperative: bool,     // If true, only yields voluntarily (not preempted by timer)
+    pub start_time_us: u64,    // When thread started running (for timeout)
+    pub timeout_us: u64,       // Timeout for cooperative threads (0 = no timeout)
 }
 
 impl Thread {
     /// Create a new thread with the given entry point
-    pub fn new(id: usize, entry: extern "C" fn() -> !) -> Self {
+    /// cooperative: if true, thread only yields voluntarily (not preempted by timer)
+    pub fn new(id: usize, entry: extern "C" fn() -> !, cooperative: bool) -> Self {
         use alloc::alloc::{Layout, alloc_zeroed};
 
         // Allocate zeroed stack using raw allocator
@@ -165,6 +196,9 @@ impl Thread {
             stack_ptr,
             stack_size: STACK_SIZE,
             state: ThreadState::Ready,
+            cooperative,
+            start_time_us: 0,
+            timeout_us: if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 },
         }
     }
 
@@ -176,6 +210,9 @@ impl Thread {
             stack_ptr: 0, // Uses boot stack
             stack_size: 0,
             state: ThreadState::Running,
+            cooperative: false,
+            start_time_us: 0,
+            timeout_us: 0,
         }
     }
 }
@@ -199,13 +236,15 @@ impl Scheduler {
         }
     }
 
-    pub fn spawn(&mut self, entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
+    /// Spawn a new thread
+    /// cooperative: if true, thread only yields voluntarily (not preempted by timer)
+    pub fn spawn(&mut self, entry: extern "C" fn() -> !, cooperative: bool) -> Result<usize, &'static str> {
         if self.threads.len() >= MAX_THREADS {
             return Err("Too many threads");
         }
 
         let tid = self.threads.len();
-        let thread = Thread::new(tid, entry);
+        let thread = Thread::new(tid, entry, cooperative);
         self.threads.push(thread);
 
         Ok(tid)
@@ -220,18 +259,37 @@ impl Scheduler {
     }
 
     /// Select next ready thread (round-robin)
+    /// voluntary: if false (timer preemption), skip cooperative threads (unless timed out)
     /// Returns (old_idx, new_idx)
-    pub fn schedule_indices(&mut self) -> Option<(usize, usize)> {
+    pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
         // Skip if only one thread
         if self.threads.len() <= 1 {
             return None;
         }
 
         let current_idx = self.current_idx;
+        let current_thread = &self.threads[current_idx];
+        
+        // Check if cooperative thread should be preempted due to timeout
+        let mut force_preempt = false;
+        if !voluntary && current_thread.cooperative {
+            let timeout = current_thread.timeout_us;
+            if timeout > 0 && current_thread.start_time_us > 0 {
+                let now = crate::timer::uptime_us();
+                let elapsed = now.saturating_sub(current_thread.start_time_us);
+                if elapsed >= timeout {
+                    force_preempt = true; // Timeout! Force preemption
+                }
+            }
+            
+            if !force_preempt {
+                return None; // Cooperative thread can't be preempted (no timeout)
+            }
+        }
+
         let thread_count = self.threads.len();
 
         // Find next ready thread (skip idle thread 0)
-        // Start from thread 1 if we'd wrap to 0
         let mut next_idx = (current_idx + 1) % thread_count;
         if next_idx == 0 {
             next_idx = 1; // Skip idle
@@ -268,10 +326,59 @@ impl Scheduler {
             self.threads[current_idx].state = ThreadState::Ready;
         }
         self.threads[next_idx].state = ThreadState::Running;
+        
+        // Record when this thread started running
+        self.threads[next_idx].start_time_us = crate::timer::uptime_us();
 
         self.current_idx = next_idx;
 
         Some((current_idx, next_idx))
+    }
+    
+    /// Get thread count statistics
+    pub fn thread_stats(&self) -> (usize, usize, usize) {
+        let mut ready = 0;
+        let mut running = 0;
+        let mut terminated = 0;
+        for t in &self.threads {
+            match t.state {
+                ThreadState::Ready => ready += 1,
+                ThreadState::Running => running += 1,
+                ThreadState::Terminated => terminated += 1,
+            }
+        }
+        (ready, running, terminated)
+    }
+    
+    /// Clean up terminated threads and free their stacks
+    pub fn cleanup_terminated(&mut self) -> usize {
+        use alloc::alloc::{Layout, dealloc};
+        
+        let mut cleaned = 0;
+        // Can't remove while iterating, mark indices to clean
+        let to_clean: Vec<usize> = self.threads.iter()
+            .enumerate()
+            .filter(|(i, t)| *i != 0 && t.state == ThreadState::Terminated && t.stack_ptr != 0)
+            .map(|(i, _)| i)
+            .collect();
+        
+        for idx in to_clean.into_iter().rev() {
+            let thread = &self.threads[idx];
+            if thread.stack_ptr != 0 && thread.stack_size > 0 {
+                unsafe {
+                    let layout = Layout::from_size_align(thread.stack_size, 16).unwrap();
+                    dealloc(thread.stack_ptr as *mut u8, layout);
+                }
+            }
+            self.threads.remove(idx);
+            cleaned += 1;
+            
+            // Adjust current_idx if needed
+            if self.current_idx >= idx && self.current_idx > 0 {
+                self.current_idx -= 1;
+            }
+        }
+        cleaned
     }
     
     /// Get direct pointers to thread contexts (unsafe - caller must ensure no aliasing)
@@ -286,6 +393,9 @@ impl Scheduler {
 
 static SCHEDULER: Spinlock<Option<Scheduler>> = Spinlock::new(None);
 
+// Flag to track if current scheduling call is voluntary (yield) vs preemptive (timer)
+static mut VOLUNTARY_SCHEDULE: bool = false;
+
 pub fn init() {
     // Try to lock - use blocking lock since we're single threaded at init
     let mut sched = SCHEDULER.lock();
@@ -294,10 +404,22 @@ pub fn init() {
     *sched = Some(Scheduler::new());
 }
 
+/// Spawn a new preemptible thread (can be interrupted by timer)
 pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
+    spawn_with_options(entry, false)
+}
+
+/// Spawn a cooperative thread (only yields voluntarily, not preempted by timer)
+pub fn spawn_cooperative(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
+    spawn_with_options(entry, true)
+}
+
+/// Spawn a thread with options
+/// cooperative: if true, thread only yields voluntarily
+pub fn spawn_with_options(entry: extern "C" fn() -> !, cooperative: bool) -> Result<usize, &'static str> {
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut scheduler) = *sched {
-        scheduler.spawn(entry)
+        scheduler.spawn(entry, cooperative)
     } else {
         Err("Scheduler not initialized")
     }
@@ -306,17 +428,12 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
 /// SGI handler for scheduling - called when scheduler SGI fires
 /// This is the only place where context switching happens
 pub fn sgi_scheduler_handler(irq: u32) {
-    static mut SGI_COUNT: usize = 0;
-    unsafe {
-        SGI_COUNT += 1;
-        if SGI_COUNT <= 5 || SGI_COUNT % 100 == 1 {
-            crate::console::print("S");
-        }
-    }
-    
     // Signal EOI BEFORE context switching
-    // This allows new interrupts to be accepted even if we don't return
     crate::gic::end_of_interrupt(irq);
+    
+    // Check if this is a voluntary yield or timer preemption
+    let voluntary = unsafe { VOLUNTARY_SCHEDULE };
+    unsafe { VOLUNTARY_SCHEDULE = false; } // Reset for next time
     
     // Get indices and raw scheduler pointer, then release lock
     let (switch_info, sched_ptr) = {
@@ -324,7 +441,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
         
         let info = if let Some(scheduler) = sched.as_mut() {
             let ptr = scheduler as *mut Scheduler;
-            (scheduler.schedule_indices(), Some(ptr))
+            (scheduler.schedule_indices(voluntary), Some(ptr))
         } else {
             (None, None)
         };
@@ -336,22 +453,79 @@ pub fn sgi_scheduler_handler(irq: u32) {
     // Now context switch WITHOUT holding lock, using raw pointer
     if let (Some((old_idx, new_idx)), Some(sched_ptr)) = (switch_info, sched_ptr) {
         unsafe { 
-            if SGI_COUNT <= 5 {
-                crate::console::print(&alloc::format!("[{}->{}]X", old_idx, new_idx));
-            }
-            
-            // SAFETY: Pointer is valid as long as scheduler exists (static lifetime)
-            // and threads vector doesn't reallocate (we reserve MAX_THREADS at init)
             let scheduler = &mut *sched_ptr;
             let (old_ptr, new_ptr) = scheduler.get_context_ptrs(old_idx, new_idx);
-            
-            // Context switch - saves current state directly to old thread's context
             switch_context(old_ptr, new_ptr);
         }
     }
 }
 
 // (switch_context declared in extern block above)
+
+/// Voluntarily yield the CPU to another thread
+pub fn yield_now() {
+    unsafe { VOLUNTARY_SCHEDULE = true; }
+    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+}
+
+/// Get thread statistics: (ready, running, terminated)
+pub fn thread_stats() -> (usize, usize, usize) {
+    let sched = SCHEDULER.lock();
+    if let Some(ref scheduler) = *sched {
+        scheduler.thread_stats()
+    } else {
+        (0, 0, 0)
+    }
+}
+
+/// Clean up terminated threads and free their stacks
+/// Returns number of threads cleaned
+pub fn cleanup_terminated() -> usize {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut scheduler) = *sched {
+        scheduler.cleanup_terminated()
+    } else {
+        0
+    }
+}
+
+/// Get total thread count
+pub fn thread_count() -> usize {
+    let sched = SCHEDULER.lock();
+    if let Some(ref scheduler) = *sched {
+        scheduler.threads.len()
+    } else {
+        0
+    }
+}
+
+/// Mark the current thread as terminated
+pub fn mark_current_terminated() {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut scheduler) = *sched {
+        scheduler.current_thread_mut().state = ThreadState::Terminated;
+    }
+}
+
+/// Check if current thread is cooperative
+pub fn is_current_cooperative() -> bool {
+    let sched = SCHEDULER.lock();
+    if let Some(ref scheduler) = *sched {
+        scheduler.current_thread().cooperative
+    } else {
+        false
+    }
+}
+
+/// Get current thread ID
+pub fn current_thread_id() -> usize {
+    let sched = SCHEDULER.lock();
+    if let Some(ref scheduler) = *sched {
+        scheduler.current_idx
+    } else {
+        0
+    }
+}
 
 /// Thread entry wrapper - called when thread function returns
 extern "C" fn thread_exit() -> ! {
