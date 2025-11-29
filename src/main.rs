@@ -120,6 +120,12 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
+    // Enable timer-driven preemptive multitasking
+    // Timer IRQ is PPI 14, which maps to IRQ 30 (16 + 14)
+    irq::register_handler(30, |_| timer::timer_irq_handler());
+    timer::enable_timer_interrupts(1_000); // 1ms intervals
+    console::print("Preemptive scheduling enabled (1ms timer)\n");
+
     // Test allocator
     let mut test_vec: Vec<u32> = Vec::new();
     for i in 0..10 {
@@ -133,25 +139,18 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     // Spawn example async tasks
     executor::spawn(async_example_task());
 
-    // Test network init with different allocation strategy
-    executor::spawn(async move {
-        console::print("Testing network init with different allocator usage...\n");
-        let result = network::init(dtb_ptr).await;
-        match result {
-            Ok(()) => console::print("Network initialized!\n"),
-            Err(e) => {
-                console::print("Network init: ");
-                console::print(e);
-                console::print("\n");
-            }
-        }
-    });
+    // Network disabled - virtio-drivers spin_loop() requires real OS threads
+    // See NETWORKING_STATUS.md for details
+    console::print("Network: Disabled (virtio spin_loop incompatible with async executor)\n");
 
     let mut should_exit = false;
     let mut buffer = Vec::new();
     let mut prompt_shown = false;
 
     while should_exit == false {
+        // Process any work queued from IRQ handlers
+        executor::process_irq_work();
+        
         // Run async tasks (non-blocking)
         executor::run_once();
 

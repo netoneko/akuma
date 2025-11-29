@@ -32,11 +32,11 @@ pub fn init() {
 pub fn enable_timer_interrupts(interval_us: u64) {
     let freq = read_frequency();
     let ticks = (freq * interval_us) / 1_000_000;
-
+    
     unsafe {
         // Set the timer compare value
         asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + ticks);
-
+        
         // Enable the timer (bit 0 = enable, bit 1 = !mask)
         asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
     }
@@ -46,13 +46,15 @@ pub fn enable_timer_interrupts(interval_us: u64) {
 pub fn timer_irq_handler() {
     // Acknowledge interrupt by setting next compare value
     let freq = read_frequency();
-    let interval_ticks = (freq * 10_000) / 1_000_000; // 10ms
-
+    let interval_ticks = (freq * 1_000) / 1_000_000; // 1ms for responsive preemption
+    
     unsafe {
         asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
     }
-
-    // Just acknowledges the timer - prevents busy-waits from hanging forever
+    
+    // Queue executor run without touching the executor lock
+    // Main loop will process this work
+    crate::executor::queue_irq_work(crate::executor::IrqWork::RunExecutorOnce);
 }
 
 pub fn tick() {

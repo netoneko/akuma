@@ -7,6 +7,13 @@ use spinning_top::Spinlock;
 
 static EXECUTOR: Spinlock<Option<Executor>> = Spinlock::new(None);
 
+// IRQ-safe work queue - can be accessed from interrupt context
+pub enum IrqWork {
+    RunExecutorOnce,
+}
+
+static IRQ_WORK_QUEUE: Spinlock<Vec<IrqWork>> = Spinlock::new(Vec::new());
+
 pub struct Executor {
     task_queue: Vec<Task>, // Changed from VecDeque to Vec
 }
@@ -110,6 +117,33 @@ pub fn has_tasks() -> bool {
         executor.has_tasks()
     } else {
         false
+    }
+}
+
+/// Queue work to be done from IRQ context (safe to call from interrupts)
+pub fn queue_irq_work(work: IrqWork) {
+    // Try to acquire lock - if we can't, skip it (prevents deadlock)
+    if let Some(mut queue) = IRQ_WORK_QUEUE.try_lock() {
+        queue.push(work);
+    }
+    // If we can't get the lock, that's OK - main loop is already processing work
+}
+
+/// Process any pending IRQ work (call from main loop)
+pub fn process_irq_work() {
+    // Take all pending work
+    let work_items = {
+        let mut queue = IRQ_WORK_QUEUE.lock();
+        core::mem::take(&mut *queue)
+    };
+    
+    // Process each item
+    for work in work_items {
+        match work {
+            IrqWork::RunExecutorOnce => {
+                run_once();
+            }
+        }
     }
 }
 
