@@ -103,20 +103,20 @@ pub fn end_of_interrupt(irq: u32) {
 }
 
 /// Trigger a Software Generated Interrupt (SGI)
-/// 
+///
 /// SGI 0-15 are available. This sends the interrupt to the current CPU.
 pub fn trigger_sgi(sgi_id: u32) {
     if sgi_id > 15 {
         return; // Invalid SGI ID
     }
-    
+
     // GICD_SGIR format:
     // [25:24] = TargetListFilter (0b10 = send to requesting CPU only)
     // [23:16] = CPUTargetList (ignored when filter=0b10)
     // [15] = NSATT (0 = secure)
     // [3:0] = SGIINTID (SGI number 0-15)
     let value = (0b10 << 24) | sgi_id;
-    
+
     unsafe {
         write_volatile(GICD_SGIR as *mut u32, value);
     }

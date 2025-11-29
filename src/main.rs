@@ -130,11 +130,11 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     // 1. Enable SGI 0 for scheduling (SGIs are always enabled, but register a dummy handler)
     console::print("Configuring scheduler SGI...\n");
     gic::enable_irq(gic::SGI_SCHEDULER);
-    
+
     // 2. Timer IRQ (PPI 14, maps to IRQ 30) will trigger the SGI
     console::print("Registering timer IRQ...\n");
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
-    
+
     console::print("Enabling timer...\n");
     timer::enable_timer_interrupts(10_000); // 10ms intervals (cleanup every tick)
     console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
@@ -153,51 +153,58 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     if !tests::run_all() {
         console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
         loop {
-            unsafe { core::arch::asm!("wfi"); }
-        }
-    }
-
-    // Heartbeat thread
-    extern "C" fn heartbeat_thread() -> ! {
-        unsafe {
-            const UART_BASE: *mut u8 = 0x0900_0000 as *mut u8;
-            UART_BASE.write_volatile(b'H');
-            UART_BASE.write_volatile(b'!');
-            
-            loop {
-                for _ in 0..10_000_000 {
-                    core::arch::asm!("nop");
-                }
-                UART_BASE.write_volatile(b'H');
+            unsafe {
+                core::arch::asm!("wfi");
             }
         }
     }
 
-    // Network initialization thread  
+    // Heartbeat thread - prints '.' every ~1s to show scheduling works
+    extern "C" fn heartbeat_thread() -> ! {
+        let mut count: u32 = 0;
+        loop {
+            // Busy delay
+            for _ in 0..5_000_000 {
+                unsafe { core::arch::asm!("nop") };
+            }
+            count += 1;
+            if count % 20 == 0 {
+                console::print(".");
+            }
+        }
+    }
+
+    // Network initialization thread with 5s timeout
     extern "C" fn network_thread() -> ! {
-        console::print("\n[Net] Starting network initialization...\n");
-        
-        // Try network init (busy-waits will be preempted)
+        let start_us = timer::uptime_us();
+
+        console::print("\n[Net] Starting (5s timeout)...\n");
+        console::print(&alloc::format!(
+            "[Net] Thread ID: {}\n",
+            threading::current_thread_id()
+        ));
+
         match network::init(0) {
             Ok(()) => console::print("[Net] SUCCESS!\n"),
-            Err(e) => {
-                console::print("[Net] Failed: ");
-                console::print(e);
-                console::print("\n");
-            }
+            Err(e) => console::print(&alloc::format!("[Net] Failed: {}\n", e)),
         }
-        
-        console::print("[Net] Thread done, entering idle loop\n");
-        
+
+        let elapsed_ms = (timer::uptime_us() - start_us) / 1000;
+        console::print(&alloc::format!("[Net] Done in {}ms\n", elapsed_ms));
+
+        threading::mark_current_terminated();
+        threading::yield_now();
+
         loop {
             unsafe { core::arch::asm!("wfi") };
         }
     }
 
     // Spawn threads
+    console::print("Spawning heartbeat thread...\n");
     threading::spawn(heartbeat_thread).expect("Failed to spawn heartbeat thread");
     console::print("Heartbeat thread spawned\n");
-    
+
     // Network thread - cooperative (only yields voluntarily)
     threading::spawn_cooperative(network_thread).expect("Failed to spawn network thread");
     console::print("Network thread spawned (cooperative)\n");
