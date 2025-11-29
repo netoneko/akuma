@@ -8,7 +8,7 @@ use spinning_top::Spinlock;
 static EXECUTOR: Spinlock<Option<Executor>> = Spinlock::new(None);
 
 pub struct Executor {
-    task_queue: Vec<Task>,  // Changed from VecDeque to Vec
+    task_queue: Vec<Task>, // Changed from VecDeque to Vec
 }
 
 struct Task {
@@ -51,14 +51,14 @@ impl Executor {
         if self.task_queue.is_empty() {
             return false;
         }
-        
+
         // Poll all tasks in round-robin fashion without removing/moving them
         // This avoids the Vec::remove() hang issue
         let waker = dummy_waker();
         let mut context = Context::from_waker(&waker);
 
         let mut completed_indices = Vec::new();
-        
+
         for (i, task) in self.task_queue.iter_mut().enumerate() {
             match task.future.as_mut().poll(&mut context) {
                 Poll::Ready(()) => {
@@ -69,12 +69,12 @@ impl Executor {
                 }
             }
         }
-        
+
         // Remove completed tasks in reverse order to avoid index shifting issues
         for i in completed_indices.iter().rev() {
             self.task_queue.swap_remove(*i);
         }
-        
+
         !self.task_queue.is_empty()
     }
 
@@ -147,7 +147,7 @@ impl Future for Timer {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = crate::timer::uptime_us();
-        
+
         // Check if current time has reached or passed the deadline
         if now >= self.deadline_us {
             Poll::Ready(())

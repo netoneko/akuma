@@ -6,13 +6,13 @@ extern crate alloc;
 mod allocator;
 mod boot;
 mod console;
+mod exceptions;
 mod executor;
+mod gic;
+mod irq;
 mod network;
 mod timer;
 mod virtio_hal;
-mod gic;
-mod exceptions;
-mod irq;
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -41,10 +41,10 @@ static PROMPT: &str = "Akuma >: ";
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     const RAM_BASE: usize = 0x40000000;
-    
+
     // DTB pointer workaround: QEMU with -device loader puts DTB at 0x44000000
     // But we can't safely read it yet before setting up, so use after heap init
-    
+
     // let ram_size = match detect_memory_size(dtb_ptr) {
     //     Ok(size) => {
     //         console::print("Detected RAM: ");
@@ -86,7 +86,7 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
     console::print("GIC initialized\n");
-    
+
     // Set up exception vectors and enable IRQs
     exceptions::init();
     console::print("IRQ handling enabled\n");
@@ -98,24 +98,24 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     // Initialize timer
     timer::init();
     console::print("Timer initialized\n");
-    
+
     // Check timer hardware
     let freq = timer::read_frequency();
     console::print("Timer frequency: ");
     console::print(&freq.to_string());
     console::print(" Hz\n");
-    
+
     // Read UTC time from PL031 RTC hardware
     if timer::init_utc_from_rtc() {
         console::print("UTC time initialized from RTC\n");
     } else {
         console::print("Warning: RTC not available, UTC time not set\n");
     }
-    
+
     console::print("Current UTC time: ");
     console::print(&timer::utc_iso8601());
     console::print("\n");
-    
+
     console::print("Uptime: ");
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
@@ -130,28 +130,31 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     drop(test_vec);
     console::print("Allocator OK\n");
 
-    // Try network initialization with legacy virtio mode
-    console::print("Initializing network...\n");
-    match network::init(dtb_ptr) {
-        Ok(()) => console::print("Network initialized successfully!\n"),
-        Err(e) => {
-            console::print("Network init failed: ");
-            console::print(e);
-            console::print("\n");
-        }
-    }
-
     // Spawn example async tasks
     executor::spawn(async_example_task());
-    // executor::spawn(async_network_task());  // Disabled - network not initialized
+
+    // Test network init with different allocation strategy
+    executor::spawn(async move {
+        console::print("Testing network init with different allocator usage...\n");
+        let result = network::init(dtb_ptr).await;
+        match result {
+            Ok(()) => console::print("Network initialized!\n"),
+            Err(e) => {
+                console::print("Network init: ");
+                console::print(e);
+                console::print("\n");
+            }
+        }
+    });
+
     let mut should_exit = false;
     let mut buffer = Vec::new();
     let mut prompt_shown = false;
-    
+
     while should_exit == false {
         // Run async tasks (non-blocking)
         executor::run_once();
-        
+
         // Show prompt if we're ready for input
         if !prompt_shown && buffer.is_empty() {
             console::print(PROMPT);
@@ -163,12 +166,12 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
             let c = console::getchar();
             buffer.push(c);
             console::print(&(c as char).to_string());
-            
+
             // Process line when Enter is pressed
             if c == b'\n' || c == b'\r' {
                 console::print("\n");
                 prompt_shown = false;
-                
+
                 if let Ok(text) = core::str::from_utf8(&buffer[..buffer.len() - 1]) {
                     match text.trim().to_lowercase().as_str() {
                         "exit" => {
@@ -222,7 +225,7 @@ fn detect_memory_size(dtb_addr: usize) -> Result<usize, &'static str> {
     if dtb_addr == 0 {
         return Err("DTB pointer is null");
     }
-    
+
     unsafe {
         match Fdt::from_ptr(dtb_addr as *const u8) {
             Ok(fdt) => {

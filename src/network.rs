@@ -5,15 +5,16 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::EthernetAddress;
 use spinning_top::Spinlock;
-use virtio_drivers::device::net::{VirtIONet, TxBuffer};
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::Transport;
+use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::virtio_hal::VirtioHal;
 
-// Virtio-net device wrapper - using 16 for default buffer count
+// Virtio-net device wrapper - using raw driver for polling mode
 pub struct VirtioNetDevice {
-    inner: VirtIONet<VirtioHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    rx_buffer: Vec<u8>,
 }
 
 pub struct VirtioRxToken {
@@ -40,13 +41,12 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     {
         let mut buffer = alloc::vec![0u8; len];
         let result = f(&mut buffer);
-        
-        // Create TxBuffer and send
-        let tx_buf = TxBuffer::from(&buffer[..]);
-        if let Err(e) = self.device.inner.send(tx_buf) {
+
+        // Send using VirtIONetRaw API
+        if let Err(_e) = self.device.inner.send(&buffer) {
             crate::console::print("[Net] TX error\n");
         }
-        
+
         result
     }
 }
@@ -56,15 +56,10 @@ impl Device for VirtioNetDevice {
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Try to receive a packet using correct virtio-drivers API
-        if let Ok(buf) = self.inner.receive() {
-            Some((
-                VirtioRxToken { buffer: buf.packet().to_vec() },
-                VirtioTxToken { device: self },
-            ))
-        } else {
-            None
-        }
+        // VirtIONetRaw doesn't have high-level receive() method
+        // For now, return None (no packets available)
+        // TODO: Implement proper polling with receive_begin/receive_complete
+        None
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -96,55 +91,67 @@ impl NetworkStack {
     pub fn new(dtb_ptr: usize) -> Result<Self, &'static str> {
         // Find virtio-mmio devices from device tree
         let virtio_addrs = find_virtio_mmio_devices(dtb_ptr)?;
-        
-        crate::console::print("Probing virtio devices...\n");
-        
+
         // Try each virtio device we found
         for (idx, addr) in virtio_addrs.iter().enumerate() {
             let addr = *addr;
             unsafe {
-                // Read version first to check legacy vs modern
-                let version = core::ptr::read_volatile((addr + 0x004) as *const u32);
+                // Read version and device_id
                 let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
-                
-                if device_id != 0 {
-                    crate::console::print("Device at 0x");
-                    crate::console::print(&alloc::format!("{:x}: version={}, device_id={}\n", addr, version, device_id));
+
+                // Skip empty slots
+                if device_id == 0 {
+                    continue;
                 }
-                
+
                 // Create VirtIOHeader pointer
                 let header_ptr = core::ptr::NonNull::new_unchecked(addr as *mut VirtIOHeader);
-                
+
                 // Try to create MMIO transport
                 match MmioTransport::new(header_ptr) {
                     Ok(transport) => {
                         let device_type = transport.device_type();
-                    
-                    // Check if it's virtio-net using the enum
-                    use virtio_drivers::transport::DeviceType;
-                    if matches!(device_type, DeviceType::Network) {
-                        // Register IRQ handler for this virtio device
-                        // QEMU virt machine maps virtio-mmio devices to IRQ 16+ (0x10+)
-                        let irq = 16 + idx as u32;
-                        crate::irq::register_handler(irq, virtio_irq_handler);
-                        
-                        let net_device = VirtIONet::<VirtioHal, MmioTransport, 16>::new(transport, 4096)
-                            .map_err(|_| "Failed to initialize virtio-net")?;
-                        
-                        let mac = net_device.mac_address();
-                        let mut device = VirtioNetDevice { inner: net_device };
-                        let hardware_addr = EthernetAddress(mac);
-                        let config = Config::new(hardware_addr.into());
-                        
-                        let interface = Interface::new(config, &mut device, Instant::ZERO);
-                        let sockets = SocketSet::new(Vec::new());
-                        
-                        return Ok(Self {
-                            device,
-                            interface,
-                            sockets,
-                        });
-                    }
+
+                        // Check if it's virtio-net using the enum
+                        use virtio_drivers::transport::DeviceType;
+                        if matches!(device_type, DeviceType::Network) {
+                            // Register IRQ handler for this virtio device
+                            // QEMU virt machine maps virtio-mmio devices to IRQ 16+ (0x10+)
+                            let irq = 16 + idx as u32;
+                            crate::irq::register_handler(irq, virtio_irq_handler);
+
+                            // Use VirtIONetRaw which doesn't pre-allocate RX buffers
+                            let net_device =
+                                VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport)
+                                    .map_err(|_| "Failed to initialize virtio-net")?;
+
+                            let mac = net_device.mac_address();
+
+                            // Try different allocation strategies
+                            crate::console::print(
+                                "Allocating RX buffer with Vec::new + resize...\n",
+                            );
+                            let mut rx_buffer = Vec::new();
+                            rx_buffer.resize(4096, 0u8);
+                            crate::console::print("RX buffer allocated\n");
+
+                            let _device = VirtioNetDevice {
+                                inner: net_device,
+                                rx_buffer,
+                            };
+
+                            // NOTE: Cannot use smoltcp - Interface::new() hangs trying to send packets
+                            // which triggers add_notify_wait_pop() -> spin_loop() in virtio-drivers
+                            //
+                            // To enable networking, need either:
+                            // 1. Preemptive threading (so spin_loop yields CPU to QEMU)
+                            // 2. Custom async virtio driver (use .await instead of spin_loop)
+                            // 3. Manual packet handling without smoltcp
+
+                            return Err(
+                                "VirtIO-net device detected but TCP/IP stack requires preemptive threading",
+                            );
+                        }
                     }
                     Err(_) => {
                         // Not a valid virtio device at this address, continue
@@ -152,7 +159,7 @@ impl NetworkStack {
                 }
             }
         }
-        
+
         Err("No virtio-net device found")
     }
 
@@ -181,7 +188,7 @@ impl NetworkStack {
     }
 }
 
-pub fn init(dtb_ptr: usize) -> Result<(), &'static str> {
+pub async fn init(dtb_ptr: usize) -> Result<(), &'static str> {
     let mut network = NETWORK.lock();
     match NetworkStack::new(dtb_ptr) {
         Ok(stack) => {
@@ -204,7 +211,7 @@ fn find_virtio_mmio_devices(_dtb_addr: usize) -> Result<Vec<usize>, &'static str
     addresses.push(0xa000a00);
     addresses.push(0xa000c00);
     addresses.push(0xa000e00);
-    
+
     Ok(addresses)
 }
 

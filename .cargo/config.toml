@@ -2,8 +2,7 @@
 target = "aarch64-unknown-none"
 
 [target.aarch64-unknown-none]
-# Default runner with user-mode networking (works on macOS)
-# Guest is accessible from host via port forwarding
+# Runner with user-mode networking
 # Force legacy virtio mode (version 1) for better compatibility
 runner = """qemu-system-aarch64 \
   -machine virt \
@@ -15,14 +14,5 @@ runner = """qemu-system-aarch64 \
   -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
   -kernel"""
-
-# To disable networking, comment out the above and uncomment below:
-# runner = """qemu-system-aarch64 \
-#   -machine virt \
-#   -cpu cortex-a72 \
-#   -m 128M \
-#   -nographic \
-#   -serial mon:stdio \
-#   -kernel"""
 
 rustflags = ["-C", "link-arg=-Tlinker.ld"]

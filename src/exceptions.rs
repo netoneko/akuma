@@ -107,22 +107,18 @@ unsafe extern "C" {
 pub fn init() {
     unsafe {
         let vbar = &exception_vector_table as *const _ as u64;
-        
+
         // Set VBAR_EL1 (Vector Base Address Register)
-        unsafe {
-            core::arch::asm!(
-                "msr vbar_el1, {vbar}",
-                "isb",
-                vbar = in(reg) vbar
-            );
-        }
-        
+        core::arch::asm!(
+            "msr vbar_el1, {vbar}",
+            "isb",
+            vbar = in(reg) vbar
+        );
+
         // Enable IRQs by clearing the I bit in DAIF
-        unsafe {
-            core::arch::asm!(
-                "msr daifclr, #2"  // Clear IRQ mask (bit 1)
-            );
-        }
+        core::arch::asm!(
+            "msr daifclr, #2" // Clear IRQ mask (bit 1)
+        );
     }
 }
 
@@ -133,9 +129,8 @@ extern "C" fn rust_irq_handler() {
     if let Some(irq) = crate::gic::acknowledge_irq() {
         // Call registered handler
         crate::irq::dispatch_irq(irq);
-        
+
         // Signal end of interrupt
         crate::gic::end_of_interrupt(irq);
     }
 }
-

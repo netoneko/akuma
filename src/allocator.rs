@@ -32,13 +32,18 @@ struct Talck;
 unsafe impl core::alloc::GlobalAlloc for Talck {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         unsafe {
-            // Debug: print allocation request
-            // crate::console::print(".");  // Show allocation activity
-            
-            TALC.lock()
+            let result = TALC
+                .lock()
                 .malloc(layout)
                 .map(|ptr| ptr.as_ptr())
-                .unwrap_or(core::ptr::null_mut())
+                .unwrap_or(core::ptr::null_mut());
+
+            // Log allocation failures - use only static strings to avoid recursion!
+            if result.is_null() {
+                crate::console::print("\n[ALLOC FAIL]\n");
+            }
+
+            result
         }
     }
 
@@ -47,6 +52,8 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
             let ptr = self.alloc(layout);
             if !ptr.is_null() {
                 core::ptr::write_bytes(ptr, 0, layout.size());
+            } else {
+                crate::console::print("\n[ALLOC_ZEROED FAIL]\n");
             }
             ptr
         }
@@ -59,7 +66,12 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
         }
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
         unsafe {
             // Handle zero-sized allocations
             if new_size == 0 {
@@ -87,7 +99,7 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
                 if copy_size > 0 {
                     core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
                 }
-                
+
                 // Free old memory
                 self.dealloc(ptr, layout);
             }

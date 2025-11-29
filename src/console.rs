@@ -42,9 +42,7 @@ fn _getchar_blocking() -> u8 {
 
 // non-blocking read (only call if has_char() is true!)
 pub fn getchar() -> u8 {
-    unsafe {
-        UART0_DR.read_volatile()
-    }
+    unsafe { UART0_DR.read_volatile() }
 }
 
 const BUFFER_SIZE: usize = 100;

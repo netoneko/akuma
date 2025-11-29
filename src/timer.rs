@@ -1,7 +1,7 @@
 use alloc::string::String;
+use arm_pl031::Rtc;
 use core::arch::asm;
 use spinning_top::Spinlock;
-use arm_pl031::Rtc;
 
 // Manual tick counter (u64)
 // Overflow times at different frequencies:
@@ -25,6 +25,34 @@ pub fn init() {
         let rtc = Rtc::new(0x9010000 as *mut _);
         *RTC.lock() = Some(rtc);
     }
+}
+
+// Enable timer interrupts for preemptive scheduling
+// interval_us: interval in microseconds between interrupts
+pub fn enable_timer_interrupts(interval_us: u64) {
+    let freq = read_frequency();
+    let ticks = (freq * interval_us) / 1_000_000;
+
+    unsafe {
+        // Set the timer compare value
+        asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + ticks);
+
+        // Enable the timer (bit 0 = enable, bit 1 = !mask)
+        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+    }
+}
+
+// Timer interrupt handler - called from IRQ handler
+pub fn timer_irq_handler() {
+    // Acknowledge interrupt by setting next compare value
+    let freq = read_frequency();
+    let interval_ticks = (freq * 10_000) / 1_000_000; // 10ms
+
+    unsafe {
+        asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
+    }
+
+    // Just acknowledges the timer - prevents busy-waits from hanging forever
 }
 
 pub fn tick() {
