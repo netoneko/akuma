@@ -9,6 +9,7 @@ mod console;
 mod executor;
 mod network;
 mod timer;
+mod virtio_hal;
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -18,30 +19,45 @@ use fdt::Fdt;
 use fdt::FdtError;
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    console::print("\n\n!!! PANIC !!!\n");
+    if let Some(location) = info.location() {
+        console::print("Location: ");
+        console::print(location.file());
+        console::print(":");
+        console::print(&location.line().to_string());
+        console::print("\n");
+    }
+    console::print("Message: ");
+    console::print(&alloc::format!("{}\n", info.message()));
     loop {}
 }
 
 static PROMPT: &str = "Akuma >: ";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(dtb_ptr: usize) -> ! {
+pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     const RAM_BASE: usize = 0x40000000;
+    
+    // DTB pointer workaround: QEMU with -device loader puts DTB at 0x44000000
+    // But we can't safely read it yet before setting up, so use after heap init
+    
+    // let ram_size = match detect_memory_size(dtb_ptr) {
+    //     Ok(size) => {
+    //         console::print("Detected RAM: ");
+    //         console::print(&(size / 1024 / 1024).to_string());
+    //         console::print(" MB\n");
+    //         size
+    //     }
+    //     Err(e) => {
+    //         console::print("Error detecting memory: ");
+    //         console::print(e);
+    //         console::print("\nUsing default 32 MB\n");
+    //         32 * 1024 * 1024
+    //     }
+    // };
 
-    let ram_size = match detect_memory_size(dtb_ptr) {
-        Ok(size) => {
-            console::print("Detected RAM: ");
-            console::print(&(size / 1024 / 1024).to_string());
-            console::print(" MB\n");
-            size
-        }
-        Err(e) => {
-            console::print("Error detecting memory: ");
-            console::print(e);
-            console::print("\nUsing default 32 MB\n");
-            32 * 1024 * 1024
-        }
-    };
+    let ram_size = 128 * 1024 * 1024; // 128 MB
 
     let code_and_stack = ram_size / 16; // 1/16 of total RAM
     let heap_start = RAM_BASE + code_and_stack;
@@ -91,27 +107,43 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
-    // test Vec::remove()
-    // let mut vec = Vec::new();
-    // vec.push(1);
-    // vec.push(2);
-    // vec.push(3);
-    // vec.remove(1);
-    // console::print("Vec: ");
-    // console::print(&vec[0].to_string());
-    // console::print("\n");
+    // Test allocator
+    let mut test_vec: Vec<u32> = Vec::new();
+    for i in 0..10 {
+        test_vec.push(i);
+    }
+    test_vec.remove(0);
+    test_vec.insert(0, 99);
+    drop(test_vec);
+    console::print("Allocator OK\n");
 
-
-    // Initialize network stack
-    // TODO: Network stack initialization hangs in smoltcp Interface::new()
-    // This appears to be related to the allocator issue we saw with Vec::remove()
-    // Disabled for now until we investigate allocator problems
-    network::init();
-    console::print("Network stack initialized\n");
+    // Network stack initialization is currently disabled due to hang in VirtIONet::new()
+    // 
+    // Status:
+    // - virtio-net device is detected at 0xa000000 (device_id=0x1, vendor_id=QEMU)
+    // - MmioTransport successfully created
+    // - VirtIONet::new() hangs after 4 DMA allocations and 1 share() call
+    // 
+    // Root cause: The virtio-drivers crate expects interrupt/IRQ support for device
+    // initialization. The driver polls device status registers waiting for IRQs that
+    // never arrive since we haven't implemented interrupt handling yet.
+    //
+    // TODO: Implement ARM GIC (Generic Interrupt Controller) and virtio IRQ handling
+    // 
+    // Uncomment below once IRQ support is added:
+    // console::print("Initializing network...\n");
+    // match network::init(dtb_ptr) {
+    //     Ok(()) => console::print("Network initialized successfully!\n"),
+    //     Err(e) => {
+    //         console::print("Network init failed: ");
+    //         console::print(e);
+    //         console::print("\n");
+    //     }
+    // }
 
     // Spawn example async tasks
     executor::spawn(async_example_task());
-    // executor::spawn(async_network_task()); // Disabled - needs network stack
+    // executor::spawn(async_network_task());  // Disabled - network not initialized
     let mut should_exit = false;
     let mut buffer = Vec::new();
     let mut prompt_shown = false;
@@ -187,6 +219,10 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
 }
 
 fn detect_memory_size(dtb_addr: usize) -> Result<usize, &'static str> {
+    if dtb_addr == 0 {
+        return Err("DTB pointer is null");
+    }
+    
     unsafe {
         match Fdt::from_ptr(dtb_addr as *const u8) {
             Ok(fdt) => {

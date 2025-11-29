@@ -4,6 +4,7 @@ target = "aarch64-unknown-none"
 [target.aarch64-unknown-none]
 # Default runner with user-mode networking (works on macOS)
 # Guest is accessible from host via port forwarding
+# Explicitly assign virtio-net-device to virtio-mmio-bus.0
 runner = """qemu-system-aarch64 \
   -machine virt \
   -cpu cortex-a72 \
@@ -11,7 +12,8 @@ runner = """qemu-system-aarch64 \
   -nographic \
   -serial mon:stdio \
   -netdev user,id=net0,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443,hostfwd=tcp::2222-:22 \
-  -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
+  -global virtio-mmio.force-legacy=false \
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
   -kernel"""
 
 # To disable networking, comment out the above and uncomment below:
