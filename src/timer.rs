@@ -1,6 +1,7 @@
 use alloc::string::String;
 use core::arch::asm;
 use spinning_top::Spinlock;
+use arm_pl031::Rtc;
 
 // Manual tick counter (u64)
 // Overflow times at different frequencies:
@@ -13,14 +14,17 @@ static TICK_COUNT: Spinlock<u64> = Spinlock::new(0);
 // Can be set via set_utc_offset() to sync with real time
 static UTC_OFFSET_US: Spinlock<Option<u64>> = Spinlock::new(None);
 
-pub fn init() {
-    // Initialize the ARM Generic Timer
-    // This is a simplified version - in a real implementation you'd need to:
-    // 1. Set up the timer interrupt handler
-    // 2. Configure the timer frequency
-    // 3. Enable timer interrupts
+// PL031 RTC instance for reading real-time clock from QEMU
+// The standard PL031 address for QEMU virt machine is 0x9010000
+static RTC: Spinlock<Option<Rtc>> = Spinlock::new(None);
 
-    // For now, we'll use a simple counter that can be incremented manually
+pub fn init() {
+    // Initialize the PL031 RTC
+    // SAFETY: 0x9010000 is the standard PL031 RTC address on QEMU virt machine
+    unsafe {
+        let rtc = Rtc::new(0x9010000 as *mut _);
+        *RTC.lock() = Some(rtc);
+    }
 }
 
 pub fn tick() {
@@ -169,6 +173,26 @@ pub fn delay_ns(ns: u64) {
 // Overflows after ~584 years
 pub fn uptime_us() -> u64 {
     get_time_us()
+}
+
+// Read Unix timestamp from PL031 RTC (seconds since Unix epoch)
+// Returns None if RTC is not initialized
+pub fn read_rtc_timestamp() -> Option<u32> {
+    let rtc = RTC.lock();
+    rtc.as_ref().map(|r| r.get_unix_timestamp())
+}
+
+// Initialize UTC time from PL031 RTC
+// Returns true if successful, false if RTC not available
+pub fn init_utc_from_rtc() -> bool {
+    if let Some(timestamp) = read_rtc_timestamp() {
+        // Convert seconds to microseconds
+        let unix_epoch_us = (timestamp as u64) * 1_000_000;
+        set_utc_time_us(unix_epoch_us);
+        true
+    } else {
+        false
+    }
 }
 
 // Set UTC offset for real-world time tracking

@@ -94,10 +94,12 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     console::print(&freq.to_string());
     console::print(" Hz\n");
     
-    // Set UTC time to a known value (example: 2025-11-28 12:00:00 UTC)
-    // In a real system, you'd get this from NTP or RTC
-    let example_utc_us = 1732795200_000000u64; // 2025-11-28 12:00:00 UTC
-    timer::set_utc_time_us(example_utc_us);
+    // Read UTC time from PL031 RTC hardware
+    if timer::init_utc_from_rtc() {
+        console::print("UTC time initialized from RTC\n");
+    } else {
+        console::print("Warning: RTC not available, UTC time not set\n");
+    }
     
     console::print("Current UTC time: ");
     console::print(&timer::utc_iso8601());
