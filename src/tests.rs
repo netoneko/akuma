@@ -6,7 +6,10 @@
 use crate::console;
 use crate::threading;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Run all system tests - returns true if all pass
@@ -19,6 +22,30 @@ pub fn run_all() -> bool {
     all_pass &= test_allocator_vec();
     all_pass &= test_allocator_box();
     all_pass &= test_allocator_large();
+
+    // Comprehensive allocator tests
+    all_pass &= test_realloc_grow();
+    all_pass &= test_realloc_shrink();
+    all_pass &= test_realloc_preserves_data();
+    all_pass &= test_alloc_zeroed_basic();
+    all_pass &= test_alloc_zeroed_after_dirty();
+    all_pass &= test_alignment_various();
+    all_pass &= test_fragmentation_small_blocks();
+    all_pass &= test_interleaved_alloc_free();
+    all_pass &= test_mixed_sizes();
+    all_pass &= test_vec_remove_regression();
+    all_pass &= test_rapid_push_pop();
+    all_pass &= test_string_operations();
+    all_pass &= test_vec_of_vecs();
+    all_pass &= test_adjacent_allocations();
+
+    // Common memory allocation patterns
+    all_pass &= test_lifo_pattern();
+    all_pass &= test_fifo_pattern();
+    all_pass &= test_memory_pool_pattern();
+    all_pass &= test_resize_pattern();
+    all_pass &= test_temporary_buffers();
+    all_pass &= test_linked_structure();
 
     // Threading tests
     all_pass &= test_scheduler_init();
@@ -139,6 +166,1010 @@ fn test_allocator_large() -> bool {
     console::print("  Drop completed\n");
 
     let ok = len_ok && write_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Realloc growing - Vec growth triggers realloc
+fn test_realloc_grow() -> bool {
+    console::print("\n[TEST] Realloc grow (Vec capacity growth)\n");
+
+    let mut vec: Vec<u64> = Vec::with_capacity(4);
+    console::print(&format!("  Initial capacity: {}\n", vec.capacity()));
+
+    // Fill with known pattern
+    for i in 0..4u64 {
+        vec.push(i * 0x1111_1111_1111_1111);
+    }
+
+    // Force reallocation by pushing more
+    for i in 4..20u64 {
+        vec.push(i * 0x1111_1111_1111_1111);
+    }
+    console::print(&format!(
+        "  New capacity: {} (should be >= 20)\n",
+        vec.capacity()
+    ));
+
+    // Verify all data preserved
+    let mut data_ok = true;
+    for i in 0..20u64 {
+        if vec[i as usize] != i * 0x1111_1111_1111_1111 {
+            console::print(&format!("  Data mismatch at index {}\n", i));
+            data_ok = false;
+            break;
+        }
+    }
+
+    let capacity_ok = vec.capacity() >= 20;
+    console::print(&format!("  Data preserved: {}\n", data_ok));
+
+    drop(vec);
+
+    let ok = capacity_ok && data_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Realloc shrinking - shrink_to_fit
+fn test_realloc_shrink() -> bool {
+    console::print("\n[TEST] Realloc shrink (shrink_to_fit)\n");
+
+    let mut vec: Vec<u32> = Vec::with_capacity(100);
+    console::print(&format!("  Initial capacity: {}\n", vec.capacity()));
+
+    // Add just a few elements
+    for i in 0..5u32 {
+        vec.push(i * 12345);
+    }
+
+    // Shrink to fit
+    vec.shrink_to_fit();
+    console::print(&format!("  After shrink_to_fit: {}\n", vec.capacity()));
+
+    // Verify data
+    let mut data_ok = true;
+    for i in 0..5u32 {
+        if vec[i as usize] != i * 12345 {
+            data_ok = false;
+            break;
+        }
+    }
+
+    let shrunk = vec.capacity() <= 10; // Should shrink to close to 5
+    console::print(&format!("  Data preserved: {}\n", data_ok));
+
+    drop(vec);
+
+    let ok = shrunk && data_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Realloc preserves data with known pattern
+fn test_realloc_preserves_data() -> bool {
+    console::print("\n[TEST] Realloc preserves data pattern\n");
+
+    const PATTERN: u8 = 0xDE;
+    const INITIAL_SIZE: usize = 64;
+    const FINAL_SIZE: usize = 256;
+
+    let mut vec: Vec<u8> = Vec::with_capacity(INITIAL_SIZE);
+    for _ in 0..INITIAL_SIZE {
+        vec.push(PATTERN);
+    }
+    console::print(&format!(
+        "  Filled {} bytes with 0x{:02X}\n",
+        INITIAL_SIZE, PATTERN
+    ));
+
+    // Force multiple reallocations
+    for _ in INITIAL_SIZE..FINAL_SIZE {
+        vec.push(0xAD); // Different pattern for new data
+    }
+    console::print(&format!("  Grew to {} bytes\n", vec.len()));
+
+    // Verify original data unchanged
+    let mut original_ok = true;
+    for i in 0..INITIAL_SIZE {
+        if vec[i] != PATTERN {
+            console::print(&format!(
+                "  Corruption at byte {} (got 0x{:02X})\n",
+                i, vec[i]
+            ));
+            original_ok = false;
+            break;
+        }
+    }
+
+    // Verify new data correct
+    let mut new_ok = true;
+    for i in INITIAL_SIZE..FINAL_SIZE {
+        if vec[i] != 0xAD {
+            new_ok = false;
+            break;
+        }
+    }
+
+    console::print(&format!("  Original data intact: {}\n", original_ok));
+    console::print(&format!("  New data correct: {}\n", new_ok));
+
+    drop(vec);
+
+    let ok = original_ok && new_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: alloc_zeroed - verify memory is actually zeroed
+fn test_alloc_zeroed_basic() -> bool {
+    console::print("\n[TEST] alloc_zeroed basic\n");
+
+    // vec![0; N] uses alloc_zeroed internally
+    const SIZE: usize = 512;
+    let vec: Vec<u8> = vec![0u8; SIZE];
+
+    let mut all_zero = true;
+    for (i, &byte) in vec.iter().enumerate() {
+        if byte != 0 {
+            console::print(&format!("  Non-zero at index {}: 0x{:02X}\n", i, byte));
+            all_zero = false;
+            break;
+        }
+    }
+
+    console::print(&format!("  {} bytes all zero: {}\n", SIZE, all_zero));
+
+    // Also test with Box
+    let boxed: Box<[u8; 256]> = Box::new([0u8; 256]);
+    let box_ok = boxed.iter().all(|&b| b == 0);
+    console::print(&format!("  Boxed array all zero: {}\n", box_ok));
+
+    drop(vec);
+    drop(boxed);
+
+    let ok = all_zero && box_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: alloc_zeroed after dirty memory
+fn test_alloc_zeroed_after_dirty() -> bool {
+    console::print("\n[TEST] alloc_zeroed after dirty memory\n");
+
+    const SIZE: usize = 128;
+
+    // First allocation - fill with dirty pattern
+    {
+        let mut dirty: Vec<u8> = Vec::with_capacity(SIZE);
+        for _ in 0..SIZE {
+            dirty.push(0xFF);
+        }
+        console::print(&format!("  Filled {} bytes with 0xFF, dropping...\n", SIZE));
+        drop(dirty);
+    }
+
+    // Second allocation - request zeroed memory
+    let clean: Vec<u8> = vec![0u8; SIZE];
+
+    let mut all_zero = true;
+    for (i, &byte) in clean.iter().enumerate() {
+        if byte != 0 {
+            console::print(&format!("  Residual dirty data at {}: 0x{:02X}\n", i, byte));
+            all_zero = false;
+            break;
+        }
+    }
+
+    console::print(&format!("  Zeroed allocation clean: {}\n", all_zero));
+
+    drop(clean);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_zero { "PASS" } else { "FAIL" }
+    ));
+    all_zero
+}
+
+/// Test: Various alignment requirements
+fn test_alignment_various() -> bool {
+    console::print("\n[TEST] Alignment requirements\n");
+
+    let mut all_aligned = true;
+
+    // Test different alignments using repr(align) structs
+    #[repr(align(8))]
+    #[allow(dead_code)]
+    struct Align8([u8; 8]);
+
+    #[repr(align(16))]
+    #[allow(dead_code)]
+    struct Align16([u8; 16]);
+
+    #[repr(align(32))]
+    #[allow(dead_code)]
+    struct Align32([u8; 32]);
+
+    #[repr(align(64))]
+    #[allow(dead_code)]
+    struct Align64([u8; 64]);
+
+    // Allocate and check alignment
+    let a8: Box<Align8> = Box::new(Align8([0; 8]));
+    let ptr8 = &*a8 as *const Align8 as usize;
+    let ok8 = ptr8 % 8 == 0;
+    console::print(&format!("  Align 8: ptr=0x{:x}, ok={}\n", ptr8, ok8));
+    all_aligned &= ok8;
+
+    let a16: Box<Align16> = Box::new(Align16([0; 16]));
+    let ptr16 = &*a16 as *const Align16 as usize;
+    let ok16 = ptr16 % 16 == 0;
+    console::print(&format!("  Align 16: ptr=0x{:x}, ok={}\n", ptr16, ok16));
+    all_aligned &= ok16;
+
+    let a32: Box<Align32> = Box::new(Align32([0; 32]));
+    let ptr32 = &*a32 as *const Align32 as usize;
+    let ok32 = ptr32 % 32 == 0;
+    console::print(&format!("  Align 32: ptr=0x{:x}, ok={}\n", ptr32, ok32));
+    all_aligned &= ok32;
+
+    let a64: Box<Align64> = Box::new(Align64([0; 64]));
+    let ptr64 = &*a64 as *const Align64 as usize;
+    let ok64 = ptr64 % 64 == 0;
+    console::print(&format!("  Align 64: ptr=0x{:x}, ok={}\n", ptr64, ok64));
+    all_aligned &= ok64;
+
+    drop(a8);
+    drop(a16);
+    drop(a32);
+    drop(a64);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_aligned { "PASS" } else { "FAIL" }
+    ));
+    all_aligned
+}
+
+/// Test: Fragmentation with many small blocks
+fn test_fragmentation_small_blocks() -> bool {
+    console::print("\n[TEST] Fragmentation (small blocks)\n");
+
+    const NUM_BLOCKS: usize = 100;
+    const BLOCK_SIZE: usize = 32;
+
+    // Allocate many small blocks
+    let mut blocks: Vec<Box<[u8; BLOCK_SIZE]>> = Vec::with_capacity(NUM_BLOCKS);
+    for i in 0..NUM_BLOCKS {
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        block[0] = i as u8;
+        block[BLOCK_SIZE - 1] = (i * 2) as u8;
+        blocks.push(block);
+    }
+    console::print(&format!(
+        "  Allocated {} blocks of {} bytes\n",
+        NUM_BLOCKS, BLOCK_SIZE
+    ));
+
+    // Free every other block (create fragmentation)
+    let mut freed = 0;
+    for i in (0..NUM_BLOCKS).step_by(2) {
+        blocks[i] = Box::new([0xDD; BLOCK_SIZE]); // Replace with new allocation
+        freed += 1;
+    }
+    console::print(&format!("  Replaced {} blocks (fragmented heap)\n", freed));
+
+    // Verify remaining blocks intact
+    let mut data_ok = true;
+    for i in (1..NUM_BLOCKS).step_by(2) {
+        if blocks[i][0] != i as u8 || blocks[i][BLOCK_SIZE - 1] != (i * 2) as u8 {
+            console::print(&format!("  Data corruption at block {}\n", i));
+            data_ok = false;
+            break;
+        }
+    }
+    console::print(&format!("  Odd blocks intact: {}\n", data_ok));
+
+    // Allocate new blocks in the holes
+    let mut new_blocks: Vec<Box<[u8; BLOCK_SIZE]>> = Vec::new();
+    for _ in 0..freed {
+        new_blocks.push(Box::new([0xAA; BLOCK_SIZE]));
+    }
+    console::print(&format!(
+        "  Allocated {} new blocks in gaps\n",
+        new_blocks.len()
+    ));
+
+    drop(blocks);
+    drop(new_blocks);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if data_ok { "PASS" } else { "FAIL" }
+    ));
+    data_ok
+}
+
+/// Test: Interleaved allocation and deallocation pattern
+fn test_interleaved_alloc_free() -> bool {
+    console::print("\n[TEST] Interleaved alloc/free pattern\n");
+
+    const ITERATIONS: usize = 50;
+    let mut all_ok = true;
+
+    for i in 0..ITERATIONS {
+        // Allocate A
+        let a: Box<[u8; 64]> = Box::new([i as u8; 64]);
+
+        // Allocate B
+        let b: Box<[u8; 128]> = Box::new([(i + 1) as u8; 128]);
+
+        // Free A
+        drop(a);
+
+        // Allocate C (may reuse A's memory)
+        let c: Box<[u8; 64]> = Box::new([(i + 2) as u8; 64]);
+
+        // Verify B unchanged
+        if b[0] != (i + 1) as u8 || b[127] != (i + 1) as u8 {
+            console::print(&format!("  Corruption at iteration {} (B)\n", i));
+            all_ok = false;
+            break;
+        }
+
+        // Verify C correct
+        if c[0] != (i + 2) as u8 || c[63] != (i + 2) as u8 {
+            console::print(&format!("  Corruption at iteration {} (C)\n", i));
+            all_ok = false;
+            break;
+        }
+
+        // Free B
+        drop(b);
+
+        // Free C
+        drop(c);
+    }
+
+    console::print(&format!(
+        "  {} iterations completed: {}\n",
+        ITERATIONS, all_ok
+    ));
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: Mixed allocation sizes
+fn test_mixed_sizes() -> bool {
+    console::print("\n[TEST] Mixed allocation sizes\n");
+
+    let mut all_ok = true;
+
+    // Small allocations (16-64 bytes)
+    let small1: Box<[u8; 16]> = Box::new([0x11; 16]);
+    let small2: Box<[u8; 32]> = Box::new([0x22; 32]);
+    let small3: Box<[u8; 64]> = Box::new([0x33; 64]);
+
+    // Medium allocations (1KB-4KB)
+    let medium1: Vec<u8> = vec![0x44; 1024];
+    let medium2: Vec<u8> = vec![0x55; 4096];
+
+    // Large allocation (64KB)
+    let large: Vec<u8> = vec![0x66; 65536];
+
+    // Verify all allocations
+    if small1[0] != 0x11 || small1[15] != 0x11 {
+        console::print("  Small1 corrupted\n");
+        all_ok = false;
+    }
+    if small2[0] != 0x22 || small2[31] != 0x22 {
+        console::print("  Small2 corrupted\n");
+        all_ok = false;
+    }
+    if small3[0] != 0x33 || small3[63] != 0x33 {
+        console::print("  Small3 corrupted\n");
+        all_ok = false;
+    }
+    if medium1[0] != 0x44 || medium1[1023] != 0x44 {
+        console::print("  Medium1 corrupted\n");
+        all_ok = false;
+    }
+    if medium2[0] != 0x55 || medium2[4095] != 0x55 {
+        console::print("  Medium2 corrupted\n");
+        all_ok = false;
+    }
+    if large[0] != 0x66 || large[65535] != 0x66 {
+        console::print("  Large corrupted\n");
+        all_ok = false;
+    }
+
+    console::print(&format!(
+        "  Small (16,32,64): ok={}\n",
+        small1[0] == 0x11 && small2[0] == 0x22 && small3[0] == 0x33
+    ));
+    console::print(&format!(
+        "  Medium (1K,4K): ok={}\n",
+        medium1[0] == 0x44 && medium2[0] == 0x55
+    ));
+    console::print(&format!("  Large (64K): ok={}\n", large[0] == 0x66));
+
+    // Free in random order
+    drop(medium1);
+    drop(small2);
+    drop(large);
+    drop(small1);
+    drop(medium2);
+    drop(small3);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: Vec::remove(0) regression test (original bug)
+fn test_vec_remove_regression() -> bool {
+    console::print("\n[TEST] Vec::remove(0) regression\n");
+
+    let mut vec: Vec<u32> = Vec::new();
+    for i in 0..10 {
+        vec.push(i * 100);
+    }
+    console::print(&format!("  Initial vec: {:?}\n", &vec[..3]));
+
+    // This was the original failure case
+    let removed = vec.remove(0);
+    console::print(&format!("  Removed index 0: {}\n", removed));
+
+    let remove_ok = removed == 0;
+    let first_ok = vec[0] == 100;
+    let len_ok = vec.len() == 9;
+
+    console::print(&format!("  New first element: {} (expect 100)\n", vec[0]));
+    console::print(&format!("  New length: {} (expect 9)\n", vec.len()));
+
+    // Remove from middle
+    let mid = vec.remove(4);
+    console::print(&format!("  Removed index 4: {} (expect 500)\n", mid));
+    let mid_ok = mid == 500;
+
+    // Remove from end
+    let end = vec.remove(vec.len() - 1);
+    console::print(&format!("  Removed last: {} (expect 900)\n", end));
+    let end_ok = end == 900;
+
+    drop(vec);
+
+    let ok = remove_ok && first_ok && len_ok && mid_ok && end_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Rapid push/pop cycling
+fn test_rapid_push_pop() -> bool {
+    console::print("\n[TEST] Rapid push/pop cycling\n");
+
+    const ITERATIONS: usize = 5;
+    const ITEMS: usize = 200;
+
+    let mut all_ok = true;
+
+    for iter in 0..ITERATIONS {
+        let mut vec: Vec<u64> = Vec::new();
+
+        // Push many items
+        for i in 0..ITEMS {
+            vec.push((iter * ITEMS + i) as u64);
+        }
+
+        // Verify and pop all
+        for i in (0..ITEMS).rev() {
+            let val = vec.pop().unwrap();
+            if val != (iter * ITEMS + i) as u64 {
+                console::print(&format!("  Mismatch at iter {} index {}\n", iter, i));
+                all_ok = false;
+                break;
+            }
+        }
+
+        if vec.len() != 0 {
+            console::print(&format!("  Vec not empty after iteration {}\n", iter));
+            all_ok = false;
+        }
+    }
+
+    console::print(&format!(
+        "  {} iterations of {} push/pop: {}\n",
+        ITERATIONS, ITEMS, all_ok
+    ));
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: String operations (uses realloc internally)
+fn test_string_operations() -> bool {
+    console::print("\n[TEST] String operations\n");
+
+    let mut s = String::new();
+
+    // Append strings (triggers realloc)
+    s.push_str("Hello");
+    s.push_str(", ");
+    s.push_str("World!");
+    console::print(&format!("  Built string: \"{}\"\n", s));
+
+    let hello_ok = s == "Hello, World!";
+
+    // Longer string building
+    let mut long = String::new();
+    for i in 0..50 {
+        long.push_str(&format!("{} ", i));
+    }
+    console::print(&format!("  Long string len: {}\n", long.len()));
+    let long_ok = long.starts_with("0 1 2 ");
+
+    // Truncate
+    s.truncate(5);
+    console::print(&format!("  Truncated: \"{}\"\n", s));
+    let trunc_ok = s == "Hello";
+
+    // Clear and rebuild
+    s.clear();
+    s.push_str("Rebuilt");
+    let rebuild_ok = s == "Rebuilt";
+
+    drop(s);
+    drop(long);
+
+    let ok = hello_ok && long_ok && trunc_ok && rebuild_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Nested allocations (Vec of Vecs)
+fn test_vec_of_vecs() -> bool {
+    console::print("\n[TEST] Vec of Vecs (nested allocations)\n");
+
+    const OUTER: usize = 10;
+    const INNER: usize = 20;
+
+    let mut outer: Vec<Vec<u8>> = Vec::new();
+
+    // Build nested structure
+    for i in 0..OUTER {
+        let mut inner: Vec<u8> = Vec::new();
+        for j in 0..INNER {
+            inner.push((i * INNER + j) as u8);
+        }
+        outer.push(inner);
+    }
+    console::print(&format!("  Created {}x{} nested vecs\n", OUTER, INNER));
+
+    // Verify data
+    let mut all_ok = true;
+    for i in 0..OUTER {
+        for j in 0..INNER {
+            if outer[i][j] != (i * INNER + j) as u8 {
+                console::print(&format!("  Mismatch at [{i}][{j}]\n"));
+                all_ok = false;
+                break;
+            }
+        }
+        if !all_ok {
+            break;
+        }
+    }
+
+    // Remove some inner vecs
+    outer.remove(5);
+    outer.remove(3);
+    console::print(&format!("  After removals: {} outer vecs\n", outer.len()));
+
+    let len_ok = outer.len() == OUTER - 2;
+
+    // Add new inner vec
+    outer.push(vec![0xAB; 30]);
+    console::print(&format!("  After push: {} outer vecs\n", outer.len()));
+
+    drop(outer);
+
+    let ok = all_ok && len_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Adjacent allocations boundary integrity
+fn test_adjacent_allocations() -> bool {
+    console::print("\n[TEST] Adjacent allocation boundaries\n");
+
+    console::print("  Allocating buf1...");
+    let mut buf1: Box<[u8; 64]> = Box::new([0x11; 64]);
+    console::print(" done\n");
+
+    console::print("  Allocating buf2...");
+    let mut buf2: Box<[u8; 64]> = Box::new([0x22; 64]);
+    console::print(" done\n");
+
+    console::print("  Allocating buf3...");
+    let mut buf3: Box<[u8; 64]> = Box::new([0x33; 64]);
+    console::print(" done\n");
+
+    // Write to boundaries
+    buf1[0] = 0xAA;
+    buf1[63] = 0xBB;
+    buf2[0] = 0xCC;
+    buf2[63] = 0xDD;
+    buf3[0] = 0xEE;
+    buf3[63] = 0xFF;
+
+    // Verify no cross-buffer corruption
+    let mut ok = true;
+
+    // Check buf1 internal bytes unchanged
+    for i in 1..63 {
+        if buf1[i] != 0x11 {
+            console::print(&format!("  buf1[{}] corrupted: 0x{:02X}\n", i, buf1[i]));
+            ok = false;
+            break;
+        }
+    }
+
+    // Check buf2 internal bytes unchanged
+    for i in 1..63 {
+        if buf2[i] != 0x22 {
+            console::print(&format!("  buf2[{}] corrupted: 0x{:02X}\n", i, buf2[i]));
+            ok = false;
+            break;
+        }
+    }
+
+    // Check buf3 internal bytes unchanged
+    for i in 1..63 {
+        if buf3[i] != 0x33 {
+            console::print(&format!("  buf3[{}] corrupted: 0x{:02X}\n", i, buf3[i]));
+            ok = false;
+            break;
+        }
+    }
+
+    // Verify boundary writes correct
+    let bounds_ok = buf1[0] == 0xAA
+        && buf1[63] == 0xBB
+        && buf2[0] == 0xCC
+        && buf2[63] == 0xDD
+        && buf3[0] == 0xEE
+        && buf3[63] == 0xFF;
+
+    console::print(&format!("  Boundaries correct: {}\n", bounds_ok));
+    console::print(&format!("  Internal data intact: {}\n", ok));
+
+    drop(buf1);
+    drop(buf2);
+    drop(buf3);
+
+    let result = ok && bounds_ok;
+    console::print(&format!(
+        "  Result: {}\n",
+        if result { "PASS" } else { "FAIL" }
+    ));
+    result
+}
+
+// ============================================================================
+// Common Memory Allocation Patterns
+// ============================================================================
+
+/// Test: LIFO (stack-like) allocation pattern
+/// Common in: function call stacks, undo buffers, recursive algorithms
+fn test_lifo_pattern() -> bool {
+    console::print("\n[TEST] LIFO allocation pattern\n");
+
+    const DEPTH: usize = 20;
+    let mut stack: Vec<Box<[u8; 128]>> = Vec::with_capacity(DEPTH);
+
+    // Push allocations (simulate nested function calls)
+    for i in 0..DEPTH {
+        let mut block = Box::new([0u8; 128]);
+        block[0] = i as u8;
+        block[127] = (i * 3) as u8;
+        stack.push(block);
+    }
+    console::print(&format!("  Pushed {} allocations\n", DEPTH));
+
+    // Pop in reverse order (LIFO)
+    let mut all_ok = true;
+    for i in (0..DEPTH).rev() {
+        let block = stack.pop().unwrap();
+        if block[0] != i as u8 || block[127] != (i * 3) as u8 {
+            console::print(&format!("  LIFO mismatch at depth {}\n", i));
+            all_ok = false;
+            break;
+        }
+        // Block is dropped here
+    }
+
+    console::print(&format!("  LIFO order verified: {}\n", all_ok));
+
+    // Ensure stack is empty and cleaned up
+    drop(stack);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: FIFO (queue-like) allocation pattern  
+/// Common in: message queues, task schedulers, event handlers
+fn test_fifo_pattern() -> bool {
+    console::print("\n[TEST] FIFO allocation pattern\n");
+
+    const QUEUE_SIZE: usize = 30;
+    let mut queue: VecDeque<Box<[u8; 64]>> = VecDeque::with_capacity(QUEUE_SIZE);
+
+    // Enqueue items
+    for i in 0..QUEUE_SIZE {
+        let mut block = Box::new([0u8; 64]);
+        block[0] = i as u8;
+        block[63] = (i ^ 0xFF) as u8;
+        queue.push_back(block);
+    }
+    console::print(&format!("  Enqueued {} items\n", QUEUE_SIZE));
+
+    // Dequeue in FIFO order
+    let mut all_ok = true;
+    for i in 0..QUEUE_SIZE {
+        let block = queue.pop_front().unwrap();
+        if block[0] != i as u8 || block[63] != (i ^ 0xFF) as u8 {
+            console::print(&format!("  FIFO mismatch at index {}\n", i));
+            all_ok = false;
+            break;
+        }
+        // Block is dropped here
+    }
+
+    console::print(&format!("  FIFO order verified: {}\n", all_ok));
+
+    // Cleanup
+    drop(queue);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: Memory pool pattern
+/// Common in: game engines, real-time systems, network buffers
+fn test_memory_pool_pattern() -> bool {
+    console::print("\n[TEST] Memory pool pattern\n");
+
+    const POOL_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = 256;
+
+    // Pre-allocate pool
+    let mut pool: Vec<Box<[u8; BLOCK_SIZE]>> = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        pool.push(Box::new([0u8; BLOCK_SIZE]));
+    }
+    console::print(&format!(
+        "  Pool created: {} x {} bytes\n",
+        POOL_SIZE, BLOCK_SIZE
+    ));
+
+    // Simulate acquire/release cycles
+    let mut acquired: Vec<Box<[u8; BLOCK_SIZE]>> = Vec::new();
+    let mut all_ok = true;
+
+    for cycle in 0..5 {
+        // Acquire half the pool
+        for i in 0..(POOL_SIZE / 2) {
+            if let Some(mut block) = pool.pop() {
+                block[0] = (cycle * 10 + i) as u8;
+                acquired.push(block);
+            }
+        }
+
+        // Use acquired blocks
+        for (i, block) in acquired.iter().enumerate() {
+            if block[0] != (cycle * 10 + i) as u8 {
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Release back to pool
+        while let Some(block) = acquired.pop() {
+            pool.push(block);
+        }
+    }
+
+    console::print(&format!("  Pool cycles: {} (all ok: {})\n", 5, all_ok));
+    console::print(&format!("  Pool size after: {}\n", pool.len()));
+
+    let size_ok = pool.len() == POOL_SIZE;
+
+    // Cleanup pool
+    drop(pool);
+    drop(acquired);
+
+    let ok = all_ok && size_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Dynamic resize pattern
+/// Common in: growing arrays, string builders, buffers
+fn test_resize_pattern() -> bool {
+    console::print("\n[TEST] Dynamic resize pattern\n");
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut all_ok = true;
+
+    // Exponential growth pattern
+    let sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+    for &size in &sizes {
+        // Resize to new size
+        buffer.resize(size, 0xAB);
+
+        // Verify content
+        for i in 0..size {
+            if buffer[i] != 0xAB {
+                console::print(&format!("  Content mismatch at size {}\n", size));
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Overwrite with pattern
+        for i in 0..size {
+            buffer[i] = (i & 0xFF) as u8;
+        }
+    }
+
+    console::print(&format!(
+        "  Grew through {} sizes (max {})\n",
+        sizes.len(),
+        sizes.last().unwrap()
+    ));
+
+    // Shrink back down
+    for &size in sizes.iter().rev().skip(1) {
+        buffer.truncate(size);
+        if buffer.len() != size {
+            all_ok = false;
+            break;
+        }
+        // Verify data preserved
+        for i in 0..size {
+            if buffer[i] != (i & 0xFF) as u8 {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+
+    console::print(&format!("  Shrink verified: {}\n", all_ok));
+
+    // Clear and cleanup
+    buffer.clear();
+    buffer.shrink_to_fit();
+    drop(buffer);
+
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: Temporary buffer pattern
+/// Common in: I/O operations, parsing, formatting
+fn test_temporary_buffers() -> bool {
+    console::print("\n[TEST] Temporary buffer pattern\n");
+
+    const ITERATIONS: usize = 50;
+    let mut all_ok = true;
+
+    for i in 0..ITERATIONS {
+        // Simulate: allocate temp buffer, use it, free it
+        let size = 64 + (i % 7) * 32; // Varying sizes
+
+        // Allocate
+        let mut temp: Vec<u8> = vec![0u8; size];
+
+        // Use (write pattern)
+        for j in 0..size {
+            temp[j] = ((i + j) & 0xFF) as u8;
+        }
+
+        // Verify
+        for j in 0..size {
+            if temp[j] != ((i + j) & 0xFF) as u8 {
+                console::print(&format!("  Temp buffer {} failed\n", i));
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Free (drop at end of scope)
+        drop(temp);
+    }
+
+    console::print(&format!(
+        "  {} temporary allocations: {}\n",
+        ITERATIONS, all_ok
+    ));
+    console::print(&format!(
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    all_ok
+}
+
+/// Test: Linked/tree structure pattern
+/// Common in: linked lists, trees, graphs
+fn test_linked_structure() -> bool {
+    console::print("\n[TEST] Linked structure pattern\n");
+
+    // Simple linked list node
+    struct Node {
+        value: u32,
+        next: Option<Box<Node>>,
+    }
+
+    // Build linked list
+    const LIST_SIZE: usize = 20;
+    let mut head: Option<Box<Node>> = None;
+
+    for i in (0..LIST_SIZE).rev() {
+        head = Some(Box::new(Node {
+            value: i as u32,
+            next: head,
+        }));
+    }
+    console::print(&format!("  Built linked list of {} nodes\n", LIST_SIZE));
+
+    // Traverse and verify
+    let mut all_ok = true;
+    let mut current = &head;
+    let mut count = 0;
+
+    while let Some(node) = current {
+        if node.value != count {
+            console::print(&format!(
+                "  Node {} has wrong value {}\n",
+                count, node.value
+            ));
+            all_ok = false;
+            break;
+        }
+        current = &node.next;
+        count += 1;
+    }
+
+    let count_ok = count == LIST_SIZE as u32;
+    console::print(&format!(
+        "  Traversed {} nodes (expect {})\n",
+        count, LIST_SIZE
+    ));
+
+    // Cleanup: drop the entire list (recursive drops)
+    drop(head);
+    console::print("  List dropped (recursive cleanup)\n");
+
+    let ok = all_ok && count_ok;
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
     ok
 }
@@ -366,7 +1397,7 @@ fn test_spawn_and_cleanup() -> bool {
 
     // Spawn thread
     console::print("  Spawning...");
-    let tid = match threading::spawn(test_thread_terminates) {
+    let _tid = match threading::spawn(test_thread_terminates) {
         Ok(t) => {
             console::print(&format!(" tid={}\n", t));
             t
