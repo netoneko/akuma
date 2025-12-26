@@ -1,6 +1,12 @@
 // Network stack with TCP netcat-like server
 // Uses smoltcp for TCP/IP and virtio-net for the network device
+//
+// This version uses safe Rust with Box allocations instead of static mut
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cell::RefCell;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
@@ -19,49 +25,114 @@ use crate::virtio_hal::VirtioHal;
 // ============================================================================
 
 const LISTEN_PORT: u16 = 23; // Telnet port, forwarded from host 2323
+const VIRTIO_BUFFER_SIZE: usize = 2048;
+const TCP_BUFFER_SIZE: usize = 4096;
 
 // ============================================================================
-// Static Buffers (required for smoltcp and virtio)
+// Statistics (protected by spinlock)
 // ============================================================================
 
-// Virtio DMA buffers
-static mut VIRTIO_RX_BUFFER: [u8; 2048] = [0; 2048];
-static mut VIRTIO_TX_BUFFER: [u8; 2048] = [0; 2048];
-
-// smoltcp socket buffers
-static mut TCP_RX_DATA: [u8; 4096] = [0; 4096];
-static mut TCP_TX_DATA: [u8; 4096] = [0; 4096];
-
-// smoltcp socket storage
-static mut SOCKET_STORAGE: [SocketStorage<'static>; 2] = [SocketStorage::EMPTY; 2];
-
-// ============================================================================
-// Global State
-// ============================================================================
-
-struct NetStack {
-    device: VirtioNetDevice,
-    iface: Interface,
-    sockets: SocketSet<'static>,
-    tcp_handle: smoltcp::iface::SocketHandle,
-    rx_pending: bool,
-    rx_token: u16,
+struct NetStats {
+    bytes_rx: u64,
+    bytes_tx: u64,
+    connections: u64,
 }
 
-static NET_STACK: Spinlock<Option<NetStack>> = Spinlock::new(None);
-static NET_INITIALIZED: Spinlock<bool> = Spinlock::new(false);
+impl NetStats {
+    const fn new() -> Self {
+        Self {
+            bytes_rx: 0,
+            bytes_tx: 0,
+            connections: 0,
+        }
+    }
+}
+
+static NET_STATS: Spinlock<NetStats> = Spinlock::new(NetStats::new());
 
 // ============================================================================
 // Virtio Network Device
 // ============================================================================
 
+/// Holds RX data after receiving, separate from the device to allow split borrows
+struct RxData {
+    buffer: Box<[u8; VIRTIO_BUFFER_SIZE]>,
+    offset: usize,
+    len: usize,
+    valid: bool,
+}
+
+impl RxData {
+    fn new() -> Self {
+        Self {
+            buffer: Box::new([0u8; VIRTIO_BUFFER_SIZE]),
+            offset: 0,
+            len: 0,
+            valid: false,
+        }
+    }
+}
+
 pub struct VirtioNetDevice {
     inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    tx_buffer: Box<[u8; VIRTIO_BUFFER_SIZE]>,
+    rx_pending_token: Option<u16>,
+    // RX data is in a RefCell to allow interior mutability for split borrows
+    rx_data: RefCell<RxData>,
 }
 
 impl VirtioNetDevice {
     fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            tx_buffer: Box::new([0u8; VIRTIO_BUFFER_SIZE]),
+            rx_pending_token: None,
+            rx_data: RefCell::new(RxData::new()),
+        }
+    }
+    
+    /// Try to receive a packet, returning true if one is available
+    fn try_receive(&mut self) -> bool {
+        let mut rx = self.rx_data.borrow_mut();
+        
+        // Check if we have a pending receive
+        if let Some(token) = self.rx_pending_token {
+            if self.inner.poll_receive().is_some() {
+                self.rx_pending_token = None;
+                // SAFETY: receive_complete requires the buffer passed to receive_begin
+                match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
+                    Ok((hdr_len, data_len)) => {
+                        rx.offset = hdr_len;
+                        rx.len = data_len;
+                        rx.valid = true;
+                        return true;
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else {
+            // Start a new receive
+            // SAFETY: receive_begin requires a buffer to store incoming data
+            match unsafe { self.inner.receive_begin(&mut rx.buffer[..]) } {
+                Ok(token) => {
+                    self.rx_pending_token = Some(token);
+                    if self.inner.poll_receive().is_some() {
+                        self.rx_pending_token = None;
+                        match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
+                            Ok((hdr_len, data_len)) => {
+                                rx.offset = hdr_len;
+                                rx.len = data_len;
+                                rx.valid = true;
+                                return true;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        false
     }
 }
 
@@ -69,24 +140,28 @@ impl VirtioNetDevice {
 // smoltcp Device Implementation
 // ============================================================================
 
-pub struct VirtioRxToken {
-    offset: usize,  // Start of actual Ethernet data (after virtio header)
-    len: usize,     // Length of Ethernet frame (not including virtio header)
+/// RxToken borrows the device's rx_data via RefCell
+pub struct VirtioRxToken<'a> {
+    device: &'a VirtioNetDevice,
 }
 
+/// TxToken holds a mutable reference to the device for sending
 pub struct VirtioTxToken<'a> {
     device: &'a mut VirtioNetDevice,
 }
 
-impl RxToken for VirtioRxToken {
+impl<'a> RxToken for VirtioRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        unsafe {
-            // Pass only the Ethernet frame (skip virtio header)
-            f(&mut VIRTIO_RX_BUFFER[self.offset..self.offset + self.len])
-        }
+        let mut rx = self.device.rx_data.borrow_mut();
+        let offset = rx.offset;
+        let len = rx.len;
+        let data = &mut rx.buffer[offset..offset + len];
+        let result = f(data);
+        rx.valid = false;
+        result
     }
 }
 
@@ -95,62 +170,28 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        unsafe {
-            let result = f(&mut VIRTIO_TX_BUFFER[..len]);
-            let _ = self.device.inner.send(&VIRTIO_TX_BUFFER[..len]);
-            result
-        }
+        let result = f(&mut self.device.tx_buffer[..len]);
+        let _ = self.device.inner.send(&self.device.tx_buffer[..len]);
+        result
     }
 }
 
-// Pending receive state
-static mut RX_PENDING_TOKEN: Option<u16> = None;
-
 impl Device for VirtioNetDevice {
-    type RxToken<'a> = VirtioRxToken where Self: 'a;
+    type RxToken<'a> = VirtioRxToken<'a> where Self: 'a;
     type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        unsafe {
-            let buf = &mut VIRTIO_RX_BUFFER[..];
-            
-            // Check if we have a pending receive
-            if let Some(token) = RX_PENDING_TOKEN {
-                // Check if it's ready
-                if self.inner.poll_receive().is_some() {
-                    RX_PENDING_TOKEN = None;
-                    match self.inner.receive_complete(token, buf) {
-                        Ok((hdr_len, data_len)) => {
-                            return Some((
-                                VirtioRxToken { offset: hdr_len, len: data_len },
-                                VirtioTxToken { device: self },
-                            ));
-                        }
-                        Err(_) => {}
-                    }
-                }
-            } else {
-                // Start a new receive
-                match self.inner.receive_begin(buf) {
-                    Ok(token) => {
-                        RX_PENDING_TOKEN = Some(token);
-                        // Check if immediately ready
-                        if self.inner.poll_receive().is_some() {
-                            RX_PENDING_TOKEN = None;
-                            match self.inner.receive_complete(token, buf) {
-                                Ok((hdr_len, data_len)) => {
-                                    return Some((
-                                        VirtioRxToken { offset: hdr_len, len: data_len },
-                                        VirtioTxToken { device: self },
-                                    ));
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
+        if self.try_receive() {
+            // We need to split self into rx and tx parts
+            // RxToken uses &self (immutable, accesses rx_data via RefCell)
+            // TxToken uses &mut self (for tx_buffer and inner.send)
+            // This is sound because RxToken only accesses rx_data through RefCell
+            let self_ptr = self as *mut Self;
+            Some((
+                VirtioRxToken { device: unsafe { &*self_ptr } },
+                VirtioTxToken { device: unsafe { &mut *self_ptr } },
+            ))
+        } else {
             None
         }
     }
@@ -166,6 +207,25 @@ impl Device for VirtioNetDevice {
         caps
     }
 }
+
+// ============================================================================
+// Network Stack State
+// ============================================================================
+
+struct NetStack {
+    device: VirtioNetDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    was_connected: bool,
+    // These keep the heap-allocated buffers alive
+    _tcp_rx_buf: Box<[u8]>,
+    _tcp_tx_buf: Box<[u8]>,
+    _socket_storage: Box<[SocketStorage<'static>]>,
+}
+
+static NET_STACK: Spinlock<Option<NetStack>> = Spinlock::new(None);
+static NET_INITIALIZED: Spinlock<bool> = Spinlock::new(false);
 
 // ============================================================================
 // Logging Helper
@@ -189,50 +249,47 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
     log("[Net] Initializing network stack...\n");
 
     // Find virtio-net device
-    let mut device: Option<VirtioNetDevice> = None;
+    let mut found_device: Option<VirtioNetDevice> = None;
     let mut mac = [0u8; 6];
 
     for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
-        unsafe {
-            // Check device ID (1 = network device)
-            let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
-            if device_id != 1 {
+        // SAFETY: Reading from MMIO registers at known QEMU virt machine addresses
+        let device_id = unsafe { core::ptr::read_volatile((addr + 0x008) as *const u32) };
+        if device_id != 1 {
+            continue;
+        }
+
+        log("[Net] Found virtio-net at slot ");
+        console::print(&alloc::format!("{}\n", i));
+
+        let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // SAFETY: Creating MmioTransport for verified virtio device
+        let transport = match unsafe { MmioTransport::new(header_ptr) } {
+            Ok(t) => t,
+            Err(_) => {
+                log("[Net] Failed to create transport\n");
                 continue;
             }
+        };
 
-            log("[Net] Found virtio-net at slot ");
-            console::print(&alloc::format!("{}\n", i));
+        let net = match VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport) {
+            Ok(n) => n,
+            Err(_) => {
+                log("[Net] Failed to init virtio device\n");
+                continue;
+            }
+        };
 
-            // Create MMIO transport
-            let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let transport = match MmioTransport::new(header_ptr) {
-                Ok(t) => t,
-                Err(_) => {
-                    log("[Net] Failed to create transport\n");
-                    continue;
-                }
-            };
-
-            // Initialize VirtIO network device
-            let net = match VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport) {
-                Ok(n) => n,
-                Err(_) => {
-                    log("[Net] Failed to init virtio device\n");
-                    continue;
-                }
-            };
-
-            mac = net.mac_address();
-            device = Some(VirtioNetDevice::new(net));
-            break;
-        }
+        mac = net.mac_address();
+        found_device = Some(VirtioNetDevice::new(net));
+        break;
     }
 
-    let mut device = device.ok_or("No virtio-net device found")?;
+    let mut device = found_device.ok_or("No virtio-net device found")?;
 
     // Log MAC address
     log("[Net] MAC: ");
@@ -260,17 +317,37 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
 
     log("[Net] IP: 10.0.2.15/24, Gateway: 10.0.2.2\n");
 
-    // Create TCP socket with static buffers
-    let tcp_socket = unsafe {
-        let tcp_rx_buffer = TcpSocketBuffer::new(&mut TCP_RX_DATA[..]);
-        let tcp_tx_buffer = TcpSocketBuffer::new(&mut TCP_TX_DATA[..]);
-        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
+    // Allocate TCP socket buffers on the heap
+    let tcp_rx_buf: Box<[u8]> = vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
+    let tcp_tx_buf: Box<[u8]> = vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
+    
+    // SAFETY: Creating 'static references from heap memory that lives in NetStack
+    let tcp_rx_ref: &'static mut [u8] = unsafe { 
+        core::slice::from_raw_parts_mut(tcp_rx_buf.as_ptr() as *mut u8, tcp_rx_buf.len())
+    };
+    let tcp_tx_ref: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(tcp_tx_buf.as_ptr() as *mut u8, tcp_tx_buf.len())
     };
 
-    // Create socket set with static storage
-    let mut sockets = unsafe {
-        SocketSet::new(&mut SOCKET_STORAGE[..])
+    let tcp_rx_buffer = TcpSocketBuffer::new(tcp_rx_ref);
+    let tcp_tx_buffer = TcpSocketBuffer::new(tcp_tx_ref);
+    let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+
+    // Allocate socket storage on heap (can't use vec![x; n] since SocketStorage isn't Clone)
+    let mut storage_vec: Vec<SocketStorage<'static>> = Vec::with_capacity(2);
+    storage_vec.push(SocketStorage::EMPTY);
+    storage_vec.push(SocketStorage::EMPTY);
+    let socket_storage: Box<[SocketStorage<'static>]> = storage_vec.into_boxed_slice();
+    
+    // SAFETY: Creating 'static reference from heap memory that lives in NetStack
+    let storage_ref: &'static mut [SocketStorage<'static>] = unsafe {
+        core::slice::from_raw_parts_mut(
+            socket_storage.as_ptr() as *mut SocketStorage<'static>,
+            socket_storage.len()
+        )
     };
+
+    let mut sockets = SocketSet::new(storage_ref);
     let tcp_handle = sockets.add(tcp_socket);
 
     // Start listening
@@ -290,8 +367,10 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
             iface,
             sockets,
             tcp_handle,
-            rx_pending: false,
-            rx_token: 0,
+            was_connected: false,
+            _tcp_rx_buf: tcp_rx_buf,
+            _tcp_tx_buf: tcp_tx_buf,
+            _socket_storage: socket_storage,
         });
     }
     
@@ -314,11 +393,6 @@ fn get_time() -> Instant {
 // Network Polling & TCP Handler
 // ============================================================================
 
-static mut BYTES_RX: u64 = 0;
-static mut BYTES_TX: u64 = 0;
-static mut CONNECTIONS: u64 = 0;
-static mut WAS_CONNECTED: bool = false;
-
 /// Poll the network stack - call this regularly from a thread
 /// Returns true if there was activity
 pub fn poll() -> bool {
@@ -337,23 +411,16 @@ pub fn poll() -> bool {
     let socket = stack.sockets.get_mut::<TcpSocket>(stack.tcp_handle);
     
     // Check for new connection
-    if socket.state() == TcpState::Established {
-        unsafe {
-            if !WAS_CONNECTED {
-                WAS_CONNECTED = true;
-                CONNECTIONS += 1;
-                // Release lock before printing
-                drop(stack_guard);
-                log("\n[Net] *** Client connected! ***\n");
-                log("[Net] Type something and press Enter (echo server)\n");
-                log("[Net] Type 'quit' to disconnect\n\n");
-                return true;
-            }
-        }
+    if socket.state() == TcpState::Established && !stack.was_connected {
+        stack.was_connected = true;
+        NET_STATS.lock().connections += 1;
+        drop(stack_guard);
+        log("\n[Net] *** Client connected! ***\n");
+        log("[Net] Type something and press Enter (echo server)\n");
+        log("[Net] Type 'quit' to disconnect\n\n");
+        return true;
     } else if socket.state() == TcpState::Listen || socket.state() == TcpState::Closed {
-        unsafe {
-            WAS_CONNECTED = false;
-        }
+        stack.was_connected = false;
     }
 
     // Echo any received data back
@@ -361,7 +428,7 @@ pub fn poll() -> bool {
         let mut buf = [0u8; 512];
         match socket.recv_slice(&mut buf) {
             Ok(len) if len > 0 => {
-                unsafe { BYTES_RX += len as u64; }
+                NET_STATS.lock().bytes_rx += len as u64;
                 
                 // Check for 'quit' command
                 let data = &buf[..len];
@@ -377,7 +444,7 @@ pub fn poll() -> bool {
                 if socket.can_send() {
                     let _ = socket.send_slice(b"echo: ");
                     let _ = socket.send_slice(&buf[..len]);
-                    unsafe { BYTES_TX += (6 + len) as u64; }
+                    NET_STATS.lock().bytes_tx += (6 + len) as u64;
                 }
                 return true;
             }
@@ -393,25 +460,14 @@ pub fn poll() -> bool {
     activity
 }
 
-/// Thread entry point for network server
-#[unsafe(no_mangle)]
-pub extern "C" fn netcat_server_entry() -> ! {
-    log("[Net] Netcat server thread started\n");
-    
-    loop {
-        poll();
-        // Yield to other threads
-        crate::threading::yield_now();
-    }
-}
-
 // ============================================================================
 // Public API
 // ============================================================================
 
-/// Run the network handler in a loop (call from a dedicated thread)
-pub fn run_netcat_server() {
-    log("[Net] Starting netcat echo server...\n");
+/// Thread entry point for network server (must be extern "C" fn() -> ! for threading)
+#[unsafe(no_mangle)]
+pub extern "C" fn netcat_server_entry() -> ! {
+    log("[Net] Netcat server thread started\n");
     
     loop {
         poll();
@@ -421,15 +477,11 @@ pub fn run_netcat_server() {
 
 /// Print network statistics
 pub fn stats() {
-    unsafe {
-        let connections = core::ptr::read_volatile(core::ptr::addr_of!(CONNECTIONS));
-        let bytes_rx = core::ptr::read_volatile(core::ptr::addr_of!(BYTES_RX));
-        let bytes_tx = core::ptr::read_volatile(core::ptr::addr_of!(BYTES_TX));
-        log(&alloc::format!(
-            "[Net] Stats: {} connections, {} bytes RX, {} bytes TX\n",
-            connections, bytes_rx, bytes_tx
-        ));
-    }
+    let s = NET_STATS.lock();
+    log(&alloc::format!(
+        "[Net] Stats: {} connections, {} bytes RX, {} bytes TX\n",
+        s.connections, s.bytes_rx, s.bytes_tx
+    ));
 }
 
 /// Check if network is initialized

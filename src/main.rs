@@ -20,6 +20,16 @@ use alloc::string::ToString;
 
 use core::panic::PanicInfo;
 
+/// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
+#[inline]
+fn halt() -> ! {
+    loop {
+        // SAFETY: wfi just puts CPU in low-power state until next interrupt.
+        // It has no memory safety implications.
+        unsafe { core::arch::asm!("wfi") }
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     console::print("\n\n!!! PANIC !!!\n");
@@ -32,11 +42,17 @@ fn panic(info: &PanicInfo) -> ! {
     }
     console::print("Message: ");
     console::print(&alloc::format!("{}\n", info.message()));
-    loop {}
+    halt()
 }
 
+/// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
+    kernel_main()
+}
+
+/// Main kernel initialization - all safe code
+fn kernel_main() -> ! {
     const RAM_BASE: usize = 0x40000000;
 
     // DTB pointer workaround: QEMU with -device loader puts DTB at 0x44000000
@@ -66,14 +82,14 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
         ram_size - code_and_stack
     } else {
         console::print("Not enough RAM for heap\n");
-        loop {}
+        halt();
     };
 
     if let Err(e) = allocator::init(heap_start, heap_size) {
         console::print("Allocator init failed: ");
         console::print(e);
         console::print("\n");
-        loop {}
+        halt();
     }
 
     console::print("Heap initialized: ");
@@ -140,11 +156,7 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     // Run system tests (includes allocator tests)
     if !tests::run_all() {
         console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
-        loop {
-            unsafe {
-                core::arch::asm!("wfi");
-            }
-        }
+        halt();
     }
 
     // =========================================================================
