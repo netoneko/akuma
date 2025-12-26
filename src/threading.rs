@@ -2,7 +2,9 @@
 // No dynamic allocation during spawn/cleanup - all memory pre-allocated at init
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 
 /// Default timeout for cooperative threads in microseconds (5 seconds)
@@ -232,20 +234,17 @@ impl ThreadPool {
 
     /// Initialize the pool - allocate all stacks upfront
     pub fn init(&mut self) {
-        use alloc::alloc::{Layout, alloc_zeroed};
-
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
         self.stacks[IDLE_THREAD_IDX] = 0; // Boot stack, don't allocate
 
-        // Pre-allocate stacks for all other slots
-        let layout = Layout::from_size_align(STACK_SIZE, 16).unwrap();
+        // Pre-allocate stacks for all other slots using Vec
         for i in 1..MAX_THREADS {
-            let stack = unsafe { alloc_zeroed(layout) as usize };
-            if stack == 0 {
-                panic!("Failed to allocate thread stack {}", i);
-            }
-            self.stacks[i] = stack;
+            // Create a zeroed Vec for the stack, then leak it to get a stable pointer
+            let stack_vec: Vec<u8> = alloc::vec![0u8; STACK_SIZE];
+            let stack_box = stack_vec.into_boxed_slice();
+            let stack_ptr = Box::into_raw(stack_box) as *mut u8;
+            self.stacks[i] = stack_ptr as usize;
         }
 
         self.initialized = true;
@@ -473,7 +472,7 @@ impl ThreadPool {
 }
 
 static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
-static mut VOLUNTARY_SCHEDULE: bool = false;
+static VOLUNTARY_SCHEDULE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the thread pool
 pub fn init() {
@@ -569,10 +568,7 @@ where
 pub fn sgi_scheduler_handler(irq: u32) {
     crate::gic::end_of_interrupt(irq);
 
-    let voluntary = unsafe { VOLUNTARY_SCHEDULE };
-    unsafe {
-        VOLUNTARY_SCHEDULE = false;
-    }
+    let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
 
     let (switch_info, pool_ptr) = {
         let mut pool = POOL.lock();
@@ -591,9 +587,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
 
 /// Yield to another thread
 pub fn yield_now() {
-    unsafe {
-        VOLUNTARY_SCHEDULE = true;
-    }
+    VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 

@@ -1,6 +1,7 @@
 use alloc::string::String;
 use arm_pl031::Rtc;
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
 // Manual tick counter (u64)
@@ -29,13 +30,11 @@ pub fn init() {
 
 // Enable timer interrupts for preemptive scheduling
 // Store configured interval for use in handler
-static mut TIMER_INTERVAL_US: u64 = 10_000; // Default 10ms
+static TIMER_INTERVAL_US: AtomicU64 = AtomicU64::new(10_000); // Default 10ms
 
 // interval_us: interval in microseconds between interrupts
 pub fn enable_timer_interrupts(interval_us: u64) {
-    unsafe {
-        TIMER_INTERVAL_US = interval_us;
-    }
+    TIMER_INTERVAL_US.store(interval_us, Ordering::Relaxed);
 
     let freq = read_frequency();
     let ticks = (freq * interval_us) / 1_000_000;
@@ -53,7 +52,7 @@ pub fn enable_timer_interrupts(interval_us: u64) {
 pub fn timer_irq_handler(_irq: u32) {
     // Acknowledge interrupt by setting next compare value
     let freq = read_frequency();
-    let interval_us = unsafe { TIMER_INTERVAL_US };
+    let interval_us = TIMER_INTERVAL_US.load(Ordering::Relaxed);
     let interval_ticks = (freq * interval_us) / 1_000_000;
 
     unsafe {

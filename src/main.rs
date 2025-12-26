@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod akuma;
 mod allocator;
 mod boot;
 mod console;

@@ -16,6 +16,7 @@ use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
+use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::timer;
 use crate::virtio_hal::VirtioHal;
@@ -218,10 +219,7 @@ struct NetStack {
     sockets: SocketSet<'static>,
     tcp_handle: smoltcp::iface::SocketHandle,
     was_connected: bool,
-    // These keep the heap-allocated buffers alive
-    _tcp_rx_buf: Box<[u8]>,
-    _tcp_tx_buf: Box<[u8]>,
-    _socket_storage: Box<[SocketStorage<'static>]>,
+    // Note: TCP buffers and socket storage are leaked via Box::leak() for 'static lifetime
 }
 
 static NET_STACK: Spinlock<Option<NetStack>> = Spinlock::new(None);
@@ -317,35 +315,27 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
 
     log("[Net] IP: 10.0.2.15/24, Gateway: 10.0.2.2\n");
 
-    // Allocate TCP socket buffers on the heap
+    // Allocate TCP socket buffers on the heap and leak them for 'static lifetime
+    // These live for the lifetime of the kernel - no deallocation needed
     let tcp_rx_buf: Box<[u8]> = vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
     let tcp_tx_buf: Box<[u8]> = vec![0u8; TCP_BUFFER_SIZE].into_boxed_slice();
     
-    // SAFETY: Creating 'static references from heap memory that lives in NetStack
-    let tcp_rx_ref: &'static mut [u8] = unsafe { 
-        core::slice::from_raw_parts_mut(tcp_rx_buf.as_ptr() as *mut u8, tcp_rx_buf.len())
-    };
-    let tcp_tx_ref: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(tcp_tx_buf.as_ptr() as *mut u8, tcp_tx_buf.len())
-    };
+    // Box::leak gives us 'static references - safe because these are never deallocated
+    let tcp_rx_ref: &'static mut [u8] = Box::leak(tcp_rx_buf);
+    let tcp_tx_ref: &'static mut [u8] = Box::leak(tcp_tx_buf);
 
     let tcp_rx_buffer = TcpSocketBuffer::new(tcp_rx_ref);
     let tcp_tx_buffer = TcpSocketBuffer::new(tcp_tx_ref);
     let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
 
-    // Allocate socket storage on heap (can't use vec![x; n] since SocketStorage isn't Clone)
+    // Allocate socket storage on heap and leak for 'static lifetime
     let mut storage_vec: Vec<SocketStorage<'static>> = Vec::with_capacity(2);
     storage_vec.push(SocketStorage::EMPTY);
     storage_vec.push(SocketStorage::EMPTY);
     let socket_storage: Box<[SocketStorage<'static>]> = storage_vec.into_boxed_slice();
     
-    // SAFETY: Creating 'static reference from heap memory that lives in NetStack
-    let storage_ref: &'static mut [SocketStorage<'static>] = unsafe {
-        core::slice::from_raw_parts_mut(
-            socket_storage.as_ptr() as *mut SocketStorage<'static>,
-            socket_storage.len()
-        )
-    };
+    // Box::leak gives us 'static reference - safe because this is never deallocated
+    let storage_ref: &'static mut [SocketStorage<'static>] = Box::leak(socket_storage);
 
     let mut sockets = SocketSet::new(storage_ref);
     let tcp_handle = sockets.add(tcp_socket);
@@ -368,9 +358,6 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
             sockets,
             tcp_handle,
             was_connected: false,
-            _tcp_rx_buf: tcp_rx_buf,
-            _tcp_tx_buf: tcp_tx_buf,
-            _socket_storage: socket_storage,
         });
     }
     
@@ -437,6 +424,12 @@ pub fn poll() -> bool {
                     socket.close();
                     drop(stack_guard);
                     log("[Net] Client disconnected (quit)\n");
+                    return true;
+                }
+
+                if len >= 3 && data.starts_with(b"cat") {
+                    let _ = socket.send_slice(AKUMA_79);
+                    NET_STATS.lock().bytes_tx += (AKUMA_79.len() as u64);
                     return true;
                 }
 
