@@ -13,6 +13,7 @@ mod executor;
 mod gic;
 mod irq;
 mod network;
+mod ssh;
 mod tests;
 mod threading;
 mod timer;
@@ -169,12 +170,28 @@ fn kernel_main() -> ! {
         Ok(()) => {
             console::print("[Net] Network initialized successfully\n");
             console::print("[Net] Starting network server thread...\n");
-            
-            // Spawn network handler thread
+
+            // Spawn network handler thread (telnet)
             match threading::spawn_fn(network::netcat_server_entry) {
-                Ok(tid) => console::print(&alloc::format!("[Net] Server thread started (tid={})\n", tid)),
+                Ok(tid) => console::print(&alloc::format!(
+                    "[Net] Telnet server thread started (tid={})\n",
+                    tid
+                )),
                 Err(e) => {
-                    console::print("[Net] Failed to spawn server thread: ");
+                    console::print("[Net] Failed to spawn telnet server thread: ");
+                    console::print(e);
+                    console::print("\n");
+                }
+            }
+
+            // Spawn SSH server thread
+            match threading::spawn_fn(ssh::ssh_server_entry) {
+                Ok(tid) => console::print(&alloc::format!(
+                    "[SSH] SSH server thread started (tid={})\n",
+                    tid
+                )),
+                Err(e) => {
+                    console::print("[SSH] Failed to spawn SSH server thread: ");
                     console::print(e);
                     console::print("\n");
                 }

@@ -440,10 +440,10 @@ fn test_fragmentation_small_blocks() -> bool {
     // Simplified test - just do a few allocations without tight loops
     let block1 = vec![0x11u8; 32];
     console::print("  Block 1 allocated\n");
-    
+
     let block2 = vec![0x22u8; 32];
     console::print("  Block 2 allocated\n");
-    
+
     let block3 = vec![0x33u8; 32];
     console::print("  Block 3 allocated\n");
 
@@ -751,20 +751,23 @@ fn test_adjacent_allocations() -> bool {
 
     // Simple test without format! to rule out format allocation issues
     console::print("  Testing simple allocations\n");
-    
+
     let buf1: Vec<u8> = vec![0x11u8; 64];
     console::print("  buf1 ok\n");
-    
+
     let buf2: Vec<u8> = vec![0x22u8; 64];
     console::print("  buf2 ok\n");
-    
+
     let buf3: Vec<u8> = vec![0x33u8; 64];
     console::print("  buf3 ok\n");
 
     // Verify data is correct
-    let ok = buf1[0] == 0x11 && buf1[63] == 0x11
-        && buf2[0] == 0x22 && buf2[63] == 0x22
-        && buf3[0] == 0x33 && buf3[63] == 0x33;
+    let ok = buf1[0] == 0x11
+        && buf1[63] == 0x11
+        && buf2[0] == 0x22
+        && buf2[63] == 0x22
+        && buf3[0] == 0x33
+        && buf3[63] == 0x33;
 
     // Cleanup
     drop(buf1);
@@ -857,7 +860,7 @@ fn test_fifo_pattern() -> bool {
     if all_ok {
         console::print("  FIFO order verified\n");
     }
-    
+
     drop(queue);
 
     if all_ok {

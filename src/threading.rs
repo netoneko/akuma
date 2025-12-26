@@ -511,7 +511,7 @@ fn closure_trampoline<F: FnOnce() -> ! + Send + 'static>(closure_ptr: *mut ()) -
 }
 
 /// Spawn a new preemptible thread with a Rust closure
-/// 
+///
 /// # Example
 /// ```
 /// spawn_fn(|| {
@@ -544,7 +544,7 @@ where
     // Box the closure and get a raw pointer
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
-    
+
     // Get the trampoline function for this specific closure type
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 

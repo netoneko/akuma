@@ -10,7 +10,7 @@ runner = """qemu-system-aarch64 \
   -m 128M \
   -nographic \
   -serial mon:stdio \
-  -netdev user,id=net0,hostfwd=tcp::2323-:23 \
+  -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22 \
   -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
   -kernel"""
