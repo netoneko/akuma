@@ -382,7 +382,7 @@ async fn handle_shell_input(
                 send_channel_data(stream, session, b"\r\n").await?;
 
                 if !line.is_empty() {
-                    let response = shell::execute_command(&line);
+                    let response = shell::execute_command(&line).await;
                     if !response.is_empty() {
                         send_channel_data(stream, session, &response).await?;
                     }
@@ -584,7 +584,7 @@ async fn handle_message(
                             "[SSH] Exec command: {:?}\n",
                             core::str::from_utf8(cmd_bytes)
                         ));
-                        let response = shell::execute_command(cmd_bytes);
+                        let response = shell::execute_command(cmd_bytes).await;
                         if !response.is_empty() {
                             send_channel_data(stream, session, &response).await?;
                         }

@@ -1,11 +1,12 @@
-//! Shell Command Handler
+//! Shell Command Handler (Async)
 //!
-//! Provides command execution for the SSH shell.
+//! Provides async command execution for the SSH shell.
 //! Commands include basic utilities and filesystem operations.
 
 use alloc::vec::Vec;
 
 use crate::akuma::AKUMA_79;
+use crate::async_fs;
 use crate::network;
 use crate::ssh_crypto::{split_first_word, trim_bytes};
 
@@ -14,7 +15,7 @@ use crate::ssh_crypto::{split_first_word, trim_bytes};
 // ============================================================================
 
 /// Execute a shell command and return the response
-pub fn execute_command(line: &[u8]) -> Vec<u8> {
+pub async fn execute_command(line: &[u8]) -> Vec<u8> {
     let line = trim_bytes(line);
     if line.is_empty() {
         return Vec::new();
@@ -29,13 +30,13 @@ pub fn execute_command(line: &[u8]) -> Vec<u8> {
         b"quit" | b"exit" => cmd_quit(&mut response),
         b"stats" => cmd_stats(&mut response),
         b"free" | b"mem" => cmd_free(&mut response),
-        b"ls" | b"dir" => cmd_ls(args, &mut response),
-        b"cat" | b"read" => cmd_cat(args, &mut response),
-        b"write" => cmd_write(args, &mut response),
-        b"append" => cmd_append(args, &mut response),
-        b"rm" | b"del" => cmd_rm(args, &mut response),
-        b"mkdir" => cmd_mkdir(args, &mut response),
-        b"df" | b"diskfree" => cmd_df(&mut response),
+        b"ls" | b"dir" => cmd_ls(args, &mut response).await,
+        b"cat" | b"read" => cmd_cat(args, &mut response).await,
+        b"write" => cmd_write(args, &mut response).await,
+        b"append" => cmd_append(args, &mut response).await,
+        b"rm" | b"del" => cmd_rm(args, &mut response).await,
+        b"mkdir" => cmd_mkdir(args, &mut response).await,
+        b"df" | b"diskfree" => cmd_df(&mut response).await,
         b"help" => cmd_help(&mut response),
         _ => {
             response.extend_from_slice(b"Unknown command: ");
@@ -55,7 +56,7 @@ pub fn is_quit_command(line: &[u8]) -> bool {
 }
 
 // ============================================================================
-// Individual Commands
+// Individual Commands (Sync)
 // ============================================================================
 
 fn cmd_echo(args: &[u8], response: &mut Vec<u8>) {
@@ -131,7 +132,29 @@ fn cmd_free(response: &mut Vec<u8>) {
     response.extend_from_slice(info.as_bytes());
 }
 
-fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
+fn cmd_help(response: &mut Vec<u8>) {
+    response.extend_from_slice(b"Available commands:\r\n");
+    response.extend_from_slice(b"  echo <text>           - Echo back text\r\n");
+    response.extend_from_slice(b"  akuma                 - Display ASCII art\r\n");
+    response.extend_from_slice(b"  stats                 - Show network statistics\r\n");
+    response.extend_from_slice(b"  free                  - Show memory usage\r\n");
+    response.extend_from_slice(b"\r\nFilesystem commands:\r\n");
+    response.extend_from_slice(b"  ls [path]             - List directory contents\r\n");
+    response.extend_from_slice(b"  cat <file>            - Display file contents\r\n");
+    response.extend_from_slice(b"  write <file> <text>   - Write text to file\r\n");
+    response.extend_from_slice(b"  append <file> <text>  - Append text to file\r\n");
+    response.extend_from_slice(b"  rm <file>             - Remove file\r\n");
+    response.extend_from_slice(b"  mkdir <dir>           - Create directory\r\n");
+    response.extend_from_slice(b"  df                    - Show disk usage\r\n");
+    response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
+    response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
+}
+
+// ============================================================================
+// Individual Commands (Async - Filesystem)
+// ============================================================================
+
+async fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
     let path = if args.is_empty() {
         "/"
     } else {
@@ -143,7 +166,7 @@ fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
         return;
     }
 
-    match crate::fs::list_dir(path) {
+    match async_fs::list_dir(path).await {
         Ok(entries) => {
             if entries.is_empty() {
                 // Nothing to show (empty directory)
@@ -185,7 +208,7 @@ fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_cat(args: &[u8], response: &mut Vec<u8>) {
+async fn cmd_cat(args: &[u8], response: &mut Vec<u8>) {
     if args.is_empty() {
         response.extend_from_slice(b"Usage: cat <filename>\r\n");
         return;
@@ -197,7 +220,7 @@ fn cmd_cat(args: &[u8], response: &mut Vec<u8>) {
     }
 
     let path = core::str::from_utf8(args).unwrap_or("");
-    match crate::fs::read_to_string(path) {
+    match async_fs::read_to_string(path).await {
         Ok(content) => {
             // Convert \n to \r\n for SSH terminal
             for line in content.split('\n') {
@@ -212,7 +235,7 @@ fn cmd_cat(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_write(args: &[u8], response: &mut Vec<u8>) {
+async fn cmd_write(args: &[u8], response: &mut Vec<u8>) {
     if args.is_empty() {
         response.extend_from_slice(b"Usage: write <filename> <content>\r\n");
         return;
@@ -230,7 +253,7 @@ fn cmd_write(args: &[u8], response: &mut Vec<u8>) {
     }
 
     let path = core::str::from_utf8(filename).unwrap_or("");
-    match crate::fs::write_file(path, content) {
+    match async_fs::write_file(path, content).await {
         Ok(()) => {
             let msg = alloc::format!("Wrote {} bytes to {}\r\n", content.len(), path);
             response.extend_from_slice(msg.as_bytes());
@@ -242,7 +265,7 @@ fn cmd_write(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_append(args: &[u8], response: &mut Vec<u8>) {
+async fn cmd_append(args: &[u8], response: &mut Vec<u8>) {
     if args.is_empty() {
         response.extend_from_slice(b"Usage: append <filename> <content>\r\n");
         return;
@@ -260,7 +283,7 @@ fn cmd_append(args: &[u8], response: &mut Vec<u8>) {
     }
 
     let path = core::str::from_utf8(filename).unwrap_or("");
-    match crate::fs::append_file(path, content) {
+    match async_fs::append_file(path, content).await {
         Ok(()) => {
             let msg = alloc::format!("Appended {} bytes to {}\r\n", content.len(), path);
             response.extend_from_slice(msg.as_bytes());
@@ -272,7 +295,7 @@ fn cmd_append(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_rm(args: &[u8], response: &mut Vec<u8>) {
+async fn cmd_rm(args: &[u8], response: &mut Vec<u8>) {
     if args.is_empty() {
         response.extend_from_slice(b"Usage: rm <filename>\r\n");
         return;
@@ -284,7 +307,7 @@ fn cmd_rm(args: &[u8], response: &mut Vec<u8>) {
     }
 
     let path = core::str::from_utf8(args).unwrap_or("");
-    match crate::fs::remove_file(path) {
+    match async_fs::remove_file(path).await {
         Ok(()) => {
             let msg = alloc::format!("Removed: {}\r\n", path);
             response.extend_from_slice(msg.as_bytes());
@@ -296,7 +319,7 @@ fn cmd_rm(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_mkdir(args: &[u8], response: &mut Vec<u8>) {
+async fn cmd_mkdir(args: &[u8], response: &mut Vec<u8>) {
     if args.is_empty() {
         response.extend_from_slice(b"Usage: mkdir <dirname>\r\n");
         return;
@@ -308,7 +331,7 @@ fn cmd_mkdir(args: &[u8], response: &mut Vec<u8>) {
     }
 
     let path = core::str::from_utf8(args).unwrap_or("");
-    match crate::fs::create_dir(path) {
+    match async_fs::create_dir(path).await {
         Ok(()) => {
             let msg = alloc::format!("Created directory: {}\r\n", path);
             response.extend_from_slice(msg.as_bytes());
@@ -320,13 +343,13 @@ fn cmd_mkdir(args: &[u8], response: &mut Vec<u8>) {
     }
 }
 
-fn cmd_df(response: &mut Vec<u8>) {
+async fn cmd_df(response: &mut Vec<u8>) {
     if !crate::fs::is_initialized() {
         response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
         return;
     }
 
-    match crate::fs::stats() {
+    match async_fs::stats().await {
         Ok(stats) => {
             let total_kb = stats.total_bytes() / 1024;
             let free_kb = stats.free_bytes() / 1024;
@@ -351,22 +374,4 @@ fn cmd_df(response: &mut Vec<u8>) {
             response.extend_from_slice(msg.as_bytes());
         }
     }
-}
-
-fn cmd_help(response: &mut Vec<u8>) {
-    response.extend_from_slice(b"Available commands:\r\n");
-    response.extend_from_slice(b"  echo <text>           - Echo back text\r\n");
-    response.extend_from_slice(b"  akuma                 - Display ASCII art\r\n");
-    response.extend_from_slice(b"  stats                 - Show network statistics\r\n");
-    response.extend_from_slice(b"  free                  - Show memory usage\r\n");
-    response.extend_from_slice(b"\r\nFilesystem commands:\r\n");
-    response.extend_from_slice(b"  ls [path]             - List directory contents\r\n");
-    response.extend_from_slice(b"  cat <file>            - Display file contents\r\n");
-    response.extend_from_slice(b"  write <file> <text>   - Write text to file\r\n");
-    response.extend_from_slice(b"  append <file> <text>  - Append text to file\r\n");
-    response.extend_from_slice(b"  rm <file>             - Remove file\r\n");
-    response.extend_from_slice(b"  mkdir <dir>           - Create directory\r\n");
-    response.extend_from_slice(b"  df                    - Show disk usage\r\n");
-    response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
-    response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
 }
