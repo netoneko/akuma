@@ -9,8 +9,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::Duration;
 
 use crate::async_net::TcpStream;
@@ -32,9 +32,9 @@ const TCP_TX_BUFFER_SIZE: usize = 4096;
 
 /// Static buffers for connections - avoids dynamic allocation
 /// We use a simple static array approach
-static mut RX_BUFFERS: [[u8; TCP_RX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] = 
+static mut RX_BUFFERS: [[u8; TCP_RX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] =
     [[0u8; TCP_RX_BUFFER_SIZE]; MAX_CONNECTIONS + 1];
-static mut TX_BUFFERS: [[u8; TCP_TX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] = 
+static mut TX_BUFFERS: [[u8; TCP_TX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] =
     [[0u8; TCP_TX_BUFFER_SIZE]; MAX_CONNECTIONS + 1];
 static mut BUFFER_IN_USE: [bool; MAX_CONNECTIONS + 1] = [false; MAX_CONNECTIONS + 1];
 
@@ -63,12 +63,7 @@ fn free_buffer_slot(slot: usize) {
 /// Get buffer references for a slot
 /// SAFETY: Caller must ensure single-threaded access and slot is allocated
 unsafe fn get_buffer_refs(slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
-    unsafe {
-        (
-            &mut RX_BUFFERS[slot][..],
-            &mut TX_BUFFERS[slot][..],
-        )
-    }
+    unsafe { (&mut RX_BUFFERS[slot][..], &mut TX_BUFFERS[slot][..]) }
 }
 
 // ============================================================================
@@ -148,11 +143,10 @@ pub async fn run(stack: Stack<'static>) {
             // Ensure we have a listening socket
             if listen_socket.is_none() {
                 // Get or allocate buffer slot
-                let slot = listen_buffer_slot.unwrap_or_else(|| {
-                    alloc_buffer_slot().expect("No buffer slots available")
-                });
+                let slot = listen_buffer_slot
+                    .unwrap_or_else(|| alloc_buffer_slot().expect("No buffer slots available"));
                 listen_buffer_slot = Some(slot);
-                
+
                 // Create socket with static buffers
                 let (rx, tx) = unsafe { get_buffer_refs(slot) };
                 let mut socket = TcpSocket::new(stack, rx, tx);
@@ -179,7 +173,11 @@ pub async fn run(stack: Stack<'static>) {
                             let connected_socket = listen_socket.take().unwrap();
                             let stream = TcpStream::from_socket(connected_socket);
                             let future = Box::pin(handle_connection_wrapper(stream, id));
-                            connections.push(ActiveConnection { future, id, buffer_slot });
+                            connections.push(ActiveConnection {
+                                future,
+                                id,
+                                buffer_slot,
+                            });
                         }
                         Err(e) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
@@ -211,7 +209,11 @@ pub async fn run(stack: Stack<'static>) {
                             let connected_socket = listen_socket.take().unwrap();
                             let stream = TcpStream::from_socket(connected_socket);
                             let future = Box::pin(handle_connection_wrapper(stream, id));
-                            connections.push(ActiveConnection { future, id, buffer_slot });
+                            connections.push(ActiveConnection {
+                                future,
+                                id,
+                                buffer_slot,
+                            });
                         }
                         Ok(Err(e)) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));

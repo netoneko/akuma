@@ -193,7 +193,8 @@ fn kernel_main() -> ! {
                             } else {
                                 console::print(&alloc::format!(
                                     "  [FILE] {} ({} bytes)\n",
-                                    entry.name, entry.size
+                                    entry.name,
+                                    entry.size
                                 ));
                             }
                         }
@@ -222,7 +223,7 @@ fn kernel_main() -> ! {
     // Async Network initialization and main loop
     // =========================================================================
     console::print("\n--- Async Network Initialization ---\n");
-    
+
     // Initialize the async network stack
     let net_init = match async_net::init() {
         Ok(init) => {
@@ -241,7 +242,7 @@ fn kernel_main() -> ! {
     };
 
     console::print("--- Async Network Initialization Done ---\n\n");
-    
+
     // Initialize SSH host key
     ssh::init_host_key();
 
@@ -255,10 +256,9 @@ fn kernel_main() -> ! {
 fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     use core::future::Future;
     use core::pin::Pin;
-    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     console::print("[AsyncMain] Starting async network loop...\n");
-    console::print("[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
 
     // Simple waker that does nothing (we poll in a loop)
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -274,28 +274,91 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     let mut runner = net_init.runner;
     let stack = net_init.stack;
 
-    // Create futures for both the network runner and SSH server
+    // First, wait for IP address (DHCP or fallback to static)
+    {
+        let mut wait_ip_fut = async_net::wait_for_ip(&stack);
+        let mut wait_ip_pinned = unsafe { Pin::new_unchecked(&mut wait_ip_fut) };
+        let mut runner_fut = runner.run();
+        let mut runner_pinned = unsafe { Pin::new_unchecked(&mut runner_fut) };
+
+        loop {
+            // Poll the network runner (needed for DHCP to work)
+            let _ = runner_pinned.as_mut().poll(&mut cx);
+
+            // Poll the wait_for_ip future
+            if let Poll::Ready(()) = wait_ip_pinned.as_mut().poll(&mut cx) {
+                break;
+            }
+
+            // Process pending IRQ work
+            executor::process_irq_work();
+            executor::run_once();
+            threading::yield_now();
+        }
+    }
+
+    console::print("[AsyncMain] Network ready!\n");
+    console::print(
+        "[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
+    );
+
+    // Create futures for network runner, SSH server, and memory monitor
     let mut runner_fut = runner.run();
     let mut ssh_fut = ssh_server::run(stack);
+    let mut mem_monitor_fut = memory_monitor();
 
     // Pin the futures
     let mut runner_pinned = unsafe { Pin::new_unchecked(&mut runner_fut) };
     let mut ssh_pinned = unsafe { Pin::new_unchecked(&mut ssh_fut) };
+    let mut mem_monitor_pinned = unsafe { Pin::new_unchecked(&mut mem_monitor_fut) };
 
     loop {
         // Poll the network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);
-        
+
         // Poll the SSH server
         let _ = ssh_pinned.as_mut().poll(&mut cx);
-        
+
+        // Poll the memory monitor
+        let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
+
         // Process pending IRQ work
         executor::process_irq_work();
-        
+
         // Poll the executor for any other tasks
         executor::run_once();
-        
+
         // Yield to other threads (cooperative multitasking)
         threading::yield_now();
+    }
+}
+
+/// Async task that periodically reports memory usage
+async fn memory_monitor() -> ! {
+    use embassy_time::{Duration, Timer};
+
+    // Wait a bit before starting to let system stabilize
+    Timer::after(Duration::from_secs(5)).await;
+
+    console::print("[MemMonitor] Memory monitoring started\n");
+
+    loop {
+        let stats = allocator::stats();
+        let allocated_kb = stats.allocated / 1024;
+        let free_kb = stats.free / 1024;
+        let peak_kb = stats.peak_allocated / 1024;
+        let heap_mb = stats.heap_size / 1024 / 1024;
+
+        console::print(&alloc::format!(
+            "[Mem] Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
+            allocated_kb,
+            free_kb,
+            peak_kb,
+            heap_mb,
+            stats.allocation_count
+        ));
+
+        // Report every 10 seconds
+        Timer::after(Duration::from_secs(10)).await;
     }
 }

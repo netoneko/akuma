@@ -28,6 +28,7 @@ pub fn execute_command(line: &[u8]) -> Vec<u8> {
         b"akuma" => cmd_akuma(&mut response),
         b"quit" | b"exit" => cmd_quit(&mut response),
         b"stats" => cmd_stats(&mut response),
+        b"free" | b"mem" => cmd_free(&mut response),
         b"ls" | b"dir" => cmd_ls(args, &mut response),
         b"cat" | b"read" => cmd_cat(args, &mut response),
         b"write" => cmd_write(args, &mut response),
@@ -86,9 +87,48 @@ fn cmd_stats(response: &mut Vec<u8>) {
     let (connections, bytes_rx, bytes_tx) = network::get_stats();
     let stats = alloc::format!(
         "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
-        connections, bytes_rx, bytes_tx
+        connections,
+        bytes_rx,
+        bytes_tx
     );
     response.extend_from_slice(stats.as_bytes());
+}
+
+fn cmd_free(response: &mut Vec<u8>) {
+    let stats = crate::allocator::stats();
+
+    let allocated_kb = stats.allocated / 1024;
+    let free_kb = stats.free / 1024;
+    let peak_kb = stats.peak_allocated / 1024;
+    let heap_kb = stats.heap_size / 1024;
+    let heap_mb = stats.heap_size / 1024 / 1024;
+
+    // Calculate percentages
+    let used_percent = if stats.heap_size > 0 {
+        (stats.allocated * 100) / stats.heap_size
+    } else {
+        0
+    };
+
+    let info = alloc::format!(
+        "Memory Statistics:\r\n\
+         \r\n\
+                      total       used       free\r\n\
+         Mem:    {:>8} KB {:>8} KB {:>8} KB\r\n\
+         \r\n\
+         Usage:       {}%\r\n\
+         Peak:        {} KB\r\n\
+         Allocs:      {}\r\n\
+         Heap size:   {} MB\r\n",
+        heap_kb,
+        allocated_kb,
+        free_kb,
+        used_percent,
+        peak_kb,
+        stats.allocation_count,
+        heap_mb
+    );
+    response.extend_from_slice(info.as_bytes());
 }
 
 fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
@@ -109,18 +149,18 @@ fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
                 // Nothing to show (empty directory)
                 return;
             }
-            
+
             // Collect entries: directories first, then files, both sorted alphabetically
             let mut dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).collect();
             let mut files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
-            
+
             dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            
+
             // ANSI color codes for zsh-like output
-            const COLOR_DIR: &[u8] = b"\x1b[1;34m";   // Bold blue for directories
+            const COLOR_DIR: &[u8] = b"\x1b[1;34m"; // Bold blue for directories
             const COLOR_RESET: &[u8] = b"\x1b[0m";
-            
+
             // Display directories first (with trailing /)
             for entry in dirs {
                 let name = entry.name.to_lowercase();
@@ -130,7 +170,7 @@ fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
                 response.extend_from_slice(COLOR_RESET);
                 response.extend_from_slice(b"\r\n");
             }
-            
+
             // Display files
             for entry in files {
                 let name = entry.name.to_lowercase();
@@ -298,7 +338,11 @@ fn cmd_df(response: &mut Vec<u8>) {
             };
             let info = alloc::format!(
                 "Filesystem Statistics:\r\n  Total:  {} KB\r\n  Used:   {} KB ({}%)\r\n  Free:   {} KB\r\n  Cluster size: {} bytes\r\n",
-                total_kb, used_kb, percent_used, free_kb, stats.cluster_size
+                total_kb,
+                used_kb,
+                percent_used,
+                free_kb,
+                stats.cluster_size
             );
             response.extend_from_slice(info.as_bytes());
         }
@@ -314,6 +358,7 @@ fn cmd_help(response: &mut Vec<u8>) {
     response.extend_from_slice(b"  echo <text>           - Echo back text\r\n");
     response.extend_from_slice(b"  akuma                 - Display ASCII art\r\n");
     response.extend_from_slice(b"  stats                 - Show network statistics\r\n");
+    response.extend_from_slice(b"  free                  - Show memory usage\r\n");
     response.extend_from_slice(b"\r\nFilesystem commands:\r\n");
     response.extend_from_slice(b"  ls [path]             - List directory contents\r\n");
     response.extend_from_slice(b"  cat <file>            - Display file contents\r\n");
@@ -325,4 +370,3 @@ fn cmd_help(response: &mut Vec<u8>) {
     response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
     response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
 }
-

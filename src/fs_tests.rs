@@ -93,7 +93,10 @@ fn test_create_tmp_directory() -> bool {
 
     // Verify the directory exists
     if !fs::exists(test_dir) {
-        log(&format!("  - FAILED: {} does not exist after creation\n", test_dir));
+        log(&format!(
+            "  - FAILED: {} does not exist after creation\n",
+            test_dir
+        ));
         return false;
     }
 
@@ -117,7 +120,11 @@ fn test_file_operations() -> bool {
     log("  - Step 1: Create and write file\n");
     match fs::write_file(test_file, initial_content) {
         Ok(()) => {
-            log(&format!("    Created {} with {} bytes\n", test_file, initial_content.len()));
+            log(&format!(
+                "    Created {} with {} bytes\n",
+                test_file,
+                initial_content.len()
+            ));
         }
         Err(e) => {
             log(&format!("    FAILED to create file: {}\n", e));
@@ -161,7 +168,11 @@ fn test_file_operations() -> bool {
     log("  - Step 4: Read and verify appended content\n");
     match fs::read_file(test_file) {
         Ok(content) => {
-            let expected: Vec<u8> = initial_content.iter().chain(append_content.iter()).copied().collect();
+            let expected: Vec<u8> = initial_content
+                .iter()
+                .chain(append_content.iter())
+                .copied()
+                .collect();
             if content != expected {
                 log(&format!(
                     "    FAILED: Content mismatch after append.\n    Expected: {:?}\n    Got: {:?}\n",
@@ -170,7 +181,10 @@ fn test_file_operations() -> bool {
                 ));
                 return false;
             }
-            log(&format!("    Content verified: {} bytes total\n", content.len()));
+            log(&format!(
+                "    Content verified: {} bytes total\n",
+                content.len()
+            ));
         }
         Err(e) => {
             log(&format!("    FAILED to read after append: {}\n", e));
@@ -220,11 +234,11 @@ fn test_long_filename_operations() -> bool {
                 let name = &entry.name;
                 let has_lowercase = name.chars().any(|c| c.is_lowercase());
                 let is_long = name.len() > 12; // 8 + 1 + 3
-                
+
                 if has_lowercase || is_long {
                     log(&format!("    Found LFN: {}\n", name));
                     found_lfn = true;
-                    
+
                     // Try to read this file if it's not a directory
                     if !entry.is_dir {
                         match fs::read_file(&format!("/{}", name)) {
@@ -239,7 +253,7 @@ fn test_long_filename_operations() -> bool {
                     }
                 }
             }
-            
+
             if !found_lfn {
                 log("    No LFN files found (test skipped)\n");
             }
@@ -278,7 +292,11 @@ fn test_subdirectory_operations() -> bool {
     log("  - Step 1: Write file in subdirectory\n");
     match fs::write_file(test_file, content) {
         Ok(()) => {
-            log(&format!("    Created {} with {} bytes\n", test_file, content.len()));
+            log(&format!(
+                "    Created {} with {} bytes\n",
+                test_file,
+                content.len()
+            ));
         }
         Err(e) => {
             log(&format!("    FAILED to create file: {}\n", e));
@@ -306,7 +324,9 @@ fn test_subdirectory_operations() -> bool {
     log("  - Step 3: List subdirectory\n");
     match fs::list_dir("/tmp") {
         Ok(entries) => {
-            let found = entries.iter().any(|e| e.name.to_lowercase() == "subtest.txt");
+            let found = entries
+                .iter()
+                .any(|e| e.name.to_lowercase() == "subtest.txt");
             if !found {
                 log("    FAILED: File not found in directory listing\n");
                 return false;

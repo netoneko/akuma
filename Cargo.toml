@@ -36,7 +36,7 @@ rand_core = { version = "0.6", default-features = false }
 embassy-executor = { version = "0.7", default-features = false, features = ["nightly", "arch-spin"] }
 embassy-time = { version = "0.4", default-features = false, features = ["generic-queue-8"] }
 embassy-time-driver = { version = "0.2", default-features = false }
-embassy-net = { version = "0.6", default-features = false, features = ["proto-ipv4", "tcp", "medium-ethernet"] }
+embassy-net = { version = "0.6", default-features = false, features = ["proto-ipv4", "tcp", "medium-ethernet", "dhcpv4"] }
 embassy-net-driver = { version = "0.2", default-features = false }
 embassy-sync = { version = "0.6", default-features = false }
 critical-section = { version = "1.2", default-features = false }

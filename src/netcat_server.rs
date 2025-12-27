@@ -120,4 +120,3 @@ pub async fn run(stack: Stack<'static>) {
 fn log(msg: &str) {
     console::print(msg);
 }
-

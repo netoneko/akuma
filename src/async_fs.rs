@@ -344,4 +344,3 @@ pub async fn write_string(path: &str, content: &str) -> Result<(), FsError> {
 pub async fn append_string(path: &str, content: &str) -> Result<(), FsError> {
     append_file(path, content.as_bytes()).await
 }
-

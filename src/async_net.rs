@@ -2,13 +2,17 @@
 //!
 //! Provides async TCP networking with:
 //! - Network stack initialization with virtio driver
+//! - DHCP support with fallback to static config
 //! - Async TCP listener for accepting connections
 //! - Async TCP stream for reading/writing
 
 use alloc::boxed::Box;
 use alloc::vec;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
+use embassy_net::{
+    Config, ConfigV4, DhcpConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
+    StaticConfigV4,
+};
 use embassy_time::Duration;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
@@ -32,6 +36,14 @@ const TCP_TX_BUFFER_SIZE: usize = 4096;
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
     0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
 ];
+
+/// DHCP timeout before falling back to static config (seconds)
+const DHCP_TIMEOUT_SECS: u64 = 5;
+
+/// Default QEMU user-mode networking addresses (fallback)
+const DEFAULT_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+const DEFAULT_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const DEFAULT_PREFIX_LEN: u8 = 24;
 
 // ============================================================================
 // Network Stack
@@ -108,20 +120,83 @@ pub fn init() -> Result<NetworkInit, &'static str> {
     // Random seed from timer
     let seed = crate::timer::uptime_us();
 
-    // Static IP configuration for QEMU user-mode networking
-    let config = Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24),
-        gateway: Some(Ipv4Address::new(10, 0, 2, 2)),
-        dns_servers: Default::default(),
-    });
+    // Use DHCP to get network configuration
+    log("[AsyncNet] Using DHCP for network configuration...\n");
+    let config = Config::dhcpv4(DhcpConfig::default());
 
     // Create the stack - returns (Stack, Runner)
     let (stack, runner) = embassy_net::new(device, config, resources_ref, seed);
 
-    log("[AsyncNet] IP: 10.0.2.15/24, Gateway: 10.0.2.2\n");
-    log("[AsyncNet] Async network stack ready\n");
+    log("[AsyncNet] Network stack created, waiting for IP...\n");
 
     Ok(NetworkInit { stack, runner })
+}
+
+/// Wait for network to get an IP address via DHCP
+/// Falls back to static QEMU defaults if DHCP times out
+pub async fn wait_for_ip(stack: &Stack<'static>) {
+    log("[AsyncNet] Waiting for DHCP (");
+    console::print(&alloc::format!("{}s timeout)...\n", DHCP_TIMEOUT_SECS));
+
+    let deadline = embassy_time::Instant::now() + Duration::from_secs(DHCP_TIMEOUT_SECS);
+
+    loop {
+        // Check if we got an IP via DHCP
+        if let Some(config) = stack.config_v4() {
+            let addr = config.address;
+            log("[AsyncNet] Got IP via DHCP: ");
+            console::print(&alloc::format!(
+                "{}.{}.{}.{}/{}\n",
+                addr.address().octets()[0],
+                addr.address().octets()[1],
+                addr.address().octets()[2],
+                addr.address().octets()[3],
+                addr.prefix_len()
+            ));
+            if let Some(gw) = config.gateway {
+                log("[AsyncNet] Gateway: ");
+                console::print(&alloc::format!(
+                    "{}.{}.{}.{}\n",
+                    gw.octets()[0],
+                    gw.octets()[1],
+                    gw.octets()[2],
+                    gw.octets()[3]
+                ));
+            }
+            return;
+        }
+
+        // Check for timeout
+        if embassy_time::Instant::now() >= deadline {
+            log("[AsyncNet] DHCP timeout, using static fallback...\n");
+
+            // Apply static configuration
+            let static_config = StaticConfigV4 {
+                address: Ipv4Cidr::new(DEFAULT_IP, DEFAULT_PREFIX_LEN),
+                gateway: Some(DEFAULT_GATEWAY),
+                dns_servers: Default::default(),
+            };
+            stack.set_config_v4(ConfigV4::Static(static_config));
+
+            log("[AsyncNet] Static IP: ");
+            console::print(&alloc::format!(
+                "{}.{}.{}.{}/{}, Gateway: {}.{}.{}.{}\n",
+                DEFAULT_IP.octets()[0],
+                DEFAULT_IP.octets()[1],
+                DEFAULT_IP.octets()[2],
+                DEFAULT_IP.octets()[3],
+                DEFAULT_PREFIX_LEN,
+                DEFAULT_GATEWAY.octets()[0],
+                DEFAULT_GATEWAY.octets()[1],
+                DEFAULT_GATEWAY.octets()[2],
+                DEFAULT_GATEWAY.octets()[3]
+            ));
+            return;
+        }
+
+        // Wait a bit before checking again
+        embassy_time::Timer::after(Duration::from_millis(100)).await;
+    }
 }
 
 // ============================================================================

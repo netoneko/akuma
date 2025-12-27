@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -24,9 +24,9 @@ use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell;
 use crate::ssh_crypto::{
-    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, write_namelist,
-    write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256, SimpleRng, AES_IV_SIZE,
-    AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
+    AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
+    SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
+    write_namelist, write_string, write_u32,
 };
 
 // ============================================================================
@@ -555,12 +555,20 @@ async fn handle_message(
                 }
 
                 if req_type == b"shell" {
-                    send_channel_data(stream, session, b"\r\n=================================\r\n")
-                        .await?;
+                    send_channel_data(
+                        stream,
+                        session,
+                        b"\r\n=================================\r\n",
+                    )
+                    .await?;
                     send_channel_data(stream, session, b"  Welcome to Akuma SSH Server\r\n")
                         .await?;
-                    send_channel_data(stream, session, b"=================================\r\n\r\n")
-                        .await?;
+                    send_channel_data(
+                        stream,
+                        session,
+                        b"=================================\r\n\r\n",
+                    )
+                    .await?;
                     send_channel_data(
                         stream,
                         session,

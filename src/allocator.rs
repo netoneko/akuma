@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 use talc::ErrOnOom;
 use talc::{Span, Talc};
@@ -6,6 +7,35 @@ use talc::{Span, Talc};
 static ALLOCATOR: Talck = Talck;
 
 static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
+
+// Memory tracking
+static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PEAK_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+/// Memory statistics
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryStats {
+    pub heap_size: usize,
+    pub allocated: usize,
+    pub free: usize,
+    pub allocation_count: usize,
+    pub peak_allocated: usize,
+}
+
+/// Get current memory statistics
+pub fn stats() -> MemoryStats {
+    let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
+    let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    MemoryStats {
+        heap_size,
+        allocated,
+        free: heap_size.saturating_sub(allocated),
+        allocation_count: ALLOCATION_COUNT.load(Ordering::Relaxed),
+        peak_allocated: PEAK_ALLOCATED.load(Ordering::Relaxed),
+    }
+}
 
 /// No-op for backwards compatibility - IRQs are now always disabled during allocation
 pub fn enable_preemption_safe_alloc() {}
@@ -41,6 +71,9 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
         return Err("Invalid heap start address");
     }
 
+    // Store heap size for stats
+    HEAP_SIZE.store(heap_size, Ordering::Relaxed);
+
     unsafe {
         let heap_ptr = heap_start as *mut u8;
         let span = Span::from_base_size(heap_ptr, heap_size);
@@ -64,9 +97,27 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
                 .map(|ptr| ptr.as_ptr())
                 .unwrap_or(core::ptr::null_mut());
 
-            // Log allocation failures - use only static strings to avoid recursion!
             if result.is_null() {
+                // Log allocation failures - use only static strings to avoid recursion!
                 crate::console::print("[ALLOC FAIL]");
+            } else {
+                // Track allocation
+                let new_allocated =
+                    ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                // Update peak if needed
+                let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+                while new_allocated > peak {
+                    match PEAK_ALLOCATED.compare_exchange_weak(
+                        peak,
+                        new_allocated,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(p) => peak = p,
+                    }
+                }
             }
 
             result
@@ -88,6 +139,8 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
         with_irqs_disabled(|| unsafe {
             TALC.lock()
                 .free(core::ptr::NonNull::new_unchecked(ptr), layout);
+            // Track deallocation
+            ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         })
     }
 

@@ -5,7 +5,9 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use embedded_sdmmc::{LfnBuffer, Mode, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    LfnBuffer, Mode, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
+};
 use spinning_top::Spinlock;
 
 use crate::block;
@@ -269,12 +271,12 @@ where
         if found_sfn.is_some() {
             return;
         }
-        
+
         let entry_name = match lfn {
             Some(long_name) => long_name.to_lowercase(),
             None => entry.name.to_string().to_lowercase(),
         };
-        
+
         if entry_name == name_lower {
             found_sfn = Some(entry.name.clone());
         }
@@ -315,16 +317,16 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
         let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
         let mut entries = Vec::new();
-        
+
         // Buffer for long filenames (up to 255 UTF-8 bytes)
         let mut lfn_storage = [0u8; 256];
         let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
 
         let components = path_components(path);
-        
+
         // Navigate to target directory
         navigate_to_dir(&mut current_dir, &components)?;
-        
+
         // List directory contents
         current_dir
             .iterate_dir_lfn(&mut lfn_buffer, |entry, lfn| {
@@ -360,10 +362,10 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the target directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Find the file's short filename
         let sfn = find_entry_sfn(&current_dir, filename)?;
 
@@ -403,10 +405,10 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the target directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Try to find existing file's short filename, or create new with the given name
         let sfn = match find_entry_sfn(&current_dir, filename) {
             Ok(sfn) => sfn,
@@ -448,10 +450,10 @@ pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the target directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Try to find existing file's short filename, or create new with the given name
         let sfn = match find_entry_sfn(&current_dir, filename) {
             Ok(sfn) => sfn,
@@ -493,10 +495,10 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
 
         let (dir_path, dirname) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the parent directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Create the new directory (must be 8.3 compatible)
         let sfn = ShortFileName::create_from_str(dirname).map_err(|_| FsError::InvalidPath)?;
         current_dir.make_dir_in_dir(sfn).map_err(convert_error)?;
@@ -521,10 +523,10 @@ pub fn remove_file(path: &str) -> Result<(), FsError> {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the target directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Find the file's short filename
         let sfn = find_entry_sfn(&current_dir, filename)?;
         current_dir.delete_file_in_dir(sfn).map_err(convert_error)?;
@@ -558,7 +560,7 @@ pub fn exists(path: &str) -> bool {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         if dir_components.is_empty() && filename.is_empty() {
             return true; // Root always exists
         }
@@ -572,7 +574,7 @@ pub fn exists(path: &str) -> bool {
         if filename.is_empty() {
             return true;
         }
-        
+
         find_entry_sfn(&current_dir, filename).is_ok()
     })
     .unwrap_or(false)
@@ -593,10 +595,10 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
 
         let (dir_path, filename) = split_path(path);
         let dir_components = path_components(dir_path);
-        
+
         // Navigate to the target directory
         navigate_to_dir(&mut current_dir, &dir_components)?;
-        
+
         // Find the file's short filename
         let sfn = find_entry_sfn(&current_dir, filename)?;
 

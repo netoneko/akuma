@@ -269,4 +269,3 @@ pub fn capacity() -> Option<u64> {
 fn log(msg: &str) {
     console::print(msg);
 }
-
