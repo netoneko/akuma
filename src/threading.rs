@@ -7,6 +7,9 @@ use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 
+// Use the shared IRQ guard from the irq module
+use crate::irq::with_irqs_disabled;
+
 /// Default timeout for cooperative threads in microseconds (5 seconds)
 pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
 
@@ -19,21 +22,6 @@ const MAX_THREADS: usize = 32;
 
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 const IDLE_THREAD_IDX: usize = 0;
-
-/// Run a closure with IRQs disabled to prevent scheduler lock deadlocks
-#[inline]
-fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
-    let daif: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif);
-        core::arch::asm!("msr daifset, #2"); // Disable IRQs
-    }
-    let result = f();
-    unsafe {
-        core::arch::asm!("msr daif, {}", in(reg) daif);
-    }
-    result
-}
 
 // Assembly context switch implementation
 global_asm!(

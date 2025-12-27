@@ -3,6 +3,8 @@
 //! Provides a block device driver for virtio-blk devices that implements
 //! the embedded-sdmmc BlockDevice trait.
 
+use core::cell::UnsafeCell;
+
 use embedded_sdmmc::BlockDevice;
 use spinning_top::Spinlock;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -59,17 +61,25 @@ impl core::fmt::Display for BlockError {
 // ============================================================================
 
 /// VirtIO block device wrapper implementing embedded-sdmmc BlockDevice trait
+///
+/// Uses UnsafeCell for interior mutability because the embedded-sdmmc BlockDevice
+/// trait requires &self for read/write operations, but VirtIOBlk needs &mut self.
 pub struct VirtioBlockDevice {
-    inner: VirtIOBlk<VirtioHal, MmioTransport>,
+    inner: UnsafeCell<VirtIOBlk<VirtioHal, MmioTransport>>,
     capacity_blocks: u64,
 }
+
+// SAFETY: VirtioBlockDevice is only accessed through the global BLOCK_DEVICE Spinlock,
+// which ensures exclusive access. The Spinlock provides the synchronization needed
+// to safely access the UnsafeCell contents.
+unsafe impl Sync for VirtioBlockDevice {}
 
 impl VirtioBlockDevice {
     /// Create a new VirtIO block device wrapper
     fn new(inner: VirtIOBlk<VirtioHal, MmioTransport>) -> Self {
         let capacity_blocks = inner.capacity();
         Self {
-            inner,
+            inner: UnsafeCell::new(inner),
             capacity_blocks,
         }
     }
@@ -82,6 +92,14 @@ impl VirtioBlockDevice {
     /// Get the capacity in bytes
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_blocks * SECTOR_SIZE as u64
+    }
+
+    /// Get mutable access to the inner VirtIOBlk
+    /// SAFETY: Caller must ensure exclusive access (e.g., via the BLOCK_DEVICE Spinlock)
+    #[inline]
+    fn inner_mut(&self) -> &mut VirtIOBlk<VirtioHal, MmioTransport> {
+        // SAFETY: We have exclusive access via the Spinlock guard
+        unsafe { &mut *self.inner.get() }
     }
 }
 
@@ -98,20 +116,13 @@ impl BlockDevice for VirtioBlockDevice {
         start_block_idx: embedded_sdmmc::BlockIdx,
     ) -> Result<(), Self::Error> {
         let start = start_block_idx.0 as usize;
-
-        // VirtIOBlk requires mutable reference, but BlockDevice::read takes &self
-        // We need to use interior mutability here
-        let inner_ptr = &self.inner as *const VirtIOBlk<VirtioHal, MmioTransport>
-            as *mut VirtIOBlk<VirtioHal, MmioTransport>;
+        let inner = self.inner_mut();
 
         for (i, block) in blocks.iter_mut().enumerate() {
             let block_idx = start + i;
-            // SAFETY: We're the only accessor due to the global spinlock
-            unsafe {
-                (*inner_ptr)
-                    .read_blocks(block_idx, &mut block.contents)
-                    .map_err(|_| BlockError::ReadError)?;
-            }
+            inner
+                .read_blocks(block_idx, &mut block.contents)
+                .map_err(|_| BlockError::ReadError)?;
         }
 
         Ok(())
@@ -123,19 +134,13 @@ impl BlockDevice for VirtioBlockDevice {
         start_block_idx: embedded_sdmmc::BlockIdx,
     ) -> Result<(), Self::Error> {
         let start = start_block_idx.0 as usize;
-
-        // VirtIOBlk requires mutable reference, but BlockDevice::write takes &self
-        let inner_ptr = &self.inner as *const VirtIOBlk<VirtioHal, MmioTransport>
-            as *mut VirtIOBlk<VirtioHal, MmioTransport>;
+        let inner = self.inner_mut();
 
         for (i, block) in blocks.iter().enumerate() {
             let block_idx = start + i;
-            // SAFETY: We're the only accessor due to the global spinlock
-            unsafe {
-                (*inner_ptr)
-                    .write_blocks(block_idx, &block.contents)
-                    .map_err(|_| BlockError::WriteError)?;
-            }
+            inner
+                .write_blocks(block_idx, &block.contents)
+                .map_err(|_| BlockError::WriteError)?;
         }
 
         Ok(())

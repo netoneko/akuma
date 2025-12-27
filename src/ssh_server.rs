@@ -5,8 +5,10 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use embassy_net::Stack;
@@ -27,43 +29,91 @@ const TCP_RX_BUFFER_SIZE: usize = 4096;
 const TCP_TX_BUFFER_SIZE: usize = 4096;
 
 // ============================================================================
-// Static Buffers - Simple approach without complex pool
+// Static Buffer Pool - Thread-safe using atomics
 // ============================================================================
 
-/// Static buffers for connections - avoids dynamic allocation
-/// We use a simple static array approach
-static mut RX_BUFFERS: [[u8; TCP_RX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] =
-    [[0u8; TCP_RX_BUFFER_SIZE]; MAX_CONNECTIONS + 1];
-static mut TX_BUFFERS: [[u8; TCP_TX_BUFFER_SIZE]; MAX_CONNECTIONS + 1] =
-    [[0u8; TCP_TX_BUFFER_SIZE]; MAX_CONNECTIONS + 1];
-static mut BUFFER_IN_USE: [bool; MAX_CONNECTIONS + 1] = [false; MAX_CONNECTIONS + 1];
+/// Buffer pool for TCP connections
+/// Uses atomics for allocation tracking and UnsafeCell for buffer storage
+struct BufferPool {
+    rx_buffers: [UnsafeCell<[u8; TCP_RX_BUFFER_SIZE]>; MAX_CONNECTIONS + 1],
+    tx_buffers: [UnsafeCell<[u8; TCP_TX_BUFFER_SIZE]>; MAX_CONNECTIONS + 1],
+    in_use: [AtomicBool; MAX_CONNECTIONS + 1],
+}
 
-/// Allocate a buffer slot
-fn alloc_buffer_slot() -> Option<usize> {
-    unsafe {
+// SAFETY: Access to individual buffer slots is serialized via the AtomicBool flags.
+// Each slot can only be used by one caller at a time (ensured by alloc/free protocol).
+unsafe impl Sync for BufferPool {}
+
+impl BufferPool {
+    const fn new() -> Self {
+        // Helper to create arrays with const initialization
+        const RX_INIT: UnsafeCell<[u8; TCP_RX_BUFFER_SIZE]> =
+            UnsafeCell::new([0u8; TCP_RX_BUFFER_SIZE]);
+        const TX_INIT: UnsafeCell<[u8; TCP_TX_BUFFER_SIZE]> =
+            UnsafeCell::new([0u8; TCP_TX_BUFFER_SIZE]);
+        const IN_USE_INIT: AtomicBool = AtomicBool::new(false);
+
+        Self {
+            rx_buffers: [RX_INIT; MAX_CONNECTIONS + 1],
+            tx_buffers: [TX_INIT; MAX_CONNECTIONS + 1],
+            in_use: [IN_USE_INIT; MAX_CONNECTIONS + 1],
+        }
+    }
+
+    /// Try to allocate a buffer slot
+    fn alloc(&self) -> Option<usize> {
         for i in 0..=MAX_CONNECTIONS {
-            if !BUFFER_IN_USE[i] {
-                BUFFER_IN_USE[i] = true;
+            // Try to atomically claim this slot
+            if self.in_use[i]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 return Some(i);
             }
         }
         None
     }
-}
 
-/// Free a buffer slot
-fn free_buffer_slot(slot: usize) {
-    unsafe {
+    /// Free a buffer slot
+    fn free(&self, slot: usize) {
         if slot <= MAX_CONNECTIONS {
-            BUFFER_IN_USE[slot] = false;
+            self.in_use[slot].store(false, Ordering::Release);
+        }
+    }
+
+    /// Get buffer references for an allocated slot
+    /// SAFETY: Caller must have successfully allocated this slot via `alloc()`
+    /// and not yet freed it. The slot must not be accessed concurrently.
+    unsafe fn get_buffers(&self, slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
+        debug_assert!(slot <= MAX_CONNECTIONS);
+        debug_assert!(self.in_use[slot].load(Ordering::Acquire));
+
+        // SAFETY: We have exclusive access to this slot (enforced by atomic in_use flag)
+        unsafe {
+            let rx = &mut *self.rx_buffers[slot].get();
+            let tx = &mut *self.tx_buffers[slot].get();
+            (rx, tx)
         }
     }
 }
 
+static BUFFER_POOL: BufferPool = BufferPool::new();
+
+/// Allocate a buffer slot
+fn alloc_buffer_slot() -> Option<usize> {
+    BUFFER_POOL.alloc()
+}
+
+/// Free a buffer slot
+fn free_buffer_slot(slot: usize) {
+    BUFFER_POOL.free(slot);
+}
+
 /// Get buffer references for a slot
-/// SAFETY: Caller must ensure single-threaded access and slot is allocated
+/// SAFETY: Caller must ensure slot is allocated and not concurrently accessed
 unsafe fn get_buffer_refs(slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
-    unsafe { (&mut RX_BUFFERS[slot][..], &mut TX_BUFFERS[slot][..]) }
+    // SAFETY: Caller guarantees slot is allocated via alloc_buffer_slot()
+    unsafe { BUFFER_POOL.get_buffers(slot) }
 }
 
 // ============================================================================

@@ -1,52 +1,95 @@
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
 
-const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR: *mut u8 = UART0_BASE as *mut u8; // Data register (offset 0x00)
-const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32; // Flag register (offset 0x18)
+// ============================================================================
+// UART Driver - Encapsulates all MMIO access
+// ============================================================================
+
+/// PL011 UART register offsets
+const DR_OFFSET: usize = 0x00; // Data register
+const FR_OFFSET: usize = 0x18; // Flag register
+
+/// Flag register bits
 const RXFE: u32 = 1 << 4; // Receive FIFO empty flag
+#[allow(dead_code)]
 const TXFF: u32 = 1 << 5; // Transmit FIFO full flag
 
-unsafe fn putchar(c: u8) {
-    // Write directly to UART data register
-    unsafe {
-        UART0_DR.write_volatile(c);
-    }
+/// UART driver that encapsulates all MMIO access
+struct Uart {
+    base: usize,
 }
 
-// blocking print
-pub fn print(s: &str) {
-    for c in s.bytes() {
+impl Uart {
+    /// Create a new UART driver at the given base address
+    const fn new(base: usize) -> Self {
+        Self { base }
+    }
+
+    /// Write a byte to the UART data register
+    #[inline]
+    fn write(&self, byte: u8) {
+        // SAFETY: Writing to UART data register at known address
         unsafe {
-            putchar(c);
+            ((self.base + DR_OFFSET) as *mut u8).write_volatile(byte);
         }
     }
+
+    /// Read a byte from the UART data register
+    #[inline]
+    fn read(&self) -> u8 {
+        // SAFETY: Reading from UART data register at known address
+        unsafe { ((self.base + DR_OFFSET) as *mut u8).read_volatile() }
+    }
+
+    /// Read the UART flag register
+    #[inline]
+    fn flags(&self) -> u32 {
+        // SAFETY: Reading from UART flag register at known address
+        unsafe { ((self.base + FR_OFFSET) as *const u32).read_volatile() }
+    }
+
+    /// Check if there is data available to read
+    #[inline]
+    fn has_data(&self) -> bool {
+        (self.flags() & RXFE) == 0
+    }
 }
 
+/// Global UART instance for QEMU virt machine
+static UART: Uart = Uart::new(0x0900_0000);
+
+// ============================================================================
+// Public API - Safe wrappers around UART operations
+// ============================================================================
+
+/// Print a string to the console
+pub fn print(s: &str) {
+    for c in s.bytes() {
+        UART.write(c);
+    }
+}
+
+/// Check if a character is available for reading
 pub fn has_char() -> bool {
-    unsafe {
-        let flags = UART0_FR.read_volatile();
-        (flags & RXFE) == 0 // If RXFE is 0, data is available
-    }
+    UART.has_data()
 }
 
-// blocking read
-fn _getchar_blocking() -> u8 {
-    unsafe {
-        // Wait until data is available
-        while !has_char() {}
-        // Read the character
-        UART0_DR.read_volatile()
-    }
-}
-
-// non-blocking read (only call if has_char() is true!)
+/// Read a character (non-blocking, only call if has_char() is true)
 pub fn getchar() -> u8 {
-    unsafe { UART0_DR.read_volatile() }
+    UART.read()
 }
 
+/// Read a character (blocking)
+#[allow(dead_code)]
+fn getchar_blocking() -> u8 {
+    while !has_char() {}
+    UART.read()
+}
+
+#[allow(dead_code)]
 const BUFFER_SIZE: usize = 100;
 
+#[allow(dead_code)]
 pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
     loop {
         if has_char() {
@@ -62,6 +105,7 @@ pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
     }
 }
 
+#[allow(dead_code)]
 pub fn print_as_akuma(s: &str) {
     print("≽ܫ≼ ... ");
     print(s);

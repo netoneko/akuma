@@ -3,6 +3,55 @@
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
+// ============================================================================
+// IRQ Guard - RAII guard for disabling interrupts
+// ============================================================================
+
+/// RAII guard that disables IRQs when created and restores them when dropped.
+/// This ensures IRQs are properly restored even if the guarded code panics.
+pub struct IrqGuard {
+    saved_daif: u64,
+}
+
+impl IrqGuard {
+    /// Create a new IRQ guard, disabling IRQs.
+    /// The previous IRQ state will be restored when this guard is dropped.
+    #[inline]
+    pub fn new() -> Self {
+        let daif: u64;
+        // SAFETY: Reading and modifying DAIF register is safe - it only affects
+        // interrupt masking for the current CPU
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+            core::arch::asm!("isb", options(nomem, nostack));
+        }
+        Self { saved_daif: daif }
+    }
+}
+
+impl Drop for IrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: Restoring DAIF register to its previous state is safe
+        unsafe {
+            core::arch::asm!("msr daif, {}", in(reg) self.saved_daif, options(nomem, nostack));
+        }
+    }
+}
+
+/// Run a closure with IRQs disabled.
+/// This is a convenience wrapper around IrqGuard.
+#[inline]
+pub fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
+    let _guard = IrqGuard::new();
+    f()
+}
+
+// ============================================================================
+// IRQ Handler Registration
+// ============================================================================
+
 type IrqHandler = fn(u32);
 
 struct IrqHandlers {

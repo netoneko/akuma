@@ -3,6 +3,8 @@
 //! Run with `tests::run_all()` after scheduler initialization.
 //! If tests fail, the kernel should halt.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use crate::console;
 use crate::threading;
 use alloc::boxed::Box;
@@ -1191,20 +1193,14 @@ fn test_thread_cleanup() -> bool {
 }
 
 // Global flag for test thread communication
-static mut TEST_THREAD_RAN: bool = false;
+static TEST_THREAD_RAN: AtomicBool = AtomicBool::new(false);
 
 fn set_test_flag(val: bool) {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(TEST_THREAD_RAN);
-        core::ptr::write_volatile(ptr, val);
-    }
+    TEST_THREAD_RAN.store(val, Ordering::Release);
 }
 
 fn get_test_flag() -> bool {
-    unsafe {
-        let ptr = core::ptr::addr_of!(TEST_THREAD_RAN);
-        core::ptr::read_volatile(ptr)
-    }
+    TEST_THREAD_RAN.load(Ordering::Acquire)
 }
 
 /// Test: Can spawn a thread without hanging
@@ -1340,28 +1336,18 @@ fn test_spawn_and_cleanup() -> bool {
 }
 
 // Counter for multiple thread test
-static mut THREAD_COUNTER: u32 = 0;
+static THREAD_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn increment_counter() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(THREAD_COUNTER);
-        let val = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, val + 1);
-    }
+    THREAD_COUNTER.fetch_add(1, Ordering::AcqRel);
 }
 
 fn get_counter() -> u32 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(THREAD_COUNTER);
-        core::ptr::read_volatile(ptr)
-    }
+    THREAD_COUNTER.load(Ordering::Acquire)
 }
 
 fn reset_counter() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(THREAD_COUNTER);
-        core::ptr::write_volatile(ptr, 0);
-    }
+    THREAD_COUNTER.store(0, Ordering::Release);
 }
 
 /// Test: Spawn multiple threads
@@ -1423,28 +1409,18 @@ fn test_spawn_multiple() -> bool {
 }
 
 // Yield counter for yield test
-static mut YIELD_COUNT: u32 = 0;
+static YIELD_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn increment_yield_count() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(YIELD_COUNT);
-        let val = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, val + 1);
-    }
+    YIELD_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
 fn get_yield_count() -> u32 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(YIELD_COUNT);
-        core::ptr::read_volatile(ptr)
-    }
+    YIELD_COUNT.load(Ordering::Acquire)
 }
 
 fn reset_yield_count() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(YIELD_COUNT);
-        core::ptr::write_volatile(ptr, 0);
-    }
+    YIELD_COUNT.store(0, Ordering::Release);
 }
 
 /// Test: Thread that yields multiple times
@@ -1534,28 +1510,18 @@ fn test_spawn_cooperative() -> bool {
 }
 
 // Yield cycle counter
-static mut YIELD_CYCLE_COUNT: u32 = 0;
+static YIELD_CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn increment_yield_cycle() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(YIELD_CYCLE_COUNT);
-        let val = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, val + 1);
-    }
+    YIELD_CYCLE_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
 fn get_yield_cycle() -> u32 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(YIELD_CYCLE_COUNT);
-        core::ptr::read_volatile(ptr)
-    }
+    YIELD_CYCLE_COUNT.load(Ordering::Acquire)
 }
 
 fn reset_yield_cycle() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(YIELD_CYCLE_COUNT);
-        core::ptr::write_volatile(ptr, 0);
-    }
+    YIELD_CYCLE_COUNT.store(0, Ordering::Release);
 }
 
 /// Test: Thread can yield and resume multiple times in sequence
@@ -1613,35 +1579,23 @@ fn test_yield_cycle() -> bool {
 }
 
 // Flags for mixed thread test
-static mut COOP_THREAD_DONE: bool = false;
-static mut PREEMPT_THREAD_DONE: bool = false;
+static COOP_THREAD_DONE: AtomicBool = AtomicBool::new(false);
+static PREEMPT_THREAD_DONE: AtomicBool = AtomicBool::new(false);
 
 fn set_coop_done(val: bool) {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(COOP_THREAD_DONE);
-        core::ptr::write_volatile(ptr, val);
-    }
+    COOP_THREAD_DONE.store(val, Ordering::Release);
 }
 
 fn get_coop_done() -> bool {
-    unsafe {
-        let ptr = core::ptr::addr_of!(COOP_THREAD_DONE);
-        core::ptr::read_volatile(ptr)
-    }
+    COOP_THREAD_DONE.load(Ordering::Acquire)
 }
 
 fn set_preempt_done(val: bool) {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(PREEMPT_THREAD_DONE);
-        core::ptr::write_volatile(ptr, val);
-    }
+    PREEMPT_THREAD_DONE.store(val, Ordering::Release);
 }
 
 fn get_preempt_done() -> bool {
-    unsafe {
-        let ptr = core::ptr::addr_of!(PREEMPT_THREAD_DONE);
-        core::ptr::read_volatile(ptr)
-    }
+    PREEMPT_THREAD_DONE.load(Ordering::Acquire)
 }
 
 /// Test: Mixed cooperative and preemptible threads

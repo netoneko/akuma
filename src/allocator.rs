@@ -40,27 +40,8 @@ pub fn stats() -> MemoryStats {
 /// No-op for backwards compatibility - IRQs are now always disabled during allocation
 pub fn enable_preemption_safe_alloc() {}
 
-/// Run a closure with IRQs disabled to prevent context switch during allocation
-/// This is always enabled once preemption starts - we unconditionally disable IRQs
-/// because the check itself could race with preemption
-#[inline(never)]
-fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
-    let daif: u64;
-    unsafe {
-        // Save current interrupt state
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-        // Disable IRQs
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-        // Memory barrier to ensure IRQs are disabled before we proceed
-        core::arch::asm!("isb", options(nomem, nostack));
-    }
-    let result = f();
-    unsafe {
-        // Restore previous interrupt state
-        core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
-    }
-    result
-}
+// Use the shared IRQ guard from the irq module
+use crate::irq::with_irqs_disabled;
 
 pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     if heap_size == 0 {

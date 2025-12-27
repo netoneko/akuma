@@ -255,7 +255,7 @@ fn kernel_main() -> ! {
 /// This is the main entry point for async networking
 fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     use core::future::Future;
-    use core::pin::Pin;
+    use core::pin::pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     console::print("[AsyncMain] Starting async network loop...\n");
@@ -276,10 +276,9 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
 
     // First, wait for IP address (DHCP or fallback to static)
     {
-        let mut wait_ip_fut = async_net::wait_for_ip(&stack);
-        let mut wait_ip_pinned = unsafe { Pin::new_unchecked(&mut wait_ip_fut) };
-        let mut runner_fut = runner.run();
-        let mut runner_pinned = unsafe { Pin::new_unchecked(&mut runner_fut) };
+        let mut wait_ip_pinned = pin!(async_net::wait_for_ip(&stack));
+        let runner_fut = runner.run();
+        let mut runner_pinned = pin!(runner_fut);
 
         loop {
             // Poll the network runner (needed for DHCP to work)
@@ -302,15 +301,10 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
         "[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
     );
 
-    // Create futures for network runner, SSH server, and memory monitor
-    let mut runner_fut = runner.run();
-    let mut ssh_fut = ssh_server::run(stack);
-    let mut mem_monitor_fut = memory_monitor();
-
-    // Pin the futures
-    let mut runner_pinned = unsafe { Pin::new_unchecked(&mut runner_fut) };
-    let mut ssh_pinned = unsafe { Pin::new_unchecked(&mut ssh_fut) };
-    let mut mem_monitor_pinned = unsafe { Pin::new_unchecked(&mut mem_monitor_fut) };
+    // Pin the futures directly using the pin! macro (no unsafe needed)
+    let mut runner_pinned = pin!(runner.run());
+    let mut ssh_pinned = pin!(ssh_server::run(stack));
+    let mut mem_monitor_pinned = pin!(memory_monitor());
 
     loop {
         // Poll the network runner
