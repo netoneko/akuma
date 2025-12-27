@@ -31,3 +31,13 @@ curve25519-dalek = { version = "4", default-features = false, features = ["alloc
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
 rand_core = { version = "0.6", default-features = false }
+
+# Embassy async runtime (for bare metal aarch64)
+embassy-executor = { version = "0.7", default-features = false, features = ["nightly", "arch-spin"] }
+embassy-time = { version = "0.4", default-features = false, features = ["generic-queue-8"] }
+embassy-time-driver = { version = "0.2", default-features = false }
+embassy-net = { version = "0.6", default-features = false, features = ["proto-ipv4", "tcp", "medium-ethernet"] }
+embassy-net-driver = { version = "0.2", default-features = false }
+embassy-sync = { version = "0.6", default-features = false }
+critical-section = { version = "1.2", default-features = false }
+static_cell = { version = "2.1" }

@@ -91,11 +91,7 @@ pub fn acknowledge_irq() -> Option<u32> {
         let irq = iar & 0x3FF;
 
         // IRQ 1023 is a spurious interrupt
-        if irq >= 1020 {
-            None
-        } else {
-            Some(irq)
-        }
+        if irq >= 1020 { None } else { Some(irq) }
     }
 }
 

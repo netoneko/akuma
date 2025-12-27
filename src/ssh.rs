@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -22,12 +22,12 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::network;
-use crate::ssh_transport::{self, SshEvent};
 use crate::ssh_crypto::{
-    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, split_first_word,
-    trim_bytes, write_namelist, write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256,
-    SimpleRng, AES_IV_SIZE, AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
+    AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
+    SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
+    split_first_word, trim_bytes, write_namelist, write_string, write_u32,
 };
+use crate::ssh_transport::{self, SshEvent};
 
 // ============================================================================
 // SSH Constants
@@ -363,7 +363,8 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
             }
             response.extend_from_slice(b"\r\n");
         }
-        b"cat" => {
+        b"akuma" => {
+            // shows picture of a cat
             // Convert \n to \r\n for proper SSH terminal display
             for &byte in AKUMA_79 {
                 if byte == b'\n' {
@@ -381,10 +382,11 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
         }
         b"stats" => {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
-            let stats =
-                alloc::format!(
+            let stats = alloc::format!(
                 "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
-                connections, bytes_rx, bytes_tx
+                connections,
+                bytes_rx,
+                bytes_tx
             );
             response.extend_from_slice(stats.as_bytes());
         }

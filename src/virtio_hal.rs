@@ -14,7 +14,7 @@ unsafe impl Hal for VirtioHal {
         pages: usize,
         _direction: virtio_drivers::BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
-        use alloc::alloc::{alloc_zeroed, Layout};
+        use alloc::alloc::{Layout, alloc_zeroed};
 
         let layout = Layout::from_size_align(pages * 4096, 4096).unwrap();
         let virt = unsafe { alloc_zeroed(layout) };
@@ -35,7 +35,7 @@ unsafe impl Hal for VirtioHal {
         vaddr: NonNull<u8>,
         pages: usize,
     ) -> i32 {
-        use alloc::alloc::{dealloc, Layout};
+        use alloc::alloc::{Layout, dealloc};
 
         let layout = Layout::from_size_align(pages * 4096, 4096).unwrap();
         unsafe {

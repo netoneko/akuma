@@ -111,4 +111,3 @@ pub fn close() {
         let _ = socket.listen(SSH_PORT);
     });
 }
-

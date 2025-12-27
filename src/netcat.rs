@@ -105,4 +105,3 @@ pub fn netcat_server_entry() -> ! {
         threading::yield_now();
     }
 }
-

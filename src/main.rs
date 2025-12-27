@@ -6,8 +6,11 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
+mod async_tests;
 mod boot;
 mod console;
+mod embassy_net_driver;
+mod embassy_time_driver;
 mod exceptions;
 mod executor;
 mod gic;
@@ -110,12 +113,16 @@ fn kernel_main() -> ! {
     exceptions::init();
     console::print("IRQ handling enabled\n");
 
-    // Skip executor - using threads instead
-    // executor::init();
-
     // Initialize timer
     timer::init();
     console::print("Timer initialized\n");
+
+    // Initialize Embassy time driver (bridges ARM timer to Embassy async)
+    embassy_time_driver::init();
+    console::print("Embassy time driver initialized\n");
+
+    // Initialize Embassy executor
+    executor::init();
 
     // Check timer hardware
     let freq = timer::read_frequency();
@@ -207,6 +214,14 @@ fn kernel_main() -> ! {
         }
     }
     console::print("--- Network Initialization Done ---\n\n");
+
+    // =========================================================================
+    // Run async tests (after network is ready)
+    // =========================================================================
+    if !async_tests::run_all() {
+        console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
+        halt();
+    }
 
     // Thread 0 becomes the idle loop
     console::print("[Idle] Entering idle loop (network server running in background)\n");

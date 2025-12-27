@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use aes::Aes128;
-use ctr::{cipher::StreamCipher, Ctr128BE};
+use ctr::{Ctr128BE, cipher::StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 

@@ -1,207 +1,172 @@
-use alloc::boxed::Box;
+//! Embassy-based async executor for bare-metal aarch64
+//!
+//! This module provides async task execution using Embassy's executor.
+//! The executor integrates with our timer infrastructure for proper waking.
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_executor::{Spawner, raw};
+
+use crate::console;
+
+// ============================================================================
+// Executor Storage
+// ============================================================================
+
+/// Safe wrapper for executor storage
+struct ExecutorStorage {
+    inner: UnsafeCell<core::mem::MaybeUninit<raw::Executor>>,
+    initialized: AtomicBool,
+}
+
+// SAFETY: We control access via the initialized flag and only access from main thread
+unsafe impl Sync for ExecutorStorage {}
+
+impl ExecutorStorage {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(core::mem::MaybeUninit::uninit()),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    fn init(&self) -> bool {
+        if self.initialized.swap(true, Ordering::AcqRel) {
+            return false; // Already initialized
+        }
+
+        // SAFETY: We're the only writer (protected by swap above)
+        unsafe {
+            (*self.inner.get()).write(raw::Executor::new(core::ptr::null_mut()));
+        }
+        true
+    }
+
+    fn get(&self) -> Option<&raw::Executor> {
+        if self.initialized.load(Ordering::Acquire) {
+            // SAFETY: Initialized and we only read
+            Some(unsafe { (*self.inner.get()).assume_init_ref() })
+        } else {
+            None
+        }
+    }
+}
+
+static EXECUTOR: ExecutorStorage = ExecutorStorage::new();
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Initialize the Embassy executor
+/// Must be called once before any async tasks can be spawned
+pub fn init() {
+    if EXECUTOR.init() {
+        console::print("[Executor] Embassy executor initialized\n");
+    }
+}
+
+/// Run the executor polling loop once
+/// Call this regularly from the main loop or a dedicated thread
+/// Returns true if executor is initialized and was polled
+pub fn run_once() -> bool {
+    let executor = match EXECUTOR.get() {
+        Some(e) => e,
+        None => return false,
+    };
+
+    // Poll all ready tasks
+    // SAFETY: We're in single-threaded context and this is the only place we poll
+    unsafe {
+        executor.poll();
+    }
+
+    true
+}
+
+/// Get a spawner for creating new tasks
+/// Returns None if executor is not initialized
+pub fn spawner() -> Option<Spawner> {
+    EXECUTOR.get().map(|e| e.spawner())
+}
+
+/// Run the executor until explicitly stopped
+/// This is useful for running in a dedicated thread
+pub fn run_blocking() {
+    loop {
+        run_once();
+        // Yield to other threads
+        crate::threading::yield_now();
+    }
+}
+
+// ============================================================================
+// Task Spawning Helpers
+// ============================================================================
+
+/// Check if executor is initialized and can spawn tasks
+pub fn can_spawn() -> bool {
+    EXECUTOR.get().is_some()
+}
+
+// ============================================================================
+// Timer Integration
+// ============================================================================
+
+/// Call this from timer interrupt to process embassy time alarms
+/// This triggers wakers for tasks waiting on embassy_time
+pub fn on_timer_tick() {
+    crate::embassy_time_driver::on_timer_interrupt();
+}
+
+// ============================================================================
+// Legacy API (for compatibility)
+// ============================================================================
+
+/// Check if executor is initialized
+pub fn has_tasks() -> bool {
+    EXECUTOR.get().is_some()
+}
+
+// ============================================================================
+// IRQ Work Queue (kept for interrupt -> task communication)
+// ============================================================================
+
 use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use spinning_top::Spinlock;
 
-static EXECUTOR: Spinlock<Option<Executor>> = Spinlock::new(None);
-
-// IRQ-safe work queue - can be accessed from interrupt context
+/// Types of work that can be queued from interrupt context
 pub enum IrqWork {
+    /// Signal that the executor should poll
     RunExecutorOnce,
+    /// Wake a specific task (by signaling via waker)
+    WakeTask,
 }
 
 static IRQ_WORK_QUEUE: Spinlock<Vec<IrqWork>> = Spinlock::new(Vec::new());
 
-pub struct Executor {
-    task_queue: Vec<Task>, // Changed from VecDeque to Vec
-}
-
-struct Task {
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
-}
-
-impl Executor {
-    pub fn new() -> Self {
-        Self {
-            task_queue: Vec::new(),
-        }
-    }
-
-    pub fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        let task = Task {
-            future: Box::pin(future),
-        };
-        self.task_queue.push(task);
-    }
-
-    pub fn run(&mut self) {
-        while !self.task_queue.is_empty() {
-            let mut task = self.task_queue.remove(0);
-            let waker = dummy_waker();
-            let mut context = Context::from_waker(&waker);
-
-            match task.future.as_mut().poll(&mut context) {
-                Poll::Ready(()) => {
-                    // Task completed
-                }
-                Poll::Pending => {
-                    // Re-queue the task
-                    self.task_queue.push(task);
-                }
-            }
-        }
-    }
-
-    pub fn run_once(&mut self) -> bool {
-        if self.task_queue.is_empty() {
-            return false;
-        }
-
-        // Poll all tasks in round-robin fashion without removing/moving them
-        // This avoids the Vec::remove() hang issue
-        let waker = dummy_waker();
-        let mut context = Context::from_waker(&waker);
-
-        let mut completed_indices = Vec::new();
-
-        for (i, task) in self.task_queue.iter_mut().enumerate() {
-            match task.future.as_mut().poll(&mut context) {
-                Poll::Ready(()) => {
-                    completed_indices.push(i);
-                }
-                Poll::Pending => {
-                    // Task still pending, leave it in the queue
-                }
-            }
-        }
-
-        // Remove completed tasks in reverse order to avoid index shifting issues
-        for i in completed_indices.iter().rev() {
-            self.task_queue.swap_remove(*i);
-        }
-
-        !self.task_queue.is_empty()
-    }
-
-    pub fn has_tasks(&self) -> bool {
-        !self.task_queue.is_empty()
-    }
-}
-
-pub fn init() {
-    let mut executor_lock = EXECUTOR.lock();
-    *executor_lock = Some(Executor::new());
-}
-
-pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
-    let mut executor_lock = EXECUTOR.lock();
-    if let Some(executor) = executor_lock.as_mut() {
-        executor.spawn(future);
-    }
-}
-
-pub fn run_once() -> bool {
-    let mut executor_lock = EXECUTOR.lock();
-    if let Some(executor) = executor_lock.as_mut() {
-        executor.run_once()
-    } else {
-        false
-    }
-}
-
-pub fn has_tasks() -> bool {
-    let executor_lock = EXECUTOR.lock();
-    if let Some(executor) = executor_lock.as_ref() {
-        executor.has_tasks()
-    } else {
-        false
-    }
-}
-
-/// Queue work to be done from IRQ context (safe to call from interrupts)
+/// Queue work from IRQ context (safe to call from interrupts)
 pub fn queue_irq_work(work: IrqWork) {
-    // Try to acquire lock - if we can't, skip it (prevents deadlock)
     if let Some(mut queue) = IRQ_WORK_QUEUE.try_lock() {
         queue.push(work);
     }
-    // If we can't get the lock, that's OK - main loop is already processing work
 }
 
-/// Process any pending IRQ work (call from main loop)
+/// Process pending IRQ work (call from main loop)
 pub fn process_irq_work() {
-    // Take all pending work
     let work_items = {
-        let mut queue = IRQ_WORK_QUEUE.lock();
-        core::mem::take(&mut *queue)
+        if let Some(mut queue) = IRQ_WORK_QUEUE.try_lock() {
+            core::mem::take(&mut *queue)
+        } else {
+            return;
+        }
     };
 
-    // Process each item
     for work in work_items {
         match work {
-            IrqWork::RunExecutorOnce => {
+            IrqWork::RunExecutorOnce | IrqWork::WakeTask => {
                 run_once();
             }
         }
     }
-}
-
-// Dummy waker implementation for basic executor
-fn dummy_raw_waker() -> RawWaker {
-    fn no_op(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        dummy_raw_waker()
-    }
-
-    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
-    RawWaker::new(core::ptr::null::<()>(), vtable)
-}
-
-fn dummy_waker() -> Waker {
-    unsafe { Waker::from_raw(dummy_raw_waker()) }
-}
-
-// Time-based async timer using actual microseconds
-pub struct Timer {
-    deadline_us: u64,
-}
-
-impl Timer {
-    pub fn new(duration_us: u64) -> Self {
-        let now = crate::timer::uptime_us();
-        Self {
-            deadline_us: now.wrapping_add(duration_us),
-        }
-    }
-}
-
-impl Future for Timer {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let now = crate::timer::uptime_us();
-
-        // Check if current time has reached or passed the deadline
-        if now >= self.deadline_us {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-// Sleep for specified microseconds
-pub fn sleep_us(us: u64) -> Timer {
-    Timer::new(us)
-}
-
-// Sleep for specified milliseconds
-pub fn sleep_ms(ms: u64) -> Timer {
-    Timer::new(ms * 1_000)
-}
-
-// Sleep for specified seconds
-pub fn sleep_sec(sec: u64) -> Timer {
-    Timer::new(sec * 1_000_000)
 }
