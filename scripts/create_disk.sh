@@ -4,7 +4,9 @@
 
 set -e
 
-SIZE_MB=${1:-32}
+# FAT32 requires more than 65525 clusters to work properly.
+# 128MB with default cluster size gives us ~130k clusters.
+SIZE_MB=${1:-128}
 DISK_IMG="disk.img"
 
 echo "Creating ${SIZE_MB}MB FAT32 disk image..."

@@ -18,6 +18,7 @@ mod embassy_virtio_driver;
 mod exceptions;
 mod executor;
 mod fs;
+mod fs_tests;
 mod gic;
 mod irq;
 mod netcat_server;
@@ -197,6 +198,9 @@ fn kernel_main() -> ! {
                             }
                         }
                     }
+
+                    // Run filesystem tests
+                    fs_tests::run_all_tests();
                 }
                 Err(e) => {
                     console::print("[FS] Filesystem init failed: ");

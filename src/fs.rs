@@ -326,10 +326,15 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
         let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
 
         let mut file = root_dir
-            .open_file_in_dir(sfn, Mode::ReadWriteCreateOrTruncate)
+            .open_file_in_dir(sfn.clone(), Mode::ReadWriteCreateOrTruncate)
             .map_err(convert_error)?;
 
         file.write(data).map_err(convert_error)?;
+
+        // Close the file explicitly to ensure data is flushed
+        drop(file);
+        drop(root_dir);
+        drop(volume);
 
         Ok(())
     })
@@ -353,10 +358,15 @@ pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
         let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
 
         let mut file = root_dir
-            .open_file_in_dir(sfn, Mode::ReadWriteCreateOrAppend)
+            .open_file_in_dir(sfn.clone(), Mode::ReadWriteCreateOrAppend)
             .map_err(convert_error)?;
 
         file.write(data).map_err(convert_error)?;
+
+        // Close the file explicitly to ensure data is flushed
+        drop(file);
+        drop(root_dir);
+        drop(volume);
 
         Ok(())
     })
@@ -507,9 +517,9 @@ pub fn stats() -> Result<FsStats, FsError> {
     }
 
     let capacity = block::capacity().ok_or(FsError::BlockDeviceNotInitialized)?;
-    let cluster_size = 4096u32;
+    let cluster_size = 512u32; // Sector size for basic estimation
     let total_clusters = (capacity / cluster_size as u64) as u32;
-    let free_clusters = total_clusters * 9 / 10;
+    let free_clusters = total_clusters * 9 / 10; // Rough estimate
 
     Ok(FsStats {
         cluster_size,
