@@ -163,6 +163,25 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
                     gw.octets()[3]
                 ));
             }
+            // Log DNS servers
+            if config.dns_servers.is_empty() {
+                log("[AsyncNet] WARNING: No DNS servers provided by DHCP\n");
+            } else {
+                log("[AsyncNet] DNS Servers: ");
+                for (i, dns) in config.dns_servers.iter().enumerate() {
+                    if i > 0 {
+                        console::print(", ");
+                    }
+                    console::print(&alloc::format!(
+                        "{}.{}.{}.{}",
+                        dns.octets()[0],
+                        dns.octets()[1],
+                        dns.octets()[2],
+                        dns.octets()[3]
+                    ));
+                }
+                log("\n");
+            }
             return;
         }
 
@@ -191,6 +210,7 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
                 DEFAULT_GATEWAY.octets()[2],
                 DEFAULT_GATEWAY.octets()[3]
             ));
+            log("[AsyncNet] WARNING: No DNS servers configured (static fallback)\n");
             return;
         }
 
