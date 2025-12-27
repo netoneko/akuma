@@ -106,20 +106,36 @@ fn cmd_ls(args: &[u8], response: &mut Vec<u8>) {
     match crate::fs::list_dir(path) {
         Ok(entries) => {
             if entries.is_empty() {
-                response.extend_from_slice(b"(empty directory)\r\n");
-            } else {
-                for entry in entries {
-                    if entry.is_dir {
-                        let line = alloc::format!("  [DIR]  {}\r\n", entry.name);
-                        response.extend_from_slice(line.as_bytes());
-                    } else {
-                        let line = alloc::format!(
-                            "  [FILE] {:20} {:>8} bytes\r\n",
-                            entry.name, entry.size
-                        );
-                        response.extend_from_slice(line.as_bytes());
-                    }
-                }
+                // Nothing to show (empty directory)
+                return;
+            }
+            
+            // Collect entries: directories first, then files, both sorted alphabetically
+            let mut dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).collect();
+            let mut files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+            
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            
+            // ANSI color codes for zsh-like output
+            const COLOR_DIR: &[u8] = b"\x1b[1;34m";   // Bold blue for directories
+            const COLOR_RESET: &[u8] = b"\x1b[0m";
+            
+            // Display directories first (with trailing /)
+            for entry in dirs {
+                let name = entry.name.to_lowercase();
+                response.extend_from_slice(COLOR_DIR);
+                response.extend_from_slice(name.as_bytes());
+                response.extend_from_slice(b"/");
+                response.extend_from_slice(COLOR_RESET);
+                response.extend_from_slice(b"\r\n");
+            }
+            
+            // Display files
+            for entry in files {
+                let name = entry.name.to_lowercase();
+                response.extend_from_slice(name.as_bytes());
+                response.extend_from_slice(b"\r\n");
             }
         }
         Err(e) => {

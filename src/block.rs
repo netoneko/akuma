@@ -96,7 +96,6 @@ impl BlockDevice for VirtioBlockDevice {
         &self,
         blocks: &mut [embedded_sdmmc::Block],
         start_block_idx: embedded_sdmmc::BlockIdx,
-        _reason: &str,
     ) -> Result<(), Self::Error> {
         let start = start_block_idx.0 as usize;
 
@@ -155,9 +154,8 @@ impl BlockDevice for &mut VirtioBlockDevice {
         &self,
         blocks: &mut [embedded_sdmmc::Block],
         start_block_idx: embedded_sdmmc::BlockIdx,
-        reason: &str,
     ) -> Result<(), Self::Error> {
-        (**self).read(blocks, start_block_idx, reason)
+        (**self).read(blocks, start_block_idx)
     }
 
     fn write(

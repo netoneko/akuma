@@ -5,7 +5,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use embedded_sdmmc::{Mode, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{LfnBuffer, Mode, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use spinning_top::Spinlock;
 
 use crate::block;
@@ -157,6 +157,30 @@ pub struct DirEntry {
 static FS_INITIALIZED: Spinlock<bool> = Spinlock::new(false);
 
 // ============================================================================
+// Path Utilities
+// ============================================================================
+
+/// Split a path into (parent_path, filename)
+/// e.g., "/tmp/foo/bar.txt" -> ("/tmp/foo", "bar.txt")
+/// e.g., "/bar.txt" -> ("", "bar.txt")
+/// e.g., "bar.txt" -> ("", "bar.txt")
+fn split_path(path: &str) -> (&str, &str) {
+    let path = path.trim_start_matches('/');
+    match path.rfind('/') {
+        Some(idx) => (&path[..idx], &path[idx + 1..]),
+        None => ("", path),
+    }
+}
+
+/// Split path into components
+fn path_components(path: &str) -> Vec<&str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -170,10 +194,10 @@ pub fn init() -> Result<(), FsError> {
     }
 
     let result = block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
 
         // Try to open volume 0
-        let mut volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
             Err(e) => {
                 log("[FS] Failed to open volume: ");
@@ -185,7 +209,7 @@ pub fn init() -> Result<(), FsError> {
         log("[FS] FAT volume opened successfully\n");
 
         // Try to open root directory to verify
-        let mut root_dir = match volume.open_root_dir() {
+        let root_dir = match volume.open_root_dir() {
             Ok(d) => d,
             Err(e) => {
                 log("[FS] Failed to open root directory: ");
@@ -226,46 +250,95 @@ pub fn is_initialized() -> bool {
     *FS_INITIALIZED.lock()
 }
 
-/// List directory contents
+/// Find a ShortFileName by matching against LFN or SFN (case-insensitive)
+/// Returns the ShortFileName from the matching DirEntry
+fn find_entry_sfn<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &embedded_sdmmc::Directory<D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> Result<ShortFileName, FsError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut lfn_storage = [0u8; 256];
+    let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
+    let mut found_sfn: Option<ShortFileName> = None;
+    let name_lower = name.to_lowercase();
+
+    dir.iterate_dir_lfn(&mut lfn_buffer, |entry, lfn| {
+        if found_sfn.is_some() {
+            return;
+        }
+        
+        let entry_name = match lfn {
+            Some(long_name) => long_name.to_lowercase(),
+            None => entry.name.to_string().to_lowercase(),
+        };
+        
+        if entry_name == name_lower {
+            found_sfn = Some(entry.name.clone());
+        }
+    })
+    .map_err(convert_error)?;
+
+    found_sfn.ok_or(FsError::NotFound)
+}
+
+/// Navigate to a directory by path components, using change_dir
+/// Returns error if any component is not found
+fn navigate_to_dir<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &mut embedded_sdmmc::Directory<D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    components: &[&str],
+) -> Result<(), FsError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    for component in components {
+        let sfn = find_entry_sfn(dir, component)?;
+        dir.change_dir(sfn).map_err(convert_error)?;
+    }
+    Ok(())
+}
+
+/// List directory contents with Long Filename (LFN) support
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
         let mut entries = Vec::new();
+        
+        // Buffer for long filenames (up to 255 UTF-8 bytes)
+        let mut lfn_storage = [0u8; 256];
+        let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
 
-        if path.is_empty() || path == "/" {
-            // List root directory
-            root_dir
-                .iterate_dir(|entry| {
-                    entries.push(DirEntry {
-                        name: entry.name.to_string(),
-                        is_dir: entry.attributes.is_directory(),
-                        size: entry.size as u64,
-                    });
-                })
-                .map_err(convert_error)?;
-        } else {
-            // Navigate to subdirectory
-            let path = path.trim_start_matches('/');
-            let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
-            let mut dir = root_dir.open_dir(sfn).map_err(convert_error)?;
-            dir.iterate_dir(|entry| {
+        let components = path_components(path);
+        
+        // Navigate to target directory
+        navigate_to_dir(&mut current_dir, &components)?;
+        
+        // List directory contents
+        current_dir
+            .iterate_dir_lfn(&mut lfn_buffer, |entry, lfn| {
+                let name = match lfn {
+                    Some(long_name) => long_name.to_string(),
+                    None => entry.name.to_string(),
+                };
                 entries.push(DirEntry {
-                    name: entry.name.to_string(),
+                    name,
                     is_dir: entry.attributes.is_directory(),
                     size: entry.size as u64,
                 });
             })
             .map_err(convert_error)?;
-        }
 
         Ok(entries)
     })
@@ -279,16 +352,22 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the target directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Find the file's short filename
+        let sfn = find_entry_sfn(&current_dir, filename)?;
 
-        let mut file = root_dir
+        let file = current_dir
             .open_file_in_dir(sfn, Mode::ReadOnly)
             .map_err(convert_error)?;
 
@@ -316,24 +395,37 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the target directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Try to find existing file's short filename, or create new with the given name
+        let sfn = match find_entry_sfn(&current_dir, filename) {
+            Ok(sfn) => sfn,
+            Err(FsError::NotFound) => {
+                // File doesn't exist - use the provided filename (must be 8.3 compatible for new files)
+                ShortFileName::create_from_str(filename).map_err(|_| FsError::InvalidPath)?
+            }
+            Err(e) => return Err(e),
+        };
 
-        let mut file = root_dir
-            .open_file_in_dir(sfn.clone(), Mode::ReadWriteCreateOrTruncate)
+        let file = current_dir
+            .open_file_in_dir(sfn, Mode::ReadWriteCreateOrTruncate)
             .map_err(convert_error)?;
 
         file.write(data).map_err(convert_error)?;
 
         // Close the file explicitly to ensure data is flushed
         drop(file);
-        drop(root_dir);
+        drop(current_dir);
         drop(volume);
 
         Ok(())
@@ -348,24 +440,37 @@ pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the target directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Try to find existing file's short filename, or create new with the given name
+        let sfn = match find_entry_sfn(&current_dir, filename) {
+            Ok(sfn) => sfn,
+            Err(FsError::NotFound) => {
+                // File doesn't exist - use the provided filename (must be 8.3 compatible for new files)
+                ShortFileName::create_from_str(filename).map_err(|_| FsError::InvalidPath)?
+            }
+            Err(e) => return Err(e),
+        };
 
-        let mut file = root_dir
-            .open_file_in_dir(sfn.clone(), Mode::ReadWriteCreateOrAppend)
+        let file = current_dir
+            .open_file_in_dir(sfn, Mode::ReadWriteCreateOrAppend)
             .map_err(convert_error)?;
 
         file.write(data).map_err(convert_error)?;
 
         // Close the file explicitly to ensure data is flushed
         drop(file);
-        drop(root_dir);
+        drop(current_dir);
         drop(volume);
 
         Ok(())
@@ -380,16 +485,21 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
-
-        root_dir.make_dir_in_dir(sfn).map_err(convert_error)?;
+        let (dir_path, dirname) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the parent directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Create the new directory (must be 8.3 compatible)
+        let sfn = ShortFileName::create_from_str(dirname).map_err(|_| FsError::InvalidPath)?;
+        current_dir.make_dir_in_dir(sfn).map_err(convert_error)?;
 
         Ok(())
     })
@@ -403,16 +513,21 @@ pub fn remove_file(path: &str) -> Result<(), FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
-
-        root_dir.delete_file_in_dir(sfn).map_err(convert_error)?;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the target directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Find the file's short filename
+        let sfn = find_entry_sfn(&current_dir, filename)?;
+        current_dir.delete_file_in_dir(sfn).map_err(convert_error)?;
 
         Ok(())
     })
@@ -431,34 +546,34 @@ pub fn exists(path: &str) -> bool {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let mut root_dir = match volume.open_root_dir() {
+        let mut current_dir = match volume.open_root_dir() {
             Ok(d) => d,
             Err(_) => return false,
         };
 
-        let path = path.trim_start_matches('/');
-        if path.is_empty() {
-            return true;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        if dir_components.is_empty() && filename.is_empty() {
+            return true; // Root always exists
         }
 
-        let sfn = match ShortFileName::create_from_str(path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
+        // Navigate to parent directory
+        if navigate_to_dir(&mut current_dir, &dir_components).is_err() {
+            return false;
+        }
 
-        let mut found = false;
-        let _ = root_dir.iterate_dir(|entry| {
-            if entry.name == sfn {
-                found = true;
-            }
-        });
-
-        found
+        // Check if the final component exists
+        if filename.is_empty() {
+            return true;
+        }
+        
+        find_entry_sfn(&current_dir, filename).is_ok()
     })
     .unwrap_or(false)
 }
@@ -470,16 +585,22 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
     }
 
     block::with_device(|device| {
-        let mut volume_mgr = VolumeManager::new(device, AkumaTimeSource);
-        let mut volume = volume_mgr
+        let volume_mgr = VolumeManager::new(device, AkumaTimeSource);
+        let volume = volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(convert_error)?;
-        let mut root_dir = volume.open_root_dir().map_err(convert_error)?;
+        let mut current_dir = volume.open_root_dir().map_err(convert_error)?;
 
-        let path = path.trim_start_matches('/');
-        let sfn = ShortFileName::create_from_str(path).map_err(|_| FsError::InvalidPath)?;
+        let (dir_path, filename) = split_path(path);
+        let dir_components = path_components(dir_path);
+        
+        // Navigate to the target directory
+        navigate_to_dir(&mut current_dir, &dir_components)?;
+        
+        // Find the file's short filename
+        let sfn = find_entry_sfn(&current_dir, filename)?;
 
-        let file = root_dir
+        let file = current_dir
             .open_file_in_dir(sfn, Mode::ReadOnly)
             .map_err(convert_error)?;
 
