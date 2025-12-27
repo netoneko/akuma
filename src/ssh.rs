@@ -541,7 +541,7 @@ async fn handle_message(
                     core::str::from_utf8(req_type)
                 ));
 
-                let success = matches!(req_type, b"pty-req" | b"shell" | b"env");
+                let success = matches!(req_type, b"pty-req" | b"shell" | b"env" | b"exec");
 
                 if want_reply {
                     let msg_type = if success {
@@ -568,6 +568,24 @@ async fn handle_message(
                     )
                     .await?;
                     send_channel_data(stream, session, b"akuma> ").await?;
+                } else if req_type == b"exec" {
+                    // Handle exec request - extract and execute the command
+                    offset += 1; // skip want_reply byte
+                    if let Some(cmd_bytes) = read_string(payload, &mut offset) {
+                        log(&alloc::format!(
+                            "[SSH] Exec command: {:?}\n",
+                            core::str::from_utf8(cmd_bytes)
+                        ));
+                        let response = shell::execute_command(cmd_bytes);
+                        if !response.is_empty() {
+                            send_channel_data(stream, session, &response).await?;
+                        }
+                        send_channel_data(stream, session, b"\n").await?;
+                    }
+                    // Send EOF after exec - client will send CLOSE, we respond to that
+                    let mut eof = vec![SSH_MSG_CHANNEL_EOF];
+                    write_u32(&mut eof, session.client_channel);
+                    send_packet(stream, &eof, session).await?;
                 }
             }
         }
