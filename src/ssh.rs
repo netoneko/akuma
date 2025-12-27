@@ -1,4 +1,4 @@
-//! SSH-2 Protocol Implementation
+//! SSH-2 Protocol Implementation (Async Multi-Session)
 //!
 //! Implements a minimal SSH-2 server that works with real SSH clients.
 //! Supports:
@@ -8,26 +8,27 @@
 //! - hmac-sha2-256 MAC
 //! - Accepts any authentication
 //! - Shell with basic commands
+//! - Multiple concurrent SSH sessions
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::akuma::AKUMA_79;
+use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::network;
 use crate::ssh_crypto::{
-    AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
-    SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
-    split_first_word, trim_bytes, write_namelist, write_string, write_u32,
+    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, split_first_word,
+    trim_bytes, write_namelist, write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256,
+    SimpleRng, AES_IV_SIZE, AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
 };
-use crate::ssh_transport::{self, SshEvent};
 
 // ============================================================================
 // SSH Constants
@@ -67,6 +68,29 @@ const MAC_ALGO: &str = "hmac-sha2-256";
 const COMPRESS_ALGO: &str = "none";
 
 // ============================================================================
+// Shared Host Key (for all sessions)
+// ============================================================================
+
+static HOST_KEY: Spinlock<Option<SigningKey>> = Spinlock::new(None);
+
+/// Initialize the shared host key (call once at startup)
+pub fn init_host_key() {
+    let mut guard = HOST_KEY.lock();
+    if guard.is_none() {
+        let mut rng = SimpleRng::new();
+        let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
+        rng.fill_bytes(&mut key_bytes);
+        *guard = Some(SigningKey::from_bytes(&key_bytes));
+        log("[SSH] Host key initialized\n");
+    }
+}
+
+/// Get a clone of the shared host key
+fn get_host_key() -> Option<SigningKey> {
+    HOST_KEY.lock().clone()
+}
+
+// ============================================================================
 // SSH State Machine
 // ============================================================================
 
@@ -83,7 +107,7 @@ enum SshState {
 }
 
 // ============================================================================
-// SSH Session
+// SSH Session (per-connection, no global state)
 // ============================================================================
 
 struct SshSession {
@@ -105,14 +129,14 @@ struct SshSession {
 impl SshSession {
     fn new() -> Self {
         Self {
-            state: SshState::Disconnected,
+            state: SshState::AwaitingVersion,
             rng: SimpleRng::new(),
             client_version: Vec::new(),
             server_version: SSH_VERSION[..SSH_VERSION.len() - 2].to_vec(),
             client_kexinit: Vec::new(),
             server_kexinit: Vec::new(),
             session_id: [0u8; 32],
-            host_key: None,
+            host_key: get_host_key(),
             crypto: CryptoState::new(),
             input_buffer: Vec::new(),
             channel_open: false,
@@ -120,27 +144,7 @@ impl SshSession {
             line_buffer: Vec::new(),
         }
     }
-
-    fn reset(&mut self) {
-        self.state = SshState::Disconnected;
-        self.client_version.clear();
-        self.client_kexinit.clear();
-        self.server_kexinit.clear();
-        self.session_id = [0u8; 32];
-        self.crypto = CryptoState::new();
-        self.input_buffer.clear();
-        self.channel_open = false;
-        self.line_buffer.clear();
-    }
-
-    fn generate_host_key(&mut self) {
-        let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
-        self.rng.fill_bytes(&mut key_bytes);
-        self.host_key = Some(SigningKey::from_bytes(&key_bytes));
-    }
 }
-
-static SESSION: Spinlock<Option<SshSession>> = Spinlock::new(None);
 
 // ============================================================================
 // KEXINIT Message
@@ -303,33 +307,47 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
 }
 
 // ============================================================================
-// Packet Sending
+// Async Packet Sending
 // ============================================================================
 
-fn send_raw(data: &[u8]) {
-    ssh_transport::send(data);
+async fn send_raw(stream: &mut TcpStream, data: &[u8]) -> Result<(), TcpError> {
+    stream.write_all(data).await
 }
 
-fn send_unencrypted_packet(payload: &[u8], session: &mut SshSession) {
+async fn send_unencrypted_packet(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    session: &mut SshSession,
+) -> Result<(), TcpError> {
     let packet = build_packet(payload);
     session.crypto.encrypt_seq = session.crypto.encrypt_seq.wrapping_add(1);
-    send_raw(&packet);
+    send_raw(stream, &packet).await
 }
 
-fn send_encrypted_packet(payload: &[u8], session: &mut SshSession) {
+async fn send_encrypted_packet(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    session: &mut SshSession,
+) -> Result<(), TcpError> {
     if let Some(cipher) = session.crypto.encrypt_cipher.as_mut() {
         let seq = session.crypto.encrypt_seq;
         session.crypto.encrypt_seq = seq.wrapping_add(1);
         let packet = build_encrypted_packet(payload, cipher, &session.crypto.encrypt_mac_key, seq);
-        send_raw(&packet);
+        send_raw(stream, &packet).await
+    } else {
+        Ok(())
     }
 }
 
-fn send_packet(payload: &[u8], session: &mut SshSession) {
+async fn send_packet(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    session: &mut SshSession,
+) -> Result<(), TcpError> {
     if session.crypto.encrypt_cipher.is_some() && session.state != SshState::AwaitingNewKeys {
-        send_encrypted_packet(payload, session);
+        send_encrypted_packet(stream, payload, session).await
     } else {
-        send_unencrypted_packet(payload, session);
+        send_unencrypted_packet(stream, payload, session).await
     }
 }
 
@@ -337,14 +355,18 @@ fn send_packet(payload: &[u8], session: &mut SshSession) {
 // Shell Handling
 // ============================================================================
 
-fn send_channel_data(session: &mut SshSession, data: &[u8]) {
+async fn send_channel_data(
+    stream: &mut TcpStream,
+    session: &mut SshSession,
+    data: &[u8],
+) -> Result<(), TcpError> {
     if !session.channel_open {
-        return;
+        return Ok(());
     }
     let mut payload = vec![SSH_MSG_CHANNEL_DATA];
     write_u32(&mut payload, session.client_channel);
     write_string(&mut payload, data);
-    send_packet(&payload, session);
+    send_packet(stream, &payload, session).await
 }
 
 fn execute_command(line: &[u8]) -> Vec<u8> {
@@ -363,7 +385,7 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
             }
             response.extend_from_slice(b"\r\n");
         }
-        b"akuma" => {
+        b"akuma" | b"cat" => {
             // shows picture of a cat
             // Convert \n to \r\n for proper SSH terminal display
             for &byte in AKUMA_79 {
@@ -384,9 +406,7 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
             let stats = alloc::format!(
                 "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
-                connections,
-                bytes_rx,
-                bytes_tx
+                connections, bytes_rx, bytes_tx
             );
             response.extend_from_slice(stats.as_bytes());
         }
@@ -414,70 +434,79 @@ fn is_quit_command(line: &[u8]) -> bool {
     cmd == b"quit" || cmd == b"exit"
 }
 
-fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
+async fn handle_shell_input(
+    stream: &mut TcpStream,
+    session: &mut SshSession,
+    data: &[u8],
+) -> Result<bool, TcpError> {
     for &byte in data {
         match byte {
             b'\r' | b'\n' => {
                 let line = session.line_buffer.clone();
                 session.line_buffer.clear();
 
-                send_channel_data(session, b"\r\n");
+                send_channel_data(stream, session, b"\r\n").await?;
 
                 if !line.is_empty() {
                     let response = execute_command(&line);
                     if !response.is_empty() {
-                        send_channel_data(session, &response);
+                        send_channel_data(stream, session, &response).await?;
                     }
 
                     if is_quit_command(&line) {
                         let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                         write_u32(&mut close, session.client_channel);
-                        send_packet(&close, session);
+                        send_packet(stream, &close, session).await?;
                         session.channel_open = false;
                         session.state = SshState::Disconnected;
-                        ssh_transport::close();
-                        return;
+                        return Ok(true); // Signal disconnect
                     }
                 }
 
-                send_channel_data(session, b"akuma> ");
+                send_channel_data(stream, session, b"akuma> ").await?;
             }
             0x7F | 0x08 => {
                 if !session.line_buffer.is_empty() {
                     session.line_buffer.pop();
-                    send_channel_data(session, b"\x08 \x08");
+                    send_channel_data(stream, session, b"\x08 \x08").await?;
                 }
             }
             0x03 => {
                 session.line_buffer.clear();
-                send_channel_data(session, b"^C\r\n");
-                send_channel_data(session, b"akuma> ");
+                send_channel_data(stream, session, b"^C\r\n").await?;
+                send_channel_data(stream, session, b"akuma> ").await?;
             }
             0x04 => {
                 if session.line_buffer.is_empty() {
-                    send_channel_data(session, b"\r\nGoodbye!\r\n");
+                    send_channel_data(stream, session, b"\r\nGoodbye!\r\n").await?;
                     let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                     write_u32(&mut close, session.client_channel);
-                    send_packet(&close, session);
+                    send_packet(stream, &close, session).await?;
                     session.channel_open = false;
                     session.state = SshState::Disconnected;
-                    ssh_transport::close();
+                    return Ok(true); // Signal disconnect
                 }
             }
             _ if byte >= 0x20 && byte < 0x7F => {
                 session.line_buffer.push(byte);
-                send_channel_data(session, &[byte]);
+                send_channel_data(stream, session, &[byte]).await?;
             }
             _ => {}
         }
     }
+    Ok(false)
 }
 
 // ============================================================================
 // Message Handlers
 // ============================================================================
 
-fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
+async fn handle_message(
+    stream: &mut TcpStream,
+    msg_type: u8,
+    payload: &[u8],
+    session: &mut SshSession,
+) -> Result<bool, TcpError> {
     log(&alloc::format!(
         "[SSH] Received message type {}\n",
         msg_type
@@ -492,7 +521,7 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             let kexinit = build_kexinit(&mut session.rng);
             session.server_kexinit = kexinit.clone();
 
-            send_unencrypted_packet(&kexinit, session);
+            send_unencrypted_packet(stream, &kexinit, session).await?;
             session.state = SshState::AwaitingKexEcdhInit;
         }
 
@@ -500,10 +529,10 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             let mut offset = 0;
             if let Some(client_pubkey) = read_string(payload, &mut offset) {
                 if let Some(reply) = handle_kex_ecdh_init(session, client_pubkey) {
-                    send_unencrypted_packet(&reply, session);
+                    send_unencrypted_packet(stream, &reply, session).await?;
 
                     let newkeys = vec![SSH_MSG_NEWKEYS];
-                    send_unencrypted_packet(&newkeys, session);
+                    send_unencrypted_packet(stream, &newkeys, session).await?;
                     session.state = SshState::AwaitingNewKeys;
                 } else {
                     log("[SSH] KEX failed\n");
@@ -526,14 +555,14 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
 
                 let mut reply = vec![SSH_MSG_SERVICE_ACCEPT];
                 write_string(&mut reply, service);
-                send_packet(&reply, session);
+                send_packet(stream, &reply, session).await?;
                 session.state = SshState::AwaitingUserAuth;
             }
         }
 
         SSH_MSG_USERAUTH_REQUEST => {
             let reply = vec![SSH_MSG_USERAUTH_SUCCESS];
-            send_packet(&reply, session);
+            send_packet(stream, &reply, session).await?;
             session.state = SshState::Authenticated;
             log("[SSH] User authenticated\n");
         }
@@ -556,7 +585,7 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
                 write_u32(&mut reply, 0);
                 write_u32(&mut reply, 0x100000);
                 write_u32(&mut reply, 0x4000);
-                send_packet(&reply, session);
+                send_packet(stream, &reply, session).await?;
 
                 log("[SSH] Channel opened\n");
             }
@@ -588,15 +617,23 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
                     };
                     let mut full_reply = vec![msg_type];
                     write_u32(&mut full_reply, session.client_channel);
-                    send_packet(&full_reply, session);
+                    send_packet(stream, &full_reply, session).await?;
                 }
 
                 if req_type == b"shell" {
-                    send_channel_data(session, b"\r\n=================================\r\n");
-                    send_channel_data(session, b"  Welcome to Akuma SSH Server\r\n");
-                    send_channel_data(session, b"=================================\r\n\r\n");
-                    send_channel_data(session, b"Type 'help' for available commands.\r\n\r\n");
-                    send_channel_data(session, b"akuma> ");
+                    send_channel_data(stream, session, b"\r\n=================================\r\n")
+                        .await?;
+                    send_channel_data(stream, session, b"  Welcome to Akuma SSH Server\r\n")
+                        .await?;
+                    send_channel_data(stream, session, b"=================================\r\n\r\n")
+                        .await?;
+                    send_channel_data(
+                        stream,
+                        session,
+                        b"Type 'help' for available commands.\r\n\r\n",
+                    )
+                    .await?;
+                    send_channel_data(stream, session, b"akuma> ").await?;
                 }
             }
         }
@@ -605,7 +642,9 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             let mut offset = 0;
             let _recipient = read_u32(payload, &mut offset);
             if let Some(data) = read_string(payload, &mut offset) {
-                handle_shell_input(session, data);
+                if handle_shell_input(stream, session, data).await? {
+                    return Ok(true); // Disconnect requested
+                }
             }
         }
 
@@ -613,18 +652,19 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             log("[SSH] Channel close requested\n");
             let mut reply = vec![SSH_MSG_CHANNEL_CLOSE];
             write_u32(&mut reply, session.client_channel);
-            send_packet(&reply, session);
+            send_packet(stream, &reply, session).await?;
             session.channel_open = false;
         }
 
         SSH_MSG_GLOBAL_REQUEST => {
             let reply = vec![SSH_MSG_REQUEST_FAILURE];
-            send_packet(&reply, session);
+            send_packet(stream, &reply, session).await?;
         }
 
         SSH_MSG_DISCONNECT => {
             log("[SSH] Client disconnected\n");
             session.state = SshState::Disconnected;
+            return Ok(true);
         }
 
         SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
@@ -636,9 +676,11 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             ));
             let mut reply = vec![SSH_MSG_UNIMPLEMENTED];
             write_u32(&mut reply, session.crypto.decrypt_seq.wrapping_sub(1));
-            send_packet(&reply, session);
+            send_packet(stream, &reply, session).await?;
         }
     }
+
+    Ok(false)
 }
 
 // ============================================================================
@@ -737,80 +779,95 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
 }
 
 // ============================================================================
-// Connection Handling
+// Async Connection Handler (per-connection)
 // ============================================================================
 
-fn handle_connect() {
-    let mut guard = SESSION.lock();
-    let session = guard.insert(SshSession::new());
-    session.state = SshState::AwaitingVersion;
-    session.generate_host_key();
+/// Handle a single SSH connection asynchronously
+/// Each connection gets its own SshSession - no global state
+pub async fn handle_connection(mut stream: TcpStream) {
+    log("[SSH] New SSH connection\n");
 
-    log("[SSH] Client connected\n");
-    drop(guard);
+    let mut session = SshSession::new();
 
-    send_raw(SSH_VERSION);
-}
-
-fn handle_data(data: &[u8]) {
-    let mut guard = SESSION.lock();
-    let session = match guard.as_mut() {
-        Some(s) => s,
-        None => return,
-    };
-
-    if session.state == SshState::Disconnected {
+    // Send our version
+    if send_raw(&mut stream, SSH_VERSION).await.is_err() {
+        log("[SSH] Failed to send version\n");
         return;
     }
 
-    session.input_buffer.extend_from_slice(data);
-
-    if session.state == SshState::AwaitingVersion {
-        if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
-            let version_line = session.input_buffer[..pos].to_vec();
-            session.input_buffer = session.input_buffer[pos + 1..].to_vec();
-
-            let version = if version_line.ends_with(b"\r") {
-                version_line[..version_line.len() - 1].to_vec()
-            } else {
-                version_line
-            };
-
-            session.client_version = version;
-            session.state = SshState::AwaitingKexInit;
-            log("[SSH] Client version received\n");
-        }
-        return;
-    }
-
+    // Main receive loop
+    let mut buf = [0u8; 512];
     loop {
-        let use_encryption = !matches!(
-            session.state,
-            SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit
-        );
-
-        let packet = if use_encryption {
-            process_encrypted_packet(session)
-        } else {
-            process_unencrypted_packet(session)
-        };
-
-        match packet {
-            Some((msg_type, payload)) => {
-                handle_message(msg_type, &payload, session);
+        match stream.read(&mut buf).await {
+            Ok(0) => {
+                log("[SSH] Connection closed by peer\n");
+                break;
             }
-            None => break,
+            Ok(n) => {
+                session.input_buffer.extend_from_slice(&buf[..n]);
+
+                // Handle version exchange
+                if session.state == SshState::AwaitingVersion {
+                    if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
+                        let version_line = session.input_buffer[..pos].to_vec();
+                        session.input_buffer = session.input_buffer[pos + 1..].to_vec();
+
+                        let version = if version_line.ends_with(b"\r") {
+                            version_line[..version_line.len() - 1].to_vec()
+                        } else {
+                            version_line
+                        };
+
+                        session.client_version = version;
+                        session.state = SshState::AwaitingKexInit;
+                        log("[SSH] Client version received\n");
+                    }
+                    continue;
+                }
+
+                // Process packets
+                loop {
+                    let use_encryption = !matches!(
+                        session.state,
+                        SshState::AwaitingNewKeys
+                            | SshState::AwaitingKexInit
+                            | SshState::AwaitingKexEcdhInit
+                    );
+
+                    let packet = if use_encryption {
+                        process_encrypted_packet(&mut session)
+                    } else {
+                        process_unencrypted_packet(&mut session)
+                    };
+
+                    match packet {
+                        Some((msg_type, payload)) => {
+                            match handle_message(&mut stream, msg_type, &payload, &mut session)
+                                .await
+                            {
+                                Ok(true) => {
+                                    // Disconnect requested
+                                    return;
+                                }
+                                Ok(false) => {}
+                                Err(_) => {
+                                    log("[SSH] Error handling message\n");
+                                    return;
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Err(_) => {
+                log("[SSH] Read error\n");
+                break;
+            }
         }
     }
-}
 
-fn handle_disconnect() {
-    let mut guard = SESSION.lock();
-    if let Some(session) = guard.as_mut() {
-        session.reset();
-    }
-    *guard = None;
-    log("[SSH] Client disconnected\n");
+    log("[SSH] Connection ended\n");
 }
 
 // ============================================================================
@@ -819,25 +876,4 @@ fn handle_disconnect() {
 
 fn log(msg: &str) {
     console::print(msg);
-}
-
-// ============================================================================
-// Public API
-// ============================================================================
-
-/// SSH server thread entry point
-pub fn ssh_server_entry() -> ! {
-    log("[SSH] SSH server thread started\n");
-    log("[SSH] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
-
-    loop {
-        match ssh_transport::poll() {
-            SshEvent::Connected => handle_connect(),
-            SshEvent::Data(data) => handle_data(&data),
-            SshEvent::Disconnected => handle_disconnect(),
-            SshEvent::None => {}
-        }
-
-        crate::threading::yield_now();
-    }
 }

@@ -6,19 +6,23 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
+mod async_net;
 mod async_tests;
 mod boot;
 mod console;
 mod embassy_net_driver;
 mod embassy_time_driver;
+mod embassy_virtio_driver;
 mod exceptions;
 mod executor;
 mod gic;
 mod irq;
 mod netcat;
+mod netcat_server;
 mod network;
 mod ssh;
 mod ssh_crypto;
+mod ssh_server;
 mod ssh_transport;
 mod tests;
 mod threading;
@@ -63,24 +67,6 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
 /// Main kernel initialization - all safe code
 fn kernel_main() -> ! {
     const RAM_BASE: usize = 0x40000000;
-
-    // DTB pointer workaround: QEMU with -device loader puts DTB at 0x44000000
-    // But we can't safely read it yet before setting up, so use after heap init
-
-    // let ram_size = match detect_memory_size(dtb_ptr) {
-    //     Ok(size) => {
-    //         console::print("Detected RAM: ");
-    //         console::print(&(size / 1024 / 1024).to_string());
-    //         console::print(" MB\n");
-    //         size
-    //     }
-    //     Err(e) => {
-    //         console::print("Error detecting memory: ");
-    //         console::print(e);
-    //         console::print("\nUsing default 32 MB\n");
-    //         32 * 1024 * 1024
-    //     }
-    // };
 
     let ram_size = 128 * 1024 * 1024; // 128 MB
 
@@ -173,59 +159,91 @@ fn kernel_main() -> ! {
     }
 
     // =========================================================================
-    // Network initialization
-    // =========================================================================
-    console::print("\n--- Network Initialization ---\n");
-    match network::init(0) {
-        Ok(()) => {
-            console::print("[Net] Network initialized successfully\n");
-            console::print("[Net] Starting network server thread...\n");
-
-            // Spawn network handler thread (telnet)
-            match threading::spawn_fn(netcat::netcat_server_entry) {
-                Ok(tid) => console::print(&alloc::format!(
-                    "[Net] Telnet server thread started (tid={})\n",
-                    tid
-                )),
-                Err(e) => {
-                    console::print("[Net] Failed to spawn telnet server thread: ");
-                    console::print(e);
-                    console::print("\n");
-                }
-            }
-
-            // Spawn SSH server thread
-            match threading::spawn_fn(ssh::ssh_server_entry) {
-                Ok(tid) => console::print(&alloc::format!(
-                    "[SSH] SSH server thread started (tid={})\n",
-                    tid
-                )),
-                Err(e) => {
-                    console::print("[SSH] Failed to spawn SSH server thread: ");
-                    console::print(e);
-                    console::print("\n");
-                }
-            }
-        }
-        Err(e) => {
-            console::print("[Net] Network init failed: ");
-            console::print(e);
-            console::print("\n");
-        }
-    }
-    console::print("--- Network Initialization Done ---\n\n");
-
-    // =========================================================================
-    // Run async tests (after network is ready)
+    // Run async tests (before network takes over the main loop)
     // =========================================================================
     if !async_tests::run_all() {
         console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
         halt();
     }
 
-    // Thread 0 becomes the idle loop
-    console::print("[Idle] Entering idle loop (network server running in background)\n");
+    // =========================================================================
+    // Async Network initialization and main loop
+    // =========================================================================
+    console::print("\n--- Async Network Initialization ---\n");
+    
+    // Initialize the async network stack
+    let net_init = match async_net::init() {
+        Ok(init) => {
+            console::print("[AsyncNet] Network initialized successfully\n");
+            init
+        }
+        Err(e) => {
+            console::print("[AsyncNet] Network init failed: ");
+            console::print(e);
+            console::print("\n");
+            console::print("[Idle] Entering idle loop (no network)\n");
+            loop {
+                threading::yield_now();
+            }
+        }
+    };
+
+    console::print("--- Async Network Initialization Done ---\n\n");
+    
+    // Initialize SSH host key
+    ssh::init_host_key();
+
+    // Run the async main loop in the main thread
+    // This drives both the network runner and the SSH server
+    run_async_main(net_init);
+}
+
+/// Run the async main loop
+/// This is the main entry point for async networking
+fn run_async_main(net_init: async_net::NetworkInit) -> ! {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+    console::print("[AsyncMain] Starting async network loop...\n");
+    console::print("[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
+
+    // Simple waker that does nothing (we poll in a loop)
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
+
+    let mut runner = net_init.runner;
+    let stack = net_init.stack;
+
+    // Create futures for both the network runner and SSH server
+    let mut runner_fut = runner.run();
+    let mut ssh_fut = ssh_server::run(stack);
+
+    // Pin the futures
+    let mut runner_pinned = unsafe { Pin::new_unchecked(&mut runner_fut) };
+    let mut ssh_pinned = unsafe { Pin::new_unchecked(&mut ssh_fut) };
+
     loop {
+        // Poll the network runner
+        let _ = runner_pinned.as_mut().poll(&mut cx);
+        
+        // Poll the SSH server
+        let _ = ssh_pinned.as_mut().poll(&mut cx);
+        
+        // Process pending IRQ work
+        executor::process_irq_work();
+        
+        // Poll the executor for any other tasks
+        executor::run_once();
+        
+        // Yield to other threads (cooperative multitasking)
         threading::yield_now();
     }
 }
