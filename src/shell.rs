@@ -3,10 +3,13 @@
 //! Provides async command execution for the SSH shell.
 //! Commands include basic utilities and filesystem operations.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::akuma::AKUMA_79;
 use crate::async_fs;
+use crate::async_net;
 use crate::network;
 use crate::ssh_crypto::{split_first_word, trim_bytes};
 
@@ -37,6 +40,7 @@ pub async fn execute_command(line: &[u8]) -> Vec<u8> {
         b"rm" | b"del" => cmd_rm(args, &mut response).await,
         b"mkdir" => cmd_mkdir(args, &mut response).await,
         b"df" | b"diskfree" => cmd_df(&mut response).await,
+        b"curl" => cmd_curl(args, &mut response).await,
         b"help" => cmd_help(&mut response),
         _ => {
             response.extend_from_slice(b"Unknown command: ");
@@ -146,6 +150,8 @@ fn cmd_help(response: &mut Vec<u8>) {
     response.extend_from_slice(b"  rm <file>             - Remove file\r\n");
     response.extend_from_slice(b"  mkdir <dir>           - Create directory\r\n");
     response.extend_from_slice(b"  df                    - Show disk usage\r\n");
+    response.extend_from_slice(b"\r\nNetwork commands:\r\n");
+    response.extend_from_slice(b"  curl <url>            - HTTP GET request\r\n");
     response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
     response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
 }
@@ -375,3 +381,113 @@ async fn cmd_df(response: &mut Vec<u8>) {
         }
     }
 }
+
+// ============================================================================
+// Network Commands (Async - HTTP)
+// ============================================================================
+
+async fn cmd_curl(args: &[u8], response: &mut Vec<u8>) {
+    if args.is_empty() {
+        response.extend_from_slice(b"Usage: curl <url>\r\n");
+        response.extend_from_slice(b"Example: curl http://10.0.2.2:8080/\r\n");
+        return;
+    }
+
+    let url = match core::str::from_utf8(args) {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            response.extend_from_slice(b"Error: Invalid URL\r\n");
+            return;
+        }
+    };
+
+    match http_get(url).await {
+        Ok(body) => {
+            // Convert \n to \r\n for SSH terminal
+            for line in body.split('\n') {
+                response.extend_from_slice(line.as_bytes());
+                response.extend_from_slice(b"\r\n");
+            }
+        }
+        Err(e) => {
+            let msg = format!("Error: {}\r\n", e);
+            response.extend_from_slice(msg.as_bytes());
+        }
+    }
+}
+
+/// Perform an HTTP GET request
+async fn http_get(url: &str) -> Result<String, &'static str> {
+    use embassy_net::tcp::TcpSocket;
+    use embassy_net::{IpAddress, IpEndpoint};
+    use embassy_time::Duration;
+    use embedded_io_async::Write;
+
+    // Get the network stack
+    let stack = async_net::get_global_stack().ok_or("Network not initialized")?;
+
+    // Parse URL: http://host:port/path or http://host/path
+    let url = url.strip_prefix("http://").ok_or("Only http:// URLs supported")?;
+
+    let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
+    let path = format!("/{}", path);
+
+    let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
+        (h, p.parse::<u16>().map_err(|_| "Invalid port")?)
+    } else {
+        (host_port, 80u16)
+    };
+
+    // Try to parse as IP address first, otherwise use DNS
+    let ip: IpAddress = if let Ok(ip) = host.parse::<embassy_net::Ipv4Address>() {
+        IpAddress::Ipv4(ip)
+    } else {
+        // DNS lookup
+        match stack.dns_query(host, embassy_net::dns::DnsQueryType::A).await {
+            Ok(addrs) if !addrs.is_empty() => addrs[0],
+            _ => return Err("DNS lookup failed"),
+        }
+    };
+
+    // Create socket
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 1024];
+    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+    socket.set_timeout(Some(Duration::from_secs(10)));
+
+    // Connect
+    let endpoint = IpEndpoint::new(ip, port);
+    socket.connect(endpoint).await.map_err(|_| "Connection failed")?;
+
+    // Send HTTP request
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: akuma-curl/1.0\r\n\r\n",
+        path, host
+    );
+    socket.write_all(request.as_bytes()).await.map_err(|_| "Write failed")?;
+
+    // Read response
+    let mut response_data = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        match socket.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => response_data.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+
+    socket.close();
+
+    // Parse response - find body after \r\n\r\n
+    let response_str = String::from_utf8(response_data).map_err(|_| "Invalid UTF-8 response")?;
+
+    // Extract body after headers
+    if let Some(body_start) = response_str.find("\r\n\r\n") {
+        Ok(response_str[body_start + 4..].to_string())
+    } else {
+        Ok(response_str)
+    }
+}
+
+use alloc::string::ToString;

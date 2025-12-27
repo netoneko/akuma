@@ -31,6 +31,7 @@ mod tests;
 mod threading;
 mod timer;
 mod virtio_hal;
+mod web_server;
 
 use alloc::string::ToString;
 
@@ -300,10 +301,15 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     console::print(
         "[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
     );
+    console::print("[AsyncMain] HTTP Server: http://localhost:8080/\n");
+
+    // Store stack reference for curl command
+    async_net::set_global_stack(stack);
 
     // Pin the futures directly using the pin! macro (no unsafe needed)
     let mut runner_pinned = pin!(runner.run());
     let mut ssh_pinned = pin!(ssh_server::run(stack));
+    let mut web_pinned = pin!(web_server::run(stack));
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
     loop {
@@ -312,6 +318,9 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
 
         // Poll the SSH server
         let _ = ssh_pinned.as_mut().poll(&mut cx);
+
+        // Poll the HTTP web server
+        let _ = web_pinned.as_mut().poll(&mut cx);
 
         // Poll the memory monitor
         let _ = mem_monitor_pinned.as_mut().poll(&mut cx);

@@ -8,6 +8,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec;
+use core::cell::UnsafeCell;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{
     Config, ConfigV4, DhcpConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
@@ -20,6 +21,27 @@ use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use crate::console;
 use crate::embassy_virtio_driver::EmbassyVirtioDriver;
 use crate::virtio_hal::VirtioHal;
+
+// ============================================================================
+// Global Stack Reference (for curl command)
+// ============================================================================
+
+struct StackHolder(UnsafeCell<Option<Stack<'static>>>);
+unsafe impl Sync for StackHolder {}
+
+static GLOBAL_STACK: StackHolder = StackHolder(UnsafeCell::new(None));
+
+/// Store the stack reference for global access (call once after init)
+pub fn set_global_stack(stack: Stack<'static>) {
+    unsafe {
+        *GLOBAL_STACK.0.get() = Some(stack);
+    }
+}
+
+/// Get a copy of the global stack reference
+pub fn get_global_stack() -> Option<Stack<'static>> {
+    unsafe { (*GLOBAL_STACK.0.get()).clone() }
+}
 
 // ============================================================================
 // Constants
