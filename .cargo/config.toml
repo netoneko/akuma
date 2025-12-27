@@ -13,6 +13,8 @@ runner = """qemu-system-aarch64 \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22 \
   -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
+  -drive file=disk.img,if=none,format=raw,id=hd0 \
+  -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -kernel"""
 
 rustflags = ["-C", "link-arg=-Tlinker.ld"]

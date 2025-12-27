@@ -20,14 +20,13 @@ use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
-use crate::akuma::AKUMA_79;
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
-use crate::network;
+use crate::shell;
 use crate::ssh_crypto::{
-    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, split_first_word,
-    trim_bytes, write_namelist, write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256,
-    SimpleRng, AES_IV_SIZE, AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
+    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, write_namelist,
+    write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256, SimpleRng, AES_IV_SIZE,
+    AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
 };
 
 // ============================================================================
@@ -369,71 +368,6 @@ async fn send_channel_data(
     send_packet(stream, &payload, session).await
 }
 
-fn execute_command(line: &[u8]) -> Vec<u8> {
-    let line = trim_bytes(line);
-    if line.is_empty() {
-        return Vec::new();
-    }
-
-    let (cmd, args) = split_first_word(line);
-    let mut response = Vec::new();
-
-    match cmd {
-        b"echo" => {
-            if !args.is_empty() {
-                response.extend_from_slice(args);
-            }
-            response.extend_from_slice(b"\r\n");
-        }
-        b"akuma" | b"cat" => {
-            // shows picture of a cat
-            // Convert \n to \r\n for proper SSH terminal display
-            for &byte in AKUMA_79 {
-                if byte == b'\n' {
-                    response.extend_from_slice(b"\r\n");
-                } else {
-                    response.push(byte);
-                }
-            }
-            if !AKUMA_79.ends_with(b"\n") {
-                response.extend_from_slice(b"\r\n");
-            }
-        }
-        b"quit" | b"exit" => {
-            response.extend_from_slice(b"Goodbye!\r\n");
-        }
-        b"stats" => {
-            let (connections, bytes_rx, bytes_tx) = network::get_stats();
-            let stats = alloc::format!(
-                "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
-                connections, bytes_rx, bytes_tx
-            );
-            response.extend_from_slice(stats.as_bytes());
-        }
-        b"help" => {
-            response.extend_from_slice(b"Available commands:\r\n");
-            response.extend_from_slice(b"  echo <text>  - Echo back text\r\n");
-            response.extend_from_slice(b"  akuma        - Display ASCII art\r\n");
-            response.extend_from_slice(b"  stats        - Show network statistics\r\n");
-            response.extend_from_slice(b"  help         - Show this help\r\n");
-            response.extend_from_slice(b"  quit/exit    - Close connection\r\n");
-        }
-        _ => {
-            response.extend_from_slice(b"Unknown command: ");
-            response.extend_from_slice(cmd);
-            response.extend_from_slice(b"\r\nType 'help' for available commands.\r\n");
-        }
-    }
-
-    response
-}
-
-fn is_quit_command(line: &[u8]) -> bool {
-    let line = trim_bytes(line);
-    let (cmd, _) = split_first_word(line);
-    cmd == b"quit" || cmd == b"exit"
-}
-
 async fn handle_shell_input(
     stream: &mut TcpStream,
     session: &mut SshSession,
@@ -448,12 +382,12 @@ async fn handle_shell_input(
                 send_channel_data(stream, session, b"\r\n").await?;
 
                 if !line.is_empty() {
-                    let response = execute_command(&line);
+                    let response = shell::execute_command(&line);
                     if !response.is_empty() {
                         send_channel_data(stream, session, &response).await?;
                     }
 
-                    if is_quit_command(&line) {
+                    if shell::is_quit_command(&line) {
                         let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                         write_u32(&mut close, session.client_channel);
                         send_packet(stream, &close, session).await?;

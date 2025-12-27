@@ -6,8 +6,10 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
+mod async_fs;
 mod async_net;
 mod async_tests;
+mod block;
 mod boot;
 mod console;
 mod embassy_net_driver;
@@ -15,10 +17,12 @@ mod embassy_time_driver;
 mod embassy_virtio_driver;
 mod exceptions;
 mod executor;
+mod fs;
 mod gic;
 mod irq;
 mod netcat_server;
 mod network;
+mod shell;
 mod ssh;
 mod ssh_crypto;
 mod ssh_server;
@@ -163,6 +167,52 @@ fn kernel_main() -> ! {
         console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
         halt();
     }
+
+    // =========================================================================
+    // Filesystem initialization
+    // =========================================================================
+    console::print("\n--- Filesystem Initialization ---\n");
+
+    // Initialize block device first
+    match block::init() {
+        Ok(()) => {
+            console::print("[Block] Block device initialized successfully\n");
+
+            // Now initialize filesystem
+            match fs::init() {
+                Ok(()) => {
+                    console::print("[FS] Filesystem mounted successfully\n");
+
+                    // List root directory contents
+                    if let Ok(entries) = fs::list_dir("/") {
+                        console::print("[FS] Root directory contents:\n");
+                        for entry in entries {
+                            if entry.is_dir {
+                                console::print(&alloc::format!("  [DIR]  {}\n", entry.name));
+                            } else {
+                                console::print(&alloc::format!(
+                                    "  [FILE] {} ({} bytes)\n",
+                                    entry.name, entry.size
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    console::print("[FS] Filesystem init failed: ");
+                    console::print(&alloc::format!("{}\n", e));
+                    console::print("[FS] Continuing without filesystem...\n");
+                }
+            }
+        }
+        Err(e) => {
+            console::print("[Block] Block device not found: ");
+            console::print(&alloc::format!("{}\n", e));
+            console::print("[Block] Continuing without filesystem...\n");
+        }
+    }
+
+    console::print("--- Filesystem Initialization Done ---\n\n");
 
     // =========================================================================
     // Async Network initialization and main loop
