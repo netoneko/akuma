@@ -2,6 +2,8 @@
 //!
 //! Manages the SSH server accept loop that handles multiple
 //! concurrent SSH sessions. Each connection runs in parallel.
+//!
+//! Uses a static buffer pool to avoid memory leaks from Box::leak().
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -27,6 +29,71 @@ const TCP_RX_BUFFER_SIZE: usize = 4096;
 const TCP_TX_BUFFER_SIZE: usize = 4096;
 
 // ============================================================================
+// Static Buffer Pool
+// ============================================================================
+
+/// Total buffer slots: MAX_CONNECTIONS for active connections + 1 for listening
+const BUFFER_POOL_SIZE: usize = MAX_CONNECTIONS + 1;
+
+/// Static buffer storage for TCP sockets
+/// Each slot has rx and tx buffers
+struct BufferPool {
+    /// RX buffers for each slot
+    rx_buffers: [[u8; TCP_RX_BUFFER_SIZE]; BUFFER_POOL_SIZE],
+    /// TX buffers for each slot  
+    tx_buffers: [[u8; TCP_TX_BUFFER_SIZE]; BUFFER_POOL_SIZE],
+    /// Bitmap of which slots are in use (true = in use)
+    in_use: [bool; BUFFER_POOL_SIZE],
+}
+
+impl BufferPool {
+    const fn new() -> Self {
+        Self {
+            rx_buffers: [[0u8; TCP_RX_BUFFER_SIZE]; BUFFER_POOL_SIZE],
+            tx_buffers: [[0u8; TCP_TX_BUFFER_SIZE]; BUFFER_POOL_SIZE],
+            in_use: [false; BUFFER_POOL_SIZE],
+        }
+    }
+
+    /// Allocate a buffer slot, returns the slot index or None if pool exhausted
+    fn alloc(&mut self) -> Option<usize> {
+        for i in 0..BUFFER_POOL_SIZE {
+            if !self.in_use[i] {
+                self.in_use[i] = true;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Free a buffer slot
+    fn free(&mut self, slot: usize) {
+        if slot < BUFFER_POOL_SIZE {
+            self.in_use[slot] = false;
+            // Zero the buffers for security
+            self.rx_buffers[slot].fill(0);
+            self.tx_buffers[slot].fill(0);
+        }
+    }
+
+    /// Get mutable references to the rx and tx buffers for a slot
+    /// SAFETY: Caller must ensure slot is allocated and not used elsewhere
+    unsafe fn get_buffers(&mut self, slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
+        let rx = &mut self.rx_buffers[slot] as *mut [u8; TCP_RX_BUFFER_SIZE];
+        let tx = &mut self.tx_buffers[slot] as *mut [u8; TCP_TX_BUFFER_SIZE];
+        unsafe {
+            (
+                core::slice::from_raw_parts_mut(rx as *mut u8, TCP_RX_BUFFER_SIZE),
+                core::slice::from_raw_parts_mut(tx as *mut u8, TCP_TX_BUFFER_SIZE),
+            )
+        }
+    }
+}
+
+/// Global buffer pool protected by spinlock
+static BUFFER_POOL: spinning_top::Spinlock<BufferPool> = spinning_top::Spinlock::new(BufferPool::new());
+
+// ============================================================================
 // Connection State
 // ============================================================================
 
@@ -34,6 +101,8 @@ const TCP_TX_BUFFER_SIZE: usize = 4096;
 struct ActiveConnection {
     future: Pin<Box<dyn Future<Output = ()>>>,
     id: usize,
+    /// Buffer slot index used by this connection (for returning to pool)
+    buffer_slot: usize,
 }
 
 // ============================================================================
@@ -47,6 +116,11 @@ pub async fn run(stack: Stack<'static>) {
         "[SSH Server] Max concurrent connections: {}\n",
         MAX_CONNECTIONS
     ));
+    log(&alloc::format!(
+        "[SSH Server] Buffer pool size: {} slots ({} KB)\n",
+        BUFFER_POOL_SIZE,
+        BUFFER_POOL_SIZE * (TCP_RX_BUFFER_SIZE + TCP_TX_BUFFER_SIZE) / 1024
+    ));
     log("[SSH Server] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
 
     // Initialize shared host key
@@ -56,8 +130,9 @@ pub async fn run(stack: Stack<'static>) {
     let mut connections: Vec<ActiveConnection> = Vec::new();
     let mut next_id: usize = 0;
 
-    // Pre-allocate a listening socket (reused when no connections)
+    // Listening socket state
     let mut listen_socket: Option<TcpSocket<'static>> = None;
+    let mut listen_buffer_slot: Option<usize> = None;
 
     // Create waker for manual polling
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -85,6 +160,8 @@ pub async fn run(stack: Stack<'static>) {
                         conn.id,
                         connections.len()
                     ));
+                    // Return the buffer slot to the pool
+                    BUFFER_POOL.lock().free(conn.buffer_slot);
                 }
                 Poll::Pending => {
                     i += 1;
@@ -98,7 +175,17 @@ pub async fn run(stack: Stack<'static>) {
         if connections.len() < MAX_CONNECTIONS {
             // Ensure we have a listening socket
             if listen_socket.is_none() {
-                listen_socket = Some(create_listen_socket(stack));
+                match create_listen_socket(stack) {
+                    Some((socket, slot)) => {
+                        listen_socket = Some(socket);
+                        listen_buffer_slot = Some(slot);
+                    }
+                    None => {
+                        // No buffers available, wait and try again
+                        embassy_time::Timer::after(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
             }
 
             if let Some(ref mut socket) = listen_socket {
@@ -108,24 +195,28 @@ pub async fn run(stack: Stack<'static>) {
                         Ok(()) => {
                             let id = next_id;
                             next_id = next_id.wrapping_add(1);
+                            let buffer_slot = listen_buffer_slot.take().unwrap();
 
-                        log(&alloc::format!(
-                            "[SSH Server] Accepted connection {} (active: 1)\n",
-                            id
-                        ));
+                            log(&alloc::format!(
+                                "[SSH Server] Accepted connection {} (active: 1)\n",
+                                id
+                            ));
 
-                        // Track connection in stats
-                        crate::network::increment_connections();
+                            // Track connection in stats
+                            crate::network::increment_connections();
 
-                        // Take the socket and create a new one for listening
-                        let connected_socket = listen_socket.take().unwrap();
-                        let stream = TcpStream::from_socket(connected_socket);
-                        let future = Box::pin(handle_connection_wrapper(stream, id));
-                        connections.push(ActiveConnection { future, id });
+                            // Take the socket for this connection
+                            let connected_socket = listen_socket.take().unwrap();
+                            let stream = TcpStream::from_socket(connected_socket);
+                            let future = Box::pin(handle_connection_wrapper(stream, id));
+                            connections.push(ActiveConnection { future, id, buffer_slot });
                         }
                         Err(e) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
-                            // Reset the socket
+                            // Return buffer to pool and reset socket
+                            if let Some(slot) = listen_buffer_slot.take() {
+                                BUFFER_POOL.lock().free(slot);
+                            }
                             listen_socket = None;
                         }
                     }
@@ -140,32 +231,38 @@ pub async fn run(stack: Stack<'static>) {
                         Ok(Ok(())) => {
                             let id = next_id;
                             next_id = next_id.wrapping_add(1);
+                            let buffer_slot = listen_buffer_slot.take().unwrap();
 
-                        log(&alloc::format!(
-                            "[SSH Server] Accepted connection {} (active: {})\n",
-                            id,
-                            connections.len() + 1
-                        ));
+                            log(&alloc::format!(
+                                "[SSH Server] Accepted connection {} (active: {})\n",
+                                id,
+                                connections.len() + 1
+                            ));
 
-                        // Track connection in stats
-                        crate::network::increment_connections();
+                            // Track connection in stats
+                            crate::network::increment_connections();
 
-                        // Take the socket and create a new one for listening
-                        let connected_socket = listen_socket.take().unwrap();
-                        let stream = TcpStream::from_socket(connected_socket);
-                        let future = Box::pin(handle_connection_wrapper(stream, id));
-                        connections.push(ActiveConnection { future, id });
-                    }
-                    Ok(Err(e)) => {
+                            // Take the socket for this connection
+                            let connected_socket = listen_socket.take().unwrap();
+                            let stream = TcpStream::from_socket(connected_socket);
+                            let future = Box::pin(handle_connection_wrapper(stream, id));
+                            connections.push(ActiveConnection { future, id, buffer_slot });
+                        }
+                        Ok(Err(e)) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
+                            // Return buffer to pool and reset socket
+                            if let Some(slot) = listen_buffer_slot.take() {
+                                BUFFER_POOL.lock().free(slot);
+                            }
                             listen_socket = None;
                         }
                         Err(_) => {
                             // Timeout - no new connection, that's okay
-                            // Socket is still in listen state, but we need to abort and recreate
-                            // because embassy-net accept future consumed the socket state
+                            // Abort the socket but DON'T destroy it - reuse it!
+                            // This avoids leaking buffers on every timeout
                             socket.abort();
-                            listen_socket = None;
+                            // Socket stays in listen_socket, buffer_slot stays allocated
+                            // Next iteration will call accept() again on the same socket
                         }
                     }
                 }
@@ -180,16 +277,21 @@ pub async fn run(stack: Stack<'static>) {
     }
 }
 
-/// Create a new socket for listening
-fn create_listen_socket(stack: Stack<'static>) -> TcpSocket<'static> {
-    let rx_buffer = alloc::vec![0u8; TCP_RX_BUFFER_SIZE].into_boxed_slice();
-    let tx_buffer = alloc::vec![0u8; TCP_TX_BUFFER_SIZE].into_boxed_slice();
-    let rx_ref: &'static mut [u8] = Box::leak(rx_buffer);
-    let tx_ref: &'static mut [u8] = Box::leak(tx_buffer);
+/// Create a new socket for listening using the buffer pool
+/// Returns (socket, buffer_slot) or None if no buffers available
+fn create_listen_socket(stack: Stack<'static>) -> Option<(TcpSocket<'static>, usize)> {
+    // Lock once and do both alloc and get_buffers
+    let (slot, rx_ref, tx_ref) = {
+        let mut pool = BUFFER_POOL.lock();
+        let slot = pool.alloc()?;
+        // SAFETY: We just allocated this slot, so we have exclusive access
+        let (rx, tx) = unsafe { pool.get_buffers(slot) };
+        (slot, rx, tx)
+    };
 
     let mut socket = TcpSocket::new(stack, rx_ref, tx_ref);
     socket.set_timeout(Some(Duration::from_secs(60)));
-    socket
+    Some((socket, slot))
 }
 
 /// Wrapper for handle_connection that logs start/end
