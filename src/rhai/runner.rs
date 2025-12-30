@@ -27,25 +27,48 @@ fn create_engine() -> Engine {
     // Start with a raw engine - no standard library
     let mut engine = Engine::new_raw();
 
-    // Register essential packages for bare metal:
-    // LanguageCorePackage: print, debug, type_of, etc.
-    // ArithmeticPackage: +, -, *, /, % operators
-    // LogicPackage: &&, ||, !, comparisons
-    // BasicStringPackage: string operations, interpolation
-    // BasicArrayPackage: array operations
+    // Register all packages that work in no_std:
+    //
+    // Core language:
+    // - LanguageCorePackage: print, debug, type_of, eval, call_fn
+    //
+    // Math & Logic:
+    // - ArithmeticPackage: +, -, *, /, %, ** operators
+    // - LogicPackage: &&, ||, !, ==, !=, <, >, <=, >=
+    // - BitFieldPackage: &, |, ^, <<, >> bit operations
+    //
+    // Strings:
+    // - BasicStringPackage: len, +, ==, !=, contains, etc.
+    // - MoreStringPackage: split, trim, replace, to_upper, to_lower, etc.
+    //
+    // Arrays:
+    // - BasicArrayPackage: push, pop, shift, len, [], etc.
+    //
+    // Objects/Maps:
+    // - BasicMapPackage: #{}, keys, values, contains, etc.
+    //
+    // Functions:
+    // - BasicFnPackage: Fn, call, curry, function pointers
+
     let core = rhai::packages::LanguageCorePackage::new();
     let arithmetic = rhai::packages::ArithmeticPackage::new();
     let logic = rhai::packages::LogicPackage::new();
+    let bit_field = rhai::packages::BitFieldPackage::new();
     let basic_string = rhai::packages::BasicStringPackage::new();
     let more_string = rhai::packages::MoreStringPackage::new();
     let basic_array = rhai::packages::BasicArrayPackage::new();
+    let basic_map = rhai::packages::BasicMapPackage::new();
+    let basic_fn = rhai::packages::BasicFnPackage::new();
 
     core.register_into_engine(&mut engine);
     arithmetic.register_into_engine(&mut engine);
     logic.register_into_engine(&mut engine);
+    bit_field.register_into_engine(&mut engine);
     basic_string.register_into_engine(&mut engine);
     more_string.register_into_engine(&mut engine);
     basic_array.register_into_engine(&mut engine);
+    basic_map.register_into_engine(&mut engine);
+    basic_fn.register_into_engine(&mut engine);
 
     engine
 }
@@ -88,10 +111,15 @@ pub fn run_script(code: &str) -> Result<String, String> {
 
     // Progress callback for cooperative behavior and safety limits
     // Returns None to continue, Some(value) to abort with that value
+    //
+    // Note: on_progress is a sync callback, so we can't truly yield to the
+    // async executor. We use spin_loop() as a CPU hint that we're busy-waiting,
+    // which can reduce power consumption on some architectures.
     engine.on_progress(|ops| {
         if ops % PROGRESS_INTERVAL == 0 {
-            // Future: could yield to async executor here
-            // For now, just continue
+            // Yield hint to CPU - signals we're in a busy loop
+            // This allows the CPU to reduce power or handle interrupts
+            core::hint::spin_loop();
         }
         None // Continue execution
     });

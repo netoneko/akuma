@@ -265,6 +265,12 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  rhai <file>           - Execute a Rhai script\r\n")
                 .await;
+            let _ = stdout
+                .write(b"  Note: String interpolation (`Hello, ${x}`) not supported in no_std.\r\n")
+                .await;
+            let _ = stdout
+                .write(b"        Use concatenation instead: \"Hello, \" + x\r\n")
+                .await;
             let _ = stdout.write(b"\r\nPipeline and redirection:\r\n").await;
             let _ = stdout
                 .write(b"  cmd1 | cmd2           - Pipe output of cmd1 to cmd2\r\n")
