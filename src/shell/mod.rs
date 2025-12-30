@@ -6,7 +6,6 @@
 //! nostd-interactive-terminal for line editing and history.
 
 pub mod commands;
-pub mod legacy;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -23,7 +22,6 @@ use crate::ssh_crypto::{split_first_word, trim_bytes};
 
 // Re-export commonly used items
 pub use commands::CommandRegistry;
-pub use legacy::{execute_command, is_quit_command};
 
 // ============================================================================
 // Shell Error Types

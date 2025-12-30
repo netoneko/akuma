@@ -7,26 +7,28 @@
 //! - aes128-ctr encryption
 //! - hmac-sha2-256 MAC
 //! - Accepts any authentication
-//! - Shell with basic commands
+//! - Shell with basic commands (via ShellSession)
 //! - Multiple concurrent SSH sessions
 
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
 use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
+use embedded_io_async::{ErrorType, Read, Write};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
-use crate::shell;
+use crate::shell::{self, commands::create_default_registry};
 use crate::ssh_crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
     SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
-    write_namelist, write_string, write_u32,
+    split_first_word, trim_bytes, write_namelist, write_string, write_u32,
 };
 
 // ============================================================================
@@ -122,7 +124,10 @@ struct SshSession {
     input_buffer: Vec<u8>,
     channel_open: bool,
     client_channel: u32,
-    line_buffer: Vec<u8>,
+    /// Buffer for incoming channel data (for SshChannelStream to read from)
+    channel_data_buffer: Vec<u8>,
+    /// Flag to indicate channel EOF was received
+    channel_eof: bool,
 }
 
 impl SshSession {
@@ -140,8 +145,164 @@ impl SshSession {
             input_buffer: Vec::new(),
             channel_open: false,
             client_channel: 0,
-            line_buffer: Vec::new(),
+            channel_data_buffer: Vec::new(),
+            channel_eof: false,
         }
+    }
+}
+
+// ============================================================================
+// SSH Channel Stream (embedded_io_async adapter)
+// ============================================================================
+
+/// Error type for SSH channel stream operations
+#[derive(Debug)]
+pub struct SshStreamError;
+
+impl embedded_io_async::Error for SshStreamError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        embedded_io_async::ErrorKind::Other
+    }
+}
+
+/// A stream adapter that provides embedded_io_async Read/Write over an SSH channel
+struct SshChannelStream<'a> {
+    stream: &'a mut TcpStream,
+    session: &'a mut SshSession,
+}
+
+impl<'a> SshChannelStream<'a> {
+    fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
+        Self { stream, session }
+    }
+
+    /// Read and process SSH packets until we have channel data or an error
+    async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
+        let mut buf = [0u8; 512];
+        
+        loop {
+            // Check if we already have channel data or EOF
+            if !self.session.channel_data_buffer.is_empty() || self.session.channel_eof {
+                return Ok(());
+            }
+            
+            // Read more data from the network
+            match self.stream.read(&mut buf).await {
+                Ok(0) => {
+                    self.session.channel_eof = true;
+                    return Ok(());
+                }
+                Ok(n) => {
+                    self.session.input_buffer.extend_from_slice(&buf[..n]);
+                    
+                    // Process any complete packets
+                    loop {
+                        let packet = process_encrypted_packet(self.session);
+                        match packet {
+                            Some((msg_type, payload)) => {
+                                match self.handle_channel_message(msg_type, &payload).await {
+                                    Ok(true) => {
+                                        // Got channel data or EOF, can return
+                                        return Ok(());
+                                    }
+                                    Ok(false) => {
+                                        // Keep processing
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            None => break, // No more complete packets
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Handle a single SSH message, return true if we got channel data or EOF
+    async fn handle_channel_message(
+        &mut self,
+        msg_type: u8,
+        payload: &[u8],
+    ) -> Result<bool, TcpError> {
+        match msg_type {
+            SSH_MSG_CHANNEL_DATA => {
+                let mut offset = 0;
+                let _recipient = read_u32(payload, &mut offset);
+                if let Some(data) = read_string(payload, &mut offset) {
+                    self.session.channel_data_buffer.extend_from_slice(data);
+                    return Ok(true);
+                }
+            }
+            SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
+                log("[SSH] Channel close/EOF received\n");
+                self.session.channel_eof = true;
+                return Ok(true);
+            }
+            SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
+            SSH_MSG_DISCONNECT => {
+                log("[SSH] Client disconnected\n");
+                self.session.state = SshState::Disconnected;
+                self.session.channel_eof = true;
+                return Ok(true);
+            }
+            _ => {
+                log(&format!("[SSH] Ignoring message type {} during shell\n", msg_type));
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl ErrorType for SshChannelStream<'_> {
+    type Error = SshStreamError;
+}
+
+impl Read for SshChannelStream<'_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        // If we have buffered channel data, return it
+        if !self.session.channel_data_buffer.is_empty() {
+            let len = buf.len().min(self.session.channel_data_buffer.len());
+            buf[..len].copy_from_slice(&self.session.channel_data_buffer[..len]);
+            self.session.channel_data_buffer = self.session.channel_data_buffer[len..].to_vec();
+            return Ok(len);
+        }
+
+        // Check for EOF
+        if self.session.channel_eof {
+            return Ok(0);
+        }
+
+        // Read until we have channel data
+        self.read_until_channel_data().await.map_err(|_| SshStreamError)?;
+
+        // Try again with the newly buffered data
+        if !self.session.channel_data_buffer.is_empty() {
+            let len = buf.len().min(self.session.channel_data_buffer.len());
+            buf[..len].copy_from_slice(&self.session.channel_data_buffer[..len]);
+            self.session.channel_data_buffer = self.session.channel_data_buffer[len..].to_vec();
+            return Ok(len);
+        }
+
+        // EOF
+        Ok(0)
+    }
+}
+
+impl Write for SshChannelStream<'_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        if !self.session.channel_open {
+            return Err(SshStreamError);
+        }
+        send_channel_data(self.stream, self.session, buf)
+            .await
+            .map_err(|_| SshStreamError)?;
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
@@ -368,79 +529,147 @@ async fn send_channel_data(
     send_packet(stream, &payload, session).await
 }
 
-async fn handle_shell_input(
-    stream: &mut TcpStream,
-    session: &mut SshSession,
-    data: &[u8],
-) -> Result<bool, TcpError> {
-    for &byte in data {
-        match byte {
-            b'\r' | b'\n' => {
-                let line = session.line_buffer.clone();
-                session.line_buffer.clear();
-
-                send_channel_data(stream, session, b"\r\n").await?;
-
-                if !line.is_empty() {
-                    let response = shell::execute_command(&line).await;
-                    if !response.is_empty() {
-                        send_channel_data(stream, session, &response).await?;
+/// Run an interactive shell session using ShellSession
+async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> Result<(), TcpError> {
+    log("[SSH] Starting shell session\n");
+    
+    // Create the SSH channel stream adapter
+    let mut channel_stream = SshChannelStream::new(stream, session);
+    
+    // Create command registry
+    let registry = create_default_registry();
+    
+    // Create and run shell session - we need to split read/write for ShellSession
+    // Since we can't split the channel_stream, we'll use a simpler approach:
+    // run the shell loop manually here
+    {
+        // Send welcome message
+        let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\nakuma> ";
+        let _ = channel_stream.write(welcome).await;
+    }
+    
+    // Line buffer for input
+    let mut line_buffer: Vec<u8> = Vec::new();
+    let mut read_buf = [0u8; 64];
+    
+    loop {
+        // Read input
+        match channel_stream.read(&mut read_buf).await {
+            Ok(0) => {
+                // EOF
+                log("[SSH] Shell session ended (EOF)\n");
+                break;
+            }
+            Ok(n) => {
+                for &byte in &read_buf[..n] {
+                    match byte {
+                        b'\r' | b'\n' => {
+                            // Echo newline
+                            let _ = channel_stream.write(b"\r\n").await;
+                            
+                            // Process command
+                            let trimmed = trim_bytes(&line_buffer);
+                            if !trimmed.is_empty() {
+                                // Check for exit/quit
+                                if trimmed == b"exit" || trimmed == b"quit" {
+                                    let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                    line_buffer.clear();
+                                    return Ok(());
+                                }
+                                
+                                // Parse command and arguments
+                                let (cmd_name, args) = split_first_word(trimmed);
+                                
+                                // Find and execute command
+                                if let Some(cmd) = registry.find(cmd_name) {
+                                    match cmd.execute(args).await {
+                                        Ok(output) => {
+                                            if !output.is_empty() {
+                                                let _ = channel_stream.write(&output).await;
+                                            }
+                                        }
+                                        Err(shell::ShellError::Exit) => {
+                                            let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                            line_buffer.clear();
+                                            return Ok(());
+                                        }
+                                        Err(shell::ShellError::ExecutionFailed(msg)) => {
+                                            let error = format!("Error: {}\r\n", msg);
+                                            let _ = channel_stream.write(error.as_bytes()).await;
+                                        }
+                                        Err(_) => {}
+                                    }
+                                } else {
+                                    let msg = format!(
+                                        "Unknown command: {}\r\nType 'help' for available commands.\r\n",
+                                        core::str::from_utf8(cmd_name).unwrap_or("?")
+                                    );
+                                    let _ = channel_stream.write(msg.as_bytes()).await;
+                                }
+                            }
+                            
+                            line_buffer.clear();
+                            let _ = channel_stream.write(b"akuma> ").await;
+                        }
+                        0x7F | 0x08 => {
+                            // Backspace
+                            if !line_buffer.is_empty() {
+                                line_buffer.pop();
+                                let _ = channel_stream.write(b"\x08 \x08").await;
+                            }
+                        }
+                        0x03 => {
+                            // Ctrl+C
+                            line_buffer.clear();
+                            let _ = channel_stream.write(b"^C\r\n").await;
+                            let _ = channel_stream.write(b"akuma> ").await;
+                        }
+                        0x04 => {
+                            // Ctrl+D
+                            if line_buffer.is_empty() {
+                                let _ = channel_stream.write(b"\r\nGoodbye!\r\n").await;
+                                return Ok(());
+                            }
+                        }
+                        _ if byte >= 0x20 && byte < 0x7F => {
+                            // Printable character
+                            line_buffer.push(byte);
+                            let _ = channel_stream.write(&[byte]).await;
+                        }
+                        _ => {}
                     }
-
-                    if shell::is_quit_command(&line) {
-                        let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
-                        write_u32(&mut close, session.client_channel);
-                        send_packet(stream, &close, session).await?;
-                        session.channel_open = false;
-                        session.state = SshState::Disconnected;
-                        return Ok(true); // Signal disconnect
-                    }
-                }
-
-                send_channel_data(stream, session, b"akuma> ").await?;
-            }
-            0x7F | 0x08 => {
-                if !session.line_buffer.is_empty() {
-                    session.line_buffer.pop();
-                    send_channel_data(stream, session, b"\x08 \x08").await?;
                 }
             }
-            0x03 => {
-                session.line_buffer.clear();
-                send_channel_data(stream, session, b"^C\r\n").await?;
-                send_channel_data(stream, session, b"akuma> ").await?;
+            Err(_) => {
+                log("[SSH] Shell session ended (read error)\n");
+                break;
             }
-            0x04 => {
-                if session.line_buffer.is_empty() {
-                    send_channel_data(stream, session, b"\r\nGoodbye!\r\n").await?;
-                    let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
-                    write_u32(&mut close, session.client_channel);
-                    send_packet(stream, &close, session).await?;
-                    session.channel_open = false;
-                    session.state = SshState::Disconnected;
-                    return Ok(true); // Signal disconnect
-                }
-            }
-            _ if byte >= 0x20 && byte < 0x7F => {
-                session.line_buffer.push(byte);
-                send_channel_data(stream, session, &[byte]).await?;
-            }
-            _ => {}
         }
     }
-    Ok(false)
+    
+    Ok(())
 }
 
 // ============================================================================
 // Message Handlers
 // ============================================================================
 
+/// Result of handling an SSH message
+enum MessageResult {
+    /// Continue processing messages
+    Continue,
+    /// Start an interactive shell session
+    StartShell,
+    /// Disconnect the session
+    Disconnect,
+}
+
 async fn handle_message(
     stream: &mut TcpStream,
     msg_type: u8,
     payload: &[u8],
     session: &mut SshSession,
-) -> Result<bool, TcpError> {
+) -> Result<MessageResult, TcpError> {
     log(&alloc::format!(
         "[SSH] Received message type {}\n",
         msg_type
@@ -555,40 +784,42 @@ async fn handle_message(
                 }
 
                 if req_type == b"shell" {
-                    send_channel_data(
-                        stream,
-                        session,
-                        b"\r\n=================================\r\n",
-                    )
-                    .await?;
-                    send_channel_data(stream, session, b"  Welcome to Akuma SSH Server\r\n")
-                        .await?;
-                    send_channel_data(
-                        stream,
-                        session,
-                        b"=================================\r\n\r\n",
-                    )
-                    .await?;
-                    send_channel_data(
-                        stream,
-                        session,
-                        b"Type 'help' for available commands.\r\n\r\n",
-                    )
-                    .await?;
-                    send_channel_data(stream, session, b"akuma> ").await?;
+                    // Signal to start the interactive shell session
+                    return Ok(MessageResult::StartShell);
                 } else if req_type == b"exec" {
-                    // Handle exec request - extract and execute the command
+                    // Handle exec request - extract and execute a single command
                     offset += 1; // skip want_reply byte
                     if let Some(cmd_bytes) = read_string(payload, &mut offset) {
-                        log(&alloc::format!(
+                        log(&format!(
                             "[SSH] Exec command: {:?}\n",
                             core::str::from_utf8(cmd_bytes)
                         ));
-                        let response = shell::execute_command(cmd_bytes).await;
-                        if !response.is_empty() {
-                            send_channel_data(stream, session, &response).await?;
+                        
+                        // Use the command registry for exec
+                        let registry = create_default_registry();
+                        let trimmed = trim_bytes(cmd_bytes);
+                        let (cmd_name, args) = split_first_word(trimmed);
+                        
+                        if let Some(cmd) = registry.find(cmd_name) {
+                            match cmd.execute(args).await {
+                                Ok(output) => {
+                                    if !output.is_empty() {
+                                        send_channel_data(stream, session, &output).await?;
+                                    }
+                                }
+                                Err(shell::ShellError::ExecutionFailed(msg)) => {
+                                    let error = format!("Error: {}\r\n", msg);
+                                    send_channel_data(stream, session, error.as_bytes()).await?;
+                                }
+                                Err(_) => {}
+                            }
+                        } else {
+                            let msg = format!(
+                                "Unknown command: {}\r\n",
+                                core::str::from_utf8(cmd_name).unwrap_or("?")
+                            );
+                            send_channel_data(stream, session, msg.as_bytes()).await?;
                         }
-                        send_channel_data(stream, session, b"\n").await?;
                     }
                     // Send EOF after exec - client will send CLOSE, we respond to that
                     let mut eof = vec![SSH_MSG_CHANNEL_EOF];
@@ -599,13 +830,9 @@ async fn handle_message(
         }
 
         SSH_MSG_CHANNEL_DATA => {
-            let mut offset = 0;
-            let _recipient = read_u32(payload, &mut offset);
-            if let Some(data) = read_string(payload, &mut offset) {
-                if handle_shell_input(stream, session, data).await? {
-                    return Ok(true); // Disconnect requested
-                }
-            }
+            // Channel data during non-shell mode is ignored
+            // (Shell mode handles data via SshChannelStream)
+            log("[SSH] Unexpected channel data outside shell mode\n");
         }
 
         SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
@@ -624,13 +851,13 @@ async fn handle_message(
         SSH_MSG_DISCONNECT => {
             log("[SSH] Client disconnected\n");
             session.state = SshState::Disconnected;
-            return Ok(true);
+            return Ok(MessageResult::Disconnect);
         }
 
         SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
 
         _ => {
-            log(&alloc::format!(
+            log(&format!(
                 "[SSH] Unhandled message type {}\n",
                 msg_type
             ));
@@ -640,7 +867,7 @@ async fn handle_message(
         }
     }
 
-    Ok(false)
+    Ok(MessageResult::Continue)
 }
 
 // ============================================================================
@@ -805,11 +1032,25 @@ pub async fn handle_connection(mut stream: TcpStream) {
                             match handle_message(&mut stream, msg_type, &payload, &mut session)
                                 .await
                             {
-                                Ok(true) => {
-                                    // Disconnect requested
+                                Ok(MessageResult::Continue) => {}
+                                Ok(MessageResult::StartShell) => {
+                                    // Run the interactive shell session
+                                    if run_shell_session(&mut stream, &mut session).await.is_err() {
+                                        log("[SSH] Shell session error\n");
+                                    }
+                                    // After shell exits, close the channel and disconnect
+                                    if session.channel_open {
+                                        let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
+                                        write_u32(&mut close, session.client_channel);
+                                        let _ = send_packet(&mut stream, &close, &mut session).await;
+                                        session.channel_open = false;
+                                    }
+                                    session.state = SshState::Disconnected;
                                     return;
                                 }
-                                Ok(false) => {}
+                                Ok(MessageResult::Disconnect) => {
+                                    return;
+                                }
                                 Err(_) => {
                                     log("[SSH] Error handling message\n");
                                     return;
