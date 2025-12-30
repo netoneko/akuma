@@ -34,6 +34,7 @@ dependencies = [
  "embedded-sdmmc",
  "fdt",
  "hmac",
+ "nostd-interactive-terminal",
  "rand_core",
  "sha2",
  "smoltcp 0.11.0",
@@ -658,6 +659,18 @@ name = "nb"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
+
+[[package]]
+name = "nostd-interactive-terminal"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4acb7a8526292a99318d4c5ee878b521c1032eaed20b0bdf041f24120f5fdbe9"
+dependencies = [
+ "embassy-futures",
+ "embassy-sync 0.6.2",
+ "embedded-io-async",
+ "heapless",
+]
 
 [[package]]
 name = "num-traits"

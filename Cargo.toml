@@ -48,3 +48,6 @@ embedded-sdmmc = { version = "0.9", default-features = false }
 # HTTP client/server (no_std)
 edge-http = { version = "0.6", default-features = false, features = ["io"] }
 embedded-io-async = { version = "0.6", default-features = false }
+
+# Interactive terminal for shell (no_std)
+nostd-interactive-terminal = { version = "0.1", default-features = false, features = ["ansi-support"] }
