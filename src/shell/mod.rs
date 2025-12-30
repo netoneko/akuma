@@ -14,8 +14,8 @@ use core::future::Future;
 use core::pin::Pin;
 
 use embedded_io_async::{Read, Write};
-use nostd_interactive_terminal::terminal::{TerminalConfig, TerminalReader, ReadLineError};
 use nostd_interactive_terminal::history::{History, HistoryConfig};
+use nostd_interactive_terminal::terminal::{ReadLineError, TerminalConfig, TerminalReader};
 use nostd_interactive_terminal::writer::TerminalWriter;
 
 use crate::ssh_crypto::{split_first_word, trim_bytes};
@@ -47,7 +47,7 @@ pub enum ShellError {
 // ============================================================================
 
 /// A command that can be executed by the shell
-/// 
+///
 /// Commands are stateless and should be implemented as unit structs.
 /// The execute method takes arguments and returns output as a Vec<u8>.
 pub trait Command: Sync {
@@ -68,7 +68,7 @@ pub trait Command: Sync {
     }
 
     /// Execute the command and return the output
-    /// 
+    ///
     /// The args parameter contains the raw argument bytes.
     /// Returns the output to be displayed.
     fn execute<'a>(
@@ -94,11 +94,7 @@ pub struct ShellSession<'a, R: Read, W: Write> {
 
 impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
     /// Create a new shell session
-    pub fn new(
-        reader: &'a mut R,
-        writer: &'a mut W,
-        registry: &'a CommandRegistry,
-    ) -> Self {
+    pub fn new(reader: &'a mut R, writer: &'a mut W, registry: &'a CommandRegistry) -> Self {
         let config = TerminalConfig {
             buffer_size: TERMINAL_BUF_SIZE,
             prompt: "akuma> ",
@@ -134,12 +130,16 @@ impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
         loop {
             // Read a line using the terminal reader
             let mut writer = TerminalWriter::new(self.writer_inner, true);
-            
-            let line = match self.reader.read_line::<_, _, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex>(
-                self.reader_inner,
-                &mut writer,
-                None,
-            ).await {
+
+            let line = match self
+                .reader
+                .read_line::<_, _, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex>(
+                    self.reader_inner,
+                    &mut writer,
+                    None,
+                )
+                .await
+            {
                 Ok(line) => line,
                 Err(ReadLineError::EndOfFile) => {
                     let _ = writer.writeln("\r\nGoodbye!").await;
@@ -150,7 +150,7 @@ impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
 
             let line_bytes = line.as_bytes();
             let trimmed = trim_bytes(line_bytes);
-            
+
             if trimmed.is_empty() {
                 continue;
             }
@@ -191,4 +191,3 @@ impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
         }
     }
 }
-

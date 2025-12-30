@@ -20,9 +20,15 @@ use crate::shell::{Command, ShellError};
 pub struct CurlCommand;
 
 impl Command for CurlCommand {
-    fn name(&self) -> &'static str { "curl" }
-    fn description(&self) -> &'static str { "HTTP GET request" }
-    fn usage(&self) -> &'static str { "curl <url>" }
+    fn name(&self) -> &'static str {
+        "curl"
+    }
+    fn description(&self) -> &'static str {
+        "HTTP GET request"
+    }
+    fn usage(&self) -> &'static str {
+        "curl <url>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -30,7 +36,7 @@ impl Command for CurlCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: curl <url>\r\n");
                 response.extend_from_slice(b"Example: curl http://10.0.2.2:8080/\r\n");
@@ -83,7 +89,9 @@ async fn http_get(url: &str) -> Result<String, &'static str> {
 
     let stack = async_net::get_global_stack().ok_or("Network not initialized")?;
 
-    let url = url.strip_prefix("http://").ok_or("Only http:// URLs supported")?;
+    let url = url
+        .strip_prefix("http://")
+        .ok_or("Only http:// URLs supported")?;
 
     let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
     let path = format!("/{}", path);
@@ -97,7 +105,10 @@ async fn http_get(url: &str) -> Result<String, &'static str> {
     let ip: IpAddress = if let Ok(ip) = host.parse::<embassy_net::Ipv4Address>() {
         IpAddress::Ipv4(ip)
     } else {
-        match stack.dns_query(host, embassy_net::dns::DnsQueryType::A).await {
+        match stack
+            .dns_query(host, embassy_net::dns::DnsQueryType::A)
+            .await
+        {
             Ok(addrs) if !addrs.is_empty() => addrs[0],
             _ => return Err("DNS lookup failed"),
         }
@@ -109,13 +120,19 @@ async fn http_get(url: &str) -> Result<String, &'static str> {
     socket.set_timeout(Some(Duration::from_secs(10)));
 
     let endpoint = IpEndpoint::new(ip, port);
-    socket.connect(endpoint).await.map_err(|_| "Connection failed")?;
+    socket
+        .connect(endpoint)
+        .await
+        .map_err(|_| "Connection failed")?;
 
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: akuma-curl/1.0\r\n\r\n",
         path, host
     );
-    socket.write_all(request.as_bytes()).await.map_err(|_| "Write failed")?;
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| "Write failed")?;
 
     let mut response_data = Vec::new();
     let mut buf = [0u8; 512];
@@ -139,4 +156,3 @@ async fn http_get(url: &str) -> Result<String, &'static str> {
 }
 
 use alloc::string::ToString;
-

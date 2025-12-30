@@ -20,10 +20,18 @@ use crate::ssh_crypto::split_first_word;
 pub struct LsCommand;
 
 impl Command for LsCommand {
-    fn name(&self) -> &'static str { "ls" }
-    fn aliases(&self) -> &'static [&'static str] { &["dir"] }
-    fn description(&self) -> &'static str { "List directory contents" }
-    fn usage(&self) -> &'static str { "ls [path]" }
+    fn name(&self) -> &'static str {
+        "ls"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["dir"]
+    }
+    fn description(&self) -> &'static str {
+        "List directory contents"
+    }
+    fn usage(&self) -> &'static str {
+        "ls [path]"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -93,10 +101,18 @@ pub static LS_CMD: LsCommand = LsCommand;
 pub struct CatCommand;
 
 impl Command for CatCommand {
-    fn name(&self) -> &'static str { "cat" }
-    fn aliases(&self) -> &'static [&'static str] { &["read"] }
-    fn description(&self) -> &'static str { "Display file contents" }
-    fn usage(&self) -> &'static str { "cat <filename>" }
+    fn name(&self) -> &'static str {
+        "cat"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["read"]
+    }
+    fn description(&self) -> &'static str {
+        "Display file contents"
+    }
+    fn usage(&self) -> &'static str {
+        "cat <filename>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -104,7 +120,7 @@ impl Command for CatCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: cat <filename>\r\n");
                 return Ok(response);
@@ -144,9 +160,15 @@ pub static CAT_CMD: CatCommand = CatCommand;
 pub struct WriteCommand;
 
 impl Command for WriteCommand {
-    fn name(&self) -> &'static str { "write" }
-    fn description(&self) -> &'static str { "Write text to file" }
-    fn usage(&self) -> &'static str { "write <filename> <content>" }
+    fn name(&self) -> &'static str {
+        "write"
+    }
+    fn description(&self) -> &'static str {
+        "Write text to file"
+    }
+    fn usage(&self) -> &'static str {
+        "write <filename> <content>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -154,7 +176,7 @@ impl Command for WriteCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: write <filename> <content>\r\n");
                 return Ok(response);
@@ -198,9 +220,15 @@ pub static WRITE_CMD: WriteCommand = WriteCommand;
 pub struct AppendCommand;
 
 impl Command for AppendCommand {
-    fn name(&self) -> &'static str { "append" }
-    fn description(&self) -> &'static str { "Append text to file" }
-    fn usage(&self) -> &'static str { "append <filename> <content>" }
+    fn name(&self) -> &'static str {
+        "append"
+    }
+    fn description(&self) -> &'static str {
+        "Append text to file"
+    }
+    fn usage(&self) -> &'static str {
+        "append <filename> <content>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -208,7 +236,7 @@ impl Command for AppendCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: append <filename> <content>\r\n");
                 return Ok(response);
@@ -252,10 +280,18 @@ pub static APPEND_CMD: AppendCommand = AppendCommand;
 pub struct RmCommand;
 
 impl Command for RmCommand {
-    fn name(&self) -> &'static str { "rm" }
-    fn aliases(&self) -> &'static [&'static str] { &["del"] }
-    fn description(&self) -> &'static str { "Remove file" }
-    fn usage(&self) -> &'static str { "rm <filename>" }
+    fn name(&self) -> &'static str {
+        "rm"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["del"]
+    }
+    fn description(&self) -> &'static str {
+        "Remove file"
+    }
+    fn usage(&self) -> &'static str {
+        "rm <filename>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -263,7 +299,7 @@ impl Command for RmCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: rm <filename>\r\n");
                 return Ok(response);
@@ -301,9 +337,15 @@ pub static RM_CMD: RmCommand = RmCommand;
 pub struct MkdirCommand;
 
 impl Command for MkdirCommand {
-    fn name(&self) -> &'static str { "mkdir" }
-    fn description(&self) -> &'static str { "Create directory" }
-    fn usage(&self) -> &'static str { "mkdir <dirname>" }
+    fn name(&self) -> &'static str {
+        "mkdir"
+    }
+    fn description(&self) -> &'static str {
+        "Create directory"
+    }
+    fn usage(&self) -> &'static str {
+        "mkdir <dirname>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -311,7 +353,7 @@ impl Command for MkdirCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if args.is_empty() {
                 response.extend_from_slice(b"Usage: mkdir <dirname>\r\n");
                 return Ok(response);
@@ -349,9 +391,15 @@ pub static MKDIR_CMD: MkdirCommand = MkdirCommand;
 pub struct DfCommand;
 
 impl Command for DfCommand {
-    fn name(&self) -> &'static str { "df" }
-    fn aliases(&self) -> &'static [&'static str] { &["diskfree"] }
-    fn description(&self) -> &'static str { "Show disk usage" }
+    fn name(&self) -> &'static str {
+        "df"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["diskfree"]
+    }
+    fn description(&self) -> &'static str {
+        "Show disk usage"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -359,7 +407,7 @@ impl Command for DfCommand {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
         Box::pin(async move {
             let mut response = Vec::new();
-            
+
             if !crate::fs::is_initialized() {
                 response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
                 return Ok(response);
@@ -393,4 +441,3 @@ impl Command for DfCommand {
 
 /// Static instance
 pub static DF_CMD: DfCommand = DfCommand;
-

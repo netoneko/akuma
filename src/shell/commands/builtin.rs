@@ -20,9 +20,15 @@ use crate::shell::{Command, ShellError};
 pub struct EchoCommand;
 
 impl Command for EchoCommand {
-    fn name(&self) -> &'static str { "echo" }
-    fn description(&self) -> &'static str { "Echo back text" }
-    fn usage(&self) -> &'static str { "echo <text>" }
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn description(&self) -> &'static str {
+        "Echo back text"
+    }
+    fn usage(&self) -> &'static str {
+        "echo <text>"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -50,8 +56,12 @@ pub static ECHO_CMD: EchoCommand = EchoCommand;
 pub struct AkumaCommand;
 
 impl Command for AkumaCommand {
-    fn name(&self) -> &'static str { "akuma" }
-    fn description(&self) -> &'static str { "Display ASCII art" }
+    fn name(&self) -> &'static str {
+        "akuma"
+    }
+    fn description(&self) -> &'static str {
+        "Display ASCII art"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -85,8 +95,12 @@ pub static AKUMA_CMD: AkumaCommand = AkumaCommand;
 pub struct StatsCommand;
 
 impl Command for StatsCommand {
-    fn name(&self) -> &'static str { "stats" }
-    fn description(&self) -> &'static str { "Show network statistics" }
+    fn name(&self) -> &'static str {
+        "stats"
+    }
+    fn description(&self) -> &'static str {
+        "Show network statistics"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -114,9 +128,15 @@ pub static STATS_CMD: StatsCommand = StatsCommand;
 pub struct FreeCommand;
 
 impl Command for FreeCommand {
-    fn name(&self) -> &'static str { "free" }
-    fn aliases(&self) -> &'static [&'static str] { &["mem"] }
-    fn description(&self) -> &'static str { "Show memory usage" }
+    fn name(&self) -> &'static str {
+        "free"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["mem"]
+    }
+    fn description(&self) -> &'static str {
+        "Show memory usage"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -147,8 +167,13 @@ impl Command for FreeCommand {
                  Peak:        {} KB\r\n\
                  Allocs:      {}\r\n\
                  Heap size:   {} MB\r\n",
-                heap_kb, allocated_kb, free_kb,
-                used_percent, peak_kb, stats.allocation_count, heap_mb
+                heap_kb,
+                allocated_kb,
+                free_kb,
+                used_percent,
+                peak_kb,
+                stats.allocation_count,
+                heap_mb
             );
             Ok(info.into_bytes())
         })
@@ -166,8 +191,12 @@ pub static FREE_CMD: FreeCommand = FreeCommand;
 pub struct HelpCommand;
 
 impl Command for HelpCommand {
-    fn name(&self) -> &'static str { "help" }
-    fn description(&self) -> &'static str { "Show this help" }
+    fn name(&self) -> &'static str {
+        "help"
+    }
+    fn description(&self) -> &'static str {
+        "Show this help"
+    }
 
     fn execute<'a>(
         &'a self,
@@ -199,4 +228,3 @@ impl Command for HelpCommand {
 
 /// Static instance
 pub static HELP_CMD: HelpCommand = HelpCommand;
-

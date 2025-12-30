@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use super::Command;
 
 // Re-export static command instances
-pub use builtin::{ECHO_CMD, AKUMA_CMD, STATS_CMD, FREE_CMD, HELP_CMD};
-pub use fs::{LS_CMD, CAT_CMD, WRITE_CMD, APPEND_CMD, RM_CMD, MKDIR_CMD, DF_CMD};
+pub use builtin::{AKUMA_CMD, ECHO_CMD, FREE_CMD, HELP_CMD, STATS_CMD};
+pub use fs::{APPEND_CMD, CAT_CMD, DF_CMD, LS_CMD, MKDIR_CMD, RM_CMD, WRITE_CMD};
 pub use net::CURL_CMD;
 
 // ============================================================================
@@ -67,14 +67,14 @@ impl CommandRegistry {
 /// Create and populate the default command registry
 pub fn create_default_registry() -> CommandRegistry {
     let mut registry = CommandRegistry::new();
-    
+
     // Built-in commands
     registry.register(&ECHO_CMD);
     registry.register(&AKUMA_CMD);
     registry.register(&STATS_CMD);
     registry.register(&FREE_CMD);
     registry.register(&HELP_CMD);
-    
+
     // Filesystem commands
     registry.register(&LS_CMD);
     registry.register(&CAT_CMD);
@@ -83,10 +83,9 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&RM_CMD);
     registry.register(&MKDIR_CMD);
     registry.register(&DF_CMD);
-    
+
     // Network commands
     registry.register(&CURL_CMD);
-    
+
     registry
 }
-

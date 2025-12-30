@@ -8,10 +8,10 @@ use alloc::string::String;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use edge_http::io::server::Connection;
 use edge_http::Method;
-use embassy_net::tcp::TcpSocket;
+use edge_http::io::server::Connection;
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::Duration;
 use embedded_io_async::Write;
 
@@ -79,11 +79,7 @@ impl BufferPool {
     unsafe fn get_buffers(
         &self,
         slot: usize,
-    ) -> (
-        &'static mut [u8],
-        &'static mut [u8],
-        &'static mut [u8],
-    ) {
+    ) -> (&'static mut [u8], &'static mut [u8], &'static mut [u8]) {
         debug_assert!(slot <= MAX_CONNECTIONS);
         unsafe {
             let rx = &mut *self.rx_buffers[slot].get();
@@ -155,13 +151,13 @@ async fn handle_connection(socket: &mut TcpSocket<'_>, http_buf: &mut [u8]) {
     };
 
     let method = headers.method;
-    let path = if headers.path.is_empty() { "/" } else { headers.path };
+    let path = if headers.path.is_empty() {
+        "/"
+    } else {
+        headers.path
+    };
 
-    log(&format!(
-        "[HTTP] {:?} {}\n",
-        method,
-        path
-    ));
+    log(&format!("[HTTP] {:?} {}\n", method, path));
 
     // Only support GET and HEAD
     match method {

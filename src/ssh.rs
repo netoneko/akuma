@@ -179,13 +179,13 @@ impl<'a> SshChannelStream<'a> {
     /// Read and process SSH packets until we have channel data or an error
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
         let mut buf = [0u8; 512];
-        
+
         loop {
             // Check if we already have channel data or EOF
             if !self.session.channel_data_buffer.is_empty() || self.session.channel_eof {
                 return Ok(());
             }
-            
+
             // Read more data from the network
             match self.stream.read(&mut buf).await {
                 Ok(0) => {
@@ -194,7 +194,7 @@ impl<'a> SshChannelStream<'a> {
                 }
                 Ok(n) => {
                     self.session.input_buffer.extend_from_slice(&buf[..n]);
-                    
+
                     // Process any complete packets
                     loop {
                         let packet = process_encrypted_packet(self.session);
@@ -248,7 +248,10 @@ impl<'a> SshChannelStream<'a> {
                 return Ok(true);
             }
             _ => {
-                log(&format!("[SSH] Ignoring message type {} during shell\n", msg_type));
+                log(&format!(
+                    "[SSH] Ignoring message type {} during shell\n",
+                    msg_type
+                ));
             }
         }
         Ok(false)
@@ -275,7 +278,9 @@ impl Read for SshChannelStream<'_> {
         }
 
         // Read until we have channel data
-        self.read_until_channel_data().await.map_err(|_| SshStreamError)?;
+        self.read_until_channel_data()
+            .await
+            .map_err(|_| SshStreamError)?;
 
         // Try again with the newly buffered data
         if !self.session.channel_data_buffer.is_empty() {
@@ -533,37 +538,40 @@ async fn send_channel_data(
 #[derive(Clone, Copy, PartialEq)]
 enum EscapeState {
     Normal,
-    Escape,      // Got ESC (0x1B)
-    Bracket,     // Got ESC [
+    Escape,  // Got ESC (0x1B)
+    Bracket, // Got ESC [
 }
 
 /// Run an interactive shell session using ShellSession
-async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> Result<(), TcpError> {
+async fn run_shell_session(
+    stream: &mut TcpStream,
+    session: &mut SshSession,
+) -> Result<(), TcpError> {
     log("[SSH] Starting shell session\n");
-    
+
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
-    
+
     // Create command registry
     let registry = create_default_registry();
-    
+
     // Send welcome message
     {
         let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\nakuma> ";
         let _ = channel_stream.write(welcome).await;
     }
-    
+
     // Line buffer for input with cursor position
     let mut line_buffer: Vec<u8> = Vec::new();
     let mut cursor_pos: usize = 0;
     let mut read_buf = [0u8; 64];
     let mut escape_state = EscapeState::Normal;
-    
+
     // Command history
     let mut history: Vec<Vec<u8>> = Vec::new();
     let mut history_index: usize = 0;
     let mut saved_line: Vec<u8> = Vec::new(); // Save current line when navigating history
-    
+
     loop {
         // Read input
         match channel_stream.read(&mut read_buf).await {
@@ -583,7 +591,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                 b'\r' | b'\n' => {
                                     // Echo newline
                                     let _ = channel_stream.write(b"\r\n").await;
-                                    
+
                                     // Process command
                                     let trimmed = trim_bytes(&line_buffer);
                                     if !trimmed.is_empty() {
@@ -593,16 +601,16 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                             history.remove(0);
                                         }
                                         history_index = history.len();
-                                        
+
                                         // Check for exit/quit
                                         if trimmed == b"exit" || trimmed == b"quit" {
                                             let _ = channel_stream.write(b"Goodbye!\r\n").await;
                                             return Ok(());
                                         }
-                                        
+
                                         // Parse command and arguments
                                         let (cmd_name, args) = split_first_word(trimmed);
-                                        
+
                                         // Find and execute command
                                         if let Some(cmd) = registry.find(cmd_name) {
                                             match cmd.execute(args).await {
@@ -612,12 +620,15 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                                     }
                                                 }
                                                 Err(shell::ShellError::Exit) => {
-                                                    let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                                    let _ =
+                                                        channel_stream.write(b"Goodbye!\r\n").await;
                                                     return Ok(());
                                                 }
                                                 Err(shell::ShellError::ExecutionFailed(msg)) => {
                                                     let error = format!("Error: {}\r\n", msg);
-                                                    let _ = channel_stream.write(error.as_bytes()).await;
+                                                    let _ = channel_stream
+                                                        .write(error.as_bytes())
+                                                        .await;
                                                 }
                                                 Err(_) => {}
                                             }
@@ -629,7 +640,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                             let _ = channel_stream.write(msg.as_bytes()).await;
                                         }
                                     }
-                                    
+
                                     line_buffer.clear();
                                     cursor_pos = 0;
                                     let _ = channel_stream.write(b"akuma> ").await;
@@ -639,10 +650,11 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                     if cursor_pos > 0 {
                                         cursor_pos -= 1;
                                         line_buffer.remove(cursor_pos);
-                                        
+
                                         // Move cursor back, rewrite rest of line, clear extra char
                                         let _ = channel_stream.write(b"\x08").await;
-                                        let _ = channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                        let _ =
+                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
                                         let _ = channel_stream.write(b" ").await;
                                         // Move cursor back to position
                                         let moves = line_buffer.len() - cursor_pos + 1;
@@ -675,7 +687,8 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                 0x05 => {
                                     // Ctrl+E - move to end of line
                                     if cursor_pos < line_buffer.len() {
-                                        let _ = channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                        let _ =
+                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
                                         cursor_pos = line_buffer.len();
                                     }
                                 }
@@ -719,9 +732,10 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                     // Printable character - insert at cursor position
                                     line_buffer.insert(cursor_pos, byte);
                                     cursor_pos += 1;
-                                    
+
                                     // Write character and rest of line
-                                    let _ = channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
+                                    let _ =
+                                        channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
                                     // Move cursor back to position
                                     let moves = line_buffer.len() - cursor_pos;
                                     for _ in 0..moves {
@@ -750,7 +764,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                             saved_line = line_buffer.clone();
                                         }
                                         history_index -= 1;
-                                        
+
                                         // Clear current line
                                         while cursor_pos > 0 {
                                             let _ = channel_stream.write(b"\x08 \x08").await;
@@ -762,7 +776,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                         for _ in 0..line_buffer.len() {
                                             let _ = channel_stream.write(b"\x08").await;
                                         }
-                                        
+
                                         // Load history entry
                                         line_buffer = history[history_index].clone();
                                         cursor_pos = line_buffer.len();
@@ -773,7 +787,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                     // Down arrow - next history
                                     if history_index < history.len() {
                                         history_index += 1;
-                                        
+
                                         // Clear current line
                                         while cursor_pos > 0 {
                                             let _ = channel_stream.write(b"\x08 \x08").await;
@@ -785,7 +799,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                         for _ in 0..line_buffer.len() {
                                             let _ = channel_stream.write(b"\x08").await;
                                         }
-                                        
+
                                         // Load history entry or saved line
                                         if history_index < history.len() {
                                             line_buffer = history[history_index].clone();
@@ -799,7 +813,8 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                 b'C' => {
                                     // Right arrow - move cursor right
                                     if cursor_pos < line_buffer.len() {
-                                        let _ = channel_stream.write(&[line_buffer[cursor_pos]]).await;
+                                        let _ =
+                                            channel_stream.write(&[line_buffer[cursor_pos]]).await;
                                         cursor_pos += 1;
                                     }
                                 }
@@ -820,7 +835,8 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
                                 b'F' => {
                                     // End key
                                     if cursor_pos < line_buffer.len() {
-                                        let _ = channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                        let _ =
+                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
                                         cursor_pos = line_buffer.len();
                                     }
                                 }
@@ -843,7 +859,7 @@ async fn run_shell_session(stream: &mut TcpStream, session: &mut SshSession) -> 
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -991,12 +1007,12 @@ async fn handle_message(
                             "[SSH] Exec command: {:?}\n",
                             core::str::from_utf8(cmd_bytes)
                         ));
-                        
+
                         // Use the command registry for exec
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
                         let (cmd_name, args) = split_first_word(trimmed);
-                        
+
                         if let Some(cmd) = registry.find(cmd_name) {
                             match cmd.execute(args).await {
                                 Ok(output) => {
@@ -1054,10 +1070,7 @@ async fn handle_message(
         SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
 
         _ => {
-            log(&format!(
-                "[SSH] Unhandled message type {}\n",
-                msg_type
-            ));
+            log(&format!("[SSH] Unhandled message type {}\n", msg_type));
             let mut reply = vec![SSH_MSG_UNIMPLEMENTED];
             write_u32(&mut reply, session.crypto.decrypt_seq.wrapping_sub(1));
             send_packet(stream, &reply, session).await?;
@@ -1239,7 +1252,8 @@ pub async fn handle_connection(mut stream: TcpStream) {
                                     if session.channel_open {
                                         let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                                         write_u32(&mut close, session.client_channel);
-                                        let _ = send_packet(&mut stream, &close, &mut session).await;
+                                        let _ =
+                                            send_packet(&mut stream, &close, &mut session).await;
                                         session.channel_open = false;
                                     }
                                     session.state = SshState::Disconnected;
