@@ -19,6 +19,7 @@ mod exceptions;
 mod executor;
 mod fs;
 mod fs_tests;
+mod vfs;
 mod gic;
 mod irq;
 mod netcat_server;

@@ -1,11 +1,10 @@
 //! VirtIO Block Device Driver
 //!
-//! Provides a block device driver for virtio-blk devices that implements
-//! the embedded-sdmmc BlockDevice trait.
+//! Provides a block device driver for virtio-blk devices with a generic
+//! sector-based read/write API suitable for filesystem implementations.
 
 use core::cell::UnsafeCell;
 
-use embedded_sdmmc::BlockDevice;
 use spinning_top::Spinlock;
 use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
@@ -43,6 +42,8 @@ pub enum BlockError {
     WriteError,
     /// Device not initialized
     NotInitialized,
+    /// Invalid offset or size
+    InvalidOffset,
 }
 
 impl core::fmt::Display for BlockError {
@@ -52,6 +53,7 @@ impl core::fmt::Display for BlockError {
             BlockError::ReadError => write!(f, "Read error"),
             BlockError::WriteError => write!(f, "Write error"),
             BlockError::NotInitialized => write!(f, "Device not initialized"),
+            BlockError::InvalidOffset => write!(f, "Invalid offset"),
         }
     }
 }
@@ -60,13 +62,13 @@ impl core::fmt::Display for BlockError {
 // VirtIO Block Device Wrapper
 // ============================================================================
 
-/// VirtIO block device wrapper implementing embedded-sdmmc BlockDevice trait
+/// VirtIO block device wrapper with interior mutability
 ///
-/// Uses UnsafeCell for interior mutability because the embedded-sdmmc BlockDevice
-/// trait requires &self for read/write operations, but VirtIOBlk needs &mut self.
+/// Uses UnsafeCell for interior mutability because VirtIOBlk needs &mut self
+/// for read/write operations, but we want to share it through a Spinlock.
 pub struct VirtioBlockDevice {
     inner: UnsafeCell<VirtIOBlk<VirtioHal, MmioTransport>>,
-    capacity_blocks: u64,
+    capacity_sectors: u64,
 }
 
 // SAFETY: VirtioBlockDevice is only accessed through the global BLOCK_DEVICE Spinlock,
@@ -77,21 +79,21 @@ unsafe impl Sync for VirtioBlockDevice {}
 impl VirtioBlockDevice {
     /// Create a new VirtIO block device wrapper
     fn new(inner: VirtIOBlk<VirtioHal, MmioTransport>) -> Self {
-        let capacity_blocks = inner.capacity();
+        let capacity_sectors = inner.capacity();
         Self {
             inner: UnsafeCell::new(inner),
-            capacity_blocks,
+            capacity_sectors,
         }
     }
 
-    /// Get the capacity in blocks
-    pub fn capacity_blocks(&self) -> u64 {
-        self.capacity_blocks
+    /// Get the capacity in sectors (512-byte blocks)
+    pub fn capacity_sectors(&self) -> u64 {
+        self.capacity_sectors
     }
 
     /// Get the capacity in bytes
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_blocks * SECTOR_SIZE as u64
+        self.capacity_sectors * SECTOR_SIZE as u64
     }
 
     /// Get mutable access to the inner VirtIOBlk
@@ -101,78 +103,110 @@ impl VirtioBlockDevice {
         // SAFETY: We have exclusive access via the Spinlock guard
         unsafe { &mut *self.inner.get() }
     }
-}
 
-// ============================================================================
-// embedded-sdmmc BlockDevice Implementation
-// ============================================================================
+    /// Read sectors from the device
+    ///
+    /// # Arguments
+    /// * `sector` - Starting sector number
+    /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
+    pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.len() % SECTOR_SIZE != 0 {
+            return Err(BlockError::InvalidOffset);
+        }
 
-impl BlockDevice for VirtioBlockDevice {
-    type Error = BlockError;
+        let num_sectors = buf.len() / SECTOR_SIZE;
+        if sector + num_sectors as u64 > self.capacity_sectors {
+            return Err(BlockError::InvalidOffset);
+        }
 
-    fn read(
-        &self,
-        blocks: &mut [embedded_sdmmc::Block],
-        start_block_idx: embedded_sdmmc::BlockIdx,
-    ) -> Result<(), Self::Error> {
-        let start = start_block_idx.0 as usize;
         let inner = self.inner_mut();
 
-        for (i, block) in blocks.iter_mut().enumerate() {
-            let block_idx = start + i;
+        // VirtIOBlk::read_blocks reads one sector at a time
+        for i in 0..num_sectors {
+            let offset = i * SECTOR_SIZE;
+            let sector_buf = &mut buf[offset..offset + SECTOR_SIZE];
             inner
-                .read_blocks(block_idx, &mut block.contents)
+                .read_blocks(sector as usize + i, sector_buf)
                 .map_err(|_| BlockError::ReadError)?;
         }
 
         Ok(())
     }
 
-    fn write(
-        &self,
-        blocks: &[embedded_sdmmc::Block],
-        start_block_idx: embedded_sdmmc::BlockIdx,
-    ) -> Result<(), Self::Error> {
-        let start = start_block_idx.0 as usize;
+    /// Write sectors to the device
+    ///
+    /// # Arguments
+    /// * `sector` - Starting sector number
+    /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
+    pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.len() % SECTOR_SIZE != 0 {
+            return Err(BlockError::InvalidOffset);
+        }
+
+        let num_sectors = buf.len() / SECTOR_SIZE;
+        if sector + num_sectors as u64 > self.capacity_sectors {
+            return Err(BlockError::InvalidOffset);
+        }
+
         let inner = self.inner_mut();
 
-        for (i, block) in blocks.iter().enumerate() {
-            let block_idx = start + i;
+        // VirtIOBlk::write_blocks writes one sector at a time
+        for i in 0..num_sectors {
+            let offset = i * SECTOR_SIZE;
+            let sector_buf = &buf[offset..offset + SECTOR_SIZE];
             inner
-                .write_blocks(block_idx, &block.contents)
+                .write_blocks(sector as usize + i, sector_buf)
                 .map_err(|_| BlockError::WriteError)?;
         }
 
         Ok(())
     }
 
-    fn num_blocks(&self) -> Result<embedded_sdmmc::BlockCount, Self::Error> {
-        Ok(embedded_sdmmc::BlockCount(self.capacity_blocks as u32))
-    }
-}
+    /// Read bytes at an arbitrary offset (handles sector alignment internally)
+    pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
 
-// Also implement for mutable references to allow use with with_device
-impl BlockDevice for &mut VirtioBlockDevice {
-    type Error = BlockError;
+        let start_sector = offset / SECTOR_SIZE as u64;
+        let end_offset = offset + buf.len() as u64;
+        let end_sector = (end_offset + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64;
+        let num_sectors = (end_sector - start_sector) as usize;
 
-    fn read(
-        &self,
-        blocks: &mut [embedded_sdmmc::Block],
-        start_block_idx: embedded_sdmmc::BlockIdx,
-    ) -> Result<(), Self::Error> {
-        (**self).read(blocks, start_block_idx)
-    }
+        // Allocate temporary buffer for aligned read
+        let mut temp = alloc::vec![0u8; num_sectors * SECTOR_SIZE];
+        self.read_sectors(start_sector, &mut temp)?;
 
-    fn write(
-        &self,
-        blocks: &[embedded_sdmmc::Block],
-        start_block_idx: embedded_sdmmc::BlockIdx,
-    ) -> Result<(), Self::Error> {
-        (**self).write(blocks, start_block_idx)
+        // Copy the requested portion
+        let start_offset = (offset % SECTOR_SIZE as u64) as usize;
+        buf.copy_from_slice(&temp[start_offset..start_offset + buf.len()]);
+
+        Ok(())
     }
 
-    fn num_blocks(&self) -> Result<embedded_sdmmc::BlockCount, Self::Error> {
-        (**self).num_blocks()
+    /// Write bytes at an arbitrary offset (handles sector alignment internally)
+    pub fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let start_sector = offset / SECTOR_SIZE as u64;
+        let end_offset = offset + buf.len() as u64;
+        let end_sector = (end_offset + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64;
+        let num_sectors = (end_sector - start_sector) as usize;
+
+        // Read existing data for sectors we'll partially overwrite
+        let mut temp = alloc::vec![0u8; num_sectors * SECTOR_SIZE];
+        self.read_sectors(start_sector, &mut temp)?;
+
+        // Overwrite with new data
+        let start_offset = (offset % SECTOR_SIZE as u64) as usize;
+        temp[start_offset..start_offset + buf.len()].copy_from_slice(buf);
+
+        // Write back
+        self.write_sectors(start_sector, &temp)?;
+
+        Ok(())
     }
 }
 
@@ -229,9 +263,9 @@ pub fn init() -> Result<(), BlockError> {
         let device = VirtioBlockDevice::new(blk);
         log("[Block] Capacity: ");
         console::print(&alloc::format!(
-            "{} MB ({} blocks)\n",
+            "{} MB ({} sectors)\n",
             device.capacity_bytes() / 1024 / 1024,
-            device.capacity_blocks()
+            device.capacity_sectors()
         ));
 
         found_device = Some(device);
@@ -252,19 +286,48 @@ pub fn is_initialized() -> bool {
     BLOCK_DEVICE.lock().is_some()
 }
 
-/// Execute a closure with mutable access to the block device
+/// Execute a closure with access to the block device
 /// Returns None if the block device is not initialized
 pub fn with_device<F, R>(f: F) -> Option<R>
 where
-    F: FnOnce(&mut VirtioBlockDevice) -> R,
+    F: FnOnce(&VirtioBlockDevice) -> R,
 {
-    let mut guard = BLOCK_DEVICE.lock();
-    guard.as_mut().map(f)
+    let guard = BLOCK_DEVICE.lock();
+    guard.as_ref().map(f)
 }
 
 /// Get the block device capacity in bytes
 pub fn capacity() -> Option<u64> {
     with_device(|dev| dev.capacity_bytes())
+}
+
+/// Get the block device capacity in sectors
+pub fn capacity_sectors() -> Option<u64> {
+    with_device(|dev| dev.capacity_sectors())
+}
+
+/// Read sectors from the block device
+pub fn read_sectors(sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    with_device(|dev| dev.read_sectors(sector, buf))
+        .ok_or(BlockError::NotInitialized)?
+}
+
+/// Write sectors to the block device
+pub fn write_sectors(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    with_device(|dev| dev.write_sectors(sector, buf))
+        .ok_or(BlockError::NotInitialized)?
+}
+
+/// Read bytes at an arbitrary offset
+pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    with_device(|dev| dev.read_bytes(offset, buf))
+        .ok_or(BlockError::NotInitialized)?
+}
+
+/// Write bytes at an arbitrary offset
+pub fn write_bytes(offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+    with_device(|dev| dev.write_bytes(offset, buf))
+        .ok_or(BlockError::NotInitialized)?
 }
 
 // ============================================================================

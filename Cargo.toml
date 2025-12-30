@@ -42,8 +42,8 @@ embassy-sync = { version = "0.6", default-features = false }
 critical-section = { version = "1.2", default-features = false }
 static_cell = { version = "2.1" }
 
-# FAT32 filesystem support
-embedded-sdmmc = { version = "0.9", default-features = false }
+# ext2 filesystem is implemented directly in src/vfs/ext2.rs
+# No external crate - custom implementation for better no_std compatibility
 
 # HTTP client/server (no_std)
 edge-http = { version = "0.6", default-features = false, features = ["io"] }
