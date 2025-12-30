@@ -54,3 +54,10 @@ nostd-interactive-terminal = { version = "0.1", default-features = false, featur
 
 # Rhai scripting engine (no_std)
 rhai = { version = "1.19", default-features = false, features = ["no_std", "sync"] }
+
+# TLS support (no_std compatible)
+# Note: Certificate verification requires forking embedded-tls to export
+# CertificateRef and CertificateVerify types from the handshake module.
+# Currently uses NoVerify (encryption without certificate validation).
+# The 'alloc' feature enables RSA signature support (required for most servers).
+embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }

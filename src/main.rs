@@ -34,6 +34,8 @@ mod ssh_server;
 mod tests;
 mod threading;
 mod timer;
+mod tls;
+mod tls_rng;
 mod vfs;
 mod virtio_hal;
 mod web_server;

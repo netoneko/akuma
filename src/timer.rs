@@ -250,6 +250,13 @@ pub fn utc_time_us() -> Option<u64> {
     offset.map(|off| off.wrapping_add(uptime_us()))
 }
 
+// Get current UTC time in seconds since Unix epoch
+// Returns None if UTC time has not been set
+// Used by TLS certificate verification
+pub fn utc_seconds() -> Option<u64> {
+    utc_time_us().map(|us| us / 1_000_000)
+}
+
 // DateTime structure for ISO 8601 formatting
 #[derive(Debug, Clone, Copy)]
 pub struct DateTime {
