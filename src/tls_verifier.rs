@@ -132,6 +132,24 @@ where
                 verify_ecdsa_p256(&x509, &message, &verify.signature)
             }
             SignatureScheme::Ed25519 => verify_ed25519(&x509, &message, &verify.signature),
+            SignatureScheme::RsaPkcs1Sha256 => {
+                verify_rsa_pkcs1_sha256(&x509, &message, &verify.signature)
+            }
+            SignatureScheme::RsaPkcs1Sha384 => {
+                verify_rsa_pkcs1_sha384(&x509, &message, &verify.signature)
+            }
+            SignatureScheme::RsaPkcs1Sha512 => {
+                verify_rsa_pkcs1_sha512(&x509, &message, &verify.signature)
+            }
+            SignatureScheme::RsaPssRsaeSha256 => {
+                verify_rsa_pss_sha256(&x509, &message, &verify.signature)
+            }
+            SignatureScheme::RsaPssRsaeSha384 => {
+                verify_rsa_pss_sha384(&x509, &message, &verify.signature)
+            }
+            SignatureScheme::RsaPssRsaeSha512 => {
+                verify_rsa_pss_sha512(&x509, &message, &verify.signature)
+            }
             _ => Err(TlsError::InvalidSignatureScheme),
         }
     }
@@ -291,5 +309,153 @@ fn verify_ed25519(
         .verify(message, &sig)
         .map_err(|_| TlsError::InvalidSignature)?;
 
+    Ok(())
+}
+
+/// Verify RSA PKCS#1 v1.5 signature with SHA-256
+fn verify_rsa_pkcs1_sha256(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    // Get the public key from the certificate's SubjectPublicKeyInfo
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+
+    // Parse RSA public key from DER
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+
+    // Create verifying key
+    let verifying_key = VerifyingKey::<sha2::Sha256>::new(public_key);
+
+    // Parse signature
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+
+    // Verify
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
+
+    Ok(())
+}
+
+/// Verify RSA PKCS#1 v1.5 signature with SHA-384
+fn verify_rsa_pkcs1_sha384(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+    let verifying_key = VerifyingKey::<sha2::Sha384>::new(public_key);
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
+    Ok(())
+}
+
+/// Verify RSA PKCS#1 v1.5 signature with SHA-512
+fn verify_rsa_pkcs1_sha512(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+    let verifying_key = VerifyingKey::<sha2::Sha512>::new(public_key);
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
+    Ok(())
+}
+
+/// Verify RSA-PSS signature with SHA-256
+fn verify_rsa_pss_sha256(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pss::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+    let verifying_key = VerifyingKey::<sha2::Sha256>::new(public_key);
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
+    Ok(())
+}
+
+/// Verify RSA-PSS signature with SHA-384
+fn verify_rsa_pss_sha384(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pss::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+    let verifying_key = VerifyingKey::<sha2::Sha384>::new(public_key);
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
+    Ok(())
+}
+
+/// Verify RSA-PSS signature with SHA-512
+fn verify_rsa_pss_sha512(
+    cert: &X509Certificate,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    use rsa::pss::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = der::Encode::to_der(spki).map_err(|_| TlsError::InvalidCertificate)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| TlsError::InvalidCertificate)?;
+    let verifying_key = VerifyingKey::<sha2::Sha512>::new(public_key);
+    let sig = Signature::try_from(signature).map_err(|_| TlsError::InvalidSignature)?;
+    verifying_key
+        .verify(message, &sig)
+        .map_err(|_| TlsError::InvalidSignature)?;
     Ok(())
 }

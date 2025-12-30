@@ -67,6 +67,10 @@ const-oid = { version = "0.9", default-features = false }
 # ECDSA P-256 signature verification
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
+# RSA signature verification
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+
 [patch.crates-io]
-# Fork based on v0.17.0 with exposed handshake/extensions modules
+# Fork based on v0.17.0 (commit 1eaaa136) with exposed handshake/extensions modules
+# After creating the branch, replace with your actual commit hash
 embedded-tls = { git = "https://github.com/netoneko/embedded-tls", branch = "expose-verifier-types" }
