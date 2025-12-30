@@ -69,6 +69,11 @@ pub fn print(s: &str) {
     }
 }
 
+/// Print a single character
+pub fn print_char(c: char) {
+    UART.write(c as u8);
+}
+
 /// Check if a character is available for reading
 pub fn has_char() -> bool {
     UART.has_data()

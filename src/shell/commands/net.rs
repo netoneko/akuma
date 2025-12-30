@@ -13,6 +13,7 @@ use core::pin::Pin;
 
 use embedded_io_async::Write;
 
+use crate::async_fs;
 use crate::async_net;
 use crate::dns;
 use crate::shell::{Command, ShellError, VecWriter};
@@ -31,17 +32,24 @@ struct CurlOpts<'a> {
     verbose: bool,
     /// The URL to fetch
     url: Option<&'a str>,
+    /// Output file path (-o, --output)
+    output: Option<&'a str>,
 }
 
 impl<'a> CurlOpts<'a> {
     /// Parse command-line arguments
     fn parse(args: &'a str) -> Self {
         let mut opts = CurlOpts::default();
+        let mut args_iter = args.split_whitespace().peekable();
 
-        for arg in args.split_whitespace() {
+        while let Some(arg) = args_iter.next() {
             match arg {
                 "-k" | "--insecure" => opts.insecure = true,
                 "-v" | "--verbose" => opts.verbose = true,
+                "-o" | "--output" => {
+                    // Consume the next argument as the output filename
+                    opts.output = args_iter.next();
+                }
                 s if !s.starts_with('-') => opts.url = Some(s),
                 _ => {} // Ignore unknown options
             }
@@ -66,7 +74,7 @@ impl Command for CurlCommand {
         "HTTP/HTTPS GET request"
     }
     fn usage(&self) -> &'static str {
-        "curl [-k] [-v] <url>"
+        "curl [-k] [-v] [-o file] <url>"
     }
 
     fn execute<'a>(
@@ -85,7 +93,9 @@ impl Command for CurlCommand {
             };
 
             if args_str.is_empty() {
-                let _ = stdout.write(b"Usage: curl [-k] [-v] <url>\r\n").await;
+                let _ = stdout
+                    .write(b"Usage: curl [-k] [-v] [-o file] <url>\r\n")
+                    .await;
                 let _ = stdout.write(b"\r\n").await;
                 let _ = stdout.write(b"Options:\r\n").await;
                 let _ = stdout
@@ -93,6 +103,9 @@ impl Command for CurlCommand {
                     .await;
                 let _ = stdout
                     .write(b"  -v, --verbose   Show detailed connection info\r\n")
+                    .await;
+                let _ = stdout
+                    .write(b"  -o, --output    Write output to file (required for binary)\r\n")
                     .await;
                 let _ = stdout.write(b"\r\n").await;
                 let _ = stdout.write(b"Examples:\r\n").await;
@@ -103,10 +116,10 @@ impl Command for CurlCommand {
                     .write(b"  curl https://example.com/\r\n")
                     .await;
                 let _ = stdout
-                    .write(b"  curl -k https://self-signed.example.com/\r\n")
+                    .write(b"  curl -o binary.elf http://10.0.2.2:8000/file.bin\r\n")
                     .await;
                 let _ = stdout
-                    .write(b"  curl -v https://example.com/\r\n")
+                    .write(b"  curl -k https://self-signed.example.com/\r\n")
                     .await;
                 return Ok(());
             }
@@ -127,11 +140,58 @@ impl Command for CurlCommand {
                 verbose: opts.verbose,
             };
 
-            match http_get_with_options(url, tls_opts, stdout).await {
-                Ok(body) => {
-                    for line in body.split('\n') {
-                        let _ = stdout.write(line.as_bytes()).await;
-                        let _ = stdout.write(b"\r\n").await;
+            // Use raw HTTP fetch to get bytes + headers
+            match http_get_raw(url, tls_opts, stdout).await {
+                Ok(response) => {
+                    let is_binary = response.is_binary_content();
+
+                    if let Some(output_path) = opts.output {
+                        // Write to file (works for both binary and text)
+                        match async_fs::write_file(output_path, &response.body).await {
+                            Ok(()) => {
+                                let msg = format!(
+                                    "Saved {} bytes to {}\r\n",
+                                    response.body.len(),
+                                    output_path
+                                );
+                                let _ = stdout.write(msg.as_bytes()).await;
+                            }
+                            Err(e) => {
+                                let msg = format!("Error writing file: {:?}\r\n", e);
+                                let _ = stdout.write(msg.as_bytes()).await;
+                            }
+                        }
+                    } else if is_binary {
+                        // Binary content without -o flag
+                        let content_type = response
+                            .content_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream");
+                        let msg = format!(
+                            "Binary content detected ({}), {} bytes\r\n\
+                             Use -o <filename> to save to file\r\n",
+                            content_type,
+                            response.body.len()
+                        );
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    } else {
+                        // Text content - display to stdout
+                        match String::from_utf8(response.body) {
+                            Ok(text) => {
+                                for line in text.split('\n') {
+                                    let _ = stdout.write(line.as_bytes()).await;
+                                    let _ = stdout.write(b"\r\n").await;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = stdout
+                                    .write(b"Error: Response contains invalid UTF-8\r\n")
+                                    .await;
+                                let _ = stdout
+                                    .write(b"Use -o <filename> to save as binary\r\n")
+                                    .await;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -244,11 +304,15 @@ pub static NSLOOKUP_CMD: NslookupCommand = NslookupCommand;
 // ============================================================================
 
 /// Perform an HTTP GET request (public for legacy API)
+/// Returns text content as a String. For binary content, use `http_get_raw`.
+#[allow(dead_code)]
 pub async fn http_get_legacy(url: &str) -> Result<String, &'static str> {
-    http_get_with_options(url, TlsOptions::default(), &mut DummyWriter).await
+    let response = http_get_raw(url, TlsOptions::default(), &mut DummyWriter).await?;
+    String::from_utf8(response.body).map_err(|_| "Invalid UTF-8 response")
 }
 
 /// Dummy writer for legacy API that doesn't need verbose output
+#[allow(dead_code)]
 struct DummyWriter;
 
 impl embedded_io_async::ErrorType for DummyWriter {
@@ -264,15 +328,74 @@ impl embedded_io_async::Write for DummyWriter {
     }
 }
 
-/// Perform an HTTP/HTTPS GET request with options
+// ============================================================================
+// HTTP Response with Headers
+// ============================================================================
+
+/// HTTP response with parsed headers and raw body
+pub struct HttpResponse {
+    /// HTTP status code (kept for future use)
+    #[allow(dead_code)]
+    pub status_code: u16,
+    /// Content-Type header value
+    pub content_type: Option<String>,
+    /// Raw response body as bytes
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Check if the content appears to be binary based on Content-Type header
+    pub fn is_binary_content(&self) -> bool {
+        match &self.content_type {
+            Some(ct) => {
+                let ct_lower = ct.to_lowercase();
+                // Text types that should be displayed
+                if ct_lower.starts_with("text/")
+                    || ct_lower.contains("json")
+                    || ct_lower.contains("xml")
+                    || ct_lower.contains("javascript")
+                    || ct_lower.contains("html")
+                {
+                    false
+                } else {
+                    // Binary types: application/octet-stream, image/*, audio/*, video/*, etc.
+                    true
+                }
+            }
+            // No Content-Type header - try to detect from body
+            None => {
+                // Check if body contains non-UTF8 or binary markers
+                // Simple heuristic: check first 512 bytes for null bytes or high ratio of non-ASCII
+                let check_len = core::cmp::min(512, self.body.len());
+                let sample = &self.body[..check_len];
+
+                // Count null bytes and non-printable characters
+                let mut null_count = 0;
+                let mut non_printable = 0;
+
+                for &byte in sample {
+                    if byte == 0 {
+                        null_count += 1;
+                    } else if byte < 32 && byte != b'\n' && byte != b'\r' && byte != b'\t' {
+                        non_printable += 1;
+                    }
+                }
+
+                // If we have null bytes or >10% non-printable, it's likely binary
+                null_count > 0 || (check_len > 0 && non_printable * 10 > check_len)
+            }
+        }
+    }
+}
+
+/// Perform an HTTP/HTTPS GET request and return raw response
 ///
-/// Supports both `http://` and `https://` URLs.
-/// HTTPS uses TLS 1.3 with optional certificate verification.
-async fn http_get_with_options<W: embedded_io_async::Write>(
+/// Returns the raw bytes and parsed headers for binary/text detection.
+async fn http_get_raw<W: embedded_io_async::Write>(
     url: &str,
     tls_opts: TlsOptions,
     stdout: &mut W,
-) -> Result<String, &'static str> {
+) -> Result<HttpResponse, &'static str> {
     use embassy_net::IpEndpoint;
     use embassy_net::tcp::TcpSocket;
     use embassy_time::Duration;
@@ -386,7 +509,7 @@ async fn http_get_with_options<W: embedded_io_async::Write>(
             let _ = stdout.write(b"* TLS handshake complete\r\n").await;
         }
 
-        let result = http_request_on_stream(&mut tls, host, &path, verbose, stdout).await;
+        let result = http_request_raw(&mut tls, host, &path, verbose, stdout).await;
 
         // Try to close TLS gracefully (ignore errors)
         let _ = tls.close().await;
@@ -398,7 +521,7 @@ async fn http_get_with_options<W: embedded_io_async::Write>(
         result
     } else {
         // Plain HTTP
-        let result = http_request_on_stream(&mut socket, host, &path, verbose, stdout).await;
+        let result = http_request_raw(&mut socket, host, &path, verbose, stdout).await;
         socket.close();
 
         if verbose {
@@ -409,14 +532,14 @@ async fn http_get_with_options<W: embedded_io_async::Write>(
     }
 }
 
-/// Send HTTP request and read response on any Read+Write stream
-async fn http_request_on_stream<S, W>(
+/// Send HTTP request and read raw response on any Read+Write stream
+async fn http_request_raw<S, W>(
     stream: &mut S,
     host: &str,
     path: &str,
     verbose: bool,
     stdout: &mut W,
-) -> Result<String, &'static str>
+) -> Result<HttpResponse, &'static str>
 where
     S: embedded_io_async::Read + embedded_io_async::Write,
     W: embedded_io_async::Write,
@@ -451,22 +574,70 @@ where
         }
     }
 
-    let response_str = String::from_utf8(response_data).map_err(|_| "Invalid UTF-8 response")?;
+    // Find header/body separator
+    let header_end = find_header_end(&response_data).ok_or("Invalid HTTP response")?;
 
-    // Split headers and body
-    if let Some(body_start) = response_str.find("\r\n\r\n") {
-        let headers = &response_str[..body_start];
-        let body = &response_str[body_start + 4..];
+    // Parse headers (as UTF-8, headers should always be ASCII)
+    let headers_bytes = &response_data[..header_end];
+    let headers_str = core::str::from_utf8(headers_bytes).map_err(|_| "Invalid headers")?;
 
-        if verbose {
-            for line in headers.lines() {
-                let msg = format!("< {}\r\n", line);
-                let _ = stdout.write(msg.as_bytes()).await;
-            }
+    // Parse status code
+    let status_code = parse_status_code(headers_str).unwrap_or(0);
+
+    // Parse Content-Type header
+    let content_type = parse_content_type(headers_str);
+
+    if verbose {
+        for line in headers_str.lines() {
+            let msg = format!("< {}\r\n", line);
+            let _ = stdout.write(msg.as_bytes()).await;
         }
+    }
 
-        Ok(body.to_string())
+    // Body starts after \r\n\r\n (4 bytes after header_end position)
+    let body = response_data[header_end + 4..].to_vec();
+
+    Ok(HttpResponse {
+        status_code,
+        content_type,
+        body,
+    })
+}
+
+/// Find the position of the header/body separator (\r\n\r\n)
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(3) {
+        if &data[i..i + 4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Parse HTTP status code from response
+fn parse_status_code(headers: &str) -> Option<u16> {
+    // HTTP/1.1 200 OK
+    let first_line = headers.lines().next()?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        parts[1].parse().ok()
     } else {
-        Ok(response_str)
+        None
     }
 }
+
+/// Parse Content-Type header value
+fn parse_content_type(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-type:") {
+            let value = line[13..].trim();
+            // Strip charset and other parameters
+            let main_type = value.split(';').next().unwrap_or(value).trim();
+            return Some(main_type.to_string());
+        }
+    }
+    None
+}
+
+

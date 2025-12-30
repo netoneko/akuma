@@ -13,6 +13,7 @@ mod block;
 mod boot;
 mod console;
 mod dns;
+mod elf_loader;
 mod embassy_net_driver;
 mod embassy_time_driver;
 mod embassy_virtio_driver;
@@ -22,14 +23,19 @@ mod fs;
 mod fs_tests;
 mod gic;
 mod irq;
+mod mmu;
 mod netcat_server;
 mod network;
+mod pmm;
+mod process;
+mod process_tests;
 mod rhai;
 mod rng;
 mod shell;
 mod shell_tests;
 mod ssh;
 mod ssh_crypto;
+mod syscall;
 mod ssh_server;
 mod tests;
 mod threading;
@@ -72,18 +78,54 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
-    kernel_main()
+pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
+    kernel_main(dtb_ptr)
+}
+
+/// Detect memory from Device Tree Blob
+fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
+    const DEFAULT_RAM_BASE: usize = 0x40000000;
+    const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024;
+
+    if dtb_ptr == 0 {
+        console::print("[Memory] No DTB pointer, using defaults\n");
+        return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
+    }
+
+    // SAFETY: QEMU passes a valid DTB pointer in x0
+    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
+        Ok(fdt) => fdt,
+        Err(_) => {
+            console::print("[Memory] Invalid DTB, using defaults\n");
+            return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
+        }
+    };
+
+    // Get memory regions from DTB
+    let memory = fdt.memory();
+    if let Some(region) = memory.regions().next() {
+        let base = region.starting_address as usize;
+        let size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
+        console::print("[Memory] Detected from DTB: base=0x");
+        console::print(&alloc::format!("{:x}", base));
+        console::print(", size=");
+        console::print(&(size / 1024 / 1024).to_string());
+        console::print(" MB\n");
+        (base, size)
+    } else {
+        console::print("[Memory] No memory region in DTB, using defaults\n");
+        (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE)
+    }
 }
 
 /// Main kernel initialization - all safe code
-fn kernel_main() -> ! {
-    const RAM_BASE: usize = 0x40000000;
-
-    let ram_size = 128 * 1024 * 1024; // 128 MB
+fn kernel_main(dtb_ptr: usize) -> ! {
+    // Detect memory from DTB (must be done before heap init, so print first)
+    console::print("Akuma Kernel starting...\n");
+    let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
     let code_and_stack = ram_size / 16; // 1/16 of total RAM
-    let heap_start = RAM_BASE + code_and_stack;
+    let heap_start = ram_base + code_and_stack;
 
     let heap_size = if ram_size > code_and_stack {
         ram_size - code_and_stack
@@ -102,6 +144,22 @@ fn kernel_main() -> ! {
     console::print("Heap initialized: ");
     console::print(&(heap_size / 1024 / 1024).to_string());
     console::print(" MB\n");
+
+    // Initialize MMU with identity mapping for kernel
+    console::print("Initializing MMU...\n");
+    mmu::init(ram_base, ram_size);
+    console::print("MMU enabled with identity mapping\n");
+
+    // Initialize Physical Memory Manager
+    // Kernel uses: ram_base to heap_start + heap_size
+    let kernel_end = heap_start + heap_size;
+    console::print("Initializing PMM...\n");
+    pmm::init(ram_base, ram_size, kernel_end);
+    let (total, allocated, free) = pmm::stats();
+    console::print(&alloc::format!(
+        "PMM initialized: {} total pages, {} allocated, {} free\n",
+        total, allocated, free
+    ));
 
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
@@ -230,6 +288,9 @@ fn kernel_main() -> ! {
 
                     // Run filesystem tests
                     fs_tests::run_all_tests();
+
+                    // Run process execution tests
+                    process_tests::run_all_tests();
                 }
                 Err(e) => {
                     console::print("[FS] Filesystem init failed: ");

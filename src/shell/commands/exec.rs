@@ -1,0 +1,95 @@
+//! Exec Command
+//!
+//! Execute binary programs from the filesystem.
+
+use alloc::boxed::Box;
+use alloc::format;
+use core::future::Future;
+use core::pin::Pin;
+
+use crate::shell::{Command, ShellError, VecWriter};
+use crate::ssh_crypto::trim_bytes;
+
+/// Static instance of the exec command
+pub static EXEC_CMD: ExecCommand = ExecCommand;
+
+/// Execute binary files
+pub struct ExecCommand;
+
+impl Command for ExecCommand {
+    fn name(&self) -> &'static str {
+        "exec"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["run"]
+    }
+
+    fn description(&self) -> &'static str {
+        "Execute a binary program"
+    }
+
+    fn usage(&self) -> &'static str {
+        "exec <path>\n\nExecute the specified binary file.\n\nExample:\n  exec /bin/echo2"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args = trim_bytes(args);
+
+            if args.is_empty() {
+                let _ = embedded_io_async::Write::write_all(
+                    stdout,
+                    b"Usage: exec <path>\r\n",
+                )
+                .await;
+                return Ok(());
+            }
+
+            // Parse path from args
+            let path = match core::str::from_utf8(args) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    let _ = embedded_io_async::Write::write_all(
+                        stdout,
+                        b"Error: Invalid path\r\n",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            // Execute the binary
+            let _ = embedded_io_async::Write::write_all(
+                stdout,
+                format!("Executing {}...\r\n", path).as_bytes(),
+            )
+            .await;
+
+            match crate::process::exec(path) {
+                Ok(exit_code) => {
+                    let _ = embedded_io_async::Write::write_all(
+                        stdout,
+                        format!("Process exited with code {}\r\n", exit_code).as_bytes(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    let _ = embedded_io_async::Write::write_all(
+                        stdout,
+                        format!("Error: {}\r\n", e).as_bytes(),
+                    )
+                    .await;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+

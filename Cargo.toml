@@ -55,6 +55,9 @@ nostd-interactive-terminal = { version = "0.1", default-features = false, featur
 # Rhai scripting engine (no_std)
 rhai = { version = "1.19", default-features = false, features = ["no_std", "sync"] }
 
+# ELF parser (no_std)
+elf = { version = "0.7", default-features = false }
+
 # TLS support (no_std compatible)
 # Using fork with exposed handshake/extensions modules for custom TlsVerifier
 embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
