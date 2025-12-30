@@ -1,0 +1,92 @@
+//! Shell Commands Module
+//!
+//! Contains all command implementations organized by category.
+
+pub mod builtin;
+pub mod fs;
+pub mod net;
+
+use alloc::vec::Vec;
+
+use super::Command;
+
+// Re-export static command instances
+pub use builtin::{ECHO_CMD, AKUMA_CMD, STATS_CMD, FREE_CMD, HELP_CMD};
+pub use fs::{LS_CMD, CAT_CMD, WRITE_CMD, APPEND_CMD, RM_CMD, MKDIR_CMD, DF_CMD};
+pub use net::CURL_CMD;
+
+// ============================================================================
+// Command Registry
+// ============================================================================
+
+/// Maximum number of commands that can be registered
+const MAX_COMMANDS: usize = 32;
+
+/// Registry of available commands
+pub struct CommandRegistry {
+    commands: Vec<&'static dyn Command>,
+}
+
+impl CommandRegistry {
+    /// Create a new empty registry
+    pub const fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+        }
+    }
+
+    /// Register a command
+    pub fn register(&mut self, command: &'static dyn Command) {
+        if self.commands.len() < MAX_COMMANDS {
+            self.commands.push(command);
+        }
+    }
+
+    /// Find a command by name or alias
+    pub fn find(&self, name: &[u8]) -> Option<&'static dyn Command> {
+        let name_str = core::str::from_utf8(name).ok()?;
+        for cmd in &self.commands {
+            if cmd.name() == name_str {
+                return Some(*cmd);
+            }
+            for alias in cmd.aliases() {
+                if *alias == name_str {
+                    return Some(*cmd);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get all registered commands
+    pub fn commands(&self) -> &[&'static dyn Command] {
+        &self.commands
+    }
+}
+
+/// Create and populate the default command registry
+pub fn create_default_registry() -> CommandRegistry {
+    let mut registry = CommandRegistry::new();
+    
+    // Built-in commands
+    registry.register(&ECHO_CMD);
+    registry.register(&AKUMA_CMD);
+    registry.register(&STATS_CMD);
+    registry.register(&FREE_CMD);
+    registry.register(&HELP_CMD);
+    
+    // Filesystem commands
+    registry.register(&LS_CMD);
+    registry.register(&CAT_CMD);
+    registry.register(&WRITE_CMD);
+    registry.register(&APPEND_CMD);
+    registry.register(&RM_CMD);
+    registry.register(&MKDIR_CMD);
+    registry.register(&DF_CMD);
+    
+    // Network commands
+    registry.register(&CURL_CMD);
+    
+    registry
+}
+
