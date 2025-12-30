@@ -49,15 +49,35 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
-    console::print(&format!("[Syscall] exit({})\n", code));
+    // Store exit code for the process manager to retrieve
+    LAST_EXIT_CODE.store(code, core::sync::atomic::Ordering::Release);
+    PROCESS_EXITED.store(true, core::sync::atomic::Ordering::Release);
+    
+    // Return won't matter - process is terminated
+    code as u64
+}
 
-    // TODO: Properly terminate the process when process management is ready
-    // For now, just mark current thread as terminated
-    crate::threading::mark_current_terminated();
-    crate::threading::yield_now();
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-    // Should not reach here
-    0
+/// Flag indicating current user process has exited
+pub static PROCESS_EXITED: AtomicBool = AtomicBool::new(false);
+
+/// Exit code of the last exited process
+pub static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+/// Reset process exit state (called before starting a new process)
+pub fn reset_exit_state() {
+    PROCESS_EXITED.store(false, Ordering::Release);
+    LAST_EXIT_CODE.store(0, Ordering::Release);
+}
+
+/// Check if process has exited and get exit code
+pub fn check_exit() -> Option<i32> {
+    if PROCESS_EXITED.load(Ordering::Acquire) {
+        Some(LAST_EXIT_CODE.load(Ordering::Acquire))
+    } else {
+        None
+    }
 }
 
 /// sys_read - Read from a file descriptor

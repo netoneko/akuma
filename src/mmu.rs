@@ -7,11 +7,11 @@
 //! - TTBR0_EL1: User space (0x0000_0000_0000_0000 - 0x0000_FFFF_FFFF_FFFF)
 //! - TTBR1_EL1: Kernel space (0xFFFF_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF)
 //!
-//! For simplicity, we use identity mapping for the kernel with 1GB blocks.
+//! The kernel runs in the upper half (TTBR1) so that TTBR0 can be switched
+//! per-process for user space mappings.
 
 #![allow(dead_code)]
 
-use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Page size: 4KB
@@ -85,12 +85,6 @@ impl PageTable {
     }
 }
 
-/// Static kernel page tables
-/// L0 table (top level, covers 512GB per entry)
-static mut KERNEL_L0: PageTable = PageTable::new();
-/// L1 table (second level, covers 1GB per entry as blocks)
-static mut KERNEL_L1: PageTable = PageTable::new();
-
 /// MMU initialization state
 static MMU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -99,157 +93,21 @@ pub fn is_initialized() -> bool {
     MMU_INITIALIZED.load(Ordering::Acquire)
 }
 
-/// Initialize MMU with identity mapping for kernel
+/// Mark MMU as initialized
 ///
-/// This sets up:
-/// - MAIR_EL1: Memory attribute configuration
-/// - TCR_EL1: Translation control register
-/// - TTBR1_EL1: Kernel page tables (identity mapped)
-/// - TTBR0_EL1: Initially zero (no user space)
-/// - SCTLR_EL1: Enable MMU
+/// The actual MMU setup is done by the boot code before jumping to Rust.
+/// This function just marks that initialization is complete and optionally
+/// extends the page tables for additional RAM.
 ///
 /// # Arguments
-/// * `ram_base` - Physical base address of RAM
-/// * `ram_size` - Size of RAM in bytes
-pub fn init(ram_base: usize, ram_size: usize) {
-    // Build kernel page tables before enabling MMU
-    unsafe {
-        build_kernel_page_tables(ram_base, ram_size);
-    }
-
-    // Get page table physical addresses
-    let l0_addr = unsafe { addr_of_mut!(KERNEL_L0) as u64 };
-
-    unsafe {
-        // Configure MAIR_EL1 (Memory Attribute Indirection Register)
-        // Attr0: Device-nGnRnE (0x00)
-        // Attr1: Normal, Non-cacheable (0x44)
-        // Attr2: Normal, Write-through (0xBB)
-        // Attr3: Normal, Write-back (0xFF)
-        let mair: u64 = 0x00 | (0x44 << 8) | (0xBB << 16) | (0xFF << 24);
-        core::arch::asm!("msr mair_el1, {}", in(reg) mair);
-
-        // Configure TCR_EL1 (Translation Control Register)
-        // T0SZ = 16 (48-bit VA for TTBR0)
-        // T1SZ = 16 (48-bit VA for TTBR1)
-        // TG0 = 0b00 (4KB granule for TTBR0)
-        // TG1 = 0b10 (4KB granule for TTBR1)
-        // IPS = 0b101 (48-bit PA, 256TB)
-        // SH0/SH1 = 0b11 (Inner shareable)
-        // ORGN0/ORGN1 = 0b01 (Write-back, write-allocate)
-        // IRGN0/IRGN1 = 0b01 (Write-back, write-allocate)
-        let tcr: u64 = (16 << 0)  // T0SZ
-                     | (16 << 16) // T1SZ
-                     | (0b00 << 14) // TG0 = 4KB
-                     | (0b10 << 30) // TG1 = 4KB
-                     | (0b101 << 32) // IPS = 48-bit
-                     | (0b11 << 12) // SH0 = Inner shareable
-                     | (0b11 << 28) // SH1 = Inner shareable
-                     | (0b01 << 10) // ORGN0
-                     | (0b01 << 8)  // IRGN0
-                     | (0b01 << 26) // ORGN1
-                     | (0b01 << 24); // IRGN1
-        core::arch::asm!("msr tcr_el1, {}", in(reg) tcr);
-
-        // Set TTBR0_EL1 to kernel L0 table for identity mapping
-        // The kernel runs at 0x40000000 which is in TTBR0's range (lower half)
-        core::arch::asm!("msr ttbr0_el1, {}", in(reg) l0_addr);
-
-        // Set TTBR1_EL1 to the same for now (kernel can use either)
-        core::arch::asm!("msr ttbr1_el1, {}", in(reg) l0_addr);
-
-        // Ensure all writes are visible
-        core::arch::asm!("isb");
-        core::arch::asm!("dsb sy");
-
-        // Invalidate TLB
-        core::arch::asm!("tlbi vmalle1");
-        core::arch::asm!("dsb sy");
-        core::arch::asm!("isb");
-
-        // Enable MMU in SCTLR_EL1
-        let mut sctlr: u64;
-        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr);
-
-        // Set M bit (MMU enable) and clear some potentially problematic bits
-        sctlr |= 1 << 0;  // M - MMU enable
-        sctlr |= 1 << 2;  // C - Data cache enable
-        sctlr |= 1 << 12; // I - Instruction cache enable
-        sctlr &= !(1 << 19); // WXN - Write Execute Never (disable for now)
-
-        core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
-        core::arch::asm!("isb");
-    }
-
+/// * `_ram_base` - Physical base address of RAM (unused, boot code handles this)
+/// * `_ram_size` - Size of RAM in bytes (unused for now)
+pub fn init(_ram_base: usize, _ram_size: usize) {
+    // MMU is already enabled by boot code
+    // TTBR1 has kernel mapping (0xFFFF_0000_4000_0000 -> 0x4000_0000)
+    // TTBR0 has identity mapping (will be replaced per-process)
+    
     MMU_INITIALIZED.store(true, Ordering::Release);
-}
-
-/// Build kernel page tables with identity mapping
-///
-/// Maps:
-/// - 0x0000_0000 - 0x3FFF_FFFF: Device memory (GIC, UART, VirtIO)
-/// - 0x4000_0000 - RAM end: Normal memory (kernel code/data/heap)
-unsafe fn build_kernel_page_tables(ram_base: usize, ram_size: usize) {
-    // For TTBR1, addresses have upper bits set (0xFFFF_...)
-    // The VA 0xFFFF_0000_4000_0000 would map to PA 0x4000_0000
-    // But for simplicity, we'll use identity mapping in TTBR0 first
-    // then transition to split addressing
-
-    // For now, set up identity mapping using TTBR0-style addresses
-    // (kernel can access via either low or high addresses initially)
-
-    // L0 index 0 covers 0x0000_0000_0000_0000 - 0x0000_007F_FFFF_FFFF (512GB)
-    // We need to map the first few GB where QEMU virt machine has devices and RAM
-
-    // Get raw pointers to avoid static_mut_refs
-    let l0_ptr = addr_of_mut!(KERNEL_L0);
-    let l1_ptr = addr_of_mut!(KERNEL_L1);
-
-    // L0[0] -> L1 table
-    let l1_addr = l1_ptr as u64;
-    unsafe {
-        (*l0_ptr).entries[0] = l1_addr | flags::VALID | flags::TABLE;
-
-        // L1 entries: each covers 1GB
-        // L1[0]: 0x0000_0000 - 0x3FFF_FFFF (Device memory - GIC, UART, VirtIO)
-        (*l1_ptr).entries[0] = 0x0000_0000u64
-            | flags::VALID
-            | flags::BLOCK
-            | flags::AF
-            | attr_index(MAIR_DEVICE_NGNRNE)
-            | flags::PXN
-            | flags::UXN
-            | flags::SH_OUTER;
-
-        // L1[1]: 0x4000_0000 - 0x7FFF_FFFF (RAM - normal memory)
-        (*l1_ptr).entries[1] = 0x4000_0000u64
-            | flags::VALID
-            | flags::BLOCK
-            | flags::AF
-            | attr_index(MAIR_NORMAL_WB)
-            | flags::SH_INNER;
-
-        // Map additional RAM if needed (for larger memory configs)
-        let ram_end = ram_base + ram_size;
-        let mut addr = 0x8000_0000usize;
-        let mut idx = 2usize;
-
-        while addr < ram_end && idx < ENTRIES_PER_TABLE {
-            (*l1_ptr).entries[idx] = (addr as u64)
-                | flags::VALID
-                | flags::BLOCK
-                | flags::AF
-                | attr_index(MAIR_NORMAL_WB)
-                | flags::SH_INNER;
-            addr += BLOCK_1GB;
-            idx += 1;
-        }
-    }
-}
-
-/// Get the physical address of the kernel L0 page table
-pub fn kernel_ttbr1() -> u64 {
-    unsafe { addr_of_mut!(KERNEL_L0) as u64 }
 }
 
 /// Invalidate all TLB entries
@@ -531,30 +389,32 @@ impl UserAddressSpace {
 
     /// Activate this address space (set TTBR0_EL1)
     ///
-    /// NOTE: Currently disabled because the kernel runs in TTBR0 space.
-    /// TODO: Move kernel to TTBR1 (upper half) to enable proper user/kernel split.
+    /// The kernel runs in TTBR1 (upper half), so we can safely switch TTBR0
+    /// to this user address space.
     pub fn activate(&self) {
-        // For now, don't switch TTBR0 - the kernel runs in TTBR0 space
-        // and would lose its own mapping. Just log that we would switch.
-        crate::console::print(&alloc::format!(
-            "[MMU] Would activate user ASID={} (skipped - kernel in TTBR0)\n",
-            self.asid
-        ));
-        // TODO: When kernel is in TTBR1, enable this:
-        // let ttbr0 = self.ttbr0();
-        // unsafe {
-        //     core::arch::asm!(
-        //         "msr ttbr0_el1, {}",
-        //         "isb",
-        //         in(reg) ttbr0
-        //     );
-        // }
+        let ttbr0 = self.ttbr0();
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {ttbr0}",
+                "isb",
+                ttbr0 = in(reg) ttbr0
+            );
+        }
     }
 
-    /// Deactivate user address space (set TTBR0_EL1 to kernel)
+    /// Deactivate user address space (clear TTBR0_EL1)
+    ///
+    /// Sets TTBR0 to an empty/invalid state. Any user-space access will fault.
     pub fn deactivate() {
-        // Currently a no-op since we don't actually switch TTBR0
-        // TODO: Restore kernel TTBR0 when user/kernel split is implemented
+        unsafe {
+            // Set TTBR0 to 0 - any user access will fault
+            core::arch::asm!(
+                "msr ttbr0_el1, xzr",
+                "isb"
+            );
+        }
+        // Flush TLB for TTBR0
+        flush_tlb_all();
     }
 }
 

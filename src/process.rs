@@ -172,30 +172,32 @@ impl Process {
         self.state = ProcessState::Running;
 
         console::print(&alloc::format!(
-            "[Process] '{}' (PID {}) loaded: entry={:#x}, sp={:#x}\n",
+            "[Process] Starting '{}' (PID {}) at entry={:#x}, sp={:#x}\n",
             self.name, self.pid, self.context.pc, self.context.sp
         ));
 
-        // TODO: Proper user mode execution requires:
-        // 1. Kernel running in upper half (TTBR1) so we can switch TTBR0
-        // 2. Exception handlers for EL0 syscalls
-        // 3. Page table switching between user/kernel
-        //
-        // For now, we just verify the ELF was loaded correctly.
-        // Full EL0 execution not yet implemented.
+        // Reset exit state before starting
+        crate::syscall::reset_exit_state();
 
-        console::print("[Process] NOTE: EL0 execution not yet implemented.\n");
-        console::print("[Process] ELF was parsed and loaded successfully.\n");
+        // Activate the user address space (sets TTBR0)
+        self.address_space.activate();
 
-        // Simulate successful exit
-        self.state = ProcessState::Zombie(0);
-        
+        // Enter user mode - this will ERET to user code
+        // When user calls exit(), it sets PROCESS_EXITED flag
+        // and the exception handler returns here
+        let exit_code = unsafe { run_user_until_exit(&self.context) };
+
+        // Deactivate user address space
+        UserAddressSpace::deactivate();
+
+        self.state = ProcessState::Zombie(exit_code);
+
         console::print(&alloc::format!(
-            "[Process] '{}' (PID {}) - simulated exit with code 0\n",
-            self.name, self.pid
+            "[Process] '{}' (PID {}) exited with code {}\n",
+            self.name, self.pid, exit_code
         ));
 
-        0
+        exit_code
     }
 }
 
@@ -254,23 +256,96 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     );
 }
 
+/// Kernel context saved before entering user mode
+/// Used to return from user mode after exit() syscall
+#[repr(C)]
+struct KernelContext {
+    sp: u64,
+    x19: u64,
+    x20: u64,
+    x21: u64,
+    x22: u64,
+    x23: u64,
+    x24: u64,
+    x25: u64,
+    x26: u64,
+    x27: u64,
+    x28: u64,
+    x29: u64,
+    x30: u64,  // Return address
+}
+
+/// Global storage for kernel context (one process at a time for now)
+static mut KERNEL_CONTEXT: KernelContext = KernelContext {
+    sp: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
+    x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+};
+
+/// Check if process has exited and return to kernel if so
+/// Called from exception handler after each syscall
+#[unsafe(no_mangle)]
+pub extern "C" fn check_process_exit() -> bool {
+    crate::syscall::PROCESS_EXITED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Return to kernel after process exit
+/// Called from exception handler when process exits
+#[unsafe(no_mangle)]
+pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    unsafe {
+        let ctx_ptr = core::ptr::addr_of!(KERNEL_CONTEXT);
+        let sp_val = (*ctx_ptr).sp;
+        core::arch::asm!(
+            "mov sp, {sp}",
+            "ldp x19, x20, [{ctx}, #8]",
+            "ldp x21, x22, [{ctx}, #24]",
+            "ldp x23, x24, [{ctx}, #40]",
+            "ldp x25, x26, [{ctx}, #56]",
+            "ldp x27, x28, [{ctx}, #72]",
+            "ldp x29, x30, [{ctx}, #88]",
+            "mov x0, {exit_code}",
+            "ret",
+            ctx = in(reg) ctx_ptr,
+            sp = in(reg) sp_val,
+            exit_code = in(reg) exit_code as i64,
+            options(noreturn)
+        );
+    }
+}
+
 /// Run a user process until it exits
 ///
+/// This saves kernel context, enters user mode (EL0) via ERET.
+/// When exit() is called, control returns here with the exit code.
+///
 /// Returns the exit code
-unsafe fn run_user_process(ctx: &UserContext) -> i32 {
-    // For now, use a simple approach: enter user mode and return when the
-    // process calls exit. In a full implementation, this would involve
-    // the scheduler.
-
-    // Set up the user context
+unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
+    let exit_code: i64;
+    
+    // Save kernel context and enter user mode
+    // The exit handler will restore this context and return here
     core::arch::asm!(
-        // Set SP_EL0 (user stack pointer)
-        "msr sp_el0, {sp}",
-        // Set ELR_EL1 (return address = entry point)
-        "msr elr_el1, {pc}",
-        // Set SPSR_EL1 (saved program status for EL0)
-        "msr spsr_el1, {spsr}",
-        // Clear most registers
+        // Save callee-saved registers to KERNEL_CONTEXT
+        "adrp x9, {kctx_sym}",
+        "add x9, x9, :lo12:{kctx_sym}",
+        "mov x10, sp",
+        "str x10, [x9, #0]",         // sp
+        "stp x19, x20, [x9, #8]",
+        "stp x21, x22, [x9, #24]",
+        "stp x23, x24, [x9, #40]",
+        "stp x25, x26, [x9, #56]",
+        "stp x27, x28, [x9, #72]",
+        "stp x29, x30, [x9, #88]",
+        
+        // Set up user context
+        "msr sp_el0, {user_sp}",
+        "msr elr_el1, {user_pc}",
+        "mov x9, #0",                // SPSR for EL0
+        "msr spsr_el1, x9",
+        "isb",
+        
+        // Clear user registers
+        "mov x0, #0",
         "mov x1, #0",
         "mov x2, #0",
         "mov x3, #0",
@@ -289,27 +364,20 @@ unsafe fn run_user_process(ctx: &UserContext) -> i32 {
         "mov x16, #0",
         "mov x17, #0",
         "mov x18, #0",
-        "mov x19, #0",
-        "mov x20, #0",
-        "mov x21, #0",
-        "mov x22, #0",
-        "mov x23, #0",
-        "mov x24, #0",
-        "mov x25, #0",
-        "mov x26, #0",
-        "mov x27, #0",
-        "mov x28, #0",
-        "mov x29, #0",
-        "mov x30, #0",
-        // x0 will be 0 (no args for now)
-        "mov x0, #0",
-        // Jump to EL0
+        
+        // Enter user mode
         "eret",
-        sp = in(reg) ctx.sp,
-        pc = in(reg) ctx.pc,
-        spsr = in(reg) ctx.spsr,
-        options(noreturn)
+        
+        kctx_sym = sym KERNEL_CONTEXT,
+        user_sp = in(reg) ctx.sp,
+        user_pc = in(reg) ctx.pc,
+        lateout("x0") exit_code,
+        // These are clobbered
+        out("x9") _,
+        out("x10") _,
     );
+    
+    exit_code as i32
 }
 
 /// Execute an ELF binary from the filesystem
