@@ -219,6 +219,7 @@ impl Command for HelpCommand {
             response.extend_from_slice(b"  df                    - Show disk usage\r\n");
             response.extend_from_slice(b"\r\nNetwork commands:\r\n");
             response.extend_from_slice(b"  curl <url>            - HTTP GET request\r\n");
+            response.extend_from_slice(b"  nslookup <host>       - DNS lookup with timing\r\n");
             response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
             response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
             Ok(response)

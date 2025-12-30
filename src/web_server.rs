@@ -16,7 +16,6 @@ use embassy_time::Duration;
 use embedded_io_async::Write;
 
 use crate::async_fs;
-use crate::console;
 
 // ============================================================================
 // Constants
@@ -98,7 +97,6 @@ static BUFFER_POOL: BufferPool = BufferPool::new();
 
 /// Run the HTTP web server on port 8080
 pub async fn run(stack: Stack<'static>) {
-    log("[HTTP] Starting web server on port 8080...\n");
 
     loop {
         // Allocate a buffer slot
@@ -119,13 +117,13 @@ pub async fn run(stack: Stack<'static>) {
         // Wait for a connection
         match socket.accept(HTTP_PORT).await {
             Ok(()) => {
-                log("[HTTP] Connection accepted\n");
                 handle_connection(&mut socket, http_buf).await;
+                let _ = socket.flush().await;
                 socket.close();
+                // Wait a bit for the close to propagate through loopback
+                embassy_time::Timer::after(Duration::from_millis(10)).await;
             }
-            Err(e) => {
-                log(&format!("[HTTP] Accept error: {:?}\n", e));
-            }
+            Err(_) => {}
         }
 
         // Free the buffer slot
@@ -138,10 +136,7 @@ async fn handle_connection(socket: &mut TcpSocket<'_>, http_buf: &mut [u8]) {
     // Parse the HTTP request using edge-http
     let mut conn: Connection<'_, _, 16> = match Connection::new(http_buf, socket).await {
         Ok(conn) => conn,
-        Err(e) => {
-            log(&format!("[HTTP] Parse error: {:?}\n", e));
-            return;
-        }
+        Err(_) => return,
     };
 
     // Get request headers
@@ -156,8 +151,6 @@ async fn handle_connection(socket: &mut TcpSocket<'_>, http_buf: &mut [u8]) {
     } else {
         headers.path
     };
-
-    log(&format!("[HTTP] {:?} {}\n", method, path));
 
     // Only support GET and HEAD
     match method {
@@ -284,6 +277,3 @@ async fn send_error<T: embedded_io_async::Read + Write>(
     Ok(())
 }
 
-fn log(msg: &str) {
-    console::print(msg);
-}

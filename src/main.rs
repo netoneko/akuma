@@ -12,6 +12,7 @@ mod async_tests;
 mod block;
 mod boot;
 mod console;
+mod dns;
 mod embassy_net_driver;
 mod embassy_time_driver;
 mod embassy_virtio_driver;
@@ -276,15 +277,23 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     let mut runner = net_init.runner;
     let stack = net_init.stack;
 
+    // Extract loopback stack and runner
+    let mut loopback_runner = net_init.loopback.runner;
+    let loopback_stack = net_init.loopback.stack;
+
     // First, wait for IP address (DHCP or fallback to static)
     {
         let mut wait_ip_pinned = pin!(async_net::wait_for_ip(&stack));
         let runner_fut = runner.run();
         let mut runner_pinned = pin!(runner_fut);
+        let loopback_runner_fut = loopback_runner.run();
+        let mut loopback_runner_pinned = pin!(loopback_runner_fut);
 
         loop {
             // Poll the network runner (needed for DHCP to work)
             let _ = runner_pinned.as_mut().poll(&mut cx);
+            // Poll the loopback runner
+            let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
             // Poll the wait_for_ip future
             if let Poll::Ready(()) = wait_ip_pinned.as_mut().poll(&mut cx) {
@@ -304,24 +313,37 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     );
     console::print("[AsyncMain] HTTP Server: http://localhost:8080/\n");
 
-    // Store stack reference for curl command
+    // Store stack references for curl/nslookup commands
     async_net::set_global_stack(stack);
+    async_net::set_loopback_stack(loopback_stack);
 
     // Pin the futures directly using the pin! macro (no unsafe needed)
     let mut runner_pinned = pin!(runner.run());
+    let mut loopback_runner_pinned = pin!(loopback_runner.run());
     let mut ssh_pinned = pin!(ssh_server::run(stack));
     let mut web_pinned = pin!(web_server::run(stack));
+    let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
     loop {
-        // Poll the network runner
+        // Poll the main network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);
 
-        // Poll the SSH server
+        // Poll loopback runner - process any pending packets
+        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
+
+        // Poll the SSH server (runs curl commands that send to loopback)
         let _ = ssh_pinned.as_mut().poll(&mut cx);
 
-        // Poll the HTTP web server
+        // Poll loopback runner again - process packets sent by curl
+        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
+
+        // Poll the HTTP web servers
         let _ = web_pinned.as_mut().poll(&mut cx);
+        let _ = web_loopback_pinned.as_mut().poll(&mut cx);
+
+        // Poll loopback runner again - process response packets from web server
+        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
         // Poll the memory monitor
         let _ = mem_monitor_pinned.as_mut().poll(&mut cx);

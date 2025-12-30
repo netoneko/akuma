@@ -1,15 +1,15 @@
 //! Embassy network driver implementations
 //!
 //! Provides:
-//! - LoopbackDevice: A loopback network device for testing async networking
-//!   without real hardware. Packets sent are immediately available to receive.
+//! - LoopbackDevice: A loopback network device for async networking
+//!   Packets sent are immediately available to receive.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::task::Waker;
 
-use critical_section::Mutex;
 use embassy_net_driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
+use spinning_top::Spinlock;
 
 // ============================================================================
 // Loopback Device
@@ -29,25 +29,25 @@ struct LoopbackPacket {
 struct LoopbackState {
     /// Queue of packets waiting to be received
     rx_queue: VecDeque<LoopbackPacket>,
-    /// Link is always up for loopback
-    link_up: bool,
+    /// Waker to notify when packets are available
+    rx_waker: Option<Waker>,
 }
 
 impl LoopbackState {
     const fn new() -> Self {
         Self {
             rx_queue: VecDeque::new(),
-            link_up: true,
+            rx_waker: None,
         }
     }
 }
 
-/// A loopback network device for testing
+/// A loopback network device
 ///
 /// Packets transmitted are immediately available for reception.
-/// This allows testing async TCP client-server code without real hardware.
+/// This allows TCP client-server communication on localhost.
 pub struct LoopbackDevice {
-    state: Mutex<RefCell<LoopbackState>>,
+    state: Spinlock<LoopbackState>,
     mac_addr: [u8; 6],
 }
 
@@ -55,8 +55,8 @@ impl LoopbackDevice {
     /// Create a new loopback device with a generated MAC address
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(RefCell::new(LoopbackState::new())),
-            // Use a locally administered MAC address
+            state: Spinlock::new(LoopbackState::new()),
+            // Use a locally administered MAC address for loopback
             mac_addr: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }
     }
@@ -64,7 +64,7 @@ impl LoopbackDevice {
     /// Create a new loopback device with a specific MAC address
     pub fn with_mac(mac: [u8; 6]) -> Self {
         Self {
-            state: Mutex::new(RefCell::new(LoopbackState::new())),
+            state: Spinlock::new(LoopbackState::new()),
             mac_addr: mac,
         }
     }
@@ -94,46 +94,39 @@ impl Driver for LoopbackDevice {
         &mut self,
         cx: &mut core::task::Context,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        critical_section::with(|cs| {
-            let state = self.state.borrow(cs);
-            let state_ref = state.borrow();
-
-            if state_ref.rx_queue.is_empty() {
-                // No packets available - register waker for later
-                // Note: In a real implementation, we'd store the waker
-                // For loopback, packets are available immediately after tx
-                drop(state_ref);
-                let _ = cx.waker(); // Acknowledge the waker
-                None
-            } else {
-                drop(state_ref);
-                Some((
-                    LoopbackRxToken {
-                        device: &self.state,
-                    },
-                    LoopbackTxToken {
-                        device: &self.state,
-                    },
-                ))
-            }
-        })
+        let mut state = self.state.lock();
+        
+        if !state.rx_queue.is_empty() {
+            // Clear waker since we're returning a packet
+            state.rx_waker = None;
+            drop(state);
+            Some((
+                LoopbackRxToken {
+                    device: &self.state,
+                },
+                LoopbackTxToken {
+                    device: &self.state,
+                },
+            ))
+        } else {
+            // Store waker to be notified when packets arrive
+            state.rx_waker = Some(cx.waker().clone());
+            None
+        }
     }
 
     fn transmit(&mut self, _cx: &mut core::task::Context) -> Option<Self::TxToken<'_>> {
-        // Loopback can always transmit (up to queue limit)
-        critical_section::with(|cs| {
-            let state = self.state.borrow(cs);
-            let state_ref = state.borrow();
+        let state = self.state.lock();
+        let can_transmit = state.rx_queue.len() < LOOPBACK_QUEUE_SIZE;
+        drop(state);
 
-            if state_ref.rx_queue.len() < LOOPBACK_QUEUE_SIZE {
-                drop(state_ref);
-                Some(LoopbackTxToken {
-                    device: &self.state,
-                })
-            } else {
-                None
-            }
-        })
+        if can_transmit {
+            Some(LoopbackTxToken {
+                device: &self.state,
+            })
+        } else {
+            None
+        }
     }
 
     fn link_state(&mut self, _cx: &mut core::task::Context) -> LinkState {
@@ -158,7 +151,7 @@ impl Driver for LoopbackDevice {
 // ============================================================================
 
 pub struct LoopbackRxToken<'a> {
-    device: &'a Mutex<RefCell<LoopbackState>>,
+    device: &'a Spinlock<LoopbackState>,
 }
 
 impl<'a> RxToken for LoopbackRxToken<'a> {
@@ -166,17 +159,13 @@ impl<'a> RxToken for LoopbackRxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        critical_section::with(|cs| {
-            let state = self.device.borrow(cs);
-            let mut state_ref = state.borrow_mut();
-
-            if let Some(mut packet) = state_ref.rx_queue.pop_front() {
-                f(&mut packet.data)
-            } else {
-                // This shouldn't happen if receive() returned Some
-                panic!("LoopbackRxToken::consume called with empty queue");
-            }
-        })
+        let mut state = self.device.lock();
+        if let Some(mut packet) = state.rx_queue.pop_front() {
+            drop(state); // Release lock before calling f
+            f(&mut packet.data)
+        } else {
+            panic!("LoopbackRxToken::consume called with empty queue");
+        }
     }
 }
 
@@ -185,7 +174,7 @@ impl<'a> RxToken for LoopbackRxToken<'a> {
 // ============================================================================
 
 pub struct LoopbackTxToken<'a> {
-    device: &'a Mutex<RefCell<LoopbackState>>,
+    device: &'a Spinlock<LoopbackState>,
 }
 
 impl<'a> TxToken for LoopbackTxToken<'a> {
@@ -193,22 +182,26 @@ impl<'a> TxToken for LoopbackTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        critical_section::with(|cs| {
-            let state = self.device.borrow(cs);
-            let mut state_ref = state.borrow_mut();
+        // Allocate buffer for the packet
+        let mut data = alloc::vec![0u8; len];
+        
+        // Call f to fill the buffer (no lock held)
+        let result = f(&mut data);
 
-            // Allocate buffer for the packet
-            let mut data = alloc::vec![0u8; len];
-            let result = f(&mut data);
-
-            // Queue the packet for reception (loopback behavior)
-            if state_ref.rx_queue.len() < LOOPBACK_QUEUE_SIZE {
-                state_ref.rx_queue.push_back(LoopbackPacket { data });
+        // Now lock and queue the packet
+        let mut state = self.device.lock();
+        if state.rx_queue.len() < LOOPBACK_QUEUE_SIZE {
+            state.rx_queue.push_back(LoopbackPacket { data });
+            
+            // Wake the receiver if it's waiting
+            if let Some(waker) = state.rx_waker.take() {
+                drop(state); // Release lock before waking
+                waker.wake();
             }
-            // If queue is full, packet is dropped (like a real network)
+        }
+        // If queue is full, packet is dropped (like a real network)
 
-            result
-        })
+        result
     }
 }
 
@@ -216,7 +209,7 @@ impl<'a> TxToken for LoopbackTxToken<'a> {
 // Helper Functions
 // ============================================================================
 
-/// Create a new loopback device for testing
+/// Create a new loopback device
 pub fn create_loopback() -> LoopbackDevice {
     LoopbackDevice::new()
 }

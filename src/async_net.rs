@@ -2,6 +2,7 @@
 //!
 //! Provides async TCP networking with:
 //! - Network stack initialization with virtio driver
+//! - Loopback stack for localhost/127.0.0.1 connections
 //! - DHCP support with fallback to static config
 //! - Async TCP listener for accepting connections
 //! - Async TCP stream for reading/writing
@@ -19,28 +20,60 @@ use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::console;
+use crate::embassy_net_driver::LoopbackDevice;
 use crate::embassy_virtio_driver::EmbassyVirtioDriver;
 use crate::virtio_hal::VirtioHal;
 
 // ============================================================================
-// Global Stack Reference (for curl command)
+// Global Stack References
 // ============================================================================
 
 struct StackHolder(UnsafeCell<Option<Stack<'static>>>);
 unsafe impl Sync for StackHolder {}
 
+/// Main network stack (virtio - external network)
 static GLOBAL_STACK: StackHolder = StackHolder(UnsafeCell::new(None));
 
-/// Store the stack reference for global access (call once after init)
+/// Loopback network stack (127.0.0.1)
+static LOOPBACK_STACK: StackHolder = StackHolder(UnsafeCell::new(None));
+
+/// Store the main stack reference for global access
 pub fn set_global_stack(stack: Stack<'static>) {
     unsafe {
         *GLOBAL_STACK.0.get() = Some(stack);
     }
 }
 
-/// Get a copy of the global stack reference
+/// Get a copy of the main stack reference
 pub fn get_global_stack() -> Option<Stack<'static>> {
     unsafe { (*GLOBAL_STACK.0.get()).clone() }
+}
+
+/// Store the loopback stack reference for global access
+pub fn set_loopback_stack(stack: Stack<'static>) {
+    unsafe {
+        *LOOPBACK_STACK.0.get() = Some(stack);
+    }
+}
+
+/// Get a copy of the loopback stack reference
+pub fn get_loopback_stack() -> Option<Stack<'static>> {
+    unsafe { (*LOOPBACK_STACK.0.get()).clone() }
+}
+
+/// Check if an address is a loopback address
+pub fn is_loopback_address(host: &str) -> bool {
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// Get the appropriate stack for a given host
+/// Returns loopback stack for localhost/127.0.0.1, main stack otherwise
+pub fn get_stack_for_host(host: &str) -> Option<Stack<'static>> {
+    if is_loopback_address(host) {
+        get_loopback_stack()
+    } else {
+        get_global_stack()
+    }
 }
 
 // ============================================================================
@@ -71,16 +104,56 @@ const DEFAULT_PREFIX_LEN: u8 = 24;
 // Network Stack
 // ============================================================================
 
+/// Loopback network initialization result
+pub struct LoopbackInit {
+    pub stack: Stack<'static>,
+    pub runner: Runner<'static, LoopbackDevice>,
+}
+
 /// Network initialization result containing stack and runner
 pub struct NetworkInit {
     pub stack: Stack<'static>,
     pub runner: Runner<'static, EmbassyVirtioDriver>,
+    pub loopback: LoopbackInit,
+}
+
+/// Initialize the loopback network stack with 127.0.0.1
+fn init_loopback() -> LoopbackInit {
+    log("[AsyncNet] Initializing loopback interface (127.0.0.1)...\n");
+
+    // Create loopback device
+    let device = LoopbackDevice::new();
+
+    // Create static storage for the loopback resources
+    let resources_box = Box::new(StackResources::<8>::new());
+    let resources_ref: &'static mut StackResources<8> = Box::leak(resources_box);
+
+    // Configure with 127.0.0.1
+    let static_config = StaticConfigV4 {
+        address: Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8),
+        gateway: None,
+        dns_servers: Default::default(),
+    };
+    let config = Config::ipv4_static(static_config);
+
+    // Random seed
+    let seed = crate::timer::uptime_us() + 1;
+
+    // Create the loopback stack
+    let (stack, runner) = embassy_net::new(device, config, resources_ref, seed);
+
+    log("[AsyncNet] Loopback interface ready: 127.0.0.1/8\n");
+
+    LoopbackInit { stack, runner }
 }
 
 /// Initialize the async network stack
 /// Returns the stack and runner on success
 pub fn init() -> Result<NetworkInit, &'static str> {
     log("[AsyncNet] Initializing async network stack...\n");
+
+    // Initialize loopback first
+    let loopback = init_loopback();
 
     // Find virtio-net device
     let mut found_device: Option<EmbassyVirtioDriver> = None;
@@ -151,7 +224,7 @@ pub fn init() -> Result<NetworkInit, &'static str> {
 
     log("[AsyncNet] Network stack created, waiting for IP...\n");
 
-    Ok(NetworkInit { stack, runner })
+    Ok(NetworkInit { stack, runner, loopback })
 }
 
 /// Wait for network to get an IP address via DHCP
