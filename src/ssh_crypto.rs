@@ -15,6 +15,7 @@ use ctr::{Ctr128BE, cipher::StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::rng;
 use crate::timer;
 
 // ============================================================================
@@ -34,7 +35,7 @@ pub type Aes128Ctr = Ctr128BE<Aes128>;
 pub type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
-// Simple RNG using timer entropy
+// Simple RNG using hardware entropy when available
 // ============================================================================
 
 pub struct SimpleRng {
@@ -43,8 +44,17 @@ pub struct SimpleRng {
 
 impl SimpleRng {
     pub fn new() -> Self {
-        let seed = timer::uptime_us() ^ 0xDEADBEEFCAFEBABE;
-        Self { state: seed }
+        let mut seed_bytes = [0u8; 8];
+        if rng::fill_bytes(&mut seed_bytes).is_ok() {
+            Self {
+                state: u64::from_le_bytes(seed_bytes),
+            }
+        } else {
+            // Fallback to timer if hardware RNG not available
+            Self {
+                state: timer::uptime_us() ^ 0xDEADBEEFCAFEBABE,
+            }
+        }
     }
 
     pub fn next_u64(&mut self) -> u64 {

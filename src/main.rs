@@ -25,6 +25,7 @@ mod irq;
 mod netcat_server;
 mod network;
 mod rhai;
+mod rng;
 mod shell;
 mod shell_tests;
 mod ssh;
@@ -178,6 +179,20 @@ fn kernel_main() -> ! {
     // Run shell tests (pipelines and grep)
     // =========================================================================
     shell_tests::run_all_tests();
+
+    // =========================================================================
+    // Hardware RNG initialization
+    // =========================================================================
+    match rng::init() {
+        Ok(()) => {
+            console::print("[RNG] Hardware RNG initialized successfully\n");
+        }
+        Err(e) => {
+            console::print("[RNG] Hardware RNG not available: ");
+            console::print(&alloc::format!("{}\n", e));
+            console::print("[RNG] Falling back to timer-based entropy\n");
+        }
+    }
 
     // =========================================================================
     // Filesystem initialization
