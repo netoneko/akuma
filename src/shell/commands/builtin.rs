@@ -261,12 +261,18 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  nslookup <host>       - DNS lookup with timing\r\n")
                 .await;
-            let _ = stdout.write(b"\r\nPipeline support:\r\n").await;
+            let _ = stdout.write(b"\r\nPipeline and redirection:\r\n").await;
             let _ = stdout
                 .write(b"  cmd1 | cmd2           - Pipe output of cmd1 to cmd2\r\n")
                 .await;
             let _ = stdout
-                .write(b"  akuma | grep #*####%#**+**%@%**#    - Filter akuma output\r\n")
+                .write(b"  cmd > file            - Redirect output to file (overwrite)\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  cmd >> file           - Redirect output to file (append)\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  ls | grep txt > out   - Combine pipes with redirection\r\n")
                 .await;
             let _ = stdout
                 .write(b"\r\n  help                  - Show this help\r\n")
