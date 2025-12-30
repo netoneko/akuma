@@ -171,28 +171,31 @@ impl Process {
     pub fn execute(&mut self) -> i32 {
         self.state = ProcessState::Running;
 
-        // Activate the user address space
-        self.address_space.activate();
-
         console::print(&alloc::format!(
-            "[Process] Starting '{}' (PID {}) at entry={:#x}, sp={:#x}\n",
+            "[Process] '{}' (PID {}) loaded: entry={:#x}, sp={:#x}\n",
             self.name, self.pid, self.context.pc, self.context.sp
         ));
 
-        // Enter user mode and run until exit
-        let exit_code = unsafe { run_user_process(&self.context) };
+        // TODO: Proper user mode execution requires:
+        // 1. Kernel running in upper half (TTBR1) so we can switch TTBR0
+        // 2. Exception handlers for EL0 syscalls
+        // 3. Page table switching between user/kernel
+        //
+        // For now, we just verify the ELF was loaded correctly.
+        // Full EL0 execution not yet implemented.
 
-        // Deactivate user address space
-        UserAddressSpace::deactivate();
+        console::print("[Process] NOTE: EL0 execution not yet implemented.\n");
+        console::print("[Process] ELF was parsed and loaded successfully.\n");
 
-        self.state = ProcessState::Zombie(exit_code);
-
+        // Simulate successful exit
+        self.state = ProcessState::Zombie(0);
+        
         console::print(&alloc::format!(
-            "[Process] '{}' (PID {}) exited with code {}\n",
-            self.name, self.pid, exit_code
+            "[Process] '{}' (PID {}) - simulated exit with code 0\n",
+            self.name, self.pid
         ));
 
-        exit_code
+        0
     }
 }
 

@@ -124,15 +124,19 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Akuma Kernel starting...\n");
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
-    let code_and_stack = ram_size / 16; // 1/16 of total RAM
+    // Memory layout:
+    // - 1/16 of RAM: kernel code and stack
+    // - 1/2 of RAM: kernel heap (managed by allocator)
+    // - Remaining: user pages (managed by PMM)
+    let code_and_stack = ram_size / 16; // 1/16 of total RAM (8MB for 128MB)
     let heap_start = ram_base + code_and_stack;
+    let heap_size = ram_size / 2; // Half of RAM for heap (64MB for 128MB)
 
-    let heap_size = if ram_size > code_and_stack {
-        ram_size - code_and_stack
-    } else {
+    // Ensure we have enough for heap
+    if heap_size == 0 {
         console::print("Not enough RAM for heap\n");
         halt();
-    };
+    }
 
     if let Err(e) = allocator::init(heap_start, heap_size) {
         console::print("Allocator init failed: ");
@@ -447,12 +451,49 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
 
 /// Async task that periodically reports memory usage
 async fn memory_monitor() -> ! {
+    use core::fmt::Write;
     use embassy_time::{Duration, Timer};
+
+    // Stack-allocated buffer to avoid heap allocation when printing stats
+    struct StackBuffer {
+        buf: [u8; 128],
+        pos: usize,
+    }
+
+    impl Write for StackBuffer {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let remaining = self.buf.len() - self.pos;
+            let to_copy = bytes.len().min(remaining);
+            self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+            self.pos += to_copy;
+            Ok(())
+        }
+    }
+
+    impl StackBuffer {
+        fn new() -> Self {
+            Self {
+                buf: [0; 128],
+                pos: 0,
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.buf[..self.pos]).unwrap_or("")
+        }
+
+        fn clear(&mut self) {
+            self.pos = 0;
+        }
+    }
 
     // Wait a bit before starting to let system stabilize
     Timer::after(Duration::from_secs(5)).await;
 
     console::print("[MemMonitor] Memory monitoring started\n");
+
+    let mut buf = StackBuffer::new();
 
     loop {
         let stats = allocator::stats();
@@ -461,14 +502,17 @@ async fn memory_monitor() -> ! {
         let peak_kb = stats.peak_allocated / 1024;
         let heap_mb = stats.heap_size / 1024 / 1024;
 
-        console::print(&alloc::format!(
+        buf.clear();
+        let _ = write!(
+            buf,
             "[Mem] Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
             allocated_kb,
             free_kb,
             peak_kb,
             heap_mb,
             stats.allocation_count
-        ));
+        );
+        console::print(buf.as_str());
 
         // Report every 10 seconds
         Timer::after(Duration::from_secs(10)).await;

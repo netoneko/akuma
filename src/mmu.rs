@@ -530,25 +530,31 @@ impl UserAddressSpace {
     }
 
     /// Activate this address space (set TTBR0_EL1)
+    ///
+    /// NOTE: Currently disabled because the kernel runs in TTBR0 space.
+    /// TODO: Move kernel to TTBR1 (upper half) to enable proper user/kernel split.
     pub fn activate(&self) {
-        let ttbr0 = self.ttbr0();
-        unsafe {
-            core::arch::asm!(
-                "msr ttbr0_el1, {}",
-                "isb",
-                in(reg) ttbr0
-            );
-        }
+        // For now, don't switch TTBR0 - the kernel runs in TTBR0 space
+        // and would lose its own mapping. Just log that we would switch.
+        crate::console::print(&alloc::format!(
+            "[MMU] Would activate user ASID={} (skipped - kernel in TTBR0)\n",
+            self.asid
+        ));
+        // TODO: When kernel is in TTBR1, enable this:
+        // let ttbr0 = self.ttbr0();
+        // unsafe {
+        //     core::arch::asm!(
+        //         "msr ttbr0_el1, {}",
+        //         "isb",
+        //         in(reg) ttbr0
+        //     );
+        // }
     }
 
-    /// Deactivate user address space (set TTBR0_EL1 to 0)
+    /// Deactivate user address space (set TTBR0_EL1 to kernel)
     pub fn deactivate() {
-        unsafe {
-            core::arch::asm!(
-                "msr ttbr0_el1, xzr",
-                "isb"
-            );
-        }
+        // Currently a no-op since we don't actually switch TTBR0
+        // TODO: Restore kernel TTBR0 when user/kernel split is implemented
     }
 }
 
