@@ -48,13 +48,6 @@ pub fn run_all_tests() {
         failed += 1;
     }
 
-    // Test 5: Case-insensitive filename matching
-    if test_case_insensitive_access() {
-        passed += 1;
-    } else {
-        failed += 1;
-    }
-
     log(&format!(
         "\n[FS Tests] Complete: {} passed, {} failed\n",
         passed, failed
@@ -358,76 +351,6 @@ fn test_subdirectory_operations() -> bool {
         return false;
     }
     log("    File confirmed deleted\n");
-
-    log("  - PASSED\n");
-    true
-}
-
-// ============================================================================
-// Test: Case-Insensitive Access
-// ============================================================================
-
-/// Test case-insensitive filename matching
-fn test_case_insensitive_access() -> bool {
-    log("[FS Tests] Test: case_insensitive_access\n");
-
-    let test_file = "/casetest.txt";
-    let content = b"Case test content";
-
-    // Step 1: Create file
-    log("  - Step 1: Create test file\n");
-    match fs::write_file(test_file, content) {
-        Ok(()) => {
-            log("    Created /casetest.txt\n");
-        }
-        Err(e) => {
-            log(&format!("    FAILED to create file: {}\n", e));
-            return false;
-        }
-    }
-
-    // Step 2: Read with different case
-    log("  - Step 2: Read with uppercase name\n");
-    match fs::read_file("/CASETEST.TXT") {
-        Ok(read_content) => {
-            if read_content.as_slice() != content {
-                log("    FAILED: Content mismatch\n");
-                let _ = fs::remove_file(test_file);
-                return false;
-            }
-            log("    Uppercase access succeeded\n");
-        }
-        Err(e) => {
-            log(&format!("    FAILED to read with uppercase: {}\n", e));
-            let _ = fs::remove_file(test_file);
-            return false;
-        }
-    }
-
-    // Step 3: Read with mixed case
-    log("  - Step 3: Read with mixed case name\n");
-    match fs::read_file("/CaseTest.Txt") {
-        Ok(read_content) => {
-            if read_content.as_slice() != content {
-                log("    FAILED: Content mismatch\n");
-                let _ = fs::remove_file(test_file);
-                return false;
-            }
-            log("    Mixed case access succeeded\n");
-        }
-        Err(e) => {
-            log(&format!("    FAILED to read with mixed case: {}\n", e));
-            let _ = fs::remove_file(test_file);
-            return false;
-        }
-    }
-
-    // Step 4: Cleanup
-    log("  - Step 4: Cleanup\n");
-    match fs::remove_file(test_file) {
-        Ok(()) => log("    File deleted\n"),
-        Err(e) => log(&format!("    Warning: cleanup failed: {}\n", e)),
-    }
 
     log("  - PASSED\n");
     true

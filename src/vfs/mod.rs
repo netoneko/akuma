@@ -265,17 +265,29 @@ impl MountTable {
 
     /// Find the filesystem and relative path for a given absolute path
     fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a dyn Filesystem, &'a str)> {
+        // Normalize the path (add leading / if missing, remove trailing /)
         let normalized = normalize_path(path);
 
         for mount in &self.mounts {
+            // Special case: root mount "/"
+            if mount.path == "/" {
+                // Root mount matches everything
+                return Some((mount.fs.as_ref(), normalized));
+            }
+
+            // Exact match
             if normalized == mount.path {
                 return Some((mount.fs.as_ref(), "/"));
             }
+
+            // Prefix match (e.g., path="/tmp/foo" matches mount="/tmp")
             if normalized.starts_with(&mount.path) {
                 let rest = &normalized[mount.path.len()..];
-                if rest.is_empty() || rest.starts_with('/') {
-                    let relative = if rest.is_empty() { "/" } else { rest };
-                    return Some((mount.fs.as_ref(), relative));
+                if rest.is_empty() {
+                    return Some((mount.fs.as_ref(), "/"));
+                }
+                if rest.starts_with('/') {
+                    return Some((mount.fs.as_ref(), rest));
                 }
             }
         }
@@ -288,17 +300,25 @@ impl MountTable {
 // Path Utilities
 // ============================================================================
 
-/// Normalize a path (remove trailing slashes, handle empty -> "/")
+/// Normalize a path: ensure leading /, remove trailing /, handle empty -> "/"
 fn normalize_path(path: &str) -> &str {
     let path = path.trim_end_matches('/');
     if path.is_empty() {
         "/"
-    } else if !path.starts_with('/') {
-        // For paths without leading slash, we can't fix without allocation
-        // Callers should ensure paths are absolute
-        path
     } else {
         path
+    }
+}
+
+/// Normalize path with allocation (adds leading / if missing)
+fn normalize_path_owned(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::from("/")
+    } else if !trimmed.starts_with('/') {
+        alloc::format!("/{}", trimmed)
+    } else {
+        String::from(trimmed)
     }
 }
 
@@ -359,10 +379,13 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
+    // Normalize path (ensure leading /)
+    let normalized = normalize_path_owned(path);
+
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
 
-    let (fs, relative_path) = table.resolve(path).ok_or(FsError::NotFound)?;
+    let (fs, relative_path) = table.resolve(&normalized).ok_or(FsError::NotFound)?;
     f(fs, relative_path)
 }
 
