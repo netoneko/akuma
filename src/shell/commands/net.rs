@@ -427,7 +427,6 @@ where
     );
 
     if verbose {
-        let _ = stdout.write(b"\r\n[Request]\r\n").await;
         for line in request.lines() {
             let msg = format!("> {}\r\n", line);
             let _ = stdout.write(msg.as_bytes()).await;
@@ -460,7 +459,6 @@ where
         let body = &response_str[body_start + 4..];
 
         if verbose {
-            let _ = stdout.write(b"\r\n[Response Headers]\r\n").await;
             for line in headers.lines() {
                 let msg = format!("< {}\r\n", line);
                 let _ = stdout.write(msg.as_bytes()).await;
