@@ -56,8 +56,17 @@ nostd-interactive-terminal = { version = "0.1", default-features = false, featur
 rhai = { version = "1.19", default-features = false, features = ["no_std", "sync"] }
 
 # TLS support (no_std compatible)
-# Note: Certificate verification requires forking embedded-tls to export
-# CertificateRef and CertificateVerify types from the handshake module.
-# Currently uses NoVerify (encryption without certificate validation).
-# The 'alloc' feature enables RSA signature support (required for most servers).
+# Using fork with exposed handshake/extensions modules for custom TlsVerifier
 embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
+
+# X.509 certificate parsing (no_std compatible)
+x509-cert = { version = "0.2", default-features = false }
+der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
+const-oid = { version = "0.9", default-features = false }
+
+# ECDSA P-256 signature verification
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+
+[patch.crates-io]
+# Fork based on v0.17.0 with exposed handshake/extensions modules
+embedded-tls = { git = "https://github.com/netoneko/embedded-tls", branch = "expose-verifier-types" }

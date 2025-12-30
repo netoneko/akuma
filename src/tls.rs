@@ -5,14 +5,15 @@
 //!
 //! # Certificate Verification
 //!
-//! Currently uses NoVerify (like `curl -k`) because embedded-tls doesn't
-//! export the types needed to implement a custom TlsVerifier.
-//! This provides encryption but not server authentication.
+//! Two modes are supported:
+//! - Secure mode (default): Uses X509Verifier for certificate validation
+//! - Insecure mode (-k flag): Uses NoVerify, skips certificate validation
 
 use embedded_io_async::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext, TlsError};
 
 use crate::tls_rng::TlsRng;
+use crate::tls_verifier::X509Verifier;
 
 /// TLS read/write buffer sizes (must be >= 16KB for TLS records)
 pub const TLS_RECORD_SIZE: usize = 16384;
@@ -108,10 +109,15 @@ where
         // Create context
         let context = TlsContext::new(&config, &mut rng);
 
-        // Perform TLS handshake
-        // Note: Currently always uses NoVerify because embedded-tls doesn't export
-        // the types needed to implement a custom TlsVerifier (CertificateRef, etc.)
-        conn.open::<TlsRng, NoVerify>(context).await?;
+        // Perform TLS handshake with appropriate verifier
+        if options.insecure {
+            // Skip certificate verification
+            conn.open::<TlsRng, NoVerify>(context).await?;
+        } else {
+            // Verify server certificate
+            conn.open::<TlsRng, X509Verifier<'_, Aes128GcmSha256>>(context)
+                .await?;
+        }
 
         Ok(Self { conn })
     }

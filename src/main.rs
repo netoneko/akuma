@@ -36,6 +36,7 @@ mod threading;
 mod timer;
 mod tls;
 mod tls_rng;
+mod tls_verifier;
 mod vfs;
 mod virtio_hal;
 mod web_server;
