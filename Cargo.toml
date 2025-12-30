@@ -51,3 +51,6 @@ embedded-io-async = { version = "0.6", default-features = false }
 
 # Interactive terminal for shell (no_std)
 nostd-interactive-terminal = { version = "0.1", default-features = false, features = ["ansi-support"] }
+
+# Rhai scripting engine (no_std)
+rhai = { version = "1.19", default-features = false, features = ["no_std", "sync"] }

@@ -24,6 +24,7 @@ mod gic;
 mod irq;
 mod netcat_server;
 mod network;
+mod rhai;
 mod shell;
 mod shell_tests;
 mod ssh;

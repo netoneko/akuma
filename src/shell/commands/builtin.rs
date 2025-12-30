@@ -261,6 +261,10 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  nslookup <host>       - DNS lookup with timing\r\n")
                 .await;
+            let _ = stdout.write(b"\r\nScripting commands:\r\n").await;
+            let _ = stdout
+                .write(b"  rhai <file>           - Execute a Rhai script\r\n")
+                .await;
             let _ = stdout.write(b"\r\nPipeline and redirection:\r\n").await;
             let _ = stdout
                 .write(b"  cmd1 | cmd2           - Pipe output of cmd1 to cmd2\r\n")

@@ -1,3 +1,4 @@
 .cursor
 /target
 *.img
+.DS_Store
