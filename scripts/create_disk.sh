@@ -30,8 +30,8 @@ if [ "$OS" = "Darwin" ]; then
     # macOS: Use e2fsprogs from Homebrew
     if command -v mkfs.ext2 &> /dev/null; then
         mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
-    elif command -v /opt/homebrew/sbin/mkfs.ext2 &> /dev/null; then
-        /opt/homebrew/sbin/mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
+    elif command -v /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 &> /dev/null; then
+        /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
     elif command -v /usr/local/sbin/mkfs.ext2 &> /dev/null; then
         /usr/local/sbin/mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
     else
@@ -42,7 +42,7 @@ if [ "$OS" = "Darwin" ]; then
         echo "  brew install e2fsprogs"
         echo ""
         echo "After installing, you may need to add it to your PATH or run:"
-        echo "  /opt/homebrew/sbin/mkfs.ext2 -F -L AKUMA $DISK_IMG"
+        echo "  /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 -F -L AKUMA $DISK_IMG"
         echo ""
         # Create empty image anyway
         echo "Created empty disk image (not formatted)"
@@ -81,9 +81,12 @@ else
     echo "  sudo umount mnt"
 fi
 echo ""
-echo "To copy bootstrap files:"
+echo "To copy bootstrap files (recommended - uses Docker):"
+echo "  ./scripts/populate_disk.sh"
+echo ""
+echo "Or manually:"
 if [ "$OS" = "Darwin" ]; then
-    echo "  # Copy public folder contents"
+    echo "  # Using debugfs (from e2fsprogs):"
     echo "  for f in bootstrap/public/*; do"
     echo "    debugfs -w $DISK_IMG -R \"write \$f \$(basename \$f)\""
     echo "  done"
