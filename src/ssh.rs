@@ -24,7 +24,7 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
-use crate::shell::{self, commands::create_default_registry};
+use crate::shell::{self, VecWriter, commands::create_default_registry};
 use crate::ssh_crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
     SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
@@ -542,6 +542,80 @@ enum EscapeState {
     Bracket, // Got ESC [
 }
 
+// ============================================================================
+// Pipeline Execution
+// ============================================================================
+
+/// Parse a command line into pipeline stages
+/// Splits on '|' character, trimming whitespace from each stage
+fn parse_pipeline(line: &[u8]) -> Vec<&[u8]> {
+    let mut stages = Vec::new();
+    let mut start = 0;
+
+    for (i, &byte) in line.iter().enumerate() {
+        if byte == b'|' {
+            let stage = trim_bytes(&line[start..i]);
+            if !stage.is_empty() {
+                stages.push(stage);
+            }
+            start = i + 1;
+        }
+    }
+
+    // Add the last stage
+    let stage = trim_bytes(&line[start..]);
+    if !stage.is_empty() {
+        stages.push(stage);
+    }
+
+    stages
+}
+
+/// Execute a pipeline of commands
+/// Returns the final output or an error
+async fn execute_pipeline(
+    stages: &[&[u8]],
+    registry: &shell::CommandRegistry,
+) -> Result<Vec<u8>, shell::ShellError> {
+    if stages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stdin_data: Option<Vec<u8>> = None;
+
+    for (i, stage) in stages.iter().enumerate() {
+        let (cmd_name, args) = split_first_word(stage);
+        let is_last = i == stages.len() - 1;
+
+        // Find the command
+        let cmd = match registry.find(cmd_name) {
+            Some(c) => c,
+            None => {
+                return Err(shell::ShellError::CommandNotFound);
+            }
+        };
+
+        // Execute command with stdin from previous stage
+        let mut stdout = VecWriter::new();
+        let stdin_slice = stdin_data.as_deref();
+
+        match cmd.execute(args, stdin_slice, &mut stdout).await {
+            Ok(()) => {
+                if is_last {
+                    // Final stage - return the output
+                    return Ok(stdout.into_inner());
+                } else {
+                    // Intermediate stage - pass output to next command
+                    stdin_data = Some(stdout.into_inner());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(stdin_data.unwrap_or_default())
+}
+
 /// Run an interactive shell session using ShellSession
 async fn run_shell_session(
     stream: &mut TcpStream,
@@ -608,12 +682,12 @@ async fn run_shell_session(
                                             return Ok(());
                                         }
 
-                                        // Parse command and arguments
-                                        let (cmd_name, args) = split_first_word(trimmed);
+                                        // Parse pipeline
+                                        let stages = parse_pipeline(trimmed);
 
-                                        // Find and execute command
-                                        if let Some(cmd) = registry.find(cmd_name) {
-                                            match cmd.execute(args).await {
+                                        if !stages.is_empty() {
+                                            // Execute pipeline
+                                            match execute_pipeline(&stages, &registry).await {
                                                 Ok(output) => {
                                                     if !output.is_empty() {
                                                         let _ = channel_stream.write(&output).await;
@@ -630,14 +704,11 @@ async fn run_shell_session(
                                                         .write(error.as_bytes())
                                                         .await;
                                                 }
+                                                Err(shell::ShellError::CommandNotFound) => {
+                                                    // Error already printed in execute_pipeline
+                                                }
                                                 Err(_) => {}
                                             }
-                                        } else {
-                                            let msg = format!(
-                                                "Unknown command: {}\r\nType 'help' for available commands.\r\n",
-                                                core::str::from_utf8(cmd_name).unwrap_or("?")
-                                            );
-                                            let _ = channel_stream.write(msg.as_bytes()).await;
                                         }
                                     }
 
@@ -1008,13 +1079,13 @@ async fn handle_message(
                             core::str::from_utf8(cmd_bytes)
                         ));
 
-                        // Use the command registry for exec
+                        // Use the command registry for exec with pipeline support
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
-                        let (cmd_name, args) = split_first_word(trimmed);
+                        let stages = parse_pipeline(trimmed);
 
-                        if let Some(cmd) = registry.find(cmd_name) {
-                            match cmd.execute(args).await {
+                        if !stages.is_empty() {
+                            match execute_pipeline(&stages, &registry).await {
                                 Ok(output) => {
                                     if !output.is_empty() {
                                         send_channel_data(stream, session, &output).await?;
@@ -1024,14 +1095,12 @@ async fn handle_message(
                                     let error = format!("Error: {}\r\n", msg);
                                     send_channel_data(stream, session, error.as_bytes()).await?;
                                 }
+                                Err(shell::ShellError::CommandNotFound) => {
+                                    send_channel_data(stream, session, b"Command not found\r\n")
+                                        .await?;
+                                }
                                 Err(_) => {}
                             }
-                        } else {
-                            let msg = format!(
-                                "Unknown command: {}\r\n",
-                                core::str::from_utf8(cmd_name).unwrap_or("?")
-                            );
-                            send_channel_data(stream, session, msg.as_bytes()).await?;
                         }
                     }
                     // Send EOF after exec - client will send CLOSE, we respond to that

@@ -8,8 +8,10 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
+use embedded_io_async::Write;
+
 use crate::async_fs;
-use crate::shell::{Command, ShellError};
+use crate::shell::{Command, ShellError, VecWriter};
 use crate::ssh_crypto::split_first_word;
 
 // ============================================================================
@@ -36,9 +38,10 @@ impl Command for LsCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
             let path = if args.is_empty() {
                 "/"
             } else {
@@ -46,14 +49,14 @@ impl Command for LsCommand {
             };
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             match async_fs::list_dir(path).await {
                 Ok(entries) => {
                     if entries.is_empty() {
-                        return Ok(response);
+                        return Ok(());
                     }
 
                     let mut dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).collect();
@@ -67,25 +70,25 @@ impl Command for LsCommand {
 
                     for entry in dirs {
                         let name = entry.name.to_lowercase();
-                        response.extend_from_slice(COLOR_DIR);
-                        response.extend_from_slice(name.as_bytes());
-                        response.extend_from_slice(b"/");
-                        response.extend_from_slice(COLOR_RESET);
-                        response.extend_from_slice(b"\r\n");
+                        let _ = stdout.write(COLOR_DIR).await;
+                        let _ = stdout.write(name.as_bytes()).await;
+                        let _ = stdout.write(b"/").await;
+                        let _ = stdout.write(COLOR_RESET).await;
+                        let _ = stdout.write(b"\r\n").await;
                     }
 
                     for entry in files {
                         let name = entry.name.to_lowercase();
-                        response.extend_from_slice(name.as_bytes());
-                        response.extend_from_slice(b"\r\n");
+                        let _ = stdout.write(name.as_bytes()).await;
+                        let _ = stdout.write(b"\r\n").await;
                     }
                 }
                 Err(e) => {
                     let msg = format!("Error listing directory: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -117,34 +120,39 @@ impl Command for CatCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
+            // If no args but stdin provided, just pass through stdin (useful for pipes)
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: cat <filename>\r\n");
-                return Ok(response);
+                if let Some(data) = stdin {
+                    let _ = stdout.write(data).await;
+                    return Ok(());
+                }
+                let _ = stdout.write(b"Usage: cat <filename>\r\n").await;
+                return Ok(());
             }
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             let path = core::str::from_utf8(args).unwrap_or("");
             match async_fs::read_to_string(path).await {
                 Ok(content) => {
                     for line in content.split('\n') {
-                        response.extend_from_slice(line.as_bytes());
-                        response.extend_from_slice(b"\r\n");
+                        let _ = stdout.write(line.as_bytes()).await;
+                        let _ = stdout.write(b"\r\n").await;
                     }
                 }
                 Err(e) => {
                     let msg = format!("Error reading file: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -173,38 +181,38 @@ impl Command for WriteCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: write <filename> <content>\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: write <filename> <content>\r\n").await;
+                return Ok(());
             }
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             let (filename, content) = split_first_word(args);
             if content.is_empty() {
-                response.extend_from_slice(b"Usage: write <filename> <content>\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: write <filename> <content>\r\n").await;
+                return Ok(());
             }
 
             let path = core::str::from_utf8(filename).unwrap_or("");
             match async_fs::write_file(path, content).await {
                 Ok(()) => {
                     let msg = format!("Wrote {} bytes to {}\r\n", content.len(), path);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error writing file: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -233,38 +241,42 @@ impl Command for AppendCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: append <filename> <content>\r\n");
-                return Ok(response);
+                let _ = stdout
+                    .write(b"Usage: append <filename> <content>\r\n")
+                    .await;
+                return Ok(());
             }
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             let (filename, content) = split_first_word(args);
             if content.is_empty() {
-                response.extend_from_slice(b"Usage: append <filename> <content>\r\n");
-                return Ok(response);
+                let _ = stdout
+                    .write(b"Usage: append <filename> <content>\r\n")
+                    .await;
+                return Ok(());
             }
 
             let path = core::str::from_utf8(filename).unwrap_or("");
             match async_fs::append_file(path, content).await {
                 Ok(()) => {
                     let msg = format!("Appended {} bytes to {}\r\n", content.len(), path);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error appending to file: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -296,32 +308,32 @@ impl Command for RmCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: rm <filename>\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: rm <filename>\r\n").await;
+                return Ok(());
             }
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             let path = core::str::from_utf8(args).unwrap_or("");
             match async_fs::remove_file(path).await {
                 Ok(()) => {
                     let msg = format!("Removed: {}\r\n", path);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error removing file: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -350,32 +362,32 @@ impl Command for MkdirCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: mkdir <dirname>\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: mkdir <dirname>\r\n").await;
+                return Ok(());
             }
 
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             let path = core::str::from_utf8(args).unwrap_or("");
             match async_fs::create_dir(path).await {
                 Ok(()) => {
                     let msg = format!("Created directory: {}\r\n", path);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error creating directory: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -404,13 +416,13 @@ impl Command for DfCommand {
     fn execute<'a>(
         &'a self,
         _args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if !crate::fs::is_initialized() {
-                response.extend_from_slice(b"Error: Filesystem not initialized\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
             }
 
             match async_fs::stats().await {
@@ -427,14 +439,14 @@ impl Command for DfCommand {
                         "Filesystem Statistics:\r\n  Total:  {} KB\r\n  Used:   {} KB ({}%)\r\n  Free:   {} KB\r\n  Cluster size: {} bytes\r\n",
                         total_kb, used_kb, percent_used, free_kb, stats.cluster_size
                     );
-                    response.extend_from_slice(info.as_bytes());
+                    let _ = stdout.write(info.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error getting filesystem stats: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }

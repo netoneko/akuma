@@ -5,13 +5,16 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
+use embedded_io_async::Write;
+
 use crate::async_net;
 use crate::dns;
-use crate::shell::{Command, ShellError};
+use crate::shell::{Command, ShellError, VecWriter};
 
 // ============================================================================
 // Curl Command
@@ -34,37 +37,39 @@ impl Command for CurlCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: curl <url>\r\n");
-                response.extend_from_slice(b"Example: curl http://10.0.2.2:8080/\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: curl <url>\r\n").await;
+                let _ = stdout
+                    .write(b"Example: curl http://10.0.2.2:8080/\r\n")
+                    .await;
+                return Ok(());
             }
 
             let url = match core::str::from_utf8(args) {
                 Ok(s) => s.trim(),
                 Err(_) => {
-                    response.extend_from_slice(b"Error: Invalid URL\r\n");
-                    return Ok(response);
+                    let _ = stdout.write(b"Error: Invalid URL\r\n").await;
+                    return Ok(());
                 }
             };
 
             match http_get(url).await {
                 Ok(body) => {
                     for line in body.split('\n') {
-                        response.extend_from_slice(line.as_bytes());
-                        response.extend_from_slice(b"\r\n");
+                        let _ = stdout.write(line.as_bytes()).await;
+                        let _ = stdout.write(b"\r\n").await;
                     }
                 }
                 Err(e) => {
                     let msg = format!("Error: {}\r\n", e);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -93,29 +98,29 @@ impl Command for NslookupCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-
             if args.is_empty() {
-                response.extend_from_slice(b"Usage: nslookup <hostname>\r\n");
-                response.extend_from_slice(b"Example: nslookup example.com\r\n");
-                return Ok(response);
+                let _ = stdout.write(b"Usage: nslookup <hostname>\r\n").await;
+                let _ = stdout.write(b"Example: nslookup example.com\r\n").await;
+                return Ok(());
             }
 
             let host = match core::str::from_utf8(args) {
                 Ok(s) => s.trim(),
                 Err(_) => {
-                    response.extend_from_slice(b"Error: Invalid hostname\r\n");
-                    return Ok(response);
+                    let _ = stdout.write(b"Error: Invalid hostname\r\n").await;
+                    return Ok(());
                 }
             };
 
             let stack = match async_net::get_global_stack() {
                 Some(s) => s,
                 None => {
-                    response.extend_from_slice(b"Error: Network not initialized\r\n");
-                    return Ok(response);
+                    let _ = stdout.write(b"Error: Network not initialized\r\n").await;
+                    return Ok(());
                 }
             };
 
@@ -128,7 +133,7 @@ impl Command for NslookupCommand {
                     dns_server.octets()[2],
                     dns_server.octets()[3]
                 );
-                response.extend_from_slice(msg.as_bytes());
+                let _ = stdout.write(msg.as_bytes()).await;
             }
 
             // Perform DNS resolution with timing
@@ -144,19 +149,19 @@ impl Command for NslookupCommand {
                         ),
                     };
                     let msg = format!("Address: {}\r\n", ip_str);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
 
                     let time_ms = duration.as_millis();
                     let msg = format!("Time: {}ms\r\n", time_ms);
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
                     let msg = format!("Error: {}\r\n", e.as_str());
-                    response.extend_from_slice(msg.as_bytes());
+                    let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
 
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -175,8 +180,8 @@ pub async fn http_get_legacy(url: &str) -> Result<String, &'static str> {
 
 /// Perform an HTTP GET request
 async fn http_get(url: &str) -> Result<String, &'static str> {
-    use embassy_net::tcp::TcpSocket;
     use embassy_net::IpEndpoint;
+    use embassy_net::tcp::TcpSocket;
     use embassy_time::Duration;
     use embedded_io_async::Write as AsyncWrite;
 
@@ -244,5 +249,3 @@ async fn http_get(url: &str) -> Result<String, &'static str> {
         Ok(response_str)
     }
 }
-
-use alloc::string::ToString;

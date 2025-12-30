@@ -95,7 +95,7 @@ impl Driver for LoopbackDevice {
         cx: &mut core::task::Context,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut state = self.state.lock();
-        
+
         if !state.rx_queue.is_empty() {
             // Clear waker since we're returning a packet
             state.rx_waker = None;
@@ -184,7 +184,7 @@ impl<'a> TxToken for LoopbackTxToken<'a> {
     {
         // Allocate buffer for the packet
         let mut data = alloc::vec![0u8; len];
-        
+
         // Call f to fill the buffer (no lock held)
         let result = f(&mut data);
 
@@ -192,7 +192,7 @@ impl<'a> TxToken for LoopbackTxToken<'a> {
         let mut state = self.device.lock();
         if state.rx_queue.len() < LOOPBACK_QUEUE_SIZE {
             state.rx_queue.push_back(LoopbackPacket { data });
-            
+
             // Wake the receiver if it's waiting
             if let Some(waker) = state.rx_waker.take() {
                 drop(state); // Release lock before waking

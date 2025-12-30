@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use spinning_top::Spinlock;
 
-use super::{path_components, split_path, DirEntry, Filesystem, FsError, FsStats, Metadata};
+use super::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::block;
 use crate::console;
 
@@ -213,18 +213,26 @@ impl Ext2Filesystem {
         if magic != EXT2_MAGIC {
             console::print(&alloc::format!(
                 "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
-                magic, EXT2_MAGIC
+                magic,
+                EXT2_MAGIC
             ));
             return Err(FsError::NoFilesystem);
         }
 
         let block_size = 1024usize << block_size_log;
-        let inode_size = if version_major >= 1 { sb_inode_size } else { 128 };
+        let inode_size = if version_major >= 1 {
+            sb_inode_size
+        } else {
+            128
+        };
         let block_group_count = (total_blocks + blocks_per_group - 1) / blocks_per_group;
 
         console::print(&alloc::format!(
             "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups\n",
-            total_blocks, total_inodes, block_size, block_group_count
+            total_blocks,
+            total_inodes,
+            block_size,
+            block_group_count
         ));
 
         let state = Ext2State {
@@ -325,8 +333,8 @@ impl Ext2Filesystem {
         let bgd = Self::read_bgd(state, group)?;
         let inode_table = bgd.inode_table;
 
-        let inode_offset =
-            inode_table as u64 * state.block_size as u64 + index_in_group as u64 * state.inode_size as u64;
+        let inode_offset = inode_table as u64 * state.block_size as u64
+            + index_in_group as u64 * state.inode_size as u64;
 
         let mut buf = vec![0u8; state.inode_size as usize];
         block::read_bytes(inode_offset, &mut buf).map_err(|_| FsError::IoError)?;
@@ -345,11 +353,12 @@ impl Ext2Filesystem {
         let bgd = Self::read_bgd(state, group)?;
         let inode_table = bgd.inode_table;
 
-        let inode_offset =
-            inode_table as u64 * state.block_size as u64 + index_in_group as u64 * state.inode_size as u64;
+        let inode_offset = inode_table as u64 * state.block_size as u64
+            + index_in_group as u64 * state.inode_size as u64;
 
-        let buf =
-            unsafe { core::slice::from_raw_parts(inode as *const Inode as *const u8, size_of::<Inode>()) };
+        let buf = unsafe {
+            core::slice::from_raw_parts(inode as *const Inode as *const u8, size_of::<Inode>())
+        };
         block::write_bytes(inode_offset, buf).map_err(|_| FsError::IoError)?;
         Ok(())
     }
@@ -416,7 +425,7 @@ impl Ext2Filesystem {
                     Self::write_superblock(state)?;
 
                     let block_num = group * state.blocks_per_group + bit;
-                    
+
                     // Zero the block
                     let zeros = vec![0u8; state.block_size];
                     Self::write_block(state, block_num, &zeros)?;
@@ -528,7 +537,11 @@ impl Ext2Filesystem {
     // Block Mapping (logical -> physical)
     // ========================================================================
 
-    fn get_block_num(state: &Ext2State, inode: &Inode, logical_block: u32) -> Result<Option<u32>, FsError> {
+    fn get_block_num(
+        state: &Ext2State,
+        inode: &Inode,
+        logical_block: u32,
+    ) -> Result<Option<u32>, FsError> {
         let ptrs_per_block = (state.block_size / 4) as u32;
 
         if logical_block < 12 {
@@ -587,7 +600,11 @@ impl Ext2Filesystem {
     }
 
     /// Ensure a block exists at the given logical position, allocating if needed
-    fn ensure_block(state: &mut Ext2State, inode: &mut Inode, logical_block: u32) -> Result<u32, FsError> {
+    fn ensure_block(
+        state: &mut Ext2State,
+        inode: &mut Inode,
+        logical_block: u32,
+    ) -> Result<u32, FsError> {
         let ptrs_per_block = (state.block_size / 4) as u32;
 
         if logical_block < 12 {
@@ -684,7 +701,12 @@ impl Ext2Filesystem {
         Ok(data)
     }
 
-    fn write_inode_data(state: &mut Ext2State, inode_num: u32, inode: &mut Inode, data: &[u8]) -> Result<(), FsError> {
+    fn write_inode_data(
+        state: &mut Ext2State,
+        inode_num: u32,
+        inode: &mut Inode,
+        data: &[u8],
+    ) -> Result<(), FsError> {
         let blocks_needed = (data.len() + state.block_size - 1) / state.block_size;
 
         for logical_block in 0..blocks_needed as u32 {
@@ -692,10 +714,10 @@ impl Ext2Filesystem {
 
             let start = logical_block as usize * state.block_size;
             let end = core::cmp::min(start + state.block_size, data.len());
-            
+
             let mut block_data = vec![0u8; state.block_size];
             block_data[..end - start].copy_from_slice(&data[start..end]);
-            
+
             Self::write_block(state, phys_block, &block_data)?;
         }
 
@@ -842,10 +864,14 @@ impl Ext2Filesystem {
                 };
 
                 let entry_bytes = unsafe {
-                    core::slice::from_raw_parts(&new_entry as *const DirEntryRaw as *const u8, DIR_ENTRY_HEADER_SIZE)
+                    core::slice::from_raw_parts(
+                        &new_entry as *const DirEntryRaw as *const u8,
+                        DIR_ENTRY_HEADER_SIZE,
+                    )
                 };
                 dir_data[offset..offset + DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
-                dir_data[offset + DIR_ENTRY_HEADER_SIZE..offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
+                dir_data[offset + DIR_ENTRY_HEADER_SIZE
+                    ..offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
                     .copy_from_slice(name_bytes);
 
                 Self::write_inode_data(state, dir_inode_num, &mut dir_inode, &dir_data)?;
@@ -869,17 +895,26 @@ impl Ext2Filesystem {
         };
 
         let entry_bytes = unsafe {
-            core::slice::from_raw_parts(&new_entry as *const DirEntryRaw as *const u8, DIR_ENTRY_HEADER_SIZE)
+            core::slice::from_raw_parts(
+                &new_entry as *const DirEntryRaw as *const u8,
+                DIR_ENTRY_HEADER_SIZE,
+            )
         };
-        dir_data[new_block_offset..new_block_offset + DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
-        dir_data[new_block_offset + DIR_ENTRY_HEADER_SIZE..new_block_offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
+        dir_data[new_block_offset..new_block_offset + DIR_ENTRY_HEADER_SIZE]
+            .copy_from_slice(entry_bytes);
+        dir_data[new_block_offset + DIR_ENTRY_HEADER_SIZE
+            ..new_block_offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
             .copy_from_slice(name_bytes);
 
         Self::write_inode_data(state, dir_inode_num, &mut dir_inode, &dir_data)?;
         Ok(())
     }
 
-    fn remove_dir_entry(state: &mut Ext2State, dir_inode_num: u32, name: &str) -> Result<u32, FsError> {
+    fn remove_dir_entry(
+        state: &mut Ext2State,
+        dir_inode_num: u32,
+        name: &str,
+    ) -> Result<u32, FsError> {
         let mut dir_inode = Self::read_inode(state, dir_inode_num)?;
         let mut dir_data = Self::read_inode_data(state, &dir_inode)?;
 
@@ -919,7 +954,12 @@ impl Ext2Filesystem {
                                 dir_data[offset + 3] = 0;
                             }
 
-                            Self::write_inode_data(state, dir_inode_num, &mut dir_inode, &dir_data)?;
+                            Self::write_inode_data(
+                                state,
+                                dir_inode_num,
+                                &mut dir_inode,
+                                &dir_data,
+                            )?;
                             return Ok(removed_inode);
                         }
                     }
@@ -980,7 +1020,11 @@ impl Ext2Filesystem {
             return Err(FsError::InvalidPath);
         }
         let state = self.state.lock();
-        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
         let parent_inode = Self::lookup_path_internal(&state, parent_path)?;
         Ok((parent_inode, name.to_string()))
     }
@@ -1165,7 +1209,10 @@ impl Filesystem for Ext2Filesystem {
             file_type: FT_DIR,
         };
         let entry_bytes = unsafe {
-            core::slice::from_raw_parts(&dot_entry as *const DirEntryRaw as *const u8, DIR_ENTRY_HEADER_SIZE)
+            core::slice::from_raw_parts(
+                &dot_entry as *const DirEntryRaw as *const u8,
+                DIR_ENTRY_HEADER_SIZE,
+            )
         };
         dir_data[0..DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
         dir_data[DIR_ENTRY_HEADER_SIZE] = b'.';
@@ -1178,7 +1225,10 @@ impl Filesystem for Ext2Filesystem {
             file_type: FT_DIR,
         };
         let entry_bytes = unsafe {
-            core::slice::from_raw_parts(&dotdot_entry as *const DirEntryRaw as *const u8, DIR_ENTRY_HEADER_SIZE)
+            core::slice::from_raw_parts(
+                &dotdot_entry as *const DirEntryRaw as *const u8,
+                DIR_ENTRY_HEADER_SIZE,
+            )
         };
         dir_data[12..12 + DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
         dir_data[12 + DIR_ENTRY_HEADER_SIZE] = b'.';
@@ -1322,4 +1372,3 @@ impl Filesystem for Ext2Filesystem {
 fn log(msg: &str) {
     console::print(msg);
 }
-

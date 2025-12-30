@@ -97,7 +97,6 @@ static BUFFER_POOL: BufferPool = BufferPool::new();
 
 /// Run the HTTP web server on port 8080
 pub async fn run(stack: Stack<'static>) {
-
     loop {
         // Allocate a buffer slot
         let slot = match BUFFER_POOL.alloc() {
@@ -276,4 +275,3 @@ async fn send_error<T: embedded_io_async::Read + Write>(
 
     Ok(())
 }
-

@@ -1,16 +1,19 @@
 //! Built-in Shell Commands
 //!
-//! Basic shell commands: echo, akuma, stats, free, help
+//! Basic shell commands: echo, akuma, stats, free, help, grep
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
+use embedded_io_async::Write;
+
 use crate::akuma::AKUMA_79;
 use crate::network;
-use crate::shell::{Command, ShellError};
+use crate::shell::{Command, ShellError, VecWriter};
 
 // ============================================================================
 // Echo Command
@@ -33,14 +36,15 @@ impl Command for EchoCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
             if !args.is_empty() {
-                response.extend_from_slice(args);
+                let _ = stdout.write(args).await;
             }
-            response.extend_from_slice(b"\r\n");
-            Ok(response)
+            let _ = stdout.write(b"\r\n").await;
+            Ok(())
         })
     }
 }
@@ -66,20 +70,21 @@ impl Command for AkumaCommand {
     fn execute<'a>(
         &'a self,
         _args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
             for &byte in AKUMA_79 {
                 if byte == b'\n' {
-                    response.extend_from_slice(b"\r\n");
+                    let _ = stdout.write(b"\r\n").await;
                 } else {
-                    response.push(byte);
+                    let _ = stdout.write(&[byte]).await;
                 }
             }
             if !AKUMA_79.ends_with(b"\n") {
-                response.extend_from_slice(b"\r\n");
+                let _ = stdout.write(b"\r\n").await;
             }
-            Ok(response)
+            Ok(())
         })
     }
 }
@@ -105,14 +110,17 @@ impl Command for StatsCommand {
     fn execute<'a>(
         &'a self,
         _args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
             let stats = format!(
                 "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
                 connections, bytes_rx, bytes_tx
             );
-            Ok(stats.into_bytes())
+            let _ = stdout.write(stats.as_bytes()).await;
+            Ok(())
         })
     }
 }
@@ -141,7 +149,9 @@ impl Command for FreeCommand {
     fn execute<'a>(
         &'a self,
         _args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let stats = crate::allocator::stats();
 
@@ -175,7 +185,8 @@ impl Command for FreeCommand {
                 stats.allocation_count,
                 heap_mb
             );
-            Ok(info.into_bytes())
+            let _ = stdout.write(info.as_bytes()).await;
+            Ok(())
         })
     }
 }
@@ -201,31 +212,195 @@ impl Command for HelpCommand {
     fn execute<'a>(
         &'a self,
         _args: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ShellError>> + 'a>> {
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let mut response = Vec::new();
-            response.extend_from_slice(b"Available commands:\r\n");
-            response.extend_from_slice(b"  echo <text>           - Echo back text\r\n");
-            response.extend_from_slice(b"  akuma                 - Display ASCII art\r\n");
-            response.extend_from_slice(b"  stats                 - Show network statistics\r\n");
-            response.extend_from_slice(b"  free                  - Show memory usage\r\n");
-            response.extend_from_slice(b"\r\nFilesystem commands:\r\n");
-            response.extend_from_slice(b"  ls [path]             - List directory contents\r\n");
-            response.extend_from_slice(b"  cat <file>            - Display file contents\r\n");
-            response.extend_from_slice(b"  write <file> <text>   - Write text to file\r\n");
-            response.extend_from_slice(b"  append <file> <text>  - Append text to file\r\n");
-            response.extend_from_slice(b"  rm <file>             - Remove file\r\n");
-            response.extend_from_slice(b"  mkdir <dir>           - Create directory\r\n");
-            response.extend_from_slice(b"  df                    - Show disk usage\r\n");
-            response.extend_from_slice(b"\r\nNetwork commands:\r\n");
-            response.extend_from_slice(b"  curl <url>            - HTTP GET request\r\n");
-            response.extend_from_slice(b"  nslookup <host>       - DNS lookup with timing\r\n");
-            response.extend_from_slice(b"\r\n  help                  - Show this help\r\n");
-            response.extend_from_slice(b"  quit/exit             - Close connection\r\n");
-            Ok(response)
+            let _ = stdout.write(b"Available commands:\r\n").await;
+            let _ = stdout
+                .write(b"  echo <text>           - Echo back text\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  akuma                 - Display ASCII art\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  stats                 - Show network statistics\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  free                  - Show memory usage\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  grep [-iv] <pattern>  - Filter lines by pattern\r\n")
+                .await;
+            let _ = stdout.write(b"\r\nFilesystem commands:\r\n").await;
+            let _ = stdout
+                .write(b"  ls [path]             - List directory contents\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  cat <file>            - Display file contents\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  write <file> <text>   - Write text to file\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  append <file> <text>  - Append text to file\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  rm <file>             - Remove file\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  mkdir <dir>           - Create directory\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  df                    - Show disk usage\r\n")
+                .await;
+            let _ = stdout.write(b"\r\nNetwork commands:\r\n").await;
+            let _ = stdout
+                .write(b"  curl <url>            - HTTP GET request\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  nslookup <host>       - DNS lookup with timing\r\n")
+                .await;
+            let _ = stdout.write(b"\r\nPipeline support:\r\n").await;
+            let _ = stdout
+                .write(b"  cmd1 | cmd2           - Pipe output of cmd1 to cmd2\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  akuma | grep #*####%#**+**%@%**#    - Filter akuma output\r\n")
+                .await;
+            let _ = stdout
+                .write(b"\r\n  help                  - Show this help\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  quit/exit             - Close connection\r\n")
+                .await;
+            Ok(())
         })
     }
 }
 
 /// Static instance
 pub static HELP_CMD: HelpCommand = HelpCommand;
+
+// ============================================================================
+// Grep Command
+// ============================================================================
+
+/// Grep command - filters lines by pattern
+pub struct GrepCommand;
+
+impl Command for GrepCommand {
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn description(&self) -> &'static str {
+        "Filter lines by pattern"
+    }
+    fn usage(&self) -> &'static str {
+        "grep [-i] [-v] <pattern> [file]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            // Parse flags and pattern
+            let mut case_insensitive = false;
+            let mut invert_match = false;
+            let mut pattern: Option<&[u8]> = None;
+            let mut file_path: Option<&str> = None;
+
+            // Simple argument parsing
+            let args_str = core::str::from_utf8(args).unwrap_or("");
+            let parts: Vec<&str> = args_str.split_whitespace().collect();
+
+            let mut i = 0;
+            while i < parts.len() {
+                let part = parts[i];
+                if part.starts_with('-') {
+                    // Parse flags
+                    for c in part[1..].chars() {
+                        match c {
+                            'i' => case_insensitive = true,
+                            'v' => invert_match = true,
+                            _ => {}
+                        }
+                    }
+                } else if pattern.is_none() {
+                    pattern = Some(part.as_bytes());
+                } else {
+                    file_path = Some(part);
+                }
+                i += 1;
+            }
+
+            let pattern = match pattern {
+                Some(p) => p,
+                None => {
+                    let _ = stdout
+                        .write(b"Usage: grep [-i] [-v] <pattern> [file]\r\n")
+                        .await;
+                    return Ok(());
+                }
+            };
+
+            // Get input data - either from file or stdin
+            let input_data: Vec<u8> = if let Some(path) = file_path {
+                // Read from file
+                if !crate::fs::is_initialized() {
+                    let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                    return Ok(());
+                }
+                match crate::async_fs::read_file(path).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        let msg = format!("Error reading file: {}\r\n", e);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                        return Ok(());
+                    }
+                }
+            } else if let Some(data) = stdin {
+                data.to_vec()
+            } else {
+                let _ = stdout
+                    .write(b"grep: no input (use with pipe or specify file)\r\n")
+                    .await;
+                return Ok(());
+            };
+
+            // Convert pattern to string for matching
+            let pattern_str = core::str::from_utf8(pattern).unwrap_or("");
+            let pattern_lower = if case_insensitive {
+                pattern_str.to_lowercase()
+            } else {
+                String::new()
+            };
+
+            // Process input line by line
+            let input_str = core::str::from_utf8(&input_data).unwrap_or("");
+            for line in input_str.lines() {
+                let matches = if case_insensitive {
+                    line.to_lowercase().contains(&pattern_lower)
+                } else {
+                    line.contains(pattern_str)
+                };
+
+                // Apply invert flag
+                let should_print = if invert_match { !matches } else { matches };
+
+                if should_print {
+                    let _ = stdout.write(line.as_bytes()).await;
+                    let _ = stdout.write(b"\r\n").await;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static GREP_CMD: GrepCommand = GrepCommand;

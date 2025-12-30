@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::Command;
 
 // Re-export static command instances
-pub use builtin::{AKUMA_CMD, ECHO_CMD, FREE_CMD, HELP_CMD, STATS_CMD};
+pub use builtin::{AKUMA_CMD, ECHO_CMD, FREE_CMD, GREP_CMD, HELP_CMD, STATS_CMD};
 pub use fs::{APPEND_CMD, CAT_CMD, DF_CMD, LS_CMD, MKDIR_CMD, RM_CMD, WRITE_CMD};
 pub use net::{CURL_CMD, NSLOOKUP_CMD};
 
@@ -74,6 +74,7 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&STATS_CMD);
     registry.register(&FREE_CMD);
     registry.register(&HELP_CMD);
+    registry.register(&GREP_CMD);
 
     // Filesystem commands
     registry.register(&LS_CMD);

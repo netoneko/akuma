@@ -303,11 +303,7 @@ impl MountTable {
 /// Normalize a path: ensure leading /, remove trailing /, handle empty -> "/"
 fn normalize_path(path: &str) -> &str {
     let path = path.trim_end_matches('/');
-    if path.is_empty() {
-        "/"
-    } else {
-        path
-    }
+    if path.is_empty() { "/" } else { path }
 }
 
 /// Normalize path with allocation (adds leading / if missing)
@@ -460,4 +456,3 @@ pub fn sync_all() -> Result<(), FsError> {
     }
     Ok(())
 }
-

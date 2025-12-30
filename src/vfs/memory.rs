@@ -122,10 +122,7 @@ impl MemoryFilesystem {
             return Err(FsError::InvalidPath);
         }
 
-        let components: Vec<&str> = parent_path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let components: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
 
         let mut current = node;
         for component in components {
@@ -147,9 +144,7 @@ impl MemoryFilesystem {
     fn total_size(node: &FsNode) -> u64 {
         match node {
             FsNode::File { data, .. } => data.len() as u64,
-            FsNode::Directory { children, .. } => {
-                children.values().map(Self::total_size).sum()
-            }
+            FsNode::Directory { children, .. } => children.values().map(Self::total_size).sum(),
         }
     }
 }
@@ -355,4 +350,3 @@ impl Filesystem for MemoryFilesystem {
         })
     }
 }
-

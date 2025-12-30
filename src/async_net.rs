@@ -224,7 +224,11 @@ pub fn init() -> Result<NetworkInit, &'static str> {
 
     log("[AsyncNet] Network stack created, waiting for IP...\n");
 
-    Ok(NetworkInit { stack, runner, loopback })
+    Ok(NetworkInit {
+        stack,
+        runner,
+        loopback,
+    })
 }
 
 /// Wait for network to get an IP address via DHCP

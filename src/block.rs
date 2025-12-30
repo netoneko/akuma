@@ -308,26 +308,22 @@ pub fn capacity_sectors() -> Option<u64> {
 
 /// Read sectors from the block device
 pub fn read_sectors(sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.read_sectors(sector, buf))
-        .ok_or(BlockError::NotInitialized)?
+    with_device(|dev| dev.read_sectors(sector, buf)).ok_or(BlockError::NotInitialized)?
 }
 
 /// Write sectors to the block device
 pub fn write_sectors(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.write_sectors(sector, buf))
-        .ok_or(BlockError::NotInitialized)?
+    with_device(|dev| dev.write_sectors(sector, buf)).ok_or(BlockError::NotInitialized)?
 }
 
 /// Read bytes at an arbitrary offset
 pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.read_bytes(offset, buf))
-        .ok_or(BlockError::NotInitialized)?
+    with_device(|dev| dev.read_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
 }
 
 /// Write bytes at an arbitrary offset
 pub fn write_bytes(offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.write_bytes(offset, buf))
-        .ok_or(BlockError::NotInitialized)?
+    with_device(|dev| dev.write_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
 }
 
 // ============================================================================

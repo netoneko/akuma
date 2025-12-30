@@ -20,18 +20,19 @@ mod exceptions;
 mod executor;
 mod fs;
 mod fs_tests;
-mod vfs;
 mod gic;
 mod irq;
 mod netcat_server;
 mod network;
 mod shell;
+mod shell_tests;
 mod ssh;
 mod ssh_crypto;
 mod ssh_server;
 mod tests;
 mod threading;
 mod timer;
+mod vfs;
 mod virtio_hal;
 mod web_server;
 
@@ -171,6 +172,11 @@ fn kernel_main() -> ! {
         console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
         halt();
     }
+
+    // =========================================================================
+    // Run shell tests (pipelines and grep)
+    // =========================================================================
+    shell_tests::run_all_tests();
 
     // =========================================================================
     // Filesystem initialization
