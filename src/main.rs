@@ -241,11 +241,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     }
 
     // =========================================================================
-    // Run shell tests (pipelines and grep)
-    // =========================================================================
-    shell_tests::run_all_tests();
-
-    // =========================================================================
     // Hardware RNG initialization
     // =========================================================================
     match rng::init() {
@@ -295,6 +290,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
                     // Run process execution tests
                     process_tests::run_all_tests();
+
+                    // Run shell tests (pipelines with /bin binaries)
+                    shell_tests::run_all_tests();
                 }
                 Err(e) => {
                     console::print("[FS] Filesystem init failed: ");

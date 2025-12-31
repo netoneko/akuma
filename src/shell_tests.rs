@@ -8,9 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::console;
-use crate::shell::VecWriter;
-use crate::shell::commands::create_default_registry;
-use crate::ssh_crypto::{split_first_word, trim_bytes};
+use crate::shell::{self, commands::create_default_registry, parse_pipeline};
 
 // ============================================================================
 // Test Runner
@@ -51,6 +49,20 @@ pub fn run_all_tests() {
         failed += 1;
     }
 
+    // Test 5: External binary in pipeline (if echo2 exists)
+    if test_external_binary_pipeline() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
+
+    // Test 6: Mixed builtin and external pipeline (if echo2 exists)
+    if test_mixed_pipeline() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
+
     log(&format!(
         "\n[Shell Tests] Complete: {} passed, {} failed\n",
         passed, failed
@@ -61,32 +73,8 @@ pub fn run_all_tests() {
 // Pipeline Execution Helper
 // ============================================================================
 
-/// Parse a command line into pipeline stages
-fn parse_pipeline(line: &[u8]) -> Vec<&[u8]> {
-    let mut stages = Vec::new();
-    let mut start = 0;
-
-    for (i, &byte) in line.iter().enumerate() {
-        if byte == b'|' {
-            let stage = trim_bytes(&line[start..i]);
-            if !stage.is_empty() {
-                stages.push(stage);
-            }
-            start = i + 1;
-        }
-    }
-
-    // Add the last stage
-    let stage = trim_bytes(&line[start..]);
-    if !stage.is_empty() {
-        stages.push(stage);
-    }
-
-    stages
-}
-
-/// Execute a pipeline and return the output
-async fn execute_pipeline(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
+/// Execute a pipeline and return the output (uses the shell module's execute_pipeline)
+async fn execute_pipeline_test(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
     let registry = create_default_registry();
     let stages = parse_pipeline(pipeline);
 
@@ -94,33 +82,9 @@ async fn execute_pipeline(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
         return Ok(Vec::new());
     }
 
-    let mut stdin_data: Option<Vec<u8>> = None;
-
-    for (i, stage) in stages.iter().enumerate() {
-        let (cmd_name, args) = split_first_word(stage);
-        let is_last = i == stages.len() - 1;
-
-        let cmd = match registry.find(cmd_name) {
-            Some(c) => c,
-            None => return Err("Command not found"),
-        };
-
-        let mut stdout = VecWriter::new();
-        let stdin_slice = stdin_data.as_deref();
-
-        match cmd.execute(args, stdin_slice, &mut stdout).await {
-            Ok(()) => {
-                if is_last {
-                    return Ok(stdout.into_inner());
-                } else {
-                    stdin_data = Some(stdout.into_inner());
-                }
-            }
-            Err(_) => return Err("Command execution failed"),
-        }
-    }
-
-    Ok(stdin_data.unwrap_or_default())
+    shell::execute_pipeline(&stages, &registry)
+        .await
+        .map_err(|_| "Pipeline execution failed")
 }
 
 /// Run an async test synchronously
@@ -176,7 +140,7 @@ fn test_grep_with_akuma_pipe() -> bool {
     log("\n[Shell Test] grep with akuma pipeline\n");
 
     let result =
-        run_async_test(async { execute_pipeline(b"akuma | grep #*####%#**+**%@%**#").await });
+        run_async_test(async { execute_pipeline_test(b"akuma | grep #*####%#**+**%@%**#").await });
 
     match result {
         Ok(output) => {
@@ -224,7 +188,7 @@ fn test_grep_case_insensitive() -> bool {
     log("\n[Shell Test] grep case insensitive (-i)\n");
 
     let result =
-        run_async_test(async { execute_pipeline(b"echo Hello World | grep -i hello").await });
+        run_async_test(async { execute_pipeline_test(b"echo Hello World | grep -i hello").await });
 
     match result {
         Ok(output) => {
@@ -260,11 +224,11 @@ fn test_grep_invert_match() -> bool {
 
     // First test: verify normal grep finds "hello"
     let normal_result =
-        run_async_test(async { execute_pipeline(b"echo hello world | grep hello").await });
+        run_async_test(async { execute_pipeline_test(b"echo hello world | grep hello").await });
 
     // Second test: verify inverted grep does NOT find "hello"
     let invert_result =
-        run_async_test(async { execute_pipeline(b"echo hello world | grep -v hello").await });
+        run_async_test(async { execute_pipeline_test(b"echo hello world | grep -v hello").await });
 
     let normal_ok = match &normal_result {
         Ok(output) => !output.is_empty(),
@@ -298,7 +262,7 @@ fn test_multi_stage_pipeline() -> bool {
     log("\n[Shell Test] multi-stage pipeline\n");
 
     // Use help command which has multiple lines, then filter twice
-    let result = run_async_test(async { execute_pipeline(b"help | grep echo | grep text").await });
+    let result = run_async_test(async { execute_pipeline_test(b"help | grep echo | grep text").await });
 
     match result {
         Ok(output) => {
@@ -319,6 +283,93 @@ fn test_multi_stage_pipeline() -> bool {
                 log("  Pipeline executed successfully\n");
                 log("  Result: PASS\n");
                 true
+            }
+        }
+        Err(e) => {
+            log(&format!("  Error: {}\n", e));
+            log("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Test: External Binary Pipeline
+// ============================================================================
+
+/// Test: echo2 hello | grep echo
+/// Verify external binary (/bin/echo2) works in pipeline with built-in grep
+fn test_external_binary_pipeline() -> bool {
+    log("\n[Shell Test] external binary pipeline (echo2 | grep)\n");
+
+    // Check if echo2 exists
+    if !run_async_test(async { crate::async_fs::exists("/bin/echo2").await }) {
+        log("  Skipping: /bin/echo2 not found\n");
+        log("  Result: SKIP (counted as pass)\n");
+        return true;
+    }
+
+    // echo2 outputs something like "echo2: hello" so grep for "echo" should match
+    let result = run_async_test(async { execute_pipeline_test(b"echo2 hello | grep echo").await });
+
+    match result {
+        Ok(output) => {
+            let output_str = String::from_utf8_lossy(&output);
+            let has_echo = output_str.contains("echo");
+
+            log(&format!("  Output: {}\n", output_str.trim()));
+            log(&format!("  Contains 'echo': {}\n", has_echo));
+
+            if has_echo {
+                log("  Result: PASS\n");
+                true
+            } else {
+                log("  Result: FAIL (expected 'echo' in output)\n");
+                false
+            }
+        }
+        Err(e) => {
+            log(&format!("  Error: {}\n", e));
+            log("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Test: Mixed Builtin and External Pipeline
+// ============================================================================
+
+/// Test: echo hello | echo2 | grep hello
+/// Verify three-stage pipeline with builtin -> external -> builtin
+fn test_mixed_pipeline() -> bool {
+    log("\n[Shell Test] mixed pipeline (echo | echo2 | grep)\n");
+
+    // Check if echo2 exists
+    if !run_async_test(async { crate::async_fs::exists("/bin/echo2").await }) {
+        log("  Skipping: /bin/echo2 not found\n");
+        log("  Result: SKIP (counted as pass)\n");
+        return true;
+    }
+
+    // echo outputs "hello", echo2 echoes it, grep filters for "hello"
+    let result =
+        run_async_test(async { execute_pipeline_test(b"echo hello | echo2 | grep hello").await });
+
+    match result {
+        Ok(output) => {
+            let output_str = String::from_utf8_lossy(&output);
+            let has_hello = output_str.contains("hello");
+
+            log(&format!("  Output: {}\n", output_str.trim()));
+            log(&format!("  Contains 'hello': {}\n", has_hello));
+
+            if has_hello {
+                log("  Result: PASS\n");
+                true
+            } else {
+                log("  Result: FAIL (expected 'hello' in output)\n");
+                false
             }
         }
         Err(e) => {
