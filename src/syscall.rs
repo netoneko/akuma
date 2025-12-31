@@ -76,12 +76,14 @@ static PROCESS_STDIN: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
 /// Position in stdin buffer
 static STDIN_POS: Spinlock<usize> = Spinlock::new(0);
 
-/// Reset process I/O state (called before starting a new process)
+/// Reset process exit state (called before starting a new process)
+/// Does NOT clear stdin/stdout - those are managed by the exec command
 pub fn reset_exit_state() {
     PROCESS_EXITED.store(false, Ordering::Release);
     LAST_EXIT_CODE.store(0, Ordering::Release);
+    // Clear stdout for new process output
     PROCESS_STDOUT.lock().clear();
-    PROCESS_STDIN.lock().clear();
+    // Reset stdin read position (but keep the data that was set via set_stdin)
     *STDIN_POS.lock() = 0;
 }
 
