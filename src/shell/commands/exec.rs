@@ -36,7 +36,7 @@ impl Command for ExecCommand {
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
-        _stdin: Option<&'a [u8]>,
+        stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
@@ -64,20 +64,34 @@ impl Command for ExecCommand {
                 }
             };
 
-            // Execute the binary
-            let _ = embedded_io_async::Write::write_all(
-                stdout,
-                format!("Executing {}...\r\n", path).as_bytes(),
-            )
-            .await;
+            // Set up stdin for the process
+            if let Some(input) = stdin {
+                crate::syscall::set_stdin(input);
+            }
 
+            // Execute the binary
             match crate::process::exec(path) {
                 Ok(exit_code) => {
-                    let _ = embedded_io_async::Write::write_all(
-                        stdout,
-                        format!("Process exited with code {}\r\n", exit_code).as_bytes(),
-                    )
-                    .await;
+                    // Get captured stdout from process
+                    let process_output = crate::syscall::take_stdout();
+                    
+                    // Convert \n to \r\n for terminal
+                    for &byte in &process_output {
+                        if byte == b'\n' {
+                            let _ = embedded_io_async::Write::write_all(stdout, b"\r\n").await;
+                        } else {
+                            let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
+                        }
+                    }
+                    
+                    // Only show exit code if non-zero
+                    if exit_code != 0 {
+                        let _ = embedded_io_async::Write::write_all(
+                            stdout,
+                            format!("[exit code: {}]\r\n", exit_code).as_bytes(),
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     let _ = embedded_io_async::Write::write_all(

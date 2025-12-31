@@ -4,6 +4,8 @@
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
 use alloc::format;
+use alloc::vec::Vec;
+use spinning_top::Spinlock;
 
 use crate::console;
 
@@ -65,10 +67,36 @@ pub static PROCESS_EXITED: AtomicBool = AtomicBool::new(false);
 /// Exit code of the last exited process
 pub static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
-/// Reset process exit state (called before starting a new process)
+/// Process stdout buffer - captures write() syscall output
+static PROCESS_STDOUT: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
+
+/// Process stdin buffer - provides read() syscall input
+static PROCESS_STDIN: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
+
+/// Position in stdin buffer
+static STDIN_POS: Spinlock<usize> = Spinlock::new(0);
+
+/// Reset process I/O state (called before starting a new process)
 pub fn reset_exit_state() {
     PROCESS_EXITED.store(false, Ordering::Release);
     LAST_EXIT_CODE.store(0, Ordering::Release);
+    PROCESS_STDOUT.lock().clear();
+    PROCESS_STDIN.lock().clear();
+    *STDIN_POS.lock() = 0;
+}
+
+/// Set stdin for the next process
+pub fn set_stdin(data: &[u8]) {
+    let mut stdin = PROCESS_STDIN.lock();
+    stdin.clear();
+    stdin.extend_from_slice(data);
+    *STDIN_POS.lock() = 0;
+}
+
+/// Get the captured stdout from the process
+pub fn take_stdout() -> Vec<u8> {
+    let mut stdout = PROCESS_STDOUT.lock();
+    core::mem::take(&mut *stdout)
 }
 
 /// Check if process has exited and get exit code
@@ -98,9 +126,26 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         return 0;
     }
 
-    // TODO: Read from process's stdin when process I/O is implemented
-    // For now, return 0 (EOF)
-    0
+    // Read from stdin buffer
+    let stdin = PROCESS_STDIN.lock();
+    let mut pos = STDIN_POS.lock();
+    
+    if *pos >= stdin.len() {
+        return 0; // EOF
+    }
+    
+    let available = stdin.len() - *pos;
+    let to_read = core::cmp::min(count, available);
+    
+    // Copy to user buffer
+    unsafe {
+        let dst = buf_ptr as *mut u8;
+        let src = stdin.as_ptr().add(*pos);
+        core::ptr::copy_nonoverlapping(src, dst, to_read);
+    }
+    
+    *pos += to_read;
+    to_read as u64
 }
 
 /// sys_write - Write to a file descriptor
@@ -126,14 +171,12 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // is within the user's address space
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
-    // Convert to string and print
+    // Capture output to buffer for shell
+    PROCESS_STDOUT.lock().extend_from_slice(buf);
+
+    // Also print to kernel console for debugging
     if let Ok(s) = core::str::from_utf8(buf) {
         console::print(s);
-    } else {
-        // Print as raw bytes if not valid UTF-8
-        for &byte in buf {
-            console::print_char(byte as char);
-        }
     }
 
     count as u64
