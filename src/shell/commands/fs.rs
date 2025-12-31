@@ -453,3 +453,103 @@ impl Command for DfCommand {
 
 /// Static instance
 pub static DF_CMD: DfCommand = DfCommand;
+
+// ============================================================================
+// Mv Command
+// ============================================================================
+
+/// Mv command - move/rename files
+pub struct MvCommand;
+
+impl Command for MvCommand {
+    fn name(&self) -> &'static str {
+        "mv"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["move", "rename"]
+    }
+    fn description(&self) -> &'static str {
+        "Move or rename a file"
+    }
+    fn usage(&self) -> &'static str {
+        "mv <source> <destination>"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            // Parse source and destination paths
+            let (source, rest) = split_first_word(args);
+            let (dest, _) = split_first_word(rest);
+
+            if source.is_empty() || dest.is_empty() {
+                let _ = stdout.write(b"Usage: mv <source> <destination>\r\n").await;
+                return Ok(());
+            }
+
+            let source_path = match core::str::from_utf8(source) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    let _ = stdout.write(b"Error: Invalid source path\r\n").await;
+                    return Ok(());
+                }
+            };
+
+            let dest_path = match core::str::from_utf8(dest) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    let _ = stdout.write(b"Error: Invalid destination path\r\n").await;
+                    return Ok(());
+                }
+            };
+
+            // Check if source exists
+            if !async_fs::exists(source_path).await {
+                let msg = format!("Error: '{}' not found\r\n", source_path);
+                let _ = stdout.write(msg.as_bytes()).await;
+                return Ok(());
+            }
+
+            // Check if it's a directory (try to list it)
+            if async_fs::list_dir(source_path).await.is_ok() {
+                let _ = stdout.write(b"Error: Moving directories is not supported\r\n").await;
+                return Ok(());
+            }
+
+            // Read source file
+            let data = match async_fs::read_file(source_path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("Error reading '{}': {}\r\n", source_path, e);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Ok(());
+                }
+            };
+
+            // Write to destination
+            if let Err(e) = async_fs::write_file(dest_path, &data).await {
+                let msg = format!("Error writing '{}': {}\r\n", dest_path, e);
+                let _ = stdout.write(msg.as_bytes()).await;
+                return Ok(());
+            }
+
+            // Remove source file
+            if let Err(e) = async_fs::remove_file(source_path).await {
+                let msg = format!("Error removing source '{}': {}\r\n", source_path, e);
+                let _ = stdout.write(msg.as_bytes()).await;
+                return Ok(());
+            }
+
+            let msg = format!("Moved '{}' -> '{}'\r\n", source_path, dest_path);
+            let _ = stdout.write(msg.as_bytes()).await;
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static MV_CMD: MvCommand = MvCommand;
