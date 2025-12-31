@@ -53,6 +53,8 @@ impl core::fmt::Display for ElfError {
     }
 }
 
+use alloc::collections::BTreeMap;
+
 /// Load an ELF binary from memory
 ///
 /// # Arguments
@@ -83,6 +85,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
     // Track highest address for brk
     let mut brk: usize = 0;
+    
+    // Track already-mapped pages (VA -> PA) to avoid double allocation
+    let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
 
     // Get program headers
     let segments = elf
@@ -113,10 +118,18 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         for i in 0..num_pages {
             let page_va = start_page + i * PAGE_SIZE;
 
-            // Allocate a physical page
-            let frame = address_space
-                .alloc_and_map(page_va, page_flags)
-                .map_err(|e| ElfError::MappingFailed(e))?;
+            // Check if this page is already mapped (from a previous segment)
+            let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
+                // Reuse existing mapping
+                pa
+            } else {
+                // Allocate a new physical page
+                let frame = address_space
+                    .alloc_and_map(page_va, page_flags)
+                    .map_err(|e| ElfError::MappingFailed(e))?;
+                mapped_pages.insert(page_va, frame.addr);
+                frame.addr
+            };
 
             // Copy data from ELF file if this page contains file data
             let page_start_in_segment = if page_va >= vaddr {
@@ -136,7 +149,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
                 if copy_len > 0 && file_offset + copy_len <= elf_data.len() {
                     unsafe {
-                        let dst = (frame.addr + copy_start) as *mut u8;
+                        let dst = (frame_addr + copy_start) as *mut u8;
                         let src = elf_data.as_ptr().add(file_offset);
                         core::ptr::copy_nonoverlapping(src, dst, copy_len);
                     }
@@ -188,9 +201,10 @@ pub fn load_elf_with_stack(
 ) -> Result<(usize, UserAddressSpace, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
 
-    // Place stack at a fixed high address
-    // User stack top at 0x7FFF_F000 (just below 2GB mark)
-    const STACK_TOP: usize = 0x7FFF_F000;
+    // Place stack at a fixed address in the first 1GB (user space)
+    // User stack top at 0x3FFF_F000 (just below 1GB mark)
+    // This avoids conflict with kernel RAM mapped at 0x40000000+
+    const STACK_TOP: usize = 0x3FFF_F000;
     let stack_bottom = STACK_TOP - stack_size;
 
     // Ensure stack is page-aligned

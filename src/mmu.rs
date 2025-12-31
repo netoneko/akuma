@@ -227,7 +227,11 @@ pub struct UserAddressSpace {
 }
 
 impl UserAddressSpace {
-    /// Create a new empty user address space
+    /// Create a new user address space with kernel identity mapping
+    ///
+    /// The kernel runs at physical addresses (0x40000000), so we need to include
+    /// the kernel's identity mapping in every user address space. This allows the
+    /// kernel to continue executing when TTBR0 is switched to this address space.
     pub fn new() -> Option<Self> {
         // Allocate L0 page table
         let l0_frame = pmm::alloc_page_zeroed()?;
@@ -235,12 +239,95 @@ impl UserAddressSpace {
         // Allocate an ASID
         let asid = ASID_ALLOCATOR.lock().alloc()?;
 
-        Some(Self {
+        let mut addr_space = Self {
             l0_frame,
             page_table_frames: Vec::new(),
             user_frames: Vec::new(),
             asid,
-        })
+        };
+        
+        // Add kernel identity mapping (device + RAM)
+        // This mirrors the boot page tables so kernel can run while TTBR0 is active
+        addr_space.add_kernel_mappings().ok()?;
+
+        Some(addr_space)
+    }
+    
+    /// Add kernel identity mappings to this address space
+    ///
+    /// Maps kernel RAM (0x40000000+) and device memory as 1GB blocks.
+    /// The first 1GB (0x00000000-0x3FFFFFFF) is left for user mappings at 4KB granularity.
+    fn add_kernel_mappings(&mut self) -> Result<(), &'static str> {
+        // We need L1 table entries for identity mapping
+        // L0[0] -> L1 table
+        // L1[0] = 0x00000000-0x3FFFFFFF (user code space - NOT mapped as block)
+        // L1[1] = 0x40000000-0x7FFFFFFF (kernel RAM - 1GB block)
+        // L1[2] = 0x80000000-0xBFFFFFFF (more RAM - 1GB block)
+        
+        // Allocate L1 table for low 512GB region
+        let l1_frame = pmm::alloc_page_zeroed()
+            .ok_or("Failed to allocate L1 table for kernel mapping")?;
+        self.page_table_frames.push(l1_frame);
+        
+        // Set L0[0] to point to L1
+        let l0_ptr = self.l0_frame.addr as *mut u64;
+        unsafe {
+            let l1_entry = (l1_frame.addr as u64) | flags::VALID | flags::TABLE;
+            core::ptr::write_volatile(l0_ptr, l1_entry);
+        }
+        
+        // Set up L1 entries
+        let l1_ptr = l1_frame.addr as *mut u64;
+        
+        // L1[0]: Leave unmapped (or map for device access at 2MB granularity later)
+        // User code at 0x400000 will be mapped with 4KB pages via map_page()
+        // Device memory (GIC, UART at 0x08-0x09 million) needs separate handling
+        
+        // For now, set up L2 table for first 1GB to allow both device access and user code
+        let l2_frame = pmm::alloc_page_zeroed()
+            .ok_or("Failed to allocate L2 table")?;
+        self.page_table_frames.push(l2_frame);
+        
+        unsafe {
+            // L1[0] -> L2 table (for fine-grained mapping of first 1GB)
+            let l2_entry = (l2_frame.addr as u64) | flags::VALID | flags::TABLE;
+            core::ptr::write_volatile(l1_ptr.add(0), l2_entry);
+        }
+        
+        // Map device memory regions as 2MB blocks in L2
+        // Each L2 entry covers 2MB (0x200000)
+        // GIC at 0x08000000 = L2 index 64
+        // UART at 0x09000000 = L2 index 72
+        let l2_ptr = l2_frame.addr as *mut u64;
+        let device_block_flags = flags::VALID | flags::BLOCK | flags::AF 
+            | attr_index(MAIR_DEVICE_NGNRNE)
+            | flags::PXN | flags::UXN | flags::SH_OUTER;
+            
+        // Map 0x08000000-0x09FFFFFF (GIC, UART, etc) as device memory (2MB blocks)
+        for i in 64..80 {  // Covers 0x08000000 - 0x09FFFFFF (32MB)
+            let pa = (i as u64) * 0x200000;  // 2MB * index
+            unsafe {
+                core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags);
+            }
+        }
+        
+        // L1[1]: Kernel RAM 0x40000000-0x7FFFFFFF (1GB block)
+        // Flags: valid, block, AF, normal memory, kernel-only access
+        let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
+            | attr_index(MAIR_NORMAL_WB)
+            | flags::UXN  // No user execute
+            | flags::SH_INNER
+            | (0b00 << 6);  // AP[2:1] = 00 = RW at EL1, no access at EL0
+        unsafe {
+            core::ptr::write_volatile(l1_ptr.add(1), 0x4000_0000u64 | kernel_ram_flags);
+        }
+        
+        // L1[2]: More RAM 0x80000000-0xBFFFFFFF (1GB block)
+        unsafe {
+            core::ptr::write_volatile(l1_ptr.add(2), 0x8000_0000u64 | kernel_ram_flags);
+        }
+        
+        Ok(())
     }
 
     /// Get the TTBR0 value for this address space
@@ -402,18 +489,32 @@ impl UserAddressSpace {
         }
     }
 
-    /// Deactivate user address space (clear TTBR0_EL1)
+    /// Deactivate user address space (restore boot page tables to TTBR0)
     ///
-    /// Sets TTBR0 to an empty/invalid state. Any user-space access will fault.
+    /// Restores the boot page tables so the kernel identity mapping is active.
     pub fn deactivate() {
-        unsafe {
-            // Set TTBR0 to 0 - any user access will fault
+        // Get the boot TTBR0 value (stored by boot code)
+        let boot_ttbr0: u64 = unsafe {
+            let addr: u64;
             core::arch::asm!(
-                "msr ttbr0_el1, xzr",
-                "isb"
+                "adrp {tmp}, boot_ttbr0_addr",
+                "add {tmp}, {tmp}, :lo12:boot_ttbr0_addr",
+                "ldr {out}, [{tmp}]",
+                tmp = out(reg) _,
+                out = out(reg) addr,
+            );
+            addr
+        };
+        
+        unsafe {
+            // Restore boot page tables
+            core::arch::asm!(
+                "msr ttbr0_el1, {ttbr0}",
+                "isb",
+                ttbr0 = in(reg) boot_ttbr0
             );
         }
-        // Flush TLB for TTBR0
+        // Flush TLB
         flush_tlb_all();
     }
 }

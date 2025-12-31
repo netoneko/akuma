@@ -58,8 +58,13 @@ exception_vector_table:
     .balign 0x80
     b default_exception_handler     // SError
 
-// Default exception handler - just returns
+// Default exception handler - calls Rust handler then returns
 default_exception_handler:
+    stp     x0, x1, [sp, #-16]!
+    stp     x29, x30, [sp, #-16]!
+    bl      rust_default_exception_handler
+    ldp     x29, x30, [sp], #16
+    ldp     x0, x1, [sp], #16
     eret
 
 // Synchronous exception from EL1 (kernel fault)
@@ -353,6 +358,24 @@ pub fn init() {
     }
 }
 
+/// Default exception handler - logs unexpected exceptions
+#[unsafe(no_mangle)]
+extern "C" fn rust_default_exception_handler() {
+    let esr: u64;
+    let elr: u64;
+    let spsr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
+        core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
+        core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
+    }
+    let ec = (esr >> 26) & 0x3F;
+    crate::console::print(&alloc::format!(
+        "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
+        ec, elr, spsr
+    ));
+}
+
 /// Rust IRQ handler called from assembly
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler() {
@@ -377,21 +400,26 @@ extern "C" fn rust_sync_el1_handler() {
     let esr: u64;
     let elr: u64;
     let far: u64;
+    let spsr: u64;
     unsafe {
         core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
         core::arch::asm!("mrs {}, far_el1", out(reg) far);
+        core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
     }
 
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
 
     crate::console::print(&alloc::format!(
-        "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}, ELR={:#x}, FAR={:#x}\n",
-        ec, iss, elr, far
+        "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
+        ec, iss, elr, far, spsr
     ));
 
-    // For now, just continue (may cause issues if it's a real fault)
+    // Halt on kernel exceptions - they indicate bugs
+    loop {
+        unsafe { core::arch::asm!("wfe"); }
+    }
 }
 
 /// Synchronous exception handler from EL0 (user mode)
@@ -406,6 +434,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
     let ec = (esr >> 26) & 0x3F; // Exception Class
     let iss = esr & 0x1FFFFFF; // Instruction Specific Syndrome
+    
 
     match ec {
         esr::EC_SVC64 => {
@@ -420,7 +449,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x4,
                 frame_ref.x5,
             ];
-
+            
             // Handle syscall
             let ret = crate::syscall::handle_syscall(syscall_num, &args);
             

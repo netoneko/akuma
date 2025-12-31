@@ -182,8 +182,10 @@ configure_mmu_regs:
 // Data section for boot
 .section .data.boot
 .balign 8
+.global boot_ttbr0_addr
 boot_ttbr0_addr:
     .quad   0
+.global boot_ttbr1_addr
 boot_ttbr1_addr:
     .quad   0
 

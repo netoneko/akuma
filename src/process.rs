@@ -171,11 +171,6 @@ impl Process {
     pub fn execute(&mut self) -> i32 {
         self.state = ProcessState::Running;
 
-        console::print(&alloc::format!(
-            "[Process] Starting '{}' (PID {}) at entry={:#x}, sp={:#x}\n",
-            self.name, self.pid, self.context.pc, self.context.sp
-        ));
-
         // Reset exit state before starting
         crate::syscall::reset_exit_state();
 
@@ -295,6 +290,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     unsafe {
         let ctx_ptr = core::ptr::addr_of!(KERNEL_CONTEXT);
         let sp_val = (*ctx_ptr).sp;
+        
         core::arch::asm!(
             "mov sp, {sp}",
             "ldp x19, x20, [{ctx}, #8]",
@@ -319,13 +315,18 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 /// When exit() is called, control returns here with the exit code.
 ///
 /// Returns the exit code
+#[inline(never)]  // Prevent inlining to ensure x30 is the return address
 unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
     let exit_code: i64;
+    let user_sp = ctx.sp;
+    let user_pc = ctx.pc;
     
     // Save kernel context and enter user mode
-    // The exit handler will restore this context and return here
+    // IMPORTANT: No function calls between here and the asm block!
+    // x30 must contain our return address when we save it.
     core::arch::asm!(
         // Save callee-saved registers to KERNEL_CONTEXT
+        // x30 contains return address to execute() at this point
         "adrp x9, {kctx_sym}",
         "add x9, x9, :lo12:{kctx_sym}",
         "mov x10, sp",
@@ -369,8 +370,8 @@ unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
         "eret",
         
         kctx_sym = sym KERNEL_CONTEXT,
-        user_sp = in(reg) ctx.sp,
-        user_pc = in(reg) ctx.pc,
+        user_sp = in(reg) user_sp,
+        user_pc = in(reg) user_pc,
         lateout("x0") exit_code,
         // These are clobbered
         out("x9") _,
