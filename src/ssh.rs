@@ -24,7 +24,7 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
-use crate::shell::{self, VecWriter, commands::create_default_registry};
+use crate::shell::{self, commands::create_default_registry};
 use crate::ssh_crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
     SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
@@ -633,51 +633,6 @@ fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, Option<&[u8]>) {
 }
 
 
-/// Execute a pipeline of commands
-/// Returns the final output or an error
-async fn execute_pipeline(
-    stages: &[&[u8]],
-    registry: &shell::CommandRegistry,
-) -> Result<Vec<u8>, shell::ShellError> {
-    if stages.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut stdin_data: Option<Vec<u8>> = None;
-
-    for (i, stage) in stages.iter().enumerate() {
-        let (cmd_name, args) = split_first_word(stage);
-        let is_last = i == stages.len() - 1;
-
-        // Find the command
-        let cmd = match registry.find(cmd_name) {
-            Some(c) => c,
-            None => {
-                return Err(shell::ShellError::CommandNotFound);
-            }
-        };
-
-        // Execute command with stdin from previous stage
-        let mut stdout = VecWriter::new();
-        let stdin_slice = stdin_data.as_deref();
-
-        match cmd.execute(args, stdin_slice, &mut stdout).await {
-            Ok(()) => {
-                if is_last {
-                    // Final stage - return the output
-                    return Ok(stdout.into_inner());
-                } else {
-                    // Intermediate stage - pass output to next command
-                    stdin_data = Some(stdout.into_inner());
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(stdin_data.unwrap_or_default())
-}
-
 /// Run an interactive shell session using ShellSession
 async fn run_shell_session(
     stream: &mut TcpStream,
@@ -749,7 +704,7 @@ async fn run_shell_session(
 
                                         if !parsed.stages.is_empty() {
                                             // Execute pipeline
-                                            match execute_pipeline(&parsed.stages, &registry).await {
+                                            match shell::execute_pipeline(&parsed.stages, &registry).await {
                                                 Ok(output) => {
                                                     // Handle redirection
                                                     match (parsed.redirect_mode, parsed.redirect_target) {
@@ -801,13 +756,8 @@ async fn run_shell_session(
                                                         .await;
                                                 }
                                                 Err(shell::ShellError::CommandNotFound) => {
-                                                    // Print unknown command error
-                                                    let (cmd_name, _) = split_first_word(trimmed);
-                                                    let msg = format!(
-                                                        "Unknown command: {}\r\nType 'help' for available commands.\r\n",
-                                                        core::str::from_utf8(cmd_name).unwrap_or("?")
-                                                    );
-                                                    let _ = channel_stream.write(msg.as_bytes()).await;
+                                                    // Command not found - the error could be for any command in the pipeline
+                                                    let _ = channel_stream.write(b"Command not found\r\nType 'help' for available commands.\r\n").await;
                                                 }
                                                 Err(_) => {}
                                             }
@@ -1187,7 +1137,7 @@ async fn handle_message(
                         let parsed = parse_command_line(trimmed);
 
                         if !parsed.stages.is_empty() {
-                            match execute_pipeline(&parsed.stages, &registry).await {
+                            match shell::execute_pipeline(&parsed.stages, &registry).await {
                                 Ok(output) => {
                                     // Handle redirection
                                     match (parsed.redirect_mode, parsed.redirect_target) {

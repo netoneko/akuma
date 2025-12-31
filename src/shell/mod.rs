@@ -137,7 +137,7 @@ pub trait Command: Sync {
 
 /// Parse a command line into pipeline stages
 /// Splits on '|' character, trimming whitespace from each stage
-fn parse_pipeline(line: &[u8]) -> Vec<&[u8]> {
+pub fn parse_pipeline(line: &[u8]) -> Vec<&[u8]> {
     let mut stages = Vec::new();
     let mut start = 0;
 
@@ -183,6 +183,55 @@ enum PipelineResult {
     Error(ShellError, Option<alloc::string::String>),
 }
 
+/// Check if an executable exists in /bin
+async fn find_executable(name: &str) -> Option<alloc::string::String> {
+    let bin_path = format!("/bin/{}", name);
+    if crate::async_fs::exists(&bin_path).await {
+        // Make sure it's a file, not a directory
+        if crate::async_fs::list_dir(&bin_path).await.is_err() {
+            return Some(bin_path);
+        }
+    }
+    None
+}
+
+/// Execute an external binary with stdin/stdout
+async fn execute_external(path: &str, stdin: Option<&[u8]>, stdout: &mut VecWriter) -> Result<(), ShellError> {
+    // Set up stdin for the process
+    if let Some(input) = stdin {
+        crate::syscall::set_stdin(input);
+    }
+
+    // Execute the binary
+    match crate::process::exec(path) {
+        Ok(exit_code) => {
+            // Get captured stdout from process
+            let process_output = crate::syscall::take_stdout();
+            
+            // Convert \n to \r\n for terminal
+            for &byte in &process_output {
+                if byte == b'\n' {
+                    let _ = embedded_io_async::Write::write_all(stdout, b"\r\n").await;
+                } else {
+                    let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
+                }
+            }
+            
+            // Only show exit code if non-zero
+            if exit_code != 0 {
+                let msg = format!("[exit code: {}]\r\n", exit_code);
+                let _ = embedded_io_async::Write::write_all(stdout, msg.as_bytes()).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("Error: {}\r\n", e);
+            let _ = embedded_io_async::Write::write_all(stdout, msg.as_bytes()).await;
+            Ok(())
+        }
+    }
+}
+
 /// Execute a pipeline of commands
 /// Returns the final output or an error with a message
 async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry) -> PipelineResult {
@@ -196,46 +245,78 @@ async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry)
         let (cmd_name, args) = split_first_word(stage);
         let is_last = i == stages.len() - 1;
 
-        // Find the command
-        let cmd = match registry.find(cmd_name) {
-            Some(c) => c,
-            None => {
-                let msg = format!(
-                    "Unknown command: {}\r\n",
-                    core::str::from_utf8(cmd_name).unwrap_or("?")
-                );
-                return PipelineResult::Error(ShellError::CommandNotFound, Some(msg));
-            }
-        };
-
         // Execute command with stdin from previous stage
         let mut stdout = VecWriter::new();
         let stdin_slice = stdin_data.as_deref();
 
-        match cmd.execute(args, stdin_slice, &mut stdout).await {
-            Ok(()) => {
-                if is_last {
-                    // Final stage - return the output
-                    return PipelineResult::Output(stdout.into_inner());
-                } else {
-                    // Intermediate stage - pass output to next command
-                    stdin_data = Some(stdout.into_inner());
+        // First, try built-in commands
+        if let Some(cmd) = registry.find(cmd_name) {
+            match cmd.execute(args, stdin_slice, &mut stdout).await {
+                Ok(()) => {
+                    if is_last {
+                        return PipelineResult::Output(stdout.into_inner());
+                    } else {
+                        stdin_data = Some(stdout.into_inner());
+                    }
+                    continue;
+                }
+                Err(ShellError::Exit) => {
+                    return PipelineResult::Error(ShellError::Exit, None);
+                }
+                Err(ShellError::ExecutionFailed(msg)) => {
+                    let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
+                    return PipelineResult::Error(ShellError::ExecutionFailed(msg), Some(error_msg));
+                }
+                Err(e) => {
+                    return PipelineResult::Error(e, None);
                 }
             }
-            Err(ShellError::Exit) => {
-                return PipelineResult::Error(ShellError::Exit, None);
+        }
+
+        // Not a built-in - check /bin for an executable
+        let cmd_name_str = match core::str::from_utf8(cmd_name) {
+            Ok(s) => s,
+            Err(_) => {
+                let msg = "Invalid command name\r\n".into();
+                return PipelineResult::Error(ShellError::CommandNotFound, Some(msg));
             }
-            Err(ShellError::ExecutionFailed(msg)) => {
-                let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
-                return PipelineResult::Error(ShellError::ExecutionFailed(msg), Some(error_msg));
-            }
-            Err(e) => {
-                return PipelineResult::Error(e, None);
+        };
+
+        if let Some(bin_path) = find_executable(cmd_name_str).await {
+            // Found an executable in /bin - run it
+            match execute_external(&bin_path, stdin_slice, &mut stdout).await {
+                Ok(()) => {
+                    if is_last {
+                        return PipelineResult::Output(stdout.into_inner());
+                    } else {
+                        stdin_data = Some(stdout.into_inner());
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return PipelineResult::Error(e, None);
+                }
             }
         }
+
+        // Command not found anywhere
+        let msg = format!(
+            "Unknown command: {}\r\nType 'help' for available commands.\r\n",
+            cmd_name_str
+        );
+        return PipelineResult::Error(ShellError::CommandNotFound, Some(msg));
     }
 
     PipelineResult::Output(stdin_data.unwrap_or_default())
+}
+
+/// Execute a pipeline of commands (public API)
+/// Returns the final output or an error
+pub async fn execute_pipeline(stages: &[&[u8]], registry: &CommandRegistry) -> Result<Vec<u8>, ShellError> {
+    match execute_pipeline_internal(stages, registry).await {
+        PipelineResult::Output(output) => Ok(output),
+        PipelineResult::Error(e, _) => Err(e),
+    }
 }
 
 impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
