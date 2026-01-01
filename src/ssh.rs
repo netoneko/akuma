@@ -128,6 +128,10 @@ struct SshSession {
     channel_data_buffer: Vec<u8>,
     /// Flag to indicate channel EOF was received
     channel_eof: bool,
+    /// Terminal width in columns (from pty-req)
+    term_width: u32,
+    /// Terminal height in rows (from pty-req)
+    term_height: u32,
 }
 
 impl SshSession {
@@ -147,6 +151,8 @@ impl SshSession {
             client_channel: 0,
             channel_data_buffer: Vec::new(),
             channel_eof: false,
+            term_width: 80,  // default
+            term_height: 24, // default
         }
     }
 }
@@ -174,6 +180,11 @@ struct SshChannelStream<'a> {
 impl<'a> SshChannelStream<'a> {
     fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
         Self { stream, session }
+    }
+
+    /// Get the terminal size (width, height) from the session
+    fn term_size(&self) -> (u32, u32) {
+        (self.session.term_width, self.session.term_height)
     }
 
     /// Read and process SSH packets until we have channel data or an error
@@ -295,14 +306,25 @@ impl Read for SshChannelStream<'_> {
     }
 }
 
+/// Maximum chunk size for SSH channel data (conservative to avoid packet issues)
+const SSH_CHANNEL_MAX_CHUNK: usize = 4096;
+
 impl Write for SshChannelStream<'_> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         if !self.session.channel_open {
             return Err(SshStreamError);
         }
-        send_channel_data(self.stream, self.session, buf)
-            .await
-            .map_err(|_| SshStreamError)?;
+        
+        // Send data in chunks to avoid packet size issues
+        let mut sent = 0;
+        while sent < buf.len() {
+            let chunk_size = (buf.len() - sent).min(SSH_CHANNEL_MAX_CHUNK);
+            let chunk = &buf[sent..sent + chunk_size];
+            send_channel_data(self.stream, self.session, chunk)
+                .await
+                .map_err(|_| SshStreamError)?;
+            sent += chunk_size;
+        }
         Ok(buf.len())
     }
 
@@ -702,12 +724,21 @@ async fn run_shell_session(
                                         // Check for neko editor command
                                         if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
                                             let filepath = if trimmed.len() > 5 {
-                                                Some(core::str::from_utf8(&trimmed[5..]).unwrap_or(""))
+                                                let path_bytes = trim_bytes(&trimmed[5..]);
+                                                if path_bytes.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(core::str::from_utf8(path_bytes).unwrap_or(""))
+                                                }
                                             } else {
                                                 None
                                             };
                                             
-                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath).await {
+                                            // Get terminal size from session
+                                            let (tw, th) = channel_stream.term_size();
+                                            let term_size = crate::editor::TermSize::new(tw, th);
+                                            
+                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath, term_size).await {
                                                 let msg = format!("Editor error: {}\r\n", e);
                                                 let _ = channel_stream.write(msg.as_bytes()).await;
                                             }
@@ -1126,6 +1157,23 @@ async fn handle_message(
                 ));
 
                 let success = matches!(req_type, b"pty-req" | b"shell" | b"env" | b"exec");
+
+                // Parse pty-req to get terminal dimensions
+                if req_type == b"pty-req" {
+                    offset += 1; // skip want_reply byte
+                    // pty-req format: string TERM, uint32 width_chars, uint32 height_rows, ...
+                    let _term = read_string(payload, &mut offset);
+                    if let Some(width) = read_u32(payload, &mut offset) {
+                        if let Some(height) = read_u32(payload, &mut offset) {
+                            session.term_width = width;
+                            session.term_height = height;
+                            log(&alloc::format!(
+                                "[SSH] Terminal size: {}x{}\n",
+                                width, height
+                            ));
+                        }
+                    }
+                }
 
                 if want_reply {
                     let msg_type = if success {

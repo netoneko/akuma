@@ -15,6 +15,8 @@ use crate::async_fs;
 // ANSI Escape Sequences
 // ============================================================================
 
+/// Move cursor to home and clear screen (combined for reliability)
+const CLEAR_AND_HOME: &[u8] = b"\x1b[H\x1b[J";
 /// Clear entire screen
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
 /// Move cursor to home position (1,1)
@@ -36,14 +38,42 @@ const CLEAR_EOL: &[u8] = b"\x1b[K";
 // Editor Configuration
 // ============================================================================
 
-/// Terminal width (assumed)
-const TERM_WIDTH: usize = 80;
-/// Terminal height (assumed)
-const TERM_HEIGHT: usize = 24;
-/// Width reserved for line numbers
-const LINE_NUM_WIDTH: usize = 5;
-/// Number of content rows (total - title - separator - status - shortcuts)
-const CONTENT_ROWS: usize = TERM_HEIGHT - 4;
+/// Width reserved for line numbers (4 digits + "| " = 6 chars)
+const LINE_NUM_WIDTH: usize = 6;
+
+/// Terminal dimensions passed to the editor
+#[derive(Clone, Copy)]
+pub struct TermSize {
+    pub width: usize,
+    pub height: usize,
+}
+
+impl TermSize {
+    /// Create a new TermSize with given dimensions
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width: width as usize,
+            height: height as usize,
+        }
+    }
+
+    /// Default terminal size (80x24)
+    pub fn default() -> Self {
+        Self {
+            width: 80,
+            height: 24,
+        }
+    }
+
+    /// Number of content rows (total - title - separator*2 - status)
+    fn content_rows(&self) -> usize {
+        if self.height > 4 {
+            self.height - 4
+        } else {
+            1
+        }
+    }
+}
 
 // ============================================================================
 // Editor Buffer
@@ -63,11 +93,13 @@ pub struct EditorBuffer {
     modified: bool,
     /// File path
     filepath: String,
+    /// Terminal size
+    term_size: TermSize,
 }
 
 impl EditorBuffer {
     /// Create a new empty buffer
-    pub fn new(filepath: &str) -> Self {
+    pub fn new(filepath: &str, term_size: TermSize) -> Self {
         Self {
             lines: vec![String::new()],
             cursor_row: 0,
@@ -75,13 +107,15 @@ impl EditorBuffer {
             scroll_offset: 0,
             modified: false,
             filepath: String::from(filepath),
+            term_size,
         }
     }
 
     /// Load content from a file
-    pub async fn load(&mut self) -> Result<(), &'static str> {
+    /// Returns the number of lines loaded, or 0 if file doesn't exist (new file)
+    pub async fn load(&mut self) -> Result<usize, &'static str> {
         if self.filepath.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         match async_fs::read_to_string(&self.filepath).await {
@@ -90,6 +124,7 @@ impl EditorBuffer {
                     .lines()
                     .map(|s| String::from(s))
                     .collect();
+                let line_count = self.lines.len();
                 if self.lines.is_empty() {
                     self.lines.push(String::new());
                 }
@@ -97,13 +132,13 @@ impl EditorBuffer {
                 self.cursor_col = 0;
                 self.scroll_offset = 0;
                 self.modified = false;
-                Ok(())
+                Ok(line_count)
             }
             Err(_) => {
-                // File doesn't exist - start with empty buffer
+                // File doesn't exist - start with empty buffer (new file)
                 self.lines = vec![String::new()];
                 self.modified = false;
-                Ok(())
+                Ok(0)
             }
         }
     }
@@ -257,26 +292,28 @@ impl EditorBuffer {
 
     /// Ensure cursor is visible by adjusting scroll
     fn ensure_cursor_visible(&mut self) {
+        let content_rows = self.term_size.content_rows();
         if self.cursor_row < self.scroll_offset {
             self.scroll_offset = self.cursor_row;
-        } else if self.cursor_row >= self.scroll_offset + CONTENT_ROWS {
-            self.scroll_offset = self.cursor_row - CONTENT_ROWS + 1;
+        } else if self.cursor_row >= self.scroll_offset + content_rows {
+            self.scroll_offset = self.cursor_row - content_rows + 1;
         }
     }
 
     /// Get visible lines for rendering
-    fn visible_lines(&self) -> impl Iterator<Item = (usize, &String)> {
+    fn visible_lines(&self) -> impl Iterator<Item = (usize, &String)> + '_ {
+        let content_rows = self.term_size.content_rows();
         self.lines
             .iter()
             .enumerate()
             .skip(self.scroll_offset)
-            .take(CONTENT_ROWS)
+            .take(content_rows)
     }
 
     /// Get cursor position on screen (row, col)
     fn screen_cursor(&self) -> (usize, usize) {
-        let row = self.cursor_row - self.scroll_offset + 2; // +2 for title bar and separator
-        let col = LINE_NUM_WIDTH + 2 + self.cursor_col; // +2 for "| "
+        let row = self.cursor_row - self.scroll_offset + 3; // +3 for title bar, separator, and 1-based indexing
+        let col = LINE_NUM_WIDTH + self.cursor_col + 1; // LINE_NUM_WIDTH already includes "| ", +1 for 1-based
         (row, col)
     }
 }
@@ -302,22 +339,30 @@ pub struct Editor {
     mode: EditorMode,
     message: String,
     running: bool,
+    term_size: TermSize,
 }
 
 impl Editor {
     /// Create a new editor
-    pub fn new(filepath: &str) -> Self {
+    pub fn new(filepath: &str, term_size: TermSize) -> Self {
         Self {
-            buffer: EditorBuffer::new(filepath),
+            buffer: EditorBuffer::new(filepath, term_size),
             mode: EditorMode::Normal,
             message: String::new(),
             running: true,
+            term_size,
         }
     }
 
-    /// Load file into buffer
-    pub async fn load(&mut self) -> Result<(), &'static str> {
-        self.buffer.load().await
+    /// Load file into buffer, returns number of lines loaded
+    pub async fn load(&mut self) -> Result<usize, &'static str> {
+        let lines = self.buffer.load().await?;
+        if lines > 0 {
+            self.set_message(&format!("Loaded {} lines", lines));
+        } else {
+            self.set_message("New file");
+        }
+        Ok(lines)
     }
 
     /// Set a status message
@@ -370,14 +415,21 @@ enum InputEvent {
 // Screen Rendering
 // ============================================================================
 
-/// Render the editor screen
-async fn render_screen<W: Write>(writer: &mut W, editor: &Editor) -> Result<(), W::Error> {
-    // Hide cursor during render
-    writer.write_all(CURSOR_HIDE).await?;
-    writer.write_all(CURSOR_HOME).await?;
+/// Build the screen output into a buffer
+fn build_screen_buffer(editor: &Editor) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8192);
+    let term_width = editor.term_size.width;
+    let content_rows = editor.term_size.content_rows();
 
-    // Title bar
-    writer.write_all(REVERSE_VIDEO).await?;
+    // Reset all attributes first, hide cursor, move home, and clear screen
+    buf.extend_from_slice(RESET_ATTRS);
+    buf.extend_from_slice(CURSOR_HIDE);
+    buf.extend_from_slice(CURSOR_HOME);
+    buf.extend_from_slice(CLEAR_SCREEN);
+    buf.extend_from_slice(CURSOR_HOME);
+
+    // Title bar (reverse video = white on black)  
+    buf.extend_from_slice(REVERSE_VIDEO);
     let title = if editor.buffer.filepath.is_empty() {
         format!("  neko - [New File]")
     } else if editor.buffer.modified {
@@ -385,72 +437,80 @@ async fn render_screen<W: Write>(writer: &mut W, editor: &Editor) -> Result<(), 
     } else {
         format!("  neko - {}", editor.buffer.filepath)
     };
-    let padded_title = format!("{:width$}", title, width = TERM_WIDTH);
-    writer.write_all(padded_title.as_bytes()).await?;
-    writer.write_all(RESET_ATTRS).await?;
-    writer.write_all(b"\r\n").await?;
+    // Pad title to full width
+    let padded_title = format!("{:width$}", title, width = term_width);
+    buf.extend_from_slice(padded_title.as_bytes());
+    buf.extend_from_slice(RESET_ATTRS);
+    buf.extend_from_slice(b"\r\n");
 
     // Separator line
-    let separator: String = (0..TERM_WIDTH).map(|_| '-').collect();
-    writer.write_all(separator.as_bytes()).await?;
-    writer.write_all(b"\r\n").await?;
+    for _ in 0..term_width {
+        buf.push(b'-');
+    }
+    buf.extend_from_slice(b"\r\n");
 
     // Content area
     let mut row_count = 0;
     for (line_num, line) in editor.buffer.visible_lines() {
         // Line number
-        writer.write_all(DIM_TEXT).await?;
         let line_num_str = format!("{:>4}| ", line_num + 1);
-        writer.write_all(line_num_str.as_bytes()).await?;
-        writer.write_all(RESET_ATTRS).await?;
+        buf.extend_from_slice(line_num_str.as_bytes());
 
         // Line content (truncate if too long)
-        let available_width = TERM_WIDTH - LINE_NUM_WIDTH - 2;
+        let available_width = term_width.saturating_sub(LINE_NUM_WIDTH);
         let display_line: String = line.chars().take(available_width).collect();
-        writer.write_all(display_line.as_bytes()).await?;
-        writer.write_all(CLEAR_EOL).await?;
-        writer.write_all(b"\r\n").await?;
+        buf.extend_from_slice(display_line.as_bytes());
+        buf.extend_from_slice(CLEAR_EOL);
+        buf.extend_from_slice(b"\r\n");
         row_count += 1;
     }
 
-    // Fill remaining content rows with empty lines
-    while row_count < CONTENT_ROWS {
-        writer.write_all(DIM_TEXT).await?;
-        writer.write_all(b"   ~ ").await?;
-        writer.write_all(RESET_ATTRS).await?;
-        writer.write_all(CLEAR_EOL).await?;
-        writer.write_all(b"\r\n").await?;
+    // Fill remaining content rows with empty lines (tilde markers)
+    while row_count < content_rows {
+        buf.extend_from_slice(b"   ~");
+        buf.extend_from_slice(CLEAR_EOL);
+        buf.extend_from_slice(b"\r\n");
         row_count += 1;
     }
 
     // Bottom separator
-    writer.write_all(separator.as_bytes()).await?;
-    writer.write_all(b"\r\n").await?;
+    for _ in 0..term_width {
+        buf.push(b'-');
+    }
+    buf.extend_from_slice(b"\r\n");
 
     // Status/Shortcut bar
-    writer.write_all(REVERSE_VIDEO).await?;
+    buf.extend_from_slice(REVERSE_VIDEO);
     let status = match editor.mode {
         EditorMode::ConfirmQuit => {
-            format!("{:width$}", "  Unsaved changes! Press Ctrl+C to quit without saving, or any other key to cancel", width = TERM_WIDTH)
+            format!("{:width$}", "  Unsaved changes! Press Ctrl+C to quit without saving, or any other key to cancel", width = term_width)
         }
         EditorMode::Message => {
-            format!("{:width$}", format!("  {}", editor.message), width = TERM_WIDTH)
+            format!("{:width$}", format!("  {}", editor.message), width = term_width)
         }
         EditorMode::Normal => {
-            format!("{:width$}", "  ^O Save   ^X Exit   ^C Quit without saving", width = TERM_WIDTH)
+            format!("{:width$}", "  ^O Save   ^X Exit   ^C Quit without saving", width = term_width)
         }
     };
-    writer.write_all(status.as_bytes()).await?;
-    writer.write_all(RESET_ATTRS).await?;
+    buf.extend_from_slice(status.as_bytes());
+    buf.extend_from_slice(RESET_ATTRS);
 
-    // Position cursor
+    // Position cursor (ANSI uses 1-based coordinates)
     let (cursor_row, cursor_col) = editor.buffer.screen_cursor();
-    let cursor_pos = format!("\x1b[{};{}H", cursor_row, cursor_col + 1);
-    writer.write_all(cursor_pos.as_bytes()).await?;
+    let cursor_pos = format!("\x1b[{};{}H", cursor_row, cursor_col);
+    buf.extend_from_slice(cursor_pos.as_bytes());
 
     // Show cursor
-    writer.write_all(CURSOR_SHOW).await?;
+    buf.extend_from_slice(CURSOR_SHOW);
 
+    buf
+}
+
+/// Render the editor screen - writes all output in a single batch
+async fn render_screen<W: Write>(writer: &mut W, editor: &Editor) -> Result<(), W::Error> {
+    let buf = build_screen_buffer(editor);
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -571,12 +631,13 @@ async fn handle_normal_input<S: Write>(
 pub async fn run<S: Read + Write>(
     stream: &mut S,
     filepath: Option<&str>,
+    term_size: TermSize,
 ) -> Result<(), &'static str> {
-    let mut editor = Editor::new(filepath.unwrap_or(""));
+    let mut editor = Editor::new(filepath.unwrap_or(""), term_size);
 
     // Load file if specified
     if filepath.is_some() {
-        editor.load().await?;
+        let _ = editor.load().await?;
     }
 
     // Clear screen initially
@@ -685,6 +746,7 @@ pub async fn run<S: Read + Write>(
     let _ = stream.write_all(CLEAR_SCREEN).await;
     let _ = stream.write_all(CURSOR_HOME).await;
     let _ = stream.write_all(CURSOR_SHOW).await;
+    let _ = stream.flush().await;
 
     Ok(())
 }
