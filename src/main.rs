@@ -35,9 +35,7 @@ mod rng;
 mod shell;
 mod shell_tests;
 mod ssh;
-mod ssh_crypto;
 mod syscall;
-mod ssh_server;
 mod tests;
 mod threading;
 mod timer;
@@ -409,7 +407,7 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     // Pin the futures directly using the pin! macro (no unsafe needed)
     let mut runner_pinned = pin!(runner.run());
     let mut loopback_runner_pinned = pin!(loopback_runner.run());
-    let mut ssh_pinned = pin!(ssh_server::run(stack));
+    let mut ssh_pinned = pin!(ssh::run(stack));
     let mut web_pinned = pin!(web_server::run(stack));
     let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
     let mut mem_monitor_pinned = pin!(memory_monitor());

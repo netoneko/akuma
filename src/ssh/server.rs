@@ -17,7 +17,7 @@ use embassy_time::Duration;
 
 use crate::async_net::TcpStream;
 use crate::console;
-use crate::ssh;
+use super::protocol;
 
 // ============================================================================
 // Constants
@@ -140,8 +140,11 @@ pub async fn run(stack: Stack<'static>) {
     ));
     log("[SSH Server] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
 
-    // Initialize shared host key
-    ssh::init_host_key();
+    // Initialize shared host key from filesystem
+    protocol::init_host_key_async().await;
+    
+    // Ensure default config exists
+    super::config::ensure_default_config().await;
 
     // Active connections
     let mut connections: Vec<ActiveConnection> = Vec::new();
@@ -289,7 +292,7 @@ pub async fn run(stack: Stack<'static>) {
 /// Wrapper for handle_connection that logs start/end
 async fn handle_connection_wrapper(stream: TcpStream, id: usize) {
     log(&alloc::format!("[SSH {}] Starting session\n", id));
-    ssh::handle_connection(stream).await;
+    protocol::handle_connection(stream).await;
     log(&alloc::format!("[SSH {}] Session ended\n", id));
 }
 

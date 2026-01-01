@@ -20,7 +20,7 @@ use nostd_interactive_terminal::history::{History, HistoryConfig};
 use nostd_interactive_terminal::terminal::{ReadLineError, TerminalConfig, TerminalReader};
 use nostd_interactive_terminal::writer::TerminalWriter;
 
-use crate::ssh_crypto::{split_first_word, trim_bytes};
+use crate::ssh::crypto::{split_first_word, trim_bytes};
 
 // Re-export commonly used items
 pub use commands::CommandRegistry;
