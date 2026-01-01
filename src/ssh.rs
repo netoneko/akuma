@@ -132,6 +132,8 @@ struct SshSession {
     term_width: u32,
     /// Terminal height in rows (from pty-req)
     term_height: u32,
+    /// Flag to indicate terminal was resized (triggers re-render)
+    resize_pending: bool,
 }
 
 impl SshSession {
@@ -153,6 +155,7 @@ impl SshSession {
             channel_eof: false,
             term_width: 80,  // default
             term_height: 24, // default
+            resize_pending: false,
         }
     }
 }
@@ -180,11 +183,6 @@ struct SshChannelStream<'a> {
 impl<'a> SshChannelStream<'a> {
     fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
         Self { stream, session }
-    }
-
-    /// Get the terminal size (width, height) from the session
-    fn term_size(&self) -> (u32, u32) {
-        (self.session.term_width, self.session.term_height)
     }
 
     /// Read and process SSH packets until we have channel data or an error
@@ -246,6 +244,35 @@ impl<'a> SshChannelStream<'a> {
                     return Ok(true);
                 }
             }
+            SSH_MSG_CHANNEL_REQUEST => {
+                // Handle window-change requests during shell session
+                let mut offset = 0;
+                let _recipient = read_u32(payload, &mut offset);
+                if let Some(req_type) = read_string(payload, &mut offset) {
+                    if req_type == b"window-change" {
+                        let _want_reply = if offset < payload.len() {
+                            payload[offset] != 0
+                        } else {
+                            false
+                        };
+                        offset += 1;
+                        // window-change format: uint32 width_cols, uint32 height_rows, uint32 width_px, uint32 height_px
+                        if let Some(width) = read_u32(payload, &mut offset) {
+                            if let Some(height) = read_u32(payload, &mut offset) {
+                                self.session.term_width = width;
+                                self.session.term_height = height;
+                                self.session.resize_pending = true;
+                                log(&format!(
+                                    "[SSH] Terminal resized: {}x{}\n",
+                                    width, height
+                                ));
+                                // Return true to break out of read loop and trigger re-render
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
             SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
                 log("[SSH] Channel close/EOF received\n");
                 self.session.channel_eof = true;
@@ -273,8 +300,26 @@ impl ErrorType for SshChannelStream<'_> {
     type Error = SshStreamError;
 }
 
+impl crate::editor::TermSizeProvider for SshChannelStream<'_> {
+    fn get_term_size(&self) -> crate::editor::TermSize {
+        crate::editor::TermSize::new(self.session.term_width, self.session.term_height)
+    }
+}
+
+/// Special byte used to signal a terminal resize event
+pub const RESIZE_SIGNAL_BYTE: u8 = 0x00;
+
 impl Read for SshChannelStream<'_> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        // Check for resize signal first
+        if self.session.resize_pending {
+            self.session.resize_pending = false;
+            if !buf.is_empty() {
+                buf[0] = RESIZE_SIGNAL_BYTE;
+                return Ok(1);
+            }
+        }
+
         // If we have buffered channel data, return it
         if !self.session.channel_data_buffer.is_empty() {
             let len = buf.len().min(self.session.channel_data_buffer.len());
@@ -288,10 +333,19 @@ impl Read for SshChannelStream<'_> {
             return Ok(0);
         }
 
-        // Read until we have channel data
+        // Read until we have channel data (or resize occurs)
         self.read_until_channel_data()
             .await
             .map_err(|_| SshStreamError)?;
+
+        // Check for resize after read loop returns
+        if self.session.resize_pending {
+            self.session.resize_pending = false;
+            if !buf.is_empty() {
+                buf[0] = RESIZE_SIGNAL_BYTE;
+                return Ok(1);
+            }
+        }
 
         // Try again with the newly buffered data
         if !self.session.channel_data_buffer.is_empty() {
@@ -734,11 +788,7 @@ async fn run_shell_session(
                                                 None
                                             };
                                             
-                                            // Get terminal size from session
-                                            let (tw, th) = channel_stream.term_size();
-                                            let term_size = crate::editor::TermSize::new(tw, th);
-                                            
-                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath, term_size).await {
+                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath).await {
                                                 let msg = format!("Editor error: {}\r\n", e);
                                                 let _ = channel_stream.write(msg.as_bytes()).await;
                                             }

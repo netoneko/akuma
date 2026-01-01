@@ -34,6 +34,9 @@ const DIM_TEXT: &[u8] = b"\x1b[2m";
 /// Clear to end of line
 const CLEAR_EOL: &[u8] = b"\x1b[K";
 
+/// Special byte used to signal a terminal resize event (matches ssh.rs)
+const RESIZE_SIGNAL_BYTE: u8 = 0x00;
+
 // ============================================================================
 // Editor Configuration
 // ============================================================================
@@ -42,7 +45,7 @@ const CLEAR_EOL: &[u8] = b"\x1b[K";
 const LINE_NUM_WIDTH: usize = 6;
 
 /// Terminal dimensions passed to the editor
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct TermSize {
     pub width: usize,
     pub height: usize,
@@ -73,6 +76,12 @@ impl TermSize {
             1
         }
     }
+}
+
+/// Trait for streams that can provide terminal size information
+pub trait TermSizeProvider {
+    /// Get the current terminal size
+    fn get_term_size(&self) -> TermSize;
 }
 
 // ============================================================================
@@ -365,6 +374,14 @@ impl Editor {
         Ok(lines)
     }
 
+    /// Update the terminal size (called when window is resized)
+    pub fn update_term_size(&mut self, new_size: TermSize) {
+        self.term_size = new_size;
+        self.buffer.term_size = new_size;
+        // Ensure cursor is still visible with new dimensions
+        self.buffer.ensure_cursor_visible();
+    }
+
     /// Set a status message
     fn set_message(&mut self, msg: &str) {
         self.message = String::from(msg);
@@ -627,12 +644,12 @@ async fn handle_normal_input<S: Write>(
 /// Run the neko editor
 ///
 /// This function takes over the terminal until the user exits.
-/// Uses a single stream that implements both Read and Write.
-pub async fn run<S: Read + Write>(
+/// Uses a single stream that implements Read, Write, and TermSizeProvider.
+pub async fn run<S: Read + Write + TermSizeProvider>(
     stream: &mut S,
     filepath: Option<&str>,
-    term_size: TermSize,
 ) -> Result<(), &'static str> {
+    let term_size = stream.get_term_size();
     let mut editor = Editor::new(filepath.unwrap_or(""), term_size);
 
     // Load file if specified
@@ -650,6 +667,12 @@ pub async fn run<S: Read + Write>(
 
     // Main editor loop
     while editor.running {
+        // Check for terminal resize
+        let new_size = stream.get_term_size();
+        if new_size != editor.term_size {
+            editor.update_term_size(new_size);
+        }
+
         // Render screen
         if render_screen(stream, &editor).await.is_err() {
             return Err("Failed to render screen");
@@ -663,6 +686,12 @@ pub async fn run<S: Read + Write>(
             }
             Ok(n) => {
                 for &byte in &read_buf[..n] {
+                    // Check for resize signal first
+                    if byte == RESIZE_SIGNAL_BYTE {
+                        // Resize signal received - just continue to trigger resize check
+                        continue;
+                    }
+                    
                     let event = match escape_state {
                         EscapeState::Normal => {
                             match byte {
