@@ -13,6 +13,7 @@ mod block;
 mod boot;
 mod console;
 mod dns;
+mod editor;
 mod elf_loader;
 mod embassy_net_driver;
 mod embassy_time_driver;

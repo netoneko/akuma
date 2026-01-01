@@ -699,6 +699,25 @@ async fn run_shell_session(
                                             return Ok(());
                                         }
 
+                                        // Check for neko editor command
+                                        if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
+                                            let filepath = if trimmed.len() > 5 {
+                                                Some(core::str::from_utf8(&trimmed[5..]).unwrap_or(""))
+                                            } else {
+                                                None
+                                            };
+                                            
+                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath).await {
+                                                let msg = format!("Editor error: {}\r\n", e);
+                                                let _ = channel_stream.write(msg.as_bytes()).await;
+                                            }
+                                            
+                                            line_buffer.clear();
+                                            cursor_pos = 0;
+                                            let _ = channel_stream.write(b"akuma> ").await;
+                                            continue;
+                                        }
+
                                         // Parse command line with pipeline and redirection
                                         let parsed = parse_command_line(trimmed);
 
