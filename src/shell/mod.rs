@@ -6,6 +6,7 @@
 //! nostd-interactive-terminal for line editing and history.
 //!
 //! Supports pipeline execution via the `|` operator.
+//! Supports command chaining via `;` and `&&` operators.
 
 pub mod commands;
 
@@ -181,6 +182,78 @@ enum PipelineResult {
     Output(Vec<u8>),
     /// Error with optional message to display
     Error(ShellError, Option<alloc::string::String>),
+}
+
+// ============================================================================
+// Command Chain Parsing (for ; and && operators)
+// ============================================================================
+
+/// Operator between chained commands
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChainOperator {
+    /// `;` - Execute next command regardless of previous result
+    Semicolon,
+    /// `&&` - Execute next command only if previous succeeded
+    And,
+}
+
+/// A command in a chain, with the operator that follows it
+#[derive(Debug)]
+pub struct ChainedCommand<'a> {
+    /// The command (may be a pipeline with |, >, >>)
+    pub command: &'a [u8],
+    /// The operator that follows this command (None for the last command)
+    pub next_operator: Option<ChainOperator>,
+}
+
+/// Parse a command line into chained commands separated by `;` and `&&`
+pub fn parse_command_chain(line: &[u8]) -> Vec<ChainedCommand<'_>> {
+    let mut commands = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < line.len() {
+        // Check for && (must check before single &)
+        if i + 1 < line.len() && line[i] == b'&' && line[i + 1] == b'&' {
+            let cmd = trim_bytes(&line[start..i]);
+            if !cmd.is_empty() {
+                commands.push(ChainedCommand {
+                    command: cmd,
+                    next_operator: Some(ChainOperator::And),
+                });
+            }
+            i += 2;
+            start = i;
+            continue;
+        }
+
+        // Check for ;
+        if line[i] == b';' {
+            let cmd = trim_bytes(&line[start..i]);
+            if !cmd.is_empty() {
+                commands.push(ChainedCommand {
+                    command: cmd,
+                    next_operator: Some(ChainOperator::Semicolon),
+                });
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Add the last command
+    let cmd = trim_bytes(&line[start..]);
+    if !cmd.is_empty() {
+        commands.push(ChainedCommand {
+            command: cmd,
+            next_operator: None,
+        });
+    }
+
+    commands
 }
 
 /// Check if an executable exists in /bin
