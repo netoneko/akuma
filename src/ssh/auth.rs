@@ -71,8 +71,11 @@ pub async fn handle_userauth_request(
         core::str::from_utf8(method)
     ));
 
+    let disable_key_verification = config.disable_key_verification;
+    // let disable_key_verification = true;
+
     // If key verification is disabled, accept any auth
-    if config.disable_key_verification {
+    if disable_key_verification {
         log("[SSH Auth] Key verification disabled, accepting auth\n");
         return (AuthResult::Success, build_success_response());
     }
