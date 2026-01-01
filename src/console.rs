@@ -74,6 +74,51 @@ pub fn print_char(c: char) {
     UART.write(c as u8);
 }
 
+/// Print a number in hexadecimal (no heap allocation)
+pub fn print_hex(n: u64) {
+    const HEX_CHARS: &[u8] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut i = 16;
+    let mut val = n;
+    
+    if val == 0 {
+        UART.write(b'0');
+        return;
+    }
+    
+    while val > 0 && i > 0 {
+        i -= 1;
+        buf[i] = HEX_CHARS[(val & 0xf) as usize];
+        val >>= 4;
+    }
+    
+    for c in &buf[i..] {
+        UART.write(*c);
+    }
+}
+
+/// Print a number in decimal (no heap allocation)
+pub fn print_dec(n: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    let mut val = n;
+    
+    if val == 0 {
+        UART.write(b'0');
+        return;
+    }
+    
+    while val > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    
+    for c in &buf[i..] {
+        UART.write(*c);
+    }
+}
+
 /// Check if a character is available for reading
 pub fn has_char() -> bool {
     UART.has_data()

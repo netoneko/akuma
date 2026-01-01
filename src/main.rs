@@ -85,7 +85,7 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 /// Detect memory from Device Tree Blob
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x40000000;
-    const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024;
+    const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024; // Must match QEMU -m setting
 
     if dtb_ptr == 0 {
         console::print("[Memory] No DTB pointer, using defaults\n");
@@ -124,17 +124,59 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Akuma Kernel starting...\n");
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
+    // Memory layout constants
+    const MIN_CODE_AND_STACK: usize = 32 * 1024 * 1024; // Minimum 32MB for kernel binary + stack
+    
     // Memory layout:
-    // - 1/16 of RAM: kernel code and stack
-    // - 1/2 of RAM: kernel heap (managed by allocator)
-    // - Remaining: user pages (managed by PMM)
-    let code_and_stack = ram_size / 16; // 1/16 of total RAM (8MB for 128MB)
+    // - Code + Stack: max(1/8 of RAM, 32MB) - kernel binary and stack
+    // - Heap: 1/2 of RAM - dynamic allocations
+    // - User pages: remaining - for user processes
+    // Note: See docs/MEMORY_LAYOUT.md for details on sizing constraints
+    
+    // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
+    let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = ram_size / 2; // Half of RAM for heap (64MB for 128MB)
+    let heap_size = ram_size / 2;
+    let user_pages_start = heap_start + heap_size;
+    let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
+
+    // Log memory layout decisions (using print_hex/print_dec since heap not yet initialized)
+    console::print("\n=== Memory Layout ===\n");
+    console::print("Total RAM: ");
+    console::print_dec(ram_size / 1024 / 1024);
+    console::print(" MB at 0x");
+    console::print_hex(ram_base as u64);
+    console::print("\n");
+    
+    console::print("Code+Stack: ");
+    console::print_dec(code_and_stack / 1024 / 1024);
+    console::print(" MB (0x");
+    console::print_hex(ram_base as u64);
+    console::print(" - 0x");
+    console::print_hex(heap_start as u64);
+    console::print(") [min 32MB]\n");
+    
+    console::print("Heap:       ");
+    console::print_dec(heap_size / 1024 / 1024);
+    console::print(" MB (0x");
+    console::print_hex(heap_start as u64);
+    console::print(" - 0x");
+    console::print_hex(user_pages_start as u64);
+    console::print(") [1/2 of RAM]\n");
+    
+    console::print("User pages: ");
+    console::print_dec(user_pages_size / 1024 / 1024);
+    console::print(" MB (0x");
+    console::print_hex(user_pages_start as u64);
+    console::print(" - 0x");
+    console::print_hex((ram_base + ram_size) as u64);
+    console::print(") [remaining]\n");
+    
+    console::print("=====================\n\n");
 
     // Ensure we have enough for heap
     if heap_size == 0 {
-        console::print("Not enough RAM for heap\n");
+        console::print("FATAL: Not enough RAM for heap\n");
         halt();
     }
 
@@ -145,9 +187,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         halt();
     }
 
-    console::print("Heap initialized: ");
-    console::print(&(heap_size / 1024 / 1024).to_string());
-    console::print(" MB\n");
+    console::print(&alloc::format!("Heap initialized: {} MB\n", heap_size / 1024 / 1024));
 
     // Initialize MMU with identity mapping for kernel
     console::print("Initializing MMU...\n");
