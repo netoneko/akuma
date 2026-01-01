@@ -9,7 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 libakuma = { path = "../libakuma" }
-# Note: ahash requires std by default, so we use default hashbrown which has no hasher
-# We'll use the inline feature which provides DefaultHashBuilder for no_std
-hashbrown = { version = "0.14", default-features = false, features = ["inline-more"] }
 

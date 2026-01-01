@@ -170,7 +170,7 @@ pub struct Process {
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
-        // Load ELF with stack
+        // Load ELF with stack and pre-allocated heap
         let (entry_point, address_space, stack_pointer, brk) =
             elf_loader::load_elf_with_stack(elf_data, 64 * 1024)?; // 64KB stack
 

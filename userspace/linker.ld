@@ -17,6 +17,9 @@ SECTIONS
         *(.rodata .rodata.*)
     }
     
+    /* Align to page boundary before writable sections */
+    . = ALIGN(0x1000);
+    
     .data : {
         *(.data .data.*)
     }

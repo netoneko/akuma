@@ -106,8 +106,13 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
 
-        // Determine page flags
-        let page_flags = flags_to_user_flags(flags);
+        // Use appropriate flags based on segment permissions
+        // Note: If segment is writable, use RW_NO_EXEC to handle BSS overlaps
+        let page_flags = if (flags & PF_X) != 0 {
+            user_flags::RX  // Executable segment
+        } else {
+            user_flags::RW_NO_EXEC  // Data/BSS - always RW to handle overlaps
+        };
 
         // Calculate number of pages needed
         let start_page = vaddr & !(PAGE_SIZE - 1);
@@ -120,7 +125,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
             // Check if this page is already mapped (from a previous segment)
             let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
-                // Reuse existing mapping
+                // Reuse existing mapping (all pages are RW now)
                 pa
             } else {
                 // Allocate a new physical page
@@ -220,9 +225,34 @@ pub fn load_elf_with_stack(
             .map_err(|e| ElfError::MappingFailed(e))?;
     }
 
+    // Pre-allocate heap pages (64KB = 16 pages, unrolled)
+    // Note: Adding more causes EC=0x0 crashes due to binary size constraints
+    let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let f = user_flags::RW_NO_EXEC;
+    let _ = loaded.address_space.alloc_and_map(hs, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x1000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x2000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x3000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x4000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x5000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x6000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x7000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x8000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0x9000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xa000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xb000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xc000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xd000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xe000, f);
+    let _ = loaded.address_space.alloc_and_map(hs + 0xf000, f);
+    // The allocator expects brk(0) to return current brk, then allocates FROM that address.
+    // So we need to set brk to the heap START so allocator uses the pre-mapped pages.
+    // The kernel's sys_brk will update the brk when allocator calls brk(new_value).
+
     // Stack pointer starts at top (grows down)
     // Align to 16 bytes as required by AArch64 ABI
     let initial_sp = STACK_TOP & !0xF;
 
-    Ok((loaded.entry_point, loaded.address_space, initial_sp, loaded.brk))
+    // Return hs (heap start) - allocator will allocate from here and call brk() to extend
+    Ok((loaded.entry_point, loaded.address_space, initial_sp, hs))
 }

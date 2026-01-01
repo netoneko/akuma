@@ -17,8 +17,8 @@ panic = "abort"
 [dependencies]
 talc = "4"
 spinning_top = "0.3"
-# hashbrown with ahash (requires CPU with crypto extensions)
-hashbrown = { version = "0.14", default-features = false, features = ["ahash", "allocator-api2"] }
+# hashbrown without ahash (ahash requires CPU crypto extensions)
+hashbrown = { version = "0.14", default-features = false, features = ["allocator-api2"] }
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"] }
 fdt = "0.1"
 smoltcp = { version = "0.11", default-features = false, features = ["log", "async", "proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet"] }

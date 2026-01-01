@@ -152,7 +152,11 @@ mod allocator {
                     // First allocation - get initial brk from kernel
                     let initial_brk = super::brk(0);
                     *head = initial_brk;
-                    *self.end.get() = initial_brk;
+                    
+                    // Request 64KB of heap space (kernel may have pre-allocated this)
+                    let requested_end = initial_brk + 0x10000;
+                    let actual_end = super::brk(requested_end);
+                    *self.end.get() = actual_end;
                 }
             }
         }

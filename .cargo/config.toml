@@ -6,7 +6,7 @@ target = "aarch64-unknown-none"
 # Force legacy virtio mode (version 1) for better compatibility
 runner = """qemu-system-aarch64 \
   -machine virt \
-  -cpu max \
+  -cpu cortex-a72 \
   -m 128M \
   -nographic \
   -serial mon:stdio \
