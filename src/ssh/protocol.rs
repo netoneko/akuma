@@ -25,10 +25,13 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::{self, commands::create_default_registry};
-use crate::ssh_crypto::{
+use super::auth::{self, AuthResult};
+use super::config::SshdConfig;
+use super::keys;
+use super::crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
     SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
-    split_first_word, trim_bytes, write_namelist, write_string, write_u32,
+    trim_bytes, write_namelist, write_string, write_u32,
 };
 
 // ============================================================================
@@ -72,23 +75,32 @@ const COMPRESS_ALGO: &str = "none";
 // Shared Host Key (for all sessions)
 // ============================================================================
 
-static HOST_KEY: Spinlock<Option<SigningKey>> = Spinlock::new(None);
-
 /// Initialize the shared host key (call once at startup)
+/// This is a synchronous wrapper that generates a temporary key.
+/// The full async key loading happens in init_host_key_async().
 pub fn init_host_key() {
-    let mut guard = HOST_KEY.lock();
+    // Generate a temporary key synchronously for backward compatibility
+    // The proper key loading with filesystem persistence is done async
+    let mut guard = keys::get_host_key();
     if guard.is_none() {
         let mut rng = SimpleRng::new();
         let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
         rng.fill_bytes(&mut key_bytes);
-        *guard = Some(SigningKey::from_bytes(&key_bytes));
-        log("[SSH] Host key initialized\n");
+        let key = SigningKey::from_bytes(&key_bytes);
+        keys::set_host_key(key);
+        log("[SSH] Temporary host key initialized (will load from fs on first connection)\n");
     }
+}
+
+/// Initialize the shared host key asynchronously (loads from filesystem)
+pub async fn init_host_key_async() {
+    let _key = keys::load_or_generate_host_key().await;
+    log("[SSH] Host key loaded/generated from filesystem\n");
 }
 
 /// Get a clone of the shared host key
 fn get_host_key() -> Option<SigningKey> {
-    HOST_KEY.lock().clone()
+    keys::get_host_key()
 }
 
 // ============================================================================
@@ -134,10 +146,12 @@ struct SshSession {
     term_height: u32,
     /// Flag to indicate terminal was resized (triggers re-render)
     resize_pending: bool,
+    /// SSH server configuration
+    config: SshdConfig,
 }
 
 impl SshSession {
-    fn new() -> Self {
+    fn new(config: SshdConfig) -> Self {
         Self {
             state: SshState::AwaitingVersion,
             rng: SimpleRng::new(),
@@ -156,6 +170,7 @@ impl SshSession {
             term_width: 80,  // default
             term_height: 24, // default
             resize_pending: false,
+            config,
         }
     }
 }
@@ -1160,10 +1175,29 @@ async fn handle_message(
         }
 
         SSH_MSG_USERAUTH_REQUEST => {
-            let reply = vec![SSH_MSG_USERAUTH_SUCCESS];
+            // Use the auth module for proper authentication
+            let (result, reply) = auth::handle_userauth_request(
+                payload,
+                &session.session_id,
+                &session.config,
+            ).await;
+            
             send_packet(stream, &reply, session).await?;
-            session.state = SshState::Authenticated;
-            log("[SSH] User authenticated\n");
+            
+            match result {
+                AuthResult::Success => {
+                    session.state = SshState::Authenticated;
+                    log("[SSH] User authenticated\n");
+                }
+                AuthResult::PublicKeyOk(_) => {
+                    // Key query - stay in AwaitingUserAuth state
+                    log("[SSH] Public key accepted, waiting for signature\n");
+                }
+                AuthResult::Failure => {
+                    // Stay in AwaitingUserAuth state to allow retry
+                    log("[SSH] Authentication failed, waiting for retry\n");
+                }
+            }
         }
 
         SSH_MSG_CHANNEL_OPEN => {
@@ -1453,7 +1487,9 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
 pub async fn handle_connection(mut stream: TcpStream) {
     log("[SSH] New SSH connection\n");
 
-    let mut session = SshSession::new();
+    // Load configuration
+    let config = super::config::load_config().await;
+    let mut session = SshSession::new(config);
 
     // Send our version
     if send_raw(&mut stream, SSH_VERSION).await.is_err() {
