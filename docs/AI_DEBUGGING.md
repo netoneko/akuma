@@ -6,6 +6,51 @@ This document describes the workflow for debugging userspace processes in Akuma.
 
 When debugging userspace packages (e.g., `stdcheck`, `echo2`), follow this workflow to verify changes and test execution.
 
+## GDB Debugging
+
+For low-level kernel debugging, you can run QEMU with a GDB server that waits for a debugger connection before starting the kernel.
+
+### Start QEMU with GDB Server
+
+```bash
+./scripts/run_with_gdb.sh
+```
+
+This launches QEMU with:
+- `-s` - Opens GDB server on port 1234
+- `-S` - Freezes CPU at startup (waits for GDB to connect)
+
+### Connect with GDB
+
+In a separate terminal:
+
+```bash
+# Using gdb-multiarch (Linux)
+gdb-multiarch -ex 'target remote :1234' target/aarch64-unknown-none/release/akuma
+
+# Using lldb (macOS)
+lldb -o 'gdb-remote 1234' target/aarch64-unknown-none/release/akuma
+```
+
+### Common GDB Commands
+
+| Command | Description |
+|---------|-------------|
+| `continue` / `c` | Resume execution |
+| `break <symbol>` | Set breakpoint at function |
+| `break *0x40000000` | Set breakpoint at address |
+| `info registers` | Show all registers |
+| `x/10i $pc` | Disassemble 10 instructions at PC |
+| `stepi` / `si` | Step one instruction |
+| `next` / `n` | Step over (source level) |
+| `bt` | Backtrace |
+
+### Debugging Tips
+
+- Build with debug symbols: `cargo build` (not `--release`) for better debugging
+- Set breakpoints on panic handlers to catch kernel panics
+- Use `monitor info registers` for QEMU-specific register info
+
 ## Debugging Steps
 
 ### 1. Build the Kernel (Release)
@@ -59,10 +104,14 @@ ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 "pkg
 | Action | Command |
 |--------|---------|
 | Build kernel | `cargo build --release` |
+| Build kernel (debug) | `cargo build` |
 | Build userspace package | `cd userspace && cargo build --release -p <package>` |
 | Start package server | `cd userspace && python3 -m http.server 8000` |
 | Run userspace process | `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 <package>` |
 | Install package | `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 "pkg install <package>"` |
+| Run with GDB | `./scripts/run_with_gdb.sh` |
+| Connect GDB (Linux) | `gdb-multiarch -ex 'target remote :1234' target/aarch64-unknown-none/release/akuma` |
+| Connect GDB (macOS) | `lldb -o 'gdb-remote 1234' target/aarch64-unknown-none/release/akuma` |
 
 ## Notes
 
