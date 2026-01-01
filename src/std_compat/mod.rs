@@ -6,53 +6,12 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use core::hash::{BuildHasherDefault, Hasher};
-
-/// Simple FNV-1a hasher for no_std HashMap
-/// 
-/// This is a fast, non-cryptographic hasher suitable for hash tables.
-/// We use this instead of ahash because ahash requires CPU crypto extensions.
-#[derive(Default)]
-pub struct FnvHasher(u64);
-
-impl Hasher for FnvHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        const FNV_PRIME: u64 = 0x100000001b3;
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        
-        if self.0 == 0 {
-            self.0 = FNV_OFFSET;
-        }
-        
-        for byte in bytes {
-            self.0 ^= *byte as u64;
-            self.0 = self.0.wrapping_mul(FNV_PRIME);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-/// BuildHasher for FnvHasher
-pub type FnvBuildHasher = BuildHasherDefault<FnvHasher>;
-
 /// Collections compatible with std::collections
+/// 
+/// Uses ahash (hardware-accelerated) with QEMU `-cpu max`.
 pub mod collections {
-    use super::FnvBuildHasher;
-    
-    /// HashMap with FNV hasher (no ahash/crypto required)
-    pub type HashMap<K, V> = hashbrown::HashMap<K, V, FnvBuildHasher>;
-    
-    /// HashSet with FNV hasher (no ahash/crypto required)
-    pub type HashSet<T> = hashbrown::HashSet<T, FnvBuildHasher>;
-    
-    /// Raw hashbrown types if you need them with a custom hasher
-    pub mod raw {
-        pub use hashbrown::HashMap as RawHashMap;
-        pub use hashbrown::HashSet as RawHashSet;
-    }
+    pub use hashbrown::HashMap;
+    pub use hashbrown::HashSet;
 }
 
 /// Synchronization primitives compatible with std::sync

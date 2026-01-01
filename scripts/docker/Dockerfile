@@ -8,7 +8,7 @@ EXPOSE 22 8080
 
 CMD ["qemu-system-aarch64", \
      "-machine", "virt", \
-     "-cpu", "cortex-a72", \
+     "-cpu", "max", \
      "-m", "128M", \
      "-nographic", \
      "-serial", "mon:stdio", \
