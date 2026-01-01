@@ -19,6 +19,41 @@ pub type Pid = u32;
 /// Next available PID
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
+/// Current program break (heap end) for the running process
+static PROGRAM_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Initial program break set when process is loaded
+static INITIAL_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Initialize the program break for a new process
+pub fn init_brk(initial_brk: usize) {
+    use core::sync::atomic::Ordering;
+    let aligned_brk = (initial_brk + 0xFFF) & !0xFFF;
+    INITIAL_BRK.store(aligned_brk, Ordering::Release);
+    PROGRAM_BRK.store(aligned_brk, Ordering::Release);
+}
+
+/// Get the current program break
+pub fn get_brk() -> usize {
+    use core::sync::atomic::Ordering;
+    PROGRAM_BRK.load(Ordering::Acquire)
+}
+
+/// Set the program break, returns new value
+pub fn set_brk(new_brk: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let current = PROGRAM_BRK.load(Ordering::Acquire);
+    let initial = INITIAL_BRK.load(Ordering::Acquire);
+    
+    if new_brk < initial {
+        return current;
+    }
+    
+    let aligned = (new_brk + 0xFFF) & !0xFFF;
+    PROGRAM_BRK.store(aligned, Ordering::Release);
+    aligned
+}
+
 /// Process state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
@@ -128,13 +163,15 @@ pub struct Process {
     pub context: UserContext,
     /// Parent process ID (0 for init)
     pub parent_pid: Pid,
+    /// Initial program break (end of loaded segments, start of heap)
+    pub brk: usize,
 }
 
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack
-        let (entry_point, address_space, stack_pointer) =
+        let (entry_point, address_space, stack_pointer, brk) =
             elf_loader::load_elf_with_stack(elf_data, 64 * 1024)?; // 64KB stack
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +183,7 @@ impl Process {
             address_space,
             context: UserContext::new(entry_point, stack_pointer),
             parent_pid: 0,
+            brk,
         })
     }
 
@@ -173,6 +211,9 @@ impl Process {
 
         // Reset exit state before starting
         crate::syscall::reset_exit_state();
+        
+        // Initialize the program break for heap allocation
+        init_brk(self.brk);
 
         // Activate the user address space (sets TTBR0)
         self.address_space.activate();

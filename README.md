@@ -46,7 +46,10 @@ Akuma is a **bare-metal ARM64 kernel** written entirely in Rust. It boots direct
 - **Async Networking** - Embassy-based async runtime with VirtIO network driver
 - **No OS Required** - Runs directly on hardware (or QEMU), no Linux, no dependencies
 
-This is not a userspace application. This is the entire operating system.
+
+## Running
+
+You can probably run it with Docker: [docs/DOCKER.md](docs/DOCKER.md)
 
 ## Features
 

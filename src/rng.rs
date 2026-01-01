@@ -499,3 +499,4 @@ pub fn fill_bytes(buf: &mut [u8]) -> Result<(), RngError> {
 fn log(msg: &str) {
     console::print(msg);
 }
+

@@ -35,6 +35,7 @@ mod rng;
 mod shell;
 mod shell_tests;
 mod ssh;
+mod std_compat;
 mod syscall;
 mod tests;
 mod threading;
@@ -176,6 +177,19 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     timer::init();
     console::print("Timer initialized\n");
 
+    // =========================================================================
+    // Hardware RNG initialization
+    // =========================================================================
+    match rng::init() {
+        Ok(()) => {
+            console::print("[RNG] Hardware RNG initialized\n");
+        }
+        Err(e) => {
+            console::print("[RNG] Hardware RNG not available: ");
+            console::print(&alloc::format!("{}\n", e));
+        }
+    }
+
     // Initialize Embassy time driver (bridges ARM timer to Embassy async)
     embassy_time_driver::init();
     console::print("Embassy time driver initialized\n");
@@ -237,20 +251,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     if !async_tests::run_all() {
         console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
         halt();
-    }
-
-    // =========================================================================
-    // Hardware RNG initialization
-    // =========================================================================
-    match rng::init() {
-        Ok(()) => {
-            console::print("[RNG] Hardware RNG initialized successfully\n");
-        }
-        Err(e) => {
-            console::print("[RNG] Hardware RNG not available: ");
-            console::print(&alloc::format!("{}\n", e));
-            console::print("[RNG] Falling back to timer-based entropy\n");
-        }
     }
 
     // =========================================================================

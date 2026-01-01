@@ -14,6 +14,7 @@ pub mod nr {
     pub const EXIT: u64 = 0;
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
+    pub const BRK: u64 = 3;
 }
 
 /// File descriptor numbers
@@ -36,6 +37,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
+        nr::BRK => sys_brk(args[0] as usize),
         _ => {
             console::print(&format!(
                 "[Syscall] Unknown syscall: {}\n",
@@ -43,6 +45,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ));
             (-1i64) as u64 // ENOSYS
         }
+    }
+}
+
+/// sys_brk - Change the program break (heap end)
+fn sys_brk(new_brk: usize) -> u64 {
+    if new_brk == 0 {
+        crate::process::get_brk() as u64
+    } else {
+        crate::process::set_brk(new_brk) as u64
     }
 }
 
@@ -183,4 +194,3 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     count as u64
 }
-

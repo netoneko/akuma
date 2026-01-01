@@ -194,11 +194,11 @@ fn flags_to_user_flags(elf_flags: u32) -> u64 {
 /// * `stack_size` - Size of user stack in bytes (default: 64KB)
 ///
 /// # Returns
-/// (entry_point, address_space, initial_stack_pointer)
+/// (entry_point, address_space, initial_stack_pointer, brk)
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
 
     // Place stack at a fixed address in the first 1GB (user space)
@@ -224,6 +224,5 @@ pub fn load_elf_with_stack(
     // Align to 16 bytes as required by AArch64 ABI
     let initial_sp = STACK_TOP & !0xF;
 
-    Ok((loaded.entry_point, loaded.address_space, initial_sp))
+    Ok((loaded.entry_point, loaded.address_space, initial_sp, loaded.brk))
 }
-
