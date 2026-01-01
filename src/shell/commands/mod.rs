@@ -16,7 +16,7 @@ use super::Command;
 pub use builtin::{AKUMA_CMD, ECHO_CMD, FREE_CMD, GREP_CMD, HELP_CMD, STATS_CMD};
 pub use exec::EXEC_CMD;
 pub use fs::{APPEND_CMD, CAT_CMD, DF_CMD, LS_CMD, MKDIR_CMD, MV_CMD, RM_CMD, WRITE_CMD};
-pub use net::{CURL_CMD, NSLOOKUP_CMD};
+pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
 pub use scripting::RHAI_CMD;
 
 // ============================================================================
@@ -93,6 +93,7 @@ pub fn create_default_registry() -> CommandRegistry {
     // Network commands
     registry.register(&CURL_CMD);
     registry.register(&NSLOOKUP_CMD);
+    registry.register(&PKG_CMD);
 
     // Scripting commands
     registry.register(&RHAI_CMD);

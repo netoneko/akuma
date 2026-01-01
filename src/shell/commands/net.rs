@@ -300,6 +300,113 @@ impl Command for NslookupCommand {
 pub static NSLOOKUP_CMD: NslookupCommand = NslookupCommand;
 
 // ============================================================================
+// Pkg Command
+// ============================================================================
+
+/// Pkg command - package manager for userspace binaries
+pub struct PkgCommand;
+
+impl Command for PkgCommand {
+    fn name(&self) -> &'static str {
+        "pkg"
+    }
+    fn description(&self) -> &'static str {
+        "Package manager for userspace binaries"
+    }
+    fn usage(&self) -> &'static str {
+        "pkg install <package>"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args_str = match core::str::from_utf8(args) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    let _ = stdout.write(b"Error: Invalid arguments\r\n").await;
+                    return Ok(());
+                }
+            };
+
+            let mut parts = args_str.split_whitespace();
+            let subcommand = parts.next();
+            let package = parts.next();
+
+            match (subcommand, package) {
+                (Some("install"), Some(pkg_name)) => {
+                    // Build URL: http://10.0.2.2:8000/target/aarch64-unknown-none/release/<package>
+                    let url = format!(
+                        "http://10.0.2.2:8000/target/aarch64-unknown-none/release/{}",
+                        pkg_name
+                    );
+                    let output_path = format!("/bin/{}", pkg_name);
+
+                    let msg = format!("Installing {} from {}...\r\n", pkg_name, url);
+                    let _ = stdout.write(msg.as_bytes()).await;
+
+                    // Use http_get_raw to download the binary
+                    let tls_opts = TlsOptions::default();
+                    match http_get_raw(&url, tls_opts, stdout).await {
+                        Ok(response) => {
+                            if response.body.is_empty() {
+                                let _ = stdout.write(b"Error: Empty response\r\n").await;
+                                return Ok(());
+                            }
+
+                            // Write to /bin/<package>
+                            match async_fs::write_file(&output_path, &response.body).await {
+                                Ok(()) => {
+                                    let msg = format!(
+                                        "Installed {} ({} bytes) to {}\r\n",
+                                        pkg_name,
+                                        response.body.len(),
+                                        output_path
+                                    );
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                }
+                                Err(e) => {
+                                    let msg = format!("Error writing file: {:?}\r\n", e);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("Error downloading: {}\r\n", e);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                        }
+                    }
+                }
+                (Some("install"), None) => {
+                    let _ = stdout.write(b"Error: No package name specified\r\n").await;
+                    let _ = stdout.write(b"Usage: pkg install <package>\r\n").await;
+                }
+                (Some(cmd), _) => {
+                    let msg = format!("Unknown subcommand: {}\r\n", cmd);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    let _ = stdout.write(b"Available: install\r\n").await;
+                }
+                (None, _) => {
+                    let _ = stdout.write(b"Usage: pkg install <package>\r\n").await;
+                    let _ = stdout.write(b"\r\n").await;
+                    let _ = stdout.write(b"Examples:\r\n").await;
+                    let _ = stdout.write(b"  pkg install stdcheck\r\n").await;
+                    let _ = stdout.write(b"  pkg install echo2\r\n").await;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static PKG_CMD: PkgCommand = PkgCommand;
+
+// ============================================================================
 // HTTP Helper
 // ============================================================================
 
