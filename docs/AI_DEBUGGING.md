@@ -122,3 +122,38 @@ ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 "pkg
 - Host key checking is disabled (`-o StrictHostKeyChecking=no`) for convenience during development
 - The Python web server must be running on port 8000 for `pkg install` to work
 
+## AI Testing Best Practices
+
+When running automated tests via SSH against the QEMU emulator:
+
+1. **Always kill QEMU before starting a new instance**:
+   ```bash
+   pkill -9 qemu-system-aarch64 2>/dev/null
+   sleep 2
+   ```
+
+2. **Wait for the system to fully boot** (20-25 seconds) before running SSH commands
+
+3. **Kill QEMU after tests complete** to avoid stale processes
+
+4. **Example test pattern**:
+   ```bash
+   # Clean up any existing QEMU instance
+   pkill -9 qemu-system-aarch64 2>/dev/null
+   sleep 2
+   
+   # Start QEMU in background
+   cargo run --release 2>/dev/null &
+   
+   # Wait for boot
+   sleep 25
+   
+   # Run tests
+   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222 "pwd"
+   
+   # Clean up
+   pkill -9 qemu-system-aarch64 2>/dev/null
+   ```
+
+This prevents issues with multiple QEMU instances competing for the same ports and ensures a clean testing environment.
+
