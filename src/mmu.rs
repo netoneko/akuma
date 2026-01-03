@@ -475,6 +475,13 @@ impl UserAddressSpace {
         Ok(frame)
     }
     
+    /// Track a frame that was allocated externally (e.g., by sys_mmap)
+    /// 
+    /// This adds the frame to user_frames so it will be freed when the
+    /// address space is dropped.
+    pub fn track_user_frame(&mut self, frame: PhysFrame) {
+        self.user_frames.push(frame);
+    }
 
     /// Unmap a page (doesn't free the physical frame)
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {

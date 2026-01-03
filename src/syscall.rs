@@ -111,10 +111,19 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
         return MAP_FAILED;
     }
     
-    // Map pages using the current process's address space
+    // Get current process to track frames for cleanup
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return MAP_FAILED,
+    };
+    
+    // Map pages and track frames for cleanup on process exit
     for i in 0..pages {
         let va = mmap_addr + i * PAGE_SIZE;
         if let Some(frame) = pmm::alloc_page_zeroed() {
+            // Track frame so it will be freed when process exits
+            proc.address_space.track_user_frame(frame);
+            
             unsafe {
                 crate::mmu::map_user_page(va, frame.addr, user_flags::RW_NO_EXEC);
             }

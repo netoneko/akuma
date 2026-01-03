@@ -55,7 +55,17 @@ pub extern "C" fn _start() -> ! {
         failed += 1;
     }
 
-    // Test 4: Box allocation (disabled - causes kernel crash, see docs/STDCHECK_DEBUG.md)
+    // Test 4: String::push_str with debug prints (uses print! macro)
+    print("[TEST] String::push_str (debug)... ");
+    if test_string_push_str_with_debug_prints() {
+        print("PASS\n");
+        _passed += 1;
+    } else {
+        print("FAIL\n");
+        failed += 1;
+    }
+
+    // Test 5: Box allocation (disabled - causes kernel crash, see docs/STDCHECK_DEBUG.md)
     // print("[TEST] Box... ");
     // if test_box() {
     //     print("PASS\n");
@@ -76,12 +86,19 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+#[inline(never)]
 fn test_vec() -> bool {
     let mut v: Vec<i32> = Vec::new();
     v.push(1);
     v.push(2);
     v.push(3);
-    v.len() == 3 && v[0] == 1 && v[2] == 3
+    
+    // Force evaluation to avoid optimizations
+    let len = core::hint::black_box(v.len());
+    let v0 = core::hint::black_box(v[0]);
+    let v2 = core::hint::black_box(v[2]);
+    
+    len == 3 && v0 == 1 && v2 == 3
 }
 
 fn test_string_from() -> bool {
@@ -137,6 +154,62 @@ fn test_string_push_str() -> bool {
         libakuma::write(1, b"FAIL: bytes[12]=");
         libakuma::write(1, &[b12]);
         libakuma::write(1, b" != !\n");
+        return false;
+    }
+    
+    true
+}
+
+fn test_string_push_str_with_debug_prints() -> bool {
+    use alloc::format;
+    
+    // This triggers reallocation
+    let mut s = String::from("Hello");
+    print(&format!("  Initial: len={}, cap={}\n", s.len(), s.capacity()));
+    
+    s.push_str(", World!");
+    print(&format!("  After push_str: len={}, cap={}\n", s.len(), s.capacity()));
+    
+    // Print actual content
+    print(&format!("  Content: \"{}\"\n", s));
+    
+    // Check length (should be 13: "Hello, World!")
+    let len = s.len();
+    if len != 13 {
+        print(&format!("  FAIL: len={} != 13\n", len));
+        return false;
+    }
+    
+    // Actual string comparison
+    let expected = "Hello, World!";
+    if s != expected {
+        print(&format!("  FAIL: \"{}\" != \"{}\"\n", s, expected));
+        return false;
+    }
+    print(&format!("  String comparison: OK\n"));
+    
+    // Verify content byte-by-byte
+    let bytes = s.as_bytes();
+    print(&format!("  bytes.len={}\n", bytes.len()));
+    
+    // Check first byte
+    let b0 = bytes[0];
+    if b0 != b'H' {
+        print(&format!("  FAIL: bytes[0]={} != 'H'\n", b0 as char));
+        return false;
+    }
+    
+    // Check bytes[5] = ','
+    let b5 = bytes[5];
+    if b5 != b',' {
+        print(&format!("  FAIL: bytes[5]={} != ','\n", b5 as char));
+        return false;
+    }
+    
+    // Check bytes[12] = '!'
+    let b12 = bytes[12];
+    if b12 != b'!' {
+        print(&format!("  FAIL: bytes[12]={} != '!'\n", b12 as char));
         return false;
     }
     
