@@ -61,12 +61,6 @@ pub type Pid = u32;
 /// Next available PID
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-/// Current program break (heap end) for the running process
-static PROGRAM_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Initial program break set when process is loaded
-static INITIAL_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
 /// Wrapper for process pointer to allow Send
 /// 
 /// SAFETY: Process pointers are only accessed from kernel context
@@ -193,35 +187,6 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
     }
     
     result
-}
-
-/// Initialize the program break for a new process
-pub fn init_brk(initial_brk: usize) {
-    use core::sync::atomic::Ordering;
-    let aligned_brk = (initial_brk + 0xFFF) & !0xFFF;
-    INITIAL_BRK.store(aligned_brk, Ordering::Release);
-    PROGRAM_BRK.store(aligned_brk, Ordering::Release);
-}
-
-/// Get the current program break
-pub fn get_brk() -> usize {
-    use core::sync::atomic::Ordering;
-    PROGRAM_BRK.load(Ordering::Acquire)
-}
-
-/// Set the program break, returns new value
-pub fn set_brk(new_brk: usize) -> usize {
-    use core::sync::atomic::Ordering;
-    let current = PROGRAM_BRK.load(Ordering::Acquire);
-    let initial = INITIAL_BRK.load(Ordering::Acquire);
-    
-    if new_brk < initial {
-        return current;
-    }
-    
-    let aligned = (new_brk + 0xFFF) & !0xFFF;
-    PROGRAM_BRK.store(aligned, Ordering::Release);
-    aligned
 }
 
 /// Process state
@@ -387,8 +352,10 @@ pub struct Process {
     pub context: UserContext,
     /// Parent process ID (0 for init)
     pub parent_pid: Pid,
-    /// Initial program break (end of loaded segments, start of heap)
+    /// Current program break (heap end)
     pub brk: usize,
+    /// Initial program break (start of heap, set from ELF loader)
+    pub initial_brk: usize,
     /// Memory regions tracking
     pub memory: ProcessMemory,
     /// Physical address of the process info page
@@ -396,6 +363,19 @@ pub struct Process {
     /// This page is mapped read-only at PROCESS_INFO_ADDR for the user.
     /// The kernel writes to it (via phys_to_virt) before entering userspace.
     pub process_info_phys: usize,
+    
+    // ========== Per-process I/O ==========
+    
+    /// Process stdin buffer (set before execution)
+    pub stdin_buf: Vec<u8>,
+    /// Position in stdin buffer for reads
+    pub stdin_pos: usize,
+    /// Process stdout buffer (captured during execution)
+    pub stdout_buf: Vec<u8>,
+    /// Process has exited
+    pub exited: bool,
+    /// Exit code (valid when exited=true)
+    pub exit_code: i32,
 }
 
 impl Process {
@@ -438,8 +418,15 @@ impl Process {
             context: UserContext::new(entry_point, stack_pointer),
             parent_pid: 0,
             brk,
+            initial_brk: brk,
             memory,
             process_info_phys: process_info_frame.addr,
+            // Per-process I/O - initialized empty
+            stdin_buf: Vec::new(),
+            stdin_pos: 0,
+            stdout_buf: Vec::new(),
+            exited: false,
+            exit_code: 0,
         })
     }
 
@@ -465,8 +452,8 @@ impl Process {
     pub fn execute(&mut self) -> i32 {
         self.state = ProcessState::Running;
 
-        // Reset exit state before starting
-        crate::syscall::reset_exit_state();
+        // Reset per-process I/O state
+        self.reset_io();
         
         // Write process info to the physical page (before activating address space)
         // We write directly to physical memory via phys_to_virt since the page
@@ -478,9 +465,6 @@ impl Process {
         
         // Register this process in the table for PID-based lookup
         register_process(self.pid, self as *mut Process);
-        
-        // Initialize the program break for heap allocation
-        init_brk(self.brk);
 
         // Activate the user address space (sets TTBR0)
         // After this, reading from PROCESS_INFO_ADDR will return our ProcessInfo
@@ -505,6 +489,58 @@ impl Process {
         ));
 
         exit_code
+    }
+    
+    // ========== Per-Process I/O Methods ==========
+    
+    /// Set stdin data for this process
+    pub fn set_stdin(&mut self, data: &[u8]) {
+        self.stdin_buf.clear();
+        self.stdin_buf.extend_from_slice(data);
+        self.stdin_pos = 0;
+    }
+    
+    /// Read from this process's stdin
+    /// Returns number of bytes read
+    pub fn read_stdin(&mut self, buf: &mut [u8]) -> usize {
+        let remaining = &self.stdin_buf[self.stdin_pos..];
+        let to_read = buf.len().min(remaining.len());
+        buf[..to_read].copy_from_slice(&remaining[..to_read]);
+        self.stdin_pos += to_read;
+        to_read
+    }
+    
+    /// Write to this process's stdout
+    pub fn write_stdout(&mut self, data: &[u8]) {
+        self.stdout_buf.extend_from_slice(data);
+    }
+    
+    /// Take captured stdout (transfers ownership)
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.stdout_buf)
+    }
+    
+    /// Get current program break
+    pub fn get_brk(&self) -> usize {
+        self.brk
+    }
+    
+    /// Set program break, returns new value
+    /// Will not go below initial_brk
+    pub fn set_brk(&mut self, new_brk: usize) -> usize {
+        if new_brk < self.initial_brk {
+            return self.brk;
+        }
+        self.brk = (new_brk + 0xFFF) & !0xFFF; // Page-align
+        self.brk
+    }
+    
+    /// Reset I/O state for execution
+    pub fn reset_io(&mut self) {
+        self.stdin_pos = 0;
+        self.stdout_buf.clear();
+        self.exited = false;
+        self.exit_code = 0;
     }
 }
 
@@ -693,7 +729,35 @@ unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
     exit_code as i32
 }
 
-/// Execute an ELF binary from the filesystem
+/// Execute an ELF binary from the filesystem with per-process I/O
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `stdin` - Optional stdin data for the process
+///
+/// # Returns
+/// Tuple of (exit_code, stdout_data), or error message
+pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
+    // Read the ELF file
+    let elf_data = crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
+
+    // Create the process
+    let mut process =
+        Process::from_elf(path, &elf_data).map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+    
+    // Set up stdin if provided
+    if let Some(data) = stdin {
+        process.set_stdin(data);
+    }
+
+    // Execute and capture output
+    let exit_code = process.execute();
+    let stdout_data = process.take_stdout();
+    
+    Ok((exit_code, stdout_data))
+}
+
+/// Execute an ELF binary from the filesystem (legacy API for backwards compatibility)
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
@@ -701,13 +765,7 @@ unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
 /// # Returns
 /// Exit code of the process, or error message
 pub fn exec(path: &str) -> Result<i32, String> {
-    // Read the ELF file
-    let elf_data = crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
-
-    // Create and execute the process
-    let mut process =
-        Process::from_elf(path, &elf_data).map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
-
-    Ok(process.execute())
+    let (exit_code, _stdout) = exec_with_io(path, None)?;
+    Ok(exit_code)
 }
 

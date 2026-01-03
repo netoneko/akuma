@@ -4,8 +4,7 @@
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
 use alloc::format;
-use alloc::vec::Vec;
-use spinning_top::Spinlock;
+use alloc::vec;
 
 use crate::console;
 
@@ -54,10 +53,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
 
 /// sys_brk - Change the program break (heap end)
 fn sys_brk(new_brk: usize) -> u64 {
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return 0,
+    };
+    
     if new_brk == 0 {
-        crate::process::get_brk() as u64
+        proc.get_brk() as u64
     } else {
-        crate::process::set_brk(new_brk) as u64
+        proc.set_brk(new_brk) as u64
     }
 }
 
@@ -129,7 +133,14 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
-    // Store exit code for the process manager to retrieve
+    // Update per-process state
+    if let Some(proc) = crate::process::current_process() {
+        proc.exited = true;
+        proc.exit_code = code;
+        proc.state = crate::process::ProcessState::Zombie(code);
+    }
+    
+    // Also set global flags for backwards compatibility during transition
     LAST_EXIT_CODE.store(code, core::sync::atomic::Ordering::Release);
     PROCESS_EXITED.store(true, core::sync::atomic::Ordering::Release);
     
@@ -145,41 +156,8 @@ pub static PROCESS_EXITED: AtomicBool = AtomicBool::new(false);
 /// Exit code of the last exited process
 pub static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
-/// Process stdout buffer - captures write() syscall output
-static PROCESS_STDOUT: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
-
-/// Process stdin buffer - provides read() syscall input
-static PROCESS_STDIN: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
-
-/// Position in stdin buffer
-static STDIN_POS: Spinlock<usize> = Spinlock::new(0);
-
-/// Reset process exit state (called before starting a new process)
-/// Does NOT clear stdin/stdout - those are managed by the exec command
-pub fn reset_exit_state() {
-    PROCESS_EXITED.store(false, Ordering::Release);
-    LAST_EXIT_CODE.store(0, Ordering::Release);
-    // Clear stdout for new process output
-    PROCESS_STDOUT.lock().clear();
-    // Reset stdin read position (but keep the data that was set via set_stdin)
-    *STDIN_POS.lock() = 0;
-}
-
-/// Set stdin for the next process
-pub fn set_stdin(data: &[u8]) {
-    let mut stdin = PROCESS_STDIN.lock();
-    stdin.clear();
-    stdin.extend_from_slice(data);
-    *STDIN_POS.lock() = 0;
-}
-
-/// Get the captured stdout from the process
-pub fn take_stdout() -> Vec<u8> {
-    let mut stdout = PROCESS_STDOUT.lock();
-    core::mem::take(&mut *stdout)
-}
-
 /// Check if process has exited and get exit code
+/// (Still used by exception handler for synchronous exit detection)
 pub fn check_exit() -> Option<i32> {
     if PROCESS_EXITED.load(Ordering::Acquire) {
         Some(LAST_EXIT_CODE.load(Ordering::Acquire))
@@ -206,26 +184,27 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         return 0;
     }
 
-    // Read from stdin buffer
-    let stdin = PROCESS_STDIN.lock();
-    let mut pos = STDIN_POS.lock();
+    // Get the current process for per-process stdin
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-1i64) as u64,
+    };
     
-    if *pos >= stdin.len() {
+    // Create a temporary buffer to read into
+    let mut temp_buf = alloc::vec![0u8; count];
+    let bytes_read = proc.read_stdin(&mut temp_buf);
+    
+    if bytes_read == 0 {
         return 0; // EOF
     }
-    
-    let available = stdin.len() - *pos;
-    let to_read = core::cmp::min(count, available);
     
     // Copy to user buffer
     unsafe {
         let dst = buf_ptr as *mut u8;
-        let src = stdin.as_ptr().add(*pos);
-        core::ptr::copy_nonoverlapping(src, dst, to_read);
+        core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), dst, bytes_read);
     }
     
-    *pos += to_read;
-    to_read as u64
+    bytes_read as u64
 }
 
 /// sys_write - Write to a file descriptor
@@ -251,8 +230,10 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // is within the user's address space
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
-    // Capture output to buffer for shell
-    PROCESS_STDOUT.lock().extend_from_slice(buf);
+    // Write to per-process stdout buffer
+    if let Some(proc) = crate::process::current_process() {
+        proc.write_stdout(buf);
+    }
 
     // Also print to kernel console for debugging
     if let Ok(s) = core::str::from_utf8(buf) {

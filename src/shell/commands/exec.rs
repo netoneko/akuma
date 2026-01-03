@@ -65,17 +65,9 @@ impl Command for ExecCommand {
                 }
             };
 
-            // Set up stdin for the process
-            if let Some(input) = stdin {
-                crate::syscall::set_stdin(input);
-            }
-
-            // Execute the binary
-            match crate::process::exec(path) {
-                Ok(exit_code) => {
-                    // Get captured stdout from process
-                    let process_output = crate::syscall::take_stdout();
-                    
+            // Execute the binary with per-process I/O
+            match crate::process::exec_with_io(path, stdin) {
+                Ok((exit_code, process_output)) => {
                     // Convert \n to \r\n for terminal
                     for &byte in &process_output {
                         if byte == b'\n' {
