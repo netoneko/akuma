@@ -288,18 +288,56 @@ pub fn stats() -> (usize, usize, usize) {
 
 /// Allocate a zeroed page
 pub fn alloc_page_zeroed() -> Option<PhysFrame> {
+    use crate::mmu::phys_to_virt;
+    
     let frame = alloc_page()?;
     unsafe {
-        core::ptr::write_bytes(frame.addr as *mut u8, 0, PAGE_SIZE);
+        // Use phys_to_virt to get a valid kernel VA for the physical address
+        // This ensures the write works regardless of current TTBR0 state
+        let virt_addr = phys_to_virt(frame.addr);
+        core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
+        
+        // Clean data cache for entire page to ensure zeros are visible through
+        // other VA mappings (e.g., user VA vs kernel identity mapping)
+        // ARM64 cache line is typically 64 bytes
+        const CACHE_LINE_SIZE: usize = 64;
+        let mut addr = virt_addr as usize;
+        let end = addr + PAGE_SIZE;
+        while addr < end {
+            core::arch::asm!(
+                "dc cvac, {addr}",  // Clean data cache by VA to PoC
+                addr = in(reg) addr,
+            );
+            addr += CACHE_LINE_SIZE;
+        }
+        core::arch::asm!("dsb ish");  // Data synchronization barrier
     }
     Some(frame)
 }
 
 /// Allocate zeroed contiguous pages
 pub fn alloc_pages_zeroed(count: usize) -> Option<PhysFrame> {
+    use crate::mmu::phys_to_virt;
+    
     let frame = alloc_pages(count)?;
+    let total_size = PAGE_SIZE * count;
     unsafe {
-        core::ptr::write_bytes(frame.addr as *mut u8, 0, PAGE_SIZE * count);
+        // Use phys_to_virt to get a valid kernel VA for the physical address
+        let virt_addr = phys_to_virt(frame.addr);
+        core::ptr::write_bytes(virt_addr, 0, total_size);
+        
+        // Clean data cache for all pages
+        const CACHE_LINE_SIZE: usize = 64;
+        let mut addr = virt_addr as usize;
+        let end = addr + total_size;
+        while addr < end {
+            core::arch::asm!(
+                "dc cvac, {addr}",
+                addr = in(reg) addr,
+            );
+            addr += CACHE_LINE_SIZE;
+        }
+        core::arch::asm!("dsb ish");
     }
     Some(frame)
 }

@@ -154,7 +154,8 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
                 if copy_len > 0 && file_offset + copy_len <= elf_data.len() {
                     unsafe {
-                        let dst = (frame_addr + copy_start) as *mut u8;
+                        // Convert physical address to kernel virtual address for copy
+                        let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);
                         let src = elf_data.as_ptr().add(file_offset);
                         core::ptr::copy_nonoverlapping(src, dst, copy_len);
                     }

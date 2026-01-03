@@ -110,6 +110,40 @@ pub fn init(_ram_base: usize, _ram_size: usize) {
     MMU_INITIALIZED.store(true, Ordering::Release);
 }
 
+// =============================================================================
+// Physical/Virtual Address Translation
+// =============================================================================
+// 
+// These functions provide explicit translation between physical and virtual
+// addresses. Currently the kernel uses identity mapping (VA == PA), but having
+// these functions:
+// 1. Makes the code explicit about which addresses are physical vs virtual
+// 2. Allows future migration to non-identity-mapped kernel
+// 3. Ensures correct behavior regardless of active TTBR0 page tables
+
+/// Convert a physical address to a kernel-accessible virtual address
+/// 
+/// For identity-mapped memory regions, this returns the same address.
+/// This should be used whenever dereferencing a physical address returned
+/// by PMM or stored in page table entries.
+#[inline(always)]
+pub fn phys_to_virt(paddr: usize) -> *mut u8 {
+    // Identity mapping: VA == PA for kernel memory (0x40000000+)
+    // The kernel has this mapped as 1GB blocks at L1[1] and L1[2]
+    paddr as *mut u8
+}
+
+/// Convert a kernel virtual address to a physical address
+///
+/// For identity-mapped memory regions, this returns the same address.
+/// This should be used when passing addresses to hardware (DMA, VirtIO)
+/// or when storing addresses in page table entries.
+#[inline(always)]
+pub fn virt_to_phys(vaddr: usize) -> usize {
+    // Identity mapping: PA == VA for kernel memory
+    vaddr
+}
+
 /// Invalidate all TLB entries
 pub fn flush_tlb_all() {
     unsafe {
@@ -270,14 +304,15 @@ impl UserAddressSpace {
         self.page_table_frames.push(l1_frame);
         
         // Set L0[0] to point to L1
-        let l0_ptr = self.l0_frame.addr as *mut u64;
+        // Use phys_to_virt to get a kernel VA for the physical page table address
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
         unsafe {
             let l1_entry = (l1_frame.addr as u64) | flags::VALID | flags::TABLE;
             core::ptr::write_volatile(l0_ptr, l1_entry);
         }
         
         // Set up L1 entries
-        let l1_ptr = l1_frame.addr as *mut u64;
+        let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
         
         // L1[0]: Leave unmapped (or map for device access at 2MB granularity later)
         // User code at 0x400000 will be mapped with 4KB pages via map_page()
@@ -298,7 +333,7 @@ impl UserAddressSpace {
         // Each L2 entry covers 2MB (0x200000)
         // GIC at 0x08000000 = L2 index 64
         // UART at 0x09000000 = L2 index 72
-        let l2_ptr = l2_frame.addr as *mut u64;
+        let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
         let device_block_flags = flags::VALID | flags::BLOCK | flags::AF 
             | attr_index(MAIR_DEVICE_NGNRNE)
             | flags::PXN | flags::UXN | flags::SH_OUTER;
@@ -360,16 +395,16 @@ impl UserAddressSpace {
         let l2_idx = (va >> 21) & 0x1FF;
         let l3_idx = (va >> 12) & 0x1FF;
 
-        // Walk/create page tables
-        let l0_ptr = self.l0_frame.addr as *mut u64;
+        // Walk/create page tables (use phys_to_virt for all PA->pointer conversions)
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
         let l1_frame = self.get_or_create_table(l0_ptr, l0_idx)?;
-        let l1_ptr = l1_frame.addr as *mut u64;
+        let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
 
         let l2_frame = self.get_or_create_table(l1_ptr, l1_idx)?;
-        let l2_ptr = l2_frame.addr as *mut u64;
+        let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
 
         let l3_frame = self.get_or_create_table(l2_ptr, l2_idx)?;
-        let l3_ptr = l3_frame.addr as *mut u64;
+        let l3_ptr = phys_to_virt(l3_frame.addr) as *mut u64;
 
         // Create L3 entry (4KB page descriptor)
         let entry = (pa as u64)
@@ -449,25 +484,28 @@ impl UserAddressSpace {
         let l3_idx = (va >> 12) & 0x1FF;
 
         unsafe {
-            let l0_ptr = self.l0_frame.addr as *mut u64;
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
             let l0_entry = l0_ptr.add(l0_idx).read_volatile();
             if l0_entry & flags::VALID == 0 {
                 return Ok(()); // Not mapped
             }
 
-            let l1_ptr = (l0_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+            let l1_addr = (l0_entry & 0x0000_FFFF_FFFF_F000) as usize;
+            let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
             let l1_entry = l1_ptr.add(l1_idx).read_volatile();
             if l1_entry & flags::VALID == 0 {
                 return Ok(());
             }
 
-            let l2_ptr = (l1_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+            let l2_addr = (l1_entry & 0x0000_FFFF_FFFF_F000) as usize;
+            let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
             let l2_entry = l2_ptr.add(l2_idx).read_volatile();
             if l2_entry & flags::VALID == 0 {
                 return Ok(());
             }
 
-            let l3_ptr = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+            let l3_addr = (l2_entry & 0x0000_FFFF_FFFF_F000) as usize;
+            let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
             l3_ptr.add(l3_idx).write_volatile(0);
         }
 
@@ -582,15 +620,16 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
     let l3_idx = (va >> 12) & 0x1FF;
     
     // Walk the page tables, creating entries as needed
-    let l0_ptr = l0_addr as *mut u64;
+    // All PA->pointer conversions go through phys_to_virt
+    let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
     let l1_addr = get_or_create_table(l0_ptr, l0_idx);
-    let l1_ptr = l1_addr as *mut u64;
+    let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
     
     let l2_addr = get_or_create_table(l1_ptr, l1_idx);
-    let l2_ptr = l2_addr as *mut u64;
+    let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
     
     let l3_addr = get_or_create_table(l2_ptr, l2_idx);
-    let l3_ptr = l3_addr as *mut u64;
+    let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
     
     // Create L3 entry (4KB page descriptor)
     let entry = (pa as u64)
@@ -614,19 +653,22 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
     );
 }
 
-/// Get or create a page table entry, returning the next level table address
+/// Get or create a page table entry, returning the next level table physical address
+/// 
+/// Note: The returned address is a PHYSICAL address. Callers must use phys_to_virt()
+/// before dereferencing it.
 unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> usize {
     let entry = table_ptr.add(idx).read_volatile();
     
     if entry & flags::VALID != 0 {
-        // Entry exists, extract address
+        // Entry exists, extract physical address
         (entry & 0x0000_FFFF_FFFF_F000) as usize
     } else {
         // Need to allocate a new page table
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
             table_ptr.add(idx).write_volatile(new_entry);
-            frame.addr
+            frame.addr  // Return physical address
         } else {
             // Allocation failed - this is bad, but return 0
             0

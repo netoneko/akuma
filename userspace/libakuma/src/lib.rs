@@ -231,7 +231,7 @@ mod allocator {
         }
 
         unsafe fn mmap_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            // Allocate new
+            // Allocate new buffer
             let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
@@ -242,12 +242,10 @@ mod allocator {
                 return ptr::null_mut();
             }
             
-            // Copy old data
-            if !ptr.is_null() {
+            // Copy old data to new buffer
+            if !ptr.is_null() && layout.size() > 0 {
                 let copy_size = layout.size().min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-                // Skip dealloc - munmap is currently a no-op anyway
-                // self.mmap_dealloc(ptr, layout);
             }
             
             new_ptr

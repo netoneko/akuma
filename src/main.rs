@@ -180,28 +180,34 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         halt();
     }
 
+    // Initialize allocator first (uses talc until PMM is ready)
     if let Err(e) = allocator::init(heap_start, heap_size) {
         console::print("Allocator init failed: ");
         console::print(e);
         console::print("\n");
         halt();
     }
+    console::print("Allocator initialized (talc mode)\n");
 
-    console::print(&alloc::format!("Heap initialized: {} MB\n", heap_size / 1024 / 1024));
+    // Initialize Physical Memory Manager
+    // After this, the allocator can switch to page-based allocation
+    let kernel_end = heap_start + heap_size;
+    console::print("Initializing PMM...\n");
+    pmm::init(ram_base, ram_size, kernel_end);
+    
+    // Signal that PMM is ready - allocator will switch to page mode
+    allocator::mark_pmm_ready();
+    console::print("PMM initialized, allocator switched to page mode\n");
 
     // Initialize MMU with identity mapping for kernel
     console::print("Initializing MMU...\n");
     mmu::init(ram_base, ram_size);
     console::print("MMU enabled with identity mapping\n");
 
-    // Initialize Physical Memory Manager
-    // Kernel uses: ram_base to heap_start + heap_size
-    let kernel_end = heap_start + heap_size;
-    console::print("Initializing PMM...\n");
-    pmm::init(ram_base, ram_size, kernel_end);
+    // Print PMM stats (now that allocator is ready for format!)
     let (total, allocated, free) = pmm::stats();
     console::print(&alloc::format!(
-        "PMM initialized: {} total pages, {} allocated, {} free\n",
+        "PMM stats: {} total pages, {} allocated, {} free\n",
         total, allocated, free
     ));
 

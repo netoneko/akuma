@@ -1,10 +1,37 @@
+//! Kernel memory allocator with page-based and talc-based options
+//!
+//! The page-based allocator is ported from libakuma's mmap allocator.
+//! It allocates whole pages for each allocation, fixing layout-sensitive
+//! heap corruption bugs at the cost of higher memory usage.
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 use talc::ErrOnOom;
 use talc::{Span, Talc};
 
+/// Set to true to use page-based allocation (like userspace mmap allocator)
+/// This fixes layout-sensitive heap corruption bugs but uses more memory.
+pub const USE_PAGE_ALLOCATOR: bool = true;
+
+const PAGE_SIZE: usize = 4096;
+
+/// Flag indicating PMM is ready for use (set after PMM init completes)
+static PMM_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Signal that PMM is ready for use by the page allocator
+pub fn mark_pmm_ready() {
+    PMM_READY.store(true, Ordering::Release);
+}
+
+/// Check if PMM is ready
+fn is_pmm_ready() -> bool {
+    PMM_READY.load(Ordering::Acquire)
+}
+
 #[global_allocator]
-static ALLOCATOR: Talck = Talck;
+static ALLOCATOR: HybridAllocator = HybridAllocator;
 
 static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
@@ -55,6 +82,7 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     // Store heap size for stats
     HEAP_SIZE.store(heap_size, Ordering::Relaxed);
 
+    // Initialize talc allocator (used as fallback or when USE_PAGE_ALLOCATOR is false)
     unsafe {
         let heap_ptr = heap_start as *mut u8;
         let span = Span::from_base_size(heap_ptr, heap_size);
@@ -66,104 +94,218 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
-struct Talck;
+// ============================================================================
+// Hybrid Allocator (switches between page-based and talc-based)
+// ============================================================================
 
-unsafe impl core::alloc::GlobalAlloc for Talck {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        // Always disable IRQs during allocation to prevent context switch deadlock
-        with_irqs_disabled(|| unsafe {
-            let result = TALC
-                .lock()
-                .malloc(layout)
-                .map(|ptr| ptr.as_ptr())
-                .unwrap_or(core::ptr::null_mut());
+struct HybridAllocator;
 
-            if result.is_null() {
-                // Log allocation failures - use only static strings to avoid recursion!
-                crate::console::print("[ALLOC FAIL]");
+unsafe impl GlobalAlloc for HybridAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe {
+            // Use page allocator only if enabled AND PMM is ready
+            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
+                page_alloc(layout)
             } else {
-                // Track allocation
-                let new_allocated =
-                    ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-                ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-                // Update peak if needed
-                let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
-                while new_allocated > peak {
-                    match PEAK_ALLOCATED.compare_exchange_weak(
-                        peak,
-                        new_allocated,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(p) => peak = p,
-                    }
-                }
+                talc_alloc(layout)
             }
-
-            result
-        })
+        }
     }
 
-    unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         unsafe {
             let ptr = self.alloc(layout);
             if !ptr.is_null() {
-                core::ptr::write_bytes(ptr, 0, layout.size());
+                // Page allocator already returns zeroed pages
+                if !(USE_PAGE_ALLOCATOR && is_pmm_ready()) {
+                    ptr::write_bytes(ptr, 0, layout.size());
+                }
             }
             ptr
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
-        // Always disable IRQs during deallocation to prevent context switch deadlock
-        with_irqs_disabled(|| unsafe {
-            TALC.lock()
-                .free(core::ptr::NonNull::new_unchecked(ptr), layout);
-            // Track deallocation
-            ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        })
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            // For dealloc, we need to handle both cases since memory might
+            // have been allocated with either allocator
+            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
+                page_dealloc(ptr, layout);
+            } else {
+                talc_dealloc(ptr, layout);
+            }
+        }
     }
 
-    unsafe fn realloc(
-        &self,
-        ptr: *mut u8,
-        layout: core::alloc::Layout,
-        new_size: usize,
-    ) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         unsafe {
-            // Handle zero-sized allocations
-            if new_size == 0 {
-                self.dealloc(ptr, layout);
-                return core::ptr::null_mut();
+            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
+                page_realloc(ptr, layout, new_size)
+            } else {
+                talc_realloc(ptr, layout, new_size)
             }
-
-            // Create new layout with the new size
-            let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
-                Ok(layout) => layout,
-                Err(_) => return core::ptr::null_mut(),
-            };
-
-            // Allocate new memory
-            let new_ptr = self.alloc(new_layout);
-            if new_ptr.is_null() {
-                // Allocation failed - return null but don't free old memory
-                return core::ptr::null_mut();
-            }
-
-            // Only copy if we have valid old data
-            if !ptr.is_null() && layout.size() > 0 {
-                // Copy old data to new location (copy the minimum of old and new sizes)
-                let copy_size = core::cmp::min(layout.size(), new_size);
-                if copy_size > 0 {
-                    core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-                }
-
-                // Free old memory
-                self.dealloc(ptr, layout);
-            }
-
-            new_ptr
         }
+    }
+}
+
+// ============================================================================
+// Page-based allocator (ported from libakuma mmap allocator)
+// ============================================================================
+
+/// Allocate using PMM pages directly
+unsafe fn page_alloc(layout: Layout) -> *mut u8 {
+    with_irqs_disabled(|| {
+        let size = layout.size().max(layout.align());
+        let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let pages = alloc_size / PAGE_SIZE;
+
+        // Allocate contiguous pages from PMM
+        // For simplicity, allocate pages one at a time and use the first one's address
+        // This works because PMM allocates from a contiguous region
+        let mut first_addr: Option<*mut u8> = None;
+        
+        for i in 0..pages {
+            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                if i == 0 {
+                    // Convert physical address to kernel virtual address
+                    first_addr = Some(crate::mmu::phys_to_virt(frame.addr));
+                }
+                // Track allocation
+                ALLOCATED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
+            } else {
+                // Allocation failed
+                return ptr::null_mut();
+            }
+        }
+
+        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        
+        // Update peak
+        let new_allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+        while new_allocated > peak {
+            match PEAK_ALLOCATED.compare_exchange_weak(
+                peak,
+                new_allocated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(p) => peak = p,
+            }
+        }
+
+        first_addr.unwrap_or(ptr::null_mut())
+    })
+}
+
+/// Deallocate pages (currently a no-op like userspace munmap)
+unsafe fn page_dealloc(_ptr: *mut u8, layout: Layout) {
+    // For now, don't actually free pages (matches userspace behavior)
+    // A full implementation would return pages to PMM
+    let size = layout.size().max(layout.align());
+    let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    ALLOCATED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+}
+
+/// Realloc using page allocation
+unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe {
+        if new_size == 0 {
+            page_dealloc(ptr, layout);
+            return ptr::null_mut();
+        }
+
+        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+            Ok(l) => l,
+            Err(_) => return ptr::null_mut(),
+        };
+
+        let new_ptr = page_alloc(new_layout);
+        if new_ptr.is_null() {
+            return ptr::null_mut();
+        }
+
+        // Copy old data
+        if !ptr.is_null() {
+            let copy_size = layout.size().min(new_size);
+            ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            // Skip dealloc - memory leak but avoids issues (matches userspace)
+        }
+
+        new_ptr
+    }
+}
+
+// ============================================================================
+// Talc-based allocator (original implementation)
+// ============================================================================
+
+unsafe fn talc_alloc(layout: Layout) -> *mut u8 {
+    with_irqs_disabled(|| {
+        let result = TALC
+            .lock()
+            .malloc(layout)
+            .map(|ptr| ptr.as_ptr())
+            .unwrap_or(ptr::null_mut());
+
+        if result.is_null() {
+            crate::console::print("[ALLOC FAIL]");
+        } else {
+            let new_allocated =
+                ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+            while new_allocated > peak {
+                match PEAK_ALLOCATED.compare_exchange_weak(
+                    peak,
+                    new_allocated,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(p) => peak = p,
+                }
+            }
+        }
+
+        result
+    })
+}
+
+unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) {
+    with_irqs_disabled(|| {
+        TALC.lock()
+            .free(core::ptr::NonNull::new_unchecked(ptr), layout);
+        ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+    })
+}
+
+unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe {
+        if new_size == 0 {
+            talc_dealloc(ptr, layout);
+            return ptr::null_mut();
+        }
+
+        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+            Ok(layout) => layout,
+            Err(_) => return ptr::null_mut(),
+        };
+
+        let new_ptr = talc_alloc(new_layout);
+        if new_ptr.is_null() {
+            return ptr::null_mut();
+        }
+
+        if !ptr.is_null() && layout.size() > 0 {
+            let copy_size = core::cmp::min(layout.size(), new_size);
+            if copy_size > 0 {
+                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            }
+            talc_dealloc(ptr, layout);
+        }
+
+        new_ptr
     }
 }

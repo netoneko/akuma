@@ -282,7 +282,9 @@ impl VirtioRngDevice {
         fence(Ordering::SeqCst);
 
         // Set queue PFN (page frame number) - legacy mode
-        let queue_pfn = (queue_mem as usize) / PAGE_SIZE;
+        // VirtIO needs the physical address for DMA
+        let queue_phys = crate::mmu::virt_to_phys(queue_mem as usize);
+        let queue_pfn = queue_phys / PAGE_SIZE;
         unsafe {
             write_volatile((base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32, queue_pfn as u32);
         }
@@ -336,10 +338,11 @@ impl VirtioRngDevice {
             let to_read = core::cmp::min(256, buf.len() - bytes_read);
 
             // Set up descriptor for device-writable buffer
+            // VirtIO descriptor needs physical address for DMA
             let desc_idx = 0u16;
             unsafe {
                 let d = &mut *self.desc.add(desc_idx as usize);
-                d.addr = self.buffer as u64;
+                d.addr = crate::mmu::virt_to_phys(self.buffer as usize) as u64;
                 d.len = to_read as u32;
                 d.flags = VIRTQ_DESC_F_WRITE;
                 d.next = 0;
