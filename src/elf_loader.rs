@@ -13,6 +13,10 @@ use elf::ElfBytes;
 use crate::mmu::{user_flags, PageTable, UserAddressSpace, PAGE_SIZE};
 use crate::pmm::{self, PhysFrame};
 
+/// Enable debug output for ELF loading
+/// Set to false to reduce boot verbosity
+pub const DEBUG_ELF_LOADING: bool = true;
+
 /// Result of loading an ELF binary
 pub struct LoadedElf {
     /// Entry point virtual address
@@ -106,6 +110,16 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
 
+        if DEBUG_ELF_LOADING {
+            crate::console::print(&alloc::format!(
+                "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+                vaddr, filesz, memsz,
+                if flags & PF_R != 0 { "R" } else { "-" },
+                if flags & PF_W != 0 { "W" } else { "-" },
+                if flags & PF_X != 0 { "X" } else { "-" },
+            ));
+        }
+
         // Use appropriate flags based on segment permissions
         // Note: If segment is writable, use RW_NO_EXEC to handle BSS overlaps
         let page_flags = if (flags & PF_X) != 0 {
@@ -171,6 +185,13 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         }
     }
 
+    if DEBUG_ELF_LOADING {
+        crate::console::print(&alloc::format!(
+            "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
+            entry_point, brk, mapped_pages.len()
+        ));
+    }
+
     Ok(LoadedElf {
         entry_point,
         address_space,
@@ -200,17 +221,17 @@ fn flags_to_user_flags(elf_flags: u32) -> u64 {
 /// * `stack_size` - Size of user stack in bytes (default: 64KB)
 ///
 /// # Returns
-/// (entry_point, address_space, initial_stack_pointer, brk)
+/// (entry_point, address_space, initial_stack_pointer, brk, stack_bottom, stack_top)
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
 
-    // Place stack at a fixed address in the first 1GB (user space)
-    // User stack top at 0x3FFF_F000 (just below 1GB mark)
-    // This avoids conflict with kernel RAM mapped at 0x40000000+
-    const STACK_TOP: usize = 0x3FFF_F000;
+    // Place stack at top of first 1GB (user space), after mmap region
+    // Layout: code (0x400000) < mmap (0x10000000-0x3F000000) < stack (0x3F000000-0x40000000)
+    // This keeps everything in the first 1GB where we have fine-grained page table control
+    const STACK_TOP: usize = 0x4000_0000;  // Top of first 1GB
     let stack_bottom = STACK_TOP - stack_size;
 
     // Ensure stack is page-aligned
@@ -224,6 +245,17 @@ pub fn load_elf_with_stack(
             .address_space
             .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
             .map_err(|e| ElfError::MappingFailed(e))?;
+    }
+
+    // Calculate initial SP within mapped region
+    let stack_end = stack_bottom_aligned + stack_pages * PAGE_SIZE;
+    let initial_sp_local = (stack_end - 16) & !0xF;
+    
+    if DEBUG_ELF_LOADING {
+        crate::console::print(&alloc::format!(
+            "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), SP=0x{:x}\n",
+            stack_bottom_aligned, stack_end, stack_pages, initial_sp_local
+        ));
     }
 
     // Pre-allocate heap pages (64KB = 16 pages, unrolled)
@@ -246,14 +278,23 @@ pub fn load_elf_with_stack(
     let _ = loaded.address_space.alloc_and_map(hs + 0xd000, f);
     let _ = loaded.address_space.alloc_and_map(hs + 0xe000, f);
     let _ = loaded.address_space.alloc_and_map(hs + 0xf000, f);
+
+    if DEBUG_ELF_LOADING {
+        crate::console::print(&alloc::format!(
+            "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs
+        ));
+    }
+
     // The allocator expects brk(0) to return current brk, then allocates FROM that address.
     // So we need to set brk to the heap START so allocator uses the pre-mapped pages.
     // The kernel's sys_brk will update the brk when allocator calls brk(new_value).
 
-    // Stack pointer starts at top (grows down)
+    // Stack pointer starts at top of MAPPED region (grows down)
+    // STACK_TOP is the first address ABOVE the stack, so we subtract to get within mapped pages
     // Align to 16 bytes as required by AArch64 ABI
-    let initial_sp = STACK_TOP & !0xF;
+    let stack_end = stack_bottom_aligned + stack_pages * PAGE_SIZE;
+    let initial_sp = (stack_end - 16) & !0xF;
 
-    // Return hs (heap start) - allocator will allocate from here and call brk() to extend
-    Ok((loaded.entry_point, loaded.address_space, initial_sp, hs))
+    // Return: entry, address_space, initial_sp, brk, stack_bottom, stack_top
+    Ok((loaded.entry_point, loaded.address_space, initial_sp, hs, stack_bottom_aligned, stack_end))
 }

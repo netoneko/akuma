@@ -25,6 +25,57 @@ static PROGRAM_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// Initial program break set when process is loaded
 static INITIAL_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Per-process mmap tracking
+static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static MMAP_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static STACK_BOTTOM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static STACK_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Initialize memory tracking for a new process
+pub fn init_process_memory(memory: &ProcessMemory) {
+    use core::sync::atomic::Ordering;
+    NEXT_MMAP_ADDR.store(memory.next_mmap, Ordering::SeqCst);
+    MMAP_LIMIT.store(memory.mmap_limit, Ordering::SeqCst);
+    STACK_BOTTOM.store(memory.stack_bottom, Ordering::SeqCst);
+    STACK_TOP.store(memory.stack_top, Ordering::SeqCst);
+}
+
+/// Allocate mmap region for current process
+/// Returns the address or 0 on failure
+pub fn alloc_mmap(size: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    
+    let addr = NEXT_MMAP_ADDR.fetch_add(size, Ordering::SeqCst);
+    let limit = MMAP_LIMIT.load(Ordering::SeqCst);
+    let stack_bottom = STACK_BOTTOM.load(Ordering::SeqCst);
+    
+    // Check bounds
+    if addr + size > limit {
+        console::print(&alloc::format!(
+            "[mmap] REJECT: 0x{:x}+0x{:x} > limit 0x{:x}\n",
+            addr, size, limit
+        ));
+        return 0;
+    }
+    
+    // Check stack overlap
+    if addr + size > stack_bottom {
+        console::print(&alloc::format!(
+            "[mmap] REJECT: 0x{:x}+0x{:x} overlaps stack at 0x{:x}\n",
+            addr, size, stack_bottom
+        ));
+        return 0;
+    }
+    
+    addr
+}
+
+/// Get stack bounds for validation
+pub fn get_stack_bounds() -> (usize, usize) {
+    use core::sync::atomic::Ordering;
+    (STACK_BOTTOM.load(Ordering::SeqCst), STACK_TOP.load(Ordering::SeqCst))
+}
+
 /// Initialize the program break for a new process
 pub fn init_brk(initial_brk: usize) {
     use core::sync::atomic::Ordering;
@@ -149,6 +200,60 @@ impl UserContext {
     }
 }
 
+/// Memory regions for a process
+#[derive(Debug, Clone)]
+pub struct ProcessMemory {
+    /// Code/data region end (start of heap)
+    pub code_end: usize,
+    /// Current program break (heap grows up from here)
+    pub brk: usize,
+    /// Stack bottom (lowest mapped stack address)
+    pub stack_bottom: usize,
+    /// Stack top (highest mapped stack address + 1)
+    pub stack_top: usize,
+    /// Next mmap address (mmap region between code_end and stack_bottom)
+    pub next_mmap: usize,
+    /// Mmap region limit (must stay below this)
+    pub mmap_limit: usize,
+}
+
+impl ProcessMemory {
+    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize) -> Self {
+        // Mmap region: from 0x10000000 up to (stack_bottom - 1MB buffer)
+        // Stack is at top of first 1GB (0x3FFF0000-0x40000000 for 64KB stack)
+        let mmap_start = 0x1000_0000;
+        let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
+        
+        Self {
+            code_end,
+            brk: code_end,
+            stack_bottom,
+            stack_top,
+            next_mmap: mmap_start,
+            mmap_limit,
+        }
+    }
+    
+    /// Check if an address range overlaps with stack
+    pub fn overlaps_stack(&self, addr: usize, size: usize) -> bool {
+        let end = addr.saturating_add(size);
+        addr < self.stack_top && end > self.stack_bottom
+    }
+    
+    /// Allocate mmap region, returns None if would overlap stack
+    pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
+        let addr = self.next_mmap;
+        let end = addr.checked_add(size)?;
+        
+        if end > self.mmap_limit {
+            return None; // Would get too close to stack
+        }
+        
+        self.next_mmap = end;
+        Some(addr)
+    }
+}
+
 /// A user process
 pub struct Process {
     /// Process ID
@@ -165,16 +270,26 @@ pub struct Process {
     pub parent_pid: Pid,
     /// Initial program break (end of loaded segments, start of heap)
     pub brk: usize,
+    /// Memory regions tracking
+    pub memory: ProcessMemory,
 }
 
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack and pre-allocated heap
-        let (entry_point, address_space, stack_pointer, brk) =
+        let (entry_point, address_space, stack_pointer, brk, stack_bottom, stack_top) =
             elf_loader::load_elf_with_stack(elf_data, 64 * 1024)?; // 64KB stack
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        
+        // Initialize per-process memory tracking
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        
+        console::print(&alloc::format!(
+            "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit
+        ));
 
         Ok(Self {
             pid,
@@ -184,6 +299,7 @@ impl Process {
             context: UserContext::new(entry_point, stack_pointer),
             parent_pid: 0,
             brk,
+            memory,
         })
     }
 
@@ -211,6 +327,9 @@ impl Process {
 
         // Reset exit state before starting
         crate::syscall::reset_exit_state();
+        
+        // Initialize per-process memory tracking (mmap, stack bounds)
+        init_process_memory(&self.memory);
         
         // Initialize the program break for heap allocation
         init_brk(self.brk);

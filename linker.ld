@@ -32,6 +32,7 @@ SECTIONS
     }
     
     /* Main kernel code */
+    _text_start = .;
     .text : {
         *(.text .text.*)
     }
@@ -40,11 +41,19 @@ SECTIONS
     .text.exceptions : ALIGN(0x800) {
         *(.text.exceptions)
     }
+    _text_end = .;
     
+    /* Read-only data - page align for separate protection */
+    . = ALIGN(0x1000);
+    _rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     }
+    _rodata_end = .;
     
+    /* Writable data - page align for separate protection */
+    . = ALIGN(0x1000);
+    _data_start = .;
     .data : {
         *(.data .data.*)
     }
@@ -54,6 +63,7 @@ SECTIONS
         *(.bss .bss.*)
         __bss_end = .;
     }
+    _data_end = .;
     
     /* Boot BSS - at physical address but after main BSS */
     .bss.boot : {

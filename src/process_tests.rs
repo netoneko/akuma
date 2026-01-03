@@ -16,11 +16,57 @@ pub fn run_all_tests() {
     // test_echo2();
     console::print("[Test] echo2 test SKIPPED (disabled for debugging)\n");
 
-    // DISABLED: stdcheck fails due to layout-sensitive heap corruption bug
-    // test_stdcheck();
-    console::print("[Test] stdcheck test SKIPPED (debugging heap corruption)\n");
+    // Minimal ELF loading verification (run before stdcheck)
+    test_elftest();
+
+    // Test stdcheck with mmap allocator
+    test_stdcheck();
 
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// Test minimal ELF loading with elftest binary
+/// 
+/// This is the simplest possible test - if the binary runs and exits with
+/// code 42, ELF loading is working correctly.
+fn test_elftest() {
+    const ELFTEST_PATH: &str = "/bin/elftest";
+
+    match fs::read_file(ELFTEST_PATH) {
+        Ok(data) => {
+            console::print(&format!(
+                "[Test] Found {} ({} bytes), verifying ELF loading...\n",
+                ELFTEST_PATH,
+                data.len()
+            ));
+
+            match process::Process::from_elf("elftest", &data) {
+                Ok(mut proc) => {
+                    // Execute the process
+                    let exit_code = proc.execute();
+                    
+                    // elftest exits with code 42 on success
+                    if exit_code == 42 {
+                        console::print("[Test] elftest PASSED (ELF loading verified)\n");
+                    } else {
+                        console::print(&format!(
+                            "[Test] elftest FAILED: expected exit code 42, got {}\n",
+                            exit_code
+                        ));
+                    }
+                }
+                Err(e) => {
+                    console::print(&format!("[Test] Failed to load elftest: {}\n", e));
+                }
+            }
+        }
+        Err(_) => {
+            console::print(&format!(
+                "[Test] {} not found, skipping ELF loading test\n",
+                ELFTEST_PATH
+            ));
+        }
+    }
 }
 
 /// Test the stdcheck binary if it exists (tests mmap allocator)

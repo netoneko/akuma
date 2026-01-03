@@ -203,6 +203,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Initializing MMU...\n");
     mmu::init(ram_base, ram_size);
     console::print("MMU enabled with identity mapping\n");
+    
+    // Log kernel section boundaries (for future read-only protection)
+    mmu::protect_kernel_code();
 
     // Print PMM stats (now that allocator is ready for format!)
     let (total, allocated, free) = pmm::stats();

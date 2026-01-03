@@ -61,15 +61,10 @@ fn sys_brk(new_brk: usize) -> u64 {
     }
 }
 
-/// Next mmap address (simple bump allocator for mmap regions)
-/// Starts at 0x10000000 to be well away from code (0x400000) and stack (0x3FFFF000)
-static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = 
-    core::sync::atomic::AtomicUsize::new(0x10000000);
-
 /// sys_mmap - Map memory pages
 /// 
-/// Simplified implementation: ignores addr hint, prot, and flags.
-/// Just allocates pages at the next available mmap address.
+/// Uses per-process mmap allocation from process module.
+/// Checks for stack overlap.
 fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
     use crate::mmu::user_flags;
     use crate::pmm;
@@ -85,12 +80,11 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
     let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     let size = pages * PAGE_SIZE;
     
-    // Get the next mmap address (ignore addr hint for simplicity)
+    // Get the next mmap address from per-process tracking
     let _ = addr; // Unused for now
-    let mmap_addr = NEXT_MMAP_ADDR.fetch_add(size, Ordering::SeqCst);
+    let mmap_addr = crate::process::alloc_mmap(size);
     
-    // Sanity check - don't go past 0x3F000000 (near stack)
-    if mmap_addr + size > 0x3F000000 {
+    if mmap_addr == 0 {
         return MAP_FAILED;
     }
     

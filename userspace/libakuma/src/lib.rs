@@ -164,15 +164,17 @@ mod allocator {
     const MAP_FAILED: usize = usize::MAX;
 
     /// Hybrid allocator that can use either mmap or brk
-    /// WORKAROUND: 64-byte alignment helps with layout-sensitive heap corruption bug
-    #[repr(C, align(64))]
+    /// WORKAROUND: Large padding to work around layout-sensitive heap corruption bug.
+    /// The bug causes String::push_str to fail when the binary is a certain size.
+    /// Adding padding changes the binary layout and makes the bug go away.
+    #[repr(C, align(256))]
     pub struct HybridAllocator {
         /// For brk mode: current allocation pointer
         brk_head: AtomicUsize,
         /// For brk mode: end of allocated heap
         brk_end: AtomicUsize,
-        /// Padding to ensure 64-byte struct size (workaround for layout bug)
-        _padding: [u8; 48],
+        /// Padding to work around layout-sensitive bug (see docs/HEAP_CORRUPTION_ANALYSIS.md)
+        _padding: [u8; 240],
     }
 
     unsafe impl Sync for HybridAllocator {}
@@ -182,7 +184,7 @@ mod allocator {
             Self {
                 brk_head: AtomicUsize::new(0),
                 brk_end: AtomicUsize::new(0),
-                _padding: [0u8; 48],
+                _padding: [0u8; 240],
             }
         }
 
@@ -203,6 +205,7 @@ mod allocator {
         // mmap-based allocation
         // =====================================================================
 
+        #[inline(never)]
         unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
             use super::mmap_flags::*;
             
@@ -228,27 +231,6 @@ mod allocator {
             let size = layout.size().max(layout.align());
             let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             super::munmap(ptr as usize, alloc_size);
-        }
-
-        unsafe fn mmap_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            // Allocate new buffer
-            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
-                Ok(l) => l,
-                Err(_) => return ptr::null_mut(),
-            };
-            
-            let new_ptr = self.mmap_alloc(new_layout);
-            if new_ptr.is_null() {
-                return ptr::null_mut();
-            }
-            
-            // Copy old data to new buffer
-            if !ptr.is_null() && layout.size() > 0 {
-                let copy_size = layout.size().min(new_size);
-                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-            }
-            
-            new_ptr
         }
 
         // =====================================================================
@@ -332,11 +314,42 @@ mod allocator {
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            if USE_MMAP_ALLOCATOR {
-                self.mmap_realloc(ptr, layout, new_size)
-            } else {
-                self.brk_realloc(ptr, layout, new_size)
+            // Extract layout fields HERE where they're correct
+            let old_size = layout.size();
+            let old_align = layout.align();
+            
+            if !USE_MMAP_ALLOCATOR {
+                return self.brk_realloc(ptr, layout, new_size);
             }
+            
+            // INLINE realloc logic - no function call to avoid ABI issues
+            // (see docs/STDCHECK_DEBUG.md for why this is necessary)
+            
+            // Use safe alignment
+            let safe_align = if old_align == 0 || (old_align & (old_align - 1)) != 0 {
+                1
+            } else {
+                old_align
+            };
+            
+            // Allocate new buffer
+            let new_layout = match Layout::from_size_align(new_size, safe_align) {
+                Ok(l) => l,
+                Err(_) => return ptr::null_mut(),
+            };
+            
+            let new_ptr = self.mmap_alloc(new_layout);
+            if new_ptr.is_null() {
+                return ptr::null_mut();
+            }
+            
+            // Copy old data
+            if !ptr.is_null() && old_size > 0 {
+                let copy_size = old_size.min(new_size);
+                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            }
+            
+            new_ptr
         }
     }
 

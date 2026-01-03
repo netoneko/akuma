@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libakuma",
     "echo2",
+    "elftest",
     "stdcheck",
 ]
 

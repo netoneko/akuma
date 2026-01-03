@@ -676,3 +676,50 @@ unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> usize {
     }
 }
 
+// ============================================================================
+// Kernel Memory Protection
+// ============================================================================
+
+unsafe extern "C" {
+    static _text_start: u8;
+    static _text_end: u8;
+    static _rodata_start: u8;
+    static _rodata_end: u8;
+    static _data_start: u8;
+    static _data_end: u8;
+    static _kernel_phys_end: u8;
+}
+
+/// Protect kernel code by marking it read-only
+/// 
+/// This should be called after boot when the kernel is running normally.
+/// Currently uses the boot page tables which have 1GB block mappings,
+/// so we can't do fine-grained protection without switching to 4KB pages.
+/// 
+/// For now, this function just logs the section boundaries.
+/// A full implementation would need to:
+/// 1. Allocate L2/L3 page tables for the kernel region
+/// 2. Remap kernel .text as read-only + executable
+/// 3. Remap kernel .rodata as read-only + no-execute
+/// 4. Remap kernel .data/.bss as read-write + no-execute
+pub fn protect_kernel_code() {
+    let text_start = unsafe { &_text_start as *const u8 as usize };
+    let text_end = unsafe { &_text_end as *const u8 as usize };
+    let rodata_start = unsafe { &_rodata_start as *const u8 as usize };
+    let rodata_end = unsafe { &_rodata_end as *const u8 as usize };
+    let data_start = unsafe { &_data_start as *const u8 as usize };
+    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+    
+    crate::console::print(&alloc::format!(
+        "[MMU] Kernel sections:\n  .text:   0x{:08x}-0x{:08x} ({} KB)\n  .rodata: 0x{:08x}-0x{:08x} ({} KB)\n  .data:   0x{:08x}-0x{:08x} ({} KB)\n",
+        text_start, text_end, (text_end - text_start) / 1024,
+        rodata_start, rodata_end, (rodata_end - rodata_start) / 1024,
+        data_start, kernel_end, (kernel_end - data_start) / 1024,
+    ));
+    
+    // TODO: Implement fine-grained page table protection
+    // For now, the boot stack fix (placing stack at 0x42000000) prevents
+    // stack from overwriting kernel code, but the code is still writable.
+    crate::console::print("[MMU] Note: Kernel code protection not yet implemented (uses 1GB block mappings)\n");
+}
+

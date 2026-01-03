@@ -23,6 +23,7 @@ global_asm!(
 // Constants
 .equ KERNEL_PHYS_BASE,  0x40000000
 .equ STACK_SIZE,        0x100000        // 1MB stack
+.equ STACK_TOP,         0x42000000      // 32MB from kernel base (end of Code+Stack region)
 
 // Page table constants
 .equ PAGE_SIZE,         4096
@@ -52,8 +53,9 @@ _boot:
     isb
     
     // Set up early stack (physical address)
-    ldr     x0, =KERNEL_PHYS_BASE
-    add     x0, x0, #STACK_SIZE
+    // Place at top of Code+Stack region (32MB from kernel base)
+    // This ensures stack is well above the ~3MB kernel binary
+    ldr     x0, =STACK_TOP
     mov     sp, x0
     
     // Set up page tables
