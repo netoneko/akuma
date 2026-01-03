@@ -1,6 +1,6 @@
 # Identity Mapping Dependencies
 
-This document catalogs places in the kernel that rely on **physical == virtual address identity mapping** and would break if that assumption is removed.
+This document catalogs places in the kernel that rely on **physical == virtual address identity mapping** and documents the translation functions used to make this explicit.
 
 ## Current Memory Model
 
@@ -12,252 +12,147 @@ The kernel uses identity mapping set up at boot time:
 | L1[1] | 0x40000000 - 0x7FFFFFFF | RAM block 1 |
 | L1[2] | 0x80000000 - 0xBFFFFFFF | RAM block 2 |
 
-This allows the kernel to use physical addresses directly as pointers.
+This allows the kernel to use physical addresses directly as pointers via translation functions.
 
-## Why This Matters
+## Translation Functions
 
-If you ever:
-- Move the kernel to the high half (TTBR1 with `0xFFFF_xxxx` addresses)
-- Remove identity mapping for certain regions
-- Allocate memory outside the identity-mapped range
-- Enable KASLR (kernel address space layout randomization)
+The kernel provides explicit translation functions in `src/mmu.rs`:
 
-You will need to introduce proper `phys_to_virt()` and `virt_to_phys()` translation functions.
+```rust
+/// Physical to virtual address translation
+pub fn phys_to_virt(paddr: usize) -> *mut u8 {
+    // Identity mapping: VA == PA for kernel memory (0x40000000+)
+    paddr as *mut u8
+}
+
+/// Virtual to physical address translation
+pub fn virt_to_phys(vaddr: usize) -> usize {
+    // Identity mapping: PA == VA for kernel memory
+    vaddr
+}
+```
+
+These functions currently implement identity mapping but provide a single point of change if the memory model is updated in the future.
 
 ---
 
-## Issue Catalog
+## Status: ✅ All Issues Fixed
 
-### 1. PMM `alloc_page_zeroed()` - High Severity
+All identified physical/virtual address translation issues have been fixed in the codebase. The following sections document where translation functions are used.
 
-**File:** `src/pmm.rs:290-296`
+### 1. PMM `alloc_page_zeroed()` - ✅ Fixed
+
+**File:** `src/pmm.rs:290-316`
 
 ```rust
 pub fn alloc_page_zeroed() -> Option<PhysFrame> {
+    use crate::mmu::phys_to_virt;
+    
     let frame = alloc_page()?;
     unsafe {
-        core::ptr::write_bytes(frame.addr as *mut u8, 0, PAGE_SIZE);  // ⚠️
+        let virt_addr = phys_to_virt(frame.addr);  // ✅ Uses translation
+        core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
+        
+        // Clean data cache for coherency with other VA mappings
+        // ...
     }
     Some(frame)
 }
 ```
 
-**Problem:** Dereferences a physical address (`frame.addr`) directly as a pointer.
+### 2. Kernel Page-Based Allocator - ✅ Fixed
 
-**Fix Required:** Use `phys_to_virt(frame.addr)` before dereferencing.
-
----
-
-### 2. Kernel Page-Based Allocator - High Severity
-
-**File:** `src/allocator.rs:168-197`
+**File:** `src/allocator.rs:168-171`
 
 ```rust
-for i in 0..pages {
-    if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-        if i == 0 {
-            first_addr = Some(frame.addr);  // ⚠️ Physical address stored
-        }
+if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+    if i == 0 {
+        first_addr = Some(crate::mmu::phys_to_virt(frame.addr));  // ✅
     }
 }
-first_addr.map(|a| a as *mut u8).unwrap_or(ptr::null_mut())  // ⚠️ Returned as VA
 ```
 
-**Problem:** Returns a physical address from PMM directly to Rust's global allocator as a usable pointer.
+### 3. ELF Loader Segment Copy - ✅ Fixed
 
-**Fix Required:** Either:
-- Map the physical pages into kernel VA space and return the VA
-- Use `phys_to_virt()` translation
-
----
-
-### 3. ELF Loader Segment Copy - High Severity
-
-**File:** `src/elf_loader.rs:156-159`
+**File:** `src/elf_loader.rs:157-160`
 
 ```rust
 unsafe {
-    let dst = (frame_addr + copy_start) as *mut u8;  // ⚠️
+    let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);  // ✅
     let src = elf_data.as_ptr().add(file_offset);
     core::ptr::copy_nonoverlapping(src, dst, copy_len);
 }
 ```
 
-**Problem:** Copies ELF segment data to a physical frame address directly as a pointer.
-
-**Fix Required:** Use `phys_to_virt(frame_addr)` for the destination pointer.
-
----
-
-### 4. MMU Page Table Manipulation - High Severity
+### 4. MMU Page Table Manipulation - ✅ Fixed
 
 **File:** `src/mmu.rs` (multiple locations)
 
+All page table operations use `phys_to_virt()`:
+
 ```rust
 // In add_kernel_mappings()
-let l0_ptr = self.l0_frame.addr as *mut u64;  // ⚠️
-unsafe {
-    let l1_entry = (l1_frame.addr as u64) | flags::VALID | flags::TABLE;
-    core::ptr::write_volatile(l0_ptr, l1_entry);
-}
+let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;  // ✅
+let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;       // ✅
+let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;       // ✅
+
+// In map_page()
+let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;  // ✅
+let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;       // ✅
+// ... etc
+
+// In unmap_page()
+let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;  // ✅
+let l1_ptr = phys_to_virt(l1_addr) as *mut u64;             // ✅
+// ... etc
 ```
 
-```rust
-// In get_or_create_table() - standalone function
-unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> usize {
-    if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-        let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
-        table_ptr.add(idx).write_volatile(new_entry);
-        frame.addr  // ⚠️ Returns PA, caller uses as VA
-    }
-}
-```
+### 5. VirtIO HAL DMA Allocation - ✅ Fixed
 
-**Problem:** All page table operations use `PhysFrame.addr` directly as pointers.
-
-**Affected functions:**
-- `UserAddressSpace::add_kernel_mappings()`
-- `UserAddressSpace::map_page()`
-- `UserAddressSpace::get_or_create_table()`
-- `UserAddressSpace::unmap_page()`
-- Standalone `get_or_create_table()`
-- Standalone `map_user_page()`
-
-**Fix Required:** All page table accesses need `phys_to_virt()` translation.
-
----
-
-### 5. VirtIO HAL DMA Allocation - Critical Severity
-
-**File:** `src/virtio_hal.rs:17-30`
+**File:** `src/virtio_hal.rs:19-37`
 
 ```rust
 fn dma_alloc(...) -> (PhysAddr, NonNull<u8>) {
     let virt = unsafe { alloc_zeroed(layout) };
-    // On QEMU ARM64 virt machine, physical == virtual for RAM
-    let phys = virt as usize;  // ⚠️ Assumes VA == PA
+    let phys = virt_to_phys(virt as usize);  // ✅ Uses translation
     (phys, ptr)
 }
-```
 
-**Problem:** Assumes allocator pointers are physical addresses. VirtIO devices need true physical addresses for DMA.
+unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
+    unsafe { NonNull::new_unchecked(phys_to_virt(paddr)) }  // ✅
+}
 
-**Fix Required:** Use `virt_to_phys()` to get the actual physical address:
-```rust
-let phys = virt_to_phys(virt as usize);
-```
-
----
-
-### 6. VirtIO RNG Queue PFN - Critical Severity
-
-**File:** `src/rng.rs:284-288`
-
-```rust
-// Set queue PFN (page frame number) - legacy mode
-let queue_pfn = (queue_mem as usize) / PAGE_SIZE;  // ⚠️
-unsafe {
-    write_volatile((base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32, queue_pfn as u32);
+unsafe fn share(buffer: NonNull<[u8]>, ...) -> PhysAddr {
+    virt_to_phys(buffer.as_ptr() as *mut u8 as usize)  // ✅
 }
 ```
 
-**Problem:** VirtIO legacy mode expects a physical page frame number, but this code passes a virtual pointer divided by page size.
+### 6. VirtIO RNG Queue PFN - ✅ Fixed
 
-**Fix Required:**
+**File:** `src/rng.rs:286-287`
+
 ```rust
-let queue_phys = virt_to_phys(queue_mem as usize);
+let queue_phys = crate::mmu::virt_to_phys(queue_mem as usize);  // ✅
 let queue_pfn = queue_phys / PAGE_SIZE;
 ```
 
----
+### 7. VirtIO RNG Buffer Descriptor - ✅ Fixed
 
-### 7. VirtIO RNG Buffer Descriptor - Critical Severity
-
-**File:** `src/rng.rs:340-346`
+**File:** `src/rng.rs:345`
 
 ```rust
-unsafe {
-    let d = &mut *self.desc.add(desc_idx as usize);
-    d.addr = self.buffer as u64;  // ⚠️ VA passed as PA to device
-    d.len = to_read as u32;
-    d.flags = VIRTQ_DESC_F_WRITE;
-    d.next = 0;
-}
-```
-
-**Problem:** VirtIO descriptor `addr` field needs a physical address for DMA, but a virtual pointer is passed.
-
-**Fix Required:**
-```rust
-d.addr = virt_to_phys(self.buffer as usize) as u64;
+d.addr = crate::mmu::virt_to_phys(self.buffer as usize) as u64;  // ✅
 ```
 
 ---
 
-## Summary Table
+## Future Changes
 
-| Location | Issue | Severity | DMA? |
-|----------|-------|----------|------|
-| `pmm.rs:290-296` | `alloc_page_zeroed()` uses PA directly | High | No |
-| `allocator.rs:168-197` | Page allocator returns PA as pointer | High | No |
-| `elf_loader.rs:156-159` | ELF copy uses PA as pointer | High | No |
-| `mmu.rs` (multiple) | Page table walks use PA as pointer | High | No |
-| `virtio_hal.rs:27` | DMA assumes VA == PA | **Critical** | Yes |
-| `rng.rs:285` | Queue PFN from VA pointer | **Critical** | Yes |
-| `rng.rs:342` | DMA buffer VA passed as PA | **Critical** | Yes |
+If the kernel is ever moved to a non-identity-mapped configuration:
 
----
-
-## Recommended Fix Strategy
-
-### 1. Add Translation Functions
-
-Create `src/mm.rs` or add to `src/mmu.rs`:
-
-```rust
-/// Physical to virtual address translation
-/// Only valid for identity-mapped kernel memory
-#[inline]
-pub fn phys_to_virt(paddr: usize) -> usize {
-    // For now: identity mapping
-    paddr
-    // Future: paddr + KERNEL_VIRT_OFFSET
-}
-
-/// Virtual to physical address translation
-/// Only valid for identity-mapped kernel memory  
-#[inline]
-pub fn virt_to_phys(vaddr: usize) -> usize {
-    // For now: identity mapping
-    vaddr
-    // Future: vaddr - KERNEL_VIRT_OFFSET (or walk page tables)
-}
-```
-
-### 2. Update Code Incrementally
-
-Replace all direct `frame.addr as *mut T` with `phys_to_virt(frame.addr) as *mut T`.
-
-### 3. Priority Order
-
-1. **VirtIO/DMA code** (Critical) - broken DMA causes device malfunction
-2. **PMM zeroing** (High) - required for correct page initialization
-3. **ELF loader** (High) - required for process loading
-4. **MMU code** (High) - required for page table management
-5. **Allocator** (High) - required for kernel heap
-
----
-
-## Testing After Changes
-
-After introducing translation functions, verify:
-
-1. Kernel boots successfully
-2. Block device reads/writes work (VirtIO-blk)
-3. Network works (VirtIO-net)  
-4. Random number generation works (VirtIO-rng)
-5. User processes load and execute correctly
-6. Memory allocation stress tests pass
+1. Update `phys_to_virt()` to add the kernel virtual offset
+2. Update `virt_to_phys()` to subtract the kernel virtual offset (or walk page tables)
+3. All existing code should work without changes
 
 ---
 
@@ -265,5 +160,5 @@ After introducing translation functions, verify:
 
 - `docs/MEMORY_LAYOUT.md` - Kernel memory regions
 - `docs/HEAP_CORRUPTION_ANALYSIS.md` - Previous memory bugs
+- `docs/USERSPACE_MEMORY_MODEL.md` - Userspace address handling
 - `src/boot.rs` - Boot page table setup
-
