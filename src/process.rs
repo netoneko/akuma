@@ -13,6 +13,47 @@ use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::UserAddressSpace;
 
+/// Fixed address for process info page (read-only from userspace)
+/// 
+/// This page is mapped read-only for the user process but the kernel
+/// writes to it before entering userspace. The kernel can read from
+/// this address during syscalls to identify which process is calling.
+/// 
+/// WARNING: This struct currently uses only ~8 bytes but we reserve 1KB (1024 bytes).
+/// If ProcessInfo grows beyond 1KB, it will overflow into unmapped memory!
+pub const PROCESS_INFO_ADDR: usize = 0x1000;
+
+/// Process info structure shared between kernel and userspace
+/// 
+/// The kernel writes this, userspace reads it (read-only mapping).
+/// Kernel reads it during syscalls to prevent PID spoofing.
+/// 
+/// WARNING: Must not exceed 1024 bytes! Currently uses ~8 bytes.
+/// Add a compile-time assertion if adding fields.
+#[repr(C)]
+pub struct ProcessInfo {
+    /// Process ID
+    pub pid: u32,
+    /// Parent process ID
+    pub ppid: u32,
+    // Future fields: uid, gid, etc.
+    // Reserved space to reach 1KB
+    _reserved: [u8; 1024 - 8],
+}
+
+impl ProcessInfo {
+    pub const fn new(pid: u32, ppid: u32) -> Self {
+        Self {
+            pid,
+            ppid,
+            _reserved: [0u8; 1024 - 8],
+        }
+    }
+}
+
+// Compile-time check that ProcessInfo fits in 1KB
+const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
+
 /// Process ID type
 pub type Pid = u32;
 
@@ -25,55 +66,97 @@ static PROGRAM_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// Initial program break set when process is loaded
 static INITIAL_BRK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Per-process mmap tracking
-static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static MMAP_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static STACK_BOTTOM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static STACK_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Wrapper for process pointer to allow Send
+/// 
+/// SAFETY: Process pointers are only accessed from kernel context
+/// with proper synchronization through the Spinlock.
+#[derive(Clone, Copy)]
+struct ProcessPtr(*mut Process);
 
-/// Initialize memory tracking for a new process
-pub fn init_process_memory(memory: &ProcessMemory) {
-    use core::sync::atomic::Ordering;
-    NEXT_MMAP_ADDR.store(memory.next_mmap, Ordering::SeqCst);
-    MMAP_LIMIT.store(memory.mmap_limit, Ordering::SeqCst);
-    STACK_BOTTOM.store(memory.stack_bottom, Ordering::SeqCst);
-    STACK_TOP.store(memory.stack_top, Ordering::SeqCst);
+// SAFETY: We ensure single-threaded access through the Spinlock
+unsafe impl Send for ProcessPtr {}
+
+/// Process table: maps PID to process pointer
+/// 
+/// Processes are stored here when created and removed when they exit.
+/// Syscall handlers use read_current_pid() + lookup_process() to find
+/// the calling process.
+static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, ProcessPtr>> = 
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Register a process in the table
+fn register_process(pid: Pid, proc: *mut Process) {
+    PROCESS_TABLE.lock().insert(pid, ProcessPtr(proc));
+}
+
+/// Unregister a process from the table
+fn unregister_process(pid: Pid) {
+    PROCESS_TABLE.lock().remove(&pid);
+}
+
+/// Read the current process PID from the process info page
+/// 
+/// During a syscall, TTBR0 is still set to the user's page tables,
+/// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
+/// This prevents PID spoofing since the page is read-only for userspace.
+pub fn read_current_pid() -> Option<Pid> {
+    // Read from the fixed address in the current address space
+    // SAFETY: If a process is running, this address is mapped and contains valid ProcessInfo
+    let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
+    if pid == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+/// Look up a process by PID
+/// 
+/// Returns a mutable reference to the process if found.
+/// SAFETY: The caller must ensure no other code is mutating the process.
+pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|&ProcessPtr(ptr)| unsafe { &mut *ptr })
+}
+
+/// Get the current process (for syscall handlers)
+/// 
+/// Reads PID from the process info page and looks up in process table.
+/// Returns None if no process is currently executing.
+pub fn current_process() -> Option<&'static mut Process> {
+    let pid = read_current_pid()?;
+    lookup_process(pid)
 }
 
 /// Allocate mmap region for current process
 /// Returns the address or 0 on failure
 pub fn alloc_mmap(size: usize) -> usize {
-    use core::sync::atomic::Ordering;
+    let proc = match current_process() {
+        Some(p) => p,
+        None => {
+            console::print("[mmap] ERROR: No current process\n");
+            return 0;
+        }
+    };
     
-    let addr = NEXT_MMAP_ADDR.fetch_add(size, Ordering::SeqCst);
-    let limit = MMAP_LIMIT.load(Ordering::SeqCst);
-    let stack_bottom = STACK_BOTTOM.load(Ordering::SeqCst);
-    
-    // Check bounds
-    if addr + size > limit {
-        console::print(&alloc::format!(
-            "[mmap] REJECT: 0x{:x}+0x{:x} > limit 0x{:x}\n",
-            addr, size, limit
-        ));
-        return 0;
+    // Use per-process memory tracking
+    match proc.memory.alloc_mmap(size) {
+        Some(addr) => addr,
+        None => {
+            console::print(&alloc::format!(
+                "[mmap] REJECT: size 0x{:x} exceeds limit\n", size
+            ));
+            0
+        }
     }
-    
-    // Check stack overlap
-    if addr + size > stack_bottom {
-        console::print(&alloc::format!(
-            "[mmap] REJECT: 0x{:x}+0x{:x} overlaps stack at 0x{:x}\n",
-            addr, size, stack_bottom
-        ));
-        return 0;
-    }
-    
-    addr
 }
 
-/// Get stack bounds for validation
+/// Get stack bounds for current process
 pub fn get_stack_bounds() -> (usize, usize) {
-    use core::sync::atomic::Ordering;
-    (STACK_BOTTOM.load(Ordering::SeqCst), STACK_TOP.load(Ordering::SeqCst))
+    match current_process() {
+        Some(p) => (p.memory.stack_bottom, p.memory.stack_top),
+        None => (0, 0),
+    }
 }
 
 /// Initialize the program break for a new process
@@ -272,16 +355,35 @@ pub struct Process {
     pub brk: usize,
     /// Memory regions tracking
     pub memory: ProcessMemory,
+    /// Physical address of the process info page
+    /// 
+    /// This page is mapped read-only at PROCESS_INFO_ADDR for the user.
+    /// The kernel writes to it (via phys_to_virt) before entering userspace.
+    pub process_info_phys: usize,
 }
 
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack and pre-allocated heap
-        let (entry_point, address_space, stack_pointer, brk, stack_bottom, stack_top) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
             elf_loader::load_elf_with_stack(elf_data, 64 * 1024)?; // 64KB stack
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        
+        // Allocate and map the process info page (read-only for userspace)
+        // The kernel will write to this page before entering userspace
+        let process_info_frame = crate::pmm::alloc_page_zeroed()
+            .ok_or(ElfError::OutOfMemory)?;
+        
+        // Map as read-only at the fixed address
+        // user_flags::RO = AP_RO_ALL, meaning read-only for both EL1 and EL0
+        // But we use phys_to_virt to write, bypassing page tables
+        address_space.map_page(
+            PROCESS_INFO_ADDR, 
+            process_info_frame.addr, 
+            crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN
+        ).map_err(|_| ElfError::MappingFailed("process info page"))?;
         
         // Initialize per-process memory tracking
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
@@ -300,6 +402,7 @@ impl Process {
             parent_pid: 0,
             brk,
             memory,
+            process_info_phys: process_info_frame.addr,
         })
     }
 
@@ -328,13 +431,22 @@ impl Process {
         // Reset exit state before starting
         crate::syscall::reset_exit_state();
         
-        // Initialize per-process memory tracking (mmap, stack bounds)
-        init_process_memory(&self.memory);
+        // Write process info to the physical page (before activating address space)
+        // We write directly to physical memory via phys_to_virt since the page
+        // is mapped read-only in the user's address space
+        unsafe {
+            let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            core::ptr::write(info_ptr, ProcessInfo::new(self.pid, self.parent_pid));
+        }
+        
+        // Register this process in the table for PID-based lookup
+        register_process(self.pid, self as *mut Process);
         
         // Initialize the program break for heap allocation
         init_brk(self.brk);
 
         // Activate the user address space (sets TTBR0)
+        // After this, reading from PROCESS_INFO_ADDR will return our ProcessInfo
         self.address_space.activate();
 
         // Enter user mode - this will ERET to user code
@@ -342,6 +454,9 @@ impl Process {
         // and the exception handler returns here
         let exit_code = unsafe { run_user_until_exit(&self.context) };
 
+        // Unregister this process from the table
+        unregister_process(self.pid);
+        
         // Deactivate user address space
         UserAddressSpace::deactivate();
 

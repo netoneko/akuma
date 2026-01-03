@@ -25,6 +25,45 @@ pub mod fd {
     pub const STDERR: u64 = 2;
 }
 
+/// Fixed address for process info page (read-only, set by kernel)
+/// 
+/// The kernel maps this page read-only and writes process information
+/// before the process starts. Userspace can read but not modify.
+pub const PROCESS_INFO_ADDR: usize = 0x1000;
+
+/// Process info structure shared between kernel and userspace
+/// 
+/// This is mapped read-only at PROCESS_INFO_ADDR.
+/// The kernel writes it, userspace reads it.
+/// 
+/// WARNING: Must match kernel's ProcessInfo struct exactly!
+/// Must not exceed 1024 bytes.
+#[repr(C)]
+pub struct ProcessInfo {
+    /// Process ID
+    pub pid: u32,
+    /// Parent process ID  
+    pub ppid: u32,
+    // Reserved space to reach 1KB
+    _reserved: [u8; 1024 - 8],
+}
+
+/// Get the current process ID
+/// 
+/// Reads from the kernel-provided process info page.
+#[inline]
+pub fn getpid() -> u32 {
+    unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid }
+}
+
+/// Get the parent process ID
+/// 
+/// Reads from the kernel-provided process info page.
+#[inline]
+pub fn getppid() -> u32 {
+    unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).ppid }
+}
+
 /// Perform a syscall with up to 6 arguments
 ///
 /// Uses the Linux AArch64 syscall ABI:
