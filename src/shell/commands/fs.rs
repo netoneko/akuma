@@ -4,6 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -11,7 +12,7 @@ use core::pin::Pin;
 use embedded_io_async::Write;
 
 use crate::async_fs;
-use crate::shell::{Command, ShellError, VecWriter};
+use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 use crate::ssh::crypto::split_first_word;
 
 // ============================================================================
@@ -40,13 +41,16 @@ impl Command for LsCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let path = if args.is_empty() {
-                "/"
+                ctx.cwd().to_string()
             } else {
-                core::str::from_utf8(args).unwrap_or("/")
+                let arg_str = core::str::from_utf8(args).unwrap_or("/");
+                ctx.resolve_path(arg_str)
             };
+            let path = path.as_str();
 
             if !crate::fs::is_initialized() {
                 let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
@@ -122,6 +126,7 @@ impl Command for CatCommand {
         args: &'a [u8],
         stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             // If no args but stdin provided, just pass through stdin (useful for pipes)
@@ -139,8 +144,9 @@ impl Command for CatCommand {
                 return Ok(());
             }
 
-            let path = core::str::from_utf8(args).unwrap_or("");
-            match async_fs::read_to_string(path).await {
+            let arg_str = core::str::from_utf8(args).unwrap_or("");
+            let path = ctx.resolve_path(arg_str);
+            match async_fs::read_to_string(&path).await {
                 Ok(content) => {
                     for line in content.split('\n') {
                         let _ = stdout.write(line.as_bytes()).await;
@@ -183,6 +189,7 @@ impl Command for WriteCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
@@ -201,8 +208,9 @@ impl Command for WriteCommand {
                 return Ok(());
             }
 
-            let path = core::str::from_utf8(filename).unwrap_or("");
-            match async_fs::write_file(path, content).await {
+            let filename_str = core::str::from_utf8(filename).unwrap_or("");
+            let path = ctx.resolve_path(filename_str);
+            match async_fs::write_file(&path, content).await {
                 Ok(()) => {
                     let msg = format!("Wrote {} bytes to {}\r\n", content.len(), path);
                     let _ = stdout.write(msg.as_bytes()).await;
@@ -243,6 +251,7 @@ impl Command for AppendCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
@@ -265,8 +274,9 @@ impl Command for AppendCommand {
                 return Ok(());
             }
 
-            let path = core::str::from_utf8(filename).unwrap_or("");
-            match async_fs::append_file(path, content).await {
+            let filename_str = core::str::from_utf8(filename).unwrap_or("");
+            let path = ctx.resolve_path(filename_str);
+            match async_fs::append_file(&path, content).await {
                 Ok(()) => {
                     let msg = format!("Appended {} bytes to {}\r\n", content.len(), path);
                     let _ = stdout.write(msg.as_bytes()).await;
@@ -310,6 +320,7 @@ impl Command for RmCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
@@ -322,8 +333,9 @@ impl Command for RmCommand {
                 return Ok(());
             }
 
-            let path = core::str::from_utf8(args).unwrap_or("");
-            match async_fs::remove_file(path).await {
+            let arg_str = core::str::from_utf8(args).unwrap_or("");
+            let path = ctx.resolve_path(arg_str);
+            match async_fs::remove_file(&path).await {
                 Ok(()) => {
                     let msg = format!("Removed: {}\r\n", path);
                     let _ = stdout.write(msg.as_bytes()).await;
@@ -364,6 +376,7 @@ impl Command for MkdirCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
@@ -376,8 +389,9 @@ impl Command for MkdirCommand {
                 return Ok(());
             }
 
-            let path = core::str::from_utf8(args).unwrap_or("");
-            match async_fs::create_dir(path).await {
+            let arg_str = core::str::from_utf8(args).unwrap_or("");
+            let path = ctx.resolve_path(arg_str);
+            match async_fs::create_dir(&path).await {
                 Ok(()) => {
                     let msg = format!("Created directory: {}\r\n", path);
                     let _ = stdout.write(msg.as_bytes()).await;
@@ -418,6 +432,7 @@ impl Command for DfCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if !crate::fs::is_initialized() {
@@ -480,6 +495,7 @@ impl Command for MvCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             // Parse source and destination paths
@@ -491,7 +507,7 @@ impl Command for MvCommand {
                 return Ok(());
             }
 
-            let source_path = match core::str::from_utf8(source) {
+            let source_str = match core::str::from_utf8(source) {
                 Ok(s) => s.trim(),
                 Err(_) => {
                     let _ = stdout.write(b"Error: Invalid source path\r\n").await;
@@ -499,7 +515,7 @@ impl Command for MvCommand {
                 }
             };
 
-            let dest_path = match core::str::from_utf8(dest) {
+            let dest_str = match core::str::from_utf8(dest) {
                 Ok(s) => s.trim(),
                 Err(_) => {
                     let _ = stdout.write(b"Error: Invalid destination path\r\n").await;
@@ -507,21 +523,24 @@ impl Command for MvCommand {
                 }
             };
 
+            let source_path = ctx.resolve_path(source_str);
+            let dest_path = ctx.resolve_path(dest_str);
+
             // Check if source exists
-            if !async_fs::exists(source_path).await {
+            if !async_fs::exists(&source_path).await {
                 let msg = format!("Error: '{}' not found\r\n", source_path);
                 let _ = stdout.write(msg.as_bytes()).await;
                 return Ok(());
             }
 
             // Check if it's a directory (try to list it)
-            if async_fs::list_dir(source_path).await.is_ok() {
+            if async_fs::list_dir(&source_path).await.is_ok() {
                 let _ = stdout.write(b"Error: Moving directories is not supported\r\n").await;
                 return Ok(());
             }
 
             // Read source file
-            let data = match async_fs::read_file(source_path).await {
+            let data = match async_fs::read_file(&source_path).await {
                 Ok(d) => d,
                 Err(e) => {
                     let msg = format!("Error reading '{}': {}\r\n", source_path, e);
@@ -531,14 +550,14 @@ impl Command for MvCommand {
             };
 
             // Write to destination
-            if let Err(e) = async_fs::write_file(dest_path, &data).await {
+            if let Err(e) = async_fs::write_file(&dest_path, &data).await {
                 let msg = format!("Error writing '{}': {}\r\n", dest_path, e);
                 let _ = stdout.write(msg.as_bytes()).await;
                 return Ok(());
             }
 
             // Remove source file
-            if let Err(e) = async_fs::remove_file(source_path).await {
+            if let Err(e) = async_fs::remove_file(&source_path).await {
                 let msg = format!("Error removing source '{}': {}\r\n", source_path, e);
                 let _ = stdout.write(msg.as_bytes()).await;
                 return Ok(());

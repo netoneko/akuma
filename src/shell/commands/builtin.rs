@@ -1,6 +1,6 @@
 //! Built-in Shell Commands
 //!
-//! Basic shell commands: echo, akuma, stats, free, help, grep
+//! Basic shell commands: echo, akuma, stats, free, help, grep, pwd, cd
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -13,7 +13,7 @@ use embedded_io_async::Write;
 
 use crate::akuma::AKUMA_79;
 use crate::network;
-use crate::shell::{Command, ShellError, VecWriter};
+use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 
 // ============================================================================
 // Echo Command
@@ -38,6 +38,7 @@ impl Command for EchoCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if !args.is_empty() {
@@ -72,6 +73,7 @@ impl Command for AkumaCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             for &byte in AKUMA_79 {
@@ -112,6 +114,7 @@ impl Command for StatsCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
@@ -151,6 +154,7 @@ impl Command for FreeCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let stats = crate::allocator::stats();
@@ -214,6 +218,7 @@ impl Command for HelpCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let _ = stdout.write(b"Available commands:\r\n").await;
@@ -237,6 +242,13 @@ impl Command for HelpCommand {
                 .await;
             let _ = stdout
                 .write(b"  kthreads              - List kernel threads with stack info\r\n")
+                .await;
+            let _ = stdout.write(b"\r\nNavigation commands:\r\n").await;
+            let _ = stdout
+                .write(b"  pwd                   - Print current working directory\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  cd [path]             - Change current working directory\r\n")
                 .await;
             let _ = stdout.write(b"\r\nFilesystem commands:\r\n").await;
             let _ = stdout
@@ -327,6 +339,7 @@ impl Command for GrepCommand {
         args: &'a [u8],
         stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             // Parse flags and pattern
@@ -450,6 +463,7 @@ impl Command for PsCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             use crate::process;
@@ -502,6 +516,7 @@ impl Command for KthreadsCommand {
         _args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             use crate::threading;
@@ -559,3 +574,100 @@ impl Command for KthreadsCommand {
 
 /// Static instance
 pub static KTHREADS_CMD: KthreadsCommand = KthreadsCommand;
+
+// ============================================================================
+// Pwd Command
+// ============================================================================
+
+/// Pwd command - print current working directory
+pub struct PwdCommand;
+
+impl Command for PwdCommand {
+    fn name(&self) -> &'static str {
+        "pwd"
+    }
+    fn description(&self) -> &'static str {
+        "Print current working directory"
+    }
+    fn usage(&self) -> &'static str {
+        "pwd"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let _ = stdout.write(ctx.cwd().as_bytes()).await;
+            let _ = stdout.write(b"\r\n").await;
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static PWD_CMD: PwdCommand = PwdCommand;
+
+// ============================================================================
+// Cd Command
+// ============================================================================
+
+/// Cd command - change current working directory
+pub struct CdCommand;
+
+impl Command for CdCommand {
+    fn name(&self) -> &'static str {
+        "cd"
+    }
+    fn description(&self) -> &'static str {
+        "Change current working directory"
+    }
+    fn usage(&self) -> &'static str {
+        "cd [path]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+            
+            // Default to root if no argument
+            let target = if args_str.is_empty() {
+                String::from("/")
+            } else {
+                ctx.resolve_path(args_str)
+            };
+            
+            // Check if the directory exists
+            if !crate::fs::is_initialized() {
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
+            }
+            
+            // Try to list the directory to verify it exists and is a directory
+            match crate::async_fs::list_dir(&target).await {
+                Ok(_) => {
+                    ctx.set_cwd(&target);
+                    // cd is silent on success (like in real shells)
+                }
+                Err(_) => {
+                    let msg = format!("cd: {}: No such directory\r\n", target);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                }
+            }
+            
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static CD_CMD: CdCommand = CdCommand;

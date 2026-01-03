@@ -9,7 +9,7 @@ use core::pin::Pin;
 
 use embedded_io_async::Write;
 
-use crate::shell::{Command, ShellError, VecWriter};
+use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 
 // ============================================================================
 // Rhai Command
@@ -36,6 +36,7 @@ impl Command for RhaiCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let path = core::str::from_utf8(args).unwrap_or("").trim();

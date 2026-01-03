@@ -25,6 +25,7 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::{self, commands::create_default_registry};
+use crate::shell::ShellContext;
 use super::auth::{self, AuthResult};
 use super::config::SshdConfig;
 use super::keys;
@@ -633,103 +634,20 @@ enum EscapeState {
     Bracket, // Got ESC [
 }
 
-// ============================================================================
-// Pipeline Execution
-// ============================================================================
-
-/// Output redirection mode
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RedirectMode {
-    /// No redirection - output to terminal
-    None,
-    /// Overwrite file (>)
-    Overwrite,
-    /// Append to file (>>)
-    Append,
+/// Generate the shell prompt with current working directory
+fn generate_prompt(ctx: &ShellContext) -> alloc::string::String {
+    format!("akuma:{}> ", ctx.cwd())
 }
 
-/// Parsed command line with pipeline stages and optional redirection
-struct ParsedCommandLine<'a> {
-    /// Pipeline stages (commands separated by |)
-    stages: Vec<&'a [u8]>,
-    /// Output redirection mode
-    redirect_mode: RedirectMode,
-    /// Target file for redirection (if any)
-    redirect_target: Option<&'a [u8]>,
-}
-
-/// Parse a command line into pipeline stages and redirection
-/// Supports: cmd1 | cmd2 > file  or  cmd1 | cmd2 >> file
-fn parse_command_line(line: &[u8]) -> ParsedCommandLine<'_> {
-    // First, check for redirection at the end
-    let (pipeline_part, redirect_mode, redirect_target) = parse_redirection(line);
-
-    // Now parse the pipeline part
-    let mut stages = Vec::new();
-    let mut start = 0;
-
-    for (i, &byte) in pipeline_part.iter().enumerate() {
-        if byte == b'|' {
-            let stage = trim_bytes(&pipeline_part[start..i]);
-            if !stage.is_empty() {
-                stages.push(stage);
-            }
-            start = i + 1;
-        }
-    }
-
-    // Add the last stage
-    let stage = trim_bytes(&pipeline_part[start..]);
-    if !stage.is_empty() {
-        stages.push(stage);
-    }
-
-    ParsedCommandLine {
-        stages,
-        redirect_mode,
-        redirect_target,
-    }
-}
-
-/// Parse redirection from the end of a command line
-/// Returns (pipeline_part, redirect_mode, redirect_target)
-fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, Option<&[u8]>) {
-    // Look for >> first (must check before >)
-    for i in 0..line.len().saturating_sub(1) {
-        if line[i] == b'>' && line[i + 1] == b'>' {
-            let pipeline_part = trim_bytes(&line[..i]);
-            let target = trim_bytes(&line[i + 2..]);
-            if !target.is_empty() {
-                return (pipeline_part, RedirectMode::Append, Some(target));
-            }
-        }
-    }
-
-    // Look for single >
-    for i in 0..line.len() {
-        if line[i] == b'>' {
-            // Make sure it's not >>
-            if i + 1 < line.len() && line[i + 1] == b'>' {
-                continue;
-            }
-            let pipeline_part = trim_bytes(&line[..i]);
-            let target = trim_bytes(&line[i + 1..]);
-            if !target.is_empty() {
-                return (pipeline_part, RedirectMode::Overwrite, Some(target));
-            }
-        }
-    }
-
-    (line, RedirectMode::None, None)
-}
-
-
-/// Run an interactive shell session using ShellSession
+/// Run an interactive shell session
 async fn run_shell_session(
     stream: &mut TcpStream,
     session: &mut SshSession,
 ) -> Result<(), TcpError> {
     log("[SSH] Starting shell session\n");
+
+    // Create per-session shell context (starts at /)
+    let mut ctx = ShellContext::new();
 
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
@@ -739,8 +657,10 @@ async fn run_shell_session(
 
     // Send welcome message
     {
-        let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\nakuma> ";
+        let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\n";
         let _ = channel_stream.write(welcome).await;
+        let prompt = generate_prompt(&ctx);
+        let _ = channel_stream.write(prompt.as_bytes()).await;
     }
 
     // Line buffer for input with cursor position
@@ -784,13 +704,7 @@ async fn run_shell_session(
                                         }
                                         history_index = history.len();
 
-                                        // Check for exit/quit
-                                        if trimmed == b"exit" || trimmed == b"quit" {
-                                            let _ = channel_stream.write(b"Goodbye!\r\n").await;
-                                            return Ok(());
-                                        }
-
-                                        // Check for neko editor command
+                                        // Check for neko editor command (special case - not part of command chain)
                                         if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
                                             let filepath = if trimmed.len() > 5 {
                                                 let path_bytes = trim_bytes(&trimmed[5..]);
@@ -810,78 +724,30 @@ async fn run_shell_session(
                                             
                                             line_buffer.clear();
                                             cursor_pos = 0;
-                                            let _ = channel_stream.write(b"akuma> ").await;
+                                            let prompt = generate_prompt(&ctx);
+                                            let _ = channel_stream.write(prompt.as_bytes()).await;
                                             continue;
                                         }
 
-                                        // Parse command line with pipeline and redirection
-                                        let parsed = parse_command_line(trimmed);
-
-                                        if !parsed.stages.is_empty() {
-                                            // Execute pipeline
-                                            match shell::execute_pipeline(&parsed.stages, &registry).await {
-                                                Ok(output) => {
-                                                    // Handle redirection
-                                                    match (parsed.redirect_mode, parsed.redirect_target) {
-                                                        (RedirectMode::Overwrite, Some(target)) => {
-                                                            // Write to file (overwrite)
-                                                            let path = core::str::from_utf8(target).unwrap_or("");
-                                                            match crate::async_fs::write_file(path, &output).await {
-                                                                Ok(()) => {
-                                                                    let msg = format!("Wrote {} bytes to {}\r\n", output.len(), path);
-                                                                    let _ = channel_stream.write(msg.as_bytes()).await;
-                                                                }
-                                                                Err(e) => {
-                                                                    let msg = format!("Error writing to {}: {}\r\n", path, e);
-                                                                    let _ = channel_stream.write(msg.as_bytes()).await;
-                                                                }
-                                                            }
-                                                        }
-                                                        (RedirectMode::Append, Some(target)) => {
-                                                            // Append to file
-                                                            let path = core::str::from_utf8(target).unwrap_or("");
-                                                            match crate::async_fs::append_file(path, &output).await {
-                                                                Ok(()) => {
-                                                                    let msg = format!("Appended {} bytes to {}\r\n", output.len(), path);
-                                                                    let _ = channel_stream.write(msg.as_bytes()).await;
-                                                                }
-                                                                Err(e) => {
-                                                                    let msg = format!("Error appending to {}: {}\r\n", path, e);
-                                                                    let _ = channel_stream.write(msg.as_bytes()).await;
-                                                                }
-                                                            }
-                                                        }
-                                                        _ => {
-                                                            // No redirection - output to terminal
-                                                            if !output.is_empty() {
-                                                                let _ = channel_stream.write(&output).await;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Err(shell::ShellError::Exit) => {
-                                                    let _ =
-                                                        channel_stream.write(b"Goodbye!\r\n").await;
-                                                    return Ok(());
-                                                }
-                                                Err(shell::ShellError::ExecutionFailed(msg)) => {
-                                                    let error = format!("Error: {}\r\n", msg);
-                                                    let _ = channel_stream
-                                                        .write(error.as_bytes())
-                                                        .await;
-                                                }
-                                                Err(shell::ShellError::CommandNotFound) => {
-                                                    // Command not found - the error could be for any command in the pipeline
-                                                    let _ = channel_stream.write(b"Command not found\r\nType 'help' for available commands.\r\n").await;
-                                                }
-                                                Err(_) => {}
-                                            }
+                                        // Execute command chain (handles ;, &&, |, >, >> and exit/quit)
+                                        let result = shell::execute_command_chain(trimmed, &registry, &mut ctx).await;
+                                        
+                                        // Output the result
+                                        if !result.output.is_empty() {
+                                            let _ = channel_stream.write(&result.output).await;
+                                        }
+                                        
+                                        // Check if we should exit
+                                        if result.should_exit {
+                                            let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                            return Ok(());
                                         }
                                     }
 
                                     line_buffer.clear();
                                     cursor_pos = 0;
-                                    let _ = channel_stream.write(b"akuma> ").await;
+                                    let prompt = generate_prompt(&ctx);
+                                    let _ = channel_stream.write(prompt.as_bytes()).await;
                                 }
                                 0x7F | 0x08 => {
                                     // Backspace - delete character before cursor
@@ -906,7 +772,8 @@ async fn run_shell_session(
                                     line_buffer.clear();
                                     cursor_pos = 0;
                                     let _ = channel_stream.write(b"^C\r\n").await;
-                                    let _ = channel_stream.write(b"akuma> ").await;
+                                    let prompt = generate_prompt(&ctx);
+                                    let _ = channel_stream.write(prompt.as_bytes()).await;
                                 }
                                 0x04 => {
                                     // Ctrl+D
@@ -1275,6 +1142,8 @@ async fn handle_message(
                     return Ok(MessageResult::StartShell);
                 } else if req_type == b"exec" {
                     // Handle exec request - supports command chaining with ; and &&
+                    // Create per-session context (starts at /)
+                    let mut exec_ctx = ShellContext::new();
                     offset += 1; // skip want_reply byte
                     if let Some(cmd_bytes) = read_string(payload, &mut offset) {
                         log(&format!(
@@ -1285,92 +1154,12 @@ async fn handle_message(
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
                         
-                        // Parse command chain (handles ; and && operators)
-                        let chain = shell::parse_command_chain(trimmed);
-                        let mut last_success = true;
-
-                        for chained_cmd in &chain {
-                            // Check if we should skip based on && operator
-                            if let Some(prev_op) = chained_cmd.next_operator {
-                                // This checks the PREVIOUS operator, but we need to track state
-                            }
-                            
-                            // For && operator from previous command, skip if last failed
-                            if !last_success {
-                                // Check if previous was &&
-                                break;
-                            }
-
-                            // Check for exit command
-                            let cmd_str = core::str::from_utf8(chained_cmd.command).unwrap_or("");
-                            if cmd_str.trim() == "exit" {
-                                break;
-                            }
-
-                            let parsed = parse_command_line(chained_cmd.command);
-
-                            if !parsed.stages.is_empty() {
-                                match shell::execute_pipeline(&parsed.stages, &registry).await {
-                                    Ok(output) => {
-                                        last_success = true;
-                                        // Handle redirection
-                                        match (parsed.redirect_mode, parsed.redirect_target) {
-                                            (RedirectMode::Overwrite, Some(target)) => {
-                                                let path = core::str::from_utf8(target).unwrap_or("");
-                                                match crate::async_fs::write_file(path, &output).await {
-                                                    Ok(()) => {
-                                                        let msg = format!("Wrote {} bytes to {}\r\n", output.len(), path);
-                                                        send_channel_data(stream, session, msg.as_bytes()).await?;
-                                                    }
-                                                    Err(e) => {
-                                                        let msg = format!("Error writing to {}: {}\r\n", path, e);
-                                                        send_channel_data(stream, session, msg.as_bytes()).await?;
-                                                        last_success = false;
-                                                    }
-                                                }
-                                            }
-                                            (RedirectMode::Append, Some(target)) => {
-                                                let path = core::str::from_utf8(target).unwrap_or("");
-                                                match crate::async_fs::append_file(path, &output).await {
-                                                    Ok(()) => {
-                                                        let msg = format!("Appended {} bytes to {}\r\n", output.len(), path);
-                                                        send_channel_data(stream, session, msg.as_bytes()).await?;
-                                                    }
-                                                    Err(e) => {
-                                                        let msg = format!("Error appending to {}: {}\r\n", path, e);
-                                                        send_channel_data(stream, session, msg.as_bytes()).await?;
-                                                        last_success = false;
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                if !output.is_empty() {
-                                                    send_channel_data(stream, session, &output).await?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(shell::ShellError::ExecutionFailed(msg)) => {
-                                        let error = format!("Error: {}\r\n", msg);
-                                        send_channel_data(stream, session, error.as_bytes()).await?;
-                                        last_success = false;
-                                    }
-                                    Err(shell::ShellError::CommandNotFound) => {
-                                        send_channel_data(stream, session, b"Command not found\r\n").await?;
-                                        last_success = false;
-                                    }
-                                    Err(_) => {
-                                        last_success = false;
-                                    }
-                                }
-                            }
-
-                            // Check && operator - if this command has && and failed, stop
-                            if let Some(shell::ChainOperator::And) = chained_cmd.next_operator {
-                                if !last_success {
-                                    break;
-                                }
-                            }
+                        // Use unified command chain executor
+                        let result = shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
+                        
+                        // Send collected output
+                        if !result.output.is_empty() {
+                            send_channel_data(stream, session, &result.output).await?;
                         }
                     }
                     // Send EOF after exec - client will send CLOSE, we respond to that

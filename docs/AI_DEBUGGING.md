@@ -48,6 +48,7 @@ lldb -o 'gdb-remote 1234' target/aarch64-unknown-none/release/akuma
 ### Debugging Tips
 
 - Build with debug symbols: `cargo build` (not `--release`) for better debugging
+- Use short timeouts (up to 20s and no more)
 - Set breakpoints on panic handlers to catch kernel panics
 - Use `monitor info registers` for QEMU-specific register info
 

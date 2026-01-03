@@ -79,12 +79,13 @@ pub fn run_all_tests() {
 async fn execute_pipeline_test(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
     let registry = create_default_registry();
     let stages = parse_pipeline(pipeline);
+    let mut ctx = shell::ShellContext::new();
 
     if stages.is_empty() {
         return Ok(Vec::new());
     }
 
-    shell::execute_pipeline(&stages, &registry)
+    shell::execute_pipeline(&stages, &registry, &mut ctx)
         .await
         .map_err(|_| "Pipeline execution failed")
 }

@@ -16,7 +16,7 @@ use embedded_io_async::Write;
 use crate::async_fs;
 use crate::async_net;
 use crate::dns;
-use crate::shell::{Command, ShellError, VecWriter};
+use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 use crate::tls::{TlsOptions, TlsStream, TLS_RECORD_SIZE};
 
 // ============================================================================
@@ -82,6 +82,7 @@ impl Command for CurlCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let args_str = match core::str::from_utf8(args) {
@@ -230,6 +231,7 @@ impl Command for NslookupCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
@@ -322,6 +324,7 @@ impl Command for PkgCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let args_str = match core::str::from_utf8(args) {

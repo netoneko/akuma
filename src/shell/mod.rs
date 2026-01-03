@@ -2,29 +2,105 @@
 //!
 //! Provides async command execution for the SSH shell with an extensible
 //! command system. Commands implement the `Command` trait and are registered
-//! in a `CommandRegistry`. The `ShellSession` handles terminal I/O using
-//! nostd-interactive-terminal for line editing and history.
+//! in a `CommandRegistry`.
 //!
-//! Supports pipeline execution via the `|` operator.
-//! Supports command chaining via `;` and `&&` operators.
+//! Supports:
+//! - Pipeline execution via the `|` operator
+//! - Command chaining via `;` and `&&` operators
+//! - Output redirection via `>` and `>>`
 
 pub mod commands;
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-
-use embedded_io_async::{Read, Write};
-use nostd_interactive_terminal::history::{History, HistoryConfig};
-use nostd_interactive_terminal::terminal::{ReadLineError, TerminalConfig, TerminalReader};
-use nostd_interactive_terminal::writer::TerminalWriter;
 
 use crate::ssh::crypto::{split_first_word, trim_bytes};
 
 // Re-export commonly used items
 pub use commands::CommandRegistry;
+
+// ============================================================================
+// Shell Context (per-session state)
+// ============================================================================
+
+/// Per-session shell context holding state like current working directory
+pub struct ShellContext {
+    /// Current working directory
+    cwd: String,
+}
+
+impl ShellContext {
+    /// Create a new shell context with root as the working directory
+    pub fn new() -> Self {
+        Self {
+            cwd: String::from("/"),
+        }
+    }
+
+    /// Get the current working directory
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Set the current working directory
+    pub fn set_cwd(&mut self, path: &str) {
+        self.cwd = String::from(path);
+    }
+
+    /// Resolve a path relative to the current working directory
+    pub fn resolve_path(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            // Absolute path
+            normalize_path(path)
+        } else {
+            // Relative path
+            let full_path = if self.cwd == "/" {
+                format!("/{}", path)
+            } else {
+                format!("{}/{}", self.cwd, path)
+            };
+            normalize_path(&full_path)
+        }
+    }
+}
+
+impl Default for ShellContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Normalize a path (resolve . and ..)
+fn normalize_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => {
+                components.push(c);
+            }
+        }
+    }
+
+    if components.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for c in components {
+            result.push('/');
+            result.push_str(c);
+        }
+        result
+    }
+}
 
 // ============================================================================
 // Shell Error Types
@@ -124,11 +200,13 @@ pub trait Command: Sync {
     /// - `args`: command arguments (everything after the command name)
     /// - `stdin`: optional input from a previous command in a pipeline
     /// - `stdout`: writer to send output to (either next command or terminal)
+    /// - `ctx`: shell context with per-session state (cwd, etc.)
     fn execute<'a>(
         &'a self,
         args: &'a [u8],
         stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>>;
 }
 
@@ -161,22 +239,7 @@ pub fn parse_pipeline(line: &[u8]) -> Vec<&[u8]> {
     stages
 }
 
-// ============================================================================
-// Shell Session
-// ============================================================================
-
-/// Buffer size for terminal input
-const TERMINAL_BUF_SIZE: usize = 256;
-
-/// Shell session that handles terminal I/O and command execution
-pub struct ShellSession<'a, R: Read, W: Write> {
-    reader: TerminalReader<TERMINAL_BUF_SIZE>,
-    writer_inner: &'a mut W,
-    reader_inner: &'a mut R,
-    registry: &'a CommandRegistry,
-}
-
-/// Result of pipeline execution
+/// Result of pipeline execution (internal)
 enum PipelineResult {
     /// Success with output bytes
     Output(Vec<u8>),
@@ -307,7 +370,7 @@ async fn execute_external(path: &str, stdin: Option<&[u8]>, stdout: &mut VecWrit
 
 /// Execute a pipeline of commands
 /// Returns the final output or an error with a message
-async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry) -> PipelineResult {
+async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry, ctx: &mut ShellContext) -> PipelineResult {
     if stages.is_empty() {
         return PipelineResult::Output(Vec::new());
     }
@@ -324,7 +387,7 @@ async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry)
 
         // First, try built-in commands
         if let Some(cmd) = registry.find(cmd_name) {
-            match cmd.execute(args, stdin_slice, &mut stdout).await {
+            match cmd.execute(args, stdin_slice, &mut stdout, ctx).await {
                 Ok(()) => {
                     if is_last {
                         return PipelineResult::Output(stdout.into_inner());
@@ -385,111 +448,216 @@ async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry)
 
 /// Execute a pipeline of commands (public API)
 /// Returns the final output or an error
-pub async fn execute_pipeline(stages: &[&[u8]], registry: &CommandRegistry) -> Result<Vec<u8>, ShellError> {
-    match execute_pipeline_internal(stages, registry).await {
+pub async fn execute_pipeline(stages: &[&[u8]], registry: &CommandRegistry, ctx: &mut ShellContext) -> Result<Vec<u8>, ShellError> {
+    match execute_pipeline_internal(stages, registry, ctx).await {
         PipelineResult::Output(output) => Ok(output),
         PipelineResult::Error(e, _) => Err(e),
     }
 }
 
-impl<'a, R: Read, W: Write> ShellSession<'a, R, W> {
-    /// Create a new shell session
-    pub fn new(reader: &'a mut R, writer: &'a mut W, registry: &'a CommandRegistry) -> Self {
-        let config = TerminalConfig {
-            buffer_size: TERMINAL_BUF_SIZE,
-            prompt: "akuma> ",
-            echo: true,
-            ansi_enabled: true,
-        };
+// ============================================================================
+// Output Redirection
+// ============================================================================
 
-        let history_config = HistoryConfig {
-            max_entries: 10,
-            deduplicate: true,
-        };
+/// Output redirection mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RedirectMode {
+    /// No redirection - output to terminal
+    None,
+    /// Overwrite file (>)
+    Overwrite,
+    /// Append to file (>>)
+    Append,
+}
 
-        let terminal_reader = TerminalReader::new(config, Some(History::new(history_config)));
+/// Parsed command line with pipeline stages and optional redirection
+pub struct ParsedCommandLine<'a> {
+    /// Pipeline stages (commands separated by |)
+    pub stages: Vec<&'a [u8]>,
+    /// Output redirection mode
+    pub redirect_mode: RedirectMode,
+    /// Target file for redirection (if any)
+    pub redirect_target: Option<&'a [u8]>,
+}
 
-        Self {
-            reader: terminal_reader,
-            writer_inner: writer,
-            reader_inner: reader,
-            registry,
+/// Parse a command line into pipeline stages and redirection
+/// Supports: cmd1 | cmd2 > file  or  cmd1 | cmd2 >> file
+pub fn parse_command_line(line: &[u8]) -> ParsedCommandLine<'_> {
+    // First, check for redirection at the end
+    let (pipeline_part, redirect_mode, redirect_target) = parse_redirection(line);
+
+    // Now parse the pipeline part
+    let stages = parse_pipeline(pipeline_part);
+
+    ParsedCommandLine {
+        stages,
+        redirect_mode,
+        redirect_target,
+    }
+}
+
+/// Parse redirection from the end of a command line
+/// Returns (pipeline_part, redirect_mode, redirect_target)
+fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, Option<&[u8]>) {
+    // Look for >> first (must check before >)
+    for i in 0..line.len().saturating_sub(1) {
+        if line[i] == b'>' && line[i + 1] == b'>' {
+            let pipeline_part = trim_bytes(&line[..i]);
+            let target = trim_bytes(&line[i + 2..]);
+            if !target.is_empty() {
+                return (pipeline_part, RedirectMode::Append, Some(target));
+            }
         }
     }
 
-    /// Run the shell session until exit or error
-    pub async fn run(&mut self) -> Result<(), ShellError> {
-        // Get registry reference upfront to avoid borrow conflicts
-        let registry = self.registry;
+    // Look for single >
+    for i in 0..line.len() {
+        if line[i] == b'>' {
+            // Make sure it's not >>
+            if i + 1 < line.len() && line[i + 1] == b'>' {
+                continue;
+            }
+            let pipeline_part = trim_bytes(&line[..i]);
+            let target = trim_bytes(&line[i + 1..]);
+            if !target.is_empty() {
+                return (pipeline_part, RedirectMode::Overwrite, Some(target));
+            }
+        }
+    }
 
-        // Display welcome message
-        {
-            let mut writer = TerminalWriter::new(self.writer_inner, true);
-            let _ = writer.writeln("Welcome to Akuma Shell").await;
-            let _ = writer.writeln("Type 'help' for available commands.").await;
-            let _ = writer.write_str("\r\n").await;
+    (line, RedirectMode::None, None)
+}
+
+// ============================================================================
+// Unified Command Chain Executor
+// ============================================================================
+
+/// Result of executing a command chain
+pub struct ChainExecutionResult {
+    /// Collected output from all commands
+    pub output: Vec<u8>,
+    /// Whether the last command succeeded
+    pub success: bool,
+    /// Whether the shell should exit
+    pub should_exit: bool,
+}
+
+/// Execute a command chain with proper `;` and `&&` operator handling
+///
+/// This is the unified executor used by both SSH exec mode and interactive mode.
+/// It correctly handles:
+/// - `;` operator: Always execute next command regardless of previous result
+/// - `&&` operator: Only execute next command if previous succeeded
+/// - Output redirection (>, >>)
+/// - Pipeline execution (|)
+pub async fn execute_command_chain(line: &[u8], registry: &CommandRegistry, ctx: &mut ShellContext) -> ChainExecutionResult {
+    let chain = parse_command_chain(line);
+    let mut collected_output = Vec::new();
+    let mut last_success = true;
+    let mut prev_operator: Option<ChainOperator> = None;
+    let mut should_exit = false;
+
+    for chained_cmd in &chain {
+        // Check if we should skip based on PREVIOUS operator
+        if let Some(ChainOperator::And) = prev_operator {
+            if !last_success {
+                // && and previous failed - skip remaining commands
+                break;
+            }
+        }
+        // For ; operator or no previous operator, always continue
+
+        // Check for exit/quit command
+        let cmd_trimmed = trim_bytes(chained_cmd.command);
+        if cmd_trimmed == b"exit" || cmd_trimmed == b"quit" {
+            should_exit = true;
+            break;
         }
 
-        loop {
-            // Read a line using the terminal reader
-            let mut writer = TerminalWriter::new(self.writer_inner, true);
+        // Parse this command for pipeline and redirection
+        let parsed = parse_command_line(chained_cmd.command);
 
-            let line = match self
-                .reader
-                .read_line::<_, _, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex>(
-                    self.reader_inner,
-                    &mut writer,
-                    None,
-                )
-                .await
-            {
-                Ok(line) => line,
-                Err(ReadLineError::EndOfFile) => {
-                    let _ = writer.writeln("\r\nGoodbye!").await;
-                    return Ok(());
-                }
-                Err(_) => continue,
-            };
+        if parsed.stages.is_empty() {
+            // Track operator for next iteration
+            prev_operator = chained_cmd.next_operator;
+            continue;
+        }
 
-            let line_bytes = line.as_bytes();
-            let trimmed = trim_bytes(line_bytes);
+        // Execute the pipeline
+        match execute_pipeline_internal(&parsed.stages, registry, ctx).await {
+            PipelineResult::Output(output) => {
+                last_success = true;
 
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Check for exit/quit (before pipeline parsing)
-            if trimmed == b"exit" || trimmed == b"quit" {
-                let _ = writer.writeln("Goodbye!").await;
-                return Ok(());
-            }
-
-            // Parse and execute pipeline
-            let stages = parse_pipeline(trimmed);
-
-            if stages.is_empty() {
-                continue;
-            }
-
-            // Execute pipeline without holding writer borrow
-            let result = execute_pipeline_internal(&stages, registry).await;
-
-            // Now write the result
-            match result {
-                PipelineResult::Output(output) => {
-                    if !output.is_empty() {
-                        if let Ok(s) = core::str::from_utf8(&output) {
-                            let _ = writer.write_str(s).await;
+                // Handle redirection
+                match (parsed.redirect_mode, parsed.redirect_target) {
+                    (RedirectMode::Overwrite, Some(target)) => {
+                        let path = core::str::from_utf8(target).unwrap_or("");
+                        match crate::async_fs::write_file(path, &output).await {
+                            Ok(()) => {
+                                let msg = format!("Wrote {} bytes to {}\r\n", output.len(), path);
+                                collected_output.extend_from_slice(msg.as_bytes());
+                            }
+                            Err(e) => {
+                                let msg = format!("Error writing to {}: {}\r\n", path, e);
+                                collected_output.extend_from_slice(msg.as_bytes());
+                                last_success = false;
+                            }
                         }
                     }
+                    (RedirectMode::Append, Some(target)) => {
+                        let path = core::str::from_utf8(target).unwrap_or("");
+                        match crate::async_fs::append_file(path, &output).await {
+                            Ok(()) => {
+                                let msg = format!("Appended {} bytes to {}\r\n", output.len(), path);
+                                collected_output.extend_from_slice(msg.as_bytes());
+                            }
+                            Err(e) => {
+                                let msg = format!("Error appending to {}: {}\r\n", path, e);
+                                collected_output.extend_from_slice(msg.as_bytes());
+                                last_success = false;
+                            }
+                        }
+                    }
+                    _ => {
+                        // No redirection - collect output
+                        collected_output.extend_from_slice(&output);
+                    }
                 }
-                PipelineResult::Error(ShellError::Exit, _) => return Ok(()),
-                PipelineResult::Error(_, Some(msg)) => {
-                    let _ = writer.write_str(&msg).await;
-                }
-                PipelineResult::Error(_, None) => {}
+            }
+            PipelineResult::Error(ShellError::Exit, _) => {
+                should_exit = true;
+                break;
+            }
+            PipelineResult::Error(ShellError::CommandNotFound, Some(msg)) => {
+                collected_output.extend_from_slice(msg.as_bytes());
+                last_success = false;
+            }
+            PipelineResult::Error(ShellError::CommandNotFound, None) => {
+                collected_output.extend_from_slice(b"Command not found\r\n");
+                last_success = false;
+            }
+            PipelineResult::Error(ShellError::ExecutionFailed(msg), _) => {
+                let error = format!("Error: {}\r\n", msg);
+                collected_output.extend_from_slice(error.as_bytes());
+                last_success = false;
+            }
+            PipelineResult::Error(_, Some(msg)) => {
+                collected_output.extend_from_slice(msg.as_bytes());
+                last_success = false;
+            }
+            PipelineResult::Error(_, None) => {
+                last_success = false;
             }
         }
+
+        // Track operator for next iteration
+        prev_operator = chained_cmd.next_operator;
+    }
+
+    ChainExecutionResult {
+        output: collected_output,
+        success: last_success,
+        should_exit,
     }
 }
 
@@ -528,3 +696,4 @@ mod tests {
         assert_eq!(stages[2], b"head");
     }
 }
+

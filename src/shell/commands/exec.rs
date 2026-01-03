@@ -7,7 +7,7 @@ use alloc::format;
 use core::future::Future;
 use core::pin::Pin;
 
-use crate::shell::{Command, ShellError, VecWriter};
+use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 use crate::ssh::crypto::trim_bytes;
 
 /// Static instance of the exec command
@@ -38,6 +38,7 @@ impl Command for ExecCommand {
         args: &'a [u8],
         stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let args = trim_bytes(args);
