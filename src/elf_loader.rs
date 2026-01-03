@@ -3,15 +3,11 @@
 //! Parses and loads ELF binaries into user address space.
 //! Uses the `elf` crate for parsing.
 
-use alloc::string::String;
-use alloc::vec::Vec;
-
 use elf::abi::{EM_AARCH64, ET_EXEC, PT_LOAD, PF_R, PF_W, PF_X};
 use elf::endian::LittleEndian;
 use elf::ElfBytes;
 
-use crate::mmu::{user_flags, PageTable, UserAddressSpace, PAGE_SIZE};
-use crate::pmm::{self, PhysFrame};
+use crate::mmu::{user_flags, UserAddressSpace, PAGE_SIZE};
 
 /// Enable debug output for ELF loading
 /// Set to false to reduce boot verbosity
@@ -214,14 +210,23 @@ fn flags_to_user_flags(elf_flags: u32) -> u64 {
     }
 }
 
-/// Load an ELF binary and set up user stack
+/// Load an ELF binary and set up user stack with guard page
 ///
 /// # Arguments
 /// * `elf_data` - Raw ELF file data
-/// * `stack_size` - Size of user stack in bytes (default: 64KB)
+/// * `stack_size` - Size of user stack in bytes (default: 64KB from config::USER_STACK_SIZE)
 ///
 /// # Returns
 /// (entry_point, address_space, initial_stack_pointer, brk, stack_bottom, stack_top)
+///
+/// # Stack Layout
+/// ```text
+/// 0x40000000  <- STACK_TOP (unmapped, end of user space)
+/// 0x3FFF0000  <- stack_end (top of mapped stack)
+///    ...      <- stack pages (RW)
+/// 0x3FFE0000  <- stack_bottom (first mapped page)
+/// 0x3FFDF000  <- guard_page (UNMAPPED - causes fault on overflow)
+/// ```
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     stack_size: usize,
@@ -232,13 +237,18 @@ pub fn load_elf_with_stack(
     // Layout: code (0x400000) < mmap (0x10000000-0x3F000000) < stack (0x3F000000-0x40000000)
     // This keeps everything in the first 1GB where we have fine-grained page table control
     const STACK_TOP: usize = 0x4000_0000;  // Top of first 1GB
-    let stack_bottom = STACK_TOP - stack_size;
-
+    
+    // Reserve space for guard page + stack
+    // Guard page is at the bottom (lowest address), unmapped to cause fault on overflow
+    let total_size = stack_size + PAGE_SIZE;  // stack + 1 guard page
+    let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
+    let stack_bottom = guard_page + PAGE_SIZE;  // First usable stack page is above guard
+    
     // Ensure stack is page-aligned
     let stack_bottom_aligned = stack_bottom & !(PAGE_SIZE - 1);
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    // Map stack pages
+    // Map stack pages (guard page at guard_page is intentionally NOT mapped)
     for i in 0..stack_pages {
         let page_va = stack_bottom_aligned + i * PAGE_SIZE;
         loaded
@@ -253,8 +263,8 @@ pub fn load_elf_with_stack(
     
     if DEBUG_ELF_LOADING {
         crate::console::print(&alloc::format!(
-            "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), SP=0x{:x}\n",
-            stack_bottom_aligned, stack_end, stack_pages, initial_sp_local
+            "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), guard=0x{:x}, SP=0x{:x}\n",
+            stack_bottom_aligned, stack_end, stack_pages, guard_page, initial_sp_local
         ));
     }
 

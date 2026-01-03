@@ -1,8 +1,30 @@
 # Thread Stack Analysis
 
-This document analyzes stack usage in the kernel's threading system and provides guidance on implementing stack guard pages.
+This document analyzes stack usage in the kernel's threading system and documents the memory protection features.
 
-## Current Stack Configuration
+## Stack Configuration
+
+All stack sizes are configurable via `src/config.rs`:
+
+```rust
+/// Boot/kernel stack size (1MB default)
+pub const KERNEL_STACK_SIZE: usize = 1024 * 1024;
+
+/// Default per-thread stack size (32KB)
+pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
+
+/// Stack size for networking/async thread (256KB)
+pub const ASYNC_THREAD_STACK_SIZE: usize = 256 * 1024;
+
+/// User process stack size (64KB default)
+pub const USER_STACK_SIZE: usize = 64 * 1024;
+
+/// Maximum kernel threads
+pub const MAX_THREADS: usize = 32;
+
+/// Enable stack canary checking
+pub const ENABLE_STACK_CANARIES: bool = true;
+```
 
 ### Boot Thread (Thread 0)
 
@@ -21,88 +43,209 @@ _boot:
 |----------|-------|
 | Stack top | `0x42000000` (32MB from kernel base) |
 | Stack size | 1MB (grows down to `0x41F00000`) |
-| Location | Above kernel binary (~3MB), below heap |
+| Usage | Async networking loop (SSH, HTTP, etc.) |
+| Guard pages | ❌ None (uses 1GB block mapping) |
+| Protection | ⚠️ Tracked in `StackInfo` for bounds checking |
 
-**Status**: ✅ Fixed - Stack is now placed above the kernel binary.
+**Status**: ✅ Fixed - Stack is positioned above the kernel binary (which is ~3.5MB).
 
 ### Spawned Threads (1-31)
 
-Spawned threads get stacks from the heap in `src/threading.rs`:
+Spawned threads get stacks allocated on demand with configurable sizes:
 
 ```rust
-const STACK_SIZE: usize = 32 * 1024;  // 32KB
-const MAX_THREADS: usize = 32;
+// Spawn with default 32KB stack
+threading::spawn(my_thread)?;
 
-pub fn init(&mut self) {
-    for i in 1..MAX_THREADS {
-        let stack_vec: Vec<u8> = alloc::vec![0u8; STACK_SIZE];
-        let stack_box = stack_vec.into_boxed_slice();
-        let stack_ptr = Box::into_raw(stack_box) as *mut u8;
-        self.stacks[i] = stack_ptr as usize;
+// Spawn with custom stack size
+threading::spawn_fn_with_stack(|| {
+    run_network_server();
+}, config::ASYNC_THREAD_STACK_SIZE, false)?;
+```
+
+| Property | Value |
+|----------|-------|
+| Default size | 32KB per thread (configurable) |
+| Max threads | 32 (thread 0 + 31 spawned) |
+| Allocation | Heap via `Vec<u8>` |
+| Guard pages | ❌ None (heap allocated) |
+| Protection | ✅ Stack canaries, overlap checking, bounds validation |
+
+### User Process Stacks
+
+User processes get stacks mapped via the ELF loader with a guard page:
+
+```rust
+const STACK_TOP: usize = 0x4000_0000;  // Top of first 1GB
+
+// Stack layout (grows down):
+// [guard page] [stack pages...] [STACK_TOP]
+let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
+let stack_bottom = guard_page + PAGE_SIZE;
+```
+
+| Property | Value |
+|----------|-------|
+| Stack size | 64KB default (`config::USER_STACK_SIZE`) |
+| Location | Top of first 1GB (`0x3FF00000-0x40000000`) |
+| Allocation | Via MMU page mapping |
+| Guard pages | ✅ One unmapped page at bottom |
+| Protection | ✅ Hardware fault on overflow |
+
+---
+
+## Protection Mechanisms
+
+### Summary Table
+
+| Protection | Boot Thread | Kernel Threads | User Processes |
+|------------|-------------|----------------|----------------|
+| Guard pages | ❌ | ❌ | ✅ |
+| Stack canaries | ✅ Tracked | ✅ | N/A |
+| Overlap checking | N/A | ✅ | N/A |
+| SP bounds validation | ✅ | ✅ | Via page faults |
+| Configurable size | Fixed | ✅ | ✅ |
+
+### Stack Canaries
+
+Stack canaries are magic values written at the bottom of each thread stack:
+
+```rust
+const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+const CANARY_WORDS: usize = 8;  // 64 bytes of canaries
+```
+
+Canaries are:
+- Initialized when stack is allocated
+- Checked periodically in the async main loop
+- Checked when threads are reclaimed
+- Logged when corruption is detected
+
+```rust
+// Periodic check in async loop
+let bad = threading::check_all_stack_canaries();
+if !bad.is_empty() {
+    console::print("[WARN] Stack overflow detected in threads: ...");
+}
+```
+
+### Overlap Protection
+
+Each thread stack is tracked via `StackInfo`:
+
+```rust
+pub struct StackInfo {
+    pub base: usize,  // Stack base (lowest address)
+    pub size: usize,  // Stack size in bytes
+    pub top: usize,   // Stack top (highest address)
+}
+```
+
+On spawn, new stacks are checked for overlap:
+
+```rust
+// Verify no overlap with existing stacks
+for (i, existing) in self.stacks.iter().enumerate() {
+    if i != slot_idx && new_stack.overlaps(existing) {
+        return Err("Stack allocation overlaps with existing thread");
     }
 }
 ```
 
-| Property | Value |
-|----------|-------|
-| Stack size | 32KB per thread |
-| Max threads | 32 (thread 0 + 31 spawned) |
-| Total memory | ~1MB for all thread stacks |
-| Allocation | Heap via `Vec<u8>` |
-| Guard pages | ❌ None |
+Debug functions:
+- `threading::check_stack_overlaps()` - Returns list of overlapping thread pairs
+- `threading::get_stack_bounds(tid)` - Get base/top for a thread
+- `threading::validate_current_sp()` - Check if SP is within current thread's bounds
 
-### User Process Stacks
+### User Stack Guard Pages
 
-User processes get stacks mapped via the ELF loader in `src/elf_loader.rs`:
+User stacks have an unmapped guard page at the bottom:
 
-```rust
-const STACK_TOP: usize = 0x4000_0000;  // Top of first 1GB
-let stack_bottom = STACK_TOP - stack_size;  // Default: 64KB
+```
+0x40000000  <- STACK_TOP (unmapped, end of user space)
+0x3FFF0000  <- stack_end (top of mapped stack)
+   ...      <- stack pages (RW)
+0x3FFE0000  <- stack_bottom (first mapped page)
+0x3FFDF000  <- guard_page (UNMAPPED - causes fault on overflow)
 ```
 
-| Property | Value |
-|----------|-------|
-| Stack size | 64KB default |
-| Location | Top of first 1GB (`0x3FF00000-0x40000000`) |
-| Allocation | Via MMU page mapping |
-| Guard pages | ❌ None (could be added) |
+On stack overflow, the user process triggers:
+- **Exception**: Data Abort from EL0 (EC=0x24)
+- **FAR**: Points to the guard page address
+- **Result**: Process is terminated instead of silently corrupting memory
 
-## Stack Overflow Risks
+---
 
-### Current Situation
+## Per-Thread Stack Size API
 
-| Stack | Size | Guard Page | Risk |
-|-------|------|------------|------|
-| Boot stack | 1MB | ❌ | Low - large size, well-positioned |
-| Thread stacks | 32KB | ❌ | Medium - heap allocated, no isolation |
-| User stacks | 64KB | ❌ | Medium - could add guard pages |
+### Spawning with Custom Stack Size
 
-### Why No Guard Pages?
+```rust
+use crate::config;
 
-**Boot stack**: Uses kernel 1GB block mapping (no fine-grained page control).
+// Spawn extern "C" function with custom stack
+threading::spawn_with_stack_size(
+    my_heavy_thread,
+    config::ASYNC_THREAD_STACK_SIZE,  // 256KB
+    false  // not cooperative
+)?;
 
-**Thread stacks**: Allocated via heap (`Vec<u8>`), not via page allocator. All heap memory uses the same 1GB block mapping.
+// Spawn closure with custom stack
+threading::spawn_fn_with_stack(|| {
+    run_network_server();
+}, 256 * 1024, false)?;
+```
 
-**User stacks**: Could have guard pages since they use 4KB page mappings, but currently don't.
+### Recommended Stack Sizes
 
-### Overflow Consequences
+| Workload | Recommended Size | Reason |
+|----------|------------------|--------|
+| Simple background task | 32KB | Default, sufficient for most work |
+| Network/async polling | 256KB | Deep call chains in SSH/HTTP |
+| Shell command execution | 64KB | Medium complexity |
+| Heavy recursive work | 128KB+ | Depends on recursion depth |
 
-Without guard pages, stack overflow causes **silent memory corruption**:
-- Boot stack overflow → corrupts heap
-- Thread stack overflow → corrupts adjacent heap allocations
-- User stack overflow → corrupts adjacent user memory regions
+---
+
+## Stack Overflow Symptoms
+
+### Kernel Thread Overflow (No Guard Pages)
+
+Without guard pages, kernel thread overflow causes **silent corruption**:
+- Canary corruption (detected by periodic checks)
+- Random crashes or hangs
+- Corrupted heap allocations
+- Corrupted adjacent thread stacks
+
+### User Process Overflow (With Guard Pages)
+
+With guard pages, user overflow causes a **clean fault**:
+```
+[PROC] Process pid=1 faulted: EC=0x24 (Data Abort from EL0)
+[PROC] FAR=0x3FFDF0F8 (guard page)
+[PROC] Process terminated
+```
+
+---
 
 ## Async Execution and Stack Depth
 
-The main async polling loop runs on thread 0 (boot thread):
+The async main loop runs on thread 0 (boot thread with 1MB stack):
 
 ```rust
 // In src/main.rs run_async_main()
 loop {
-    let _ = runner_pinned.as_mut().poll(&mut cx);        // Network
-    let _ = ssh_pinned.as_mut().poll(&mut cx);           // SSH server
-    let _ = web_pinned.as_mut().poll(&mut cx);           // HTTP server
-    // ...
+    let _ = runner_pinned.as_mut().poll(&mut cx);  // Network
+    let _ = ssh_pinned.as_mut().poll(&mut cx);     // SSH server
+    let _ = web_pinned.as_mut().poll(&mut cx);     // HTTP server
+    
+    // Periodic canary check
+    if config::ENABLE_STACK_CANARIES {
+        let bad = threading::check_all_stack_canaries();
+        // ...
+    }
+    
+    threading::yield_now();
 }
 ```
 
@@ -119,273 +262,39 @@ Each `poll()` creates a call chain. Complex async code = deep stacks:
 
 ### Stack Safety
 
-**Future state**: Stored on heap (via `Box::pin()` or `pin!` macro) - doesn't consume stack.
+**Future state**: Stored on heap - doesn't consume stack.
 
 **Poll chains**: Use thread stack - can be deep with complex async code.
 
-The 1MB boot stack should handle current async complexity, but has no safety margin against overflow.
+The 1MB boot stack handles current async complexity comfortably.
 
 ---
 
-## Implementing Guard Pages
+## Future Improvements
 
-### Strategy Overview
+### Fine-Grained Kernel Page Tables
 
-Guard pages are unmapped pages placed at stack boundaries. Accessing them triggers a page fault instead of silent corruption.
+Currently impossible due to 1GB block mapping. Would require:
 
-```
-┌───────────────────┐ High address
-│   Stack data      │
-│        ↓          │ (grows down)
-│   (used stack)    │
-├───────────────────┤
-│   (unused stack)  │
-├───────────────────┤
-│   GUARD PAGE      │ ← Unmapped - triggers fault on access
-├───────────────────┤
-│   Other memory    │ Low address
-└───────────────────┘
-```
+1. Switch kernel region to 4KB page mappings in `src/boot.rs`
+2. Add kernel page table management in `src/mmu.rs`
+3. Allocate thread stacks via PMM instead of heap
+4. Leave guard pages unmapped
 
-### Option 1: Guard Pages for User Stacks (Easiest)
-
-User stacks already use 4KB page mappings via `UserAddressSpace`. Adding a guard page is straightforward.
-
-**In `src/elf_loader.rs`:**
-
-```rust
-pub fn load_elf_with_stack(
-    elf_data: &[u8],
-    stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
-    let mut loaded = load_elf(elf_data)?;
-
-    const STACK_TOP: usize = 0x4000_0000;
-    const PAGE_SIZE: usize = 4096;
-    
-    // Reserve one page for guard
-    let stack_with_guard = stack_size + PAGE_SIZE;
-    let stack_bottom = STACK_TOP - stack_with_guard;
-    let stack_bottom_aligned = stack_bottom & !(PAGE_SIZE - 1);
-    
-    // Guard page is at stack_bottom_aligned (DON'T map it)
-    let guard_page = stack_bottom_aligned;
-    let actual_stack_bottom = guard_page + PAGE_SIZE;
-    
-    // Only map pages ABOVE the guard page
-    let stack_pages = stack_size / PAGE_SIZE;
-    for i in 0..stack_pages {
-        let page_va = actual_stack_bottom + i * PAGE_SIZE;
-        loaded.address_space
-            .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
-            .map_err(|e| ElfError::MappingFailed(e))?;
-    }
-    
-    // Stack usable region: actual_stack_bottom to STACK_TOP
-    let stack_end = actual_stack_bottom + stack_pages * PAGE_SIZE;
-    let initial_sp = (stack_end - 16) & !0xF;
-    
-    Ok((loaded.entry_point, loaded.address_space, initial_sp, 
-        loaded.brk, actual_stack_bottom, stack_end))
-}
-```
-
-**Result**: User stack overflow triggers `EC=0x24` (Data Abort from EL0) instead of corruption.
-
-### Option 2: Guard Pages for Thread Stacks (Medium Difficulty)
-
-Thread stacks are currently heap-allocated. To add guard pages:
-
-1. Allocate via PMM (page allocator) instead of heap
-2. Leave one page unmapped at the bottom
-
-**Modify `src/threading.rs`:**
-
-```rust
-use crate::pmm;
-use crate::mmu::PAGE_SIZE;
-
-const STACK_SIZE: usize = 32 * 1024;  // 32KB = 8 pages
-const STACK_PAGES: usize = STACK_SIZE / PAGE_SIZE;
-const GUARD_PAGES: usize = 1;
-const TOTAL_PAGES: usize = STACK_PAGES + GUARD_PAGES;
-
-pub fn init(&mut self) {
-    self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
-    self.stacks[IDLE_THREAD_IDX] = 0;  // Boot stack
-
-    for i in 1..MAX_THREADS {
-        // Allocate contiguous pages for stack + guard
-        if let Some(frame) = pmm::alloc_pages_zeroed(TOTAL_PAGES) {
-            // Guard page at bottom (frame.addr)
-            // Stack pages above it (frame.addr + PAGE_SIZE)
-            let stack_base = frame.addr + (GUARD_PAGES * PAGE_SIZE);
-            self.stacks[i] = stack_base;
-        } else {
-            // Fallback to heap allocation without guard
-            let stack_vec: Vec<u8> = alloc::vec![0u8; STACK_SIZE];
-            let stack_ptr = Box::into_raw(stack_vec.into_boxed_slice()) as *mut u8;
-            self.stacks[i] = stack_ptr as usize;
-        }
-    }
-    self.initialized = true;
-}
-```
-
-**Problem**: The kernel uses 1GB block mapping - ALL physical memory in the kernel region is mapped. The guard page is still accessible!
-
-**Solution**: Need to switch kernel region to 4KB page mappings (see Option 3).
-
-### Option 3: Fine-Grained Kernel Page Tables (Full Solution)
-
-To have working guard pages in kernel space, the kernel needs to use 4KB page mappings instead of 1GB blocks.
-
-**Changes required:**
-
-1. **Modify boot page tables** (`src/boot.rs`):
-   - Instead of 1GB block for L1[1], create L2 table
-   - Map kernel code/data/heap as 4KB pages with proper permissions
-   - Leave guard pages unmapped
-
-2. **Modify MMU init** (`src/mmu.rs`):
-   - Add functions to manage kernel page mappings
-   - `map_kernel_page(va, pa, flags)` 
-   - `unmap_kernel_page(va)`
-
-3. **Modify threading** (`src/threading.rs`):
-   - Allocate stack pages via PMM
-   - Call `unmap_kernel_page()` for guard page addresses
-
-**Example kernel page table setup:**
-
-```rust
-// In src/mmu.rs - new function
-pub fn setup_kernel_page_tables() -> Result<(), &'static str> {
-    // Get current L1 table address from boot code
-    let boot_l1_addr: usize = unsafe {
-        // Read from boot_ttbr0_addr
-        // ...
-    };
-    
-    // Allocate L2 table for kernel 1GB region (0x40000000-0x7FFFFFFF)
-    let l2_frame = pmm::alloc_page_zeroed()
-        .ok_or("Failed to allocate L2 for kernel")?;
-    
-    // Each L2 entry covers 2MB (512 entries × 2MB = 1GB)
-    // For fine-grained control, we need L3 tables too
-    
-    // Map kernel sections with appropriate permissions:
-    // .text:   Read-only, Executable
-    // .rodata: Read-only, No-execute  
-    // .data/.bss: Read-write, No-execute
-    // Stack:   Read-write, No-execute (with guard page unmapped)
-    // Heap:    Read-write, No-execute
-    
-    // ... implementation ...
-    
-    Ok(())
-}
-
-pub unsafe fn unmap_kernel_page(va: usize) {
-    // Walk kernel page tables
-    // Clear the L3 entry for this VA
-    // Flush TLB
-    flush_tlb_page(va);
-}
-```
-
-**Trade-offs**:
-- More complex boot code
-- Slight TLB pressure (more entries needed)
-- But: Stack overflow detection, code protection, better security
-
-### Option 4: Stack Canaries (Software Detection)
-
-If hardware guard pages are too complex, use software detection:
-
-```rust
-const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
-
-pub fn init(&mut self) {
-    for i in 1..MAX_THREADS {
-        let stack_vec: Vec<u8> = alloc::vec![0u8; STACK_SIZE];
-        let stack_ptr = Box::into_raw(stack_vec.into_boxed_slice()) as *mut u8;
-        
-        // Write canary at bottom of stack
-        unsafe {
-            let canary_ptr = stack_ptr as *mut u64;
-            for j in 0..8 {  // 64 bytes of canaries
-                canary_ptr.add(j).write_volatile(STACK_CANARY);
-            }
-        }
-        
-        self.stacks[i] = stack_ptr as usize;
-    }
-}
-
-pub fn check_stack_overflow(&self, thread_idx: usize) -> bool {
-    if thread_idx == 0 || thread_idx >= MAX_THREADS {
-        return false;
-    }
-    
-    let stack_base = self.stacks[thread_idx];
-    if stack_base == 0 {
-        return false;
-    }
-    
-    unsafe {
-        let canary_ptr = stack_base as *const u64;
-        for j in 0..8 {
-            if canary_ptr.add(j).read_volatile() != STACK_CANARY {
-                return true;  // Overflow detected!
-            }
-        }
-    }
-    false
-}
-```
-
-Call `check_stack_overflow()` periodically or on context switch.
-
-**Limitation**: Detects overflow after it happens, not at the moment of overflow.
-
----
-
-## Recommendations
-
-### Immediate (Low Effort)
-
-1. **Add user stack guard pages** (Option 1)
-   - Simple change to `elf_loader.rs`
-   - Catches user process stack overflows
-
-2. **Add stack canaries** (Option 4)
-   - Software detection for thread stacks
-   - Check on context switch or periodically
-
-### Medium Term
-
-3. **Increase thread stack size**
-   ```rust
-   const STACK_SIZE: usize = 64 * 1024;  // 64KB
-   ```
-   - Reduces overflow risk
-   - Trade-off: MAX_THREADS or heap usage
-
-### Long Term
-
-4. **Implement fine-grained kernel page tables** (Option 3)
-   - Full hardware protection for kernel code and stacks
-   - Significant refactoring of boot and MMU code
-   - Enables proper W^X (write XOR execute) policy
+This would enable:
+- Hardware guard pages for kernel threads
+- Read-only protection for kernel code (`.text`)
+- Execute-never for data sections
+- Full W^X (write XOR execute) policy
 
 ---
 
 ## Related Files
 
+- `src/config.rs` - Stack size configuration constants
 - `src/boot.rs` - Boot stack setup
-- `src/threading.rs` - Thread pool and stack allocation
-- `src/elf_loader.rs` - User stack setup
+- `src/threading.rs` - Thread pool, per-thread stacks, canaries, overlap checking
+- `src/elf_loader.rs` - User stack setup with guard page
+- `src/process.rs` - Process memory management
 - `src/mmu.rs` - Page table management
-- `src/pmm.rs` - Physical page allocation
-- `linker.ld` - Kernel section symbols (`_text_start`, `_kernel_phys_end`, etc.)
+- `src/main.rs` - Async loop with periodic canary checks

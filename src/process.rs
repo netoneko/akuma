@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use spinning_top::Spinlock;
 
+use crate::config;
 use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::UserAddressSpace;
@@ -401,8 +402,9 @@ impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack and pre-allocated heap
+        // Stack size is configurable via config::USER_STACK_SIZE
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
-            elf_loader::load_elf_with_stack(elf_data, 64 * 1024)?; // 64KB stack
+            elf_loader::load_elf_with_stack(elf_data, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         

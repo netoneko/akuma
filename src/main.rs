@@ -11,6 +11,7 @@ mod async_net;
 mod async_tests;
 mod block;
 mod boot;
+mod config;
 mod console;
 mod dns;
 mod editor;
@@ -391,7 +392,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 }
 
 /// Run the async main loop
-/// This is the main entry point for async networking
+/// 
+/// This is the main entry point for async networking.
+/// Runs on thread 0 (boot thread) which has a 1MB stack (config::KERNEL_STACK_SIZE).
+/// This is sufficient for deep async call chains (SSH, HTTP, etc.).
+/// 
+/// Note: Thread 0 uses the boot stack at 0x41F00000-0x42000000 which is
+/// protected by stack canaries checked periodically in this loop.
 fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     use core::future::Future;
     use core::pin::pin;
@@ -489,6 +496,22 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
 
         // Poll the executor for any other tasks
         executor::run_once();
+
+        // Periodic stack canary check (every ~1000 iterations to reduce overhead)
+        static mut CANARY_CHECK_COUNTER: u32 = 0;
+        unsafe {
+            CANARY_CHECK_COUNTER = CANARY_CHECK_COUNTER.wrapping_add(1);
+            if CANARY_CHECK_COUNTER % 1000 == 0 && config::ENABLE_STACK_CANARIES {
+                let bad = threading::check_all_stack_canaries();
+                if !bad.is_empty() {
+                    console::print("[WARN] Stack overflow detected in threads: ");
+                    for tid in &bad {
+                        console::print(&alloc::format!("{} ", tid));
+                    }
+                    console::print("\n");
+                }
+            }
+        }
 
         // Yield to other threads (cooperative multitasking)
         threading::yield_now();

@@ -1,5 +1,7 @@
 // Preemptive threading with fixed-size thread pool
-// No dynamic allocation during spawn/cleanup - all memory pre-allocated at init
+// Supports per-thread stack sizes and stack overflow detection
+
+#![allow(dead_code)]
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -9,16 +11,10 @@ use spinning_top::Spinlock;
 
 // Use the shared IRQ guard from the irq module
 use crate::irq::with_irqs_disabled;
+use crate::config;
 
 /// Default timeout for cooperative threads in microseconds (5 seconds)
 pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
-
-/// Stack size per thread (32KB)
-const STACK_SIZE: usize = 32 * 1024;
-
-/// Maximum threads - with 32KB stacks, 32 threads = 1MB
-/// Reasonable for 120MB heap
-const MAX_THREADS: usize = 32;
 
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 const IDLE_THREAD_IDX: usize = 0;
@@ -180,6 +176,47 @@ pub enum ThreadState {
     Terminated, // Finished, slot can be reclaimed
 }
 
+/// Stack information for a thread
+#[derive(Debug, Clone, Copy)]
+pub struct StackInfo {
+    /// Stack base address (lowest address)
+    pub base: usize,
+    /// Stack size in bytes
+    pub size: usize,
+    /// Stack top address (highest address, where SP starts)
+    pub top: usize,
+}
+
+impl StackInfo {
+    /// Create empty/unallocated stack info
+    pub const fn empty() -> Self {
+        Self { base: 0, size: 0, top: 0 }
+    }
+    
+    /// Create new stack info
+    pub fn new(base: usize, size: usize) -> Self {
+        Self { base, size, top: base + size }
+    }
+    
+    /// Check if this stack overlaps with another
+    pub fn overlaps(&self, other: &StackInfo) -> bool {
+        if self.base == 0 || other.base == 0 {
+            return false;  // Unallocated stacks don't overlap
+        }
+        self.base < other.top && other.base < self.top
+    }
+    
+    /// Check if an address is within this stack
+    pub fn contains(&self, addr: usize) -> bool {
+        self.base != 0 && addr >= self.base && addr < self.top
+    }
+    
+    /// Check if this stack is allocated
+    pub fn is_allocated(&self) -> bool {
+        self.base != 0
+    }
+}
+
 /// Thread slot in the pool
 #[repr(C)]
 pub struct ThreadSlot {
@@ -202,10 +239,10 @@ impl ThreadSlot {
     }
 }
 
-/// Fixed-size thread pool with pre-allocated stacks
+/// Fixed-size thread pool with per-thread stack sizes
 pub struct ThreadPool {
-    slots: [ThreadSlot; MAX_THREADS],
-    stacks: [usize; MAX_THREADS], // Pointers to pre-allocated stacks
+    slots: [ThreadSlot; config::MAX_THREADS],
+    stacks: [StackInfo; config::MAX_THREADS],
     current_idx: usize,
     initialized: bool,
 }
@@ -213,35 +250,98 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub const fn new() -> Self {
         Self {
-            slots: [const { ThreadSlot::empty() }; MAX_THREADS],
-            stacks: [0; MAX_THREADS],
+            slots: [const { ThreadSlot::empty() }; config::MAX_THREADS],
+            stacks: [const { StackInfo::empty() }; config::MAX_THREADS],
             current_idx: 0,
             initialized: false,
         }
     }
 
-    /// Initialize the pool - allocate all stacks upfront
+    /// Initialize the pool - allocate default stacks for all slots
     pub fn init(&mut self) {
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
-        self.stacks[IDLE_THREAD_IDX] = 0; // Boot stack, don't allocate
+        // Boot stack info (fixed location from boot.rs)
+        self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
+            0x41F00000,  // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
+            config::KERNEL_STACK_SIZE
+        );
 
-        // Pre-allocate stacks for all other slots using Vec
-        for i in 1..MAX_THREADS {
-            // Create a zeroed Vec for the stack, then leak it to get a stable pointer
-            let stack_vec: Vec<u8> = alloc::vec![0u8; STACK_SIZE];
-            let stack_box = stack_vec.into_boxed_slice();
-            let stack_ptr = Box::into_raw(stack_box) as *mut u8;
-            self.stacks[i] = stack_ptr as usize;
+        // Pre-allocate default stacks for all other slots
+        for i in 1..config::MAX_THREADS {
+            self.allocate_stack_for_slot(i, config::DEFAULT_THREAD_STACK_SIZE);
         }
 
         self.initialized = true;
     }
+    
+    /// Allocate a stack for a specific slot
+    fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) {
+        let stack_vec: Vec<u8> = alloc::vec![0u8; size];
+        let stack_box = stack_vec.into_boxed_slice();
+        let stack_ptr = Box::into_raw(stack_box) as *mut u8;
+        let stack_info = StackInfo::new(stack_ptr as usize, size);
+        
+        // Initialize canary at bottom of stack
+        if config::ENABLE_STACK_CANARIES {
+            init_stack_canary(stack_info.base);
+        }
+        
+        self.stacks[slot_idx] = stack_info;
+    }
+    
+    /// Reallocate stack for a slot with new size (only if slot is Free)
+    fn reallocate_stack(&mut self, slot_idx: usize, new_size: usize) -> Result<(), &'static str> {
+        if slot_idx == 0 {
+            return Err("Cannot reallocate boot stack");
+        }
+        if slot_idx >= config::MAX_THREADS {
+            return Err("Invalid slot index");
+        }
+        if self.slots[slot_idx].state != ThreadState::Free {
+            return Err("Can only reallocate stack for free slot");
+        }
+        
+        let old_stack = &self.stacks[slot_idx];
+        
+        // Free old stack if allocated
+        if old_stack.is_allocated() {
+            unsafe {
+                let ptr = old_stack.base as *mut u8;
+                let slice = core::slice::from_raw_parts_mut(ptr, old_stack.size);
+                let _ = Box::from_raw(slice as *mut [u8]);
+            }
+        }
+        
+        // Allocate new stack
+        self.allocate_stack_for_slot(slot_idx, new_size);
+        
+        // Check for overlaps with other stacks
+        let new_stack = &self.stacks[slot_idx];
+        for i in 0..config::MAX_THREADS {
+            if i != slot_idx && new_stack.overlaps(&self.stacks[i]) {
+                // This shouldn't happen with heap allocation, but check anyway
+                return Err("New stack overlaps with existing stack");
+            }
+        }
+        
+        Ok(())
+    }
 
-    /// Spawn a new thread with extern "C" entry function
+    /// Spawn a new thread with extern "C" entry function and default stack
     pub fn spawn(
         &mut self,
         entry: extern "C" fn() -> !,
+        cooperative: bool,
+    ) -> Result<usize, &'static str> {
+        self.spawn_with_stack_size(entry, config::DEFAULT_THREAD_STACK_SIZE, cooperative)
+    }
+    
+    /// Spawn a new thread with extern "C" entry function and custom stack size
+    pub fn spawn_with_stack_size(
+        &mut self,
+        entry: extern "C" fn() -> !,
+        stack_size: usize,
         cooperative: bool,
     ) -> Result<usize, &'static str> {
         if !self.initialized {
@@ -249,16 +349,19 @@ impl ThreadPool {
         }
 
         // Find first free slot (skip slot 0 = idle)
-        for i in 1..MAX_THREADS {
+        for i in 1..config::MAX_THREADS {
             if self.slots[i].state == ThreadState::Free {
-                // Setup the thread - write all fields point-by-point to avoid
-                // large struct copies which can hang due to compiler optimization issues
-                let stack_base = self.stacks[i];
-                let stack_top = stack_base + STACK_SIZE;
-                let sp = (stack_top & !0xF) as u64;
+                // Reallocate stack if size differs
+                if self.stacks[i].size != stack_size {
+                    self.reallocate_stack(i, stack_size)?;
+                }
+                
+                // Setup the thread
+                let stack = &self.stacks[i];
+                let sp = (stack.top & !0xF) as u64;
                 let entry_addr = entry as *const () as u64;
 
-                // Write context fields individually (128-byte struct copy was hanging)
+                // Write context fields individually
                 self.slots[i].context.x19 = entry_addr;
                 self.slots[i].context.x20 = 0;
                 self.slots[i].context.x21 = 0;
@@ -269,7 +372,7 @@ impl ThreadPool {
                 self.slots[i].context.x26 = 0;
                 self.slots[i].context.x27 = 0;
                 self.slots[i].context.x28 = 0;
-                self.slots[i].context.x29 = 0; // Frame pointer
+                self.slots[i].context.x29 = 0;
                 self.slots[i].context.x30 = thread_start as *const () as u64;
                 self.slots[i].context.sp = sp;
                 self.slots[i].context.daif = 0;
@@ -295,13 +398,27 @@ impl ThreadPool {
         Err("No free thread slots")
     }
 
-    /// Spawn a new thread with a boxed closure
-    /// trampoline_fn: function that takes raw closure pointer and calls it
-    /// closure_ptr: raw pointer to the boxed closure
+    /// Spawn a new thread with a boxed closure and default stack
     pub fn spawn_closure(
         &mut self,
         trampoline_fn: fn(*mut ()) -> !,
         closure_ptr: *mut (),
+        cooperative: bool,
+    ) -> Result<usize, &'static str> {
+        self.spawn_closure_with_stack_size(
+            trampoline_fn, 
+            closure_ptr, 
+            config::DEFAULT_THREAD_STACK_SIZE,
+            cooperative
+        )
+    }
+    
+    /// Spawn a new thread with a boxed closure and custom stack size
+    pub fn spawn_closure_with_stack_size(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+        stack_size: usize,
         cooperative: bool,
     ) -> Result<usize, &'static str> {
         if !self.initialized {
@@ -309,11 +426,15 @@ impl ThreadPool {
         }
 
         // Find first free slot (skip slot 0 = idle)
-        for i in 1..MAX_THREADS {
+        for i in 1..config::MAX_THREADS {
             if self.slots[i].state == ThreadState::Free {
-                let stack_base = self.stacks[i];
-                let stack_top = stack_base + STACK_SIZE;
-                let sp = (stack_top & !0xF) as u64;
+                // Reallocate stack if size differs
+                if self.stacks[i].size != stack_size {
+                    self.reallocate_stack(i, stack_size)?;
+                }
+                
+                let stack = &self.stacks[i];
+                let sp = (stack.top & !0xF) as u64;
 
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
@@ -353,18 +474,25 @@ impl ThreadPool {
 
     /// Reclaim a terminated thread slot (just mark as Free)
     pub fn reclaim(&mut self, idx: usize) {
-        if idx > 0 && idx < MAX_THREADS && self.slots[idx].state == ThreadState::Terminated {
+        if idx > 0 && idx < config::MAX_THREADS && self.slots[idx].state == ThreadState::Terminated {
             self.slots[idx].state = ThreadState::Free;
-            // Stack stays allocated - will be reused
+            // Re-initialize canary for reuse
+            if config::ENABLE_STACK_CANARIES && self.stacks[idx].is_allocated() {
+                init_stack_canary(self.stacks[idx].base);
+            }
         }
     }
 
     /// Clean up all terminated threads
     pub fn cleanup_terminated(&mut self) -> usize {
         let mut count = 0;
-        for i in 1..MAX_THREADS {
+        for i in 1..config::MAX_THREADS {
             if self.slots[i].state == ThreadState::Terminated {
                 self.slots[i].state = ThreadState::Free;
+                // Re-initialize canary for reuse
+                if config::ENABLE_STACK_CANARIES && self.stacks[i].is_allocated() {
+                    init_stack_canary(self.stacks[i].base);
+                }
                 count += 1;
             }
         }
@@ -372,7 +500,6 @@ impl ThreadPool {
     }
 
     /// Select next ready thread (round-robin)
-    /// Thread 0 (boot/main) is a regular thread that can be scheduled
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
         let current_idx = self.current_idx;
         let current = &self.slots[current_idx];
@@ -384,17 +511,15 @@ impl ThreadPool {
                 let now = crate::timer::uptime_us();
                 let elapsed = now.saturating_sub(current.start_time_us);
                 if elapsed < timeout {
-                    return None; // Not timed out yet
+                    return None;
                 }
-                // Debug: cooperative thread timed out
-                // crate::console::print("[SCHED] coop timeout\n");
             } else {
-                return None; // No timeout, can't preempt
+                return None;
             }
         }
 
         // Find next ready thread (including thread 0)
-        let mut next_idx = (current_idx + 1) % MAX_THREADS;
+        let mut next_idx = (current_idx + 1) % config::MAX_THREADS;
         let start_idx = next_idx;
 
         loop {
@@ -403,10 +528,10 @@ impl ThreadPool {
                 break;
             }
 
-            next_idx = (next_idx + 1) % MAX_THREADS;
+            next_idx = (next_idx + 1) % config::MAX_THREADS;
 
             if next_idx == start_idx {
-                return None; // No ready threads
+                return None;
             }
         }
 
@@ -414,8 +539,7 @@ impl ThreadPool {
             return None;
         }
 
-        // Update states - ALL threads get set to Ready when switching away
-        // (except terminated threads)
+        // Update states
         if self.slots[current_idx].state != ThreadState::Terminated {
             self.slots[current_idx].state = ThreadState::Ready;
         }
@@ -459,6 +583,43 @@ impl ThreadPool {
     }
 }
 
+// ============================================================================
+// Stack Canary Functions
+// ============================================================================
+
+/// Initialize stack canary at the bottom of a stack
+fn init_stack_canary(stack_base: usize) {
+    if stack_base == 0 {
+        return;
+    }
+    unsafe {
+        let ptr = stack_base as *mut u64;
+        for i in 0..config::CANARY_WORDS {
+            ptr.add(i).write_volatile(config::STACK_CANARY);
+        }
+    }
+}
+
+/// Check if stack canary is intact
+fn check_stack_canary(stack_base: usize) -> bool {
+    if stack_base == 0 {
+        return true;  // Boot stack or unallocated
+    }
+    unsafe {
+        let ptr = stack_base as *const u64;
+        for i in 0..config::CANARY_WORDS {
+            if ptr.add(i).read_volatile() != config::STACK_CANARY {
+                return false;  // Corrupted!
+            }
+        }
+    }
+    true
+}
+
+// ============================================================================
+// Global Thread Pool
+// ============================================================================
+
 static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
 static VOLUNTARY_SCHEDULE: AtomicBool = AtomicBool::new(false);
 
@@ -468,17 +629,17 @@ pub fn init() {
     pool.init();
 }
 
-/// Spawn a new preemptible thread with extern "C" entry
+/// Spawn a new preemptible thread with extern "C" entry and default stack
 pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
     spawn_with_options(entry, false)
 }
 
-/// Spawn a cooperative thread (only yields voluntarily) with extern "C" entry
+/// Spawn a cooperative thread with extern "C" entry and default stack
 pub fn spawn_cooperative(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
     spawn_with_options(entry, true)
 }
 
-/// Spawn with options (extern "C" entry)
+/// Spawn with options and default stack (extern "C" entry)
 pub fn spawn_with_options(
     entry: extern "C" fn() -> !,
     cooperative: bool,
@@ -489,26 +650,25 @@ pub fn spawn_with_options(
     })
 }
 
+/// Spawn with custom stack size (extern "C" entry)
+pub fn spawn_with_stack_size(
+    entry: extern "C" fn() -> !,
+    stack_size: usize,
+    cooperative: bool,
+) -> Result<usize, &'static str> {
+    with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_with_stack_size(entry, stack_size, cooperative)
+    })
+}
+
 /// Trampoline function that calls a boxed FnOnce closure
-/// Called from assembly with the closure pointer in x0
 fn closure_trampoline<F: FnOnce() -> ! + Send + 'static>(closure_ptr: *mut ()) -> ! {
-    // SAFETY: The pointer was created from Box::into_raw in spawn_fn
-    // and is only called once (the thread runs the closure and never returns)
     let closure = unsafe { Box::from_raw(closure_ptr as *mut F) };
     closure()
 }
 
-/// Spawn a new preemptible thread with a Rust closure
-///
-/// # Example
-/// ```
-/// spawn_fn(|| {
-///     loop {
-///         // thread work
-///         yield_now();
-///     }
-/// })
-/// ```
+/// Spawn a new preemptible thread with a Rust closure and default stack
 pub fn spawn_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
@@ -516,7 +676,7 @@ where
     spawn_fn_with_options(f, false)
 }
 
-/// Spawn a cooperative thread with a Rust closure
+/// Spawn a cooperative thread with a Rust closure and default stack
 pub fn spawn_fn_cooperative<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
@@ -524,8 +684,24 @@ where
     spawn_fn_with_options(f, true)
 }
 
-/// Spawn a thread with a Rust closure and options
+/// Spawn a thread with a Rust closure, options, and default stack
 pub fn spawn_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_fn_with_stack(f, config::DEFAULT_THREAD_STACK_SIZE, cooperative)
+}
+
+/// Spawn a thread with a Rust closure and custom stack size
+/// 
+/// # Example
+/// ```
+/// // Spawn with 256KB stack for async networking
+/// spawn_fn_with_stack(|| {
+///     run_async_main();
+/// }, config::ASYNC_THREAD_STACK_SIZE, false)?;
+/// ```
+pub fn spawn_fn_with_stack<F>(f: F, stack_size: usize, cooperative: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
@@ -538,12 +714,11 @@ where
 
     let result = with_irqs_disabled(|| {
         let mut pool = POOL.lock();
-        pool.spawn_closure(trampoline, closure_ptr, cooperative)
+        pool.spawn_closure_with_stack_size(trampoline, closure_ptr, stack_size, cooperative)
     });
 
-    // If spawn failed, we need to clean up the boxed closure
+    // If spawn failed, clean up the boxed closure
     if result.is_err() {
-        // SAFETY: We just created this pointer and spawn failed, so we own it
         unsafe {
             let _ = Box::from_raw(closure_ptr as *mut F);
         }
@@ -608,7 +783,6 @@ pub fn mark_current_terminated() {
     with_irqs_disabled(|| {
         let mut pool = POOL.lock();
         let idx = pool.current_idx;
-        // Never allow terminating thread 0 (boot/idle thread)
         if idx != IDLE_THREAD_IDX {
             pool.slots[idx].state = ThreadState::Terminated;
         }
@@ -625,5 +799,81 @@ pub fn current_thread_id() -> usize {
 
 /// Get max thread count
 pub fn max_threads() -> usize {
-    MAX_THREADS
+    config::MAX_THREADS
+}
+
+// ============================================================================
+// Stack Protection Functions
+// ============================================================================
+
+/// Check all thread stacks for overlap (debug/diagnostic)
+/// Returns list of (thread_a, thread_b) pairs that overlap
+pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut overlaps = Vec::new();
+        
+        for i in 0..config::MAX_THREADS {
+            for j in (i + 1)..config::MAX_THREADS {
+                if pool.stacks[i].overlaps(&pool.stacks[j]) {
+                    overlaps.push((i, j));
+                }
+            }
+        }
+        overlaps
+    })
+}
+
+/// Get stack bounds for a thread
+pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        if thread_id < config::MAX_THREADS && pool.stacks[thread_id].is_allocated() {
+            Some((pool.stacks[thread_id].base, pool.stacks[thread_id].top))
+        } else {
+            None
+        }
+    })
+}
+
+/// Validate current stack pointer is within bounds
+pub fn validate_current_sp() -> bool {
+    let sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
+    
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let current = pool.current_idx;
+        pool.stacks[current].contains(sp)
+    })
+}
+
+/// Check all thread stack canaries for corruption
+/// Returns list of thread IDs with corrupted canaries
+pub fn check_all_stack_canaries() -> Vec<usize> {
+    if !config::ENABLE_STACK_CANARIES {
+        return Vec::new();
+    }
+    
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut bad = Vec::new();
+        
+        // Skip boot thread (index 0) - it uses fixed boot stack
+        for i in 1..config::MAX_THREADS {
+            let stack = &pool.stacks[i];
+            if stack.is_allocated() && !check_stack_canary(stack.base) {
+                bad.push(i);
+            }
+        }
+        bad
+    })
+}
+
+/// Check if there are any threads ready to run
+pub fn has_ready_threads() -> bool {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        pool.slots.iter().any(|s| s.state == ThreadState::Ready)
+    })
 }
