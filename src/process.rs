@@ -159,6 +159,41 @@ pub fn get_stack_bounds() -> (usize, usize) {
     }
 }
 
+/// Process info for display (used by ps command)
+#[derive(Debug, Clone)]
+pub struct ProcessInfo2 {
+    pub pid: Pid,
+    pub ppid: Pid,
+    pub name: String,
+    pub state: &'static str,
+}
+
+/// List all running processes
+/// 
+/// Returns a vector of process info for display.
+pub fn list_processes() -> Vec<ProcessInfo2> {
+    let table = PROCESS_TABLE.lock();
+    let mut result = Vec::new();
+    
+    for (&pid, &ProcessPtr(ptr)) in table.iter() {
+        let proc = unsafe { &*ptr };
+        let state = match proc.state {
+            ProcessState::Ready => "ready",
+            ProcessState::Running => "running",
+            ProcessState::Blocked => "blocked",
+            ProcessState::Zombie(_) => "zombie",
+        };
+        result.push(ProcessInfo2 {
+            pid,
+            ppid: proc.parent_pid,
+            name: proc.name.clone(),
+            state,
+        });
+    }
+    
+    result
+}
+
 /// Initialize the program break for a new process
 pub fn init_brk(initial_brk: usize) {
     use core::sync::atomic::Ordering;

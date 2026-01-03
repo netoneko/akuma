@@ -232,6 +232,9 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  grep [-iv] <pattern>  - Filter lines by pattern\r\n")
                 .await;
+            let _ = stdout
+                .write(b"  ps                    - List running processes\r\n")
+                .await;
             let _ = stdout.write(b"\r\nFilesystem commands:\r\n").await;
             let _ = stdout
                 .write(b"  ls [path]             - List directory contents\r\n")
@@ -420,3 +423,55 @@ impl Command for GrepCommand {
 
 /// Static instance
 pub static GREP_CMD: GrepCommand = GrepCommand;
+
+// ============================================================================
+// Ps Command
+// ============================================================================
+
+/// Ps command - list running processes
+pub struct PsCommand;
+
+impl Command for PsCommand {
+    fn name(&self) -> &'static str {
+        "ps"
+    }
+    fn description(&self) -> &'static str {
+        "List running processes"
+    }
+    fn usage(&self) -> &'static str {
+        "ps"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            use crate::process;
+            
+            // Header
+            let _ = stdout.write(b"  PID  PPID  STATE     NAME\r\n").await;
+            
+            let procs = process::list_processes();
+            
+            if procs.is_empty() {
+                let _ = stdout.write(b"(no processes running)\r\n").await;
+            } else {
+                for p in procs {
+                    let line = format!(
+                        "{:>5}  {:>4}  {:<8}  {}\r\n",
+                        p.pid, p.ppid, p.state, p.name
+                    );
+                    let _ = stdout.write(line.as_bytes()).await;
+                }
+            }
+            
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static PS_CMD: PsCommand = PsCommand;

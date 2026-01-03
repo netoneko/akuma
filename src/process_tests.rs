@@ -111,6 +111,7 @@ fn test_stdcheck() {
     }
 }
 
+#[allow(dead_code)]
 /// Test the echo2 binary if it exists
 fn test_echo2() {
     const ECHO2_PATH: &str = "/bin/echo2";

@@ -4,6 +4,7 @@ members = [
     "libakuma",
     "echo2",
     "elftest",
+    "hello",
     "stdcheck",
 ]
 
