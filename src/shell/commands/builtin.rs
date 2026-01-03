@@ -235,6 +235,9 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  ps                    - List running processes\r\n")
                 .await;
+            let _ = stdout
+                .write(b"  kthreads              - List kernel threads with stack info\r\n")
+                .await;
             let _ = stdout.write(b"\r\nFilesystem commands:\r\n").await;
             let _ = stdout
                 .write(b"  ls [path]             - List directory contents\r\n")
@@ -475,3 +478,84 @@ impl Command for PsCommand {
 
 /// Static instance
 pub static PS_CMD: PsCommand = PsCommand;
+
+// ============================================================================
+// Kthreads Command
+// ============================================================================
+
+/// Kthreads command - list kernel threads with stack info
+pub struct KthreadsCommand;
+
+impl Command for KthreadsCommand {
+    fn name(&self) -> &'static str {
+        "kthreads"
+    }
+    fn description(&self) -> &'static str {
+        "List kernel threads with stack info"
+    }
+    fn usage(&self) -> &'static str {
+        "kthreads"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            use crate::threading;
+            
+            // Header
+            let _ = stdout.write(b"  TID  STATE     STACK_BASE  STACK_SIZE  STACK_USED  CANARY  TYPE         NAME\r\n").await;
+            
+            let threads = threading::list_kernel_threads();
+            
+            if threads.is_empty() {
+                let _ = stdout.write(b"(no kernel threads)\r\n").await;
+            } else {
+                for t in threads {
+                    // Format stack size and usage in KB
+                    let size_kb = t.stack_size / 1024;
+                    let used_kb = t.stack_used / 1024;
+                    let used_pct = if t.stack_size > 0 {
+                        (t.stack_used * 100) / t.stack_size
+                    } else {
+                        0
+                    };
+                    
+                    let canary_str = if t.canary_ok { "OK" } else { "FAIL" };
+                    let type_str = if t.cooperative { "cooperative" } else { "preemptive" };
+                    
+                    let line = format!(
+                        "{:>4}  {:<8}  0x{:08x}  {:>6} KB   {:>4} KB {:>2}%  {:<6}  {:<11}  {}\r\n",
+                        t.tid,
+                        t.state,
+                        t.stack_base,
+                        size_kb,
+                        used_kb,
+                        used_pct,
+                        canary_str,
+                        type_str,
+                        t.name
+                    );
+                    let _ = stdout.write(line.as_bytes()).await;
+                }
+            }
+            
+            // Summary
+            let (ready, running, terminated) = threading::thread_stats();
+            let total = ready + running + terminated;
+            let summary = format!(
+                "\r\nTotal: {} threads (ready: {}, running: {}, terminated: {})\r\n",
+                total, ready, running, terminated
+            );
+            let _ = stdout.write(summary.as_bytes()).await;
+            
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static KTHREADS_CMD: KthreadsCommand = KthreadsCommand;

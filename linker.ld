@@ -77,3 +77,17 @@ SECTIONS
         *(.eh_frame)
     }
 }
+
+/*
+ * Boot stack layout check:
+ *   KERNEL_PHYS_BASE = 0x40000000
+ *   STACK_TOP        = 0x42000000 (32MB from base)
+ *   STACK_SIZE       = 0x100000   (1MB)
+ *   STACK_BOTTOM     = 0x41F00000 (31MB from base)
+ *
+ * Kernel binary must fit below STACK_BOTTOM.
+ * This assertion fails the build if kernel is too large.
+ */
+STACK_BOTTOM = 0x41F00000;
+ASSERT(_kernel_phys_end < STACK_BOTTOM, 
+    "FATAL: Kernel binary overlaps boot stack! Kernel end must be < 0x41F00000 (31MB from base). Reduce kernel size or increase STACK_TOP in boot.rs.")

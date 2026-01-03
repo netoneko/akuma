@@ -123,6 +123,55 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
 fn kernel_main(dtb_ptr: usize) -> ! {
     // Detect memory from DTB (must be done before heap init, so print first)
     console::print("Akuma Kernel starting...\n");
+    
+    // =========================================================================
+    // CRITICAL: Verify kernel binary doesn't overlap with boot stack
+    // =========================================================================
+    // Stack layout (from boot.rs):
+    //   STACK_TOP    = 0x42000000 (32MB from kernel base)
+    //   STACK_SIZE   = 0x100000   (1MB)
+    //   Stack bottom = 0x41F00000 (31MB from kernel base)
+    //
+    // Kernel must fit below 0x41F00000 to not corrupt stack!
+    const KERNEL_BASE: usize = 0x4000_0000;
+    const STACK_BOTTOM: usize = 0x41F0_0000;  // STACK_TOP - STACK_SIZE
+    
+    unsafe extern "C" {
+        static _kernel_phys_end: u8;
+    }
+    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+    let kernel_size = kernel_end - KERNEL_BASE;
+    
+    console::print("Kernel binary: ");
+    console::print_dec(kernel_size / 1024);
+    console::print(" KB (0x");
+    console::print_hex(KERNEL_BASE as u64);
+    console::print(" - 0x");
+    console::print_hex(kernel_end as u64);
+    console::print(")\n");
+    
+    if kernel_end >= STACK_BOTTOM {
+        console::print("\n!!! FATAL: Kernel binary overlaps with boot stack !!!\n");
+        console::print("Kernel end:   0x");
+        console::print_hex(kernel_end as u64);
+        console::print("\nStack bottom: 0x");
+        console::print_hex(STACK_BOTTOM as u64);
+        console::print("\n\nThe kernel has grown too large. Options:\n");
+        console::print("  1. Increase STACK_TOP in boot.rs (move stack higher)\n");
+        console::print("  2. Reduce kernel size (remove unused features)\n");
+        console::print("  3. Move to dynamic stack allocation\n");
+        console::print("\nHALTING.\n");
+        halt();
+    }
+    
+    // Safety margin check - warn if kernel is getting close to stack
+    let margin = STACK_BOTTOM - kernel_end;
+    if margin < 4 * 1024 * 1024 {  // Less than 4MB margin
+        console::print("WARNING: Kernel is within 4MB of stack! (");
+        console::print_dec(margin / 1024);
+        console::print(" KB margin)\n");
+    }
+    
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
     // Memory layout constants

@@ -119,6 +119,61 @@ To add proper memory protection:
 
 See `docs/THREAD_STACK_ANALYSIS.md` for detailed guard page implementation guidance.
 
+---
+
+## Safeguards Against Recurrence
+
+Two safeguards prevent the kernel from growing too large and overlapping the stack:
+
+### Build-Time Check (Linker Assertion)
+
+The linker script (`linker.ld`) includes an assertion that fails the build if the kernel is too large:
+
+```ld
+STACK_BOTTOM = 0x41F00000;
+ASSERT(_kernel_phys_end < STACK_BOTTOM, 
+    "FATAL: Kernel binary overlaps boot stack!")
+```
+
+If the kernel grows beyond 31MB, the build fails with:
+```
+ld.lld: error: FATAL: Kernel binary overlaps boot stack!
+```
+
+### Runtime Check (kernel_main)
+
+Early in `kernel_main()` (`src/main.rs`), we verify the kernel fits:
+
+```rust
+const STACK_BOTTOM: usize = 0x41F0_0000;
+let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+
+if kernel_end >= STACK_BOTTOM {
+    console::print("!!! FATAL: Kernel binary overlaps with boot stack !!!\n");
+    halt();
+}
+
+// Warn if getting close (< 4MB margin)
+let margin = STACK_BOTTOM - kernel_end;
+if margin < 4 * 1024 * 1024 {
+    console::print("WARNING: Kernel is within 4MB of stack!\n");
+}
+```
+
+### Current Status
+
+The kernel is currently ~3.5MB, leaving ~27.5MB margin before the 31MB limit.
+
+| Component | Address | Size |
+|-----------|---------|------|
+| Kernel base | `0x40000000` | - |
+| Kernel end | `~0x40380000` | ~3.5MB |
+| Stack bottom | `0x41F00000` | - |
+| Stack top | `0x42000000` | 1MB |
+| **Margin** | - | **~27.5MB** |
+
+---
+
 ## Testing
 
 Verify the fix:

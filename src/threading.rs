@@ -877,3 +877,96 @@ pub fn has_ready_threads() -> bool {
         pool.slots.iter().any(|s| s.state == ThreadState::Ready)
     })
 }
+
+// ============================================================================
+// Kernel Thread Info for kthreads command
+// ============================================================================
+
+/// Information about a kernel thread for display
+#[derive(Debug, Clone)]
+pub struct KernelThreadInfo {
+    /// Thread ID (0-31)
+    pub tid: usize,
+    /// Thread state as string
+    pub state: &'static str,
+    /// Whether thread is cooperative
+    pub cooperative: bool,
+    /// Stack base address
+    pub stack_base: usize,
+    /// Stack size in bytes
+    pub stack_size: usize,
+    /// Estimated stack usage (based on SP)
+    pub stack_used: usize,
+    /// Stack canary status (true = intact, false = corrupted)
+    pub canary_ok: bool,
+    /// Thread description/name
+    pub name: &'static str,
+}
+
+/// Get list of all kernel threads with their info
+pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut threads = Vec::new();
+        
+        for i in 0..config::MAX_THREADS {
+            let slot = &pool.slots[i];
+            let stack = &pool.stacks[i];
+            
+            // Skip free slots
+            if slot.state == ThreadState::Free {
+                continue;
+            }
+            
+            let state_str = match slot.state {
+                ThreadState::Free => "free",
+                ThreadState::Ready => "ready",
+                ThreadState::Running => "running",
+                ThreadState::Terminated => "zombie",
+            };
+            
+            // Estimate stack usage from saved SP in context
+            let stack_used = if stack.is_allocated() && slot.context.sp != 0 {
+                // SP points to current stack position (grows down)
+                // Usage = top - SP
+                let sp = slot.context.sp as usize;
+                if sp >= stack.base && sp <= stack.top {
+                    stack.top.saturating_sub(sp)
+                } else {
+                    0  // SP outside stack bounds
+                }
+            } else {
+                0
+            };
+            
+            // Check canary status
+            let canary_ok = if i == 0 || !stack.is_allocated() {
+                true  // Boot stack or unallocated
+            } else if config::ENABLE_STACK_CANARIES {
+                check_stack_canary(stack.base)
+            } else {
+                true  // Canaries disabled
+            };
+            
+            // Thread name based on index and state
+            let name = match i {
+                0 => "boot/async",
+                _ if slot.cooperative => "cooperative",
+                _ => "preemptive",
+            };
+            
+            threads.push(KernelThreadInfo {
+                tid: i,
+                state: state_str,
+                cooperative: slot.cooperative,
+                stack_base: stack.base,
+                stack_size: stack.size,
+                stack_used,
+                canary_ok,
+                name,
+            });
+        }
+        
+        threads
+    })
+}

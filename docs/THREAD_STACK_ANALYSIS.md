@@ -49,6 +49,15 @@ _boot:
 
 **Status**: ✅ Fixed - Stack is positioned above the kernel binary (which is ~3.5MB).
 
+> **Note**: The async networking loop (SSH, HTTP, network polling) currently runs on
+> thread 0 with the 1MB boot stack. While `config::ASYNC_THREAD_STACK_SIZE` (256KB)
+> exists for spawning dedicated network threads, the main async loop uses thread 0
+> because `NetworkInit` contains non-Send types. The 1MB boot stack is more than
+> sufficient for current async workloads.
+>
+> **Future work**: Refactor network initialization to support spawning async on a
+> dedicated thread with configurable stack size.
+
 ### Spawned Threads (1-31)
 
 Spawned threads get stacks allocated on demand with configurable sizes:
