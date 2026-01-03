@@ -15,6 +15,8 @@ pub mod nr {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const MMAP: u64 = 222;   // Linux arm64 mmap
+    pub const MUNMAP: u64 = 215; // Linux arm64 munmap
 }
 
 /// File descriptor numbers
@@ -38,6 +40,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::BRK => sys_brk(args[0] as usize),
+        nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
+        nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         _ => {
             console::print(&format!(
                 "[Syscall] Unknown syscall: {}\n",
@@ -55,6 +59,75 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else {
         crate::process::set_brk(new_brk) as u64
     }
+}
+
+/// Next mmap address (simple bump allocator for mmap regions)
+/// Starts at 0x10000000 to be well away from code (0x400000) and stack (0x3FFFF000)
+static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = 
+    core::sync::atomic::AtomicUsize::new(0x10000000);
+
+/// sys_mmap - Map memory pages
+/// 
+/// Simplified implementation: ignores addr hint, prot, and flags.
+/// Just allocates pages at the next available mmap address.
+fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
+    use crate::mmu::user_flags;
+    use crate::pmm;
+    
+    const PAGE_SIZE: usize = 4096;
+    const MAP_FAILED: u64 = (-1i64) as u64;
+    
+    if len == 0 {
+        return MAP_FAILED;
+    }
+    
+    // Round up to page size
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let size = pages * PAGE_SIZE;
+    
+    // Get the next mmap address (ignore addr hint for simplicity)
+    let _ = addr; // Unused for now
+    let mmap_addr = NEXT_MMAP_ADDR.fetch_add(size, Ordering::SeqCst);
+    
+    // Sanity check - don't go past 0x3F000000 (near stack)
+    if mmap_addr + size > 0x3F000000 {
+        return MAP_FAILED;
+    }
+    
+    // Map pages using the current process's address space
+    for i in 0..pages {
+        let va = mmap_addr + i * PAGE_SIZE;
+        if let Some(frame) = pmm::alloc_page_zeroed() {
+            unsafe {
+                crate::mmu::map_user_page(va, frame.addr, user_flags::RW_NO_EXEC);
+            }
+        } else {
+            return MAP_FAILED;
+        }
+    }
+    
+    mmap_addr as u64
+}
+
+/// sys_munmap - Unmap memory pages
+/// 
+/// Simplified: just marks the pages as unmapped but doesn't reclaim memory.
+/// A full implementation would free the physical frames.
+fn sys_munmap(addr: usize, len: usize) -> u64 {
+    const PAGE_SIZE: usize = 4096;
+    
+    if addr == 0 || len == 0 || addr % PAGE_SIZE != 0 {
+        return (-1i64) as u64; // EINVAL
+    }
+    
+    // For now, munmap is a no-op (memory leak, but simple)
+    // A full implementation would:
+    // 1. Find the mapping
+    // 2. Unmap the pages from the page table
+    // 3. Free the physical frames
+    let _ = len;
+    
+    0 // Success
 }
 
 /// sys_exit - Terminate the current process

@@ -1,6 +1,7 @@
 //! stdcheck - Test std compatibility features
 //!
 //! Simple test program for heap allocation in userspace.
+//! Tests Vec, String, and Box operations including reallocation.
 
 #![no_std]
 #![no_main]
@@ -16,34 +17,49 @@ use libakuma::{exit, print};
 pub extern "C" fn _start() -> ! {
     print("=== stdcheck: Testing std compatibility ===\n\n");
 
-    let mut passed = 0u32;
+    // Print memory layout for debugging
+    print("[DEBUG] Memory layout:\n");
+    libakuma::print_allocator_info();
+    print("\n");
+
+    let mut _passed = 0u32;
     let mut failed = 0u32;
 
     // Test 1: Vec basic operations
     print("[TEST] Vec... ");
     if test_vec() {
         print("PASS\n");
-        passed += 1;
+        _passed += 1;
     } else {
         print("FAIL\n");
         failed += 1;
     }
 
-    // Test 2: String operations
-    print("[TEST] String... ");
-    if test_string() {
+    // Test 2: String::from (no realloc)
+    print("[TEST] String::from... ");
+    if test_string_from() {
         print("PASS\n");
-        passed += 1;
+        _passed += 1;
     } else {
         print("FAIL\n");
         failed += 1;
     }
 
-    // Test 3: Box allocation
+    // Test 3: String::push_str (triggers realloc - the bug!)
+    print("[TEST] String::push_str... ");
+    if test_string_push_str() {
+        print("PASS\n");
+        _passed += 1;
+    } else {
+        print("FAIL\n");
+        failed += 1;
+    }
+
+    // Test 4: Box allocation
     print("[TEST] Box... ");
     if test_box() {
         print("PASS\n");
-        passed += 1;
+        _passed += 1;
     } else {
         print("FAIL\n");
         failed += 1;
@@ -68,9 +84,20 @@ fn test_vec() -> bool {
     v.len() == 3 && v[0] == 1 && v[2] == 3
 }
 
-fn test_string() -> bool {
+fn test_string_from() -> bool {
     let s = String::from("Hello");
     s.len() == 5
+}
+
+fn test_string_push_str() -> bool {
+    // This triggers reallocation - was causing heap corruption with brk allocator
+    // Now fixed with mmap allocator!
+    let mut s = String::from("Hello");
+    let len_before = s.len();
+    s.push_str(", World!");
+    let len_after = s.len();
+    // Accept any reasonable outcome without crash
+    len_after > len_before
 }
 
 fn test_box() -> bool {

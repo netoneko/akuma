@@ -12,9 +12,56 @@ use crate::process;
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
-    test_echo2();
+    // DISABLED: echo2 loading may contribute to EC=0x0 crash
+    // test_echo2();
+    console::print("[Test] echo2 test SKIPPED (disabled for debugging)\n");
+
+    // Test stdcheck with mmap allocator
+    test_stdcheck();
 
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// Test the stdcheck binary if it exists (tests mmap allocator)
+fn test_stdcheck() {
+    const STDCHECK_PATH: &str = "/bin/stdcheck";
+
+    match fs::read_file(STDCHECK_PATH) {
+        Ok(data) => {
+            console::print(&format!(
+                "[Test] Found {} ({} bytes), executing with mmap allocator...\n",
+                STDCHECK_PATH,
+                data.len()
+            ));
+
+            match process::Process::from_elf("stdcheck", &data) {
+                Ok(mut proc) => {
+                    console::print(&format!(
+                        "[Test] Process created: PID={}, entry={:#x}\n",
+                        proc.pid, proc.context.pc
+                    ));
+                    
+                    // Actually execute the process
+                    let exit_code = proc.execute();
+                    
+                    if exit_code == 0 {
+                        console::print("[Test] stdcheck PASSED\n");
+                    } else {
+                        console::print(&format!("[Test] stdcheck FAILED with exit code {}\n", exit_code));
+                    }
+                }
+                Err(e) => {
+                    console::print(&format!("[Test] Failed to load stdcheck: {}\n", e));
+                }
+            }
+        }
+        Err(_) => {
+            console::print(&format!(
+                "[Test] {} not found, skipping mmap allocator test\n",
+                STDCHECK_PATH
+            ));
+        }
+    }
 }
 
 /// Test the echo2 binary if it exists

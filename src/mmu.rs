@@ -563,3 +563,74 @@ pub mod user_flags {
     pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
 }
 
+/// Map a user page in the current TTBR0 address space
+/// 
+/// This is used by sys_mmap to add pages to the running process.
+/// SAFETY: Caller must ensure VA and PA are page-aligned and valid.
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
+    // Get current TTBR0
+    let ttbr0: u64;
+    core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+    
+    // Extract L0 table address (bits 47:1, assuming 4KB granule)
+    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    
+    // Extract page table indices from virtual address
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    
+    // Walk the page tables, creating entries as needed
+    let l0_ptr = l0_addr as *mut u64;
+    let l1_addr = get_or_create_table(l0_ptr, l0_idx);
+    let l1_ptr = l1_addr as *mut u64;
+    
+    let l2_addr = get_or_create_table(l1_ptr, l1_idx);
+    let l2_ptr = l2_addr as *mut u64;
+    
+    let l3_addr = get_or_create_table(l2_ptr, l2_idx);
+    let l3_ptr = l3_addr as *mut u64;
+    
+    // Create L3 entry (4KB page descriptor)
+    let entry = (pa as u64)
+        | flags::VALID
+        | flags::TABLE // For L3, bit 1 must be 1 (page descriptor)
+        | flags::AF
+        | flags::NG // Non-global (uses ASID)
+        | attr_index(MAIR_NORMAL_WB)
+        | flags::SH_INNER
+        | user_flags_val;
+    
+    l3_ptr.add(l3_idx).write_volatile(entry);
+    
+    // Flush TLB for this VA
+    core::arch::asm!(
+        "dsb ishst",
+        "tlbi vale1is, {va}",
+        "dsb ish",
+        "isb",
+        va = in(reg) va >> 12,
+    );
+}
+
+/// Get or create a page table entry, returning the next level table address
+unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> usize {
+    let entry = table_ptr.add(idx).read_volatile();
+    
+    if entry & flags::VALID != 0 {
+        // Entry exists, extract address
+        (entry & 0x0000_FFFF_FFFF_F000) as usize
+    } else {
+        // Need to allocate a new page table
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+            table_ptr.add(idx).write_volatile(new_entry);
+            frame.addr
+        } else {
+            // Allocation failed - this is bad, but return 0
+            0
+        }
+    }
+}
+

@@ -38,8 +38,20 @@ pub fn run_all() -> bool {
     all_pass &= test_vec_remove_regression();
     all_pass &= test_rapid_push_pop();
     all_pass &= test_string_operations();
+    all_pass &= test_string_push_str_realloc();  // Userspace bug mirror test
+    all_pass &= test_string_realloc_detailed();  // Detailed realloc tracking
     all_pass &= test_vec_of_vecs();
     all_pass &= test_adjacent_allocations();
+
+    // Mmap allocator edge case tests (for userspace debugging)
+    all_pass &= test_mmap_single_page();
+    all_pass &= test_mmap_multi_page();
+    all_pass &= test_mmap_page_boundary_write();
+    all_pass &= test_mmap_rapid_alloc_dealloc();
+    all_pass &= test_mmap_realloc_pattern();
+    all_pass &= test_mmap_string_growth_pattern();
+    all_pass &= test_mmap_vec_capacity_doubling();
+    all_pass &= test_mmap_interleaved_strings();
 
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
@@ -695,6 +707,101 @@ fn test_string_operations() -> bool {
     ok
 }
 
+/// Test: String::push_str reallocation pattern (userspace bug reproduction)
+/// This test mirrors the exact pattern that causes heap corruption in userspace:
+/// 1. Vec allocates
+/// 2. String::from allocates  
+/// 3. push_str triggers realloc -> corruption
+fn test_string_push_str_realloc() -> bool {
+    console::print("\n[TEST] String::push_str realloc pattern (userspace bug mirror)\n");
+
+    // Step 1: Vec allocation (like userspace test_vec)
+    console::print("  Step 1: Vec allocation...\n");
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    let v_ptr = v.as_ptr() as usize;
+    console::print(&format!("    Vec ptr: {:#x}, len: {}\n", v_ptr, v.len()));
+
+    // Step 2: String::from allocation (like userspace test_string_from)
+    console::print("  Step 2: String::from allocation...\n");
+    let s = String::from("Hello");
+    let s_ptr = s.as_ptr() as usize;
+    console::print(&format!("    String ptr: {:#x}, len: {}, cap: {}\n", s_ptr, s.len(), s.capacity()));
+
+    // Step 3: push_str triggers reallocation (THE BUG!)
+    console::print("  Step 3: push_str (triggers realloc)...\n");
+    let mut s2 = s.clone();
+    let s2_ptr_before = s2.as_ptr() as usize;
+    console::print(&format!("    Before push_str: ptr={:#x}, cap={}\n", s2_ptr_before, s2.capacity()));
+    
+    // This is where userspace crashes - realloc corrupts the allocator head
+    s2.push_str(", World!");
+    
+    let s2_ptr_after = s2.as_ptr() as usize;
+    console::print(&format!("    After push_str: ptr={:#x}, cap={}\n", s2_ptr_after, s2.capacity()));
+    console::print(&format!("    Result: \"{}\"\n", s2));
+
+    // Verify data integrity
+    let vec_ok = v.len() == 3 && v[0] == 1 && v[2] == 3;
+    let string_ok = s2 == "Hello, World!";
+
+    // Check for suspicious pointer values (like 0x814000 in userspace bug)
+    let ptr_suspicious = s2_ptr_after > 0x800000 && s2_ptr_after < 0x900000;
+    if ptr_suspicious {
+        console::print(&format!("  WARNING: Suspicious pointer {:#x} (similar to userspace bug pattern)\n", s2_ptr_after));
+    }
+
+    drop(v);
+    drop(s);
+    drop(s2);
+
+    let ok = vec_ok && string_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Detailed String reallocation with capacity tracking
+/// Tracks each allocation to help debug heap corruption
+fn test_string_realloc_detailed() -> bool {
+    console::print("\n[TEST] String realloc with detailed tracking\n");
+
+    // Create with small capacity to force realloc
+    let mut s = String::with_capacity(5);
+    console::print(&format!("  Initial: ptr={:#x}, len={}, cap={}\n", 
+        s.as_ptr() as usize, s.len(), s.capacity()));
+
+    // Push small string (no realloc needed)
+    s.push_str("Hi");
+    console::print(&format!("  After 'Hi': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize, s.len(), s.capacity()));
+
+    // Push more to trigger realloc
+    s.push_str("!!!");  // Still within capacity
+    console::print(&format!("  After '!!!': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize, s.len(), s.capacity()));
+
+    // This should trigger realloc (capacity 5, current len 5, adding 6 more)
+    let ptr_before = s.as_ptr() as usize;
+    s.push_str(" World");
+    let ptr_after = s.as_ptr() as usize;
+    
+    console::print(&format!("  After ' World': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize, s.len(), s.capacity()));
+    
+    let reallocated = ptr_before != ptr_after;
+    console::print(&format!("  Reallocation occurred: {}\n", reallocated));
+
+    let content_ok = s == "Hi!!! World";
+    console::print(&format!("  Content: \"{}\" (expect \"Hi!!! World\")\n", s));
+
+    drop(s);
+
+    console::print(&format!("  Result: {}\n", if content_ok { "PASS" } else { "FAIL" }));
+    content_ok
+}
+
 /// Test: Nested allocations (Vec of Vecs)
 fn test_vec_of_vecs() -> bool {
     console::print("\n[TEST] Vec of Vecs (nested allocations)\n");
@@ -782,6 +889,265 @@ fn test_adjacent_allocations() -> bool {
     } else {
         console::print("  Result: FAIL\n");
     }
+    ok
+}
+
+// ============================================================================
+// Mmap Allocator Edge Case Tests (for userspace debugging)
+// ============================================================================
+
+/// Test: Single page allocation and access
+/// Verifies basic mmap allocation returns usable memory
+fn test_mmap_single_page() -> bool {
+    console::print("\n[TEST] Mmap: Single page allocation\n");
+
+    // Allocate a small buffer (will use one page in mmap mode)
+    let buf: Vec<u8> = vec![0u8; 100];
+    let ptr = buf.as_ptr() as usize;
+    console::print(&format!("  Allocated 100 bytes at {:#x}\n", ptr));
+
+    // Write pattern
+    let mut buf = buf;
+    for i in 0..100 {
+        buf[i] = (i & 0xFF) as u8;
+    }
+
+    // Verify pattern
+    let mut ok = true;
+    for i in 0..100 {
+        if buf[i] != (i & 0xFF) as u8 {
+            console::print(&format!("  Mismatch at {}: got {}, expected {}\n", i, buf[i], i & 0xFF));
+            ok = false;
+            break;
+        }
+    }
+
+    drop(buf);
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Multi-page allocation
+/// Tests allocations that span multiple pages (> 4KB)
+fn test_mmap_multi_page() -> bool {
+    console::print("\n[TEST] Mmap: Multi-page allocation (12KB)\n");
+
+    const SIZE: usize = 12 * 1024; // 3 pages
+
+    let mut buf: Vec<u8> = vec![0u8; SIZE];
+    let ptr = buf.as_ptr() as usize;
+    console::print(&format!("  Allocated {} bytes at {:#x}\n", SIZE, ptr));
+
+    // Write to first byte of each page
+    buf[0] = 0x11;
+    buf[4096] = 0x22;
+    buf[8192] = 0x33;
+    buf[SIZE - 1] = 0x44;
+
+    // Verify
+    let ok = buf[0] == 0x11 && buf[4096] == 0x22 && buf[8192] == 0x33 && buf[SIZE - 1] == 0x44;
+
+    console::print(&format!("  Page boundaries: {:#x}, {:#x}, {:#x}, {:#x}\n",
+        buf[0], buf[4096], buf[8192], buf[SIZE - 1]));
+
+    drop(buf);
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Write exactly at page boundary
+/// This catches off-by-one errors in page mapping
+fn test_mmap_page_boundary_write() -> bool {
+    console::print("\n[TEST] Mmap: Page boundary writes\n");
+
+    const PAGE_SIZE: usize = 4096;
+
+    // Allocate exactly 2 pages
+    let mut buf: Vec<u8> = vec![0u8; PAGE_SIZE * 2];
+    let ptr = buf.as_ptr() as usize;
+
+    // Write at critical positions
+    buf[PAGE_SIZE - 1] = 0xAA;  // Last byte of page 1
+    buf[PAGE_SIZE] = 0xBB;      // First byte of page 2
+
+    console::print(&format!("  Ptr: {:#x}\n", ptr));
+    console::print(&format!("  buf[{}] = {:#x} (last of page 1)\n", PAGE_SIZE - 1, buf[PAGE_SIZE - 1]));
+    console::print(&format!("  buf[{}] = {:#x} (first of page 2)\n", PAGE_SIZE, buf[PAGE_SIZE]));
+
+    let ok = buf[PAGE_SIZE - 1] == 0xAA && buf[PAGE_SIZE] == 0xBB;
+
+    drop(buf);
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Rapid alloc/dealloc cycles
+/// Stresses the allocator with many short-lived allocations
+fn test_mmap_rapid_alloc_dealloc() -> bool {
+    console::print("\n[TEST] Mmap: Rapid alloc/dealloc (100 cycles)\n");
+
+    let mut ok = true;
+
+    for i in 0..100 {
+        let buf: Vec<u8> = vec![(i & 0xFF) as u8; 256];
+        if buf[0] != (i & 0xFF) as u8 || buf[255] != (i & 0xFF) as u8 {
+            console::print(&format!("  Cycle {} failed\n", i));
+            ok = false;
+            break;
+        }
+        drop(buf);
+    }
+
+    if ok {
+        console::print("  All 100 cycles passed\n");
+    }
+
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Realloc pattern that mirrors userspace bug
+/// Allocate, then grow, then use - the exact pattern that fails
+fn test_mmap_realloc_pattern() -> bool {
+    console::print("\n[TEST] Mmap: Realloc pattern (grow then use)\n");
+
+    // Small initial allocation
+    let mut v: Vec<u64> = Vec::with_capacity(2);
+    let ptr1 = v.as_ptr() as usize;
+    console::print(&format!("  Initial: ptr={:#x}, cap={}\n", ptr1, v.capacity()));
+
+    v.push(0x1111111111111111);
+    v.push(0x2222222222222222);
+
+    // Force reallocation
+    v.push(0x3333333333333333);
+    v.push(0x4444444444444444);
+    v.push(0x5555555555555555);
+    let ptr2 = v.as_ptr() as usize;
+    console::print(&format!("  After growth: ptr={:#x}, cap={}\n", ptr2, v.capacity()));
+
+    // Immediately use the new memory (this is where userspace fails)
+    v.push(0x6666666666666666);
+    v.push(0x7777777777777777);
+
+    // Verify all data
+    let ok = v[0] == 0x1111111111111111
+        && v[1] == 0x2222222222222222
+        && v[2] == 0x3333333333333333
+        && v[5] == 0x6666666666666666
+        && v[6] == 0x7777777777777777;
+
+    console::print(&format!("  Data integrity: {}\n", if ok { "OK" } else { "CORRUPTED" }));
+
+    drop(v);
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: String growth pattern (exact userspace failure scenario)
+fn test_mmap_string_growth_pattern() -> bool {
+    console::print("\n[TEST] Mmap: String growth pattern\n");
+
+    // This is the exact pattern that crashes in userspace
+    let mut s = String::from("Hello");
+    let ptr1 = s.as_ptr() as usize;
+    console::print(&format!("  Initial: ptr={:#x}, len={}, cap={}\n", ptr1, s.len(), s.capacity()));
+
+    // Trigger realloc by pushing more data
+    s.push_str(", World!");
+    let ptr2 = s.as_ptr() as usize;
+    console::print(&format!("  After push_str: ptr={:#x}, len={}, cap={}\n", ptr2, s.len(), s.capacity()));
+
+    // Critical: access the string after realloc
+    let content_ok = s == "Hello, World!";
+    let len_ok = s.len() == 13;
+
+    // Try to use it more
+    s.push_str(" This is a test.");
+    let final_ok = s == "Hello, World! This is a test.";
+
+    console::print(&format!("  Content: \"{}\"\n", s));
+
+    drop(s);
+
+    let ok = content_ok && len_ok && final_ok;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Vec capacity doubling stress test
+fn test_mmap_vec_capacity_doubling() -> bool {
+    console::print("\n[TEST] Mmap: Vec capacity doubling (1->1024 elements)\n");
+
+    let mut v: Vec<u32> = Vec::new();
+    let mut reallocs = 0;
+    let mut last_ptr = 0usize;
+
+    for i in 0..1024 {
+        let ptr_before = v.as_ptr() as usize;
+        v.push(i);
+        let ptr_after = v.as_ptr() as usize;
+
+        if ptr_before != ptr_after && ptr_before != 0 {
+            reallocs += 1;
+        }
+        last_ptr = ptr_after;
+    }
+
+    console::print(&format!("  Final: len={}, cap={}, ptr={:#x}\n", v.len(), v.capacity(), last_ptr));
+    console::print(&format!("  Realloc count: {}\n", reallocs));
+
+    // Verify all data
+    let mut ok = true;
+    for i in 0..1024 {
+        if v[i] != i as u32 {
+            console::print(&format!("  Mismatch at {}: got {}\n", i, v[i]));
+            ok = false;
+            break;
+        }
+    }
+
+    drop(v);
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Interleaved string operations
+/// Multiple strings allocated and modified in interleaved order
+fn test_mmap_interleaved_strings() -> bool {
+    console::print("\n[TEST] Mmap: Interleaved string operations\n");
+
+    let mut s1 = String::from("AAA");
+    let mut s2 = String::from("BBB");
+    let mut s3 = String::from("CCC");
+
+    console::print(&format!("  s1: ptr={:#x}\n", s1.as_ptr() as usize));
+    console::print(&format!("  s2: ptr={:#x}\n", s2.as_ptr() as usize));
+    console::print(&format!("  s3: ptr={:#x}\n", s3.as_ptr() as usize));
+
+    // Interleaved modifications (triggers reallocs in different orders)
+    s1.push_str("111");
+    s2.push_str("222");
+    s3.push_str("333");
+
+    s2.push_str("more");
+    s1.push_str("even more");
+    s3.push_str("and more");
+
+    console::print(&format!("  After modifications:\n"));
+    console::print(&format!("    s1: \"{}\"\n", s1));
+    console::print(&format!("    s2: \"{}\"\n", s2));
+    console::print(&format!("    s3: \"{}\"\n", s3));
+
+    let ok = s1 == "AAA111even more"
+        && s2 == "BBB222more"
+        && s3 == "CCC333and more";
+
+    drop(s1);
+    drop(s2);
+    drop(s3);
+
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
     ok
 }
 
@@ -942,23 +1308,35 @@ fn test_resize_pattern() -> bool {
     // Exponential growth pattern
     let sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
+    let mut prev_size = 0usize;
     for &size in &sizes {
         // Resize to new size
         buffer.resize(size, 0xAB);
 
-        // Verify content
-        for i in 0..size {
-            if buffer[i] != 0xAB {
-                console::print("  Content mismatch\n");
+        // Verify OLD content is preserved (should be index pattern)
+        for i in 0..prev_size {
+            if buffer[i] != (i & 0xFF) as u8 {
+                console::print("  Old content mismatch\n");
                 all_ok = false;
                 break;
             }
         }
 
-        // Overwrite with pattern
+        // Verify NEW content is 0xAB
+        for i in prev_size..size {
+            if buffer[i] != 0xAB {
+                console::print("  New content mismatch\n");
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Overwrite with index pattern
         for i in 0..size {
             buffer[i] = (i & 0xFF) as u8;
         }
+        
+        prev_size = size;
     }
 
     console::print("  Grew through 12 sizes (max 2048)\n");

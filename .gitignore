@@ -2,3 +2,5 @@
 target
 *.img
 .DS_Store
+authorized_keys
+bootstrap/bin

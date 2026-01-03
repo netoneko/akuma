@@ -14,6 +14,8 @@ pub mod syscall {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const MMAP: u64 = 222;
+    pub const MUNMAP: u64 = 215;
 }
 
 /// File descriptors
@@ -102,6 +104,37 @@ pub fn brk(addr: usize) -> usize {
     syscall(syscall::BRK, addr as u64, 0, 0, 0, 0, 0) as usize
 }
 
+/// mmap flags
+pub mod mmap_flags {
+    pub const PROT_READ: u32 = 0x1;
+    pub const PROT_WRITE: u32 = 0x2;
+    pub const MAP_PRIVATE: u32 = 0x02;
+    pub const MAP_ANONYMOUS: u32 = 0x20;
+}
+
+/// Map memory pages
+/// 
+/// Returns the mapped address, or usize::MAX on failure.
+#[inline(always)]
+pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32) -> usize {
+    let result = syscall(
+        syscall::MMAP,
+        addr as u64,
+        len as u64,
+        prot as u64,
+        flags as u64,
+        0,
+        0,
+    );
+    result as usize
+}
+
+/// Unmap memory pages
+#[inline(always)]
+pub fn munmap(addr: usize, len: usize) -> isize {
+    syscall(syscall::MUNMAP, addr as u64, len as u64, 0, 0, 0, 0) as isize
+}
+
 /// Print a string to stdout
 #[inline(always)]
 pub fn print(s: &str) {
@@ -115,108 +148,167 @@ pub fn eprint(s: &str) {
 }
 
 // ============================================================================
-// Global Allocator using brk syscall
+// Global Allocator with mmap/brk switch
 // ============================================================================
+
+/// Set to true to use mmap-based allocation, false for brk-based
+pub const USE_MMAP_ALLOCATOR: bool = true;
 
 mod allocator {
     use core::alloc::{GlobalAlloc, Layout};
-    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use core::ptr;
+    use super::USE_MMAP_ALLOCATOR;
 
-    /// Simple bump allocator using brk syscall
-    /// 
-    /// This is a very simple allocator that only grows the heap.
-    /// Deallocation is a no-op (memory is only freed when process exits).
-    pub struct BrkAllocator {
-        /// Current allocation pointer (next free address)
-        head: UnsafeCell<usize>,
-        /// End of currently allocated heap pages
-        end: UnsafeCell<usize>,
+    const PAGE_SIZE: usize = 4096;
+    const MAP_FAILED: usize = usize::MAX;
+
+    /// Hybrid allocator that can use either mmap or brk
+    /// WORKAROUND: 64-byte alignment helps with layout-sensitive heap corruption bug
+    #[repr(C, align(64))]
+    pub struct HybridAllocator {
+        /// For brk mode: current allocation pointer
+        brk_head: AtomicUsize,
+        /// For brk mode: end of allocated heap
+        brk_end: AtomicUsize,
+        /// Padding to ensure 64-byte struct size (workaround for layout bug)
+        _padding: [u8; 48],
     }
 
-    unsafe impl Sync for BrkAllocator {}
+    unsafe impl Sync for HybridAllocator {}
 
-    impl BrkAllocator {
+    impl HybridAllocator {
         pub const fn new() -> Self {
             Self {
-                head: UnsafeCell::new(0),
-                end: UnsafeCell::new(0),
+                brk_head: AtomicUsize::new(0),
+                brk_end: AtomicUsize::new(0),
+                _padding: [0u8; 48],
             }
         }
 
-        /// Initialize the allocator by getting the current brk
-        fn init(&self) {
-            unsafe {
-                let head = self.head.get();
-                if *head == 0 {
-                    // First allocation - get initial brk from kernel
-                    let initial_brk = super::brk(0);
-                    *head = initial_brk;
-                    
-                    // Request 64KB of heap space (kernel may have pre-allocated this)
-                    let requested_end = initial_brk + 0x10000;
-                    let actual_end = super::brk(requested_end);
-                    *self.end.get() = actual_end;
-                }
+        /// Get allocator info for debugging
+        pub fn head_addr(&self) -> usize {
+            &self.brk_head as *const _ as usize
+        }
+
+        pub fn head_value(&self) -> usize {
+            self.brk_head.load(Ordering::SeqCst)
+        }
+
+        pub fn end_value(&self) -> usize {
+            self.brk_end.load(Ordering::SeqCst)
+        }
+
+        // =====================================================================
+        // mmap-based allocation
+        // =====================================================================
+
+        unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
+            use super::mmap_flags::*;
+            
+            // Round up to page size for mmap
+            let size = layout.size().max(layout.align());
+            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            
+            let addr = super::mmap(
+                0,  // Let kernel choose address
+                alloc_size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+            );
+            
+            if addr == MAP_FAILED || addr == 0 {
+                ptr::null_mut()
+            } else {
+                addr as *mut u8
             }
         }
 
-        /// Expand the heap if needed
-        fn expand(&self, needed: usize) -> bool {
-            unsafe {
-                let end = self.end.get();
-                // Request more memory from kernel
-                // Add some extra to reduce syscall frequency
-                let grow_by = ((needed + 0xFFF) & !0xFFF).max(4096);
-                let new_end = *end + grow_by;
-                let result = super::brk(new_end);
-                if result >= new_end {
-                    *end = result;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    unsafe impl GlobalAlloc for BrkAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            self.init();
-
-            let head = self.head.get();
-            let end = self.end.get();
-
-            // Align the head pointer
-            let align = layout.align();
-            let aligned = (*head + align - 1) & !(align - 1);
-            let new_head = aligned + layout.size();
-
-            // Check if we need more heap space
-            if new_head > *end {
-                let needed = new_head - *end;
-                if !self.expand(needed) {
-                    return ptr::null_mut();
-                }
-            }
-
-            *head = new_head;
-            aligned as *mut u8
+        unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let size = layout.size().max(layout.align());
+            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            super::munmap(ptr as usize, alloc_size);
         }
 
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-            // Bump allocator - no-op for deallocation
-            // Memory is reclaimed when process exits
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            // Simple implementation: allocate new, copy, don't free old
+        unsafe fn mmap_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // Allocate new
             let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
             };
             
-            let new_ptr = self.alloc(new_layout);
+            let new_ptr = self.mmap_alloc(new_layout);
+            if new_ptr.is_null() {
+                return ptr::null_mut();
+            }
+            
+            // Copy old data
+            if !ptr.is_null() {
+                let copy_size = layout.size().min(new_size);
+                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+                // Skip dealloc - munmap is currently a no-op anyway
+                // self.mmap_dealloc(ptr, layout);
+            }
+            
+            new_ptr
+        }
+
+        // =====================================================================
+        // brk-based allocation (fallback)
+        // =====================================================================
+
+        fn brk_init(&self) {
+            if self.brk_head.load(Ordering::SeqCst) == 0 {
+                let initial_brk = super::brk(0);
+                if self.brk_head.compare_exchange(0, initial_brk, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    let requested_end = initial_brk + 0x10000;
+                    let actual_end = super::brk(requested_end);
+                    self.brk_end.store(actual_end, Ordering::SeqCst);
+                }
+            }
+        }
+
+        fn brk_expand(&self, needed: usize) -> bool {
+            let current_end = self.brk_end.load(Ordering::SeqCst);
+            let grow_by = ((needed + 0xFFF) & !0xFFF).max(4096);
+            let new_end = current_end + grow_by;
+            let result = super::brk(new_end);
+            if result >= new_end {
+                self.brk_end.store(result, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        }
+
+        unsafe fn brk_alloc(&self, layout: Layout) -> *mut u8 {
+            self.brk_init();
+
+            let current_head = self.brk_head.load(Ordering::SeqCst);
+            let current_end = self.brk_end.load(Ordering::SeqCst);
+
+            let align = layout.align();
+            let aligned = (current_head + align - 1) & !(align - 1);
+            let new_head = aligned + layout.size();
+
+            if new_head > current_end {
+                let needed = new_head - current_end;
+                if !self.brk_expand(needed) {
+                    return ptr::null_mut();
+                }
+            }
+
+            self.brk_head.store(new_head, Ordering::SeqCst);
+            aligned as *mut u8
+        }
+
+        unsafe fn brk_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+                Ok(l) => l,
+                Err(_) => return ptr::null_mut(),
+            };
+            
+            let new_ptr = self.brk_alloc(new_layout);
             if !new_ptr.is_null() && !ptr.is_null() {
                 let copy_size = layout.size().min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
@@ -225,8 +317,95 @@ mod allocator {
         }
     }
 
+    unsafe impl GlobalAlloc for HybridAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if USE_MMAP_ALLOCATOR {
+                self.mmap_alloc(layout)
+            } else {
+                self.brk_alloc(layout)
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if USE_MMAP_ALLOCATOR {
+                self.mmap_dealloc(ptr, layout);
+            }
+            // brk mode: no-op (bump allocator)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if USE_MMAP_ALLOCATOR {
+                self.mmap_realloc(ptr, layout, new_size)
+            } else {
+                self.brk_realloc(ptr, layout, new_size)
+            }
+        }
+    }
+
     #[global_allocator]
-    pub static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+    pub static ALLOCATOR: HybridAllocator = HybridAllocator::new();
+}
+
+/// Print allocator debug info (addresses and values)
+pub fn print_allocator_info() {
+    print("  Allocator head addr: 0x");
+    print_hex(allocator::ALLOCATOR.head_addr());
+    print("\n  Allocator head value: 0x");
+    print_hex(allocator::ALLOCATOR.head_value());
+    print("\n  Allocator end value: 0x");
+    print_hex(allocator::ALLOCATOR.end_value());
+    print("\n  brk(0) = 0x");
+    print_hex(brk(0));
+    print("\n");
+}
+
+/// Print a usize as hex
+pub fn print_hex(val: usize) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut v = val;
+    let mut i = 15;
+    
+    if v == 0 {
+        print("0");
+        return;
+    }
+    
+    while v > 0 {
+        buf[i] = HEX_CHARS[v & 0xF];
+        v >>= 4;
+        if i == 0 { break; }
+        i -= 1;
+    }
+    
+    // Safety: we only write valid ASCII hex digits
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        print(s);
+    }
+}
+
+/// Print a usize as decimal
+pub fn print_dec(val: usize) {
+    const DEC_CHARS: &[u8; 10] = b"0123456789";
+    let mut buf = [0u8; 20];
+    let mut v = val;
+    let mut i = 19;
+    
+    if v == 0 {
+        print("0");
+        return;
+    }
+    
+    while v > 0 {
+        buf[i] = DEC_CHARS[v % 10];
+        v /= 10;
+        if i == 0 { break; }
+        i -= 1;
+    }
+    
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        print(s);
+    }
 }
 
 /// Panic handler for user programs
