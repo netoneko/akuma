@@ -99,18 +99,47 @@ fn test_string_push_str() -> bool {
     let mut s = String::from("Hello");
     s.push_str(", World!");
     
-    // Check length
+    // Check length (should be 13: "Hello, World!")
     let len = s.len();
     if len != 13 {
-        // Print length using raw syscall (no allocation)
-        libakuma::write(1, b"len=");
-        let mut buf = [0u8; 4];
-        buf[0] = b'0' + ((len / 10) as u8);
-        buf[1] = b'0' + ((len % 10) as u8);
-        buf[2] = b'\n';
-        libakuma::write(1, &buf[..3]);
+        libakuma::write(1, b"FAIL: len != 13\n");
         return false;
     }
+    
+    // Verify content - access bytes directly without creating new allocations
+    let bytes = s.as_bytes();
+    if bytes.len() != 13 {
+        libakuma::write(1, b"FAIL: bytes.len != 13\n");
+        return false;
+    }
+    
+    // Check first byte
+    let b0 = bytes[0];
+    if b0 != b'H' {
+        libakuma::write(1, b"FAIL: bytes[0]=");
+        libakuma::write(1, &[b0]);
+        libakuma::write(1, b" != H\n");
+        return false;
+    }
+    
+    // Check bytes[5] = ','
+    let b5 = bytes[5];
+    if b5 != b',' {
+        libakuma::write(1, b"FAIL: bytes[5]=");
+        libakuma::write(1, &[b5]);
+        libakuma::write(1, b" != ,\n");
+        return false;
+    }
+    
+    // Check bytes[12] = '!'
+    let b12 = bytes[12];
+    if b12 != b'!' {
+        libakuma::write(1, b"FAIL: bytes[12]=");
+        libakuma::write(1, &[b12]);
+        libakuma::write(1, b" != !\n");
+        return false;
+    }
+    
     true
 }
 
