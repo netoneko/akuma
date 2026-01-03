@@ -14,6 +14,7 @@ pub mod syscall {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const NANOSLEEP: u64 = 101;
     pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
 }
@@ -172,6 +173,24 @@ pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32) -> usize {
 #[inline(always)]
 pub fn munmap(addr: usize, len: usize) -> isize {
     syscall(syscall::MUNMAP, addr as u64, len as u64, 0, 0, 0, 0) as isize
+}
+
+/// Sleep for the specified number of seconds
+/// 
+/// Yields to other threads while sleeping.
+#[inline(always)]
+pub fn sleep(seconds: u64) {
+    syscall(syscall::NANOSLEEP, seconds, 0, 0, 0, 0, 0);
+}
+
+/// Sleep for the specified number of milliseconds
+/// 
+/// Yields to other threads while sleeping.
+#[inline(always)]
+pub fn sleep_ms(milliseconds: u64) {
+    let seconds = milliseconds / 1000;
+    let nanos = (milliseconds % 1000) * 1_000_000;
+    syscall(syscall::NANOSLEEP, seconds, nanos, 0, 0, 0, 0);
 }
 
 /// Print a string to stdout

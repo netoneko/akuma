@@ -671,3 +671,42 @@ impl Command for CdCommand {
 
 /// Static instance
 pub static CD_CMD: CdCommand = CdCommand;
+
+// ============================================================================
+// Uptime Command
+// ============================================================================
+
+/// Uptime command - display system uptime
+pub struct UptimeCommand;
+
+impl Command for UptimeCommand {
+    fn name(&self) -> &'static str {
+        "uptime"
+    }
+    fn description(&self) -> &'static str {
+        "Display system uptime"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let uptime_us = crate::timer::uptime_us();
+            let uptime_sec = uptime_us / 1_000_000;
+            let hours = uptime_sec / 3600;
+            let mins = (uptime_sec % 3600) / 60;
+            let secs = uptime_sec % 60;
+            
+            let msg = format!("up {}:{:02}:{:02}\r\n", hours, mins, secs);
+            let _ = stdout.write(msg.as_bytes()).await;
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static UPTIME_CMD: UptimeCommand = UptimeCommand;

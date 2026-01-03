@@ -64,6 +64,17 @@ impl Command for ExecCommand {
                     return Ok(());
                 }
             };
+            
+            // Check if user threads are available for process execution
+            let available = crate::threading::user_threads_available();
+            if available == 0 {
+                let _ = embedded_io_async::Write::write_all(
+                    stdout,
+                    b"Error: No available threads for process execution\r\n",
+                )
+                .await;
+                return Ok(());
+            }
 
             // Execute the binary with per-process I/O
             match crate::process::exec_with_io(path, stdin) {

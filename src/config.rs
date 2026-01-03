@@ -47,6 +47,27 @@ pub const USER_STACK_SIZE: usize = 64 * 1024;
 /// Actual usable threads = MAX_THREADS - 1
 pub const MAX_THREADS: usize = 32;
 
+/// Number of kernel threads reserved for system services
+///
+/// Threads 0 to RESERVED_THREADS-1 are reserved for:
+/// - Thread 0: Boot/async main loop
+/// - Threads 1-7: Shell, SSH sessions, internal services
+///
+/// User processes can only spawn on threads RESERVED_THREADS through MAX_THREADS-1.
+pub const RESERVED_THREADS: usize = 8;
+
+/// Stack size for reserved system threads (256KB)
+///
+/// Used for threads 1 through RESERVED_THREADS-1.
+/// Larger stacks to handle deep SSH/HTTP async call chains.
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 256 * 1024;
+
+/// Stack size for user process threads (64KB)
+///
+/// Used for threads RESERVED_THREADS through MAX_THREADS-1.
+/// Smaller stacks since user processes have their own user-space stack.
+pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
+
 /// Enable stack canary checking
 ///
 /// When enabled, canary values are written at the bottom of each thread stack

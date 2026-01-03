@@ -86,7 +86,18 @@ sync_el1_handler:
 sync_el0_handler:
     // At this point: SP = SP_EL1 (kernel stack), ELR_EL1 = user PC
     
-    // Save all user registers to kernel stack
+    // Switch to dedicated exception stack to avoid corrupting kernel stack
+    // Save current SP to x9, then load exception stack
+    mov     x9, sp
+    adrp    x10, EXCEPTION_STACK_TOP
+    add     x10, x10, :lo12:EXCEPTION_STACK_TOP
+    ldr     x10, [x10]
+    mov     sp, x10
+    
+    // Save original kernel SP at top of exception stack (we'll need it for return_to_kernel)
+    str     x9, [sp, #-16]!
+    
+    // Now allocate space for user registers on exception stack
     // Order: x0-x30, then SP_EL0, ELR_EL1, SPSR_EL1
     sub     sp, sp, #280            // 35 * 8 bytes
     
@@ -95,7 +106,7 @@ sync_el0_handler:
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
     stp     x6, x7, [sp, #48]
-    stp     x8, x9, [sp, #64]
+    stp     x8, x9, [sp, #64]       // x9 was original sp, now saved
     stp     x10, x11, [sp, #80]
     stp     x12, x13, [sp, #96]
     stp     x14, x15, [sp, #112]
@@ -195,8 +206,13 @@ sync_el0_handler:
     // Put syscall return value in x0
     mov     x0, x9
     
-    // Cleanup stack
+    // Cleanup stack - pop the user register frame
     add     sp, sp, #280
+    
+    // Pop the saved original kernel SP (we pushed it at entry)
+    // Note: we don't actually need to restore it since we're returning to user mode
+    // but we do need to clean up the exception stack
+    add     sp, sp, #16
     
     // Return to user mode
     eret
@@ -291,6 +307,34 @@ unsafe extern "C" {
     static exception_vector_table: u8;
 }
 
+/// Exception stack size (16KB should be plenty for syscall handling)
+const EXCEPTION_STACK_SIZE: usize = 16 * 1024;
+
+/// Static exception stack - used by sync_el0_handler to avoid corrupting kernel stack
+#[repr(C, align(16))]
+struct ExceptionStack {
+    data: [u8; EXCEPTION_STACK_SIZE],
+}
+
+static mut EXCEPTION_STACK: ExceptionStack = ExceptionStack {
+    data: [0; EXCEPTION_STACK_SIZE],
+};
+
+/// Pointer to top of exception stack (stack grows down)
+#[unsafe(no_mangle)]
+static mut EXCEPTION_STACK_TOP: u64 = 0;
+
+/// Initialize the exception stack pointer
+/// Must be called before any user mode code runs
+pub fn init_exception_stack() {
+    unsafe {
+        let stack_bottom = core::ptr::addr_of!(EXCEPTION_STACK.data) as u64;
+        let stack_top = stack_bottom + EXCEPTION_STACK_SIZE as u64;
+        // Align to 16 bytes (required by AArch64 ABI)
+        EXCEPTION_STACK_TOP = stack_top & !0xF;
+    }
+}
+
 /// Saved user context from EL0 exception
 /// Layout must match the assembly save/restore sequence
 #[repr(C)]
@@ -341,6 +385,9 @@ mod esr {
 
 /// Install exception vector table
 pub fn init() {
+    // Initialize exception stack before enabling exceptions
+    init_exception_stack();
+    
     unsafe {
         let vbar = &exception_vector_table as *const _ as u64;
 
@@ -454,9 +501,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let ret = crate::syscall::handle_syscall(syscall_num, &args);
             
             // Check if process exited - if so, return to kernel
-            if let Some(exit_code) = crate::syscall::check_exit() {
-                // Don't ERET back to user - return to kernel instead
-                crate::process::return_to_kernel(exit_code);
+            if let Some(proc) = crate::process::current_process() {
+                if proc.exited {
+                    // Don't ERET back to user - return to kernel instead
+                    crate::process::return_to_kernel(proc.exit_code);
+                }
             }
             
             ret

@@ -257,7 +257,11 @@ impl ThreadPool {
         }
     }
 
-    /// Initialize the pool - allocate default stacks for all slots
+    /// Initialize the pool - allocate stacks with sizes based on thread role
+    /// 
+    /// Thread 0: Boot stack (1MB, fixed location)
+    /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each, 2MB total)
+    /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each, 1.5MB total)
     pub fn init(&mut self) {
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
@@ -267,9 +271,16 @@ impl ThreadPool {
             config::KERNEL_STACK_SIZE
         );
 
-        // Pre-allocate default stacks for all other slots
-        for i in 1..config::MAX_THREADS {
-            self.allocate_stack_for_slot(i, config::DEFAULT_THREAD_STACK_SIZE);
+        // Threads 1 to RESERVED_THREADS-1: System threads with large stacks (256KB)
+        // Used for shell, SSH sessions, async executor, etc.
+        for i in 1..config::RESERVED_THREADS {
+            self.allocate_stack_for_slot(i, config::SYSTEM_THREAD_STACK_SIZE);
+        }
+
+        // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (64KB)
+        // Used for running user processes
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            self.allocate_stack_for_slot(i, config::USER_THREAD_STACK_SIZE);
         }
 
         self.initialized = true;
@@ -470,6 +481,58 @@ impl ThreadPool {
         }
 
         Err("No free thread slots")
+    }
+    
+    /// Spawn a thread for user processes (only in user thread range)
+    /// 
+    /// Only searches slots RESERVED_THREADS..MAX_THREADS.
+    /// Uses USER_THREAD_STACK_SIZE (64KB).
+    pub fn spawn_user_closure(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+    ) -> Result<usize, &'static str> {
+        if !self.initialized {
+            return Err("Thread pool not initialized");
+        }
+
+        // Only search in user thread range
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            if self.slots[i].state == ThreadState::Free {
+                let stack = &self.stacks[i];
+                let sp = (stack.top & !0xF) as u64;
+
+                // x19 = trampoline function pointer
+                // x20 = closure data pointer
+                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
+                self.slots[i].context.x20 = closure_ptr as u64;
+                self.slots[i].context.x21 = 0;
+                self.slots[i].context.x22 = 0;
+                self.slots[i].context.x23 = 0;
+                self.slots[i].context.x24 = 0;
+                self.slots[i].context.x25 = 0;
+                self.slots[i].context.x26 = 0;
+                self.slots[i].context.x27 = 0;
+                self.slots[i].context.x28 = 0;
+                self.slots[i].context.x29 = 0;
+                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
+                self.slots[i].context.sp = sp;
+                self.slots[i].context.daif = 0;
+                self.slots[i].context.elr = 0;
+                self.slots[i].context.spsr = 0;
+
+                // User threads are preemptible (not cooperative)
+                self.slots[i].cooperative = false;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = 0;
+
+                self.slots[i].state = ThreadState::Ready;
+
+                return Ok(i);
+            }
+        }
+
+        Err("No free user thread slots")
     }
 
     /// Reclaim a terminated thread slot (just mark as Free)
@@ -800,6 +863,72 @@ pub fn current_thread_id() -> usize {
 /// Get max thread count
 pub fn max_threads() -> usize {
     config::MAX_THREADS
+}
+
+// ============================================================================
+// User Process Thread API
+// ============================================================================
+
+/// Spawn a thread specifically for user processes
+/// 
+/// Only spawns in slots RESERVED_THREADS..MAX_THREADS (user thread range).
+/// Returns the thread ID or error if no user thread slots are available.
+pub fn spawn_user_thread_fn<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    // Box the closure and get a raw pointer
+    let boxed: Box<F> = Box::new(f);
+    let closure_ptr = Box::into_raw(boxed) as *mut ();
+
+    // Get the trampoline function for this specific closure type
+    let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
+
+    let result = with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_user_closure(trampoline, closure_ptr)
+    });
+
+    // If spawn failed, clean up the boxed closure
+    if result.is_err() {
+        unsafe {
+            let _ = Box::from_raw(closure_ptr as *mut F);
+        }
+    }
+
+    result
+}
+
+/// Count available user thread slots
+/// 
+/// Returns the number of free slots in the user thread range (RESERVED_THREADS..MAX_THREADS).
+pub fn user_threads_available() -> usize {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut count = 0;
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            if pool.slots[i].state == ThreadState::Free {
+                count += 1;
+            }
+        }
+        count
+    })
+}
+
+/// Count active user threads
+/// 
+/// Returns the number of non-free slots in the user thread range.
+pub fn user_threads_active() -> usize {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut count = 0;
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            if pool.slots[i].state != ThreadState::Free {
+                count += 1;
+            }
+        }
+        count
+    })
 }
 
 // ============================================================================

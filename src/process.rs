@@ -376,6 +376,30 @@ pub struct Process {
     pub exited: bool,
     /// Exit code (valid when exited=true)
     pub exit_code: i32,
+    
+    // ========== Kernel context for return ==========
+    
+    /// Saved kernel context (callee-saved registers for returning after exit)
+    pub kernel_ctx: KernelContext,
+}
+
+/// Kernel context - callee-saved registers that must be preserved across user mode execution
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct KernelContext {
+    pub sp: u64,
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,  // frame pointer
+    pub x30: u64,  // return address
 }
 
 impl Process {
@@ -427,6 +451,8 @@ impl Process {
             stdout_buf: Vec::new(),
             exited: false,
             exit_code: 0,
+            // Kernel context - set before entering user mode
+            kernel_ctx: KernelContext::default(),
         })
     }
 
@@ -471,9 +497,12 @@ impl Process {
         self.address_space.activate();
 
         // Enter user mode - this will ERET to user code
-        // When user calls exit(), it sets PROCESS_EXITED flag
-        // and the exception handler returns here
-        let exit_code = unsafe { run_user_until_exit(&self.context) };
+        // When user calls exit(), it sets proc.exited = true
+        // and the exception handler calls return_to_kernel() to return here
+        let ctx_ptr = &mut self.kernel_ctx as *mut KernelContext;
+        let exit_code = unsafe { 
+            run_user_until_exit(self.context.sp, self.context.pc, ctx_ptr) 
+        };
 
         // Unregister this process from the table
         unregister_process(self.pid);
@@ -549,108 +578,103 @@ impl Process {
 /// This sets up the CPU state and performs an ERET to EL0.
 /// Does not return.
 #[inline(never)]
+#[allow(dead_code)]
 unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
-    core::arch::asm!(
-        // Set SP_EL0 (user stack pointer)
-        "msr sp_el0, {sp}",
-        // Set ELR_EL1 (return address = entry point)
-        "msr elr_el1, {pc}",
-        // Set SPSR_EL1 (saved program status for EL0)
-        // SPSR = 0 means EL0, all interrupts enabled
-        "msr spsr_el1, {spsr}",
-        // Clear registers for clean start
-        "mov x0, #0",
-        "mov x1, #0",
-        "mov x2, #0",
-        "mov x3, #0",
-        "mov x4, #0",
-        "mov x5, #0",
-        "mov x6, #0",
-        "mov x7, #0",
-        "mov x8, #0",
-        "mov x9, #0",
-        "mov x10, #0",
-        "mov x11, #0",
-        "mov x12, #0",
-        "mov x13, #0",
-        "mov x14, #0",
-        "mov x15, #0",
-        "mov x16, #0",
-        "mov x17, #0",
-        "mov x18, #0",
-        "mov x19, #0",
-        "mov x20, #0",
-        "mov x21, #0",
-        "mov x22, #0",
-        "mov x23, #0",
-        "mov x24, #0",
-        "mov x25, #0",
-        "mov x26, #0",
-        "mov x27, #0",
-        "mov x28, #0",
-        "mov x29, #0",
-        "mov x30, #0",
-        // Jump to EL0
-        "eret",
-        sp = in(reg) ctx.sp,
-        pc = in(reg) ctx.pc,
-        spsr = in(reg) ctx.spsr,
-        options(noreturn)
-    );
+    // SAFETY: This inline asm sets up CPU state and ERETs to user mode
+    unsafe {
+        core::arch::asm!(
+            // Set SP_EL0 (user stack pointer)
+            "msr sp_el0, {sp}",
+            // Set ELR_EL1 (return address = entry point)
+            "msr elr_el1, {pc}",
+            // Set SPSR_EL1 (saved program status for EL0)
+            // SPSR = 0 means EL0, all interrupts enabled
+            "msr spsr_el1, {spsr}",
+            // Clear registers for clean start
+            "mov x0, #0",
+            "mov x1, #0",
+            "mov x2, #0",
+            "mov x3, #0",
+            "mov x4, #0",
+            "mov x5, #0",
+            "mov x6, #0",
+            "mov x7, #0",
+            "mov x8, #0",
+            "mov x9, #0",
+            "mov x10, #0",
+            "mov x11, #0",
+            "mov x12, #0",
+            "mov x13, #0",
+            "mov x14, #0",
+            "mov x15, #0",
+            "mov x16, #0",
+            "mov x17, #0",
+            "mov x18, #0",
+            "mov x19, #0",
+            "mov x20, #0",
+            "mov x21, #0",
+            "mov x22, #0",
+            "mov x23, #0",
+            "mov x24, #0",
+            "mov x25, #0",
+            "mov x26, #0",
+            "mov x27, #0",
+            "mov x28, #0",
+            "mov x29, #0",
+            "mov x30, #0",
+            // Jump to EL0
+            "eret",
+            sp = in(reg) ctx.sp,
+            pc = in(reg) ctx.pc,
+            spsr = in(reg) ctx.spsr,
+            options(noreturn)
+        )
+    }
 }
-
-/// Kernel context saved before entering user mode
-/// Used to return from user mode after exit() syscall
-#[repr(C)]
-struct KernelContext {
-    sp: u64,
-    x19: u64,
-    x20: u64,
-    x21: u64,
-    x22: u64,
-    x23: u64,
-    x24: u64,
-    x25: u64,
-    x26: u64,
-    x27: u64,
-    x28: u64,
-    x29: u64,
-    x30: u64,  // Return address
-}
-
-/// Global storage for kernel context (one process at a time for now)
-static mut KERNEL_CONTEXT: KernelContext = KernelContext {
-    sp: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
-    x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-};
 
 /// Check if process has exited and return to kernel if so
 /// Called from exception handler after each syscall
 #[unsafe(no_mangle)]
 pub extern "C" fn check_process_exit() -> bool {
-    crate::syscall::PROCESS_EXITED.load(core::sync::atomic::Ordering::Acquire)
+    // Use per-process exit flag instead of global
+    match current_process() {
+        Some(proc) => proc.exited,
+        None => false,
+    }
 }
 
 /// Return to kernel after process exit
 /// Called from exception handler when process exits
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    // Get kernel context from current process
+    let ctx_ptr = match current_process() {
+        Some(proc) => &proc.kernel_ctx as *const KernelContext,
+        None => {
+            crate::console::print("[return_to_kernel] ERROR: no current process!\n");
+            loop { core::hint::spin_loop(); }
+        }
+    };
+    
     unsafe {
-        let ctx_ptr = core::ptr::addr_of!(KERNEL_CONTEXT);
-        let sp_val = (*ctx_ptr).sp;
-        
+        // Restore all callee-saved registers from context, then return
         core::arch::asm!(
-            "mov sp, {sp}",
-            "ldp x19, x20, [{ctx}, #8]",
-            "ldp x21, x22, [{ctx}, #24]",
-            "ldp x23, x24, [{ctx}, #40]",
-            "ldp x25, x26, [{ctx}, #56]",
-            "ldp x27, x28, [{ctx}, #72]",
-            "ldp x29, x30, [{ctx}, #88]",
+            // Use x9 as scratch register for context pointer
+            "mov x9, {ctx}",
+            // Restore callee-saved registers
+            "ldp x19, x20, [x9, #8]",
+            "ldp x21, x22, [x9, #24]",
+            "ldp x23, x24, [x9, #40]",
+            "ldp x25, x26, [x9, #56]",
+            "ldp x27, x28, [x9, #72]",
+            "ldp x29, x30, [x9, #88]",
+            // Restore sp last
+            "ldr x9, [x9, #0]",
+            "mov sp, x9",
+            // Set return value and return
             "mov x0, {exit_code}",
             "ret",
             ctx = in(reg) ctx_ptr,
-            sp = in(reg) sp_val,
             exit_code = in(reg) exit_code as i64,
             options(noreturn)
         );
@@ -660,36 +684,31 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 /// Run a user process until it exits
 ///
 /// This saves kernel context, enters user mode (EL0) via ERET.
-/// When exit() is called, control returns here with the exit code.
+/// When exit() is called, return_to_kernel() jumps back here.
 ///
-/// Returns the exit code
-#[inline(never)]  // Prevent inlining to ensure x30 is the return address
-unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
-    let exit_code: i64;
-    let user_sp = ctx.sp;
-    let user_pc = ctx.pc;
-    
-    // Save kernel context and enter user mode
-    // IMPORTANT: No function calls between here and the asm block!
-    // x30 must contain our return address when we save it.
-    core::arch::asm!(
-        // Save callee-saved registers to KERNEL_CONTEXT
-        // x30 contains return address to execute() at this point
-        "adrp x9, {kctx_sym}",
-        "add x9, x9, :lo12:{kctx_sym}",
-        "mov x10, sp",
-        "str x10, [x9, #0]",         // sp
-        "stp x19, x20, [x9, #8]",
-        "stp x21, x22, [x9, #24]",
-        "stp x23, x24, [x9, #40]",
-        "stp x25, x26, [x9, #56]",
-        "stp x27, x28, [x9, #72]",
-        "stp x29, x30, [x9, #88]",
+/// Arguments passed via x0-x2:
+/// - x0: user_sp
+/// - x1: user_pc  
+/// - x2: kernel context pointer
+///
+/// Returns exit code in x0
+#[unsafe(naked)]
+unsafe extern "C" fn run_user_until_exit(user_sp: u64, user_pc: u64, ctx_ptr: *mut KernelContext) -> i32 {
+    core::arch::naked_asm!(
+        // Save callee-saved registers to context struct (x2 = ctx_ptr)
+        "mov x9, sp",
+        "str x9, [x2, #0]",      // sp at offset 0
+        "stp x19, x20, [x2, #8]",
+        "stp x21, x22, [x2, #24]",
+        "stp x23, x24, [x2, #40]",
+        "stp x25, x26, [x2, #56]",
+        "stp x27, x28, [x2, #72]",
+        "stp x29, x30, [x2, #88]",
         
-        // Set up user context
-        "msr sp_el0, {user_sp}",
-        "msr elr_el1, {user_pc}",
-        "mov x9, #0",                // SPSR for EL0
+        // Set up user context (x0 = user_sp, x1 = user_pc)
+        "msr sp_el0, x0",
+        "msr elr_el1, x1",
+        "mov x9, #0",            // SPSR for EL0
         "msr spsr_el1, x9",
         "isb",
         
@@ -715,18 +734,12 @@ unsafe fn run_user_until_exit(ctx: &UserContext) -> i32 {
         "mov x18, #0",
         
         // Enter user mode
+        // return_to_kernel() will restore context and ret back here
         "eret",
-        
-        kctx_sym = sym KERNEL_CONTEXT,
-        user_sp = in(reg) user_sp,
-        user_pc = in(reg) user_pc,
-        lateout("x0") exit_code,
-        // These are clobbered
-        out("x9") _,
-        out("x10") _,
-    );
-    
-    exit_code as i32
+        // After eret, we never reach here in normal flow
+        // return_to_kernel() will restore registers and ret,
+        // which returns to the caller of run_user_until_exit
+    )
 }
 
 /// Execute an ELF binary from the filesystem with per-process I/O
@@ -764,8 +777,57 @@ pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), 
 ///
 /// # Returns
 /// Exit code of the process, or error message
+#[allow(dead_code)]
 pub fn exec(path: &str) -> Result<i32, String> {
     let (exit_code, _stdout) = exec_with_io(path, None)?;
     Ok(exit_code)
+}
+
+/// Spawn a process on a user thread for concurrent execution
+///
+/// This function creates a new process from the ELF file and spawns it on a
+/// dedicated user thread (slots 8-31). The process runs concurrently with
+/// other threads and processes.
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `stdin` - Optional stdin data for the process
+///
+/// # Returns
+/// Thread ID of the spawned thread, or error message
+pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> {
+    // Check if user threads are available
+    if crate::threading::user_threads_available() == 0 {
+        return Err("No available user threads for process execution".into());
+    }
+    
+    // Read the ELF file
+    let elf_data = crate::fs::read_file(path)
+        .map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
+
+    // Create the process
+    let mut process = Process::from_elf(path, &elf_data)
+        .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+    
+    // Set up stdin if provided
+    if let Some(data) = stdin {
+        process.set_stdin(data);
+    }
+
+    // Spawn on a user thread
+    let thread_id = crate::threading::spawn_user_thread_fn(move || {
+        // Execute the process
+        process.execute();
+        
+        // Mark thread as terminated when process exits
+        crate::threading::mark_current_terminated();
+        
+        // This loop should never be reached, but just in case
+        loop {
+            crate::threading::yield_now();
+        }
+    }).map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
+    
+    Ok(thread_id)
 }
 

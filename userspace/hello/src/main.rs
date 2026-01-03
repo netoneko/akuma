@@ -6,16 +6,14 @@
 #![no_std]
 #![no_main]
 
-use libakuma::{exit, print, getpid};
+use libakuma::{exit, print, getpid, sleep};
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Delay between each "hello" output (in busy-wait iterations)
-/// Approximate: 10_000_000 iterations ≈ 1 second on QEMU
-/// So 100_000_000 ≈ 10 seconds
-const DELAY_ITERATIONS: u64 = 100_000_000;
+/// Sleep duration between each "hello" output (in seconds)
+const SLEEP_SECONDS: u64 = 10;
 
 /// Total number of "hello" outputs before exiting
 /// 6 outputs × 10 seconds = 60 seconds total runtime
@@ -24,15 +22,6 @@ const TOTAL_OUTPUTS: u32 = 6;
 // ============================================================================
 // Implementation  
 // ============================================================================
-
-/// Busy-wait delay (no sleep syscall available)
-#[inline(never)]
-fn delay(iterations: u64) {
-    for _ in 0..iterations {
-        // Prevent optimizer from eliminating the loop
-        core::hint::black_box(());
-    }
-}
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -51,9 +40,9 @@ pub extern "C" fn _start() -> ! {
         print_num(TOTAL_OUTPUTS);
         print(")\n");
         
-        // Don't delay after the last output
+        // Don't sleep after the last output
         if i + 1 < TOTAL_OUTPUTS {
-            delay(DELAY_ITERATIONS);
+            sleep(SLEEP_SECONDS);
         }
     }
     
@@ -86,4 +75,3 @@ fn print_num(n: u32) {
         libakuma::write(libakuma::fd::STDOUT, &s);
     }
 }
-

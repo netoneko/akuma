@@ -14,6 +14,7 @@ pub mod nr {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const NANOSLEEP: u64 = 101; // Linux arm64 nanosleep
     pub const MMAP: u64 = 222;   // Linux arm64 mmap
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
 }
@@ -39,6 +40,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::BRK => sys_brk(args[0] as usize),
+        nr::NANOSLEEP => sys_nanosleep(args[0], args[1]),
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         _ => {
@@ -63,6 +65,23 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else {
         proc.set_brk(new_brk) as u64
     }
+}
+
+/// sys_nanosleep - Sleep for a specified duration
+/// 
+/// # Arguments
+/// * `seconds` - Number of seconds to sleep
+/// * `nanoseconds` - Additional nanoseconds to sleep
+/// 
+/// # Returns
+/// 0 on success
+fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
+    let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
+    
+    // Use the existing delay_us which is known to work
+    crate::timer::delay_us(total_us);
+    
+    0 // Success
 }
 
 /// sys_mmap - Map memory pages
@@ -133,37 +152,15 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
-    // Update per-process state
+    // Update per-process state only
     if let Some(proc) = crate::process::current_process() {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
     }
     
-    // Also set global flags for backwards compatibility during transition
-    LAST_EXIT_CODE.store(code, core::sync::atomic::Ordering::Release);
-    PROCESS_EXITED.store(true, core::sync::atomic::Ordering::Release);
-    
     // Return won't matter - process is terminated
     code as u64
-}
-
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-
-/// Flag indicating current user process has exited
-pub static PROCESS_EXITED: AtomicBool = AtomicBool::new(false);
-
-/// Exit code of the last exited process
-pub static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
-
-/// Check if process has exited and get exit code
-/// (Still used by exception handler for synchronous exit detection)
-pub fn check_exit() -> Option<i32> {
-    if PROCESS_EXITED.load(Ordering::Acquire) {
-        Some(LAST_EXIT_CODE.load(Ordering::Acquire))
-    } else {
-        None
-    }
 }
 
 /// sys_read - Read from a file descriptor
