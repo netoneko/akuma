@@ -13,7 +13,9 @@ use talc::{Span, Talc};
 
 /// Set to true to use page-based allocation (like userspace mmap allocator)
 /// This fixes layout-sensitive heap corruption bugs but uses more memory.
-pub const USE_PAGE_ALLOCATOR: bool = true;
+/// WARNING: page_dealloc is currently a no-op, so this LEAKS memory!
+/// Set to false until proper deallocation is implemented.
+pub const USE_PAGE_ALLOCATOR: bool = false;
 
 const PAGE_SIZE: usize = 4096;
 

@@ -426,6 +426,9 @@ impl Process {
             crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN
         ).map_err(|_| ElfError::MappingFailed("process info page"))?;
         
+        // Track the frame so it's freed when the address space is dropped
+        address_space.track_user_frame(process_info_frame);
+        
         // Initialize per-process memory tracking
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
         
