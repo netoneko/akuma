@@ -331,14 +331,37 @@ async fn find_executable(name: &str) -> Option<alloc::string::String> {
     None
 }
 
-/// Execute an external binary with stdin/stdout
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Flag to indicate whether async execution is available (SSH server running)
+/// When false, falls back to synchronous execution for boot-time tests
+static ASYNC_EXEC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable async process execution (call when SSH server starts)
+pub fn enable_async_exec() {
+    ASYNC_EXEC_ENABLED.store(true, Ordering::Release);
+}
+
+/// Check if async execution is enabled
+pub fn is_async_exec_enabled() -> bool {
+    ASYNC_EXEC_ENABLED.load(Ordering::Acquire)
+}
+
+/// Execute an external binary with stdin/stdout (buffered, for pipelines)
 async fn execute_external(
     path: &str,
     stdin: Option<&[u8]>,
     stdout: &mut VecWriter,
 ) -> Result<(), ShellError> {
-    // Execute the binary with per-process I/O
-    match crate::process::exec_with_io(path, stdin) {
+    // Use async execution if enabled (SSH context), otherwise sync (test context)
+    let result = if is_async_exec_enabled() {
+        crate::process::exec_async(path, stdin).await
+    } else {
+        // Synchronous fallback for boot-time tests
+        crate::process::exec_with_io(path, stdin)
+    };
+
+    match result {
         Ok((exit_code, process_output)) => {
             // Convert \n to \r\n for terminal
             for &byte in &process_output {
@@ -360,6 +383,25 @@ async fn execute_external(
             let msg = format!("Error: {}\r\n", e);
             let _ = embedded_io_async::Write::write_all(stdout, msg.as_bytes()).await;
             Ok(())
+        }
+    }
+}
+
+/// Execute an external binary with streaming output (for direct SSH output)
+pub async fn execute_external_streaming<W>(
+    path: &str,
+    stdin: Option<&[u8]>,
+    output: &mut W,
+) -> Result<i32, ShellError>
+where
+    W: embedded_io_async::Write,
+{
+    match crate::process::exec_streaming(path, stdin, output).await {
+        Ok(exit_code) => Ok(exit_code),
+        Err(e) => {
+            let msg = format!("Error: {}\r\n", e);
+            let _ = output.write_all(msg.as_bytes()).await;
+            Err(ShellError::ExecutionFailed("process execution failed"))
         }
     }
 }

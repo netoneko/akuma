@@ -944,6 +944,20 @@ pub fn user_threads_active() -> usize {
     })
 }
 
+/// Check if a thread has terminated
+///
+/// Returns true if the thread has finished execution (state is Terminated or Free).
+/// Also returns true for invalid thread IDs.
+pub fn is_thread_terminated(thread_id: usize) -> bool {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        pool.slots
+            .get(thread_id)
+            .map(|s| s.state == ThreadState::Terminated || s.state == ThreadState::Free)
+            .unwrap_or(true)
+    })
+}
+
 // ============================================================================
 // Stack Protection Functions
 // ============================================================================

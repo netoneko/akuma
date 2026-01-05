@@ -140,6 +140,9 @@ pub async fn run(stack: Stack<'static>) {
     ));
     log("[SSH Server] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
 
+    // Enable async process execution now that SSH server is running
+    crate::shell::enable_async_exec();
+
     // Initialize shared host key from filesystem
     protocol::init_host_key_async().await;
 

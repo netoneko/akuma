@@ -70,8 +70,8 @@ impl Command for ExecCommand {
                 return Ok(());
             }
 
-            // Execute the binary with per-process I/O
-            match crate::process::exec_with_io(path, stdin) {
+            // Execute the binary asynchronously (non-blocking)
+            match crate::process::exec_async(path, stdin).await {
                 Ok((exit_code, process_output)) => {
                     // Convert \n to \r\n for terminal
                     for &byte in &process_output {

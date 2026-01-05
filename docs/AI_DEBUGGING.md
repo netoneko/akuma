@@ -172,11 +172,42 @@ When running automated tests via SSH against the QEMU emulator:
    ```bash
    pkill -9 qemu-system-aarch64 2>/dev/null
    sleep 2
-   cargo run --release 2>/dev/null &
+   cargo run --release > /tmp/qemu_output.txt 2>&1 &
    sleep 25
    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222 "pwd"
    pkill -9 qemu-system-aarch64 2>/dev/null
    ```
+
+7. **Check for panics and exceptions**: After running tests, always examine the kernel output for errors:
+   ```bash
+   # Check for kernel panics
+   grep -i "panic" /tmp/qemu_output.txt
+   
+   # Check for exceptions
+   grep -i "exception\|fault\|abort" /tmp/qemu_output.txt
+   
+   # Check for errors
+   grep -i "error" /tmp/qemu_output.txt
+   
+   # View last 50 lines of output for context
+   tail -50 /tmp/qemu_output.txt
+   ```
+
+8. **If tests fail or hang**, examine the full kernel output:
+   ```bash
+   # View the entire output
+   cat /tmp/qemu_output.txt
+   
+   # Or search for specific patterns
+   grep -E "(panic|exception|error|failed)" /tmp/qemu_output.txt
+   ```
+
+9. **Common error patterns to watch for**:
+   - `PANIC:` - Kernel panic, examine the message and backtrace
+   - `Exception:` - CPU exception (data abort, instruction abort, etc.)
+   - `[Process]` - Process-related messages, look for exit codes
+   - `[SSH]` - SSH connection issues
+   - `deadlock` - Lock contention issues
 
 This prevents issues with multiple QEMU instances competing for the same ports and ensures a clean testing environment.
 

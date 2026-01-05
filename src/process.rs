@@ -89,6 +89,108 @@ fn unregister_process(pid: Pid) {
     PROCESS_TABLE.lock().remove(&pid);
 }
 
+// ============================================================================
+// Process Channel - Inter-thread communication for process I/O
+// ============================================================================
+
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicI32};
+
+/// Channel for streaming process output between threads
+///
+/// Used to pass output from a process running on a user thread
+/// to the async shell that spawned it.
+pub struct ProcessChannel {
+    /// Output buffer (spinlock-protected for thread safety)
+    buffer: Spinlock<VecDeque<u8>>,
+    /// Exit code (set when process exits)
+    exit_code: AtomicI32,
+    /// Whether the process has exited
+    exited: AtomicBool,
+}
+
+impl ProcessChannel {
+    /// Create a new empty process channel
+    pub fn new() -> Self {
+        Self {
+            buffer: Spinlock::new(VecDeque::new()),
+            exit_code: AtomicI32::new(0),
+            exited: AtomicBool::new(false),
+        }
+    }
+
+    /// Write data to the channel buffer
+    pub fn write(&self, data: &[u8]) {
+        let mut buf = self.buffer.lock();
+        buf.extend(data);
+    }
+
+    /// Read available data from the channel (non-blocking)
+    /// Returns None if no data is available
+    pub fn try_read(&self) -> Option<Vec<u8>> {
+        let mut buf = self.buffer.lock();
+        if buf.is_empty() {
+            None
+        } else {
+            Some(buf.drain(..).collect())
+        }
+    }
+
+    /// Read all remaining data from the channel
+    pub fn read_all(&self) -> Vec<u8> {
+        let mut buf = self.buffer.lock();
+        buf.drain(..).collect()
+    }
+
+    /// Mark the process as exited with the given exit code
+    pub fn set_exited(&self, code: i32) {
+        self.exit_code.store(code, Ordering::Release);
+        self.exited.store(true, Ordering::Release);
+    }
+
+    /// Check if the process has exited
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    /// Get the exit code (only valid after has_exited() returns true)
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ProcessChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global registry mapping thread IDs to their process channels
+static PROCESS_CHANNELS: Spinlock<alloc::collections::BTreeMap<usize, Arc<ProcessChannel>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Register a process channel for a thread
+pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
+    PROCESS_CHANNELS.lock().insert(thread_id, channel);
+}
+
+/// Get the process channel for a thread (if any)
+pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
+    PROCESS_CHANNELS.lock().get(&thread_id).cloned()
+}
+
+/// Remove and return the process channel for a thread
+pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
+    PROCESS_CHANNELS.lock().remove(&thread_id)
+}
+
+/// Get channel for the current thread (used by syscall handlers)
+pub fn current_channel() -> Option<Arc<ProcessChannel>> {
+    let thread_id = crate::threading::current_thread_id();
+    get_channel(thread_id)
+}
+
 /// Read the current process PID from the process info page
 ///
 /// During a syscall, TTBR0 is still set to the user's page tables,
@@ -829,6 +931,25 @@ pub fn exec(path: &str) -> Result<i32, String> {
 /// # Returns
 /// Thread ID of the spawned thread, or error message
 pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> {
+    let (thread_id, _channel) = spawn_process_with_channel(path, stdin)?;
+    Ok(thread_id)
+}
+
+/// Spawn a process on a user thread with a channel for I/O
+///
+/// Like spawn_process, but returns a ProcessChannel that can be used to
+/// read the process's output and check its exit status.
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `stdin` - Optional stdin data for the process
+///
+/// # Returns
+/// Tuple of (thread_id, channel) or error message
+pub fn spawn_process_with_channel(
+    path: &str,
+    stdin: Option<&[u8]>,
+) -> Result<(usize, Arc<ProcessChannel>), String> {
     // Check if user threads are available
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
@@ -847,10 +968,24 @@ pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> 
         process.set_stdin(data);
     }
 
+    // Create a channel for this process
+    let channel = Arc::new(ProcessChannel::new());
+    let channel_for_thread = channel.clone();
+
     // Spawn on a user thread
     let thread_id = crate::threading::spawn_user_thread_fn(move || {
+        // Register channel for this thread so syscalls can find it
+        let tid = crate::threading::current_thread_id();
+        register_channel(tid, channel_for_thread.clone());
+
         // Execute the process
-        process.execute();
+        let exit_code = process.execute();
+
+        // Mark channel as exited
+        channel_for_thread.set_exited(exit_code);
+
+        // Remove channel registration
+        remove_channel(tid);
 
         // Mark thread as terminated when process exits
         crate::threading::mark_current_terminated();
@@ -862,5 +997,107 @@ pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> 
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
-    Ok(thread_id)
+    Ok((thread_id, channel))
+}
+
+/// Execute a binary asynchronously and return its output when complete
+///
+/// Spawns the process on a user thread and polls for completion,
+/// yielding to other async tasks while waiting. Returns the buffered
+/// output when the process exits.
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `stdin` - Optional stdin data for the process
+///
+/// # Returns
+/// Tuple of (exit_code, stdout_data) or error message
+pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
+    use embassy_time::{Duration, Timer};
+
+    // Spawn process with channel
+    let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
+
+    // Poll for completion
+    loop {
+        // Check if process has exited
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            break;
+        }
+
+        // Yield to other async tasks
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    // Collect all output
+    let output = channel.read_all();
+    let exit_code = channel.exit_code();
+
+    // Clean up terminated thread
+    crate::threading::cleanup_terminated();
+
+    Ok((exit_code, output))
+}
+
+/// Execute a binary with streaming output to an async writer
+///
+/// Spawns the process on a user thread and streams output to the
+/// provided writer as it becomes available. This allows real-time
+/// output display while keeping SSH responsive.
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `stdin` - Optional stdin data for the process
+/// * `output` - Async writer to stream output to
+///
+/// # Returns
+/// Exit code or error message
+pub async fn exec_streaming<W>(path: &str, stdin: Option<&[u8]>, output: &mut W) -> Result<i32, String>
+where
+    W: embedded_io_async::Write,
+{
+    use embassy_time::{Duration, Timer};
+
+    // Spawn process with channel
+    let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
+
+    // Poll for output and completion
+    loop {
+        // Drain any available output and write to stream
+        if let Some(data) = channel.try_read() {
+            // Convert \n to \r\n for terminal display
+            for &byte in &data {
+                if byte == b'\n' {
+                    let _ = output.write_all(b"\r\n").await;
+                } else {
+                    let _ = output.write_all(&[byte]).await;
+                }
+            }
+        }
+
+        // Check if process has exited
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            // Drain any remaining output
+            if let Some(data) = channel.try_read() {
+                for &byte in &data {
+                    if byte == b'\n' {
+                        let _ = output.write_all(b"\r\n").await;
+                    } else {
+                        let _ = output.write_all(&[byte]).await;
+                    }
+                }
+            }
+            break;
+        }
+
+        // Yield to other async tasks
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    let exit_code = channel.exit_code();
+
+    // Clean up terminated thread
+    crate::threading::cleanup_terminated();
+
+    Ok(exit_code)
 }

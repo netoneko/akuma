@@ -70,6 +70,9 @@ fn sys_brk(new_brk: usize) -> u64 {
 
 /// sys_nanosleep - Sleep for a specified duration
 ///
+/// Yields to other threads while waiting, allowing the system to remain
+/// responsive during long sleeps.
+///
 /// # Arguments
 /// * `seconds` - Number of seconds to sleep
 /// * `nanoseconds` - Additional nanoseconds to sleep
@@ -78,9 +81,12 @@ fn sys_brk(new_brk: usize) -> u64 {
 /// 0 on success
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
+    let end_time = crate::timer::get_time_us().wrapping_add(total_us);
 
-    // Use the existing delay_us which is known to work
-    crate::timer::delay_us(total_us);
+    // Yield to other threads while waiting instead of busy-spinning
+    while crate::timer::get_time_us() < end_time {
+        crate::threading::yield_now();
+    }
 
     0 // Success
 }
@@ -247,7 +253,12 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // is within the user's address space
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
-    // Write to per-process stdout buffer
+    // Write to process channel for streaming output (if one exists)
+    if let Some(channel) = crate::process::current_channel() {
+        channel.write(buf);
+    }
+
+    // Write to per-process stdout buffer (for legacy exec_with_io)
     if let Some(proc) = crate::process::current_process() {
         proc.write_stdout(buf);
     }

@@ -125,9 +125,10 @@ where
                 if crate::timer::uptime_us() - start > timeout_us {
                     panic!("Shell test timed out");
                 }
-                for _ in 0..1000 {
-                    core::hint::spin_loop();
-                }
+                // Yield to allow spawned process threads to run
+                crate::threading::yield_now();
+                // Clean up any terminated threads
+                crate::threading::cleanup_terminated();
             }
         }
     }
