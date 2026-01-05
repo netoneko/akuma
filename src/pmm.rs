@@ -431,13 +431,14 @@ pub fn alloc_pages(count: usize) -> Option<PhysFrame> {
 
 /// Free a single physical page
 pub fn free_page(frame: PhysFrame) {
+    // Untrack BEFORE freeing to prevent race condition:
+    // If we free first then untrack, another CPU could reallocate the same
+    // frame and track it before we untrack, causing us to remove their tracking.
+    untrack_frame(frame);
+    
     let mut pmm = PMM.lock();
     pmm.free_page(frame);
     ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
-    
-    // Untrack after successful free (if tracking is enabled)
-    drop(pmm); // Release lock before tracking to avoid potential deadlock
-    untrack_frame(frame);
 }
 
 /// Free contiguous physical pages

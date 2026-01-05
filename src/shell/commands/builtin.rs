@@ -795,10 +795,10 @@ impl Command for PmmCommand {
                     let stats_msg = format!(
                         "Physical Memory Manager:\r\n\
                          \r\n\
-                                       pages       MB\r\n\
-                         Total:    {:>8}   {:>6}\r\n\
-                         Allocated:{:>8}   {:>6}\r\n\
-                         Free:     {:>8}   {:>6}\r\n",
+                                     pages       MB\r\n\
+                         Total:      {:>5}      {:>3}\r\n\
+                         Allocated:  {:>5}      {:>3}\r\n\
+                         Free:       {:>5}      {:>3}\r\n",
                         total, total_mb,
                         allocated, allocated_mb,
                         free, free_mb
