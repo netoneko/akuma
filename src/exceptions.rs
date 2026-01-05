@@ -85,13 +85,22 @@ sync_el1_handler:
 // Handles SVC syscalls and user faults
 sync_el0_handler:
     // At this point: SP = SP_EL1 (kernel stack), ELR_EL1 = user PC
+    // CRITICAL: We must save ALL user registers we're about to clobber!
     
-    // Switch to dedicated exception stack to avoid corrupting kernel stack
-    // Save current SP to x9, then load exception stack
-    mov     x9, sp
+    // First, save user x8-x11 to kernel stack (we'll use x9, x10 for stack switching)
+    stp     x8, x9, [sp, #-32]!     // Push user x8, x9 (sp -= 32)
+    stp     x10, x11, [sp, #16]     // Save user x10, x11 at sp+16
+    
+    // Now we can safely use x9 to hold kernel SP while switching stacks
+    add     x9, sp, #32             // x9 = original kernel SP (before we pushed)
+    
+    // Switch to dedicated exception stack
     adrp    x10, EXCEPTION_STACK_TOP
     add     x10, x10, :lo12:EXCEPTION_STACK_TOP
     ldr     x10, [x10]
+    
+    // x11 = old kernel SP where we saved user x8-x11
+    mov     x11, sp
     mov     sp, x10
     
     // Save original kernel SP at top of exception stack (we'll need it for return_to_kernel)
@@ -101,13 +110,17 @@ sync_el0_handler:
     // Order: x0-x30, then SP_EL0, ELR_EL1, SPSR_EL1
     sub     sp, sp, #280            // 35 * 8 bytes
     
-    // Save x0-x30
+    // Save x0-x7 (not clobbered)
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
     stp     x6, x7, [sp, #48]
-    stp     x8, x9, [sp, #64]       // x9 was original sp, now saved
-    stp     x10, x11, [sp, #80]
+    
+    // Load user x8-x11 from old kernel stack and save to trap frame
+    ldp     x0, x1, [x11, #0]       // Load user x8->x0, user x9->x1
+    stp     x0, x1, [sp, #64]       // Store to proper slot [sp+64] = x8, [sp+72] = x9
+    ldp     x0, x1, [x11, #16]      // Load user x10->x0, user x11->x1
+    stp     x0, x1, [sp, #80]       // Store to proper slot [sp+80] = x10, [sp+88] = x11
     stp     x12, x13, [sp, #96]
     stp     x14, x15, [sp, #112]
     stp     x16, x17, [sp, #128]
@@ -188,8 +201,11 @@ sync_el0_handler:
     // Restore x10-x11
     ldp     x10, x11, [sp, #80]
     
-    // Restore x8 (skip x9, we're using it for return value)
-    ldr     x8, [sp, #64]
+    // Restore x8-x9 (x9 is used for return value, so save it to stack first)
+    // We need to preserve x9 for userspace, so use a different strategy:
+    // Store return value temporarily on stack, restore x9, then load return to x0
+    str     x9, [sp, #272]          // Store return value in padding slot
+    ldp     x8, x9, [sp, #64]       // Restore x8 and x9
     
     // Restore x6-x7
     ldp     x6, x7, [sp, #48]
@@ -203,8 +219,8 @@ sync_el0_handler:
     // Restore x1 (x0 will be syscall return)
     ldr     x1, [sp, #8]
     
-    // Put syscall return value in x0
-    mov     x0, x9
+    // Load syscall return value into x0
+    ldr     x0, [sp, #272]
     
     // Cleanup stack - pop the user register frame
     add     sp, sp, #280
@@ -520,12 +536,15 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
         esr::EC_DATA_ABORT_LOWER => {
             // Data abort from user - terminate with error
             let far: u64;
+            let elr: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
+                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
             crate::console::print(&alloc::format!(
-                "[Fault] Data abort from EL0 at FAR={:#x}, ISS={:#x}\n",
+                "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far,
+                elr,
                 iss
             ));
             // Terminate process
