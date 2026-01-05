@@ -50,20 +50,20 @@ pub fn run_all_tests() {
     }
 
     // Test 5: External binary in pipeline (if echo2 exists)
-    // DISABLED: echo2 execution may contribute to EC=0x0 kernel crash
-    // if test_external_binary_pipeline() {
-    //     passed += 1;
-    // } else {
-    //     failed += 1;
-    // }
+    // Re-enabled to investigate EC=0x0 crash
+    if test_external_binary_pipeline() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
 
     // Test 6: Mixed builtin and external pipeline (if echo2 exists)
-    // DISABLED: echo2 execution may contribute to EC=0x0 kernel crash
-    // if test_mixed_pipeline() {
-    //     passed += 1;
-    // } else {
-    //     failed += 1;
-    // }
+    // Re-enabled to investigate EC=0x0 crash
+    if test_mixed_pipeline() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
 
     log(&format!(
         "\n[Shell Tests] Complete: {} passed, {} failed\n",

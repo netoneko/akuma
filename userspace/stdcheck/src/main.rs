@@ -65,15 +65,15 @@ pub extern "C" fn _start() -> ! {
         failed += 1;
     }
 
-    // Test 5: Box allocation (disabled - causes kernel crash, see docs/STDCHECK_DEBUG.md)
-    // print("[TEST] Box... ");
-    // if test_box() {
-    //     print("PASS\n");
-    //     _passed += 1;
-    // } else {
-    //     print("FAIL\n");
-    //     failed += 1;
-    // }
+    // Test 5: Box allocation
+    print("[TEST] Box... ");
+    if test_box() {
+        print("PASS\n");
+        _passed += 1;
+    } else {
+        print("FAIL\n");
+        failed += 1;
+    }
 
     print("\n=== stdcheck: All tests complete ===\n");
     
@@ -88,17 +88,53 @@ pub extern "C" fn _start() -> ! {
 
 #[inline(never)]
 fn test_vec() -> bool {
+    use alloc::format;
+    
+    print("\n  Creating Vec...\n");
     let mut v: Vec<i32> = Vec::new();
+    print(&format!("  After new: len={}, cap={}, ptr={:p}\n", v.len(), v.capacity(), v.as_ptr()));
+    
+    print("  Pushing 1...\n");
     v.push(1);
+    print(&format!("  After push(1): len={}, cap={}, ptr={:p}\n", v.len(), v.capacity(), v.as_ptr()));
+    
+    print("  Pushing 2...\n");
     v.push(2);
+    print(&format!("  After push(2): len={}, cap={}\n", v.len(), v.capacity()));
+    
+    print("  Pushing 3...\n");
     v.push(3);
+    print(&format!("  After push(3): len={}, cap={}\n", v.len(), v.capacity()));
     
-    // Force evaluation to avoid optimizations
-    let len = core::hint::black_box(v.len());
-    let v0 = core::hint::black_box(v[0]);
-    let v2 = core::hint::black_box(v[2]);
+    // Test WITHOUT black_box
+    print(&format!("  Direct read: len={}, v[0]={}, v[2]={}\n", v.len(), v[0], v[2]));
     
-    len == 3 && v0 == 1 && v2 == 3
+    // Store to local variables (prevent optimization)
+    let len = v.len();
+    let v0 = v[0];
+    let v2 = v[2];
+    print(&format!("  Via locals: len={}, v0={}, v2={}\n", len, v0, v2));
+    
+    // Test with volatile read
+    let len_volatile = unsafe { core::ptr::read_volatile(&v.len()) };
+    print(&format!("  Volatile len: {}\n", len_volatile));
+    
+    // Test black_box on a simple value (not from Vec)
+    let simple: usize = 42;
+    let bb_simple = core::hint::black_box(simple);
+    print(&format!("  black_box(42) = {}\n", bb_simple));
+    
+    // Test black_box on v.len()
+    let bb_len = core::hint::black_box(v.len());
+    print(&format!("  black_box(v.len()) = {}\n", bb_len));
+    
+    // Use bb_len in comparison (original test logic)
+    if bb_len == 3 && v0 == 1 && v2 == 3 {
+        true
+    } else {
+        print(&format!("  FAILED: bb_len={}, expected 3\n", bb_len));
+        false
+    }
     // Vec is dropped here - the fix in libakuma prevents x0 corruption
 }
 
@@ -218,6 +254,41 @@ fn test_string_push_str_with_debug_prints() -> bool {
 }
 
 fn test_box() -> bool {
+    use alloc::format;
+    
+    print("  Allocating Box<i32>...\n");
+    
+    // Try manual allocation first to debug
+    let layout = core::alloc::Layout::new::<i32>();
+    print(&format!("  Layout: size={}, align={}\n", layout.size(), layout.align()));
+    
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    print(&format!("  alloc returned: {:p}\n", ptr));
+    
+    if ptr.is_null() {
+        print("  ERROR: alloc returned null!\n");
+        return false;
+    }
+    
+    // Write value
+    print("  Writing 42 to allocated memory...\n");
+    unsafe { *(ptr as *mut i32) = 42; }
+    
+    // Read value
+    print("  Reading value back...\n");
+    let val = unsafe { *(ptr as *const i32) };
+    print(&format!("  Value: {}\n", val));
+    
+    // Deallocate
+    print("  Deallocating...\n");
+    unsafe { alloc::alloc::dealloc(ptr, layout); }
+    
+    print("  Manual allocation test complete.\n");
+    
+    // Now try Box
+    print("  Creating Box<i32> with Box::new...\n");
     let b = Box::new(42i32);
+    print(&format!("  Box created at {:p}, value={}\n", &*b as *const i32, *b));
+    
     *b == 42
 }

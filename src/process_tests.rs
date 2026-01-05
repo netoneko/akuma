@@ -12,9 +12,8 @@ use crate::process;
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
-    // DISABLED: echo2 loading may contribute to EC=0x0 crash
-    // test_echo2();
-    console::print("[Test] echo2 test SKIPPED (disabled for debugging)\n");
+    // Re-enabled to investigate EC=0x0 crash
+    test_echo2();
 
     // Minimal ELF loading verification (run before stdcheck)
     test_elftest();

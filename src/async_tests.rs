@@ -50,9 +50,8 @@ pub fn run_all() -> bool {
     ));
     console::print("==================================\n\n");
 
-    // DISABLED: SSH tests cause EC=0x0 crash during host key init
-    // all_pass &= run_multi_session_tests();
-    console::print("[Note] Multi-Session SSH tests skipped (EC=0x0 debugging)\n");
+    // Re-enabled to investigate EC=0x0 crash
+    all_pass &= run_multi_session_tests();
 
     all_pass
 }
