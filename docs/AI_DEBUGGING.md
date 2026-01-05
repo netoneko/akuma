@@ -132,26 +132,49 @@ When running automated tests via SSH against the QEMU emulator:
    sleep 2
    ```
 
-2. **Wait for the system to fully boot** (20-25 seconds) before running SSH commands
+2. **Detect boot completion** by checking for the SSH host key message in QEMU output:
+   ```
+   [SSH] Host key loaded/generated from filesystem
+   ```
+   When you see this message, the system is ready to accept SSH connections.
 
-3. **Kill QEMU after tests complete** to avoid stale processes
+3. **Alternative: Wait with timeout** - If not monitoring output, wait 20-25 seconds
 
-4. **Example test pattern**:
+4. **Kill QEMU after tests complete** to avoid stale processes
+
+5. **Example test pattern with boot detection**:
    ```bash
    # Clean up any existing QEMU instance
    pkill -9 qemu-system-aarch64 2>/dev/null
    sleep 2
    
-   # Start QEMU in background
-   cargo run --release 2>/dev/null &
+   # Start QEMU in background, save output to file
+   cargo run --release > /tmp/qemu_output.txt 2>&1 &
+   QEMU_PID=$!
    
-   # Wait for boot
-   sleep 25
+   # Wait for boot (check for SSH ready message)
+   for i in {1..30}; do
+     if grep -q "Host key loaded/generated" /tmp/qemu_output.txt 2>/dev/null; then
+       echo "System booted!"
+       break
+     fi
+     sleep 1
+   done
    
    # Run tests
    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222 "pwd"
    
    # Clean up
+   pkill -9 qemu-system-aarch64 2>/dev/null
+   ```
+
+6. **Simple pattern (fixed wait)**:
+   ```bash
+   pkill -9 qemu-system-aarch64 2>/dev/null
+   sleep 2
+   cargo run --release 2>/dev/null &
+   sleep 25
+   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222 "pwd"
    pkill -9 qemu-system-aarch64 2>/dev/null
    ```
 

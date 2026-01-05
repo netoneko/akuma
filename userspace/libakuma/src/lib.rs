@@ -175,6 +175,37 @@ pub fn munmap(addr: usize, len: usize) -> isize {
     syscall(syscall::MUNMAP, addr as u64, len as u64, 0, 0, 0, 0) as isize
 }
 
+/// Unmap memory pages (version that properly marks x0 as clobbered)
+/// Used by dealloc to ensure compiler saves any important values in x0
+/// 
+/// CRITICAL: We use mov+svc to avoid inout on x0, which ensures the compiler
+/// knows x0 is clobbered and will save/restore any important values.
+#[inline(never)]  // Prevent inlining to ensure proper call/return semantics
+fn munmap_void(addr: usize, len: usize) {
+    unsafe {
+        let _ret: u64;
+        core::arch::asm!(
+            "mov x0, {addr}",
+            "mov x1, {len}",
+            "mov x2, #0",
+            "mov x3, #0",
+            "mov x4, #0",
+            "mov x5, #0",
+            "svc #0",
+            addr = in(reg) addr as u64,
+            len = in(reg) len as u64,
+            in("x8") syscall::MUNMAP,
+            lateout("x0") _ret,  // x0 is clobbered by syscall return
+            out("x1") _,
+            out("x2") _,
+            out("x3") _,
+            out("x4") _,
+            out("x5") _,
+            options(nostack)
+        );
+    }
+}
+
 /// Sleep for the specified number of seconds
 /// 
 /// Yields to other threads while sleeping.
@@ -288,7 +319,9 @@ mod allocator {
         unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
             let size = layout.size().max(layout.align());
             let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            super::munmap(ptr as usize, alloc_size);
+            // Use munmap_void which properly marks x0 as clobbered
+            // to prevent corrupting function return values when called from Drop
+            super::munmap_void(ptr as usize, alloc_size);
         }
 
         // =====================================================================

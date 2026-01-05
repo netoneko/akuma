@@ -99,6 +99,7 @@ fn test_vec() -> bool {
     let v2 = core::hint::black_box(v[2]);
     
     len == 3 && v0 == 1 && v2 == 3
+    // Vec is dropped here - the fix in libakuma prevents x0 corruption
 }
 
 fn test_string_from() -> bool {
