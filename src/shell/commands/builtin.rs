@@ -756,7 +756,7 @@ impl Command for PmmCommand {
                         // Show breakdown by source
                         if let Some(stats) = pmm::tracking_stats() {
                             let breakdown = format!(
-                                "Breakdown:\r\n\
+                                "Current allocations:\r\n\
                                  \r\n\
                                  Kernel:          {:>6}\r\n\
                                  User Page Table: {:>6}\r\n\
@@ -764,13 +764,19 @@ impl Command for PmmCommand {
                                  ELF Loader:      {:>6}\r\n\
                                  Unknown:         {:>6}\r\n\
                                  \r\n\
-                                 Total tracked:   {:>6}\r\n",
+                                 Currently held:  {:>6}\r\n\
+                                 \r\n\
+                                 Cumulative (since boot):\r\n\
+                                   Allocated:     {:>6}\r\n\
+                                   Freed:         {:>6}\r\n",
                                 stats.kernel_count,
                                 stats.user_page_table_count,
                                 stats.user_data_count,
                                 stats.elf_loader_count,
                                 stats.unknown_count,
-                                stats.total_tracked
+                                stats.current_tracked,
+                                stats.total_tracked,
+                                stats.total_untracked
                             );
                             let _ = stdout.write(breakdown.as_bytes()).await;
                         }

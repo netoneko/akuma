@@ -121,6 +121,9 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
     for i in 0..pages {
         let va = mmap_addr + i * PAGE_SIZE;
         if let Some(frame) = pmm::alloc_page_zeroed() {
+            // Debug tracking: record this as a user data allocation
+            pmm::track_frame(frame, pmm::FrameSource::UserData, proc.pid);
+            
             // Track frame so it will be freed when process exits
             proc.address_space.track_user_frame(frame);
             
@@ -131,6 +134,8 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
             
             // Track dynamically allocated page table frames for cleanup
             for table_frame in table_frames {
+                // Debug tracking: record page table allocations
+                pmm::track_frame(table_frame, pmm::FrameSource::UserPageTable, proc.pid);
                 proc.dynamic_page_tables.push(table_frame);
             }
         } else {

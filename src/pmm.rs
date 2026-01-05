@@ -46,12 +46,15 @@ pub struct FrameInfo {
 struct FrameTracker {
     /// Map of physical address to allocation info
     allocations: BTreeMap<usize, FrameInfo>,
-    /// Count of allocations by source
+    /// Count of current allocations by source
     kernel_count: usize,
     user_page_table_count: usize,
     user_data_count: usize,
     elf_loader_count: usize,
     unknown_count: usize,
+    /// Cumulative stats
+    total_tracked: usize,
+    total_untracked: usize,
 }
 
 impl FrameTracker {
@@ -63,6 +66,8 @@ impl FrameTracker {
             user_data_count: 0,
             elf_loader_count: 0,
             unknown_count: 0,
+            total_tracked: 0,
+            total_untracked: 0,
         }
     }
 
@@ -81,6 +86,7 @@ impl FrameTracker {
             FrameSource::ElfLoader => self.elf_loader_count += 1,
             FrameSource::Unknown => self.unknown_count += 1,
         }
+        self.total_tracked += 1;
     }
 
     fn untrack(&mut self, addr: usize) -> Option<FrameInfo> {
@@ -92,6 +98,7 @@ impl FrameTracker {
                 FrameSource::ElfLoader => self.elf_loader_count = self.elf_loader_count.saturating_sub(1),
                 FrameSource::Unknown => self.unknown_count = self.unknown_count.saturating_sub(1),
             }
+            self.total_untracked += 1;
             Some(info)
         } else {
             crate::console::print(&alloc::format!(
@@ -107,12 +114,14 @@ impl FrameTracker {
     
     fn stats(&self) -> FrameTrackingStats {
         FrameTrackingStats {
-            total_tracked: self.allocations.len(),
+            current_tracked: self.allocations.len(),
             kernel_count: self.kernel_count,
             user_page_table_count: self.user_page_table_count,
             user_data_count: self.user_data_count,
             elf_loader_count: self.elf_loader_count,
             unknown_count: self.unknown_count,
+            total_tracked: self.total_tracked,
+            total_untracked: self.total_untracked,
         }
     }
 }
@@ -120,12 +129,15 @@ impl FrameTracker {
 /// Statistics from frame tracking
 #[derive(Debug, Clone)]
 pub struct FrameTrackingStats {
-    pub total_tracked: usize,
+    pub current_tracked: usize,
     pub kernel_count: usize,
     pub user_page_table_count: usize,
     pub user_data_count: usize,
     pub elf_loader_count: usize,
     pub unknown_count: usize,
+    /// Cumulative totals
+    pub total_tracked: usize,
+    pub total_untracked: usize,
 }
 
 static FRAME_TRACKER: Spinlock<FrameTracker> = Spinlock::new(FrameTracker::new());
@@ -422,6 +434,10 @@ pub fn free_page(frame: PhysFrame) {
     let mut pmm = PMM.lock();
     pmm.free_page(frame);
     ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+    
+    // Untrack after successful free (if tracking is enabled)
+    drop(pmm); // Release lock before tracking to avoid potential deadlock
+    untrack_frame(frame);
 }
 
 /// Free contiguous physical pages
