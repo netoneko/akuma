@@ -201,10 +201,15 @@ sync_el0_handler:
     // Restore x10-x11
     ldp     x10, x11, [sp, #80]
     
-    // Restore x8-x9 (x9 is used for return value, so save it to stack first)
-    // We need to preserve x9 for userspace, so use a different strategy:
-    // Store return value temporarily on stack, restore x9, then load return to x0
+    // Store return value temporarily on stack
     str     x9, [sp, #272]          // Store return value in padding slot
+    
+    // Load the original kernel SP now (while we can still use x9)
+    // It's stored at [sp + 280] (after the trap frame)
+    ldr     x9, [sp, #280]          // Load original kernel SP
+    str     x9, [sp, #272 + 8]      // Store to second padding slot
+    
+    // Now restore user x8-x9
     ldp     x8, x9, [sp, #64]       // Restore x8 and x9
     
     // Restore x6-x7
@@ -222,13 +227,23 @@ sync_el0_handler:
     // Load syscall return value into x0
     ldr     x0, [sp, #272]
     
-    // Cleanup stack - pop the user register frame
-    add     sp, sp, #280
+    // Load original kernel SP into temporary location (use exception stack)
+    // We'll switch to it right before eret
+    ldr     x10, [sp, #272 + 8]     // x10 = original kernel SP (temporarily clobber x10)
     
-    // Pop the saved original kernel SP (we pushed it at entry)
-    // Note: we don't actually need to restore it since we're returning to user mode
-    // but we do need to clean up the exception stack
-    add     sp, sp, #16
+    // Cleanup stack - skip past trap frame and kernel SP slot  
+    add     sp, sp, #296            // 280 (trap frame) + 16 (kernel SP slot)
+    
+    // Now restore x10 - we clobbered it, need to restore from trap frame
+    // But wait, trap frame is gone! We need a different approach.
+    // Let's use the user stack temporarily via SP_EL0
+    
+    // Actually, let's just accept that x10 is clobbered and switch to kernel stack
+    mov     sp, x10
+    
+    // Restore x10 from the saved value on kernel stack
+    // At kernel_sp - 16, we stored x10 during entry
+    ldr     x10, [sp, #-16]
     
     // Return to user mode
     eret

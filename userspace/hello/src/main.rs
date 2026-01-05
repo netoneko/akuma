@@ -13,11 +13,11 @@ use libakuma::{exit, getpid, print, sleep};
 // ============================================================================
 
 /// Sleep duration between each "hello" output (in seconds)
-const SLEEP_SECONDS: u64 = 10;
+const SLEEP_SECONDS: u64 = 1;
 
 /// Total number of "hello" outputs before exiting
 /// 6 outputs × 10 seconds = 60 seconds total runtime
-const TOTAL_OUTPUTS: u32 = 6;
+const TOTAL_OUTPUTS: u32 = 10;
 
 // ============================================================================
 // Implementation
