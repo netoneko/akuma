@@ -611,8 +611,13 @@ pub mod user_flags {
 /// Map a user page in the current TTBR0 address space
 /// 
 /// This is used by sys_mmap to add pages to the running process.
+/// Returns a Vec of newly allocated page table frames that the caller should track
+/// for cleanup when the process exits.
+/// 
 /// SAFETY: Caller must ensure VA and PA are page-aligned and valid.
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> {
+    let mut allocated_tables = Vec::new();
+    
     // Get current TTBR0
     let ttbr0: u64;
     core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
@@ -629,13 +634,22 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
     // Walk the page tables, creating entries as needed
     // All PA->pointer conversions go through phys_to_virt
     let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
-    let l1_addr = get_or_create_table(l0_ptr, l0_idx);
+    let (l1_addr, l1_frame) = get_or_create_table(l0_ptr, l0_idx);
+    if let Some(frame) = l1_frame {
+        allocated_tables.push(frame);
+    }
     let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
     
-    let l2_addr = get_or_create_table(l1_ptr, l1_idx);
+    let (l2_addr, l2_frame) = get_or_create_table(l1_ptr, l1_idx);
+    if let Some(frame) = l2_frame {
+        allocated_tables.push(frame);
+    }
     let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
     
-    let l3_addr = get_or_create_table(l2_ptr, l2_idx);
+    let (l3_addr, l3_frame) = get_or_create_table(l2_ptr, l2_idx);
+    if let Some(frame) = l3_frame {
+        allocated_tables.push(frame);
+    }
     let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
     
     // Create L3 entry (4KB page descriptor)
@@ -658,27 +672,33 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) {
         "isb",
         va = in(reg) va >> 12,
     );
+    
+    allocated_tables
 }
 
 /// Get or create a page table entry, returning the next level table physical address
+/// and optionally the newly allocated frame (if one was created).
 /// 
 /// Note: The returned address is a PHYSICAL address. Callers must use phys_to_virt()
 /// before dereferencing it.
-unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> usize {
+/// 
+/// Returns: (physical_address, Option<PhysFrame>) where the frame is Some if a new
+/// page table was allocated (caller should track it for cleanup).
+unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) {
     let entry = table_ptr.add(idx).read_volatile();
     
     if entry & flags::VALID != 0 {
         // Entry exists, extract physical address
-        (entry & 0x0000_FFFF_FFFF_F000) as usize
+        ((entry & 0x0000_FFFF_FFFF_F000) as usize, None)
     } else {
         // Need to allocate a new page table
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
             table_ptr.add(idx).write_volatile(new_entry);
-            frame.addr  // Return physical address
+            (frame.addr, Some(frame))  // Return physical address and the frame
         } else {
             // Allocation failed - this is bad, but return 0
-            0
+            (0, None)
         }
     }
 }

@@ -124,8 +124,14 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
             // Track frame so it will be freed when process exits
             proc.address_space.track_user_frame(frame);
             
-            unsafe {
-                crate::mmu::map_user_page(va, frame.addr, user_flags::RW_NO_EXEC);
+            // Map the page and collect any newly allocated page table frames
+            let table_frames = unsafe {
+                crate::mmu::map_user_page(va, frame.addr, user_flags::RW_NO_EXEC)
+            };
+            
+            // Track dynamically allocated page table frames for cleanup
+            for table_frame in table_frames {
+                proc.dynamic_page_tables.push(table_frame);
             }
         } else {
             return MAP_FAILED;

@@ -13,6 +13,7 @@ use crate::config;
 use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::UserAddressSpace;
+use crate::pmm::PhysFrame;
 
 /// Fixed address for process info page (read-only from userspace)
 /// 
@@ -381,6 +382,13 @@ pub struct Process {
     
     /// Saved kernel context (callee-saved registers for returning after exit)
     pub kernel_ctx: KernelContext,
+    
+    // ========== Dynamic page table tracking ==========
+    
+    /// Page table frames allocated during mmap (for cleanup on exit)
+    /// These are allocated by map_user_page() and need to be freed separately
+    /// from address_space.page_table_frames since they're created dynamically.
+    pub dynamic_page_tables: Vec<PhysFrame>,
 }
 
 /// Kernel context - callee-saved registers that must be preserved across user mode execution
@@ -456,6 +464,8 @@ impl Process {
             exit_code: 0,
             // Kernel context - set before entering user mode
             kernel_ctx: KernelContext::default(),
+            // Dynamic page tables - for mmap-allocated page tables
+            dynamic_page_tables: Vec::new(),
         })
     }
 
@@ -512,6 +522,11 @@ impl Process {
         
         // Deactivate user address space
         UserAddressSpace::deactivate();
+        
+        // Free dynamically allocated page table frames (from mmap calls)
+        for frame in self.dynamic_page_tables.drain(..) {
+            crate::pmm::free_page(frame);
+        }
 
         self.state = ProcessState::Zombie(exit_code);
 
@@ -573,6 +588,16 @@ impl Process {
         self.stdout_buf.clear();
         self.exited = false;
         self.exit_code = 0;
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Free any remaining dynamically allocated page table frames
+        // This handles the case where the process is dropped without execute() being called
+        for frame in self.dynamic_page_tables.drain(..) {
+            crate::pmm::free_page(frame);
+        }
     }
 }
 

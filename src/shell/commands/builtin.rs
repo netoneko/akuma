@@ -710,3 +710,109 @@ impl Command for UptimeCommand {
 
 /// Static instance
 pub static UPTIME_CMD: UptimeCommand = UptimeCommand;
+
+// ============================================================================
+// Pmm Command
+// ============================================================================
+
+/// Pmm command - show physical memory manager stats and debug info
+pub struct PmmCommand;
+
+impl Command for PmmCommand {
+    fn name(&self) -> &'static str {
+        "pmm"
+    }
+    fn description(&self) -> &'static str {
+        "Show physical memory manager stats"
+    }
+    fn usage(&self) -> &'static str {
+        "pmm [stats|leaks]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            use crate::pmm;
+            
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+            
+            match args_str {
+                "leaks" => {
+                    // Show leak info (only meaningful if DEBUG_FRAME_TRACKING is enabled)
+                    if pmm::DEBUG_FRAME_TRACKING {
+                        let count = pmm::leak_count();
+                        if count == 0 {
+                            let _ = stdout.write(b"No tracked frame leaks detected.\r\n").await;
+                        } else {
+                            let msg = format!("Potentially leaked frames: {}\r\n", count);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                        }
+                        
+                        // Show breakdown by source
+                        if let Some(stats) = pmm::tracking_stats() {
+                            let breakdown = format!(
+                                "Breakdown:\r\n\
+                                 \r\n\
+                                 Kernel:          {:>6}\r\n\
+                                 User Page Table: {:>6}\r\n\
+                                 User Data:       {:>6}\r\n\
+                                 ELF Loader:      {:>6}\r\n\
+                                 Unknown:         {:>6}\r\n\
+                                 \r\n\
+                                 Total tracked:   {:>6}\r\n",
+                                stats.kernel_count,
+                                stats.user_page_table_count,
+                                stats.user_data_count,
+                                stats.elf_loader_count,
+                                stats.unknown_count,
+                                stats.total_tracked
+                            );
+                            let _ = stdout.write(breakdown.as_bytes()).await;
+                        }
+                    } else {
+                        let _ = stdout.write(b"DEBUG_FRAME_TRACKING is disabled.\r\n").await;
+                        let _ = stdout.write(b"Enable it in src/pmm.rs to track frame allocations.\r\n").await;
+                    }
+                }
+                _ => {
+                    // Default: show basic PMM stats
+                    let (total, allocated, free) = pmm::stats();
+                    let total_mb = (total * 4) / 1024; // 4KB pages to MB
+                    let allocated_mb = (allocated * 4) / 1024;
+                    let free_mb = (free * 4) / 1024;
+                    
+                    let stats_msg = format!(
+                        "Physical Memory Manager:\r\n\
+                         \r\n\
+                                       pages       MB\r\n\
+                         Total:    {:>8}   {:>6}\r\n\
+                         Allocated:{:>8}   {:>6}\r\n\
+                         Free:     {:>8}   {:>6}\r\n",
+                        total, total_mb,
+                        allocated, allocated_mb,
+                        free, free_mb
+                    );
+                    let _ = stdout.write(stats_msg.as_bytes()).await;
+                    
+                    // Show tracking status
+                    if pmm::DEBUG_FRAME_TRACKING {
+                        let _ = stdout.write(b"\r\nFrame tracking: ENABLED\r\n").await;
+                        let _ = stdout.write(b"Use 'pmm leaks' to see allocation breakdown.\r\n").await;
+                    } else {
+                        let _ = stdout.write(b"\r\nFrame tracking: DISABLED\r\n").await;
+                    }
+                }
+            }
+            
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static PMM_CMD: PmmCommand = PmmCommand;

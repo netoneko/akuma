@@ -3,11 +3,164 @@
 //! Manages physical page allocation using a bitmap allocator.
 //! Each bit in the bitmap represents a 4KB page.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use crate::mmu::PAGE_SIZE;
+
+// ============================================================================
+// Debug Frame Tracking
+// ============================================================================
+
+/// Enable debug frame tracking (adds overhead but helps find leaks)
+/// Set to true to track all frame allocations with metadata
+pub const DEBUG_FRAME_TRACKING: bool = true;
+
+/// Allocation source for debug tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSource {
+    /// Kernel heap allocation
+    Kernel,
+    /// User page table
+    UserPageTable,
+    /// User data page (mmap/brk)
+    UserData,
+    /// ELF loader (code/data segments)
+    ElfLoader,
+    /// Unknown/unspecified
+    Unknown,
+}
+
+/// Information about a tracked frame allocation
+#[derive(Debug, Clone)]
+pub struct FrameInfo {
+    /// Source of the allocation
+    pub source: FrameSource,
+    /// Process ID (0 for kernel)
+    pub pid: u32,
+}
+
+/// Debug tracker for frame allocations
+struct FrameTracker {
+    /// Map of physical address to allocation info
+    allocations: BTreeMap<usize, FrameInfo>,
+    /// Count of allocations by source
+    kernel_count: usize,
+    user_page_table_count: usize,
+    user_data_count: usize,
+    elf_loader_count: usize,
+    unknown_count: usize,
+}
+
+impl FrameTracker {
+    const fn new() -> Self {
+        Self {
+            allocations: BTreeMap::new(),
+            kernel_count: 0,
+            user_page_table_count: 0,
+            user_data_count: 0,
+            elf_loader_count: 0,
+            unknown_count: 0,
+        }
+    }
+
+    fn track(&mut self, addr: usize, source: FrameSource, pid: u32) {
+        if let Some(old) = self.allocations.insert(addr, FrameInfo { source, pid }) {
+            // Double allocation detected!
+            crate::console::print(&alloc::format!(
+                "[PMM WARN] Double allocation at 0x{:x}! Old: {:?}, New: {:?}\n",
+                addr, old.source, source
+            ));
+        }
+        match source {
+            FrameSource::Kernel => self.kernel_count += 1,
+            FrameSource::UserPageTable => self.user_page_table_count += 1,
+            FrameSource::UserData => self.user_data_count += 1,
+            FrameSource::ElfLoader => self.elf_loader_count += 1,
+            FrameSource::Unknown => self.unknown_count += 1,
+        }
+    }
+
+    fn untrack(&mut self, addr: usize) -> Option<FrameInfo> {
+        if let Some(info) = self.allocations.remove(&addr) {
+            match info.source {
+                FrameSource::Kernel => self.kernel_count = self.kernel_count.saturating_sub(1),
+                FrameSource::UserPageTable => self.user_page_table_count = self.user_page_table_count.saturating_sub(1),
+                FrameSource::UserData => self.user_data_count = self.user_data_count.saturating_sub(1),
+                FrameSource::ElfLoader => self.elf_loader_count = self.elf_loader_count.saturating_sub(1),
+                FrameSource::Unknown => self.unknown_count = self.unknown_count.saturating_sub(1),
+            }
+            Some(info)
+        } else {
+            crate::console::print(&alloc::format!(
+                "[PMM WARN] Freeing untracked frame at 0x{:x}\n", addr
+            ));
+            None
+        }
+    }
+    
+    fn leak_count(&self) -> usize {
+        self.allocations.len()
+    }
+    
+    fn stats(&self) -> FrameTrackingStats {
+        FrameTrackingStats {
+            total_tracked: self.allocations.len(),
+            kernel_count: self.kernel_count,
+            user_page_table_count: self.user_page_table_count,
+            user_data_count: self.user_data_count,
+            elf_loader_count: self.elf_loader_count,
+            unknown_count: self.unknown_count,
+        }
+    }
+}
+
+/// Statistics from frame tracking
+#[derive(Debug, Clone)]
+pub struct FrameTrackingStats {
+    pub total_tracked: usize,
+    pub kernel_count: usize,
+    pub user_page_table_count: usize,
+    pub user_data_count: usize,
+    pub elf_loader_count: usize,
+    pub unknown_count: usize,
+}
+
+static FRAME_TRACKER: Spinlock<FrameTracker> = Spinlock::new(FrameTracker::new());
+
+/// Track a frame allocation (only if DEBUG_FRAME_TRACKING is enabled)
+pub fn track_frame(frame: PhysFrame, source: FrameSource, pid: u32) {
+    if DEBUG_FRAME_TRACKING {
+        FRAME_TRACKER.lock().track(frame.addr, source, pid);
+    }
+}
+
+/// Untrack a frame (only if DEBUG_FRAME_TRACKING is enabled)
+pub fn untrack_frame(frame: PhysFrame) {
+    if DEBUG_FRAME_TRACKING {
+        FRAME_TRACKER.lock().untrack(frame.addr);
+    }
+}
+
+/// Get frame tracking statistics
+pub fn tracking_stats() -> Option<FrameTrackingStats> {
+    if DEBUG_FRAME_TRACKING {
+        Some(FRAME_TRACKER.lock().stats())
+    } else {
+        None
+    }
+}
+
+/// Get number of potentially leaked frames (only meaningful if DEBUG_FRAME_TRACKING is enabled)
+pub fn leak_count() -> usize {
+    if DEBUG_FRAME_TRACKING {
+        FRAME_TRACKER.lock().leak_count()
+    } else {
+        0
+    }
+}
 
 /// Physical page frame
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
