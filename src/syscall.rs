@@ -4,7 +4,6 @@
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
 use alloc::format;
-use alloc::vec;
 
 use crate::console;
 

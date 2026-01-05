@@ -183,7 +183,6 @@ pub fn flush_tlb_page(va: usize) {
 // User Address Space Management
 // ============================================================================
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -622,7 +621,7 @@ pub mod user_flags {
 /// for cleanup when the process exits.
 ///
 /// SAFETY: Caller must ensure VA and PA are page-aligned and valid.
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> {
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
     let mut allocated_tables = Vec::new();
 
     // Get current TTBR0
@@ -681,7 +680,7 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     );
 
     allocated_tables
-}
+}}
 
 /// Get or create a page table entry, returning the next level table physical address
 /// and optionally the newly allocated frame (if one was created).
@@ -691,7 +690,7 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
 ///
 /// Returns: (physical_address, Option<PhysFrame>) where the frame is Some if a new
 /// page table was allocated (caller should track it for cleanup).
-unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) {
+unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
     let entry = table_ptr.add(idx).read_volatile();
 
     if entry & flags::VALID != 0 {
@@ -708,7 +707,7 @@ unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option
             (0, None)
         }
     }
-}
+}}
 
 // ============================================================================
 // Kernel Memory Protection

@@ -14,7 +14,6 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
-use spinning_top::Spinlock;
 
 use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
 use embedded_io_async::{ErrorType, Read, Write};
@@ -82,7 +81,7 @@ const COMPRESS_ALGO: &str = "none";
 pub fn init_host_key() {
     // Generate a temporary key synchronously for backward compatibility
     // The proper key loading with filesystem persistence is done async
-    let mut guard = keys::get_host_key();
+    let guard = keys::get_host_key();
     if guard.is_none() {
         let mut rng = SimpleRng::new();
         let mut key_bytes = [0u8; SECRET_KEY_LENGTH];

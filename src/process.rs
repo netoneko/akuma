@@ -2,7 +2,6 @@
 //!
 //! Manages user processes including creation, execution, and termination.
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};

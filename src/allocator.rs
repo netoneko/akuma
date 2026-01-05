@@ -253,7 +253,7 @@ unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
 // Talc-based allocator (original implementation)
 // ============================================================================
 
-unsafe fn talc_alloc(layout: Layout) -> *mut u8 {
+unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
     with_irqs_disabled(|| {
         let result = TALC
             .lock()
@@ -283,15 +283,15 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 {
 
         result
     })
-}
+}}
 
-unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) {
+unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
     with_irqs_disabled(|| {
         TALC.lock()
             .free(core::ptr::NonNull::new_unchecked(ptr), layout);
         ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
     })
-}
+}}
 
 unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     unsafe {
