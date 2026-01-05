@@ -347,7 +347,7 @@ pub struct UserTrapFrame {
     pub x5: u64,
     pub x6: u64,
     pub x7: u64,
-    pub x8: u64,   // Syscall number
+    pub x8: u64, // Syscall number
     pub x9: u64,
     pub x10: u64,
     pub x11: u64,
@@ -371,7 +371,7 @@ pub struct UserTrapFrame {
     pub x29: u64,
     pub x30: u64,
     pub sp_el0: u64,
-    pub elr_el1: u64,  // User PC
+    pub elr_el1: u64, // User PC
     pub spsr_el1: u64,
     pub _padding: u64,
 }
@@ -387,7 +387,7 @@ mod esr {
 pub fn init() {
     // Initialize exception stack before enabling exceptions
     init_exception_stack();
-    
+
     unsafe {
         let vbar = &exception_vector_table as *const _ as u64;
 
@@ -419,7 +419,9 @@ extern "C" fn rust_default_exception_handler() {
     let ec = (esr >> 26) & 0x3F;
     crate::console::print(&alloc::format!(
         "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
-        ec, elr, spsr
+        ec,
+        elr,
+        spsr
     ));
 }
 
@@ -460,12 +462,18 @@ extern "C" fn rust_sync_el1_handler() {
 
     crate::console::print(&alloc::format!(
         "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
-        ec, iss, elr, far, spsr
+        ec,
+        iss,
+        elr,
+        far,
+        spsr
     ));
 
     // Halt on kernel exceptions - they indicate bugs
     loop {
-        unsafe { core::arch::asm!("wfe"); }
+        unsafe {
+            core::arch::asm!("wfe");
+        }
     }
 }
 
@@ -481,7 +489,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
     let ec = (esr >> 26) & 0x3F; // Exception Class
     let iss = esr & 0x1FFFFFF; // Instruction Specific Syndrome
-    
 
     match ec {
         esr::EC_SVC64 => {
@@ -496,10 +503,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x4,
                 frame_ref.x5,
             ];
-            
+
             // Handle syscall
             let ret = crate::syscall::handle_syscall(syscall_num, &args);
-            
+
             // Check if process exited - if so, return to kernel
             if let Some(proc) = crate::process::current_process() {
                 if proc.exited {
@@ -507,7 +514,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     crate::process::return_to_kernel(proc.exit_code);
                 }
             }
-            
+
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
@@ -518,7 +525,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
             crate::console::print(&alloc::format!(
                 "[Fault] Data abort from EL0 at FAR={:#x}, ISS={:#x}\n",
-                far, iss
+                far,
+                iss
             ));
             // Terminate process
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
@@ -531,14 +539,16 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
             crate::console::print(&alloc::format!(
                 "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
-                far, iss
+                far,
+                iss
             ));
             crate::process::return_to_kernel(-11) // never returns
         }
         _ => {
             crate::console::print(&alloc::format!(
                 "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n",
-                ec, iss
+                ec,
+                iss
             ));
             crate::process::return_to_kernel(-1) // never returns
         }

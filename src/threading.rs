@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 
 // Use the shared IRQ guard from the irq module
-use crate::irq::with_irqs_disabled;
 use crate::config;
+use crate::irq::with_irqs_disabled;
 
 /// Default timeout for cooperative threads in microseconds (5 seconds)
 pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
@@ -190,27 +190,35 @@ pub struct StackInfo {
 impl StackInfo {
     /// Create empty/unallocated stack info
     pub const fn empty() -> Self {
-        Self { base: 0, size: 0, top: 0 }
+        Self {
+            base: 0,
+            size: 0,
+            top: 0,
+        }
     }
-    
+
     /// Create new stack info
     pub fn new(base: usize, size: usize) -> Self {
-        Self { base, size, top: base + size }
+        Self {
+            base,
+            size,
+            top: base + size,
+        }
     }
-    
+
     /// Check if this stack overlaps with another
     pub fn overlaps(&self, other: &StackInfo) -> bool {
         if self.base == 0 || other.base == 0 {
-            return false;  // Unallocated stacks don't overlap
+            return false; // Unallocated stacks don't overlap
         }
         self.base < other.top && other.base < self.top
     }
-    
+
     /// Check if an address is within this stack
     pub fn contains(&self, addr: usize) -> bool {
         self.base != 0 && addr >= self.base && addr < self.top
     }
-    
+
     /// Check if this stack is allocated
     pub fn is_allocated(&self) -> bool {
         self.base != 0
@@ -258,7 +266,7 @@ impl ThreadPool {
     }
 
     /// Initialize the pool - allocate stacks with sizes based on thread role
-    /// 
+    ///
     /// Thread 0: Boot stack (1MB, fixed location)
     /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each, 2MB total)
     /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each, 1.5MB total)
@@ -267,8 +275,8 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
         // Boot stack info (fixed location from boot.rs)
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
-            0x41F00000,  // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
-            config::KERNEL_STACK_SIZE
+            0x41F00000, // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
+            config::KERNEL_STACK_SIZE,
         );
 
         // Threads 1 to RESERVED_THREADS-1: System threads with large stacks (256KB)
@@ -285,22 +293,22 @@ impl ThreadPool {
 
         self.initialized = true;
     }
-    
+
     /// Allocate a stack for a specific slot
     fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) {
         let stack_vec: Vec<u8> = alloc::vec![0u8; size];
         let stack_box = stack_vec.into_boxed_slice();
         let stack_ptr = Box::into_raw(stack_box) as *mut u8;
         let stack_info = StackInfo::new(stack_ptr as usize, size);
-        
+
         // Initialize canary at bottom of stack
         if config::ENABLE_STACK_CANARIES {
             init_stack_canary(stack_info.base);
         }
-        
+
         self.stacks[slot_idx] = stack_info;
     }
-    
+
     /// Reallocate stack for a slot with new size (only if slot is Free)
     fn reallocate_stack(&mut self, slot_idx: usize, new_size: usize) -> Result<(), &'static str> {
         if slot_idx == 0 {
@@ -312,9 +320,9 @@ impl ThreadPool {
         if self.slots[slot_idx].state != ThreadState::Free {
             return Err("Can only reallocate stack for free slot");
         }
-        
+
         let old_stack = &self.stacks[slot_idx];
-        
+
         // Free old stack if allocated
         if old_stack.is_allocated() {
             unsafe {
@@ -323,10 +331,10 @@ impl ThreadPool {
                 let _ = Box::from_raw(slice as *mut [u8]);
             }
         }
-        
+
         // Allocate new stack
         self.allocate_stack_for_slot(slot_idx, new_size);
-        
+
         // Check for overlaps with other stacks
         let new_stack = &self.stacks[slot_idx];
         for i in 0..config::MAX_THREADS {
@@ -335,7 +343,7 @@ impl ThreadPool {
                 return Err("New stack overlaps with existing stack");
             }
         }
-        
+
         Ok(())
     }
 
@@ -347,7 +355,7 @@ impl ThreadPool {
     ) -> Result<usize, &'static str> {
         self.spawn_with_stack_size(entry, config::DEFAULT_THREAD_STACK_SIZE, cooperative)
     }
-    
+
     /// Spawn a new thread with extern "C" entry function and custom stack size
     pub fn spawn_with_stack_size(
         &mut self,
@@ -366,7 +374,7 @@ impl ThreadPool {
                 if self.stacks[i].size != stack_size {
                     self.reallocate_stack(i, stack_size)?;
                 }
-                
+
                 // Setup the thread
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
@@ -417,13 +425,13 @@ impl ThreadPool {
         cooperative: bool,
     ) -> Result<usize, &'static str> {
         self.spawn_closure_with_stack_size(
-            trampoline_fn, 
-            closure_ptr, 
+            trampoline_fn,
+            closure_ptr,
             config::DEFAULT_THREAD_STACK_SIZE,
-            cooperative
+            cooperative,
         )
     }
-    
+
     /// Spawn a new thread with a boxed closure and custom stack size
     pub fn spawn_closure_with_stack_size(
         &mut self,
@@ -443,7 +451,7 @@ impl ThreadPool {
                 if self.stacks[i].size != stack_size {
                     self.reallocate_stack(i, stack_size)?;
                 }
-                
+
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
@@ -482,9 +490,9 @@ impl ThreadPool {
 
         Err("No free thread slots")
     }
-    
+
     /// Spawn a thread for user processes (only in user thread range)
-    /// 
+    ///
     /// Only searches slots RESERVED_THREADS..MAX_THREADS.
     /// Uses USER_THREAD_STACK_SIZE (64KB).
     pub fn spawn_user_closure(
@@ -537,7 +545,8 @@ impl ThreadPool {
 
     /// Reclaim a terminated thread slot (just mark as Free)
     pub fn reclaim(&mut self, idx: usize) {
-        if idx > 0 && idx < config::MAX_THREADS && self.slots[idx].state == ThreadState::Terminated {
+        if idx > 0 && idx < config::MAX_THREADS && self.slots[idx].state == ThreadState::Terminated
+        {
             self.slots[idx].state = ThreadState::Free;
             // Re-initialize canary for reuse
             if config::ENABLE_STACK_CANARIES && self.stacks[idx].is_allocated() {
@@ -666,13 +675,13 @@ fn init_stack_canary(stack_base: usize) {
 /// Check if stack canary is intact
 fn check_stack_canary(stack_base: usize) -> bool {
     if stack_base == 0 {
-        return true;  // Boot stack or unallocated
+        return true; // Boot stack or unallocated
     }
     unsafe {
         let ptr = stack_base as *const u64;
         for i in 0..config::CANARY_WORDS {
             if ptr.add(i).read_volatile() != config::STACK_CANARY {
-                return false;  // Corrupted!
+                return false; // Corrupted!
             }
         }
     }
@@ -756,7 +765,7 @@ where
 }
 
 /// Spawn a thread with a Rust closure and custom stack size
-/// 
+///
 /// # Example
 /// ```
 /// // Spawn with 256KB stack for async networking
@@ -764,7 +773,11 @@ where
 ///     run_async_main();
 /// }, config::ASYNC_THREAD_STACK_SIZE, false)?;
 /// ```
-pub fn spawn_fn_with_stack<F>(f: F, stack_size: usize, cooperative: bool) -> Result<usize, &'static str>
+pub fn spawn_fn_with_stack<F>(
+    f: F,
+    stack_size: usize,
+    cooperative: bool,
+) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
@@ -870,7 +883,7 @@ pub fn max_threads() -> usize {
 // ============================================================================
 
 /// Spawn a thread specifically for user processes
-/// 
+///
 /// Only spawns in slots RESERVED_THREADS..MAX_THREADS (user thread range).
 /// Returns the thread ID or error if no user thread slots are available.
 pub fn spawn_user_thread_fn<F>(f: F) -> Result<usize, &'static str>
@@ -900,7 +913,7 @@ where
 }
 
 /// Count available user thread slots
-/// 
+///
 /// Returns the number of free slots in the user thread range (RESERVED_THREADS..MAX_THREADS).
 pub fn user_threads_available() -> usize {
     with_irqs_disabled(|| {
@@ -916,7 +929,7 @@ pub fn user_threads_available() -> usize {
 }
 
 /// Count active user threads
-/// 
+///
 /// Returns the number of non-free slots in the user thread range.
 pub fn user_threads_active() -> usize {
     with_irqs_disabled(|| {
@@ -941,7 +954,7 @@ pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
     with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut overlaps = Vec::new();
-        
+
         for i in 0..config::MAX_THREADS {
             for j in (i + 1)..config::MAX_THREADS {
                 if pool.stacks[i].overlaps(&pool.stacks[j]) {
@@ -968,8 +981,10 @@ pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
 /// Validate current stack pointer is within bounds
 pub fn validate_current_sp() -> bool {
     let sp: usize;
-    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
-    
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp);
+    }
+
     with_irqs_disabled(|| {
         let pool = POOL.lock();
         let current = pool.current_idx;
@@ -983,11 +998,11 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
     if !config::ENABLE_STACK_CANARIES {
         return Vec::new();
     }
-    
+
     with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut bad = Vec::new();
-        
+
         // Skip boot thread (index 0) - it uses fixed boot stack
         for i in 1..config::MAX_THREADS {
             let stack = &pool.stacks[i];
@@ -1037,23 +1052,23 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
     with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut threads = Vec::new();
-        
+
         for i in 0..config::MAX_THREADS {
             let slot = &pool.slots[i];
             let stack = &pool.stacks[i];
-            
+
             // Skip free slots
             if slot.state == ThreadState::Free {
                 continue;
             }
-            
+
             let state_str = match slot.state {
                 ThreadState::Free => "free",
                 ThreadState::Ready => "ready",
                 ThreadState::Running => "running",
                 ThreadState::Terminated => "zombie",
             };
-            
+
             // Estimate stack usage from saved SP in context
             let stack_used = if stack.is_allocated() && slot.context.sp != 0 {
                 // SP points to current stack position (grows down)
@@ -1062,28 +1077,28 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 if sp >= stack.base && sp <= stack.top {
                     stack.top.saturating_sub(sp)
                 } else {
-                    0  // SP outside stack bounds
+                    0 // SP outside stack bounds
                 }
             } else {
                 0
             };
-            
+
             // Check canary status
             let canary_ok = if i == 0 || !stack.is_allocated() {
-                true  // Boot stack or unallocated
+                true // Boot stack or unallocated
             } else if config::ENABLE_STACK_CANARIES {
                 check_stack_canary(stack.base)
             } else {
-                true  // Canaries disabled
+                true // Canaries disabled
             };
-            
+
             // Thread name based on index and state
             let name = match i {
                 0 => "boot/async",
                 _ if slot.cooperative => "cooperative",
                 _ => "preemptive",
             };
-            
+
             threads.push(KernelThreadInfo {
                 tid: i,
                 state: state_str,
@@ -1095,7 +1110,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 name,
             });
         }
-        
+
         threads
     })
 }

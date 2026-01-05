@@ -48,9 +48,7 @@ impl Command for RhaiCommand {
 
             // Check filesystem is initialized
             if !crate::fs::is_initialized() {
-                let _ = stdout
-                    .write(b"Error: Filesystem not initialized\r\n")
-                    .await;
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
                 return Ok(());
             }
 
@@ -83,4 +81,3 @@ impl Command for RhaiCommand {
 
 /// Static instance
 pub static RHAI_CMD: RhaiCommand = RhaiCommand;
-

@@ -535,7 +535,9 @@ impl Command for MvCommand {
 
             // Check if it's a directory (try to list it)
             if async_fs::list_dir(&source_path).await.is_ok() {
-                let _ = stdout.write(b"Error: Moving directories is not supported\r\n").await;
+                let _ = stdout
+                    .write(b"Error: Moving directories is not supported\r\n")
+                    .await;
                 return Ok(());
             }
 

@@ -16,20 +16,20 @@ use crate::mmu::UserAddressSpace;
 use crate::pmm::PhysFrame;
 
 /// Fixed address for process info page (read-only from userspace)
-/// 
+///
 /// This page is mapped read-only for the user process but the kernel
 /// writes to it before entering userspace. The kernel can read from
 /// this address during syscalls to identify which process is calling.
-/// 
+///
 /// WARNING: This struct currently uses only ~8 bytes but we reserve 1KB (1024 bytes).
 /// If ProcessInfo grows beyond 1KB, it will overflow into unmapped memory!
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
 /// Process info structure shared between kernel and userspace
-/// 
+///
 /// The kernel writes this, userspace reads it (read-only mapping).
 /// Kernel reads it during syscalls to prevent PID spoofing.
-/// 
+///
 /// WARNING: Must not exceed 1024 bytes! Currently uses ~8 bytes.
 /// Add a compile-time assertion if adding fields.
 #[repr(C)]
@@ -63,7 +63,7 @@ pub type Pid = u32;
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
 /// Wrapper for process pointer to allow Send
-/// 
+///
 /// SAFETY: Process pointers are only accessed from kernel context
 /// with proper synchronization through the Spinlock.
 #[derive(Clone, Copy)]
@@ -73,11 +73,11 @@ struct ProcessPtr(*mut Process);
 unsafe impl Send for ProcessPtr {}
 
 /// Process table: maps PID to process pointer
-/// 
+///
 /// Processes are stored here when created and removed when they exit.
 /// Syscall handlers use read_current_pid() + lookup_process() to find
 /// the calling process.
-static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, ProcessPtr>> = 
+static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, ProcessPtr>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a process in the table
@@ -91,7 +91,7 @@ fn unregister_process(pid: Pid) {
 }
 
 /// Read the current process PID from the process info page
-/// 
+///
 /// During a syscall, TTBR0 is still set to the user's page tables,
 /// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
 /// This prevents PID spoofing since the page is read-only for userspace.
@@ -99,15 +99,11 @@ pub fn read_current_pid() -> Option<Pid> {
     // Read from the fixed address in the current address space
     // SAFETY: If a process is running, this address is mapped and contains valid ProcessInfo
     let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
-    if pid == 0 {
-        None
-    } else {
-        Some(pid)
-    }
+    if pid == 0 { None } else { Some(pid) }
 }
 
 /// Look up a process by PID
-/// 
+///
 /// Returns a mutable reference to the process if found.
 /// SAFETY: The caller must ensure no other code is mutating the process.
 pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
@@ -116,7 +112,7 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
 }
 
 /// Get the current process (for syscall handlers)
-/// 
+///
 /// Reads PID from the process info page and looks up in process table.
 /// Returns None if no process is currently executing.
 pub fn current_process() -> Option<&'static mut Process> {
@@ -134,13 +130,14 @@ pub fn alloc_mmap(size: usize) -> usize {
             return 0;
         }
     };
-    
+
     // Use per-process memory tracking
     match proc.memory.alloc_mmap(size) {
         Some(addr) => addr,
         None => {
             console::print(&alloc::format!(
-                "[mmap] REJECT: size 0x{:x} exceeds limit\n", size
+                "[mmap] REJECT: size 0x{:x} exceeds limit\n",
+                size
             ));
             0
         }
@@ -165,12 +162,12 @@ pub struct ProcessInfo2 {
 }
 
 /// List all running processes
-/// 
+///
 /// Returns a vector of process info for display.
 pub fn list_processes() -> Vec<ProcessInfo2> {
     let table = PROCESS_TABLE.lock();
     let mut result = Vec::new();
-    
+
     for (&pid, &ProcessPtr(ptr)) in table.iter() {
         let proc = unsafe { &*ptr };
         let state = match proc.state {
@@ -186,7 +183,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
             state,
         });
     }
-    
+
     result
 }
 
@@ -237,10 +234,10 @@ pub struct UserContext {
     pub x26: u64,
     pub x27: u64,
     pub x28: u64,
-    pub x29: u64, // Frame pointer
-    pub x30: u64, // Link register
-    pub sp: u64,  // Stack pointer (SP_EL0)
-    pub pc: u64,  // Program counter (ELR_EL1)
+    pub x29: u64,  // Frame pointer
+    pub x30: u64,  // Link register
+    pub sp: u64,   // Stack pointer (SP_EL0)
+    pub pc: u64,   // Program counter (ELR_EL1)
     pub spsr: u64, // Saved program status
 }
 
@@ -308,7 +305,7 @@ impl ProcessMemory {
         // Stack is at top of first 1GB (0x3FFF0000-0x40000000 for 64KB stack)
         let mmap_start = 0x1000_0000;
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
-        
+
         Self {
             code_end,
             brk: code_end,
@@ -318,22 +315,22 @@ impl ProcessMemory {
             mmap_limit,
         }
     }
-    
+
     /// Check if an address range overlaps with stack
     pub fn overlaps_stack(&self, addr: usize, size: usize) -> bool {
         let end = addr.saturating_add(size);
         addr < self.stack_top && end > self.stack_bottom
     }
-    
+
     /// Allocate mmap region, returns None if would overlap stack
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
         let addr = self.next_mmap;
         let end = addr.checked_add(size)?;
-        
+
         if end > self.mmap_limit {
             return None; // Would get too close to stack
         }
-        
+
         self.next_mmap = end;
         Some(addr)
     }
@@ -360,13 +357,12 @@ pub struct Process {
     /// Memory regions tracking
     pub memory: ProcessMemory,
     /// Physical address of the process info page
-    /// 
+    ///
     /// This page is mapped read-only at PROCESS_INFO_ADDR for the user.
     /// The kernel writes to it (via phys_to_virt) before entering userspace.
     pub process_info_phys: usize,
-    
+
     // ========== Per-process I/O ==========
-    
     /// Process stdin buffer (set before execution)
     pub stdin_buf: Vec<u8>,
     /// Position in stdin buffer for reads
@@ -377,14 +373,12 @@ pub struct Process {
     pub exited: bool,
     /// Exit code (valid when exited=true)
     pub exit_code: i32,
-    
+
     // ========== Kernel context for return ==========
-    
     /// Saved kernel context (callee-saved registers for returning after exit)
     pub kernel_ctx: KernelContext,
-    
+
     // ========== Dynamic page table tracking ==========
-    
     /// Page table frames allocated during mmap (for cleanup on exit)
     /// These are allocated by map_user_page() and need to be freed separately
     /// from address_space.page_table_frames since they're created dynamically.
@@ -406,8 +400,8 @@ pub struct KernelContext {
     pub x26: u64,
     pub x27: u64,
     pub x28: u64,
-    pub x29: u64,  // frame pointer
-    pub x30: u64,  // return address
+    pub x29: u64, // frame pointer
+    pub x30: u64, // return address
 }
 
 impl Process {
@@ -419,32 +413,38 @@ impl Process {
             elf_loader::load_elf_with_stack(elf_data, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-        
+
         // Allocate and map the process info page (read-only for userspace)
         // The kernel will write to this page before entering userspace
-        let process_info_frame = crate::pmm::alloc_page_zeroed()
-            .ok_or(ElfError::OutOfMemory)?;
+        let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
         // Track as user data for this process
         crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
-        
+
         // Map as read-only at the fixed address
         // user_flags::RO = AP_RO_ALL, meaning read-only for both EL1 and EL0
         // But we use phys_to_virt to write, bypassing page tables
-        address_space.map_page(
-            PROCESS_INFO_ADDR, 
-            process_info_frame.addr, 
-            crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN
-        ).map_err(|_| ElfError::MappingFailed("process info page"))?;
-        
+        address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+            )
+            .map_err(|_| ElfError::MappingFailed("process info page"))?;
+
         // Track the frame so it's freed when the address space is dropped
         address_space.track_user_frame(process_info_frame);
-        
+
         // Initialize per-process memory tracking
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
-        
+
         console::print(&alloc::format!(
             "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
-            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit
+            pid,
+            brk,
+            stack_bottom,
+            stack_top,
+            memory.next_mmap,
+            memory.mmap_limit
         ));
 
         Ok(Self {
@@ -495,7 +495,7 @@ impl Process {
 
         // Reset per-process I/O state
         self.reset_io();
-        
+
         // Write process info to the physical page (before activating address space)
         // We write directly to physical memory via phys_to_virt since the page
         // is mapped read-only in the user's address space
@@ -503,7 +503,7 @@ impl Process {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
             core::ptr::write(info_ptr, ProcessInfo::new(self.pid, self.parent_pid));
         }
-        
+
         // Register this process in the table for PID-based lookup
         register_process(self.pid, self as *mut Process);
 
@@ -515,16 +515,14 @@ impl Process {
         // When user calls exit(), it sets proc.exited = true
         // and the exception handler calls return_to_kernel() to return here
         let ctx_ptr = &mut self.kernel_ctx as *mut KernelContext;
-        let exit_code = unsafe { 
-            run_user_until_exit(self.context.sp, self.context.pc, ctx_ptr) 
-        };
+        let exit_code = unsafe { run_user_until_exit(self.context.sp, self.context.pc, ctx_ptr) };
 
         // Unregister this process from the table
         unregister_process(self.pid);
-        
+
         // Deactivate user address space
         UserAddressSpace::deactivate();
-        
+
         // Free dynamically allocated page table frames (from mmap calls)
         for frame in self.dynamic_page_tables.drain(..) {
             crate::pmm::free_page(frame);
@@ -534,21 +532,23 @@ impl Process {
 
         console::print(&alloc::format!(
             "[Process] '{}' (PID {}) exited with code {}\n",
-            self.name, self.pid, exit_code
+            self.name,
+            self.pid,
+            exit_code
         ));
 
         exit_code
     }
-    
+
     // ========== Per-Process I/O Methods ==========
-    
+
     /// Set stdin data for this process
     pub fn set_stdin(&mut self, data: &[u8]) {
         self.stdin_buf.clear();
         self.stdin_buf.extend_from_slice(data);
         self.stdin_pos = 0;
     }
-    
+
     /// Read from this process's stdin
     /// Returns number of bytes read
     pub fn read_stdin(&mut self, buf: &mut [u8]) -> usize {
@@ -558,22 +558,22 @@ impl Process {
         self.stdin_pos += to_read;
         to_read
     }
-    
+
     /// Write to this process's stdout
     pub fn write_stdout(&mut self, data: &[u8]) {
         self.stdout_buf.extend_from_slice(data);
     }
-    
+
     /// Take captured stdout (transfers ownership)
     pub fn take_stdout(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.stdout_buf)
     }
-    
+
     /// Get current program break
     pub fn get_brk(&self) -> usize {
         self.brk
     }
-    
+
     /// Set program break, returns new value
     /// Will not go below initial_brk
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
@@ -583,7 +583,7 @@ impl Process {
         self.brk = (new_brk + 0xFFF) & !0xFFF; // Page-align
         self.brk
     }
-    
+
     /// Reset I/O state for execution
     pub fn reset_io(&mut self) {
         self.stdin_pos = 0;
@@ -682,10 +682,12 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         Some(proc) => &proc.kernel_ctx as *const KernelContext,
         None => {
             crate::console::print("[return_to_kernel] ERROR: no current process!\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
-    
+
     unsafe {
         // Restore all callee-saved registers from context, then return
         core::arch::asm!(
@@ -723,25 +725,27 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 ///
 /// Returns exit code in x0
 #[unsafe(naked)]
-unsafe extern "C" fn run_user_until_exit(user_sp: u64, user_pc: u64, ctx_ptr: *mut KernelContext) -> i32 {
+unsafe extern "C" fn run_user_until_exit(
+    user_sp: u64,
+    user_pc: u64,
+    ctx_ptr: *mut KernelContext,
+) -> i32 {
     core::arch::naked_asm!(
         // Save callee-saved registers to context struct (x2 = ctx_ptr)
         "mov x9, sp",
-        "str x9, [x2, #0]",      // sp at offset 0
+        "str x9, [x2, #0]", // sp at offset 0
         "stp x19, x20, [x2, #8]",
         "stp x21, x22, [x2, #24]",
         "stp x23, x24, [x2, #40]",
         "stp x25, x26, [x2, #56]",
         "stp x27, x28, [x2, #72]",
         "stp x29, x30, [x2, #88]",
-        
         // Set up user context (x0 = user_sp, x1 = user_pc)
         "msr sp_el0, x0",
         "msr elr_el1, x1",
-        "mov x9, #0",            // SPSR for EL0
+        "mov x9, #0", // SPSR for EL0
         "msr spsr_el1, x9",
         "isb",
-        
         // Clear user registers
         "mov x0, #0",
         "mov x1, #0",
@@ -762,7 +766,6 @@ unsafe extern "C" fn run_user_until_exit(user_sp: u64, user_pc: u64, ctx_ptr: *m
         "mov x16, #0",
         "mov x17, #0",
         "mov x18, #0",
-        
         // Enter user mode
         // return_to_kernel() will restore context and ret back here
         "eret",
@@ -782,12 +785,13 @@ unsafe extern "C" fn run_user_until_exit(user_sp: u64, user_pc: u64, ctx_ptr: *m
 /// Tuple of (exit_code, stdout_data), or error message
 pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
     // Read the ELF file
-    let elf_data = crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
+    let elf_data =
+        crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
 
     // Create the process
-    let mut process =
-        Process::from_elf(path, &elf_data).map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
-    
+    let mut process = Process::from_elf(path, &elf_data)
+        .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+
     // Set up stdin if provided
     if let Some(data) = stdin {
         process.set_stdin(data);
@@ -796,7 +800,7 @@ pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), 
     // Execute and capture output
     let exit_code = process.execute();
     let stdout_data = process.take_stdout();
-    
+
     Ok((exit_code, stdout_data))
 }
 
@@ -830,15 +834,15 @@ pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> 
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
     }
-    
+
     // Read the ELF file
-    let elf_data = crate::fs::read_file(path)
-        .map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
+    let elf_data =
+        crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
 
     // Create the process
     let mut process = Process::from_elf(path, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
-    
+
     // Set up stdin if provided
     if let Some(data) = stdin {
         process.set_stdin(data);
@@ -848,16 +852,16 @@ pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> 
     let thread_id = crate::threading::spawn_user_thread_fn(move || {
         // Execute the process
         process.execute();
-        
+
         // Mark thread as terminated when process exits
         crate::threading::mark_current_terminated();
-        
+
         // This loop should never be reached, but just in case
         loop {
             crate::threading::yield_now();
         }
-    }).map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
-    
+    })
+    .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
+
     Ok(thread_id)
 }
-

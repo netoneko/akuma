@@ -70,11 +70,7 @@ impl TermSize {
 
     /// Number of content rows (total - title - separator*2 - status)
     fn content_rows(&self) -> usize {
-        if self.height > 4 {
-            self.height - 4
-        } else {
-            1
-        }
+        if self.height > 4 { self.height - 4 } else { 1 }
     }
 }
 
@@ -129,10 +125,7 @@ impl EditorBuffer {
 
         match async_fs::read_to_string(&self.filepath).await {
             Ok(content) => {
-                self.lines = content
-                    .lines()
-                    .map(|s| String::from(s))
-                    .collect();
+                self.lines = content.lines().map(|s| String::from(s)).collect();
                 let line_count = self.lines.len();
                 if self.lines.is_empty() {
                     self.lines.push(String::new());
@@ -445,7 +438,7 @@ fn build_screen_buffer(editor: &Editor) -> Vec<u8> {
     buf.extend_from_slice(CLEAR_SCREEN);
     buf.extend_from_slice(CURSOR_HOME);
 
-    // Title bar (reverse video = white on black)  
+    // Title bar (reverse video = white on black)
     buf.extend_from_slice(REVERSE_VIDEO);
     let title = if editor.buffer.filepath.is_empty() {
         format!("  neko - [New File]")
@@ -500,13 +493,25 @@ fn build_screen_buffer(editor: &Editor) -> Vec<u8> {
     buf.extend_from_slice(REVERSE_VIDEO);
     let status = match editor.mode {
         EditorMode::ConfirmQuit => {
-            format!("{:width$}", "  Unsaved changes! Press Ctrl+C to quit without saving, or any other key to cancel", width = term_width)
+            format!(
+                "{:width$}",
+                "  Unsaved changes! Press Ctrl+C to quit without saving, or any other key to cancel",
+                width = term_width
+            )
         }
         EditorMode::Message => {
-            format!("{:width$}", format!("  {}", editor.message), width = term_width)
+            format!(
+                "{:width$}",
+                format!("  {}", editor.message),
+                width = term_width
+            )
         }
         EditorMode::Normal => {
-            format!("{:width$}", "  ^O Save   ^X Exit   ^C Quit without saving", width = term_width)
+            format!(
+                "{:width$}",
+                "  ^O Save   ^X Exit   ^C Quit without saving",
+                width = term_width
+            )
         }
     };
     buf.extend_from_slice(status.as_bytes());
@@ -542,16 +547,14 @@ async fn handle_input<S: Write>(
     stream: &mut S,
 ) -> Result<(), S::Error> {
     match editor.mode {
-        EditorMode::ConfirmQuit => {
-            match event {
-                InputEvent::CtrlC => {
-                    editor.running = false;
-                }
-                _ => {
-                    editor.mode = EditorMode::Normal;
-                }
+        EditorMode::ConfirmQuit => match event {
+            InputEvent::CtrlC => {
+                editor.running = false;
             }
-        }
+            _ => {
+                editor.mode = EditorMode::Normal;
+            }
+        },
         EditorMode::Message => {
             // Any input clears the message
             editor.clear_message();
@@ -691,7 +694,7 @@ pub async fn run<S: Read + Write + TermSizeProvider>(
                         // Resize signal received - just continue to trigger resize check
                         continue;
                     }
-                    
+
                     let event = match escape_state {
                         EscapeState::Normal => {
                             match byte {
@@ -699,16 +702,14 @@ pub async fn run<S: Read + Write + TermSizeProvider>(
                                     escape_state = EscapeState::Escape;
                                     InputEvent::None
                                 }
-                                0x01 => InputEvent::CtrlA,  // Ctrl+A
-                                0x03 => InputEvent::CtrlC,  // Ctrl+C
-                                0x05 => InputEvent::CtrlE,  // Ctrl+E
-                                0x0F => InputEvent::CtrlO,  // Ctrl+O
-                                0x18 => InputEvent::CtrlX,  // Ctrl+X
+                                0x01 => InputEvent::CtrlA, // Ctrl+A
+                                0x03 => InputEvent::CtrlC, // Ctrl+C
+                                0x05 => InputEvent::CtrlE, // Ctrl+E
+                                0x0F => InputEvent::CtrlO, // Ctrl+O
+                                0x18 => InputEvent::CtrlX, // Ctrl+X
                                 0x0D | 0x0A => InputEvent::Enter,
                                 0x7F | 0x08 => InputEvent::Backspace,
-                                c if c >= 0x20 && c < 0x7F => {
-                                    InputEvent::Char(c as char)
-                                }
+                                c if c >= 0x20 && c < 0x7F => InputEvent::Char(c as char),
                                 _ => InputEvent::None,
                             }
                         }
@@ -779,4 +780,3 @@ pub async fn run<S: Read + Write + TermSizeProvider>(
 
     Ok(())
 }
-

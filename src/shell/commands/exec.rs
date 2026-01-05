@@ -44,11 +44,8 @@ impl Command for ExecCommand {
             let args = trim_bytes(args);
 
             if args.is_empty() {
-                let _ = embedded_io_async::Write::write_all(
-                    stdout,
-                    b"Usage: exec <path>\r\n",
-                )
-                .await;
+                let _ =
+                    embedded_io_async::Write::write_all(stdout, b"Usage: exec <path>\r\n").await;
                 return Ok(());
             }
 
@@ -56,15 +53,12 @@ impl Command for ExecCommand {
             let path = match core::str::from_utf8(args) {
                 Ok(s) => s.trim(),
                 Err(_) => {
-                    let _ = embedded_io_async::Write::write_all(
-                        stdout,
-                        b"Error: Invalid path\r\n",
-                    )
-                    .await;
+                    let _ = embedded_io_async::Write::write_all(stdout, b"Error: Invalid path\r\n")
+                        .await;
                     return Ok(());
                 }
             };
-            
+
             // Check if user threads are available for process execution
             let available = crate::threading::user_threads_available();
             if available == 0 {
@@ -87,7 +81,7 @@ impl Command for ExecCommand {
                             let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
                         }
                     }
-                    
+
                     // Only show exit code if non-zero
                     if exit_code != 0 {
                         let _ = embedded_io_async::Write::write_all(
@@ -110,4 +104,3 @@ impl Command for ExecCommand {
         })
     }
 }
-

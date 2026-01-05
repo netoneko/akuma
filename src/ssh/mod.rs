@@ -19,4 +19,3 @@ pub mod server;
 // Re-export commonly used items
 pub use protocol::{init_host_key, init_host_key_async};
 pub use server::run;
-

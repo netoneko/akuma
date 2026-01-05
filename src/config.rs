@@ -86,4 +86,3 @@ pub const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
 /// More canary words = better detection but more wasted stack space.
 /// 8 words = 64 bytes of canary.
 pub const CANARY_WORDS: usize = 8;
-

@@ -164,7 +164,7 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
         // For simplicity, allocate pages one at a time and use the first one's address
         // This works because PMM allocates from a contiguous region
         let mut first_addr: Option<*mut u8> = None;
-        
+
         for i in 0..pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 // Track as kernel allocation (PID=0 for kernel)
@@ -182,7 +182,7 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
         }
 
         ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        
+
         // Update peak
         let new_allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
         let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);

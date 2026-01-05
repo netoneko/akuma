@@ -5,7 +5,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ed25519_dalek::{SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
 
 use super::crypto::SimpleRng;
@@ -204,7 +204,8 @@ async fn ensure_sshd_directory() {
         if let Err(e) = async_fs::create_dir(SSHD_DIR).await {
             log(&alloc::format!(
                 "[SSH Keys] Failed to create {}: {}\n",
-                SSHD_DIR, e
+                SSHD_DIR,
+                e
             ));
         }
     }
@@ -262,7 +263,10 @@ pub async fn load_or_generate_host_key() -> SigningKey {
             e
         ));
     } else {
-        log(&alloc::format!("[SSH Keys] Saved private key to {}\n", HOST_KEY_PATH));
+        log(&alloc::format!(
+            "[SSH Keys] Saved private key to {}\n",
+            HOST_KEY_PATH
+        ));
     }
 
     // Save public key in SSH format
@@ -275,19 +279,30 @@ pub async fn load_or_generate_host_key() -> SigningKey {
             e
         ));
     } else {
-        log(&alloc::format!("[SSH Keys] Saved public key to {}\n", HOST_KEY_PUB_PATH));
+        log(&alloc::format!(
+            "[SSH Keys] Saved public key to {}\n",
+            HOST_KEY_PUB_PATH
+        ));
     }
 
     // Also add to authorized_keys if it doesn't exist
     if !async_fs::exists(AUTHORIZED_KEYS_PATH).await {
-        let auth_keys_content = alloc::format!("# Authorized SSH Keys\n# Add public keys here, one per line\n{}\n", pub_key_str);
-        if let Err(e) = async_fs::write_file(AUTHORIZED_KEYS_PATH, auth_keys_content.as_bytes()).await {
+        let auth_keys_content = alloc::format!(
+            "# Authorized SSH Keys\n# Add public keys here, one per line\n{}\n",
+            pub_key_str
+        );
+        if let Err(e) =
+            async_fs::write_file(AUTHORIZED_KEYS_PATH, auth_keys_content.as_bytes()).await
+        {
             log(&alloc::format!(
                 "[SSH Keys] Failed to save authorized_keys: {}\n",
                 e
             ));
         } else {
-            log(&alloc::format!("[SSH Keys] Created {} with host public key\n", AUTHORIZED_KEYS_PATH));
+            log(&alloc::format!(
+                "[SSH Keys] Created {} with host public key\n",
+                AUTHORIZED_KEYS_PATH
+            ));
         }
     }
 
@@ -333,4 +348,3 @@ pub async fn load_authorized_keys() -> Vec<VerifyingKey> {
 fn log(msg: &str) {
     console::print(msg);
 }
-

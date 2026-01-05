@@ -27,16 +27,16 @@ pub mod fd {
 }
 
 /// Fixed address for process info page (read-only, set by kernel)
-/// 
+///
 /// The kernel maps this page read-only and writes process information
 /// before the process starts. Userspace can read but not modify.
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
 /// Process info structure shared between kernel and userspace
-/// 
+///
 /// This is mapped read-only at PROCESS_INFO_ADDR.
 /// The kernel writes it, userspace reads it.
-/// 
+///
 /// WARNING: Must match kernel's ProcessInfo struct exactly!
 /// Must not exceed 1024 bytes.
 #[repr(C)]
@@ -50,7 +50,7 @@ pub struct ProcessInfo {
 }
 
 /// Get the current process ID
-/// 
+///
 /// Reads from the kernel-provided process info page.
 #[inline]
 pub fn getpid() -> u32 {
@@ -58,7 +58,7 @@ pub fn getpid() -> u32 {
 }
 
 /// Get the parent process ID
-/// 
+///
 /// Reads from the kernel-provided process info page.
 #[inline]
 pub fn getppid() -> u32 {
@@ -153,7 +153,7 @@ pub mod mmap_flags {
 }
 
 /// Map memory pages
-/// 
+///
 /// Returns the mapped address, or usize::MAX on failure.
 #[inline(always)]
 pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32) -> usize {
@@ -177,10 +177,10 @@ pub fn munmap(addr: usize, len: usize) -> isize {
 
 /// Unmap memory pages (version that properly marks x0 as clobbered)
 /// Used by dealloc to ensure compiler saves any important values in x0
-/// 
+///
 /// CRITICAL: We use mov+svc to avoid inout on x0, which ensures the compiler
 /// knows x0 is clobbered and will save/restore any important values.
-#[inline(never)]  // Prevent inlining to ensure proper call/return semantics
+#[inline(never)] // Prevent inlining to ensure proper call/return semantics
 fn munmap_void(addr: usize, len: usize) {
     unsafe {
         let _ret: u64;
@@ -207,7 +207,7 @@ fn munmap_void(addr: usize, len: usize) {
 }
 
 /// Sleep for the specified number of seconds
-/// 
+///
 /// Yields to other threads while sleeping.
 #[inline(always)]
 pub fn sleep(seconds: u64) {
@@ -215,7 +215,7 @@ pub fn sleep(seconds: u64) {
 }
 
 /// Sleep for the specified number of milliseconds
-/// 
+///
 /// Yields to other threads while sleeping.
 #[inline(always)]
 pub fn sleep_ms(milliseconds: u64) {
@@ -244,10 +244,10 @@ pub fn eprint(s: &str) {
 pub const USE_MMAP_ALLOCATOR: bool = true;
 
 mod allocator {
-    use core::alloc::{GlobalAlloc, Layout};
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use core::ptr;
     use super::USE_MMAP_ALLOCATOR;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ptr;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     const PAGE_SIZE: usize = 4096;
     const MAP_FAILED: usize = usize::MAX;
@@ -297,18 +297,18 @@ mod allocator {
         #[inline(never)]
         unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
             use super::mmap_flags::*;
-            
+
             // Round up to page size for mmap
             let size = layout.size().max(layout.align());
             let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            
+
             let addr = super::mmap(
-                0,  // Let kernel choose address
+                0, // Let kernel choose address
                 alloc_size,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
             );
-            
+
             if addr == MAP_FAILED || addr == 0 {
                 ptr::null_mut()
             } else {
@@ -331,7 +331,11 @@ mod allocator {
         fn brk_init(&self) {
             if self.brk_head.load(Ordering::SeqCst) == 0 {
                 let initial_brk = super::brk(0);
-                if self.brk_head.compare_exchange(0, initial_brk, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                if self
+                    .brk_head
+                    .compare_exchange(0, initial_brk, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
                     let requested_end = initial_brk + 0x10000;
                     let actual_end = super::brk(requested_end);
                     self.brk_end.store(actual_end, Ordering::SeqCst);
@@ -378,7 +382,7 @@ mod allocator {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
             };
-            
+
             let new_ptr = self.brk_alloc(new_layout);
             if !new_ptr.is_null() && !ptr.is_null() {
                 let copy_size = layout.size().min(new_size);
@@ -408,38 +412,38 @@ mod allocator {
             // Extract layout fields HERE where they're correct
             let old_size = layout.size();
             let old_align = layout.align();
-            
+
             if !USE_MMAP_ALLOCATOR {
                 return self.brk_realloc(ptr, layout, new_size);
             }
-            
+
             // INLINE realloc logic - no function call to avoid ABI issues
             // (see docs/STDCHECK_DEBUG.md for why this is necessary)
-            
+
             // Use safe alignment
             let safe_align = if old_align == 0 || (old_align & (old_align - 1)) != 0 {
                 1
             } else {
                 old_align
             };
-            
+
             // Allocate new buffer
             let new_layout = match Layout::from_size_align(new_size, safe_align) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
             };
-            
+
             let new_ptr = self.mmap_alloc(new_layout);
             if new_ptr.is_null() {
                 return ptr::null_mut();
             }
-            
+
             // Copy old data
             if !ptr.is_null() && old_size > 0 {
                 let copy_size = old_size.min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
             }
-            
+
             new_ptr
         }
     }
@@ -467,19 +471,21 @@ pub fn print_hex(val: usize) {
     let mut buf = [0u8; 16];
     let mut v = val;
     let mut i = 15;
-    
+
     if v == 0 {
         print("0");
         return;
     }
-    
+
     while v > 0 {
         buf[i] = HEX_CHARS[v & 0xF];
         v >>= 4;
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
     }
-    
+
     // Safety: we only write valid ASCII hex digits
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
         print(s);
@@ -492,19 +498,21 @@ pub fn print_dec(val: usize) {
     let mut buf = [0u8; 20];
     let mut v = val;
     let mut i = 19;
-    
+
     if v == 0 {
         print("0");
         return;
     }
-    
+
     while v > 0 {
         buf[i] = DEC_CHARS[v % 10];
         v /= 10;
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
     }
-    
+
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
         print(s);
     }

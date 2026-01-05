@@ -38,8 +38,8 @@ pub fn run_all() -> bool {
     all_pass &= test_vec_remove_regression();
     all_pass &= test_rapid_push_pop();
     all_pass &= test_string_operations();
-    all_pass &= test_string_push_str_realloc();  // Userspace bug mirror test
-    all_pass &= test_string_realloc_detailed();  // Detailed realloc tracking
+    all_pass &= test_string_push_str_realloc(); // Userspace bug mirror test
+    all_pass &= test_string_realloc_detailed(); // Detailed realloc tracking
     all_pass &= test_vec_of_vecs();
     all_pass &= test_adjacent_allocations();
 
@@ -728,19 +728,32 @@ fn test_string_push_str_realloc() -> bool {
     console::print("  Step 2: String::from allocation...\n");
     let s = String::from("Hello");
     let s_ptr = s.as_ptr() as usize;
-    console::print(&format!("    String ptr: {:#x}, len: {}, cap: {}\n", s_ptr, s.len(), s.capacity()));
+    console::print(&format!(
+        "    String ptr: {:#x}, len: {}, cap: {}\n",
+        s_ptr,
+        s.len(),
+        s.capacity()
+    ));
 
     // Step 3: push_str triggers reallocation (THE BUG!)
     console::print("  Step 3: push_str (triggers realloc)...\n");
     let mut s2 = s.clone();
     let s2_ptr_before = s2.as_ptr() as usize;
-    console::print(&format!("    Before push_str: ptr={:#x}, cap={}\n", s2_ptr_before, s2.capacity()));
-    
+    console::print(&format!(
+        "    Before push_str: ptr={:#x}, cap={}\n",
+        s2_ptr_before,
+        s2.capacity()
+    ));
+
     // This is where userspace crashes - realloc corrupts the allocator head
     s2.push_str(", World!");
-    
+
     let s2_ptr_after = s2.as_ptr() as usize;
-    console::print(&format!("    After push_str: ptr={:#x}, cap={}\n", s2_ptr_after, s2.capacity()));
+    console::print(&format!(
+        "    After push_str: ptr={:#x}, cap={}\n",
+        s2_ptr_after,
+        s2.capacity()
+    ));
     console::print(&format!("    Result: \"{}\"\n", s2));
 
     // Verify data integrity
@@ -750,7 +763,10 @@ fn test_string_push_str_realloc() -> bool {
     // Check for suspicious pointer values (like 0x814000 in userspace bug)
     let ptr_suspicious = s2_ptr_after > 0x800000 && s2_ptr_after < 0x900000;
     if ptr_suspicious {
-        console::print(&format!("  WARNING: Suspicious pointer {:#x} (similar to userspace bug pattern)\n", s2_ptr_after));
+        console::print(&format!(
+            "  WARNING: Suspicious pointer {:#x} (similar to userspace bug pattern)\n",
+            s2_ptr_after
+        ));
     }
 
     drop(v);
@@ -769,27 +785,43 @@ fn test_string_realloc_detailed() -> bool {
 
     // Create with small capacity to force realloc
     let mut s = String::with_capacity(5);
-    console::print(&format!("  Initial: ptr={:#x}, len={}, cap={}\n", 
-        s.as_ptr() as usize, s.len(), s.capacity()));
+    console::print(&format!(
+        "  Initial: ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    ));
 
     // Push small string (no realloc needed)
     s.push_str("Hi");
-    console::print(&format!("  After 'Hi': ptr={:#x}, len={}, cap={}\n",
-        s.as_ptr() as usize, s.len(), s.capacity()));
+    console::print(&format!(
+        "  After 'Hi': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    ));
 
     // Push more to trigger realloc
-    s.push_str("!!!");  // Still within capacity
-    console::print(&format!("  After '!!!': ptr={:#x}, len={}, cap={}\n",
-        s.as_ptr() as usize, s.len(), s.capacity()));
+    s.push_str("!!!"); // Still within capacity
+    console::print(&format!(
+        "  After '!!!': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    ));
 
     // This should trigger realloc (capacity 5, current len 5, adding 6 more)
     let ptr_before = s.as_ptr() as usize;
     s.push_str(" World");
     let ptr_after = s.as_ptr() as usize;
-    
-    console::print(&format!("  After ' World': ptr={:#x}, len={}, cap={}\n",
-        s.as_ptr() as usize, s.len(), s.capacity()));
-    
+
+    console::print(&format!(
+        "  After ' World': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    ));
+
     let reallocated = ptr_before != ptr_after;
     console::print(&format!("  Reallocation occurred: {}\n", reallocated));
 
@@ -798,7 +830,10 @@ fn test_string_realloc_detailed() -> bool {
 
     drop(s);
 
-    console::print(&format!("  Result: {}\n", if content_ok { "PASS" } else { "FAIL" }));
+    console::print(&format!(
+        "  Result: {}\n",
+        if content_ok { "PASS" } else { "FAIL" }
+    ));
     content_ok
 }
 
@@ -916,7 +951,12 @@ fn test_mmap_single_page() -> bool {
     let mut ok = true;
     for i in 0..100 {
         if buf[i] != (i & 0xFF) as u8 {
-            console::print(&format!("  Mismatch at {}: got {}, expected {}\n", i, buf[i], i & 0xFF));
+            console::print(&format!(
+                "  Mismatch at {}: got {}, expected {}\n",
+                i,
+                buf[i],
+                i & 0xFF
+            ));
             ok = false;
             break;
         }
@@ -947,8 +987,13 @@ fn test_mmap_multi_page() -> bool {
     // Verify
     let ok = buf[0] == 0x11 && buf[4096] == 0x22 && buf[8192] == 0x33 && buf[SIZE - 1] == 0x44;
 
-    console::print(&format!("  Page boundaries: {:#x}, {:#x}, {:#x}, {:#x}\n",
-        buf[0], buf[4096], buf[8192], buf[SIZE - 1]));
+    console::print(&format!(
+        "  Page boundaries: {:#x}, {:#x}, {:#x}, {:#x}\n",
+        buf[0],
+        buf[4096],
+        buf[8192],
+        buf[SIZE - 1]
+    ));
 
     drop(buf);
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
@@ -967,12 +1012,19 @@ fn test_mmap_page_boundary_write() -> bool {
     let ptr = buf.as_ptr() as usize;
 
     // Write at critical positions
-    buf[PAGE_SIZE - 1] = 0xAA;  // Last byte of page 1
-    buf[PAGE_SIZE] = 0xBB;      // First byte of page 2
+    buf[PAGE_SIZE - 1] = 0xAA; // Last byte of page 1
+    buf[PAGE_SIZE] = 0xBB; // First byte of page 2
 
     console::print(&format!("  Ptr: {:#x}\n", ptr));
-    console::print(&format!("  buf[{}] = {:#x} (last of page 1)\n", PAGE_SIZE - 1, buf[PAGE_SIZE - 1]));
-    console::print(&format!("  buf[{}] = {:#x} (first of page 2)\n", PAGE_SIZE, buf[PAGE_SIZE]));
+    console::print(&format!(
+        "  buf[{}] = {:#x} (last of page 1)\n",
+        PAGE_SIZE - 1,
+        buf[PAGE_SIZE - 1]
+    ));
+    console::print(&format!(
+        "  buf[{}] = {:#x} (first of page 2)\n",
+        PAGE_SIZE, buf[PAGE_SIZE]
+    ));
 
     let ok = buf[PAGE_SIZE - 1] == 0xAA && buf[PAGE_SIZE] == 0xBB;
 
@@ -1014,7 +1066,11 @@ fn test_mmap_realloc_pattern() -> bool {
     // Small initial allocation
     let mut v: Vec<u64> = Vec::with_capacity(2);
     let ptr1 = v.as_ptr() as usize;
-    console::print(&format!("  Initial: ptr={:#x}, cap={}\n", ptr1, v.capacity()));
+    console::print(&format!(
+        "  Initial: ptr={:#x}, cap={}\n",
+        ptr1,
+        v.capacity()
+    ));
 
     v.push(0x1111111111111111);
     v.push(0x2222222222222222);
@@ -1024,7 +1080,11 @@ fn test_mmap_realloc_pattern() -> bool {
     v.push(0x4444444444444444);
     v.push(0x5555555555555555);
     let ptr2 = v.as_ptr() as usize;
-    console::print(&format!("  After growth: ptr={:#x}, cap={}\n", ptr2, v.capacity()));
+    console::print(&format!(
+        "  After growth: ptr={:#x}, cap={}\n",
+        ptr2,
+        v.capacity()
+    ));
 
     // Immediately use the new memory (this is where userspace fails)
     v.push(0x6666666666666666);
@@ -1037,7 +1097,10 @@ fn test_mmap_realloc_pattern() -> bool {
         && v[5] == 0x6666666666666666
         && v[6] == 0x7777777777777777;
 
-    console::print(&format!("  Data integrity: {}\n", if ok { "OK" } else { "CORRUPTED" }));
+    console::print(&format!(
+        "  Data integrity: {}\n",
+        if ok { "OK" } else { "CORRUPTED" }
+    ));
 
     drop(v);
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
@@ -1051,12 +1114,22 @@ fn test_mmap_string_growth_pattern() -> bool {
     // This is the exact pattern that crashes in userspace
     let mut s = String::from("Hello");
     let ptr1 = s.as_ptr() as usize;
-    console::print(&format!("  Initial: ptr={:#x}, len={}, cap={}\n", ptr1, s.len(), s.capacity()));
+    console::print(&format!(
+        "  Initial: ptr={:#x}, len={}, cap={}\n",
+        ptr1,
+        s.len(),
+        s.capacity()
+    ));
 
     // Trigger realloc by pushing more data
     s.push_str(", World!");
     let ptr2 = s.as_ptr() as usize;
-    console::print(&format!("  After push_str: ptr={:#x}, len={}, cap={}\n", ptr2, s.len(), s.capacity()));
+    console::print(&format!(
+        "  After push_str: ptr={:#x}, len={}, cap={}\n",
+        ptr2,
+        s.len(),
+        s.capacity()
+    ));
 
     // Critical: access the string after realloc
     let content_ok = s == "Hello, World!";
@@ -1094,7 +1167,12 @@ fn test_mmap_vec_capacity_doubling() -> bool {
         last_ptr = ptr_after;
     }
 
-    console::print(&format!("  Final: len={}, cap={}, ptr={:#x}\n", v.len(), v.capacity(), last_ptr));
+    console::print(&format!(
+        "  Final: len={}, cap={}, ptr={:#x}\n",
+        v.len(),
+        v.capacity(),
+        last_ptr
+    ));
     console::print(&format!("  Realloc count: {}\n", reallocs));
 
     // Verify all data
@@ -1139,9 +1217,7 @@ fn test_mmap_interleaved_strings() -> bool {
     console::print(&format!("    s2: \"{}\"\n", s2));
     console::print(&format!("    s3: \"{}\"\n", s3));
 
-    let ok = s1 == "AAA111even more"
-        && s2 == "BBB222more"
-        && s3 == "CCC333and more";
+    let ok = s1 == "AAA111even more" && s2 == "BBB222more" && s3 == "CCC333and more";
 
     drop(s1);
     drop(s2);
@@ -1335,7 +1411,7 @@ fn test_resize_pattern() -> bool {
         for i in 0..size {
             buffer[i] = (i & 0xFF) as u8;
         }
-        
+
         prev_size = size;
     }
 

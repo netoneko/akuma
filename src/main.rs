@@ -123,7 +123,7 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
 fn kernel_main(dtb_ptr: usize) -> ! {
     // Detect memory from DTB (must be done before heap init, so print first)
     console::print("Akuma Kernel starting...\n");
-    
+
     // =========================================================================
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
@@ -134,14 +134,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     //
     // Kernel must fit below 0x41F00000 to not corrupt stack!
     const KERNEL_BASE: usize = 0x4000_0000;
-    const STACK_BOTTOM: usize = 0x41F0_0000;  // STACK_TOP - STACK_SIZE
-    
+    const STACK_BOTTOM: usize = 0x41F0_0000; // STACK_TOP - STACK_SIZE
+
     unsafe extern "C" {
         static _kernel_phys_end: u8;
     }
     let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
     let kernel_size = kernel_end - KERNEL_BASE;
-    
+
     console::print("Kernel binary: ");
     console::print_dec(kernel_size / 1024);
     console::print(" KB (0x");
@@ -149,7 +149,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" - 0x");
     console::print_hex(kernel_end as u64);
     console::print(")\n");
-    
+
     if kernel_end >= STACK_BOTTOM {
         console::print("\n!!! FATAL: Kernel binary overlaps with boot stack !!!\n");
         console::print("Kernel end:   0x");
@@ -163,26 +163,27 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         console::print("\nHALTING.\n");
         halt();
     }
-    
+
     // Safety margin check - warn if kernel is getting close to stack
     let margin = STACK_BOTTOM - kernel_end;
-    if margin < 4 * 1024 * 1024 {  // Less than 4MB margin
+    if margin < 4 * 1024 * 1024 {
+        // Less than 4MB margin
         console::print("WARNING: Kernel is within 4MB of stack! (");
         console::print_dec(margin / 1024);
         console::print(" KB margin)\n");
     }
-    
+
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
     // Memory layout constants
     const MIN_CODE_AND_STACK: usize = 32 * 1024 * 1024; // Minimum 32MB for kernel binary + stack
-    
+
     // Memory layout:
     // - Code + Stack: max(1/8 of RAM, 32MB) - kernel binary and stack
     // - Heap: 1/2 of RAM - dynamic allocations
     // - User pages: remaining - for user processes
     // Note: See docs/MEMORY_LAYOUT.md for details on sizing constraints
-    
+
     // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
@@ -197,7 +198,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" MB at 0x");
     console::print_hex(ram_base as u64);
     console::print("\n");
-    
+
     console::print("Code+Stack: ");
     console::print_dec(code_and_stack / 1024 / 1024);
     console::print(" MB (0x");
@@ -205,7 +206,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" - 0x");
     console::print_hex(heap_start as u64);
     console::print(") [min 32MB]\n");
-    
+
     console::print("Heap:       ");
     console::print_dec(heap_size / 1024 / 1024);
     console::print(" MB (0x");
@@ -213,7 +214,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" - 0x");
     console::print_hex(user_pages_start as u64);
     console::print(") [1/2 of RAM]\n");
-    
+
     console::print("User pages: ");
     console::print_dec(user_pages_size / 1024 / 1024);
     console::print(" MB (0x");
@@ -221,7 +222,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" - 0x");
     console::print_hex((ram_base + ram_size) as u64);
     console::print(") [remaining]\n");
-    
+
     console::print("=====================\n\n");
 
     // Ensure we have enough for heap
@@ -244,7 +245,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let kernel_end = heap_start + heap_size;
     console::print("Initializing PMM...\n");
     pmm::init(ram_base, ram_size, kernel_end);
-    
+
     // Signal that PMM is ready - allocator will switch to page mode
     allocator::mark_pmm_ready();
     console::print("PMM initialized, allocator switched to page mode\n");
@@ -253,7 +254,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Initializing MMU...\n");
     mmu::init(ram_base, ram_size);
     console::print("MMU enabled with identity mapping\n");
-    
+
     // Log kernel section boundaries (for future read-only protection)
     mmu::protect_kernel_code();
 
@@ -261,7 +262,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let (total, allocated, free) = pmm::stats();
     console::print(&alloc::format!(
         "PMM stats: {} total pages, {} allocated, {} free\n",
-        total, allocated, free
+        total,
+        allocated,
+        free
     ));
 
     // Initialize GIC (Generic Interrupt Controller)
@@ -441,11 +444,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 }
 
 /// Run the async main loop
-/// 
+///
 /// This is the main entry point for async networking.
 /// Runs on thread 0 (boot thread) which has a 1MB stack (config::KERNEL_STACK_SIZE).
 /// This is sufficient for deep async call chains (SSH, HTTP, etc.).
-/// 
+///
 /// Note: Thread 0 uses the boot stack at 0x41F00000-0x42000000 which is
 /// protected by stack canaries checked periodically in this loop.
 fn run_async_main(net_init: async_net::NetworkInit) -> ! {
@@ -624,11 +627,7 @@ async fn memory_monitor() -> ! {
         let _ = write!(
             buf,
             "[Mem] Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
-            allocated_kb,
-            free_kb,
-            peak_kb,
-            heap_mb,
-            stats.allocation_count
+            allocated_kb, free_kb, peak_kb, heap_mb, stats.allocation_count
         );
         console::print(buf.as_str());
 

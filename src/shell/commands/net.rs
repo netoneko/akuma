@@ -17,7 +17,7 @@ use crate::async_fs;
 use crate::async_net;
 use crate::dns;
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
-use crate::tls::{TlsOptions, TlsStream, TLS_RECORD_SIZE};
+use crate::tls::{TLS_RECORD_SIZE, TlsOptions, TlsStream};
 
 // ============================================================================
 // Curl Options
@@ -110,12 +110,8 @@ impl Command for CurlCommand {
                     .await;
                 let _ = stdout.write(b"\r\n").await;
                 let _ = stdout.write(b"Examples:\r\n").await;
-                let _ = stdout
-                    .write(b"  curl http://10.0.2.2:8080/\r\n")
-                    .await;
-                let _ = stdout
-                    .write(b"  curl https://example.com/\r\n")
-                    .await;
+                let _ = stdout.write(b"  curl http://10.0.2.2:8080/\r\n").await;
+                let _ = stdout.write(b"  curl https://example.com/\r\n").await;
                 let _ = stdout
                     .write(b"  curl -o binary.elf http://10.0.2.2:8000/file.bin\r\n")
                     .await;
@@ -596,24 +592,19 @@ async fn http_get_raw<W: embedded_io_async::Write>(
         let mut tls_rx = [0u8; TLS_RECORD_SIZE];
         let mut tls_tx = [0u8; TLS_RECORD_SIZE];
 
-        let mut tls = match TlsStream::connect_with_options(
-            socket,
-            host,
-            &mut tls_rx,
-            &mut tls_tx,
-            tls_opts,
-        )
-        .await
-        {
-            Ok(tls) => tls,
-            Err(e) => {
-                if verbose {
-                    let msg = format!("* TLS error: {:?}\r\n", e);
-                    let _ = stdout.write(msg.as_bytes()).await;
+        let mut tls =
+            match TlsStream::connect_with_options(socket, host, &mut tls_rx, &mut tls_tx, tls_opts)
+                .await
+            {
+                Ok(tls) => tls,
+                Err(e) => {
+                    if verbose {
+                        let msg = format!("* TLS error: {:?}\r\n", e);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                    return Err("TLS handshake failed");
                 }
-                return Err("TLS handshake failed");
-            }
-        };
+            };
 
         if verbose {
             let _ = stdout.write(b"* TLS handshake complete\r\n").await;
@@ -749,5 +740,3 @@ fn parse_content_type(headers: &str) -> Option<String> {
     }
     None
 }
-
-

@@ -22,18 +22,18 @@ use hmac::Mac;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
-use crate::async_net::{TcpError, TcpStream};
-use crate::console;
-use crate::shell::{self, commands::create_default_registry};
-use crate::shell::ShellContext;
 use super::auth::{self, AuthResult};
 use super::config::SshdConfig;
-use super::keys;
 use super::crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
-    SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
-    trim_bytes, write_namelist, write_string, write_u32,
+    SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32, trim_bytes,
+    write_namelist, write_string, write_u32,
 };
+use super::keys;
+use crate::async_net::{TcpError, TcpStream};
+use crate::console;
+use crate::shell::ShellContext;
+use crate::shell::{self, commands::create_default_registry};
 
 // ============================================================================
 // SSH Constants
@@ -278,10 +278,7 @@ impl<'a> SshChannelStream<'a> {
                                 self.session.term_width = width;
                                 self.session.term_height = height;
                                 self.session.resize_pending = true;
-                                log(&format!(
-                                    "[SSH] Terminal resized: {}x{}\n",
-                                    width, height
-                                ));
+                                log(&format!("[SSH] Terminal resized: {}x{}\n", width, height));
                                 // Return true to break out of read loop and trigger re-render
                                 return Ok(true);
                             }
@@ -384,7 +381,7 @@ impl Write for SshChannelStream<'_> {
         if !self.session.channel_open {
             return Err(SshStreamError);
         }
-        
+
         // Send data in chunks to avoid packet size issues
         let mut sent = 0;
         while sent < buf.len() {
@@ -711,17 +708,23 @@ async fn run_shell_session(
                                                 if path_bytes.is_empty() {
                                                     None
                                                 } else {
-                                                    Some(core::str::from_utf8(path_bytes).unwrap_or(""))
+                                                    Some(
+                                                        core::str::from_utf8(path_bytes)
+                                                            .unwrap_or(""),
+                                                    )
                                                 }
                                             } else {
                                                 None
                                             };
-                                            
-                                            if let Err(e) = crate::editor::run(&mut channel_stream, filepath).await {
+
+                                            if let Err(e) =
+                                                crate::editor::run(&mut channel_stream, filepath)
+                                                    .await
+                                            {
                                                 let msg = format!("Editor error: {}\r\n", e);
                                                 let _ = channel_stream.write(msg.as_bytes()).await;
                                             }
-                                            
+
                                             line_buffer.clear();
                                             cursor_pos = 0;
                                             let prompt = generate_prompt(&ctx);
@@ -730,13 +733,16 @@ async fn run_shell_session(
                                         }
 
                                         // Execute command chain (handles ;, &&, |, >, >> and exit/quit)
-                                        let result = shell::execute_command_chain(trimmed, &registry, &mut ctx).await;
-                                        
+                                        let result = shell::execute_command_chain(
+                                            trimmed, &registry, &mut ctx,
+                                        )
+                                        .await;
+
                                         // Output the result
                                         if !result.output.is_empty() {
                                             let _ = channel_stream.write(&result.output).await;
                                         }
-                                        
+
                                         // Check if we should exit
                                         if result.should_exit {
                                             let _ = channel_stream.write(b"Goodbye!\r\n").await;
@@ -1043,14 +1049,11 @@ async fn handle_message(
 
         SSH_MSG_USERAUTH_REQUEST => {
             // Use the auth module for proper authentication
-            let (result, reply) = auth::handle_userauth_request(
-                payload,
-                &session.session_id,
-                &session.config,
-            ).await;
-            
+            let (result, reply) =
+                auth::handle_userauth_request(payload, &session.session_id, &session.config).await;
+
             send_packet(stream, &reply, session).await?;
-            
+
             match result {
                 AuthResult::Success => {
                     session.state = SshState::Authenticated;
@@ -1120,7 +1123,8 @@ async fn handle_message(
                             session.term_height = height;
                             log(&alloc::format!(
                                 "[SSH] Terminal size: {}x{}\n",
-                                width, height
+                                width,
+                                height
                             ));
                         }
                     }
@@ -1153,10 +1157,11 @@ async fn handle_message(
 
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
-                        
+
                         // Use unified command chain executor
-                        let result = shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
-                        
+                        let result =
+                            shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
+
                         // Send collected output
                         if !result.output.is_empty() {
                             send_channel_data(stream, session, &result.output).await?;

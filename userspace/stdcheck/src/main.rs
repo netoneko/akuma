@@ -76,7 +76,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     print("\n=== stdcheck: All tests complete ===\n");
-    
+
     if failed == 0 {
         print("Result: ALL PASSED\n");
         exit(0);
@@ -89,45 +89,71 @@ pub extern "C" fn _start() -> ! {
 #[inline(never)]
 fn test_vec() -> bool {
     use alloc::format;
-    
+
     print("\n  Creating Vec...\n");
     let mut v: Vec<i32> = Vec::new();
-    print(&format!("  After new: len={}, cap={}, ptr={:p}\n", v.len(), v.capacity(), v.as_ptr()));
-    
+    print(&format!(
+        "  After new: len={}, cap={}, ptr={:p}\n",
+        v.len(),
+        v.capacity(),
+        v.as_ptr()
+    ));
+
     print("  Pushing 1...\n");
     v.push(1);
-    print(&format!("  After push(1): len={}, cap={}, ptr={:p}\n", v.len(), v.capacity(), v.as_ptr()));
-    
+    print(&format!(
+        "  After push(1): len={}, cap={}, ptr={:p}\n",
+        v.len(),
+        v.capacity(),
+        v.as_ptr()
+    ));
+
     print("  Pushing 2...\n");
     v.push(2);
-    print(&format!("  After push(2): len={}, cap={}\n", v.len(), v.capacity()));
-    
+    print(&format!(
+        "  After push(2): len={}, cap={}\n",
+        v.len(),
+        v.capacity()
+    ));
+
     print("  Pushing 3...\n");
     v.push(3);
-    print(&format!("  After push(3): len={}, cap={}\n", v.len(), v.capacity()));
-    
+    print(&format!(
+        "  After push(3): len={}, cap={}\n",
+        v.len(),
+        v.capacity()
+    ));
+
     // Test WITHOUT black_box
-    print(&format!("  Direct read: len={}, v[0]={}, v[2]={}\n", v.len(), v[0], v[2]));
-    
+    print(&format!(
+        "  Direct read: len={}, v[0]={}, v[2]={}\n",
+        v.len(),
+        v[0],
+        v[2]
+    ));
+
     // Store to local variables (prevent optimization)
     let len = v.len();
     let v0 = v[0];
     let v2 = v[2];
-    print(&format!("  Via locals: len={}, v0={}, v2={}\n", len, v0, v2));
-    
+    print(&format!(
+        "  Via locals: len={}, v0={}, v2={}\n",
+        len, v0, v2
+    ));
+
     // Test with volatile read
     let len_volatile = unsafe { core::ptr::read_volatile(&v.len()) };
     print(&format!("  Volatile len: {}\n", len_volatile));
-    
+
     // Test black_box on a simple value (not from Vec)
     let simple: usize = 42;
     let bb_simple = core::hint::black_box(simple);
     print(&format!("  black_box(42) = {}\n", bb_simple));
-    
+
     // Test black_box on v.len()
     let bb_len = core::hint::black_box(v.len());
     print(&format!("  black_box(v.len()) = {}\n", bb_len));
-    
+
     // Use bb_len in comparison (original test logic)
     if bb_len == 3 && v0 == 1 && v2 == 3 {
         true
@@ -152,21 +178,21 @@ fn test_string_push_str() -> bool {
     // This triggers reallocation
     let mut s = String::from("Hello");
     s.push_str(", World!");
-    
+
     // Check length (should be 13: "Hello, World!")
     let len = s.len();
     if len != 13 {
         libakuma::write(1, b"FAIL: len != 13\n");
         return false;
     }
-    
+
     // Verify content - access bytes directly without creating new allocations
     let bytes = s.as_bytes();
     if bytes.len() != 13 {
         libakuma::write(1, b"FAIL: bytes.len != 13\n");
         return false;
     }
-    
+
     // Check first byte
     let b0 = bytes[0];
     if b0 != b'H' {
@@ -175,7 +201,7 @@ fn test_string_push_str() -> bool {
         libakuma::write(1, b" != H\n");
         return false;
     }
-    
+
     // Check bytes[5] = ','
     let b5 = bytes[5];
     if b5 != b',' {
@@ -184,7 +210,7 @@ fn test_string_push_str() -> bool {
         libakuma::write(1, b" != ,\n");
         return false;
     }
-    
+
     // Check bytes[12] = '!'
     let b12 = bytes[12];
     if b12 != b'!' {
@@ -193,30 +219,38 @@ fn test_string_push_str() -> bool {
         libakuma::write(1, b" != !\n");
         return false;
     }
-    
+
     true
 }
 
 fn test_string_push_str_with_debug_prints() -> bool {
     use alloc::format;
-    
+
     // This triggers reallocation
     let mut s = String::from("Hello");
-    print(&format!("  Initial: len={}, cap={}\n", s.len(), s.capacity()));
-    
+    print(&format!(
+        "  Initial: len={}, cap={}\n",
+        s.len(),
+        s.capacity()
+    ));
+
     s.push_str(", World!");
-    print(&format!("  After push_str: len={}, cap={}\n", s.len(), s.capacity()));
-    
+    print(&format!(
+        "  After push_str: len={}, cap={}\n",
+        s.len(),
+        s.capacity()
+    ));
+
     // Print actual content
     print(&format!("  Content: \"{}\"\n", s));
-    
+
     // Check length (should be 13: "Hello, World!")
     let len = s.len();
     if len != 13 {
         print(&format!("  FAIL: len={} != 13\n", len));
         return false;
     }
-    
+
     // Actual string comparison
     let expected = "Hello, World!";
     if s != expected {
@@ -224,71 +258,82 @@ fn test_string_push_str_with_debug_prints() -> bool {
         return false;
     }
     print(&format!("  String comparison: OK\n"));
-    
+
     // Verify content byte-by-byte
     let bytes = s.as_bytes();
     print(&format!("  bytes.len={}\n", bytes.len()));
-    
+
     // Check first byte
     let b0 = bytes[0];
     if b0 != b'H' {
         print(&format!("  FAIL: bytes[0]={} != 'H'\n", b0 as char));
         return false;
     }
-    
+
     // Check bytes[5] = ','
     let b5 = bytes[5];
     if b5 != b',' {
         print(&format!("  FAIL: bytes[5]={} != ','\n", b5 as char));
         return false;
     }
-    
+
     // Check bytes[12] = '!'
     let b12 = bytes[12];
     if b12 != b'!' {
         print(&format!("  FAIL: bytes[12]={} != '!'\n", b12 as char));
         return false;
     }
-    
+
     true
 }
 
 fn test_box() -> bool {
     use alloc::format;
-    
+
     print("  Allocating Box<i32>...\n");
-    
+
     // Try manual allocation first to debug
     let layout = core::alloc::Layout::new::<i32>();
-    print(&format!("  Layout: size={}, align={}\n", layout.size(), layout.align()));
-    
+    print(&format!(
+        "  Layout: size={}, align={}\n",
+        layout.size(),
+        layout.align()
+    ));
+
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     print(&format!("  alloc returned: {:p}\n", ptr));
-    
+
     if ptr.is_null() {
         print("  ERROR: alloc returned null!\n");
         return false;
     }
-    
+
     // Write value
     print("  Writing 42 to allocated memory...\n");
-    unsafe { *(ptr as *mut i32) = 42; }
-    
+    unsafe {
+        *(ptr as *mut i32) = 42;
+    }
+
     // Read value
     print("  Reading value back...\n");
     let val = unsafe { *(ptr as *const i32) };
     print(&format!("  Value: {}\n", val));
-    
+
     // Deallocate
     print("  Deallocating...\n");
-    unsafe { alloc::alloc::dealloc(ptr, layout); }
-    
+    unsafe {
+        alloc::alloc::dealloc(ptr, layout);
+    }
+
     print("  Manual allocation test complete.\n");
-    
+
     // Now try Box
     print("  Creating Box<i32> with Box::new...\n");
     let b = Box::new(42i32);
-    print(&format!("  Box created at {:p}, value={}\n", &*b as *const i32, *b));
-    
+    print(&format!(
+        "  Box created at {:p}, value={}\n",
+        &*b as *const i32, *b
+    ));
+
     *b == 42
 }

@@ -25,7 +25,7 @@ pub fn run_all_tests() {
 }
 
 /// Test minimal ELF loading with elftest binary
-/// 
+///
 /// This is the simplest possible test - if the binary runs and exits with
 /// code 42, ELF loading is working correctly.
 fn test_elftest() {
@@ -43,7 +43,7 @@ fn test_elftest() {
                 Ok(mut proc) => {
                     // Execute the process
                     let exit_code = proc.execute();
-                    
+
                     // elftest exits with code 42 on success
                     if exit_code == 42 {
                         console::print("[Test] elftest PASSED (ELF loading verified)\n");
@@ -86,14 +86,17 @@ fn test_stdcheck() {
                         "[Test] Process created: PID={}, entry={:#x}\n",
                         proc.pid, proc.context.pc
                     ));
-                    
+
                     // Actually execute the process
                     let exit_code = proc.execute();
-                    
+
                     if exit_code == 0 {
                         console::print("[Test] stdcheck PASSED\n");
                     } else {
-                        console::print(&format!("[Test] stdcheck FAILED with exit code {}\n", exit_code));
+                        console::print(&format!(
+                            "[Test] stdcheck FAILED with exit code {}\n",
+                            exit_code
+                        ));
                     }
                 }
                 Err(e) => {
@@ -144,10 +147,7 @@ fn test_echo2() {
             }
         }
         Err(_) => {
-            console::print(&format!(
-                "[Test] {} not found, skipping test\n",
-                ECHO2_PATH
-            ));
+            console::print(&format!("[Test] {} not found, skipping test\n", ECHO2_PATH));
             console::print("[Test] To run this test, copy the echo2 binary to /bin/echo2\n");
         }
     }

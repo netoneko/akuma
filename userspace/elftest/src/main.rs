@@ -17,8 +17,7 @@ use libakuma::{exit, print};
 pub extern "C" fn _start() -> ! {
     // If we reach here, ELF loading worked!
     print("ELF OK\n");
-    
+
     // Exit with a specific code to verify
     exit(42);
 }
-

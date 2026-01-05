@@ -15,9 +15,9 @@ use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
 use embassy_time::Duration;
 
+use super::protocol;
 use crate::async_net::TcpStream;
 use crate::console;
-use super::protocol;
 
 // ============================================================================
 // Constants
@@ -142,7 +142,7 @@ pub async fn run(stack: Stack<'static>) {
 
     // Initialize shared host key from filesystem
     protocol::init_host_key_async().await;
-    
+
     // Ensure default config exists
     super::config::ensure_default_config().await;
 

@@ -130,7 +130,10 @@ disable_key_verification = false
             e
         ));
     } else {
-        log(&alloc::format!("[SSH Config] Created default config at {}\n", CONFIG_PATH));
+        log(&alloc::format!(
+            "[SSH Config] Created default config at {}\n",
+            CONFIG_PATH
+        ));
     }
 }
 
@@ -141,5 +144,3 @@ disable_key_verification = false
 fn log(msg: &str) {
     console::print(msg);
 }
-
-

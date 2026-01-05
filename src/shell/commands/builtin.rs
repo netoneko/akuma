@@ -467,12 +467,12 @@ impl Command for PsCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             use crate::process;
-            
+
             // Header
             let _ = stdout.write(b"  PID  PPID  STATE     NAME\r\n").await;
-            
+
             let procs = process::list_processes();
-            
+
             if procs.is_empty() {
                 let _ = stdout.write(b"(no processes running)\r\n").await;
             } else {
@@ -484,7 +484,7 @@ impl Command for PsCommand {
                     let _ = stdout.write(line.as_bytes()).await;
                 }
             }
-            
+
             Ok(())
         })
     }
@@ -520,12 +520,12 @@ impl Command for KthreadsCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             use crate::threading;
-            
+
             // Header
             let _ = stdout.write(b"  TID  STATE     STACK_BASE  STACK_SIZE  STACK_USED  CANARY  TYPE         NAME\r\n").await;
-            
+
             let threads = threading::list_kernel_threads();
-            
+
             if threads.is_empty() {
                 let _ = stdout.write(b"(no kernel threads)\r\n").await;
             } else {
@@ -538,10 +538,14 @@ impl Command for KthreadsCommand {
                     } else {
                         0
                     };
-                    
+
                     let canary_str = if t.canary_ok { "OK" } else { "FAIL" };
-                    let type_str = if t.cooperative { "cooperative" } else { "preemptive" };
-                    
+                    let type_str = if t.cooperative {
+                        "cooperative"
+                    } else {
+                        "preemptive"
+                    };
+
                     let line = format!(
                         "{:>4}  {:<8}  0x{:08x}  {:>6} KB   {:>4} KB {:>2}%  {:<6}  {:<11}  {}\r\n",
                         t.tid,
@@ -557,7 +561,7 @@ impl Command for KthreadsCommand {
                     let _ = stdout.write(line.as_bytes()).await;
                 }
             }
-            
+
             // Summary
             let (ready, running, terminated) = threading::thread_stats();
             let total = ready + running + terminated;
@@ -566,7 +570,7 @@ impl Command for KthreadsCommand {
                 total, ready, running, terminated
             );
             let _ = stdout.write(summary.as_bytes()).await;
-            
+
             Ok(())
         })
     }
@@ -638,20 +642,20 @@ impl Command for CdCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
-            
+
             // Default to root if no argument
             let target = if args_str.is_empty() {
                 String::from("/")
             } else {
                 ctx.resolve_path(args_str)
             };
-            
+
             // Check if the directory exists
             if !crate::fs::is_initialized() {
                 let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
                 return Ok(());
             }
-            
+
             // Try to list the directory to verify it exists and is a directory
             match crate::async_fs::list_dir(&target).await {
                 Ok(_) => {
@@ -663,7 +667,7 @@ impl Command for CdCommand {
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
-            
+
             Ok(())
         })
     }
@@ -700,7 +704,7 @@ impl Command for UptimeCommand {
             let hours = uptime_sec / 3600;
             let mins = (uptime_sec % 3600) / 60;
             let secs = uptime_sec % 60;
-            
+
             let msg = format!("up {}:{:02}:{:02}\r\n", hours, mins, secs);
             let _ = stdout.write(msg.as_bytes()).await;
             Ok(())
@@ -738,9 +742,9 @@ impl Command for PmmCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             use crate::pmm;
-            
+
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
-            
+
             match args_str {
                 "leaks" => {
                     // Show leak info (only meaningful if DEBUG_FRAME_TRACKING is enabled)
@@ -752,7 +756,7 @@ impl Command for PmmCommand {
                             let msg = format!("Potentially leaked frames: {}\r\n", count);
                             let _ = stdout.write(msg.as_bytes()).await;
                         }
-                        
+
                         // Show breakdown by source
                         if let Some(stats) = pmm::tracking_stats() {
                             let breakdown = format!(
@@ -782,7 +786,9 @@ impl Command for PmmCommand {
                         }
                     } else {
                         let _ = stdout.write(b"DEBUG_FRAME_TRACKING is disabled.\r\n").await;
-                        let _ = stdout.write(b"Enable it in src/pmm.rs to track frame allocations.\r\n").await;
+                        let _ = stdout
+                            .write(b"Enable it in src/pmm.rs to track frame allocations.\r\n")
+                            .await;
                     }
                 }
                 _ => {
@@ -791,7 +797,7 @@ impl Command for PmmCommand {
                     let total_mb = (total * 4) / 1024; // 4KB pages to MB
                     let allocated_mb = (allocated * 4) / 1024;
                     let free_mb = (free * 4) / 1024;
-                    
+
                     let stats_msg = format!(
                         "Physical Memory Manager:\r\n\
                          \r\n\
@@ -799,22 +805,22 @@ impl Command for PmmCommand {
                          Total:      {:>5}      {:>3}\r\n\
                          Allocated:  {:>5}      {:>3}\r\n\
                          Free:       {:>5}      {:>3}\r\n",
-                        total, total_mb,
-                        allocated, allocated_mb,
-                        free, free_mb
+                        total, total_mb, allocated, allocated_mb, free, free_mb
                     );
                     let _ = stdout.write(stats_msg.as_bytes()).await;
-                    
+
                     // Show tracking status
                     if pmm::DEBUG_FRAME_TRACKING {
                         let _ = stdout.write(b"\r\nFrame tracking: ENABLED\r\n").await;
-                        let _ = stdout.write(b"Use 'pmm leaks' to see allocation breakdown.\r\n").await;
+                        let _ = stdout
+                            .write(b"Use 'pmm leaks' to see allocation breakdown.\r\n")
+                            .await;
                     } else {
                         let _ = stdout.write(b"\r\nFrame tracking: DISABLED\r\n").await;
                     }
                 }
             }
-            
+
             Ok(())
         })
     }

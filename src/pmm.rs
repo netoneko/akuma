@@ -76,7 +76,9 @@ impl FrameTracker {
             // Double allocation detected!
             crate::console::print(&alloc::format!(
                 "[PMM WARN] Double allocation at 0x{:x}! Old: {:?}, New: {:?}\n",
-                addr, old.source, source
+                addr,
+                old.source,
+                source
             ));
         }
         match source {
@@ -93,25 +95,32 @@ impl FrameTracker {
         if let Some(info) = self.allocations.remove(&addr) {
             match info.source {
                 FrameSource::Kernel => self.kernel_count = self.kernel_count.saturating_sub(1),
-                FrameSource::UserPageTable => self.user_page_table_count = self.user_page_table_count.saturating_sub(1),
-                FrameSource::UserData => self.user_data_count = self.user_data_count.saturating_sub(1),
-                FrameSource::ElfLoader => self.elf_loader_count = self.elf_loader_count.saturating_sub(1),
+                FrameSource::UserPageTable => {
+                    self.user_page_table_count = self.user_page_table_count.saturating_sub(1)
+                }
+                FrameSource::UserData => {
+                    self.user_data_count = self.user_data_count.saturating_sub(1)
+                }
+                FrameSource::ElfLoader => {
+                    self.elf_loader_count = self.elf_loader_count.saturating_sub(1)
+                }
                 FrameSource::Unknown => self.unknown_count = self.unknown_count.saturating_sub(1),
             }
             self.total_untracked += 1;
             Some(info)
         } else {
             crate::console::print(&alloc::format!(
-                "[PMM WARN] Freeing untracked frame at 0x{:x}\n", addr
+                "[PMM WARN] Freeing untracked frame at 0x{:x}\n",
+                addr
             ));
             None
         }
     }
-    
+
     fn leak_count(&self) -> usize {
         self.allocations.len()
     }
-    
+
     fn stats(&self) -> FrameTrackingStats {
         FrameTrackingStats {
             current_tracked: self.allocations.len(),
@@ -435,7 +444,7 @@ pub fn free_page(frame: PhysFrame) {
     // If we free first then untrack, another CPU could reallocate the same
     // frame and track it before we untrack, causing us to remove their tracking.
     untrack_frame(frame);
-    
+
     let mut pmm = PMM.lock();
     pmm.free_page(frame);
     ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
@@ -459,14 +468,14 @@ pub fn stats() -> (usize, usize, usize) {
 /// Allocate a zeroed page
 pub fn alloc_page_zeroed() -> Option<PhysFrame> {
     use crate::mmu::phys_to_virt;
-    
+
     let frame = alloc_page()?;
     unsafe {
         // Use phys_to_virt to get a valid kernel VA for the physical address
         // This ensures the write works regardless of current TTBR0 state
         let virt_addr = phys_to_virt(frame.addr);
         core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
-        
+
         // Clean data cache for entire page to ensure zeros are visible through
         // other VA mappings (e.g., user VA vs kernel identity mapping)
         // ARM64 cache line is typically 64 bytes
@@ -480,7 +489,7 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
             );
             addr += CACHE_LINE_SIZE;
         }
-        core::arch::asm!("dsb ish");  // Data synchronization barrier
+        core::arch::asm!("dsb ish"); // Data synchronization barrier
     }
     Some(frame)
 }
@@ -488,14 +497,14 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
 /// Allocate zeroed contiguous pages
 pub fn alloc_pages_zeroed(count: usize) -> Option<PhysFrame> {
     use crate::mmu::phys_to_virt;
-    
+
     let frame = alloc_pages(count)?;
     let total_size = PAGE_SIZE * count;
     unsafe {
         // Use phys_to_virt to get a valid kernel VA for the physical address
         let virt_addr = phys_to_virt(frame.addr);
         core::ptr::write_bytes(virt_addr, 0, total_size);
-        
+
         // Clean data cache for all pages
         const CACHE_LINE_SIZE: usize = 64;
         let mut addr = virt_addr as usize;
@@ -511,4 +520,3 @@ pub fn alloc_pages_zeroed(count: usize) -> Option<PhysFrame> {
     }
     Some(frame)
 }
-

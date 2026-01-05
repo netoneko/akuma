@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use libakuma::{exit, print, getpid, sleep};
+use libakuma::{exit, getpid, print, sleep};
 
 // ============================================================================
 // Configuration
@@ -20,18 +20,18 @@ const SLEEP_SECONDS: u64 = 10;
 const TOTAL_OUTPUTS: u32 = 6;
 
 // ============================================================================
-// Implementation  
+// Implementation
 // ============================================================================
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
-    
+
     // Print startup message with PID
     print("hello: started (PID ");
     print_num(pid);
     print(")\n");
-    
+
     // Output "hello" periodically
     for i in 0..TOTAL_OUTPUTS {
         print("hello (");
@@ -39,13 +39,13 @@ pub extern "C" fn _start() -> ! {
         print("/");
         print_num(TOTAL_OUTPUTS);
         print(")\n");
-        
+
         // Don't sleep after the last output
         if i + 1 < TOTAL_OUTPUTS {
             sleep(SLEEP_SECONDS);
         }
     }
-    
+
     print("hello: done\n");
     exit(0);
 }
@@ -56,17 +56,17 @@ fn print_num(n: u32) {
         print("0");
         return;
     }
-    
+
     let mut buf = [0u8; 10];
     let mut i = 0;
     let mut num = n;
-    
+
     while num > 0 {
         buf[i] = b'0' + (num % 10) as u8;
         num /= 10;
         i += 1;
     }
-    
+
     // Reverse and print
     while i > 0 {
         i -= 1;

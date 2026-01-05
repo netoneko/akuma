@@ -332,7 +332,11 @@ async fn find_executable(name: &str) -> Option<alloc::string::String> {
 }
 
 /// Execute an external binary with stdin/stdout
-async fn execute_external(path: &str, stdin: Option<&[u8]>, stdout: &mut VecWriter) -> Result<(), ShellError> {
+async fn execute_external(
+    path: &str,
+    stdin: Option<&[u8]>,
+    stdout: &mut VecWriter,
+) -> Result<(), ShellError> {
     // Execute the binary with per-process I/O
     match crate::process::exec_with_io(path, stdin) {
         Ok((exit_code, process_output)) => {
@@ -344,7 +348,7 @@ async fn execute_external(path: &str, stdin: Option<&[u8]>, stdout: &mut VecWrit
                     let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
                 }
             }
-            
+
             // Only show exit code if non-zero
             if exit_code != 0 {
                 let msg = format!("[exit code: {}]\r\n", exit_code);
@@ -362,7 +366,11 @@ async fn execute_external(path: &str, stdin: Option<&[u8]>, stdout: &mut VecWrit
 
 /// Execute a pipeline of commands
 /// Returns the final output or an error with a message
-async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry, ctx: &mut ShellContext) -> PipelineResult {
+async fn execute_pipeline_internal(
+    stages: &[&[u8]],
+    registry: &CommandRegistry,
+    ctx: &mut ShellContext,
+) -> PipelineResult {
     if stages.is_empty() {
         return PipelineResult::Output(Vec::new());
     }
@@ -393,7 +401,10 @@ async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry,
                 }
                 Err(ShellError::ExecutionFailed(msg)) => {
                     let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
-                    return PipelineResult::Error(ShellError::ExecutionFailed(msg), Some(error_msg));
+                    return PipelineResult::Error(
+                        ShellError::ExecutionFailed(msg),
+                        Some(error_msg),
+                    );
                 }
                 Err(e) => {
                     return PipelineResult::Error(e, None);
@@ -440,7 +451,11 @@ async fn execute_pipeline_internal(stages: &[&[u8]], registry: &CommandRegistry,
 
 /// Execute a pipeline of commands (public API)
 /// Returns the final output or an error
-pub async fn execute_pipeline(stages: &[&[u8]], registry: &CommandRegistry, ctx: &mut ShellContext) -> Result<Vec<u8>, ShellError> {
+pub async fn execute_pipeline(
+    stages: &[&[u8]],
+    registry: &CommandRegistry,
+    ctx: &mut ShellContext,
+) -> Result<Vec<u8>, ShellError> {
     match execute_pipeline_internal(stages, registry, ctx).await {
         PipelineResult::Output(output) => Ok(output),
         PipelineResult::Error(e, _) => Err(e),
@@ -542,7 +557,11 @@ pub struct ChainExecutionResult {
 /// - `&&` operator: Only execute next command if previous succeeded
 /// - Output redirection (>, >>)
 /// - Pipeline execution (|)
-pub async fn execute_command_chain(line: &[u8], registry: &CommandRegistry, ctx: &mut ShellContext) -> ChainExecutionResult {
+pub async fn execute_command_chain(
+    line: &[u8],
+    registry: &CommandRegistry,
+    ctx: &mut ShellContext,
+) -> ChainExecutionResult {
     let chain = parse_command_chain(line);
     let mut collected_output = Vec::new();
     let mut last_success = true;
@@ -600,7 +619,8 @@ pub async fn execute_command_chain(line: &[u8], registry: &CommandRegistry, ctx:
                         let path = core::str::from_utf8(target).unwrap_or("");
                         match crate::async_fs::append_file(path, &output).await {
                             Ok(()) => {
-                                let msg = format!("Appended {} bytes to {}\r\n", output.len(), path);
+                                let msg =
+                                    format!("Appended {} bytes to {}\r\n", output.len(), path);
                                 collected_output.extend_from_slice(msg.as_bytes());
                             }
                             Err(e) => {
@@ -688,4 +708,3 @@ mod tests {
         assert_eq!(stages[2], b"head");
     }
 }
-

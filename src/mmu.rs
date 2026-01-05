@@ -106,14 +106,14 @@ pub fn init(_ram_base: usize, _ram_size: usize) {
     // MMU is already enabled by boot code
     // TTBR1 has kernel mapping (0xFFFF_0000_4000_0000 -> 0x4000_0000)
     // TTBR0 has identity mapping (will be replaced per-process)
-    
+
     MMU_INITIALIZED.store(true, Ordering::Release);
 }
 
 // =============================================================================
 // Physical/Virtual Address Translation
 // =============================================================================
-// 
+//
 // These functions provide explicit translation between physical and virtual
 // addresses. Currently the kernel uses identity mapping (VA == PA), but having
 // these functions:
@@ -122,7 +122,7 @@ pub fn init(_ram_base: usize, _ram_size: usize) {
 // 3. Ensures correct behavior regardless of active TTBR0 page tables
 
 /// Convert a physical address to a kernel-accessible virtual address
-/// 
+///
 /// For identity-mapped memory regions, this returns the same address.
 /// This should be used whenever dereferencing a physical address returned
 /// by PMM or stored in page table entries.
@@ -147,12 +147,7 @@ pub fn virt_to_phys(vaddr: usize) -> usize {
 /// Invalidate all TLB entries
 pub fn flush_tlb_all() {
     unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1",
-            "dsb ish",
-            "isb"
-        );
+        core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
     }
 }
 
@@ -281,14 +276,14 @@ impl UserAddressSpace {
             user_frames: Vec::new(),
             asid,
         };
-        
+
         // Add kernel identity mapping (device + RAM)
         // This mirrors the boot page tables so kernel can run while TTBR0 is active
         addr_space.add_kernel_mappings().ok()?;
 
         Some(addr_space)
     }
-    
+
     /// Add kernel identity mappings to this address space
     ///
     /// Maps kernel RAM (0x40000000+) and device memory as 1GB blocks.
@@ -299,13 +294,13 @@ impl UserAddressSpace {
         // L1[0] = 0x00000000-0x3FFFFFFF (user code space - NOT mapped as block)
         // L1[1] = 0x40000000-0x7FFFFFFF (kernel RAM - 1GB block)
         // L1[2] = 0x80000000-0xBFFFFFFF (more RAM - 1GB block)
-        
+
         // Allocate L1 table for low 512GB region
-        let l1_frame = pmm::alloc_page_zeroed()
-            .ok_or("Failed to allocate L1 table for kernel mapping")?;
+        let l1_frame =
+            pmm::alloc_page_zeroed().ok_or("Failed to allocate L1 table for kernel mapping")?;
         pmm::track_frame(l1_frame, pmm::FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l1_frame);
-        
+
         // Set L0[0] to point to L1
         // Use phys_to_virt to get a kernel VA for the physical page table address
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
@@ -313,59 +308,63 @@ impl UserAddressSpace {
             let l1_entry = (l1_frame.addr as u64) | flags::VALID | flags::TABLE;
             core::ptr::write_volatile(l0_ptr, l1_entry);
         }
-        
+
         // Set up L1 entries
         let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
-        
+
         // L1[0]: Leave unmapped (or map for device access at 2MB granularity later)
         // User code at 0x400000 will be mapped with 4KB pages via map_page()
         // Device memory (GIC, UART at 0x08-0x09 million) needs separate handling
-        
+
         // For now, set up L2 table for first 1GB to allow both device access and user code
-        let l2_frame = pmm::alloc_page_zeroed()
-            .ok_or("Failed to allocate L2 table")?;
+        let l2_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate L2 table")?;
         pmm::track_frame(l2_frame, pmm::FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l2_frame);
-        
+
         unsafe {
             // L1[0] -> L2 table (for fine-grained mapping of first 1GB)
             let l2_entry = (l2_frame.addr as u64) | flags::VALID | flags::TABLE;
             core::ptr::write_volatile(l1_ptr.add(0), l2_entry);
         }
-        
+
         // Map device memory regions as 2MB blocks in L2
         // Each L2 entry covers 2MB (0x200000)
         // GIC at 0x08000000 = L2 index 64
         // UART at 0x09000000 = L2 index 72
         let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
-        let device_block_flags = flags::VALID | flags::BLOCK | flags::AF 
+        let device_block_flags = flags::VALID
+            | flags::BLOCK
+            | flags::AF
             | attr_index(MAIR_DEVICE_NGNRNE)
-            | flags::PXN | flags::UXN | flags::SH_OUTER;
-            
+            | flags::PXN
+            | flags::UXN
+            | flags::SH_OUTER;
+
         // Map 0x08000000-0x09FFFFFF (GIC, UART, etc) as device memory (2MB blocks)
-        for i in 64..80 {  // Covers 0x08000000 - 0x09FFFFFF (32MB)
-            let pa = (i as u64) * 0x200000;  // 2MB * index
+        for i in 64..80 {
+            // Covers 0x08000000 - 0x09FFFFFF (32MB)
+            let pa = (i as u64) * 0x200000; // 2MB * index
             unsafe {
                 core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags);
             }
         }
-        
+
         // L1[1]: Kernel RAM 0x40000000-0x7FFFFFFF (1GB block)
         // Flags: valid, block, AF, normal memory, kernel-only access
         let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
             | attr_index(MAIR_NORMAL_WB)
             | flags::UXN  // No user execute
             | flags::SH_INNER
-            | (0b00 << 6);  // AP[2:1] = 00 = RW at EL1, no access at EL0
+            | (0b00 << 6); // AP[2:1] = 00 = RW at EL1, no access at EL0
         unsafe {
             core::ptr::write_volatile(l1_ptr.add(1), 0x4000_0000u64 | kernel_ram_flags);
         }
-        
+
         // L1[2]: More RAM 0x80000000-0xBFFFFFFF (1GB block)
         unsafe {
             core::ptr::write_volatile(l1_ptr.add(2), 0x8000_0000u64 | kernel_ram_flags);
         }
-        
+
         Ok(())
     }
 
@@ -482,9 +481,9 @@ impl UserAddressSpace {
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)
     }
-    
+
     /// Track a frame that was allocated externally (e.g., by sys_mmap)
-    /// 
+    ///
     /// This adds the frame to user_frames so it will be freed when the
     /// address space is dropped.
     pub fn track_user_frame(&mut self, frame: PhysFrame) {
@@ -559,7 +558,7 @@ impl UserAddressSpace {
             );
             addr
         };
-        
+
         unsafe {
             // Restore boot page tables
             core::arch::asm!(
@@ -617,28 +616,28 @@ pub mod user_flags {
 }
 
 /// Map a user page in the current TTBR0 address space
-/// 
+///
 /// This is used by sys_mmap to add pages to the running process.
 /// Returns a Vec of newly allocated page table frames that the caller should track
 /// for cleanup when the process exits.
-/// 
+///
 /// SAFETY: Caller must ensure VA and PA are page-aligned and valid.
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> {
     let mut allocated_tables = Vec::new();
-    
+
     // Get current TTBR0
     let ttbr0: u64;
     core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
-    
+
     // Extract L0 table address (bits 47:1, assuming 4KB granule)
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-    
+
     // Extract page table indices from virtual address
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
-    
+
     // Walk the page tables, creating entries as needed
     // All PA->pointer conversions go through phys_to_virt
     let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
@@ -647,19 +646,19 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
         allocated_tables.push(frame);
     }
     let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
-    
+
     let (l2_addr, l2_frame) = get_or_create_table(l1_ptr, l1_idx);
     if let Some(frame) = l2_frame {
         allocated_tables.push(frame);
     }
     let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
-    
+
     let (l3_addr, l3_frame) = get_or_create_table(l2_ptr, l2_idx);
     if let Some(frame) = l3_frame {
         allocated_tables.push(frame);
     }
     let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
-    
+
     // Create L3 entry (4KB page descriptor)
     let entry = (pa as u64)
         | flags::VALID
@@ -669,9 +668,9 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
         | attr_index(MAIR_NORMAL_WB)
         | flags::SH_INNER
         | user_flags_val;
-    
+
     l3_ptr.add(l3_idx).write_volatile(entry);
-    
+
     // Flush TLB for this VA
     core::arch::asm!(
         "dsb ishst",
@@ -680,21 +679,21 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
         "isb",
         va = in(reg) va >> 12,
     );
-    
+
     allocated_tables
 }
 
 /// Get or create a page table entry, returning the next level table physical address
 /// and optionally the newly allocated frame (if one was created).
-/// 
+///
 /// Note: The returned address is a PHYSICAL address. Callers must use phys_to_virt()
 /// before dereferencing it.
-/// 
+///
 /// Returns: (physical_address, Option<PhysFrame>) where the frame is Some if a new
 /// page table was allocated (caller should track it for cleanup).
 unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) {
     let entry = table_ptr.add(idx).read_volatile();
-    
+
     if entry & flags::VALID != 0 {
         // Entry exists, extract physical address
         ((entry & 0x0000_FFFF_FFFF_F000) as usize, None)
@@ -703,7 +702,7 @@ unsafe fn get_or_create_table(table_ptr: *mut u64, idx: usize) -> (usize, Option
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
             table_ptr.add(idx).write_volatile(new_entry);
-            (frame.addr, Some(frame))  // Return physical address and the frame
+            (frame.addr, Some(frame)) // Return physical address and the frame
         } else {
             // Allocation failed - this is bad, but return 0
             (0, None)
@@ -726,11 +725,11 @@ unsafe extern "C" {
 }
 
 /// Protect kernel code by marking it read-only
-/// 
+///
 /// This should be called after boot when the kernel is running normally.
 /// Currently uses the boot page tables which have 1GB block mappings,
 /// so we can't do fine-grained protection without switching to 4KB pages.
-/// 
+///
 /// For now, this function just logs the section boundaries.
 /// A full implementation would need to:
 /// 1. Allocate L2/L3 page tables for the kernel region
@@ -744,17 +743,24 @@ pub fn protect_kernel_code() {
     let rodata_end = unsafe { &_rodata_end as *const u8 as usize };
     let data_start = unsafe { &_data_start as *const u8 as usize };
     let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
-    
+
     crate::console::print(&alloc::format!(
         "[MMU] Kernel sections:\n  .text:   0x{:08x}-0x{:08x} ({} KB)\n  .rodata: 0x{:08x}-0x{:08x} ({} KB)\n  .data:   0x{:08x}-0x{:08x} ({} KB)\n",
-        text_start, text_end, (text_end - text_start) / 1024,
-        rodata_start, rodata_end, (rodata_end - rodata_start) / 1024,
-        data_start, kernel_end, (kernel_end - data_start) / 1024,
+        text_start,
+        text_end,
+        (text_end - text_start) / 1024,
+        rodata_start,
+        rodata_end,
+        (rodata_end - rodata_start) / 1024,
+        data_start,
+        kernel_end,
+        (kernel_end - data_start) / 1024,
     ));
-    
+
     // TODO: Implement fine-grained page table protection
     // For now, the boot stack fix (placing stack at 0x42000000) prevents
     // stack from overwriting kernel code, but the code is still writable.
-    crate::console::print("[MMU] Note: Kernel code protection not yet implemented (uses 1GB block mappings)\n");
+    crate::console::print(
+        "[MMU] Note: Kernel code protection not yet implemented (uses 1GB block mappings)\n",
+    );
 }
-

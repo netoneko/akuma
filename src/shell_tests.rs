@@ -265,7 +265,8 @@ fn test_multi_stage_pipeline() -> bool {
     log("\n[Shell Test] multi-stage pipeline\n");
 
     // Use help command which has multiple lines, then filter twice
-    let result = run_async_test(async { execute_pipeline_test(b"help | grep echo | grep text").await });
+    let result =
+        run_async_test(async { execute_pipeline_test(b"help | grep echo | grep text").await });
 
     match result {
         Ok(output) => {

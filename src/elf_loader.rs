@@ -3,11 +3,11 @@
 //! Parses and loads ELF binaries into user address space.
 //! Uses the `elf` crate for parsing.
 
-use elf::abi::{EM_AARCH64, ET_EXEC, PT_LOAD, PF_R, PF_W, PF_X};
-use elf::endian::LittleEndian;
 use elf::ElfBytes;
+use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
+use elf::endian::LittleEndian;
 
-use crate::mmu::{user_flags, UserAddressSpace, PAGE_SIZE};
+use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
 
 /// Enable debug output for ELF loading
 /// Set to false to reduce boot verbosity
@@ -85,7 +85,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
     // Track highest address for brk
     let mut brk: usize = 0;
-    
+
     // Track already-mapped pages (VA -> PA) to avoid double allocation
     let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -109,7 +109,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         if DEBUG_ELF_LOADING {
             crate::console::print(&alloc::format!(
                 "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
-                vaddr, filesz, memsz,
+                vaddr,
+                filesz,
+                memsz,
                 if flags & PF_R != 0 { "R" } else { "-" },
                 if flags & PF_W != 0 { "W" } else { "-" },
                 if flags & PF_X != 0 { "X" } else { "-" },
@@ -119,9 +121,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         // Use appropriate flags based on segment permissions
         // Note: If segment is writable, use RW_NO_EXEC to handle BSS overlaps
         let page_flags = if (flags & PF_X) != 0 {
-            user_flags::RX  // Executable segment
+            user_flags::RX // Executable segment
         } else {
-            user_flags::RW_NO_EXEC  // Data/BSS - always RW to handle overlaps
+            user_flags::RW_NO_EXEC // Data/BSS - always RW to handle overlaps
         };
 
         // Calculate number of pages needed
@@ -147,11 +149,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             };
 
             // Copy data from ELF file if this page contains file data
-            let page_start_in_segment = if page_va >= vaddr {
-                page_va - vaddr
-            } else {
-                0
-            };
+            let page_start_in_segment = if page_va >= vaddr { page_va - vaddr } else { 0 };
 
             if page_start_in_segment < filesz {
                 // Calculate how much to copy
@@ -184,7 +182,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     if DEBUG_ELF_LOADING {
         crate::console::print(&alloc::format!(
             "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
-            entry_point, brk, mapped_pages.len()
+            entry_point,
+            brk,
+            mapped_pages.len()
         ));
     }
 
@@ -236,14 +236,14 @@ pub fn load_elf_with_stack(
     // Place stack at top of first 1GB (user space), after mmap region
     // Layout: code (0x400000) < mmap (0x10000000-0x3F000000) < stack (0x3F000000-0x40000000)
     // This keeps everything in the first 1GB where we have fine-grained page table control
-    const STACK_TOP: usize = 0x4000_0000;  // Top of first 1GB
-    
+    const STACK_TOP: usize = 0x4000_0000; // Top of first 1GB
+
     // Reserve space for guard page + stack
     // Guard page is at the bottom (lowest address), unmapped to cause fault on overflow
-    let total_size = stack_size + PAGE_SIZE;  // stack + 1 guard page
+    let total_size = stack_size + PAGE_SIZE; // stack + 1 guard page
     let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
-    let stack_bottom = guard_page + PAGE_SIZE;  // First usable stack page is above guard
-    
+    let stack_bottom = guard_page + PAGE_SIZE; // First usable stack page is above guard
+
     // Ensure stack is page-aligned
     let stack_bottom_aligned = stack_bottom & !(PAGE_SIZE - 1);
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -260,11 +260,15 @@ pub fn load_elf_with_stack(
     // Calculate initial SP within mapped region
     let stack_end = stack_bottom_aligned + stack_pages * PAGE_SIZE;
     let initial_sp_local = (stack_end - 16) & !0xF;
-    
+
     if DEBUG_ELF_LOADING {
         crate::console::print(&alloc::format!(
             "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), guard=0x{:x}, SP=0x{:x}\n",
-            stack_bottom_aligned, stack_end, stack_pages, guard_page, initial_sp_local
+            stack_bottom_aligned,
+            stack_end,
+            stack_pages,
+            guard_page,
+            initial_sp_local
         ));
     }
 
@@ -291,7 +295,8 @@ pub fn load_elf_with_stack(
 
     if DEBUG_ELF_LOADING {
         crate::console::print(&alloc::format!(
-            "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs
+            "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n",
+            hs
         ));
     }
 
@@ -306,5 +311,12 @@ pub fn load_elf_with_stack(
     let initial_sp = (stack_end - 16) & !0xF;
 
     // Return: entry, address_space, initial_sp, brk, stack_bottom, stack_top
-    Ok((loaded.entry_point, loaded.address_space, initial_sp, hs, stack_bottom_aligned, stack_end))
+    Ok((
+        loaded.entry_point,
+        loaded.address_space,
+        initial_sp,
+        hs,
+        stack_bottom_aligned,
+        stack_end,
+    ))
 }

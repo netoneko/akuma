@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 /// Collections compatible with std::collections
-/// 
+///
 /// Uses ahash (hardware-accelerated) with QEMU `-cpu max`.
 pub mod collections {
     pub use hashbrown::HashMap;
@@ -17,9 +17,9 @@ pub mod collections {
 /// Synchronization primitives compatible with std::sync
 #[allow(dead_code)]
 pub mod sync {
-    pub use spinning_top::Spinlock as Mutex;
-    pub use spinning_top::RwSpinlock as RwLock;
     pub use once_cell::race::OnceBox as OnceLock;
+    pub use spinning_top::RwSpinlock as RwLock;
+    pub use spinning_top::Spinlock as Mutex;
 
     /// MutexGuard type alias for compatibility with std::sync::MutexGuard
     pub type MutexGuard<'a, T> = spinning_top::guard::SpinlockGuard<'a, T>;
@@ -35,4 +35,3 @@ pub mod sync {
 pub mod lazy {
     pub use once_cell::race::OnceBox;
 }
-

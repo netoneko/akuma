@@ -31,4 +31,3 @@ pub extern "C" fn _start() -> ! {
     print("echo2: Goodbye!\n");
     exit(0);
 }
-

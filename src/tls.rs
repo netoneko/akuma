@@ -75,8 +75,14 @@ where
         read_buf: &'a mut [u8],
         write_buf: &'a mut [u8],
     ) -> Result<Self, TlsError> {
-        Self::connect_with_options(transport, server_name, read_buf, write_buf, TlsOptions::new())
-            .await
+        Self::connect_with_options(
+            transport,
+            server_name,
+            read_buf,
+            write_buf,
+            TlsOptions::new(),
+        )
+        .await
     }
 
     /// Create and handshake a new TLS connection with custom options

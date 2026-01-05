@@ -152,7 +152,9 @@ async fn handle_publickey_auth(
 
     // Load authorized keys and check if this key is authorized
     let authorized_keys = load_authorized_keys().await;
-    let is_authorized = authorized_keys.iter().any(|k| k.as_bytes() == client_key.as_bytes());
+    let is_authorized = authorized_keys
+        .iter()
+        .any(|k| k.as_bytes() == client_key.as_bytes());
 
     if !is_authorized {
         log("[SSH Auth] Key not in authorized_keys\n");
@@ -184,7 +186,7 @@ async fn handle_publickey_auth(
     };
 
     // Build the data that was signed
-    // Format: string session_id, byte SSH_MSG_USERAUTH_REQUEST, string user, 
+    // Format: string session_id, byte SSH_MSG_USERAUTH_REQUEST, string user,
     //         string service, string "publickey", boolean TRUE, string algorithm, string key
     let signed_data = build_signed_data(session_id, username, service, algorithm, key_blob);
 
@@ -195,7 +197,10 @@ async fn handle_publickey_auth(
             (AuthResult::Success, build_success_response())
         }
         Err(e) => {
-            log(&alloc::format!("[SSH Auth] Signature verification failed: {:?}\n", e));
+            log(&alloc::format!(
+                "[SSH Auth] Signature verification failed: {:?}\n",
+                e
+            ));
             (AuthResult::Failure, build_failure_response())
         }
     }
@@ -303,4 +308,3 @@ fn build_pk_ok_response(algorithm: &[u8], key_blob: &[u8]) -> Vec<u8> {
 fn log(msg: &str) {
     console::print(msg);
 }
-

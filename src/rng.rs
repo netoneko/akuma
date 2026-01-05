@@ -9,9 +9,9 @@
 //! Supports legacy VirtIO mode (used with QEMU's force-legacy=true).
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
-use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use spinning_top::Spinlock;
 
 use crate::console;
@@ -286,12 +286,16 @@ impl VirtioRngDevice {
         let queue_phys = crate::mmu::virt_to_phys(queue_mem as usize);
         let queue_pfn = queue_phys / PAGE_SIZE;
         unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32, queue_pfn as u32);
+            write_volatile(
+                (base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32,
+                queue_pfn as u32,
+            );
         }
         fence(Ordering::SeqCst);
 
         // Set DRIVER_OK to finish initialization
-        let final_status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK;
+        let final_status =
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK;
         unsafe {
             write_volatile((base_addr + VIRTIO_MMIO_STATUS) as *mut u32, final_status);
         }
@@ -502,4 +506,3 @@ pub fn fill_bytes(buf: &mut [u8]) -> Result<(), RngError> {
 fn log(msg: &str) {
     console::print(msg);
 }
-
