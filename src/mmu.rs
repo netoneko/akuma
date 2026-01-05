@@ -269,6 +269,8 @@ impl UserAddressSpace {
     pub fn new() -> Option<Self> {
         // Allocate L0 page table
         let l0_frame = pmm::alloc_page_zeroed()?;
+        // Track L0 frame (PID=0 since we don't have the process yet)
+        pmm::track_frame(l0_frame, pmm::FrameSource::UserPageTable, 0);
 
         // Allocate an ASID
         let asid = ASID_ALLOCATOR.lock().alloc()?;
@@ -301,6 +303,7 @@ impl UserAddressSpace {
         // Allocate L1 table for low 512GB region
         let l1_frame = pmm::alloc_page_zeroed()
             .ok_or("Failed to allocate L1 table for kernel mapping")?;
+        pmm::track_frame(l1_frame, pmm::FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l1_frame);
         
         // Set L0[0] to point to L1
@@ -321,6 +324,7 @@ impl UserAddressSpace {
         // For now, set up L2 table for first 1GB to allow both device access and user code
         let l2_frame = pmm::alloc_page_zeroed()
             .ok_or("Failed to allocate L2 table")?;
+        pmm::track_frame(l2_frame, pmm::FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l2_frame);
         
         unsafe {
@@ -439,6 +443,8 @@ impl UserAddressSpace {
             } else {
                 // Need to allocate a new page table
                 let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
+                // Track as page table frame (PID=0 since we don't have process context here)
+                pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
                 self.page_table_frames.push(frame);
 
                 // Create table descriptor
@@ -470,6 +476,8 @@ impl UserAddressSpace {
     /// Allocate and map a new page at the given virtual address
     pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
         let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for user page")?;
+        // Track as ELF loader allocation (PID=0 since we're loading before process is created)
+        pmm::track_frame(frame, pmm::FrameSource::ElfLoader, 0);
         self.user_frames.push(frame);
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)

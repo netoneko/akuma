@@ -13,9 +13,8 @@ use talc::{Span, Talc};
 
 /// Set to true to use page-based allocation (like userspace mmap allocator)
 /// This fixes layout-sensitive heap corruption bugs but uses more memory.
-/// WARNING: page_dealloc is currently a no-op, so this LEAKS memory!
-/// Set to false until proper deallocation is implemented.
-pub const USE_PAGE_ALLOCATOR: bool = false;
+/// Deallocation properly returns pages to PMM.
+pub const USE_PAGE_ALLOCATOR: bool = false; // DOES NOT ACTUALLY WORK
 
 const PAGE_SIZE: usize = 4096;
 
@@ -168,6 +167,8 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
         
         for i in 0..pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                // Track as kernel allocation (PID=0 for kernel)
+                crate::pmm::track_frame(frame, crate::pmm::FrameSource::Kernel, 0);
                 if i == 0 {
                     // Convert physical address to kernel virtual address
                     first_addr = Some(crate::mmu::phys_to_virt(frame.addr));
@@ -201,13 +202,22 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
     })
 }
 
-/// Deallocate pages (currently a no-op like userspace munmap)
-unsafe fn page_dealloc(_ptr: *mut u8, layout: Layout) {
-    // For now, don't actually free pages (matches userspace behavior)
-    // A full implementation would return pages to PMM
-    let size = layout.size().max(layout.align());
-    let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    ALLOCATED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+/// Deallocate pages - returns pages to PMM
+unsafe fn page_dealloc(ptr: *mut u8, layout: Layout) {
+    with_irqs_disabled(|| {
+        let size = layout.size().max(layout.align());
+        let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let pages = alloc_size / PAGE_SIZE;
+
+        // Convert virtual address back to physical and free each page
+        let phys_addr = crate::mmu::virt_to_phys(ptr as usize);
+        for i in 0..pages {
+            let frame = crate::pmm::PhysFrame::new(phys_addr + i * PAGE_SIZE);
+            crate::pmm::free_page(frame);
+        }
+
+        ALLOCATED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+    })
 }
 
 /// Realloc using page allocation
@@ -228,11 +238,11 @@ unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
             return ptr::null_mut();
         }
 
-        // Copy old data
+        // Copy old data and free old allocation
         if !ptr.is_null() {
             let copy_size = layout.size().min(new_size);
             ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-            // Skip dealloc - memory leak but avoids issues (matches userspace)
+            page_dealloc(ptr, layout);
         }
 
         new_ptr

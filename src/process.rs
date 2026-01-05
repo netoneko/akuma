@@ -424,6 +424,8 @@ impl Process {
         // The kernel will write to this page before entering userspace
         let process_info_frame = crate::pmm::alloc_page_zeroed()
             .ok_or(ElfError::OutOfMemory)?;
+        // Track as user data for this process
+        crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
         
         // Map as read-only at the fixed address
         // user_flags::RO = AP_RO_ALL, meaning read-only for both EL1 and EL0
