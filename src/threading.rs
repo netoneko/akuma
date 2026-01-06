@@ -66,9 +66,16 @@ switch_context:
     ldr x9, [x1, #96]
     mov sp, x9
     
-    // Load DAIF
+    // Load DAIF (but we'll override IRQ mask below)
     ldr x9, [x1, #104]
     msr daif, x9
+    
+    // Always enable IRQs after context switch
+    // This is necessary because context switches happen inside exception handlers
+    // (SGI handler), where DAIF.I is automatically set by the CPU.
+    // Without this, threads would inherit the masked IRQ state.
+    msr daifclr, #2
+    isb  // Ensure DAIF update takes effect
     
     // Load ELR_EL1
     ldr x9, [x1, #112]
@@ -955,6 +962,14 @@ pub fn is_thread_terminated(thread_id: usize) -> bool {
             .get(thread_id)
             .map(|s| s.state == ThreadState::Terminated || s.state == ThreadState::Free)
             .unwrap_or(true)
+    })
+}
+
+/// Get the state of a specific thread (for debugging)
+pub fn get_thread_state(thread_id: usize) -> Option<ThreadState> {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        pool.slots.get(thread_id).map(|s| s.state)
     })
 }
 

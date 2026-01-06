@@ -328,8 +328,16 @@ irq_handler:
     ldp     x6, x7, [sp], #16
     ldp     x4, x5, [sp], #16
     ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
 
+    // Ensure IRQs are enabled after returning from exception
+    // SPSR_EL1 bit 7 is the I (IRQ mask) flag - clear it
+    // Use x0 as scratch before restoring it
+    mrs     x0, spsr_el1
+    bic     x0, x0, #0x80           // Clear bit 7 (I flag)
+    msr     spsr_el1, x0
+
+    ldp     x0, x1, [sp], #16
+    
     eret
 "#
 );

@@ -81,12 +81,12 @@ fn sys_brk(new_brk: usize) -> u64 {
 /// 0 on success
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
-    let end_time = crate::timer::get_time_us().wrapping_add(total_us);
 
-    // Yield to other threads while waiting instead of busy-spinning
-    while crate::timer::get_time_us() < end_time {
-        crate::threading::yield_now();
-    }
+    // Simple busy-wait implementation
+    // We can't yield here because we're in a syscall exception handler
+    // with interrupts masked. Yielding would require SGI delivery which
+    // needs interrupts enabled.
+    crate::timer::delay_us(total_us);
 
     0 // Success
 }

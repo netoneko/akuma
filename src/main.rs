@@ -520,6 +520,17 @@ fn run_async_main(net_init: async_net::NetworkInit) -> ! {
     let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
+    // Enable IRQs for the main async loop
+    // The boot thread (thread 0) starts with all exceptions masked.
+    // We need to enable IRQs so that:
+    // 1. SGIs can be delivered for thread scheduling (yield_now)
+    // 2. Timer interrupts can fire for preemptive scheduling
+    // 3. The embassy time driver can wake up on timer interrupts
+    unsafe {
+        // Clear the IRQ mask bit (bit 1 of DAIF, which is bit 7 of the value)
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+    }
+
     loop {
         // Poll the main network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);

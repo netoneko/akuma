@@ -804,6 +804,10 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // Restore sp last
             "ldr x9, [x9, #0]",
             "mov sp, x9",
+            // Enable IRQs before returning
+            // We're returning from an exception handler context where IRQs are masked.
+            // The thread that called run_user_until_exit expects to have IRQs enabled.
+            "msr daifclr, #2",
             // Set return value and return
             "mov x0, {exit_code}",
             "ret",
@@ -1013,7 +1017,6 @@ pub fn spawn_process_with_channel(
 /// # Returns
 /// Tuple of (exit_code, stdout_data) or error message
 pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    use embassy_time::{Duration, Timer};
 
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
@@ -1025,15 +1028,23 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
             break;
         }
 
-        // Yield to other async tasks
-        Timer::after(Duration::from_millis(10)).await;
+        // Yield to kernel scheduler to let spawned thread run
+        crate::threading::yield_now();
+
+        // Small delay to avoid spinning too fast (doesn't need IRQs)
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+
+        // Clean up any terminated threads
+        crate::threading::cleanup_terminated();
     }
 
     // Collect all output
     let output = channel.read_all();
     let exit_code = channel.exit_code();
 
-    // Clean up terminated thread
+    // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok((exit_code, output))
@@ -1056,8 +1067,6 @@ pub async fn exec_streaming<W>(path: &str, stdin: Option<&[u8]>, output: &mut W)
 where
     W: embedded_io_async::Write,
 {
-    use embassy_time::{Duration, Timer};
-
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
@@ -1090,8 +1099,31 @@ where
             break;
         }
 
-        // Yield to other async tasks
-        Timer::after(Duration::from_millis(10)).await;
+        // Yield to kernel scheduler to let spawned thread run
+        crate::threading::yield_now();
+
+        // Small delay to avoid spinning too fast
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+
+        // Yield to async executor (allow other tasks to run)
+        struct YieldOnce(bool);
+        impl core::future::Future for YieldOnce {
+            type Output = ();
+            fn poll(mut self: core::pin::Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
+                if self.0 {
+                    core::task::Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    core::task::Poll::Pending
+                }
+            }
+        }
+        YieldOnce(false).await;
+
+        // Clean up any terminated threads
+        crate::threading::cleanup_terminated();
     }
 
     let exit_code = channel.exit_code();
