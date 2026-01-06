@@ -274,12 +274,19 @@ impl ThreadPool {
 
     /// Initialize the pool - allocate stacks with sizes based on thread role
     ///
-    /// Thread 0: Boot stack (1MB, fixed location)
-    /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each, 2MB total)
-    /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each, 1.5MB total)
+    /// Thread 0: Boot stack (1MB, fixed location) - cooperative for I/O protection
+    /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each) - preemptible
+    /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each) - preemptible
     pub fn init(&mut self) {
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
+        // It runs the async executor and network runner, so mark it cooperative
+        // to avoid preemption during critical I/O operations. It still gets
+        // preempted after the timeout to allow other threads to run.
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
+        self.slots[IDLE_THREAD_IDX].cooperative = true;
+        self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
+        self.slots[IDLE_THREAD_IDX].start_time_us = crate::timer::uptime_us();
+
         // Boot stack info (fixed location from boot.rs)
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             0x41F00000, // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
@@ -498,6 +505,59 @@ impl ThreadPool {
         Err("No free thread slots")
     }
 
+    /// Spawn a thread for system services (SSH sessions, etc.)
+    ///
+    /// Only searches slots 1..RESERVED_THREADS.
+    /// Uses SYSTEM_THREAD_STACK_SIZE (256KB).
+    /// System threads are preemptible (not cooperative).
+    pub fn spawn_system_closure(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+    ) -> Result<usize, &'static str> {
+        if !self.initialized {
+            return Err("Thread pool not initialized");
+        }
+
+        // Only search in system thread range (skip thread 0 = boot/async)
+        for i in 1..config::RESERVED_THREADS {
+            if self.slots[i].state == ThreadState::Free {
+                let stack = &self.stacks[i];
+                let sp = (stack.top & !0xF) as u64;
+
+                // x19 = trampoline function pointer
+                // x20 = closure data pointer
+                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
+                self.slots[i].context.x20 = closure_ptr as u64;
+                self.slots[i].context.x21 = 0;
+                self.slots[i].context.x22 = 0;
+                self.slots[i].context.x23 = 0;
+                self.slots[i].context.x24 = 0;
+                self.slots[i].context.x25 = 0;
+                self.slots[i].context.x26 = 0;
+                self.slots[i].context.x27 = 0;
+                self.slots[i].context.x28 = 0;
+                self.slots[i].context.x29 = 0;
+                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
+                self.slots[i].context.sp = sp;
+                self.slots[i].context.daif = 0;
+                self.slots[i].context.elr = 0;
+                self.slots[i].context.spsr = 0;
+
+                // System threads are preemptible (not cooperative)
+                self.slots[i].cooperative = false;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = 0;
+
+                self.slots[i].state = ThreadState::Ready;
+
+                return Ok(i);
+            }
+        }
+
+        Err("No free system thread slots")
+    }
+
     /// Spawn a thread for user processes (only in user thread range)
     ///
     /// Only searches slots RESERVED_THREADS..MAX_THREADS.
@@ -579,23 +639,37 @@ impl ThreadPool {
     }
 
     /// Select next ready thread (round-robin)
+    ///
+    /// # Preemption rules:
+    /// - `voluntary=true`: Thread yielded voluntarily (yield_now) - always switch
+    /// - `voluntary=false`: Timer-triggered preemption
+    ///   - Cooperative threads (thread 0): Only switch after timeout elapses
+    ///   - Non-cooperative threads (sessions, user processes): Always preemptible
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
         let current_idx = self.current_idx;
         let current = &self.slots[current_idx];
 
-        // Check cooperative timeout
+        // For timer-triggered preemption, check if the current thread is cooperative.
+        // Cooperative threads (like thread 0 running the async executor) get time-slice
+        // protection to avoid corruption during I/O operations.
+        // Non-cooperative threads (session threads 1-7, user threads 8+) are always
+        // immediately preemptible for true multitasking.
         if !voluntary && current.cooperative && current.state == ThreadState::Running {
             let timeout = current.timeout_us;
             if timeout > 0 && current.start_time_us > 0 {
                 let now = crate::timer::uptime_us();
                 let elapsed = now.saturating_sub(current.start_time_us);
                 if elapsed < timeout {
+                    // Cooperative thread's time-slice not yet expired
                     return None;
                 }
+                // Timeout expired - allow preemption
             } else {
+                // No timeout set - don't preempt cooperative thread
                 return None;
             }
         }
+        // Non-cooperative threads: fall through to scheduling (always preemptible)
 
         // Find next ready thread (including thread 0)
         let mut next_idx = (current_idx + 1) % config::MAX_THREADS;
@@ -886,6 +960,73 @@ pub fn max_threads() -> usize {
 }
 
 // ============================================================================
+// System Thread API (for SSH sessions, etc.)
+// ============================================================================
+
+/// Spawn a thread specifically for system services (SSH sessions, etc.)
+///
+/// Only spawns in slots 1..RESERVED_THREADS (system thread range).
+/// These threads get larger stacks (256KB) and are preemptible.
+/// Returns the thread ID or error if no system thread slots are available.
+pub fn spawn_system_thread_fn<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    // Box the closure and get a raw pointer
+    let boxed: Box<F> = Box::new(f);
+    let closure_ptr = Box::into_raw(boxed) as *mut ();
+
+    // Get the trampoline function for this specific closure type
+    let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
+
+    let result = with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_system_closure(trampoline, closure_ptr)
+    });
+
+    // If spawn failed, clean up the boxed closure
+    if result.is_err() {
+        unsafe {
+            let _ = Box::from_raw(closure_ptr as *mut F);
+        }
+    }
+
+    result
+}
+
+/// Count available system thread slots
+///
+/// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
+pub fn system_threads_available() -> usize {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut count = 0;
+        for i in 1..config::RESERVED_THREADS {
+            if pool.slots[i].state == ThreadState::Free {
+                count += 1;
+            }
+        }
+        count
+    })
+}
+
+/// Count active system threads
+///
+/// Returns the number of non-free slots in the system thread range (1..RESERVED_THREADS).
+pub fn system_threads_active() -> usize {
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let mut count = 0;
+        for i in 1..config::RESERVED_THREADS {
+            if pool.slots[i].state != ThreadState::Free {
+                count += 1;
+            }
+        }
+        count
+    })
+}
+
+// ============================================================================
 // User Process Thread API
 // ============================================================================
 
@@ -1121,11 +1262,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 true // Canaries disabled
             };
 
-            // Thread name based on index and state
+            // Thread name based on index range and state
             let name = match i {
                 0 => "boot/async",
+                1..=7 => "ssh-session", // System threads for SSH sessions
                 _ if slot.cooperative => "cooperative",
-                _ => "preemptive",
+                _ => "user-process", // User process threads (8+)
             };
 
             threads.push(KernelThreadInfo {

@@ -108,6 +108,8 @@ pub struct ProcessChannel {
     exit_code: AtomicI32,
     /// Whether the process has exited
     exited: AtomicBool,
+    /// Interrupt signal (set by Ctrl+C, checked by process)
+    interrupted: AtomicBool,
 }
 
 impl ProcessChannel {
@@ -117,6 +119,7 @@ impl ProcessChannel {
             buffer: Spinlock::new(VecDeque::new()),
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
         }
     }
 
@@ -158,6 +161,21 @@ impl ProcessChannel {
     pub fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::Acquire)
     }
+
+    /// Set the interrupt flag (called when Ctrl+C is pressed)
+    pub fn set_interrupted(&self) {
+        self.interrupted.store(true, Ordering::Release);
+    }
+
+    /// Check if the process has been interrupted
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
+    /// Clear the interrupt flag
+    pub fn clear_interrupted(&self) {
+        self.interrupted.store(false, Ordering::Release);
+    }
 }
 
 impl Default for ProcessChannel {
@@ -189,6 +207,25 @@ pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
     let thread_id = crate::threading::current_thread_id();
     get_channel(thread_id)
+}
+
+/// Check if the current process has been interrupted (Ctrl+C)
+///
+/// Called by syscall handlers to detect interrupt signal.
+/// Returns true if the process should terminate.
+pub fn is_current_interrupted() -> bool {
+    current_channel()
+        .map(|ch| ch.is_interrupted())
+        .unwrap_or(false)
+}
+
+/// Interrupt a process by thread ID
+///
+/// Used by the SSH shell to send Ctrl+C signal to a running process.
+pub fn interrupt_thread(thread_id: usize) {
+    if let Some(channel) = get_channel(thread_id) {
+        channel.set_interrupted();
+    }
 }
 
 /// Read the current process PID from the process info page
@@ -1023,8 +1060,20 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
 
     // Poll for completion
     loop {
-        // Check if process has exited
+        // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            break;
+        }
+
+        // Check if interrupted
+        if channel.is_interrupted() {
+            // Give the process a moment to handle the interrupt
+            for _ in 0..100 {
+                crate::threading::yield_now();
+                if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+                    break;
+                }
+            }
             break;
         }
 
@@ -1042,12 +1091,23 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
 
     // Collect all output
     let output = channel.read_all();
-    let exit_code = channel.exit_code();
+    let exit_code = if channel.is_interrupted() && !channel.has_exited() {
+        130 // Interrupted exit code
+    } else {
+        channel.exit_code()
+    };
 
     // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok((exit_code, output))
+}
+
+/// Get the process channel for a running process by thread ID
+///
+/// Used by the SSH shell to get a handle for interrupting a process.
+pub fn get_process_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
+    get_channel(thread_id)
 }
 
 /// Execute a binary with streaming output to an async writer

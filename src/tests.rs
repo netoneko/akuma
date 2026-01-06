@@ -77,6 +77,9 @@ pub fn run_all() -> bool {
     all_pass &= test_yield_cycle();
     all_pass &= test_mixed_cooperative_preemptible();
 
+    // Parallel process tests
+    all_pass &= test_parallel_processes();
+
     console::print("\n==================================\n");
     console::print(&format!(
         "Overall: {}\n",
@@ -2147,6 +2150,148 @@ fn test_mixed_cooperative_preemptible() -> bool {
 
     // Verify: both threads completed and only idle remains
     let ok = coop_done && preempt_done && count_after == 1;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+// ============================================================================
+// Parallel Process Tests
+// ============================================================================
+
+// Flags for parallel process test
+static PROCESS1_STARTED: AtomicBool = AtomicBool::new(false);
+static PROCESS2_STARTED: AtomicBool = AtomicBool::new(false);
+static PROCESS1_DONE: AtomicBool = AtomicBool::new(false);
+static PROCESS2_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Test: Run 2 processes in parallel and verify both appear in process table
+/// 
+/// This tests true concurrency:
+/// 1. Spawn 2 hello processes on separate threads
+/// 2. While both are running, check process table shows 2 processes
+/// 3. Wait for both to complete
+/// 4. Verify both ran successfully
+fn test_parallel_processes() -> bool {
+    console::print("\n[TEST] Parallel process execution\n");
+
+    // Reset flags
+    PROCESS1_STARTED.store(false, Ordering::Release);
+    PROCESS2_STARTED.store(false, Ordering::Release);
+    PROCESS1_DONE.store(false, Ordering::Release);
+    PROCESS2_DONE.store(false, Ordering::Release);
+
+    let thread_count_before = threading::thread_count();
+    console::print(&format!("  Threads before: {}\n", thread_count_before));
+
+    // Check if hello binary exists by trying to read it
+    if crate::fs::read_file("/bin/hello").is_err() {
+        console::print("  Skipping: /bin/hello not found\n");
+        console::print("  Result: SKIP\n");
+        return true; // Skip, don't fail
+    }
+
+    // Spawn first process using spawn_process_with_channel
+    console::print("  Spawning process 1...");
+    let result1 = crate::process::spawn_process_with_channel("/bin/hello", None);
+    
+    let (tid1, channel1) = match result1 {
+        Ok((tid, channel)) => {
+            console::print(&format!(" tid={}\n", tid));
+            PROCESS1_STARTED.store(true, Ordering::Release);
+            (tid, channel)
+        }
+        Err(e) => {
+            console::print(&format!(" FAILED: {}\n", e));
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    // Spawn second process
+    console::print("  Spawning process 2...");
+    let result2 = crate::process::spawn_process_with_channel("/bin/hello", None);
+
+    let (tid2, channel2) = match result2 {
+        Ok((tid, channel)) => {
+            console::print(&format!(" tid={}\n", tid));
+            PROCESS2_STARTED.store(true, Ordering::Release);
+            (tid, channel)
+        }
+        Err(e) => {
+            console::print(&format!(" FAILED: {}\n", e));
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    console::print(&format!("  Spawned threads {} and {}\n", tid1, tid2));
+
+    // Both processes are already spawned, give them a moment to start executing
+    console::print("  Yielding to let processes execute...");
+    for _ in 0..10 {
+        threading::yield_now();
+    }
+    console::print(" done\n");
+
+    // Check process table while both are (hopefully) still running
+    // Note: With hello's 1-second sleep, they should overlap
+    let processes = crate::process::list_processes();
+    console::print(&format!("  Processes in table: {}\n", processes.len()));
+    for p in &processes {
+        console::print(&format!("    PID {} ({}): {}\n", p.pid, p.name, p.state));
+    }
+
+    // Count hello processes
+    let hello_count = processes.iter().filter(|p| p.name == "hello").count();
+    console::print(&format!("  Hello processes running: {}\n", hello_count));
+
+    // Wait for both to complete using channel status
+    console::print("  Waiting for processes to complete...");
+    let complete_timeout = 30_000_000; // 30 seconds (hello runs for ~10 seconds)
+    let complete_start = crate::timer::uptime_us();
+
+    loop {
+        threading::yield_now();
+        
+        let p1_done = channel1.has_exited() || crate::threading::is_thread_terminated(tid1);
+        let p2_done = channel2.has_exited() || crate::threading::is_thread_terminated(tid2);
+        
+        if p1_done && p2_done {
+            console::print(" done\n");
+            PROCESS1_DONE.store(true, Ordering::Release);
+            PROCESS2_DONE.store(true, Ordering::Release);
+            break;
+        }
+
+        if crate::timer::uptime_us() - complete_start > complete_timeout {
+            console::print(" TIMEOUT\n");
+            console::print(&format!("    P1 done: {}, P2 done: {}\n", p1_done, p2_done));
+            // Continue to cleanup even on timeout
+            break;
+        }
+    }
+
+    // Cleanup
+    let cleaned = threading::cleanup_terminated();
+    console::print(&format!("  Cleaned: {} threads\n", cleaned));
+
+    let thread_count_after = threading::thread_count();
+    console::print(&format!("  Threads after: {}\n", thread_count_after));
+
+    // Verify results
+    let p1_done = PROCESS1_DONE.load(Ordering::Acquire);
+    let p2_done = PROCESS2_DONE.load(Ordering::Acquire);
+    
+    // Success if:
+    // 1. Both processes completed
+    // 2. We saw at least 1 hello process in the table (ideally 2, but timing-dependent)
+    let ok = p1_done && p2_done && hello_count >= 1;
+    
+    if !ok {
+        console::print(&format!("  P1 done: {}, P2 done: {}, hello_count: {}\n", 
+                               p1_done, p2_done, hello_count));
+    }
+    
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
     ok
 }

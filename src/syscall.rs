@@ -18,6 +18,9 @@ pub mod nr {
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
 }
 
+/// Error code for interrupted syscall
+const EINTR: u64 = (-4i64) as u64;
+
 /// File descriptor numbers
 pub mod fd {
     pub const STDIN: u64 = 0;
@@ -34,6 +37,18 @@ pub mod fd {
 /// # Returns
 /// Return value to be placed in x0
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
+    // Check for interrupt signal (Ctrl+C) before processing syscall
+    // This allows the process to be interrupted between syscalls
+    if crate::process::is_current_interrupted() {
+        // Trigger exit with interrupt code
+        if let Some(proc) = crate::process::current_process() {
+            proc.exited = true;
+            proc.exit_code = 130; // 128 + SIGINT(2) - standard interrupted exit code
+            proc.state = crate::process::ProcessState::Zombie(130);
+        }
+        return EINTR;
+    }
+
     match syscall_num {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
@@ -71,22 +86,41 @@ fn sys_brk(new_brk: usize) -> u64 {
 /// sys_nanosleep - Sleep for a specified duration
 ///
 /// Yields to other threads while waiting, allowing the system to remain
-/// responsive during long sleeps.
+/// responsive during long sleeps. Can be interrupted by Ctrl+C.
 ///
 /// # Arguments
 /// * `seconds` - Number of seconds to sleep
 /// * `nanoseconds` - Additional nanoseconds to sleep
 ///
 /// # Returns
-/// 0 on success
+/// 0 on success, EINTR if interrupted
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
+    let start = crate::timer::uptime_us();
+    let deadline = start + total_us;
 
-    // Simple busy-wait implementation
-    // We can't yield here because we're in a syscall exception handler
-    // with interrupts masked. Yielding would require SGI delivery which
-    // needs interrupts enabled.
-    crate::timer::delay_us(total_us);
+    // Sleep in small increments to allow interrupt checking
+    const CHECK_INTERVAL_US: u64 = 10_000; // Check every 10ms
+
+    while crate::timer::uptime_us() < deadline {
+        // Check for interrupt signal
+        if crate::process::is_current_interrupted() {
+            // Interrupted by Ctrl+C
+            if let Some(proc) = crate::process::current_process() {
+                proc.exited = true;
+                proc.exit_code = 130;
+                proc.state = crate::process::ProcessState::Zombie(130);
+            }
+            return EINTR;
+        }
+
+        // Sleep for a small interval or remaining time
+        let remaining = deadline.saturating_sub(crate::timer::uptime_us());
+        let sleep_time = remaining.min(CHECK_INTERVAL_US);
+        if sleep_time > 0 {
+            crate::timer::delay_us(sleep_time);
+        }
+    }
 
     0 // Success
 }
