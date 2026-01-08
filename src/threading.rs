@@ -54,6 +54,12 @@ switch_context:
     mrs x9, spsr_el1
     str x9, [x0, #120]
     
+    // Save TTBR0_EL1 (user address space)
+    // This is critical for thread safety: each thread may have different TTBR0
+    // (kernel threads use boot TTBR0, user processes use their own)
+    mrs x9, ttbr0_el1
+    str x9, [x0, #128]
+    
     // Load new context
     ldp x19, x20, [x1, #0]
     ldp x21, x22, [x1, #16]
@@ -84,6 +90,12 @@ switch_context:
     // Load SPSR_EL1
     ldr x9, [x1, #120]
     msr spsr_el1, x9
+    
+    // Load TTBR0_EL1 (user address space)
+    // Must restore before returning so the thread sees the correct address space
+    ldr x9, [x1, #128]
+    msr ttbr0_el1, x9
+    isb  // Ensure TTBR0 change takes effect before any memory access
     
     // Return
     ret
@@ -150,6 +162,7 @@ pub struct Context {
     pub daif: u64, // Interrupt mask
     pub elr: u64,  // Exception Link Register
     pub spsr: u64, // Saved Program Status Register
+    pub ttbr0: u64, // User address space (TTBR0_EL1)
 }
 
 impl Context {
@@ -171,6 +184,7 @@ impl Context {
             daif: 0,
             elr: 0,
             spsr: 0,
+            ttbr0: 0, // Will be initialized to boot TTBR0
         }
     }
 }
@@ -278,6 +292,12 @@ impl ThreadPool {
     /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each) - preemptible
     /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each) - preemptible
     pub fn init(&mut self) {
+        // Get the current (boot) TTBR0 value - all kernel threads will use this
+        let boot_ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0);
+        }
+
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         // It runs the async executor and network runner, so mark it cooperative
         // to avoid preemption during critical I/O operations. It still gets
@@ -286,6 +306,7 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
         self.slots[IDLE_THREAD_IDX].start_time_us = crate::timer::uptime_us();
+        self.slots[IDLE_THREAD_IDX].context.ttbr0 = boot_ttbr0;
 
         // Boot stack info (fixed location from boot.rs)
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
@@ -395,6 +416,10 @@ impl ThreadPool {
                 let entry_addr = entry as *const () as u64;
 
                 // Write context fields individually
+                // Get current (boot) TTBR0 for kernel threads
+                let boot_ttbr0: u64;
+                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
                 self.slots[i].context.x19 = entry_addr;
                 self.slots[i].context.x20 = 0;
                 self.slots[i].context.x21 = 0;
@@ -411,6 +436,7 @@ impl ThreadPool {
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
                 self.slots[i].context.spsr = 0;
+                self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 // Write slot metadata
                 self.slots[i].cooperative = cooperative;
@@ -469,6 +495,10 @@ impl ThreadPool {
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
+                // Get current (boot) TTBR0 for kernel threads
+                let boot_ttbr0: u64;
+                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
                 self.slots[i].context.x19 = trampoline_fn as *const () as u64;
@@ -487,6 +517,7 @@ impl ThreadPool {
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
                 self.slots[i].context.spsr = 0;
+                self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 self.slots[i].cooperative = cooperative;
                 self.slots[i].start_time_us = 0;
@@ -525,6 +556,10 @@ impl ThreadPool {
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
+                // Get current (boot) TTBR0 for kernel threads
+                let boot_ttbr0: u64;
+                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
                 self.slots[i].context.x19 = trampoline_fn as *const () as u64;
@@ -543,6 +578,7 @@ impl ThreadPool {
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
                 self.slots[i].context.spsr = 0;
+                self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 // System threads are preemptible (not cooperative)
                 self.slots[i].cooperative = false;
@@ -577,6 +613,11 @@ impl ThreadPool {
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
+                // Get current (boot) TTBR0 for kernel threads
+                // Note: User process threads will update TTBR0 when entering user mode
+                let boot_ttbr0: u64;
+                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
                 self.slots[i].context.x19 = trampoline_fn as *const () as u64;
@@ -595,6 +636,7 @@ impl ThreadPool {
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
                 self.slots[i].context.spsr = 0;
+                self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 // User threads are preemptible (not cooperative)
                 self.slots[i].cooperative = false;

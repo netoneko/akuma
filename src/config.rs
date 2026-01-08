@@ -86,3 +86,13 @@ pub const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
 /// More canary words = better detection but more wasted stack space.
 /// 8 words = 64 bytes of canary.
 pub const CANARY_WORDS: usize = 8;
+
+/// Fail tests if test binaries are missing
+///
+/// When enabled, tests that require binaries (elftest, stdcheck, hello, echo2)
+/// will fail if the binary is not found on the filesystem.
+/// When disabled, these tests will be skipped with a warning.
+///
+/// Set to `true` for CI/production builds where all binaries should be present.
+/// Set to `false` for development when testing without a fully populated disk.
+pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;

@@ -2,6 +2,9 @@
 //!
 //! Wraps the VirtioNetDevice to implement embassy_net_driver::Driver trait,
 //! enabling async networking with embassy-net.
+//!
+//! Thread Safety: All virtio MMIO operations are protected by VIRTIO_LOCK
+//! to allow safe access from multiple threads (session threads + runner thread).
 
 use alloc::boxed::Box;
 use core::cell::RefCell;
@@ -9,10 +12,27 @@ use core::task::Waker;
 
 use critical_section::Mutex;
 use embassy_net_driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
+use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::MmioTransport;
 
 use crate::virtio_hal::VirtioHal;
+
+// ============================================================================
+// Global Virtio Lock for Thread Safety
+// ============================================================================
+
+/// Global lock protecting all virtio MMIO operations.
+/// This ensures that only one thread can access the virtio device at a time,
+/// preventing races between the network runner (thread 0) and session threads.
+static VIRTIO_LOCK: Spinlock<()> = Spinlock::new(());
+
+/// Execute a closure while holding the virtio lock
+#[inline]
+fn with_virtio_lock<R, F: FnOnce() -> R>(f: F) -> R {
+    let _guard = VIRTIO_LOCK.lock();
+    f()
+}
 
 // ============================================================================
 // Constants
@@ -88,44 +108,47 @@ impl EmbassyVirtioDriver {
             return true;
         }
 
-        // Check if we have a pending receive
-        if let Some(token) = self.rx_pending_token {
-            if self.inner.poll_receive().is_some() {
-                self.rx_pending_token = None;
-                // SAFETY: receive_complete requires the buffer passed to receive_begin
-                match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
-                    Ok((hdr_len, data_len)) => {
-                        rx.offset = hdr_len;
-                        rx.len = data_len;
-                        rx.valid = true;
-                        return true;
+        // All virtio MMIO operations must be done under the global lock
+        with_virtio_lock(|| {
+            // Check if we have a pending receive
+            if let Some(token) = self.rx_pending_token {
+                if self.inner.poll_receive().is_some() {
+                    self.rx_pending_token = None;
+                    // SAFETY: receive_complete requires the buffer passed to receive_begin
+                    match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
+                        Ok((hdr_len, data_len)) => {
+                            rx.offset = hdr_len;
+                            rx.len = data_len;
+                            rx.valid = true;
+                            return true;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            } else {
+                // Start a new receive
+                // SAFETY: receive_begin requires a buffer to store incoming data
+                match unsafe { self.inner.receive_begin(&mut rx.buffer[..]) } {
+                    Ok(token) => {
+                        self.rx_pending_token = Some(token);
+                        if self.inner.poll_receive().is_some() {
+                            self.rx_pending_token = None;
+                            match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
+                                Ok((hdr_len, data_len)) => {
+                                    rx.offset = hdr_len;
+                                    rx.len = data_len;
+                                    rx.valid = true;
+                                    return true;
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
                     Err(_) => {}
                 }
             }
-        } else {
-            // Start a new receive
-            // SAFETY: receive_begin requires a buffer to store incoming data
-            match unsafe { self.inner.receive_begin(&mut rx.buffer[..]) } {
-                Ok(token) => {
-                    self.rx_pending_token = Some(token);
-                    if self.inner.poll_receive().is_some() {
-                        self.rx_pending_token = None;
-                        match unsafe { self.inner.receive_complete(token, &mut rx.buffer[..]) } {
-                            Ok((hdr_len, data_len)) => {
-                                rx.offset = hdr_len;
-                                rx.len = data_len;
-                                rx.valid = true;
-                                return true;
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        false
+            false
+        })
     }
 
     /// Wake any pending RX waker
@@ -249,7 +272,10 @@ impl<'a> TxToken for VirtioTxToken<'a> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = f(&mut self.device.tx_buffer[..len]);
-        let _ = self.device.inner.send(&self.device.tx_buffer[..len]);
+        // All virtio MMIO operations must be done under the global lock
+        with_virtio_lock(|| {
+            let _ = self.device.inner.send(&self.device.tx_buffer[..len]);
+        });
         result
     }
 }

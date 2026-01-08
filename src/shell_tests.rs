@@ -7,6 +7,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::config;
 use crate::console;
 use crate::shell::{self, commands::create_default_registry, parse_pipeline};
 
@@ -309,9 +310,15 @@ fn test_external_binary_pipeline() -> bool {
 
     // Check if echo2 exists
     if !run_async_test(async { crate::async_fs::exists("/bin/echo2").await }) {
-        log("  Skipping: /bin/echo2 not found\n");
-        log("  Result: SKIP (counted as pass)\n");
-        return true;
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            log("  /bin/echo2 not found\n");
+            log("  Result: FAIL\n");
+            return false;
+        } else {
+            log("  Skipping: /bin/echo2 not found\n");
+            log("  Result: SKIP (counted as pass)\n");
+            return true;
+        }
     }
 
     // echo2 outputs something like "echo2: hello" so grep for "echo" should match
@@ -352,9 +359,15 @@ fn test_mixed_pipeline() -> bool {
 
     // Check if echo2 exists
     if !run_async_test(async { crate::async_fs::exists("/bin/echo2").await }) {
-        log("  Skipping: /bin/echo2 not found\n");
-        log("  Result: SKIP (counted as pass)\n");
-        return true;
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            log("  /bin/echo2 not found\n");
+            log("  Result: FAIL\n");
+            return false;
+        } else {
+            log("  Skipping: /bin/echo2 not found\n");
+            log("  Result: SKIP (counted as pass)\n");
+            return true;
+        }
     }
 
     // echo outputs "hello", echo2 echoes it, grep filters for "hello"

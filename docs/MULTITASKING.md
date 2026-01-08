@@ -219,9 +219,29 @@ process::exec_async(path, stdin).await -> Result<(i32, Vec<u8>), String>
 process::interrupt_thread(thread_id)
 ```
 
+## Thread Safety Details
+
+### TTBR0 Management
+
+Each thread has its own TTBR0 (user address space pointer) saved in its context:
+
+- **Kernel threads** (0-7): Use the boot TTBR0 with identity-mapped lower memory
+- **User process threads** (8-31): When running a user process, TTBR0 points to that process's page tables
+
+The context switch saves and restores TTBR0, ensuring that:
+- Session threads always have access to MMIO regions (virtio, etc.)
+- User processes are isolated in their own address spaces
+- Preemption doesn't corrupt address space state
+
+### Virtio Thread Safety
+
+All virtio MMIO operations are protected by a global spinlock (`VIRTIO_LOCK` in `embassy_virtio_driver.rs`). This prevents race conditions when:
+- Thread 0 polls the network runner
+- Session threads access the network stack for I/O
+
 ## Limitations
 
-1. **Socket Sharing**: TcpSocket is wrapped in SendableTcpStream for cross-thread use. This relies on embassy-net's internal synchronization.
+1. **Socket Sharing**: TcpSocket is wrapped in SendableTcpStream for cross-thread use. This relies on embassy-net's internal synchronization plus our virtio lock.
 
 2. **Fallback Mode**: If no system threads are available, SSH sessions fall back to async polling on thread 0.
 
@@ -229,3 +249,4 @@ process::interrupt_thread(thread_id)
 
 4. **Thread Pool Size**: Fixed at compile time (32 threads max).
 
+5. **Virtio Serialization**: The global virtio lock means network I/O is serialized across threads, which may impact throughput with many concurrent sessions.

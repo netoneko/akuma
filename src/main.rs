@@ -341,9 +341,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
 
-    // Run system tests (includes allocator tests)
-    if !tests::run_all() {
-        console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
+    // Run memory tests (no filesystem dependency)
+    if !tests::run_memory_tests() {
+        console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
         halt();
     }
 
@@ -388,6 +388,12 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
                     // Run filesystem tests
                     fs_tests::run_all_tests();
+
+                    // Run threading tests (requires fs for parallel process tests)
+                    if !tests::run_threading_tests() {
+                        console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
+                        halt();
+                    }
 
                     // Run process execution tests
                     process_tests::run_all_tests();

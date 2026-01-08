@@ -5,6 +5,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::config;
 use crate::console;
 use crate::threading;
 use alloc::boxed::Box;
@@ -14,9 +15,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Run all system tests - returns true if all pass
-pub fn run_all() -> bool {
-    console::print("\n========== System Tests ==========\n");
+/// Run memory tests (allocator, mmap) - can run before filesystem init
+/// Returns true if all pass
+pub fn run_memory_tests() -> bool {
+    console::print("\n========== Memory Tests ==========\n");
 
     let mut all_pass = true;
 
@@ -62,7 +64,28 @@ pub fn run_all() -> bool {
     // all_pass &= test_temporary_buffers();
     // all_pass &= test_linked_structure();
 
-    // Threading tests
+    console::print("\n==================================\n");
+    console::print(&format!(
+        "Memory Tests: {}\n",
+        if all_pass {
+            "ALL PASSED"
+        } else {
+            "SOME FAILED"
+        }
+    ));
+    console::print("==================================\n\n");
+
+    all_pass
+}
+
+/// Run threading tests - requires filesystem for parallel process tests
+/// Returns true if all pass
+pub fn run_threading_tests() -> bool {
+    console::print("\n========== Threading Tests ==========\n");
+
+    let mut all_pass = true;
+
+    // Threading tests (no fs dependency)
     all_pass &= test_scheduler_init();
     all_pass &= test_thread_stats();
     all_pass &= test_yield();
@@ -77,20 +100,31 @@ pub fn run_all() -> bool {
     all_pass &= test_yield_cycle();
     all_pass &= test_mixed_cooperative_preemptible();
 
-    // Parallel process tests
+    // Parallel process tests (requires /bin/hello)
     all_pass &= test_parallel_processes();
 
     console::print("\n==================================\n");
     console::print(&format!(
-        "Overall: {}\n",
+        "Threading Tests: {}\n",
         if all_pass {
-            "ALL TESTS PASSED"
+            "ALL PASSED"
         } else {
-            "SOME TESTS FAILED"
+            "SOME FAILED"
         }
     ));
     console::print("==================================\n\n");
 
+    all_pass
+}
+
+/// Run all system tests - returns true if all pass
+/// Note: This runs both memory and threading tests together.
+/// For finer control, use run_memory_tests() and run_threading_tests() separately.
+#[allow(dead_code)]
+pub fn run_all() -> bool {
+    let mut all_pass = true;
+    all_pass &= run_memory_tests();
+    all_pass &= run_threading_tests();
     all_pass
 }
 
@@ -1232,10 +1266,12 @@ fn test_mmap_interleaved_strings() -> bool {
 
 // ============================================================================
 // Common Memory Allocation Patterns
+// NOTE: These tests hang during preemption - need investigation
 // ============================================================================
 
 /// Test: LIFO (stack-like) allocation pattern
 /// Common in: function call stacks, undo buffers, recursive algorithms
+#[allow(dead_code)]
 fn test_lifo_pattern() -> bool {
     console::print("\n[TEST] LIFO allocation pattern\n");
 
@@ -1278,6 +1314,7 @@ fn test_lifo_pattern() -> bool {
 
 /// Test: FIFO (queue-like) allocation pattern  
 /// Common in: message queues, task schedulers, event handlers
+#[allow(dead_code)]
 fn test_fifo_pattern() -> bool {
     console::print("\n[TEST] FIFO allocation pattern\n");
 
@@ -1320,6 +1357,7 @@ fn test_fifo_pattern() -> bool {
 
 /// Test: Memory pool pattern
 /// Common in: game engines, real-time systems, network buffers
+#[allow(dead_code)]
 fn test_memory_pool_pattern() -> bool {
     console::print("\n[TEST] Memory pool pattern\n");
 
@@ -1378,6 +1416,7 @@ fn test_memory_pool_pattern() -> bool {
 
 /// Test: Dynamic resize pattern
 /// Common in: growing arrays, string builders, buffers
+#[allow(dead_code)]
 fn test_resize_pattern() -> bool {
     console::print("\n[TEST] Dynamic resize pattern\n");
 
@@ -1455,6 +1494,7 @@ fn test_resize_pattern() -> bool {
 
 /// Test: Temporary buffer pattern
 /// Common in: I/O operations, parsing, formatting
+#[allow(dead_code)]
 fn test_temporary_buffers() -> bool {
     console::print("\n[TEST] Temporary buffer pattern\n");
 
@@ -1496,6 +1536,7 @@ fn test_temporary_buffers() -> bool {
 
 /// Test: Linked/tree structure pattern
 /// Common in: linked lists, trees, graphs
+#[allow(dead_code)]
 fn test_linked_structure() -> bool {
     console::print("\n[TEST] Linked structure pattern\n");
 
@@ -2185,9 +2226,15 @@ fn test_parallel_processes() -> bool {
 
     // Check if hello binary exists by trying to read it
     if crate::fs::read_file("/bin/hello").is_err() {
-        console::print("  Skipping: /bin/hello not found\n");
-        console::print("  Result: SKIP\n");
-        return true; // Skip, don't fail
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            console::print("  /bin/hello not found\n");
+            console::print("  Result: FAIL\n");
+            return false;
+        } else {
+            console::print("  Skipping: /bin/hello not found\n");
+            console::print("  Result: SKIP\n");
+            return true; // Skip, don't fail
+        }
     }
 
     // Spawn first process using spawn_process_with_channel

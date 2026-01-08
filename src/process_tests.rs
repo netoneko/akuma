@@ -4,6 +4,7 @@
 
 use alloc::format;
 
+use crate::config;
 use crate::console;
 use crate::fs;
 use crate::process;
@@ -60,10 +61,18 @@ fn test_elftest() {
             }
         }
         Err(_) => {
-            console::print(&format!(
-                "[Test] {} not found, skipping ELF loading test\n",
-                ELFTEST_PATH
-            ));
+            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+                console::print(&format!(
+                    "[Test] {} not found - FAIL\n",
+                    ELFTEST_PATH
+                ));
+                panic!("Required test binary not found");
+            } else {
+                console::print(&format!(
+                    "[Test] {} not found, skipping ELF loading test\n",
+                    ELFTEST_PATH
+                ));
+            }
         }
     }
 }
@@ -105,10 +114,18 @@ fn test_stdcheck() {
             }
         }
         Err(_) => {
-            console::print(&format!(
-                "[Test] {} not found, skipping mmap allocator test\n",
-                STDCHECK_PATH
-            ));
+            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+                console::print(&format!(
+                    "[Test] {} not found - FAIL\n",
+                    STDCHECK_PATH
+                ));
+                panic!("Required test binary not found");
+            } else {
+                console::print(&format!(
+                    "[Test] {} not found, skipping mmap allocator test\n",
+                    STDCHECK_PATH
+                ));
+            }
         }
     }
 }
@@ -147,8 +164,12 @@ fn test_echo2() {
             }
         }
         Err(_) => {
-            console::print(&format!("[Test] {} not found, skipping test\n", ECHO2_PATH));
-            console::print("[Test] To run this test, copy the echo2 binary to /bin/echo2\n");
+            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+                console::print(&format!("[Test] {} not found - FAIL\n", ECHO2_PATH));
+                panic!("Required test binary not found");
+            } else {
+                console::print(&format!("[Test] {} not found, skipping test\n", ECHO2_PATH));
+            }
         }
     }
 }
