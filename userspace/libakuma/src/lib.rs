@@ -208,20 +208,42 @@ fn munmap_void(addr: usize, len: usize) {
 
 /// Sleep for the specified number of seconds
 ///
-/// Yields to other threads while sleeping.
-#[inline(always)]
+/// Sleeps in small intervals (10ms) to allow preemption between syscalls.
+/// This ensures the scheduler can switch to other threads during long sleeps.
+#[inline(never)]
 pub fn sleep(seconds: u64) {
-    syscall(syscall::NANOSLEEP, seconds, 0, 0, 0, 0, 0);
+    // Sleep in 10ms chunks to allow preemption between syscalls
+    // The kernel can't preempt during syscall handling, but can preempt
+    // between syscalls when we're in EL0 (userspace)
+    const CHUNK_MS: u64 = 10;
+    const CHUNK_NANOS: u64 = CHUNK_MS * 1_000_000;
+    
+    let total_ms = seconds * 1000;
+    let mut remaining_ms = total_ms;
+    
+    while remaining_ms > 0 {
+        let sleep_ms = if remaining_ms > CHUNK_MS { CHUNK_MS } else { remaining_ms };
+        let nanos = sleep_ms * 1_000_000;
+        syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
+        remaining_ms -= sleep_ms;
+    }
 }
 
 /// Sleep for the specified number of milliseconds
 ///
-/// Yields to other threads while sleeping.
-#[inline(always)]
+/// Sleeps in small intervals to allow preemption between syscalls.
+#[inline(never)]
 pub fn sleep_ms(milliseconds: u64) {
-    let seconds = milliseconds / 1000;
-    let nanos = (milliseconds % 1000) * 1_000_000;
-    syscall(syscall::NANOSLEEP, seconds, nanos, 0, 0, 0, 0);
+    // Sleep in 10ms chunks for preemption
+    const CHUNK_MS: u64 = 10;
+    
+    let mut remaining = milliseconds;
+    while remaining > 0 {
+        let sleep_ms = if remaining > CHUNK_MS { CHUNK_MS } else { remaining };
+        let nanos = sleep_ms * 1_000_000;
+        syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
+        remaining -= sleep_ms;
+    }
 }
 
 /// Print a string to stdout

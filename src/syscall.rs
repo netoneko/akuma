@@ -85,8 +85,9 @@ fn sys_brk(new_brk: usize) -> u64 {
 
 /// sys_nanosleep - Sleep for a specified duration
 ///
-/// Yields to other threads while waiting, allowing the system to remain
-/// responsive during long sleeps. Can be interrupted by Ctrl+C.
+/// Sleeps in short intervals to allow interrupt checking (Ctrl+C).
+/// The thread cannot be preempted during the syscall, but will be
+/// preempted once it returns to EL0 (userspace).
 ///
 /// # Arguments
 /// * `seconds` - Number of seconds to sleep
@@ -98,6 +99,13 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
     let start = crate::timer::uptime_us();
     let deadline = start + total_us;
+
+    // NOTE: We cannot enable IRQs or yield during syscall handling because:
+    // 1. Syscalls run in EL1 exception context with specific ELR/SPSR state
+    // 2. Timer interrupts would trigger context switches that corrupt this state
+    // 3. The thread will be preempted naturally once it returns to EL0
+    //
+    // For long sleeps, we check for interrupts periodically.
 
     // Sleep in small increments to allow interrupt checking
     const CHECK_INTERVAL_US: u64 = 10_000; // Check every 10ms
@@ -114,7 +122,7 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
             return EINTR;
         }
 
-        // Sleep for a small interval or remaining time
+        // Short delay
         let remaining = deadline.saturating_sub(crate::timer::uptime_us());
         let sleep_time = remaining.min(CHECK_INTERVAL_US);
         if sleep_time > 0 {
