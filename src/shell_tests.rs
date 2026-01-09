@@ -77,7 +77,7 @@ pub fn run_all_tests() {
 // ============================================================================
 
 /// Execute a pipeline and return the output (uses the shell module's execute_pipeline)
-async fn execute_pipeline_test(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub async fn execute_pipeline_test(pipeline: &[u8]) -> Result<Vec<u8>, &'static str> {
     let registry = create_default_registry();
     let stages = parse_pipeline(pipeline);
     let mut ctx = shell::ShellContext::new();

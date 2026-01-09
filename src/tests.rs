@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::config;
 use crate::console;
+use crate::shell::Command;
+use crate::shell::commands::builtin;
 use crate::threading;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -2272,6 +2274,7 @@ fn test_parallel_processes() -> bool {
     };
 
     console::print(&format!("  Spawned threads {} and {}\n", tid1, tid2));
+    console::print("Calling ps\n");
     
     // The fact that we spawned two processes on different threads (tid1 != tid2)
     // and they both complete successfully proves parallel execution capability.
@@ -2281,6 +2284,7 @@ fn test_parallel_processes() -> bool {
     console::print("  Waiting for processes to complete...");
     let complete_timeout = 30_000_000; // 30 seconds (hello runs for ~10 seconds)
     let complete_start = crate::timer::uptime_us();
+    let mut ps_done = false;
 
     loop {
         threading::yield_now();
@@ -2288,11 +2292,43 @@ fn test_parallel_processes() -> bool {
         let p1_done = channel1.has_exited() || crate::threading::is_thread_terminated(tid1);
         let p2_done = channel2.has_exited() || crate::threading::is_thread_terminated(tid2);
         
+
         if p1_done && p2_done {
             console::print(" done\n");
             PROCESS1_DONE.store(true, Ordering::Release);
             PROCESS2_DONE.store(true, Ordering::Release);
+
+            if ps_done {
+                console::print("ps done!\n");
+            }
             break;
+        } else {
+            // builtin::PsCommand.execute(&[], stdin, stdout, ctx);            
+
+            if crate::timer::uptime_us() - complete_start > complete_timeout / 100 && !ps_done {
+                let ps_result =
+                crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
+
+                match ps_result {
+                    Ok(value) => {
+                        let value_as_str = String::from_utf8_lossy(&value);
+                        console::print(&format!("ps output:\n{}\n", value_as_str));
+                        let p1_data = format!("{}", &tid1);
+                        let p2_data = format!("{}", &tid2);
+                        let process_name = String::from("/bin/hello");
+                        console::print(&format!("p1_data: {}, p2_data: {}, process_name: {}\n", p1_data, p2_data, process_name));
+
+                        // if value_as_str.contains(&p1_data) && value_as_str.contains(&p2_data) && value_as_str.contains(&process_name) {
+                        if value_as_str.contains(&process_name) {
+                            console::print("ps successful!\n");
+                            ps_done = true;
+                        }
+                    }
+                    Err(_) => {
+                        console::print("ps failed!\n");
+                    }
+                }
+            }
         }
 
         if crate::timer::uptime_us() - complete_start > complete_timeout {
@@ -2301,6 +2337,8 @@ fn test_parallel_processes() -> bool {
             // Continue to cleanup even on timeout
             break;
         }
+
+
     }
 
     // Cleanup
@@ -2319,7 +2357,7 @@ fn test_parallel_processes() -> bool {
     // 2. Both processes completed successfully
     // The interleaved output visible in logs proves true parallel execution
     let threads_different = tid1 != tid2;
-    let ok = threads_different && p1_done && p2_done;
+    let ok = threads_different && p1_done && p2_done && ps_done;
     
     if !ok {
         console::print(&format!("  tid1={}, tid2={}, P1 done: {}, P2 done: {}\n", 

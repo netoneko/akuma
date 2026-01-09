@@ -185,7 +185,7 @@ fn test_loopback_stack_init() -> bool {
 
 /// Run an async test synchronously with a timeout
 /// Uses polling with the embassy time driver
-fn run_async_test<F, T>(future: F) -> T
+pub fn run_async_test<F, T>(future: F) -> T
 where
     F: core::future::Future<Output = T>,
 {
