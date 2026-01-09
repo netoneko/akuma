@@ -2313,15 +2313,20 @@ fn test_parallel_processes() -> bool {
                     Ok(value) => {
                         let value_as_str = String::from_utf8_lossy(&value);
                         console::print(&format!("ps output:\n{}\n", value_as_str));
-                        let p1_data = format!("{}", &tid1);
-                        let p2_data = format!("{}", &tid2);
-                        let process_name = String::from("/bin/hello");
-                        console::print(&format!("p1_data: {}, p2_data: {}, process_name: {}\n", p1_data, p2_data, process_name));
 
-                        // if value_as_str.contains(&p1_data) && value_as_str.contains(&p2_data) && value_as_str.contains(&process_name) {
-                        if value_as_str.contains(&process_name) {
-                            console::print("ps successful!\n");
-                            ps_done = true;
+                        let values_split =value_as_str.split('\n').collect::<Vec<&str>>();
+                        let process_name = String::from("/bin/hello");
+                        let process_state = String::from("running");
+
+                        console::print(&format!("values_split.len(): {:?}\n", values_split.len()));
+
+                        if values_split.len() >= 3 {
+                            console::print(&format!("values_split[1]: {:?}\n", values_split[1]));
+                            console::print(&format!("values_split[2]: {:?}\n", values_split[2]));
+                            if values_split[1].contains(&process_name) && values_split[1].contains(&process_state) && 
+                                values_split[2].contains(&process_name) && values_split[2].contains(&process_state) {
+                                ps_done = true;
+                            }
                         }
                     }
                     Err(_) => {
