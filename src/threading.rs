@@ -1328,3 +1328,16 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         threads
     })
 }
+
+pub fn dump_stack_info() {
+    use crate::threading;
+    use crate::console;
+    use alloc::format;
+    let threads = threading::list_kernel_threads();
+
+    for t in threads {
+        let size_kb = t.stack_size / 1024;
+        let used_kb = t.stack_used / 1024;
+        console::print(&format!("Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb));
+    }
+}
