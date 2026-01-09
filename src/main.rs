@@ -52,8 +52,6 @@ use alloc::string::ToString;
 
 use core::panic::PanicInfo;
 
-use crate::threading::spawn_fn;
-
 /// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
 #[inline]
 fn halt() -> ! {
@@ -427,7 +425,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 }
 
 fn run_async_main_preemptive() -> ! {
-    let thread_result = crate::threading::spawn_fn_with_options(|| {
+    let thread_result = crate::threading::spawn_fn_with_stack(|| {
             run_async_main();
             //  {
             //     Ok(()) => {
@@ -440,6 +438,7 @@ fn run_async_main_preemptive() -> ! {
             //     }
             // }
         },
+        config::ASYNC_THREAD_STACK_SIZE,
         false,
     );
 

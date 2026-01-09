@@ -631,7 +631,7 @@ enum EscapeState {
 }
 
 /// Generate the shell prompt with current working directory
-fn generate_prompt(ctx: &ShellContext) -> alloc::string::String {
+fn generate_prompt(ctx: &ShellContext) -> alloc::string::String {    
     format!("akuma:{}> ", ctx.cwd())
 }
 
@@ -698,7 +698,7 @@ async fn run_shell_session(
                                         if history.len() > 50 {
                                             history.remove(0);
                                         }
-                                        history_index = history.len();
+                                        history_index = history.len();                                        
 
                                         // Check for neko editor command (special case - not part of command chain)
                                         if trimmed == b"neko" || trimmed.starts_with(b"neko ") {

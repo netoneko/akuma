@@ -101,4 +101,5 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 ///
 /// When enabled, the main thread will be cooperative and will yield to the scheduler.
 /// When disabled, the main thread will be preemptive and will not yield to the scheduler.
-pub const COOPERATIVE_MAIN_THREAD: bool = false;
+pub const COOPERATIVE_MAIN_THREAD: bool = false; // will crash with embassy error if you ever try to run an uncopperative main thread
+
