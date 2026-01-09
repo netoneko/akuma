@@ -1303,11 +1303,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
             } else {
                 true // Canaries disabled
             };
-
+            
             // Thread name based on index range and state
             let name = match i {
-                0 => "boot/async",
-                1..=7 => "ssh-session", // System threads for SSH sessions
+                0 => "bootstrap",
+                1 => "network",
+                2..=7 => "ssh-session", // System threads for SSH sessions
                 _ if slot.cooperative => "cooperative",
                 _ => "user-process", // User process threads (8+)
             };

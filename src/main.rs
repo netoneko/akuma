@@ -52,6 +52,8 @@ use alloc::string::ToString;
 
 use core::panic::PanicInfo;
 
+use crate::threading::spawn_fn;
+
 /// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
 #[inline]
 fn halt() -> ! {
@@ -417,6 +419,65 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     console::print("--- Filesystem Initialization Done ---\n\n");
 
+    if crate::config::COOPERATIVE_MAIN_THREAD {
+        run_async_main();
+    } else {
+        run_async_main_preemptive();
+    }
+}
+
+fn run_async_main_preemptive() -> ! {
+    let thread_result = crate::threading::spawn_fn_with_options(|| {
+            run_async_main();
+            //  {
+            //     Ok(()) => {
+            //         console::print("[AsyncMain] Preemtive main thread finished\n");
+            //     }
+            //     Err(e) => {
+            //         console::print("[AsyncMain] Preemtive main thread failed: ");
+            //         console::print(e);
+            //         console::print("\n");
+            //     }
+            // }
+        },
+        false,
+    );
+
+    match thread_result {
+        Ok(thread_id) => {
+            loop {
+                if threading::is_thread_terminated(thread_id) {
+                    break;
+                }
+                threading::yield_now();
+            }
+
+            console::print("[AsyncMain] Preemtive main thread terminated\n");
+        }
+        Err(e) => {
+            console::print("[AsyncMain] Preemtive main thread failed: ");
+            console::print(e);
+            console::print("\n");
+        }
+    }
+
+    console::print("System halted\n");
+    halt();
+}
+
+/// Run the async main loop
+///
+/// This is the main entry point for async networking.
+/// Runs on thread 0 (boot thread) which has a 1MB stack (config::KERNEL_STACK_SIZE).
+/// This is sufficient for deep async call chains (SSH, HTTP, etc.).
+///
+/// Note: Thread 0 uses the boot stack at 0x41F00000-0x42000000 which is
+/// protected by stack canaries checked periodically in this loop.
+fn run_async_main() -> ! {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
     // =========================================================================
     // Async Network initialization and main loop
     // =========================================================================
@@ -446,21 +507,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Run the async main loop in the main thread
     // This drives both the network runner and the SSH server
-    run_async_main(net_init);
-}
-
-/// Run the async main loop
-///
-/// This is the main entry point for async networking.
-/// Runs on thread 0 (boot thread) which has a 1MB stack (config::KERNEL_STACK_SIZE).
-/// This is sufficient for deep async call chains (SSH, HTTP, etc.).
-///
-/// Note: Thread 0 uses the boot stack at 0x41F00000-0x42000000 which is
-/// protected by stack canaries checked periodically in this loop.
-fn run_async_main(net_init: async_net::NetworkInit) -> ! {
-    use core::future::Future;
-    use core::pin::pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     console::print("[AsyncMain] Starting async network loop...\n");
 
