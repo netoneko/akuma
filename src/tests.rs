@@ -2318,11 +2318,11 @@ fn test_parallel_processes() -> bool {
                         let process_name = String::from("/bin/hello");
                         let process_state = String::from("running");
 
-                        console::print(&format!("values_split.len(): {:?}\n", values_split.len()));
+                        // console::print(&format!("values_split.len(): {:?}\n", values_split.len()));
 
                         if values_split.len() >= 3 {
-                            console::print(&format!("values_split[1]: {:?}\n", values_split[1]));
-                            console::print(&format!("values_split[2]: {:?}\n", values_split[2]));
+                            // console::print(&format!("values_split[1]: {:?}\n", values_split[1]));
+                            // console::print(&format!("values_split[2]: {:?}\n", values_split[2]));
                             if values_split[1].contains(&process_name) && values_split[1].contains(&process_state) && 
                                 values_split[2].contains(&process_name) && values_split[2].contains(&process_state) {
                                 ps_done = true;

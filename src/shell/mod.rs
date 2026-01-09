@@ -31,6 +31,7 @@ pub use commands::CommandRegistry;
 pub struct ShellContext {
     /// Current working directory
     cwd: String,
+    async_exec: bool,
 }
 
 impl ShellContext {
@@ -38,6 +39,7 @@ impl ShellContext {
     pub fn new() -> Self {
         Self {
             cwd: String::from("/"),
+            async_exec: crate::config::ENABLE_SSH_ASYNC_EXEC,
         }
     }
 
@@ -354,6 +356,7 @@ async fn execute_external(
     stdout: &mut VecWriter,
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
+    crate::console::print(&format!("execute_external: async exec enabled: {}\n", is_async_exec_enabled()));
     let result = if is_async_exec_enabled() {
         crate::process::exec_async(path, stdin).await
     } else {
@@ -391,16 +394,22 @@ async fn execute_external(
 pub async fn execute_external_streaming<W>(
     path: &str,
     stdin: Option<&[u8]>,
-    output: &mut W,
-) -> Result<i32, ShellError>
+    stdout: &mut W,
+) -> Result<(), ShellError>
 where
     W: embedded_io_async::Write,
 {
-    match crate::process::exec_streaming(path, stdin, output).await {
-        Ok(exit_code) => Ok(exit_code),
+    match crate::process::exec_streaming(path, stdin, stdout).await {
+        Ok(exit_code) => {
+            if exit_code != 0 {
+                let msg = format!("[exit code: {}]\r\n", exit_code);
+                let _ = embedded_io_async::Write::write_all(stdout, msg.as_bytes()).await;
+            }
+            Ok(())
+        },
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);
-            let _ = output.write_all(msg.as_bytes()).await;
+            let _ = stdout.write_all(msg.as_bytes()).await;
             Err(ShellError::ExecutionFailed("process execution failed"))
         }
     }
@@ -465,17 +474,34 @@ async fn execute_pipeline_internal(
 
         if let Some(bin_path) = find_executable(cmd_name_str).await {
             // Found an executable in /bin - run it
-            match execute_external(&bin_path, stdin_slice, &mut stdout).await {
-                Ok(()) => {
-                    if is_last {
-                        return PipelineResult::Output(stdout.into_inner());
-                    } else {
-                        stdin_data = Some(stdout.into_inner());
+            if ctx.async_exec {
+                match execute_external(&bin_path, stdin_slice, &mut stdout).await {
+                    Ok(()) => {
+                        if is_last {
+                            return PipelineResult::Output(stdout.into_inner());
+                        } else {
+                            stdin_data = Some(stdout.into_inner());
+                        }
+                        continue;
                     }
-                    continue;
+                    Err(e) => {
+                        return PipelineResult::Error(e, None);
+                    }
                 }
-                Err(e) => {
-                    return PipelineResult::Error(e, None);
+            } else {           
+                // DOES NOT WORK WITH SSH, blocks SSH connections entirely  
+                match execute_external_streaming(&bin_path, stdin_slice, &mut stdout).await {
+                    Ok(()) => {
+                        if is_last {
+                            return PipelineResult::Output(stdout.into_inner());
+                        } else {
+                            stdin_data = Some(stdout.into_inner());
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        return PipelineResult::Error(e, None);
+                    }
                 }
             }
         }
@@ -637,6 +663,7 @@ pub async fn execute_command_chain(
         }
 
         // Execute the pipeline
+
         match execute_pipeline_internal(&parsed.stages, registry, ctx).await {
             PipelineResult::Output(output) => {
                 last_success = true;

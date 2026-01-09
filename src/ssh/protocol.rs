@@ -671,6 +671,7 @@ async fn run_shell_session(
     let mut history_index: usize = 0;
     let mut saved_line: Vec<u8> = Vec::new(); // Save current line when navigating history
 
+    
     loop {
         // Read input
         match channel_stream.read(&mut read_buf).await {
@@ -733,6 +734,7 @@ async fn run_shell_session(
                                         }
 
                                         // Execute command chain (handles ;, &&, |, >, >> and exit/quit)
+
                                         let result = shell::execute_command_chain(
                                             trimmed, &registry, &mut ctx,
                                         )

@@ -107,3 +107,6 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 /// embassy-net's internal RefCells from re-entrant access during timer preemption.
 pub const COOPERATIVE_MAIN_THREAD: bool = false;
 
+
+// Does not actually work, blocks new ssh connections for unknown reasons
+pub const ENABLE_SSH_ASYNC_EXEC: bool = false;
