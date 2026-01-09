@@ -16,6 +16,7 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 101; // Linux arm64 nanosleep
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
+    pub const UPTIME: u64 = 216;
 }
 
 /// Error code for interrupted syscall
@@ -62,6 +63,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             args[3] as u32,
         ),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
+        nr::UPTIME => sys_uptime(),
         _ => {
             console::print(&format!("[Syscall] Unknown syscall: {}\n", syscall_num));
             (-1i64) as u64 // ENOSYS
@@ -131,6 +133,10 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     }
 
     0 // Success
+}
+
+fn sys_uptime() -> u64 {
+    crate::timer::uptime_us()
 }
 
 /// sys_mmap - Map memory pages

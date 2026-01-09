@@ -7,6 +7,7 @@
 #![no_main]
 
 use libakuma::{exit, getpid, print, sleep};
+use format_no_std;
 
 // ============================================================================
 // Configuration
@@ -28,11 +29,12 @@ pub extern "C" fn _start() -> ! {
     let pid = getpid();
 
     // Print startup message with PID
-    print("hello: started (PID ");
+    print("hello (fresh version with uptime syscall): started (PID ");
     print_num(pid);
     print(")\n");
 
-    // Output "hello" periodically
+    let mut last_uptime = libakuma::uptime();
+        // Output "hello" periodically
     for i in 0..TOTAL_OUTPUTS {
         print("hello (");
         print_num(i + 1);
@@ -42,7 +44,22 @@ pub extern "C" fn _start() -> ! {
 
         // Don't sleep after the last output
         if i + 1 < TOTAL_OUTPUTS {
-            sleep(SLEEP_SECONDS);
+            // sleep(SLEEP_SECONDS);
+            loop {
+                if libakuma::uptime() - last_uptime < 100000 { // this is too short, should be x10
+                    // crate::threading::yield_now()
+                } else {
+                    last_uptime = libakuma::uptime();
+                    let mut buf = [0u8; 64];
+                    let formatted_uptime = format_no_std::show(&mut buf, format_args!("{:#?}\n", last_uptime),).unwrap();
+                    libakuma::write(libakuma::fd::STDOUT, &formatted_uptime.as_bytes());
+                    print(&formatted_uptime);
+                    let _ = formatted_uptime;
+                    let _ = buf;
+                    break
+                }
+
+            }
         }
     }
 

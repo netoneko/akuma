@@ -17,9 +17,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "format_no_std"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae45e32b0bfe2c62c805f8e87027b5aa08562000326edbc5b421ab6d92873a7"
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
+ "format_no_std",
  "libakuma",
 ]
 

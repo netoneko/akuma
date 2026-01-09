@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 libakuma = { path = "../libakuma" }
+format_no_std = { version = "1.2.0" }
 

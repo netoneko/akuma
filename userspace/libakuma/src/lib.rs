@@ -17,6 +17,7 @@ pub mod syscall {
     pub const NANOSLEEP: u64 = 101;
     pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
+    pub const UPTIME: u64 = 216;
 }
 
 /// File descriptors
@@ -244,6 +245,11 @@ pub fn sleep_ms(milliseconds: u64) {
         syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
         remaining -= sleep_ms;
     }
+}
+
+#[inline(never)]
+pub fn uptime() -> u64 {
+    syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
 }
 
 /// Print a string to stdout
