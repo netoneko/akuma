@@ -99,7 +99,11 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 
 /// Use cooperative main thread
 ///
-/// When enabled, the main thread will be cooperative and will yield to the scheduler.
-/// When disabled, the main thread will be preemptive and will not yield to the scheduler.
-pub const COOPERATIVE_MAIN_THREAD: bool = false; // will crash with embassy error if you ever try to run an uncopperative main thread
+/// When enabled, the main thread (thread 0) runs the async loop directly.
+/// When disabled, the async loop runs in a separate preemptive thread.
+///
+/// Both modes are now safe due to preemption control around embassy-net polling.
+/// The polling loop uses disable_preemption()/enable_preemption() to protect
+/// embassy-net's internal RefCells from re-entrant access during timer preemption.
+pub const COOPERATIVE_MAIN_THREAD: bool = false;
 

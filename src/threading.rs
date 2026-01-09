@@ -6,12 +6,53 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 // Use the shared IRQ guard from the irq module
 use crate::config;
 use crate::irq::with_irqs_disabled;
+
+// ============================================================================
+// Preemption Control
+// ============================================================================
+
+/// Per-thread preemption disable counter
+/// When > 0, timer-based preemption is blocked for the current thread.
+/// This prevents context switches in the middle of RefCell borrows or other
+/// non-reentrant code sections.
+static PREEMPTION_DISABLED: AtomicUsize = AtomicUsize::new(0);
+
+/// Disable preemption for the current thread.
+///
+/// Can be nested - must call `enable_preemption()` the same number of times.
+/// While preemption is disabled, timer interrupts will not cause a context switch,
+/// but IRQs are still enabled and yield_now() still works.
+///
+/// Use this to protect code that uses RefCell or other non-thread-safe structures.
+#[inline]
+pub fn disable_preemption() {
+    PREEMPTION_DISABLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Re-enable preemption for the current thread.
+///
+/// Must be called once for each call to `disable_preemption()`.
+#[inline]
+pub fn enable_preemption() {
+    let prev = PREEMPTION_DISABLED.fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev > 0, "enable_preemption called without matching disable");
+}
+
+/// Check if preemption is currently disabled.
+#[inline]
+pub fn is_preemption_disabled() -> bool {
+    PREEMPTION_DISABLED.load(Ordering::SeqCst) > 0
+}
+
+// ============================================================================
+// Thread Constants
+// ============================================================================
 
 /// Default timeout for cooperative threads in microseconds (5 seconds)
 pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
@@ -685,11 +726,19 @@ impl ThreadPool {
     /// # Preemption rules:
     /// - `voluntary=true`: Thread yielded voluntarily (yield_now) - always switch
     /// - `voluntary=false`: Timer-triggered preemption
+    ///   - If preemption is explicitly disabled: Don't switch
     ///   - Cooperative threads (thread 0): Only switch after timeout elapses
     ///   - Non-cooperative threads (sessions, user processes): Always preemptible
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
         let current_idx = self.current_idx;
         let current = &self.slots[current_idx];
+
+        // For timer-triggered preemption, first check if preemption is explicitly disabled.
+        // This is used to protect RefCell borrows and other non-reentrant code sections
+        // (e.g., embassy-net's internal state during polling).
+        if !voluntary && is_preemption_disabled() {
+            return None;
+        }
 
         // For timer-triggered preemption, check if the current thread is cooperative.
         // Cooperative threads (like thread 0 running the async executor) get time-slice

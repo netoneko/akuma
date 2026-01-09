@@ -536,19 +536,28 @@ fn run_async_main() -> ! {
         let mut loopback_runner_pinned = pin!(loopback_runner_fut);
 
         loop {
+            // Disable preemption during polling to protect embassy-net's RefCells
+            threading::disable_preemption();
+
             // Poll the network runner (needed for DHCP to work)
             let _ = runner_pinned.as_mut().poll(&mut cx);
             // Poll the loopback runner
             let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
             // Poll the wait_for_ip future
-            if let Poll::Ready(()) = wait_ip_pinned.as_mut().poll(&mut cx) {
-                break;
-            }
+            let ip_ready = matches!(wait_ip_pinned.as_mut().poll(&mut cx), Poll::Ready(()));
 
             // Process pending IRQ work
             executor::process_irq_work();
             executor::run_once();
+
+            // Re-enable preemption before yielding or breaking
+            threading::enable_preemption();
+
+            if ip_ready {
+                break;
+            }
+
             threading::yield_now();
         }
     }
@@ -583,6 +592,11 @@ fn run_async_main() -> ! {
     }
 
     loop {
+        // Disable preemption during polling to protect embassy-net's internal RefCells.
+        // Embassy-net uses RefCell for interior mutability, which panics on re-entrant
+        // borrows. Timer preemption mid-poll would cause this panic.
+        threading::disable_preemption();
+
         // Poll the main network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);
 
@@ -610,6 +624,9 @@ fn run_async_main() -> ! {
 
         // Poll the executor for any other tasks
         executor::run_once();
+
+        // Re-enable preemption - safe now that all RefCell borrows are released
+        threading::enable_preemption();
 
         // Periodic stack canary check (every ~1000 iterations to reduce overhead)
         static mut CANARY_CHECK_COUNTER: u32 = 0;
