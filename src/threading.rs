@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 // Use the shared IRQ guard from the irq module
@@ -23,6 +23,16 @@ use crate::irq::with_irqs_disabled;
 /// non-reentrant code sections.
 static PREEMPTION_DISABLED: AtomicUsize = AtomicUsize::new(0);
 
+/// Timestamp (in microseconds) when preemption was last disabled
+/// Used by the watchdog to detect stuck threads
+static PREEMPTION_DISABLED_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum time preemption can be disabled before watchdog warning (100ms)
+const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;
+
+/// Maximum time preemption can be disabled before watchdog panic (5 seconds)
+const PREEMPTION_WATCHDOG_PANIC_US: u64 = 5_000_000;
+
 /// Disable preemption for the current thread.
 ///
 /// Can be nested - must call `enable_preemption()` the same number of times.
@@ -32,7 +42,11 @@ static PREEMPTION_DISABLED: AtomicUsize = AtomicUsize::new(0);
 /// Use this to protect code that uses RefCell or other non-thread-safe structures.
 #[inline]
 pub fn disable_preemption() {
-    PREEMPTION_DISABLED.fetch_add(1, Ordering::SeqCst);
+    let prev = PREEMPTION_DISABLED.fetch_add(1, Ordering::SeqCst);
+    // Record timestamp on first disable (nesting level 0 -> 1)
+    if prev == 0 {
+        PREEMPTION_DISABLED_SINCE.store(crate::timer::uptime_us(), Ordering::Release);
+    }
 }
 
 /// Re-enable preemption for the current thread.
@@ -42,12 +56,44 @@ pub fn disable_preemption() {
 pub fn enable_preemption() {
     let prev = PREEMPTION_DISABLED.fetch_sub(1, Ordering::SeqCst);
     debug_assert!(prev > 0, "enable_preemption called without matching disable");
+    // Clear timestamp when fully re-enabled (nesting level 1 -> 0)
+    if prev == 1 {
+        PREEMPTION_DISABLED_SINCE.store(0, Ordering::Release);
+    }
 }
 
 /// Check if preemption is currently disabled.
 #[inline]
 pub fn is_preemption_disabled() -> bool {
     PREEMPTION_DISABLED.load(Ordering::SeqCst) > 0
+}
+
+/// Check if preemption has been disabled for too long (watchdog).
+/// Called from timer interrupt handler.
+/// Returns:
+/// - None: preemption not disabled or within normal time
+/// - Some(duration_us): preemption disabled for this many microseconds
+pub fn check_preemption_watchdog() -> Option<u64> {
+    let disabled_since = PREEMPTION_DISABLED_SINCE.load(Ordering::Acquire);
+    if disabled_since == 0 {
+        return None;
+    }
+    
+    let now = crate::timer::uptime_us();
+    let duration = now.saturating_sub(disabled_since);
+    
+    if duration >= PREEMPTION_WATCHDOG_PANIC_US {
+        // Critical: been disabled way too long - panic
+        panic!(
+            "WATCHDOG: Preemption disabled for {}ms - system stuck!",
+            duration / 1000
+        );
+    } else if duration >= PREEMPTION_WATCHDOG_WARN_US {
+        // Warning: something is slow
+        return Some(duration);
+    }
+    
+    None
 }
 
 // ============================================================================

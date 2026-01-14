@@ -33,6 +33,7 @@ use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
+use embassy_time::Duration;
 
 // ============================================================================
 // SSH Constants
@@ -61,6 +62,20 @@ const SSH_MSG_CHANNEL_DATA: u8 = 94;
 const SSH_MSG_CHANNEL_EOF: u8 = 96;
 const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
+
+// ============================================================================
+// SSH Timeouts
+// ============================================================================
+
+/// Timeout for initial handshake (version exchange, key exchange, auth)
+const SSH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for idle connections (no data received)
+/// Set to 5 minutes - clients should send keepalives
+const SSH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for shell input reads (shorter, to stay responsive)
+const SSH_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
 const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 
@@ -210,13 +225,24 @@ impl<'a> SshChannelStream<'a> {
                 return Ok(());
             }
 
-            // Read more data from the network
-            match self.stream.read(&mut buf).await {
-                Ok(0) => {
+            // Read more data from the network with timeout
+            let read_result = embassy_time::with_timeout(
+                SSH_READ_TIMEOUT,
+                self.stream.read(&mut buf)
+            ).await;
+            
+            match read_result {
+                Err(_timeout) => {
+                    // Timeout - treat as EOF
                     self.session.channel_eof = true;
                     return Ok(());
                 }
-                Ok(n) => {
+                Ok(Ok(0)) => {
+                    self.session.channel_eof = true;
+                    return Ok(());
+                }
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(n)) => {
                     self.session.input_buffer.extend_from_slice(&buf[..n]);
 
                     // Process any complete packets
@@ -239,7 +265,6 @@ impl<'a> SshChannelStream<'a> {
                         }
                     }
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -1329,15 +1354,33 @@ pub async fn handle_connection(mut stream: TcpStream) {
         return;
     }
 
-    // Main receive loop
+    // Main receive loop with timeout
     let mut buf = [0u8; 512];
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
+        // Use appropriate timeout based on connection state
+        // After authentication, allow longer idle timeout for shell sessions
+        let timeout = if session.state == SshState::Authenticated {
+            SSH_IDLE_TIMEOUT
+        } else {
+            SSH_HANDSHAKE_TIMEOUT
+        };
+        
+        let read_result = embassy_time::with_timeout(timeout, stream.read(&mut buf)).await;
+        
+        match read_result {
+            Err(_timeout) => {
+                log("[SSH] Connection timed out\n");
+                break;
+            }
+            Ok(Ok(0)) => {
                 log("[SSH] Connection closed by peer\n");
                 break;
             }
-            Ok(n) => {
+            Ok(Err(_e)) => {
+                log("[SSH] Read error\n");
+                break;
+            }
+            Ok(Ok(n)) => {
                 session.input_buffer.extend_from_slice(&buf[..n]);
 
                 // Handle version exchange

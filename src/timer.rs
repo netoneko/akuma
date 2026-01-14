@@ -59,6 +59,23 @@ pub fn timer_irq_handler(_irq: u32) {
         asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
     }
 
+    // Check preemption watchdog - detect threads that hold preemption disabled too long
+    if let Some(duration_us) = crate::threading::check_preemption_watchdog() {
+        // Log warning (watchdog will panic if critically stuck)
+        static mut LAST_WARN_US: u64 = 0;
+        let now = uptime_us();
+        // Rate-limit warnings to once per second
+        unsafe {
+            if now.saturating_sub(LAST_WARN_US) > 1_000_000 {
+                LAST_WARN_US = now;
+                crate::console::print(&alloc::format!(
+                    "[WATCHDOG] Preemption disabled for {}ms\n",
+                    duration_us / 1000
+                ));
+            }
+        }
+    }
+
     // NOTE: cleanup_terminated() is NOT called here because it allocates/deallocates
     // memory which could deadlock if main code is in the middle of an allocation.
     // Cleanup should be done from user code via threading::cleanup_terminated().
