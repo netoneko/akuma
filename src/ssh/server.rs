@@ -417,9 +417,10 @@ pub async fn run(stack: Stack<'static>) {
                 crate::threading::cleanup_terminated();
             }
         }
-
-        // Check embassy time alarms
-        crate::embassy_time_driver::on_timer_interrupt();
+        
+        // Note: on_timer_interrupt() is already called by the timer interrupt handler
+        // so we don't need to call it here. Calling it redundantly could cause races
+        // with the critical section in the time driver.
     }
 }
 

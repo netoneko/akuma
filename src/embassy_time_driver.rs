@@ -157,17 +157,22 @@ impl EmbassyTimeDriver {
     }
 
     /// Check and fire any expired wakers - call from timer interrupt
+    /// 
+    /// IMPORTANT: Wakers are collected inside the critical section but woken
+    /// OUTSIDE to avoid potential deadlocks or increased interrupt latency.
     pub fn check_alarms(&self) {
         let now = self.now();
+        
+        // Collect wakers to wake - we'll wake them after releasing the lock
+        let mut wakers_to_wake: [Option<Waker>; QUEUE_SIZE] = Default::default();
 
         critical_section::with(|cs| {
             let mut queue = self.queue.borrow(cs).borrow_mut();
 
-            for entry in queue.iter_mut() {
+            for (i, entry) in queue.iter_mut().enumerate() {
                 if entry.waker.is_some() && entry.at <= now {
-                    if let Some(waker) = entry.waker.take() {
-                        waker.wake();
-                    }
+                    // Take the waker but don't wake it yet (we're in critical section)
+                    wakers_to_wake[i] = entry.waker.take();
                     entry.at = u64::MAX;
                 }
             }
@@ -175,6 +180,12 @@ impl EmbassyTimeDriver {
             // Reschedule hardware timer for next wake
             self.update_hardware_timer_locked(&queue);
         });
+        
+        // Now wake all collected wakers OUTSIDE the critical section
+        // This ensures waker.wake() can do whatever it needs without holding locks
+        for waker in wakers_to_wake.into_iter().flatten() {
+            waker.wake();
+        }
     }
 }
 
@@ -206,26 +217,41 @@ critical_section::set_impl!(CriticalSection);
 
 unsafe impl critical_section::Impl for CriticalSection {
     unsafe fn acquire() -> critical_section::RawRestoreState {
+        // CRITICAL: We must disable IRQs FIRST, atomically, before doing anything else.
+        // This prevents a race where an IRQ fires between reading DAIF and disabling IRQs,
+        // which could corrupt the nesting counter if the IRQ also uses critical_section.
+        //
+        // The sequence is:
+        // 1. Read current DAIF and disable IRQs in one "atomic" block
+        // 2. Then update nesting counter (safe because IRQs are now disabled)
         let daif: u64;
         unsafe {
-            asm!("mrs {}, daif", out(reg) daif);
-            asm!("msr daifset, #2"); // Disable IRQs
+            // Read DAIF and immediately disable IRQs
+            // Using ISB to ensure the disable takes effect before continuing
+            asm!(
+                "mrs {0}, daif",
+                "msr daifset, #2",
+                "isb",
+                out(reg) daif,
+                options(nomem, nostack)
+            );
         }
 
-        let nesting = CS_NESTING.fetch_add(1, Ordering::Relaxed);
+        // Now that IRQs are disabled, we can safely update the nesting counter
+        let nesting = CS_NESTING.fetch_add(1, Ordering::SeqCst);
         if nesting == 0 {
             // First level - save the original DAIF
-            CS_SAVED_DAIF.store(daif, Ordering::Relaxed);
+            CS_SAVED_DAIF.store(daif, Ordering::SeqCst);
         }
     }
 
     unsafe fn release(_restore_state: critical_section::RawRestoreState) {
-        let nesting = CS_NESTING.fetch_sub(1, Ordering::Relaxed);
+        let nesting = CS_NESTING.fetch_sub(1, Ordering::SeqCst);
         if nesting == 1 {
             // Last level - restore the original DAIF
-            let daif = CS_SAVED_DAIF.load(Ordering::Relaxed);
+            let daif = CS_SAVED_DAIF.load(Ordering::SeqCst);
             unsafe {
-                asm!("msr daif, {}", in(reg) daif);
+                asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
             }
         }
     }

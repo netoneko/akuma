@@ -132,18 +132,23 @@ pub fn cleanup_terminated_lockfree() -> usize {
 }
 
 // ============================================================================
-// Preemption Control
+// Preemption Control (Per-Thread)
 // ============================================================================
 
-/// Per-thread preemption disable counter
-/// When > 0, timer-based preemption is blocked for the current thread.
-/// This prevents context switches in the middle of RefCell borrows or other
-/// non-reentrant code sections.
-static PREEMPTION_DISABLED: AtomicUsize = AtomicUsize::new(0);
+/// Per-thread preemption disable counters.
+/// Each thread has its own counter to track nested disable_preemption() calls.
+/// This prevents one thread's preemption state from affecting another thread.
+static PREEMPTION_DISABLED: [AtomicUsize; config::MAX_THREADS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; config::MAX_THREADS]
+};
 
-/// Timestamp (in microseconds) when preemption was last disabled
-/// Used by the watchdog to detect stuck threads
-static PREEMPTION_DISABLED_SINCE: AtomicU64 = AtomicU64::new(0);
+/// Per-thread timestamp (in microseconds) when preemption was last disabled.
+/// Used by the watchdog to detect stuck threads.
+static PREEMPTION_DISABLED_SINCE: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; config::MAX_THREADS]
+};
 
 /// Maximum time preemption can be disabled before watchdog warning (100ms)
 const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;
@@ -154,16 +159,17 @@ const PREEMPTION_WATCHDOG_PANIC_US: u64 = 5_000_000;
 /// Disable preemption for the current thread.
 ///
 /// Can be nested - must call `enable_preemption()` the same number of times.
-/// While preemption is disabled, timer interrupts will not cause a context switch,
-/// but IRQs are still enabled and yield_now() still works.
+/// While preemption is disabled, timer interrupts will not cause a context switch
+/// for THIS thread, but IRQs are still enabled and yield_now() still works.
 ///
 /// Use this to protect code that uses RefCell or other non-thread-safe structures.
 #[inline]
 pub fn disable_preemption() {
-    let prev = PREEMPTION_DISABLED.fetch_add(1, Ordering::SeqCst);
+    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
     // Record timestamp on first disable (nesting level 0 -> 1)
     if prev == 0 {
-        PREEMPTION_DISABLED_SINCE.store(crate::timer::uptime_us(), Ordering::Release);
+        PREEMPTION_DISABLED_SINCE[tid].store(crate::timer::uptime_us(), Ordering::Release);
     }
 }
 
@@ -172,18 +178,20 @@ pub fn disable_preemption() {
 /// Must be called once for each call to `disable_preemption()`.
 #[inline]
 pub fn enable_preemption() {
-    let prev = PREEMPTION_DISABLED.fetch_sub(1, Ordering::SeqCst);
+    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let prev = PREEMPTION_DISABLED[tid].fetch_sub(1, Ordering::SeqCst);
     debug_assert!(prev > 0, "enable_preemption called without matching disable");
     // Clear timestamp when fully re-enabled (nesting level 1 -> 0)
     if prev == 1 {
-        PREEMPTION_DISABLED_SINCE.store(0, Ordering::Release);
+        PREEMPTION_DISABLED_SINCE[tid].store(0, Ordering::Release);
     }
 }
 
-/// Check if preemption is currently disabled.
+/// Check if preemption is currently disabled for the current thread.
 #[inline]
 pub fn is_preemption_disabled() -> bool {
-    PREEMPTION_DISABLED.load(Ordering::SeqCst) > 0
+    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    PREEMPTION_DISABLED[tid].load(Ordering::SeqCst) > 0
 }
 
 /// Check if preemption has been disabled for too long (watchdog).
@@ -192,7 +200,8 @@ pub fn is_preemption_disabled() -> bool {
 /// - None: preemption not disabled or within normal time
 /// - Some(duration_us): preemption disabled for this many microseconds
 pub fn check_preemption_watchdog() -> Option<u64> {
-    let disabled_since = PREEMPTION_DISABLED_SINCE.load(Ordering::Acquire);
+    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
     if disabled_since == 0 {
         return None;
     }
@@ -203,7 +212,8 @@ pub fn check_preemption_watchdog() -> Option<u64> {
     if duration >= PREEMPTION_WATCHDOG_PANIC_US {
         // Critical: been disabled way too long - panic
         panic!(
-            "WATCHDOG: Preemption disabled for {}ms - system stuck!",
+            "WATCHDOG: Thread {} preemption disabled for {}ms - system stuck!",
+            tid,
             duration / 1000
         );
     } else if duration >= PREEMPTION_WATCHDOG_WARN_US {
