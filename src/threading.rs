@@ -594,6 +594,12 @@ impl ThreadPool {
         // Only search in system thread range (skip thread 0 = boot/async)
         for i in 1..config::RESERVED_THREADS {
             if self.slots[i].state == ThreadState::Free {
+                // Ensure stack has correct size for system threads
+                // (may have been changed by spawn_closure_with_stack_size)
+                if self.stacks[i].size != config::SYSTEM_THREAD_STACK_SIZE {
+                    self.reallocate_stack(i, config::SYSTEM_THREAD_STACK_SIZE)?;
+                }
+                
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
@@ -651,6 +657,12 @@ impl ThreadPool {
         // Only search in user thread range
         for i in config::RESERVED_THREADS..config::MAX_THREADS {
             if self.slots[i].state == ThreadState::Free {
+                // Ensure stack has correct size for user threads
+                // (may have been changed by spawn_closure_with_stack_size)
+                if self.stacks[i].size != config::USER_THREAD_STACK_SIZE {
+                    self.reallocate_stack(i, config::USER_THREAD_STACK_SIZE)?;
+                }
+                
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
 
@@ -869,6 +881,15 @@ static VOLUNTARY_SCHEDULE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the thread pool
 pub fn init() {
+    // Print stack requirements before initialization
+    print_stack_requirements();
+    
+    // Verify stack memory fits in available heap
+    let heap_size = crate::allocator::stats().heap_size;
+    if let Err(msg) = verify_stack_memory(heap_size) {
+        panic!("Stack allocation failed: {}", msg);
+    }
+    
     let mut pool = POOL.lock();
     pool.init();
 }
@@ -1419,4 +1440,119 @@ pub fn dump_stack_info() {
         let used_kb = t.stack_used / 1024;
         console::print(&format!("Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb));
     }
+}
+
+// ============================================================================
+// Stack Memory Verification
+// ============================================================================
+
+/// Stack allocation summary for verification
+#[derive(Debug, Clone)]
+pub struct StackAllocationSummary {
+    /// Total stack memory required (bytes)
+    pub total_bytes: usize,
+    /// Boot stack size (thread 0)
+    pub boot_stack: usize,
+    /// Number of system threads (1..RESERVED_THREADS)
+    pub system_thread_count: usize,
+    /// Size per system thread stack
+    pub system_stack_size: usize,
+    /// Total system thread stack memory
+    pub system_total: usize,
+    /// Number of user threads (RESERVED_THREADS..MAX_THREADS)  
+    pub user_thread_count: usize,
+    /// Size per user thread stack
+    pub user_stack_size: usize,
+    /// Total user thread stack memory
+    pub user_total: usize,
+}
+
+/// Calculate the total stack memory required based on kernel config
+/// 
+/// This function computes the expected stack allocation based on:
+/// - Thread 0: KERNEL_STACK_SIZE (boot stack, fixed location)
+/// - Threads 1 to RESERVED_THREADS-1: SYSTEM_THREAD_STACK_SIZE each
+/// - Threads RESERVED_THREADS to MAX_THREADS-1: USER_THREAD_STACK_SIZE each
+///
+/// Note: Thread 0's boot stack is at a fixed address and doesn't count
+/// against heap memory, but is included for completeness.
+pub fn calculate_stack_requirements() -> StackAllocationSummary {
+    let system_thread_count = config::RESERVED_THREADS - 1; // Threads 1 to RESERVED_THREADS-1
+    let user_thread_count = config::MAX_THREADS - config::RESERVED_THREADS;
+    
+    let system_total = system_thread_count * config::SYSTEM_THREAD_STACK_SIZE;
+    let user_total = user_thread_count * config::USER_THREAD_STACK_SIZE;
+    
+    // Boot stack is at fixed location, not from heap
+    let heap_allocated = system_total + user_total;
+    
+    StackAllocationSummary {
+        total_bytes: config::KERNEL_STACK_SIZE + heap_allocated,
+        boot_stack: config::KERNEL_STACK_SIZE,
+        system_thread_count,
+        system_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
+        system_total,
+        user_thread_count,
+        user_stack_size: config::USER_THREAD_STACK_SIZE,
+        user_total,
+    }
+}
+
+/// Verify that stack allocations fit within available heap memory
+///
+/// Returns Ok(summary) if stacks fit, Err with message if not.
+///
+/// # Arguments
+/// * `available_heap` - Total heap memory available (bytes)
+pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSummary, alloc::string::String> {
+    let summary = calculate_stack_requirements();
+    
+    // Only system and user thread stacks come from heap
+    // Boot stack is at fixed location
+    let heap_required = summary.system_total + summary.user_total;
+    
+    if heap_required > available_heap {
+        return Err(alloc::format!(
+            "Stack memory exceeds heap! Required: {} KB, Available: {} KB\n\
+             Breakdown:\n\
+             - {} system threads × {} KB = {} KB\n\
+             - {} user threads × {} KB = {} KB",
+            heap_required / 1024,
+            available_heap / 1024,
+            summary.system_thread_count,
+            summary.system_stack_size / 1024,
+            summary.system_total / 1024,
+            summary.user_thread_count,
+            summary.user_stack_size / 1024,
+            summary.user_total / 1024,
+        ));
+    }
+    
+    Ok(summary)
+}
+
+/// Print stack allocation summary to console
+pub fn print_stack_requirements() {
+    use crate::console;
+    use alloc::format;
+    
+    let summary = calculate_stack_requirements();
+    let heap_required = summary.system_total + summary.user_total;
+    
+    console::print("=== Stack Memory Requirements ===\n");
+    console::print(&format!("Boot stack (fixed):     {} KB\n", summary.boot_stack / 1024));
+    console::print(&format!("System threads:         {} × {} KB = {} KB\n",
+        summary.system_thread_count,
+        summary.system_stack_size / 1024,
+        summary.system_total / 1024));
+    console::print(&format!("User threads:           {} × {} KB = {} KB\n",
+        summary.user_thread_count,
+        summary.user_stack_size / 1024,
+        summary.user_total / 1024));
+    console::print(&format!("Total from heap:        {} KB ({} MB)\n",
+        heap_required / 1024,
+        heap_required / (1024 * 1024)));
+    console::print(&format!("Grand total:            {} KB ({} MB)\n",
+        summary.total_bytes / 1024,
+        summary.total_bytes / (1024 * 1024)));
 }
