@@ -6,7 +6,32 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// Note: embassy_time Timer removed - doesn't work in block_on context
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A future that yields once then completes
+/// This allows proper async yielding in poll_fn contexts
+struct YieldOnce(bool);
+
+impl YieldOnce {
+    fn new() -> Self {
+        YieldOnce(false)
+    }
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+    
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
 use spinning_top::Spinlock;
 
 use crate::config;
@@ -1066,34 +1091,20 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
-    // Poll for completion - yield to scheduler to let user thread run
-    //
-    // NOTE: We use yield_now() + spin delay instead of embassy Timer because:
-    // - Embassy timers only advance when thread 0's executor runs
-    // - SSH sessions run in block_on() which doesn't poll embassy timers
-    // - Using embassy Timer here would cause infinite waiting
+    // Wait for process to complete
+    // Each iteration yields once (returns Pending) so block_on can yield to scheduler
     loop {
         // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
             break;
         }
 
-        // Check if interrupted
         if channel.is_interrupted() {
-            // Give the process a moment to handle the interrupt
-            for _ in 0..1000 {
-                crate::threading::yield_now();
-            }
             break;
         }
 
-        // Yield to let the user thread (running the process) get scheduled
-        crate::threading::yield_now();
-        
-        // Small spin delay to avoid hammering the scheduler
-        for _ in 0..100 {
-            core::hint::spin_loop();
-        }
+        // Yield once - this returns Pending, block_on yields, then we get polled again
+        YieldOnce::new().await;
     }
 
     // Collect all output
@@ -1166,16 +1177,8 @@ where
             break;
         }
 
-        // Yield to let the user thread (running the process) get scheduled
-        // NOTE: We use yield_now() instead of embassy Timer because:
-        // - Embassy timers only advance when thread 0's executor runs
-        // - SSH sessions run in block_on() which doesn't poll embassy timers
-        crate::threading::yield_now();
-        
-        // Small spin delay to avoid hammering the scheduler
-        for _ in 0..100 {
-            core::hint::spin_loop();
-        }
+        // Yield once - block_on will yield to scheduler and re-poll us
+        YieldOnce::new().await;
     }
 
     let exit_code = channel.exit_code();
