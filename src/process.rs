@@ -1061,6 +1061,11 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
 
     // Poll for completion using async timer to yield to embassy executor
     // This allows other SSH sessions and network I/O to proceed
+    //
+    // NOTE: We don't call yield_now() here because:
+    // 1. System threads are preemptive (10ms timer handles scheduling)
+    // 2. yield_now() acquires POOL lock, causing contention
+    // 3. The spawned process runs on a separate thread with its own time slice
     loop {
         // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
@@ -1074,12 +1079,9 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
             break;
         }
 
-        // Yield to kernel scheduler to let spawned thread run
-        crate::threading::yield_now();
-
-        // Use embassy timer to yield to async executor (allows other tasks to run)
-        // This is crucial for keeping other SSH sessions responsive
-        Timer::after(Duration::from_millis(1)).await;
+        // Use embassy timer to yield to async executor
+        // 10ms matches the kernel's preemption interval, reducing unnecessary wake-ups
+        Timer::after(Duration::from_millis(10)).await;
     }
 
     // Collect all output
@@ -1152,12 +1154,10 @@ where
             break;
         }
 
-        // Yield to kernel scheduler to let spawned thread run
-        crate::threading::yield_now();
-
         // Use embassy timer to yield to async executor
-        // This allows other SSH sessions to remain responsive
-        Timer::after(Duration::from_millis(1)).await;
+        // 10ms matches the kernel's preemption interval
+        // No yield_now() needed - system threads are preemptive
+        Timer::after(Duration::from_millis(10)).await;
     }
 
     let exit_code = channel.exit_code();

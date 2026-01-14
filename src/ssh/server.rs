@@ -400,8 +400,15 @@ pub async fn run(stack: Stack<'static>) {
             embassy_time::Timer::after(Duration::from_millis(10)).await;
         }
 
-        // Clean up terminated threads
-        crate::threading::cleanup_terminated();
+        // Clean up terminated threads periodically (not every loop iteration)
+        // This reduces POOL lock contention
+        static mut CLEANUP_COUNTER: u32 = 0;
+        unsafe {
+            CLEANUP_COUNTER = CLEANUP_COUNTER.wrapping_add(1);
+            if CLEANUP_COUNTER % 100 == 0 {
+                crate::threading::cleanup_terminated();
+            }
+        }
 
         // Check embassy time alarms
         crate::embassy_time_driver::on_timer_interrupt();
