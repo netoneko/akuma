@@ -993,7 +993,11 @@ pub fn spawn_process_with_channel(
     stdin: Option<&[u8]>,
 ) -> Result<(usize, Arc<ProcessChannel>), String> {
     // Check if user threads are available
-    if crate::threading::user_threads_available() == 0 {
+    let avail = crate::threading::user_threads_available();
+    crate::console::print(&alloc::format!(
+        "[spawn_process] path={} user_threads_available={}\n", path, avail
+    ));
+    if avail == 0 {
         return Err("No available user threads for process execution".into());
     }
 
@@ -1039,6 +1043,9 @@ pub fn spawn_process_with_channel(
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
+    crate::console::print(&alloc::format!(
+        "[spawn_process] spawned thread {} for {}\n", thread_id, path
+    ));
     Ok((thread_id, channel))
 }
 

@@ -23,6 +23,7 @@ pub mod thread_state {
     pub const READY: u8 = 1;
     pub const RUNNING: u8 = 2;
     pub const TERMINATED: u8 = 3;
+    pub const INITIALIZING: u8 = 4; // Thread claimed but context not yet set up
 }
 
 /// Atomic thread states - lock-free access
@@ -37,13 +38,16 @@ static CURRENT_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 /// Atomically claim a free slot in the given range
 /// Returns the slot index if successful, None if no free slots
+/// NOTE: Sets state to INITIALIZING, not READY - caller must set to READY after context setup!
 fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
     for i in start..end {
-        // Try to atomically change FREE -> READY
+        // Try to atomically change FREE -> INITIALIZING
+        // We use INITIALIZING (not READY) to prevent scheduler from picking up
+        // the thread before its context is fully set up
         if THREAD_STATES[i]
             .compare_exchange(
                 thread_state::FREE,
-                thread_state::READY,
+                thread_state::INITIALIZING,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
@@ -504,6 +508,7 @@ impl ThreadPool {
         // to avoid preemption during critical I/O operations. It still gets
         // preempted after the timeout to allow other threads to run.
         self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
+        THREAD_STATES[IDLE_THREAD_IDX].store(thread_state::RUNNING, Ordering::SeqCst);
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
         self.slots[IDLE_THREAD_IDX].start_time_us = crate::timer::uptime_us();
@@ -553,7 +558,7 @@ impl ThreadPool {
         if slot_idx >= config::MAX_THREADS {
             return Err("Invalid slot index");
         }
-        if self.slots[slot_idx].state != ThreadState::Free {
+        if THREAD_STATES[slot_idx].load(Ordering::SeqCst) != thread_state::FREE {
             return Err("Can only reallocate stack for free slot");
         }
 
@@ -605,7 +610,7 @@ impl ThreadPool {
 
         // Find first free slot (skip slot 0 = idle)
         for i in 1..config::MAX_THREADS {
-            if self.slots[i].state == ThreadState::Free {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // Reallocate stack if size differs
                 if self.stacks[i].size != stack_size {
                     self.reallocate_stack(i, stack_size)?;
@@ -650,6 +655,7 @@ impl ThreadPool {
 
                 // Set state last (makes thread visible to scheduler)
                 self.slots[i].state = ThreadState::Ready;
+                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
             }
@@ -674,7 +680,7 @@ impl ThreadPool {
 
         // Only search in system thread range (skip thread 0 = boot/async)
         for i in 1..config::RESERVED_THREADS {
-            if self.slots[i].state == ThreadState::Free {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // System thread stacks should be pre-allocated at correct size
                 // If not, something corrupted them (bug in spawn_closure_with_stack_size)
                 debug_assert!(
@@ -716,6 +722,7 @@ impl ThreadPool {
                 self.slots[i].timeout_us = 0;
 
                 self.slots[i].state = ThreadState::Ready;
+                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
             }
@@ -740,7 +747,7 @@ impl ThreadPool {
 
         // Only search in user thread range
         for i in config::RESERVED_THREADS..config::MAX_THREADS {
-            if self.slots[i].state == ThreadState::Free {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // User thread stacks should be pre-allocated at correct size
                 debug_assert!(
                     self.stacks[i].size == config::USER_THREAD_STACK_SIZE,
@@ -785,6 +792,7 @@ impl ThreadPool {
                 };
 
                 self.slots[i].state = ThreadState::Ready;
+                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
             }
@@ -795,9 +803,11 @@ impl ThreadPool {
 
     /// Reclaim a terminated thread slot (just mark as Free)
     pub fn reclaim(&mut self, idx: usize) {
-        if idx > 0 && idx < config::MAX_THREADS && self.slots[idx].state == ThreadState::Terminated
+        if idx > 0 && idx < config::MAX_THREADS && 
+           THREAD_STATES[idx].load(Ordering::SeqCst) == thread_state::TERMINATED
         {
             self.slots[idx].state = ThreadState::Free;
+            THREAD_STATES[idx].store(thread_state::FREE, Ordering::SeqCst);
             // Re-initialize canary for reuse
             if config::ENABLE_STACK_CANARIES && self.stacks[idx].is_allocated() {
                 init_stack_canary(self.stacks[idx].base);
@@ -809,8 +819,9 @@ impl ThreadPool {
     pub fn cleanup_terminated(&mut self) -> usize {
         let mut count = 0;
         for i in 1..config::MAX_THREADS {
-            if self.slots[i].state == ThreadState::Terminated {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::TERMINATED {
                 self.slots[i].state = ThreadState::Free;
+                THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
                 // Re-initialize canary for reuse
                 if config::ENABLE_STACK_CANARIES && self.stacks[i].is_allocated() {
                     init_stack_canary(self.stacks[i].base);
@@ -1189,9 +1200,14 @@ where
         pool.slots[slot_idx].cooperative = false; // System threads are preemptible
         pool.slots[slot_idx].start_time_us = 0;
         pool.slots[slot_idx].timeout_us = 0;
+        
+        // Sync slot state
+        pool.slots[slot_idx].state = ThreadState::Ready;
+        
+        // NOW set atomic state to READY - context is fully set up, scheduler can run it
+        THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
     });
     
-    // Slot is already READY (set by claim_free_slot), scheduler will pick it up
     Ok(slot_idx)
 }
 
@@ -1276,9 +1292,14 @@ where
         pool.slots[slot_idx].cooperative = cooperative;
         pool.slots[slot_idx].start_time_us = 0;
         pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
+        
+        // Sync slot state
+        pool.slots[slot_idx].state = ThreadState::Ready;
+        
+        // NOW set atomic state to READY - context is fully set up, scheduler can run it
+        THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
     });
     
-    // Slot is already READY (set by claim_free_slot), scheduler will pick it up
     Ok(slot_idx)
 }
 
@@ -1313,6 +1334,7 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
         thread_state::READY => ThreadState::Ready,
         thread_state::RUNNING => ThreadState::Running,
         thread_state::TERMINATED => ThreadState::Terminated,
+        thread_state::INITIALIZING => ThreadState::Ready, // Treat as ready for display
         _ => ThreadState::Free,
     })
 }
@@ -1434,7 +1456,7 @@ struct ThreadPoolSnapshot {
 
 /// Get list of all kernel threads with their info
 pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
-    // Take a quick snapshot while holding lock - just copy arrays
+    // Take a quick snapshot - read atomic states (lock-free) and pool data (brief lock)
     let snapshot: ThreadPoolSnapshot = with_irqs_disabled(|| {
         let pool = POOL.lock();
         
@@ -1443,7 +1465,15 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         let mut sps = [0u64; config::MAX_THREADS];
         
         for i in 0..config::MAX_THREADS {
-            states[i] = pool.slots[i].state;
+            // Read state from atomic array (lock-free source of truth)
+            states[i] = match THREAD_STATES[i].load(Ordering::Relaxed) {
+                thread_state::FREE => ThreadState::Free,
+                thread_state::READY => ThreadState::Ready,
+                thread_state::RUNNING => ThreadState::Running,
+                thread_state::TERMINATED => ThreadState::Terminated,
+                thread_state::INITIALIZING => ThreadState::Ready, // Show as ready (being set up)
+                _ => ThreadState::Free,
+            };
             cooperative[i] = pool.slots[i].cooperative;
             sps[i] = pool.slots[i].context.sp;
         }

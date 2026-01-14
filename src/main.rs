@@ -690,12 +690,12 @@ async fn memory_monitor() -> ! {
         let free_kb = stats.free / 1024;
         let peak_kb = stats.peak_allocated / 1024;
         let heap_mb = stats.heap_size / 1024 / 1024;
-
+        let uptime_us = timer::uptime_us();
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
-            allocated_kb, free_kb, peak_kb, heap_mb, stats.allocation_count
+            "[Mem] Uptime {} | Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
+            uptime_us, allocated_kb, free_kb, peak_kb, heap_mb, stats.allocation_count
         );
         console::print(buf.as_str());
 

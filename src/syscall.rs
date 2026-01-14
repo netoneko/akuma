@@ -311,10 +311,11 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         proc.write_stdout(buf);
     }
 
-    // Also print to kernel console for debugging
+    // Debug: print to kernel console (comment out for production)
+    // This helps verify parallel execution is actually happening
     if let Ok(s) = core::str::from_utf8(buf) {
         console::print(s);
     }
-
+    
     count as u64
 }

@@ -167,7 +167,15 @@ fn block_on<F: Future>(mut future: F) -> F::Output {
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        match future.as_mut().poll(&mut cx) {
+        // CRITICAL: Disable preemption during poll to prevent RefCell conflicts
+        // Embassy-net uses RefCell internally which is not thread-safe.
+        // If we get preempted while borrowing the RefCell, another thread
+        // might try to borrow it too → panic.
+        crate::threading::disable_preemption();
+        let poll_result = future.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match poll_result {
             Poll::Ready(output) => return output,
             Poll::Pending => {
                 // Yield to the scheduler to allow other threads to run
