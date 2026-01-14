@@ -1089,7 +1089,7 @@ where
 ///
 /// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_available() -> usize {
-    // with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut count = 0;
         for i in 1..config::RESERVED_THREADS {
@@ -1098,7 +1098,7 @@ pub fn system_threads_available() -> usize {
             }
         }
         count
-    // })
+    })
 }
 
 /// Count active system threads
@@ -1212,19 +1212,22 @@ pub fn get_thread_state(thread_id: usize) -> Option<ThreadState> {
 /// Check all thread stacks for overlap (debug/diagnostic)
 /// Returns list of (thread_a, thread_b) pairs that overlap
 pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
-    // with_irqs_disabled(|| {
+    // Copy stack info while holding lock (quick), process outside
+    let stacks: [StackInfo; config::MAX_THREADS] = with_irqs_disabled(|| {
         let pool = POOL.lock();
-        let mut overlaps = Vec::new();
+        pool.stacks
+    });
 
-        for i in 0..config::MAX_THREADS {
-            for j in (i + 1)..config::MAX_THREADS {
-                if pool.stacks[i].overlaps(&pool.stacks[j]) {
-                    overlaps.push((i, j));
-                }
+    // O(n²) check done outside critical section
+    let mut overlaps = Vec::new();
+    for i in 0..config::MAX_THREADS {
+        for j in (i + 1)..config::MAX_THREADS {
+            if stacks[i].overlaps(&stacks[j]) {
+                overlaps.push((i, j));
             }
         }
-        overlaps
-    // })
+    }
+    overlaps
 }
 
 /// Get stack bounds for a thread
@@ -1260,19 +1263,20 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
         return Vec::new();
     }
 
-    with_irqs_disabled(|| {
+    // Copy stack info quickly while holding lock
+    let stacks: [StackInfo; config::MAX_THREADS] = with_irqs_disabled(|| {
         let pool = POOL.lock();
-        let mut bad = Vec::new();
+        pool.stacks
+    });
 
-        // Skip boot thread (index 0) - it uses fixed boot stack
-        for i in 1..config::MAX_THREADS {
-            let stack = &pool.stacks[i];
-            if stack.is_allocated() && !check_stack_canary(stack.base) {
-                bad.push(i);
-            }
+    // Check canaries outside critical section (memory reads can be slow)
+    let mut bad = Vec::new();
+    for i in 1..config::MAX_THREADS {
+        if stacks[i].is_allocated() && !check_stack_canary(stacks[i].base) {
+            bad.push(i);
         }
-        bad
-    })
+    }
+    bad
 }
 
 /// Check if there are any threads ready to run
@@ -1308,74 +1312,100 @@ pub struct KernelThreadInfo {
     pub name: &'static str,
 }
 
+/// Snapshot data copied from thread pool (to minimize IRQ-disabled time)
+struct ThreadPoolSnapshot {
+    states: [ThreadState; config::MAX_THREADS],
+    cooperative: [bool; config::MAX_THREADS],
+    sps: [u64; config::MAX_THREADS],
+    stacks: [StackInfo; config::MAX_THREADS],
+}
+
 /// Get list of all kernel threads with their info
 pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
-    // with_irqs_disabled(|| {
+    // Take a quick snapshot while holding lock - just copy arrays
+    let snapshot: ThreadPoolSnapshot = with_irqs_disabled(|| {
         let pool = POOL.lock();
-        let mut threads = Vec::new();
-
+        
+        let mut states = [ThreadState::Free; config::MAX_THREADS];
+        let mut cooperative = [false; config::MAX_THREADS];
+        let mut sps = [0u64; config::MAX_THREADS];
+        
         for i in 0..config::MAX_THREADS {
-            let slot = &pool.slots[i];
-            let stack = &pool.stacks[i];
+            states[i] = pool.slots[i].state;
+            cooperative[i] = pool.slots[i].cooperative;
+            sps[i] = pool.slots[i].context.sp;
+        }
+        
+        ThreadPoolSnapshot {
+            states,
+            cooperative,
+            sps,
+            stacks: pool.stacks,
+        }
+    });
 
-            // Skip free slots
-            if slot.state == ThreadState::Free {
-                continue;
-            }
+    // Process snapshot outside critical section (Vec allocation, canary checks, etc.)
+    let mut threads = Vec::new();
 
-            let state_str = match slot.state {
-                ThreadState::Free => "free",
-                ThreadState::Ready => "ready",
-                ThreadState::Running => "running",
-                ThreadState::Terminated => "zombie",
-            };
-
-            // Estimate stack usage from saved SP in context
-            let stack_used = if stack.is_allocated() && slot.context.sp != 0 {
-                // SP points to current stack position (grows down)
-                // Usage = top - SP
-                let sp = slot.context.sp as usize;
-                if sp >= stack.base && sp <= stack.top {
-                    stack.top.saturating_sub(sp)
-                } else {
-                    0 // SP outside stack bounds
-                }
-            } else {
-                0
-            };
-
-            // Check canary status
-            let canary_ok = if i == 0 || !stack.is_allocated() {
-                true // Boot stack or unallocated
-            } else if config::ENABLE_STACK_CANARIES {
-                check_stack_canary(stack.base)
-            } else {
-                true // Canaries disabled
-            };
-
-            // Thread name based on index range and state
-            let name = match i {
-                0 => "bootstrap",
-                1 => if crate::config::COOPERATIVE_MAIN_THREAD { "system-thread" } else { "network" },
-                2..=7 => "system-thread", // System threads for SSH sessions
-                _ if slot.cooperative => "cooperative",
-                _ => "user-process", // User process threads (8+)
-            };
-
-            threads.push(KernelThreadInfo {
-                tid: i,
-                state: state_str,
-                cooperative: slot.cooperative,
-                stack_base: stack.base,
-                stack_size: stack.size,
-                stack_used,
-                canary_ok,
-                name,
-            });
+    for i in 0..config::MAX_THREADS {
+        // Skip free slots
+        if snapshot.states[i] == ThreadState::Free {
+            continue;
         }
 
-        threads
-    // })
+        let state_str = match snapshot.states[i] {
+            ThreadState::Free => "free",
+            ThreadState::Ready => "ready",
+            ThreadState::Running => "running",
+            ThreadState::Terminated => "zombie",
+        };
+
+        let stack = &snapshot.stacks[i];
+        let sp = snapshot.sps[i];
+
+        // Estimate stack usage from saved SP in context
+        let stack_used = if stack.is_allocated() && sp != 0 {
+            let sp_usize = sp as usize;
+            if sp_usize >= stack.base && sp_usize <= stack.top {
+                stack.top.saturating_sub(sp_usize)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Check canary status (memory read, done outside lock)
+        let canary_ok = if i == 0 || !stack.is_allocated() {
+            true
+        } else if config::ENABLE_STACK_CANARIES {
+            check_stack_canary(stack.base)
+        } else {
+            true
+        };
+
+        // Thread name based on index range and state
+        let name = match i {
+            0 => "bootstrap",
+            1 => if crate::config::COOPERATIVE_MAIN_THREAD { "system-thread" } else { "network" },
+            2..=7 => "system-thread",
+            _ if snapshot.cooperative[i] => "cooperative",
+            _ => "user-process",
+        };
+
+        threads.push(KernelThreadInfo {
+            tid: i,
+            state: state_str,
+            cooperative: snapshot.cooperative[i],
+            stack_base: stack.base,
+            stack_size: stack.size,
+            stack_used,
+            canary_ok,
+            name,
+        });
+    }
+
+    threads
 }
 
 pub fn dump_stack_info() {

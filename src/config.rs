@@ -73,7 +73,7 @@ pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 /// When enabled, canary values are written at the bottom of each thread stack
 /// and periodically checked to detect stack overflow.
 /// Disable for slightly better performance in production.
-pub const ENABLE_STACK_CANARIES: bool = true;
+pub const ENABLE_STACK_CANARIES: bool = false; // disabled because it can lead to interrupt exhaustion
 
 /// Stack canary value
 ///

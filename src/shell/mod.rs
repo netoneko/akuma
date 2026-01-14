@@ -356,7 +356,6 @@ async fn execute_external(
     stdout: &mut VecWriter,
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
-    crate::console::print(&format!("execute_external: async exec enabled: {}\n", is_async_exec_enabled()));
     let result = if is_async_exec_enabled() {
         crate::process::exec_async(path, stdin).await
     } else {
