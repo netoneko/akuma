@@ -2274,7 +2274,6 @@ fn test_parallel_processes() -> bool {
     };
 
     console::print(&format!("  Spawned threads {} and {}\n", tid1, tid2));
-    console::print("Calling ps\n");
     
     // The fact that we spawned two processes on different threads (tid1 != tid2)
     // and they both complete successfully proves parallel execution capability.
@@ -2285,6 +2284,7 @@ fn test_parallel_processes() -> bool {
     let complete_timeout = 30_000_000; // 30 seconds (hello runs for ~10 seconds)
     let complete_start = crate::timer::uptime_us();
     let mut ps_done = false;
+    let mut kthreads_done = false;
 
     loop {
         threading::yield_now();
@@ -2297,40 +2297,69 @@ fn test_parallel_processes() -> bool {
             console::print(" done\n");
             PROCESS1_DONE.store(true, Ordering::Release);
             PROCESS2_DONE.store(true, Ordering::Release);
-
-            if ps_done {
-                console::print("ps done!\n");
-            }
             break;
         } else {
-            // builtin::PsCommand.execute(&[], stdin, stdout, ctx);            
+            // Run ps and kthreads checks after a brief delay to let processes start
+            if crate::timer::uptime_us() - complete_start > complete_timeout / 100 && (!ps_done || !kthreads_done) {
+                // Test ps command
+                if !ps_done {
+                    let ps_result =
+                    crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
 
-            if crate::timer::uptime_us() - complete_start > complete_timeout / 100 && !ps_done {
-                let ps_result =
-                crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
+                    match ps_result {
+                        Ok(value) => {
+                            let value_as_str = String::from_utf8_lossy(&value);
+                            console::print(&format!("ps output:\n{}\n", value_as_str));
 
-                match ps_result {
-                    Ok(value) => {
-                        let value_as_str = String::from_utf8_lossy(&value);
-                        console::print(&format!("ps output:\n{}\n", value_as_str));
+                            let values_split = value_as_str.split('\n').collect::<Vec<&str>>();
+                            let process_name = String::from("/bin/hello");
+                            let process_state = String::from("running");
 
-                        let values_split =value_as_str.split('\n').collect::<Vec<&str>>();
-                        let process_name = String::from("/bin/hello");
-                        let process_state = String::from("running");
-
-                        // console::print(&format!("values_split.len(): {:?}\n", values_split.len()));
-
-                        if values_split.len() >= 3 {
-                            // console::print(&format!("values_split[1]: {:?}\n", values_split[1]));
-                            // console::print(&format!("values_split[2]: {:?}\n", values_split[2]));
-                            if values_split[1].contains(&process_name) && values_split[1].contains(&process_state) && 
-                                values_split[2].contains(&process_name) && values_split[2].contains(&process_state) {
-                                ps_done = true;
+                            if values_split.len() >= 3 {
+                                if values_split[1].contains(&process_name) && values_split[1].contains(&process_state) && 
+                                    values_split[2].contains(&process_name) && values_split[2].contains(&process_state) {
+                                    ps_done = true;
+                                    console::print("  ps check: PASS (both processes visible)\n");
+                                }
                             }
                         }
+                        Err(_) => {
+                            console::print("ps failed!\n");
+                        }
                     }
-                    Err(_) => {
-                        console::print("ps failed!\n");
+                }
+
+                // Test kthreads command
+                if !kthreads_done {
+                    let kthreads_result =
+                    crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"kthreads").await });
+
+                    match kthreads_result {
+                        Ok(value) => {
+                            let value_as_str = String::from_utf8_lossy(&value);
+                            console::print(&format!("kthreads output:\n{}\n", value_as_str));
+
+                            // Check that both thread IDs appear as user-process threads
+                            let tid1_str = format!("{:>4}", tid1);
+                            let tid2_str = format!("{:>4}", tid2);
+                            let user_process = "user-process";
+                            
+                            let has_tid1 = value_as_str.lines().any(|line| 
+                                line.contains(&tid1_str) && line.contains(user_process));
+                            let has_tid2 = value_as_str.lines().any(|line| 
+                                line.contains(&tid2_str) && line.contains(user_process));
+
+                            if has_tid1 && has_tid2 {
+                                kthreads_done = true;
+                                console::print(&format!("  kthreads check: PASS (threads {} and {} visible as user-process)\n", tid1, tid2));
+                            } else {
+                                console::print(&format!("  kthreads check: waiting (tid1={} found={}, tid2={} found={})\n", 
+                                    tid1, has_tid1, tid2, has_tid2));
+                            }
+                        }
+                        Err(_) => {
+                            console::print("kthreads failed!\n");
+                        }
                     }
                 }
             }
@@ -2342,8 +2371,6 @@ fn test_parallel_processes() -> bool {
             // Continue to cleanup even on timeout
             break;
         }
-
-
     }
 
     // Cleanup
@@ -2360,13 +2387,14 @@ fn test_parallel_processes() -> bool {
     // Success criteria:
     // 1. Both processes spawned on different threads (tid1 != tid2)
     // 2. Both processes completed successfully
+    // 3. Both ps and kthreads commands showed the processes/threads
     // The interleaved output visible in logs proves true parallel execution
     let threads_different = tid1 != tid2;
-    let ok = threads_different && p1_done && p2_done && ps_done;
+    let ok = threads_different && p1_done && p2_done && ps_done && kthreads_done;
     
     if !ok {
-        console::print(&format!("  tid1={}, tid2={}, P1 done: {}, P2 done: {}\n", 
-                               tid1, tid2, p1_done, p2_done));
+        console::print(&format!("  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}\n", 
+                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done));
     }
     
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
