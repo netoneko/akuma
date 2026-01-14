@@ -871,7 +871,6 @@ async fn run_shell_session(
                             match byte {
                                 b'A' => {
                                     // Up arrow - previous history
-                                    let _ = crate::threading::dump_stack_info();
                                     if !history.is_empty() && history_index > 0 {
                                         // Save current line if at the end
                                         if history_index == history.len() {
