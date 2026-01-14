@@ -27,11 +27,29 @@ use crate::virtio_hal::VirtioHal;
 /// preventing races between the network runner (thread 0) and session threads.
 static VIRTIO_LOCK: Spinlock<()> = Spinlock::new(());
 
-/// Execute a closure while holding the virtio lock
+/// Maximum attempts to acquire virtio lock before giving up
+/// This prevents deadlock when preemption is disabled and another thread holds the lock
+const VIRTIO_LOCK_MAX_ATTEMPTS: usize = 1000;
+
+/// Execute a closure while holding the virtio lock.
+/// Uses try_lock to avoid deadlock when preemption is disabled.
+/// Returns None if lock cannot be acquired after max attempts.
 #[inline]
-fn with_virtio_lock<R, F: FnOnce() -> R>(f: F) -> R {
-    let _guard = VIRTIO_LOCK.lock();
-    f()
+fn with_virtio_lock<R, F: FnOnce() -> R>(f: F) -> Option<R> {
+    // Try to acquire lock with limited spinning
+    for _ in 0..VIRTIO_LOCK_MAX_ATTEMPTS {
+        if let Some(guard) = VIRTIO_LOCK.try_lock() {
+            let result = f();
+            drop(guard);
+            return Some(result);
+        }
+        // Brief spin before retry
+        for _ in 0..10 {
+            core::hint::spin_loop();
+        }
+    }
+    // Could not acquire lock - avoid deadlock by returning None
+    None
 }
 
 // ============================================================================
@@ -109,7 +127,8 @@ impl EmbassyVirtioDriver {
         }
 
         // All virtio MMIO operations must be done under the global lock
-        with_virtio_lock(|| {
+        // Use try_lock to avoid deadlock when preemption is disabled
+        let result = with_virtio_lock(|| {
             // Check if we have a pending receive
             if let Some(token) = self.rx_pending_token {
                 if self.inner.poll_receive().is_some() {
@@ -148,25 +167,32 @@ impl EmbassyVirtioDriver {
                 }
             }
             false
-        })
+        });
+        
+        // If we couldn't acquire the lock, return false (no data available)
+        result.unwrap_or(false)
     }
 
     /// Wake any pending RX waker
+    /// Note: Waker is taken inside critical section but woken OUTSIDE to avoid deadlocks
     pub fn wake_rx(&self) {
-        critical_section::with(|cs| {
-            if let Some(waker) = self.rx_waker.borrow(cs).borrow_mut().take() {
-                waker.wake();
-            }
+        let waker = critical_section::with(|cs| {
+            self.rx_waker.borrow(cs).borrow_mut().take()
         });
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 
     /// Wake any pending TX waker
+    /// Note: Waker is taken inside critical section but woken OUTSIDE to avoid deadlocks
     pub fn wake_tx(&self) {
-        critical_section::with(|cs| {
-            if let Some(waker) = self.tx_waker.borrow(cs).borrow_mut().take() {
-                waker.wake();
-            }
+        let waker = critical_section::with(|cs| {
+            self.tx_waker.borrow(cs).borrow_mut().take()
         });
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }
 
@@ -273,7 +299,8 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     {
         let result = f(&mut self.device.tx_buffer[..len]);
         // All virtio MMIO operations must be done under the global lock
-        with_virtio_lock(|| {
+        // Use try_lock to avoid deadlock - if we can't send now, packet is dropped
+        let _ = with_virtio_lock(|| {
             let _ = self.device.inner.send(&self.device.tx_buffer[..len]);
         });
         result

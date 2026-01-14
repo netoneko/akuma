@@ -27,11 +27,12 @@ pub const KERNEL_STACK_SIZE: usize = 1024 * 1024;
 /// Consider using `ASYNC_THREAD_STACK_SIZE` for network-heavy threads.
 pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 
-/// Stack size for networking/async thread (256KB)
+/// Stack size for networking/async thread (512KB)
 ///
 /// Larger stack to handle deep SSH/HTTP async call chains.
 /// Use this for threads that run the async executor or network services.
-pub const ASYNC_THREAD_STACK_SIZE: usize = 256 * 1024;
+/// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
+pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
 /// User process stack size (64KB default)
 ///
@@ -56,11 +57,13 @@ pub const MAX_THREADS: usize = 32;
 /// User processes can only spawn on threads RESERVED_THREADS through MAX_THREADS-1.
 pub const RESERVED_THREADS: usize = 8;
 
-/// Stack size for reserved system threads (256KB)
+/// Stack size for reserved system threads (512KB)
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
 /// Larger stacks to handle deep SSH/HTTP async call chains.
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 256 * 1024;
+/// Note: The async main thread (when COOPERATIVE_MAIN_THREAD=false) runs on
+/// a system thread and needs significant stack space for pinned futures.
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 
 /// Stack size for user process threads (64KB)
 ///
@@ -99,13 +102,17 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 
 /// Use cooperative main thread
 ///
-/// When enabled, the main thread (thread 0) runs the async loop directly.
-/// When disabled, the async loop runs in a separate preemptive thread.
+/// When enabled, the main thread (thread 0) runs the async loop directly on the
+/// 1MB boot stack. When disabled, it runs on a system thread with 512KB stack.
+///
+/// RECOMMENDATION: Set to `true` if experiencing stack exhaustion issues.
+/// The async main loop pins 6 complex futures (SSH, HTTP, network) which can
+/// require significant stack space for deep async call chains.
 ///
 /// Both modes are now safe due to preemption control around embassy-net polling.
 /// The polling loop uses disable_preemption()/enable_preemption() to protect
 /// embassy-net's internal RefCells from re-entrant access during timer preemption.
-pub const COOPERATIVE_MAIN_THREAD: bool = false;
+pub const COOPERATIVE_MAIN_THREAD: bool = true;
 
 
 // Does not actually work, blocks new ssh connections for unknown reasons

@@ -580,62 +580,138 @@ fn run_async_main() -> ! {
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
     }
 
+    // Loop iteration counter for debugging hangs (using atomics for safety)
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LOOP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static LAST_HEARTBEAT_US: AtomicU64 = AtomicU64::new(0);
+    const HEARTBEAT_INTERVAL_US: u64 = 30_000_000; // 30 seconds
+
     loop {
+        // Periodic heartbeat that doesn't rely on async (for debugging hangs)
+        let count = LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now_us = timer::uptime_us();
+        let last_heartbeat = LAST_HEARTBEAT_US.load(Ordering::Relaxed);
+        if now_us.saturating_sub(last_heartbeat) >= HEARTBEAT_INTERVAL_US {
+            LAST_HEARTBEAT_US.store(now_us, Ordering::Relaxed);
+            
+            // Check stack usage
+            let sp: u64;
+            unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)); }
+            let tid = threading::current_thread_id();
+            
+            // Calculate stack usage based on mode
+            let (stack_used_kb, stack_mode) = if config::COOPERATIVE_MAIN_THREAD {
+                // Boot stack: 0x41F00000-0x42000000 (1MB)
+                let used = 0x4200_0000u64.saturating_sub(sp) / 1024;
+                (used, "boot-1MB")
+            } else {
+                // System thread: 512KB stack (location varies)
+                (0, "sys-512KB")
+            };
+            
+            console::print(&alloc::format!(
+                "[Heartbeat] Loop {} | T{} | SP:{:#x} | Used:{}KB | Mode:{}\n",
+                count, tid, sp, stack_used_kb, stack_mode
+            ));
+        }
+
         // Disable preemption during polling to protect embassy-net's internal RefCells.
         // Embassy-net uses RefCell for interior mutability, which panics on re-entrant
         // borrows. Timer preemption mid-poll would cause this panic.
         threading::disable_preemption();
 
+        // Debug: Track which poll step we're on (for diagnosing hangs)
+        static POLL_STEP: AtomicU64 = AtomicU64::new(0);
+        
+        POLL_STEP.store(1, Ordering::Relaxed);
         // Poll the main network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(2, Ordering::Relaxed);
         // Poll loopback runner - process any pending packets
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(3, Ordering::Relaxed);
         // Poll the SSH server (runs curl commands that send to loopback)
         let _ = ssh_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(4, Ordering::Relaxed);
         // Poll loopback runner again - process packets sent by curl
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(5, Ordering::Relaxed);
         // Poll the HTTP web servers
         let _ = web_pinned.as_mut().poll(&mut cx);
+        
+        POLL_STEP.store(6, Ordering::Relaxed);
         let _ = web_loopback_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(7, Ordering::Relaxed);
         // Poll loopback runner again - process response packets from web server
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(8, Ordering::Relaxed);
         // Poll the memory monitor
         let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
 
+        POLL_STEP.store(9, Ordering::Relaxed);
         // Process pending IRQ work
         executor::process_irq_work();
 
+        POLL_STEP.store(10, Ordering::Relaxed);
         // Poll the executor for any other tasks
         executor::run_once();
 
+        POLL_STEP.store(11, Ordering::Relaxed);
         // Re-enable preemption - safe now that all RefCell borrows are released
         threading::enable_preemption();
-
+        
+        POLL_STEP.store(12, Ordering::Relaxed);
+        
         // Periodic stack canary check (every ~1000 iterations to reduce overhead)
-        static mut CANARY_CHECK_COUNTER: u32 = 0;
-        unsafe {
-            CANARY_CHECK_COUNTER = CANARY_CHECK_COUNTER.wrapping_add(1);
-            if CANARY_CHECK_COUNTER % 1000 == 0 && config::ENABLE_STACK_CANARIES {
-                let bad = threading::check_all_stack_canaries();
-                if !bad.is_empty() {
-                    console::print("[WARN] Stack overflow detected in threads: ");
-                    for tid in &bad {
-                        console::print(&alloc::format!("{} ", tid));
-                    }
-                    console::print("\n");
+        static CANARY_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let canary_count = CANARY_CHECK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if canary_count % 1000 == 0 && config::ENABLE_STACK_CANARIES {
+            let bad = threading::check_all_stack_canaries();
+            if !bad.is_empty() {
+                console::print("[WARN] Stack overflow detected in threads: ");
+                for tid in &bad {
+                    console::print(&alloc::format!("{} ", tid));
                 }
+                console::print("\n");
             }
         }
 
+        POLL_STEP.store(13, Ordering::Relaxed);
         // Yield to other threads (cooperative multitasking)
         threading::yield_now();
+        
+        POLL_STEP.store(14, Ordering::Relaxed);
+        // We're back from yield - loop continues
+        
+        // Periodically log poll step (to catch where we hang)
+        // Log every 1 million loops to see progress
+        static STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let step_count = STEP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if step_count % 1_000_000 == 0 {
+            console::print(&alloc::format!(
+                "[PollStep] {} million loops, step: {}\n",
+                step_count / 1_000_000,
+                POLL_STEP.load(Ordering::Relaxed)
+            ));
+        }
     }
+}
+
+/// Check if IRQs are currently enabled (I bit in DAIF is clear)
+#[inline]
+fn is_irq_enabled() -> bool {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+    }
+    // Bit 7 (0x80) is the I flag - if clear, IRQs are enabled
+    (daif & 0x80) == 0
 }
 
 /// Async task that periodically reports memory usage
