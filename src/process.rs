@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_time::{Duration, Timer};
+// Note: embassy_time Timer removed - doesn't work in block_on context
 use spinning_top::Spinlock;
 
 use crate::config;
@@ -1066,13 +1066,12 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
-    // Poll for completion using async timer to yield to embassy executor
-    // This allows other SSH sessions and network I/O to proceed
+    // Poll for completion - yield to scheduler to let user thread run
     //
-    // NOTE: We don't call yield_now() here because:
-    // 1. System threads are preemptive (10ms timer handles scheduling)
-    // 2. yield_now() acquires POOL lock, causing contention
-    // 3. The spawned process runs on a separate thread with its own time slice
+    // NOTE: We use yield_now() + spin delay instead of embassy Timer because:
+    // - Embassy timers only advance when thread 0's executor runs
+    // - SSH sessions run in block_on() which doesn't poll embassy timers
+    // - Using embassy Timer here would cause infinite waiting
     loop {
         // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
@@ -1082,13 +1081,19 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
         // Check if interrupted
         if channel.is_interrupted() {
             // Give the process a moment to handle the interrupt
-            Timer::after(Duration::from_millis(10)).await;
+            for _ in 0..1000 {
+                crate::threading::yield_now();
+            }
             break;
         }
 
-        // Use embassy timer to yield to async executor
-        // 10ms matches the kernel's preemption interval, reducing unnecessary wake-ups
-        Timer::after(Duration::from_millis(10)).await;
+        // Yield to let the user thread (running the process) get scheduled
+        crate::threading::yield_now();
+        
+        // Small spin delay to avoid hammering the scheduler
+        for _ in 0..100 {
+            core::hint::spin_loop();
+        }
     }
 
     // Collect all output
@@ -1161,10 +1166,16 @@ where
             break;
         }
 
-        // Use embassy timer to yield to async executor
-        // 10ms matches the kernel's preemption interval
-        // No yield_now() needed - system threads are preemptive
-        Timer::after(Duration::from_millis(10)).await;
+        // Yield to let the user thread (running the process) get scheduled
+        // NOTE: We use yield_now() instead of embassy Timer because:
+        // - Embassy timers only advance when thread 0's executor runs
+        // - SSH sessions run in block_on() which doesn't poll embassy timers
+        crate::threading::yield_now();
+        
+        // Small spin delay to avoid hammering the scheduler
+        for _ in 0..100 {
+            core::hint::spin_loop();
+        }
     }
 
     let exit_code = channel.exit_code();
