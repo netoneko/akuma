@@ -1,4 +1,5 @@
 .cursor
+.vscode
 target
 *.img
 .DS_Store
