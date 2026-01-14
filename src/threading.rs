@@ -498,85 +498,6 @@ impl ThreadPool {
         Err("No free thread slots")
     }
 
-    /// Spawn a new thread with a boxed closure and default stack
-    pub fn spawn_closure(
-        &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
-        closure_ptr: *mut (),
-        cooperative: bool,
-    ) -> Result<usize, &'static str> {
-        self.spawn_closure_with_stack_size(
-            trampoline_fn,
-            closure_ptr,
-            config::DEFAULT_THREAD_STACK_SIZE,
-            cooperative,
-        )
-    }
-
-    /// Spawn a new thread with a boxed closure and custom stack size
-    pub fn spawn_closure_with_stack_size(
-        &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
-        closure_ptr: *mut (),
-        stack_size: usize,
-        cooperative: bool,
-    ) -> Result<usize, &'static str> {
-        if !self.initialized {
-            return Err("Thread pool not initialized");
-        }
-
-        // Find first free slot (skip slot 0 = idle)
-        for i in 1..config::MAX_THREADS {
-            if self.slots[i].state == ThreadState::Free {
-                // Reallocate stack if size differs
-                if self.stacks[i].size != stack_size {
-                    self.reallocate_stack(i, stack_size)?;
-                }
-
-                let stack = &self.stacks[i];
-                let sp = (stack.top & !0xF) as u64;
-
-                // Get current (boot) TTBR0 for kernel threads
-                let boot_ttbr0: u64;
-                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
-
-                // x19 = trampoline function pointer
-                // x20 = closure data pointer
-                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
-                self.slots[i].context.x20 = closure_ptr as u64;
-                self.slots[i].context.x21 = 0;
-                self.slots[i].context.x22 = 0;
-                self.slots[i].context.x23 = 0;
-                self.slots[i].context.x24 = 0;
-                self.slots[i].context.x25 = 0;
-                self.slots[i].context.x26 = 0;
-                self.slots[i].context.x27 = 0;
-                self.slots[i].context.x28 = 0;
-                self.slots[i].context.x29 = 0;
-                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
-                self.slots[i].context.sp = sp;
-                self.slots[i].context.daif = 0;
-                self.slots[i].context.elr = 0;
-                self.slots[i].context.spsr = 0;
-                self.slots[i].context.ttbr0 = boot_ttbr0;
-
-                self.slots[i].cooperative = cooperative;
-                self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = if cooperative {
-                    COOPERATIVE_TIMEOUT_US
-                } else {
-                    0
-                };
-
-                self.slots[i].state = ThreadState::Ready;
-
-                return Ok(i);
-            }
-        }
-
-        Err("No free thread slots")
-    }
-
     /// Spawn a thread for system services (SSH sessions, etc.)
     ///
     /// Only searches slots 1..RESERVED_THREADS.
@@ -594,11 +515,13 @@ impl ThreadPool {
         // Only search in system thread range (skip thread 0 = boot/async)
         for i in 1..config::RESERVED_THREADS {
             if self.slots[i].state == ThreadState::Free {
-                // Ensure stack has correct size for system threads
-                // (may have been changed by spawn_closure_with_stack_size)
-                if self.stacks[i].size != config::SYSTEM_THREAD_STACK_SIZE {
-                    self.reallocate_stack(i, config::SYSTEM_THREAD_STACK_SIZE)?;
-                }
+                // System thread stacks should be pre-allocated at correct size
+                // If not, something corrupted them (bug in spawn_closure_with_stack_size)
+                debug_assert!(
+                    self.stacks[i].size == config::SYSTEM_THREAD_STACK_SIZE,
+                    "System thread {} has wrong stack size: {} (expected {})",
+                    i, self.stacks[i].size, config::SYSTEM_THREAD_STACK_SIZE
+                );
                 
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
@@ -649,6 +572,7 @@ impl ThreadPool {
         &mut self,
         trampoline_fn: fn(*mut ()) -> !,
         closure_ptr: *mut (),
+        cooperative: bool,
     ) -> Result<usize, &'static str> {
         if !self.initialized {
             return Err("Thread pool not initialized");
@@ -657,11 +581,12 @@ impl ThreadPool {
         // Only search in user thread range
         for i in config::RESERVED_THREADS..config::MAX_THREADS {
             if self.slots[i].state == ThreadState::Free {
-                // Ensure stack has correct size for user threads
-                // (may have been changed by spawn_closure_with_stack_size)
-                if self.stacks[i].size != config::USER_THREAD_STACK_SIZE {
-                    self.reallocate_stack(i, config::USER_THREAD_STACK_SIZE)?;
-                }
+                // User thread stacks should be pre-allocated at correct size
+                debug_assert!(
+                    self.stacks[i].size == config::USER_THREAD_STACK_SIZE,
+                    "User thread {} has wrong stack size: {} (expected {})",
+                    i, self.stacks[i].size, config::USER_THREAD_STACK_SIZE
+                );
                 
                 let stack = &self.stacks[i];
                 let sp = (stack.top & !0xF) as u64;
@@ -691,10 +616,13 @@ impl ThreadPool {
                 self.slots[i].context.spsr = 0;
                 self.slots[i].context.ttbr0 = boot_ttbr0;
 
-                // User threads are preemptible (not cooperative)
-                self.slots[i].cooperative = false;
+                self.slots[i].cooperative = cooperative;
                 self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = 0;
+                self.slots[i].timeout_us = if cooperative {
+                    COOPERATIVE_TIMEOUT_US
+                } else {
+                    0
+                };
 
                 self.slots[i].state = ThreadState::Ready;
 
@@ -949,52 +877,16 @@ where
     spawn_fn_with_options(f, true)
 }
 
-/// Spawn a thread with a Rust closure, options, and default stack
+/// Spawn a thread with a Rust closure and options
+///
+/// Uses user thread slots (RESERVED_THREADS..MAX_THREADS) with fixed 64KB stacks.
 pub fn spawn_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    spawn_fn_with_stack(f, config::DEFAULT_THREAD_STACK_SIZE, cooperative)
+    spawn_user_thread_fn_with_options(f, cooperative)
 }
 
-/// Spawn a thread with a Rust closure and custom stack size
-///
-/// # Example
-/// ```
-/// // Spawn with 256KB stack for async networking
-/// spawn_fn_with_stack(|| {
-///     run_async_main();
-/// }, config::ASYNC_THREAD_STACK_SIZE, false)?;
-/// ```
-pub fn spawn_fn_with_stack<F>(
-    f: F,
-    stack_size: usize,
-    cooperative: bool,
-) -> Result<usize, &'static str>
-where
-    F: FnOnce() -> ! + Send + 'static,
-{
-    // Box the closure and get a raw pointer
-    let boxed: Box<F> = Box::new(f);
-    let closure_ptr = Box::into_raw(boxed) as *mut ();
-
-    // Get the trampoline function for this specific closure type
-    let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
-
-    let result = with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_closure_with_stack_size(trampoline, closure_ptr, stack_size, cooperative)
-    });
-
-    // If spawn failed, clean up the boxed closure
-    if result.is_err() {
-        unsafe {
-            let _ = Box::from_raw(closure_ptr as *mut F);
-        }
-    }
-
-    result
-}
 
 /// SGI handler for scheduling
 pub fn sgi_scheduler_handler(irq: u32) {
@@ -1146,7 +1038,16 @@ pub fn system_threads_active() -> usize {
 ///
 /// Only spawns in slots RESERVED_THREADS..MAX_THREADS (user thread range).
 /// Returns the thread ID or error if no user thread slots are available.
+/// User threads are preemptive by default.
 pub fn spawn_user_thread_fn<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_user_thread_fn_with_options(f, false)
+}
+
+/// Spawn a user thread with cooperative option
+pub fn spawn_user_thread_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
@@ -1159,7 +1060,7 @@ where
 
     let result = with_irqs_disabled(|| {
         let mut pool = POOL.lock();
-        pool.spawn_user_closure(trampoline, closure_ptr)
+        pool.spawn_user_closure(trampoline, closure_ptr, cooperative)
     });
 
     // If spawn failed, clean up the boxed closure

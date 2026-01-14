@@ -425,22 +425,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 }
 
 fn run_async_main_preemptive() -> ! {
-    let thread_result = crate::threading::spawn_fn_with_stack(|| {
-            run_async_main();
-            //  {
-            //     Ok(()) => {
-            //         console::print("[AsyncMain] Preemtive main thread finished\n");
-            //     }
-            //     Err(e) => {
-            //         console::print("[AsyncMain] Preemtive main thread failed: ");
-            //         console::print(e);
-            //         console::print("\n");
-            //     }
-            // }
-        },
-        config::ASYNC_THREAD_STACK_SIZE,
-        false,
-    );
+    // Use spawn_system_thread_fn - it uses SYSTEM_THREAD_STACK_SIZE (256KB)
+    // which equals ASYNC_THREAD_STACK_SIZE, so no custom size needed
+    let thread_result = crate::threading::spawn_system_thread_fn(|| {
+        run_async_main();
+    });
 
     match thread_result {
         Ok(thread_id) => {
