@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use embassy_time::{Duration, Timer};
 use spinning_top::Spinlock;
 
 use crate::config;
@@ -1058,7 +1059,8 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
-    // Poll for completion
+    // Poll for completion using async timer to yield to embassy executor
+    // This allows other SSH sessions and network I/O to proceed
     loop {
         // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
@@ -1068,25 +1070,16 @@ pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8
         // Check if interrupted
         if channel.is_interrupted() {
             // Give the process a moment to handle the interrupt
-            for _ in 0..100 {
-                crate::threading::yield_now();
-                if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
-                    break;
-                }
-            }
+            Timer::after(Duration::from_millis(10)).await;
             break;
         }
 
         // Yield to kernel scheduler to let spawned thread run
         crate::threading::yield_now();
 
-        // Small delay to avoid spinning too fast (doesn't need IRQs)
-        for _ in 0..1000 {
-            core::hint::spin_loop();
-        }
-
-        // Clean up any terminated threads
-        crate::threading::cleanup_terminated();
+        // Use embassy timer to yield to async executor (allows other tasks to run)
+        // This is crucial for keeping other SSH sessions responsive
+        Timer::after(Duration::from_millis(1)).await;
     }
 
     // Collect all output
@@ -1130,7 +1123,7 @@ where
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
-    // Poll for output and completion
+    // Poll for output and completion using async timer for proper yielding
     loop {
         // Drain any available output and write to stream
         if let Some(data) = channel.try_read() {
@@ -1162,33 +1155,14 @@ where
         // Yield to kernel scheduler to let spawned thread run
         crate::threading::yield_now();
 
-        // Small delay to avoid spinning too fast
-        for _ in 0..1000 {
-            core::hint::spin_loop();
-        }
-
-        // Yield to async executor (allow other tasks to run)
-        struct YieldOnce(bool);
-        impl core::future::Future for YieldOnce {
-            type Output = ();
-            fn poll(mut self: core::pin::Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
-                if self.0 {
-                    core::task::Poll::Ready(())
-                } else {
-                    self.0 = true;
-                    core::task::Poll::Pending
-                }
-            }
-        }
-        YieldOnce(false).await;
-
-        // Clean up any terminated threads
-        crate::threading::cleanup_terminated();
+        // Use embassy timer to yield to async executor
+        // This allows other SSH sessions to remain responsive
+        Timer::after(Duration::from_millis(1)).await;
     }
 
     let exit_code = channel.exit_code();
 
-    // Clean up terminated thread
+    // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok(exit_code)
