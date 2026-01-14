@@ -254,7 +254,7 @@ unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
 // ============================================================================
 
 unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
-    with_irqs_disabled(|| {
+    // with_irqs_disabled(|| {
         let result = TALC
             .lock()
             .malloc(layout)
@@ -282,7 +282,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         }
 
         result
-    })
+    // })
 }}
 
 unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {

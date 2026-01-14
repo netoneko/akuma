@@ -1089,7 +1089,7 @@ where
 ///
 /// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_available() -> usize {
-    with_irqs_disabled(|| {
+    // with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut count = 0;
         for i in 1..config::RESERVED_THREADS {
@@ -1098,7 +1098,7 @@ pub fn system_threads_available() -> usize {
             }
         }
         count
-    })
+    // })
 }
 
 /// Count active system threads
@@ -1212,7 +1212,7 @@ pub fn get_thread_state(thread_id: usize) -> Option<ThreadState> {
 /// Check all thread stacks for overlap (debug/diagnostic)
 /// Returns list of (thread_a, thread_b) pairs that overlap
 pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
-    with_irqs_disabled(|| {
+    // with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut overlaps = Vec::new();
 
@@ -1224,7 +1224,7 @@ pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
             }
         }
         overlaps
-    })
+    // })
 }
 
 /// Get stack bounds for a thread
@@ -1310,7 +1310,7 @@ pub struct KernelThreadInfo {
 
 /// Get list of all kernel threads with their info
 pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
-    with_irqs_disabled(|| {
+    // with_irqs_disabled(|| {
         let pool = POOL.lock();
         let mut threads = Vec::new();
 
@@ -1375,7 +1375,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         }
 
         threads
-    })
+    // })
 }
 
 pub fn dump_stack_info() {
