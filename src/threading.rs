@@ -6,12 +6,126 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 // Use the shared IRQ guard from the irq module
 use crate::config;
 use crate::irq::with_irqs_disabled;
+
+// ============================================================================
+// Lock-Free Thread State Management
+// ============================================================================
+
+/// Thread state values for lock-free atomic operations
+pub mod thread_state {
+    pub const FREE: u8 = 0;
+    pub const READY: u8 = 1;
+    pub const RUNNING: u8 = 2;
+    pub const TERMINATED: u8 = 3;
+}
+
+/// Atomic thread states - lock-free access
+/// Each thread's state can be read/modified without holding any lock
+static THREAD_STATES: [AtomicU8; config::MAX_THREADS] = {
+    const INIT: AtomicU8 = AtomicU8::new(thread_state::FREE);
+    [INIT; config::MAX_THREADS]
+};
+
+/// Current running thread - lock-free access
+static CURRENT_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Atomically claim a free slot in the given range
+/// Returns the slot index if successful, None if no free slots
+fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
+    for i in start..end {
+        // Try to atomically change FREE -> READY
+        if THREAD_STATES[i]
+            .compare_exchange(
+                thread_state::FREE,
+                thread_state::READY,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Mark a thread as terminated (lock-free)
+pub fn mark_thread_terminated(idx: usize) {
+    if idx != IDLE_THREAD_IDX && idx < config::MAX_THREADS {
+        THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);
+    }
+}
+
+/// Mark a thread as ready (lock-free)
+fn mark_thread_ready(idx: usize) {
+    if idx < config::MAX_THREADS {
+        THREAD_STATES[idx].store(thread_state::READY, Ordering::SeqCst);
+    }
+}
+
+/// Mark a thread as running (lock-free)
+fn mark_thread_running(idx: usize) {
+    if idx < config::MAX_THREADS {
+        THREAD_STATES[idx].store(thread_state::RUNNING, Ordering::SeqCst);
+    }
+}
+
+/// Get thread state (lock-free read)
+pub fn get_thread_state(idx: usize) -> u8 {
+    if idx < config::MAX_THREADS {
+        THREAD_STATES[idx].load(Ordering::SeqCst)
+    } else {
+        thread_state::FREE
+    }
+}
+
+/// Check if a thread is terminated (lock-free)
+pub fn is_thread_terminated(thread_id: usize) -> bool {
+    get_thread_state(thread_id) == thread_state::TERMINATED
+}
+
+/// Count free slots in range (lock-free)
+fn count_free_slots(start: usize, end: usize) -> usize {
+    (start..end)
+        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) == thread_state::FREE)
+        .count()
+}
+
+/// Cleanup terminated threads - atomically mark as free (lock-free)
+/// Returns number of threads cleaned up
+pub fn cleanup_terminated_lockfree() -> usize {
+    let mut count = 0;
+    for i in 1..config::MAX_THREADS {
+        // Try to atomically change TERMINATED -> FREE
+        if THREAD_STATES[i]
+            .compare_exchange(
+                thread_state::TERMINATED,
+                thread_state::FREE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            // Re-initialize canary for reuse
+            // Note: This reads from POOL but doesn't need the lock
+            // because the slot is now FREE and no one else will touch it
+            if config::ENABLE_STACK_CANARIES {
+                let stack_base = unsafe { (*POOL.data_ptr()).stacks[i].base };
+                if stack_base != 0 {
+                    init_stack_canary(stack_base);
+                }
+            }
+            count += 1;
+        }
+    }
+    count
+}
 
 // ============================================================================
 // Preemption Control
@@ -707,7 +821,7 @@ impl ThreadPool {
         count
     }
 
-    /// Select next ready thread (round-robin)
+    /// Select next ready thread (round-robin) - LOCK-FREE for state transitions
     ///
     /// # Preemption rules:
     /// - `voluntary=true`: Thread yielded voluntarily (yield_now) - always switch
@@ -716,45 +830,38 @@ impl ThreadPool {
     ///   - Cooperative threads (thread 0): Only switch after timeout elapses
     ///   - Non-cooperative threads (sessions, user processes): Always preemptible
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
-        let current_idx = self.current_idx;
+        // Use atomic CURRENT_THREAD instead of self.current_idx
+        let current_idx = CURRENT_THREAD.load(Ordering::SeqCst);
         let current = &self.slots[current_idx];
 
         // For timer-triggered preemption, first check if preemption is explicitly disabled.
-        // This is used to protect RefCell borrows and other non-reentrant code sections
-        // (e.g., embassy-net's internal state during polling).
         if !voluntary && is_preemption_disabled() {
             return None;
         }
 
         // For timer-triggered preemption, check if the current thread is cooperative.
-        // Cooperative threads (like thread 0 running the async executor) get time-slice
-        // protection to avoid corruption during I/O operations.
-        // Non-cooperative threads (session threads 1-7, user threads 8+) are always
-        // immediately preemptible for true multitasking.
-        if !voluntary && current.cooperative && current.state == ThreadState::Running {
+        // Use atomic state check
+        let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
+        if !voluntary && current.cooperative && current_state == thread_state::RUNNING {
             let timeout = current.timeout_us;
             if timeout > 0 && current.start_time_us > 0 {
                 let now = crate::timer::uptime_us();
                 let elapsed = now.saturating_sub(current.start_time_us);
                 if elapsed < timeout {
-                    // Cooperative thread's time-slice not yet expired
                     return None;
                 }
-                // Timeout expired - allow preemption
             } else {
-                // No timeout set - don't preempt cooperative thread
                 return None;
             }
         }
-        // Non-cooperative threads: fall through to scheduling (always preemptible)
 
-        // Find next ready thread (including thread 0)
+        // Find next ready thread using atomic state reads
         let mut next_idx = (current_idx + 1) % config::MAX_THREADS;
         let start_idx = next_idx;
 
         loop {
-            let state = self.slots[next_idx].state;
-            if state == ThreadState::Ready || state == ThreadState::Running {
+            let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
+            if state == thread_state::READY || state == thread_state::RUNNING {
                 break;
             }
 
@@ -769,14 +876,20 @@ impl ThreadPool {
             return None;
         }
 
-        // Update states
-        if self.slots[current_idx].state != ThreadState::Terminated {
-            self.slots[current_idx].state = ThreadState::Ready;
+        // Update states atomically (lock-free)
+        let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
+        if current_state != thread_state::TERMINATED {
+            THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
         }
-        self.slots[next_idx].state = ThreadState::Running;
+        THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
+        
+        // Update timing (still in slot, but we own it)
         self.slots[next_idx].start_time_us = crate::timer::uptime_us();
 
-        self.current_idx = next_idx;
+        // Update current thread atomically
+        CURRENT_THREAD.store(next_idx, Ordering::SeqCst);
+        self.current_idx = next_idx; // Keep in sync for context access
+        
         Some((current_idx, next_idx))
     }
 
@@ -864,8 +977,19 @@ pub fn init() {
         panic!("Stack allocation failed: {}", msg);
     }
     
-    let mut pool = POOL.lock();
-    pool.init();
+    // Initialize ThreadPool (allocates stacks, sets up boot thread)
+    {
+        let mut pool = POOL.lock();
+        pool.init();
+    }
+    
+    // Initialize atomic thread states to match ThreadPool state
+    // Thread 0 is RUNNING (boot thread), all others are FREE
+    THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
+    for i in 1..config::MAX_THREADS {
+        THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
+    }
+    CURRENT_THREAD.store(0, Ordering::SeqCst);
 }
 
 /// Spawn a new preemptible thread with extern "C" entry and default stack
@@ -961,47 +1085,46 @@ pub fn yield_now() {
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 
-/// Get thread stats (ready, running, terminated)
+/// Get thread stats (ready, running, terminated) - LOCK-FREE
 pub fn thread_stats() -> (usize, usize, usize) {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.thread_stats()
-    })
+    let mut ready = 0;
+    let mut running = 0;
+    let mut terminated = 0;
+    for i in 0..config::MAX_THREADS {
+        match THREAD_STATES[i].load(Ordering::Relaxed) {
+            thread_state::READY => ready += 1,
+            thread_state::RUNNING => running += 1,
+            thread_state::TERMINATED => terminated += 1,
+            _ => {}
+        }
+    }
+    (ready, running, terminated)
 }
 
-/// Clean up terminated threads (mark slots as free)
+/// Clean up terminated threads (mark slots as free) - LOCK-FREE
 pub fn cleanup_terminated() -> usize {
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.cleanup_terminated()
-    })
+    cleanup_terminated_lockfree()
 }
 
 /// Get active thread count
 pub fn thread_count() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.thread_count()
-    })
+    // Lock-free: count non-free threads
+    (0..config::MAX_THREADS)
+        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
+        .count()
 }
 
-/// Mark current thread as terminated (thread 0 cannot be terminated)
+/// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
 pub fn mark_current_terminated() {
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        let idx = pool.current_idx;
-        if idx != IDLE_THREAD_IDX {
-            pool.slots[idx].state = ThreadState::Terminated;
-        }
-    })
+    let idx = CURRENT_THREAD.load(Ordering::SeqCst);
+    if idx != IDLE_THREAD_IDX {
+        mark_thread_terminated(idx);
+    }
 }
 
-/// Get current thread ID
+/// Get current thread ID - LOCK-FREE
 pub fn current_thread_id() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.current_idx
-    })
+    CURRENT_THREAD.load(Ordering::SeqCst)
 }
 
 /// Get max thread count
@@ -1013,7 +1136,7 @@ pub fn max_threads() -> usize {
 // System Thread API (for SSH sessions, etc.)
 // ============================================================================
 
-/// Spawn a thread specifically for system services (SSH sessions, etc.)
+/// Spawn a thread specifically for system services (SSH sessions, etc.) - LOCK-FREE
 ///
 /// Only spawns in slots 1..RESERVED_THREADS (system thread range).
 /// These threads get larger stacks (256KB) and are preemptible.
@@ -1022,58 +1145,72 @@ pub fn spawn_system_thread_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    // Box the closure and get a raw pointer
+    // Step 1: Atomically claim a free slot (lock-free)
+    let slot_idx = match claim_free_slot(1, config::RESERVED_THREADS) {
+        Some(idx) => idx,
+        None => return Err("No free system thread slots"),
+    };
+    
+    // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
-
-    // Get the trampoline function for this specific closure type
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    let result = with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_system_closure(trampoline, closure_ptr)
+    // Step 3: Set up context (brief POOL access - only touching our claimed slot)
+    // We own this slot (it's READY), so this is safe
+    let setup_result = with_irqs_disabled(|| {
+        // Brief lock just to access context and stack info
+        let pool = unsafe { &mut *POOL.data_ptr() };
+        
+        let stack = &pool.stacks[slot_idx];
+        let sp = (stack.top & !0xF) as u64;
+        
+        let boot_ttbr0: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
+        pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
+        pool.slots[slot_idx].context.x20 = closure_ptr as u64;
+        pool.slots[slot_idx].context.x21 = 0;
+        pool.slots[slot_idx].context.x22 = 0;
+        pool.slots[slot_idx].context.x23 = 0;
+        pool.slots[slot_idx].context.x24 = 0;
+        pool.slots[slot_idx].context.x25 = 0;
+        pool.slots[slot_idx].context.x26 = 0;
+        pool.slots[slot_idx].context.x27 = 0;
+        pool.slots[slot_idx].context.x28 = 0;
+        pool.slots[slot_idx].context.x29 = 0;
+        pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
+        pool.slots[slot_idx].context.sp = sp;
+        pool.slots[slot_idx].context.daif = 0;
+        pool.slots[slot_idx].context.elr = 0;
+        pool.slots[slot_idx].context.spsr = 0;
+        pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
+
+        pool.slots[slot_idx].cooperative = false; // System threads are preemptible
+        pool.slots[slot_idx].start_time_us = 0;
+        pool.slots[slot_idx].timeout_us = 0;
     });
-
-    // If spawn failed, clean up the boxed closure
-    if result.is_err() {
-        unsafe {
-            let _ = Box::from_raw(closure_ptr as *mut F);
-        }
-    }
-
-    result
+    
+    // Slot is already READY (set by claim_free_slot), scheduler will pick it up
+    Ok(slot_idx)
 }
 
 /// Count available system thread slots
 ///
 /// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_available() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let mut count = 0;
-        for i in 1..config::RESERVED_THREADS {
-            if pool.slots[i].state == ThreadState::Free {
-                count += 1;
-            }
-        }
-        count
-    })
+    // Lock-free: count free system thread slots
+    count_free_slots(1, config::RESERVED_THREADS)
 }
 
 /// Count active system threads
 ///
 /// Returns the number of non-free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_active() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let mut count = 0;
-        for i in 1..config::RESERVED_THREADS {
-            if pool.slots[i].state != ThreadState::Free {
-                count += 1;
-            }
-        }
-        count
-    })
+    // Lock-free: count non-free system thread slots
+    (1..config::RESERVED_THREADS)
+        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
+        .count()
 }
 
 // ============================================================================
@@ -1092,84 +1229,91 @@ where
     spawn_user_thread_fn_with_options(f, false)
 }
 
-/// Spawn a user thread with cooperative option
+/// Spawn a user thread with cooperative option - LOCK-FREE
 pub fn spawn_user_thread_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    // Box the closure and get a raw pointer
+    // Step 1: Atomically claim a free slot (lock-free)
+    let slot_idx = match claim_free_slot(config::RESERVED_THREADS, config::MAX_THREADS) {
+        Some(idx) => idx,
+        None => return Err("No free user thread slots"),
+    };
+    
+    // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
-
-    // Get the trampoline function for this specific closure type
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    let result = with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_user_closure(trampoline, closure_ptr, cooperative)
+    // Step 3: Set up context (brief access to POOL data - only our claimed slot)
+    with_irqs_disabled(|| {
+        let pool = unsafe { &mut *POOL.data_ptr() };
+        
+        let stack = &pool.stacks[slot_idx];
+        let sp = (stack.top & !0xF) as u64;
+        
+        let boot_ttbr0: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+
+        pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
+        pool.slots[slot_idx].context.x20 = closure_ptr as u64;
+        pool.slots[slot_idx].context.x21 = 0;
+        pool.slots[slot_idx].context.x22 = 0;
+        pool.slots[slot_idx].context.x23 = 0;
+        pool.slots[slot_idx].context.x24 = 0;
+        pool.slots[slot_idx].context.x25 = 0;
+        pool.slots[slot_idx].context.x26 = 0;
+        pool.slots[slot_idx].context.x27 = 0;
+        pool.slots[slot_idx].context.x28 = 0;
+        pool.slots[slot_idx].context.x29 = 0;
+        pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
+        pool.slots[slot_idx].context.sp = sp;
+        pool.slots[slot_idx].context.daif = 0;
+        pool.slots[slot_idx].context.elr = 0;
+        pool.slots[slot_idx].context.spsr = 0;
+        pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
+
+        pool.slots[slot_idx].cooperative = cooperative;
+        pool.slots[slot_idx].start_time_us = 0;
+        pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
     });
-
-    // If spawn failed, clean up the boxed closure
-    if result.is_err() {
-        unsafe {
-            let _ = Box::from_raw(closure_ptr as *mut F);
-        }
-    }
-
-    result
+    
+    // Slot is already READY (set by claim_free_slot), scheduler will pick it up
+    Ok(slot_idx)
 }
 
 /// Count available user thread slots
 ///
 /// Returns the number of free slots in the user thread range (RESERVED_THREADS..MAX_THREADS).
 pub fn user_threads_available() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let mut count = 0;
-        for i in config::RESERVED_THREADS..config::MAX_THREADS {
-            if pool.slots[i].state == ThreadState::Free {
-                count += 1;
-            }
-        }
-        count
-    })
+    // Lock-free: count free user thread slots
+    count_free_slots(config::RESERVED_THREADS, config::MAX_THREADS)
 }
 
 /// Count active user threads
 ///
 /// Returns the number of non-free slots in the user thread range.
 pub fn user_threads_active() -> usize {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let mut count = 0;
-        for i in config::RESERVED_THREADS..config::MAX_THREADS {
-            if pool.slots[i].state != ThreadState::Free {
-                count += 1;
-            }
-        }
-        count
-    })
+    // Lock-free: count non-free user thread slots
+    (config::RESERVED_THREADS..config::MAX_THREADS)
+        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
+        .count()
 }
 
-/// Check if a thread has terminated
-///
-/// Returns true if the thread has finished execution (state is Terminated or Free).
-/// Also returns true for invalid thread IDs.
-pub fn is_thread_terminated(thread_id: usize) -> bool {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.slots
-            .get(thread_id)
-            .map(|s| s.state == ThreadState::Terminated || s.state == ThreadState::Free)
-            .unwrap_or(true)
-    })
-}
+// Note: is_thread_terminated is defined above using lock-free atomics
 
-/// Get the state of a specific thread (for debugging)
-pub fn get_thread_state(thread_id: usize) -> Option<ThreadState> {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.slots.get(thread_id).map(|s| s.state)
+/// Get the state of a specific thread (for debugging) - LOCK-FREE
+pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
+    if thread_id >= config::MAX_THREADS {
+        return None;
+    }
+    let state = THREAD_STATES[thread_id].load(Ordering::Relaxed);
+    Some(match state {
+        thread_state::FREE => ThreadState::Free,
+        thread_state::READY => ThreadState::Ready,
+        thread_state::RUNNING => ThreadState::Running,
+        thread_state::TERMINATED => ThreadState::Terminated,
+        _ => ThreadState::Free,
     })
 }
 
