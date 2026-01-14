@@ -117,3 +117,31 @@ pub const COOPERATIVE_MAIN_THREAD: bool = true;
 
 // Does not actually work, blocks new ssh connections for unknown reasons
 pub const ENABLE_SSH_ASYNC_EXEC: bool = false;
+
+// ============================================================================
+// Network TX Queue Configuration
+// ============================================================================
+
+/// Enable TX packet queueing when virtio lock is contended
+///
+/// When the main network loop can't acquire the virtio lock (held by an SSH
+/// session thread), packets would normally be dropped. With this enabled,
+/// packets are copied to a pending queue and sent on the next successful
+/// lock acquisition.
+///
+/// This prevents packet loss during lock contention but uses additional memory.
+pub const ENABLE_TX_QUEUE: bool = true;
+
+/// Number of pending TX packet slots
+///
+/// Maximum number of packets that can be queued when the virtio lock is busy.
+/// Each slot uses TX_PACKET_BUFFER_SIZE bytes of static memory.
+/// Total memory usage: TX_QUEUE_SLOTS * TX_PACKET_BUFFER_SIZE bytes
+pub const TX_QUEUE_SLOTS: usize = 8;
+
+/// Size of each TX packet buffer in bytes
+///
+/// Must be large enough to hold the largest Ethernet frame (1514 bytes)
+/// plus any virtio headers. 2048 is a safe default that matches virtio
+/// buffer sizes.
+pub const TX_PACKET_BUFFER_SIZE: usize = 2048;

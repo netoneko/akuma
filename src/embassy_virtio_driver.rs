@@ -8,6 +8,7 @@
 
 use alloc::boxed::Box;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::Waker;
 
 use critical_section::Mutex;
@@ -16,6 +17,7 @@ use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::MmioTransport;
 
+use crate::config::{ENABLE_TX_QUEUE, TX_PACKET_BUFFER_SIZE, TX_QUEUE_SLOTS};
 use crate::virtio_hal::VirtioHal;
 
 // ============================================================================
@@ -50,6 +52,119 @@ fn with_virtio_lock<R, F: FnOnce() -> R>(f: F) -> Option<R> {
     }
     // Could not acquire lock - avoid deadlock by returning None
     None
+}
+
+// ============================================================================
+// Pending TX Queue (optional, enabled via config)
+// ============================================================================
+
+/// A single pending TX packet slot
+struct PendingTxSlot {
+    buffer: [u8; TX_PACKET_BUFFER_SIZE],
+    len: AtomicUsize, // 0 means empty, >0 means contains a packet of that length
+}
+
+impl PendingTxSlot {
+    const fn new() -> Self {
+        Self {
+            buffer: [0u8; TX_PACKET_BUFFER_SIZE],
+            len: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Static storage for pending TX packets.
+/// Using an array of slots with atomic lengths for lock-free queue/dequeue.
+/// This avoids needing heap allocation or mutex for the queue itself.
+static PENDING_TX_QUEUE: Spinlock<PendingTxQueue> = Spinlock::new(PendingTxQueue::new());
+
+struct PendingTxQueue {
+    slots: [PendingTxSlot; TX_QUEUE_SLOTS],
+    head: usize, // next slot to dequeue from
+    tail: usize, // next slot to enqueue to
+    count: usize,
+}
+
+impl PendingTxQueue {
+    const fn new() -> Self {
+        // const array initialization
+        const EMPTY_SLOT: PendingTxSlot = PendingTxSlot::new();
+        Self {
+            slots: [EMPTY_SLOT; TX_QUEUE_SLOTS],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+
+    /// Try to queue a packet. Returns false if queue is full.
+    fn enqueue(&mut self, data: &[u8]) -> bool {
+        if self.count >= TX_QUEUE_SLOTS || data.len() > TX_PACKET_BUFFER_SIZE {
+            return false;
+        }
+        let slot = &mut self.slots[self.tail];
+        slot.buffer[..data.len()].copy_from_slice(data);
+        slot.len.store(data.len(), Ordering::Release);
+        self.tail = (self.tail + 1) % TX_QUEUE_SLOTS;
+        self.count += 1;
+        true
+    }
+
+    /// Get the next packet to send (returns slice and length, or None if empty)
+    fn peek(&self) -> Option<(&[u8], usize)> {
+        if self.count == 0 {
+            return None;
+        }
+        let slot = &self.slots[self.head];
+        let len = slot.len.load(Ordering::Acquire);
+        if len > 0 {
+            Some((&slot.buffer[..len], len))
+        } else {
+            None
+        }
+    }
+
+    /// Mark the head slot as consumed
+    fn dequeue(&mut self) {
+        if self.count > 0 {
+            self.slots[self.head].len.store(0, Ordering::Release);
+            self.head = (self.head + 1) % TX_QUEUE_SLOTS;
+            self.count -= 1;
+        }
+    }
+}
+
+/// Queue a packet for later transmission (used when virtio lock is contended).
+/// Returns true if successfully queued, false if queue is full (packet dropped).
+fn queue_pending_tx(data: &[u8]) -> bool {
+    if !ENABLE_TX_QUEUE {
+        return false;
+    }
+    if let Some(mut queue) = PENDING_TX_QUEUE.try_lock() {
+        queue.enqueue(data)
+    } else {
+        // Can't even get queue lock, drop packet
+        false
+    }
+}
+
+/// Drain pending TX queue, sending all queued packets.
+/// Called when we successfully acquire the virtio lock.
+/// Takes a send function to actually transmit the packets.
+fn drain_pending_tx<F: FnMut(&[u8])>(mut send_fn: F) {
+    if !ENABLE_TX_QUEUE {
+        return;
+    }
+    if let Some(mut queue) = PENDING_TX_QUEUE.try_lock() {
+        while let Some((data, _len)) = queue.peek() {
+            // Copy data out before calling send_fn to avoid borrow issues
+            let mut tmp = [0u8; TX_PACKET_BUFFER_SIZE];
+            let len = data.len();
+            tmp[..len].copy_from_slice(data);
+            queue.dequeue();
+            send_fn(&tmp[..len]);
+        }
+    }
 }
 
 // ============================================================================
@@ -299,10 +414,20 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     {
         let result = f(&mut self.device.tx_buffer[..len]);
         // All virtio MMIO operations must be done under the global lock
-        // Use try_lock to avoid deadlock - if we can't send now, packet is dropped
-        let _ = with_virtio_lock(|| {
+        // Use try_lock to avoid deadlock
+        let sent = with_virtio_lock(|| {
+            // First drain any pending packets from the queue
+            drain_pending_tx(|data| {
+                let _ = self.device.inner.send(data);
+            });
+            // Then send the current packet
             let _ = self.device.inner.send(&self.device.tx_buffer[..len]);
         });
+        
+        // If we couldn't acquire the lock, queue the packet for later
+        if sent.is_none() && ENABLE_TX_QUEUE {
+            let _ = queue_pending_tx(&self.device.tx_buffer[..len]);
+        }
         result
     }
 }
