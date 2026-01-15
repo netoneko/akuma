@@ -416,6 +416,12 @@ impl Write for SshChannelStream<'_> {
                 .map_err(|_| SshStreamError)?;
             sent += chunk_size;
         }
+        
+        // Yield to allow network runner (thread 0) to transmit packets
+        // This is critical for streaming output - without it, packets queue up
+        // and the network runner never gets CPU time to actually send them
+        crate::threading::yield_now();
+        
         Ok(buf.len())
     }
 
@@ -758,14 +764,23 @@ async fn run_shell_session(
                                             continue;
                                         }
 
-                                        // Execute command chain (handles ;, &&, |, >, >> and exit/quit)
+                                        // Try streaming execution for simple external binaries
+                                        // This provides real-time output for long-running commands
+                                        let result = if let Some(streaming_result) = 
+                                            shell::execute_command_streaming(
+                                                trimmed, &registry, &mut ctx, &mut channel_stream,
+                                            ).await 
+                                        {
+                                            streaming_result
+                                        } else {
+                                            // Fall back to buffered execution for complex commands
+                                            // (pipelines, redirects, builtins, command chains)
+                                            shell::execute_command_chain(
+                                                trimmed, &registry, &mut ctx,
+                                            ).await
+                                        };
 
-                                        let result = shell::execute_command_chain(
-                                            trimmed, &registry, &mut ctx,
-                                        )
-                                        .await;
-
-                                        // Output the result
+                                        // Output the result (empty for streamed commands)
                                         if !result.output.is_empty() {
                                             let _ = channel_stream.write(&result.output).await;
                                         }

@@ -1160,6 +1160,8 @@ where
                     let _ = output.write_all(&[byte]).await;
                 }
             }
+            // Force yield to let network runner (thread 0) transmit packets
+            crate::threading::yield_now();
         }
 
         // Check if process has exited
@@ -1173,6 +1175,8 @@ where
                         let _ = output.write_all(&[byte]).await;
                     }
                 }
+                // Final yield to flush remaining output
+                crate::threading::yield_now();
             }
             break;
         }

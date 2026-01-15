@@ -115,8 +115,15 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 pub const COOPERATIVE_MAIN_THREAD: bool = true;
 
 
-// Does not actually work, blocks new ssh connections for unknown reasons
-pub const ENABLE_SSH_ASYNC_EXEC: bool = false;
+/// Enable async process execution with streaming output over SSH
+///
+/// When enabled, external binaries stream output in real-time to the SSH client
+/// instead of buffering all output until command completion. This provides
+/// better user experience for long-running commands.
+///
+/// The streaming implementation uses proper yielding to allow the network runner
+/// to transmit packets while the process is running.
+pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // ============================================================================
 // Network TX Queue Configuration

@@ -414,6 +414,114 @@ where
     }
 }
 
+/// Result of checking if a command can be streamed
+pub enum StreamableCommand {
+    /// Command is a simple external binary that can be streamed
+    External(alloc::string::String),
+    /// Command is a builtin or complex (pipes, redirects) - use buffered execution
+    Buffered,
+    /// Command is exit/quit
+    Exit,
+}
+
+/// Check if a command line is a simple external binary that can be streamed
+///
+/// Returns `StreamableCommand::External(path)` if the command is:
+/// - A single command (no pipes |)
+/// - No output redirection (> or >>)
+/// - Not a chain (; or &&)
+/// - Not a builtin command
+/// - An existing executable in /bin
+pub async fn check_streamable_command(
+    line: &[u8],
+    registry: &CommandRegistry,
+) -> StreamableCommand {
+    let trimmed = trim_bytes(line);
+    
+    // Check for exit/quit
+    if trimmed == b"exit" || trimmed == b"quit" {
+        return StreamableCommand::Exit;
+    }
+    
+    // Check for command chaining operators (; or &&)
+    for i in 0..trimmed.len() {
+        if trimmed[i] == b';' {
+            return StreamableCommand::Buffered;
+        }
+        if i + 1 < trimmed.len() && trimmed[i] == b'&' && trimmed[i + 1] == b'&' {
+            return StreamableCommand::Buffered;
+        }
+    }
+    
+    // Check for pipes or redirection
+    for &byte in trimmed {
+        if byte == b'|' || byte == b'>' {
+            return StreamableCommand::Buffered;
+        }
+    }
+    
+    // Parse the command name
+    let (cmd_name, _args) = split_first_word(trimmed);
+    
+    // Check if it's a builtin
+    if registry.find(cmd_name).is_some() {
+        return StreamableCommand::Buffered;
+    }
+    
+    // Check if it's an external binary in /bin
+    let cmd_name_str = match core::str::from_utf8(cmd_name) {
+        Ok(s) => s,
+        Err(_) => return StreamableCommand::Buffered,
+    };
+    
+    if let Some(bin_path) = find_executable(cmd_name_str).await {
+        StreamableCommand::External(bin_path)
+    } else {
+        StreamableCommand::Buffered
+    }
+}
+
+/// Execute a simple external command with streaming output
+///
+/// This handles the common case of running a single external binary
+/// with real-time output streaming. For complex commands (pipes, redirects,
+/// builtins), use `execute_command_chain` instead.
+///
+/// Returns `Some(result)` if the command was handled, `None` if it should
+/// use buffered execution instead.
+pub async fn execute_command_streaming<W>(
+    line: &[u8],
+    registry: &CommandRegistry,
+    _ctx: &mut ShellContext,
+    output: &mut W,
+) -> Option<ChainExecutionResult>
+where
+    W: embedded_io_async::Write,
+{
+    match check_streamable_command(line, registry).await {
+        StreamableCommand::External(bin_path) => {
+            // Execute with streaming output
+            let success = execute_external_streaming(&bin_path, None, output).await.is_ok();
+            Some(ChainExecutionResult {
+                output: Vec::new(), // Output already streamed
+                success,
+                should_exit: false,
+            })
+        }
+        StreamableCommand::Exit => {
+            Some(ChainExecutionResult {
+                output: Vec::new(),
+                success: true,
+                should_exit: true,
+            })
+        }
+        StreamableCommand::Buffered => {
+            // Fall back to buffered execution
+            None
+        }
+    }
+}
+
 /// Execute a pipeline of commands
 /// Returns the final output or an error with a message
 async fn execute_pipeline_internal(
