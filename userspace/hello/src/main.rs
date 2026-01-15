@@ -33,33 +33,24 @@ pub extern "C" fn _start() -> ! {
     print_num(pid);
     print(")\n");
 
-    let mut last_uptime = libakuma::uptime();
-        // Output "hello" periodically
+    // Output "hello" periodically
     for i in 0..TOTAL_OUTPUTS {
         print("hello (");
         print_num(i + 1);
         print("/");
         print_num(TOTAL_OUTPUTS);
         print(")\n");
+        
+        // Print uptime for debugging
+        let uptime = libakuma::uptime();
+        let mut buf = [0u8; 64];
+        let formatted = format_no_std::show(&mut buf, format_args!("{}\n", uptime),).unwrap();
+        print(&formatted);
 
         // Don't sleep after the last output
         if i + 1 < TOTAL_OUTPUTS {
-            // sleep(SLEEP_SECONDS);
-            loop {
-                if libakuma::uptime() - last_uptime < 100000 { // this is too short, should be x10
-                    // crate::threading::yield_now()
-                } else {
-                    last_uptime = libakuma::uptime();
-                    let mut buf = [0u8; 64];
-                    let formatted_uptime = format_no_std::show(&mut buf, format_args!("{:#?}\n", last_uptime),).unwrap();
-                    libakuma::write(libakuma::fd::STDOUT, &formatted_uptime.as_bytes());
-                    print(&formatted_uptime);
-                    let _ = formatted_uptime;
-                    let _ = buf;
-                    break
-                }
-
-            }
+            // Sleep for 100ms to show streaming (uses nanosleep which yields)
+            libakuma::sleep_ms(100);
         }
     }
 

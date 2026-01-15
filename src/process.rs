@@ -1148,40 +1148,53 @@ where
     // Spawn process with channel
     let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
 
-    // Poll for output and completion using async timer for proper yielding
+    // Poll for output and completion
     loop {
         // Drain any available output and write to stream
         if let Some(data) = channel.try_read() {
-            // Convert \n to \r\n for terminal display
+            // Write all data at once, then flush
+            let mut buf = alloc::vec::Vec::new();
             for &byte in &data {
                 if byte == b'\n' {
-                    let _ = output.write_all(b"\r\n").await;
+                    buf.extend_from_slice(b"\r\n");
                 } else {
-                    let _ = output.write_all(&[byte]).await;
+                    buf.push(byte);
                 }
             }
-            // Force yield to let network runner (thread 0) transmit packets
-            crate::threading::yield_now();
+            
+            let _ = output.write_all(&buf).await;
+            
+            // Flush output to push to network
+            let _ = output.flush().await;
+            
+            // Yield aggressively to allow network transmission
+            for _ in 0..100 {
+                crate::threading::yield_now();
+            }
         }
 
         // Check if process has exited
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
             // Drain any remaining output
-            if let Some(data) = channel.try_read() {
+            while let Some(data) = channel.try_read() {
+                let mut buf = alloc::vec::Vec::new();
                 for &byte in &data {
                     if byte == b'\n' {
-                        let _ = output.write_all(b"\r\n").await;
+                        buf.extend_from_slice(b"\r\n");
                     } else {
-                        let _ = output.write_all(&[byte]).await;
+                        buf.push(byte);
                     }
                 }
-                // Final yield to flush remaining output
+                let _ = output.write_all(&buf).await;
+            }
+            let _ = output.flush().await;
+            for _ in 0..100 {
                 crate::threading::yield_now();
             }
             break;
         }
 
-        // Yield once - block_on will yield to scheduler and re-poll us
+        // Yield to scheduler
         YieldOnce::new().await;
     }
 

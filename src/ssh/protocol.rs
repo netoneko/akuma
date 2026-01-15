@@ -417,15 +417,14 @@ impl Write for SshChannelStream<'_> {
             sent += chunk_size;
         }
         
-        // Yield to allow network runner (thread 0) to transmit packets
-        // This is critical for streaming output - without it, packets queue up
-        // and the network runner never gets CPU time to actually send them
-        crate::threading::yield_now();
-        
         Ok(buf.len())
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
+        // Flush the underlying TCP stream to push data to network driver
+        self.stream.flush().await.map_err(|_| SshStreamError)?;
+        // Yield to give network runner a chance to transmit
+        crate::threading::yield_now();
         Ok(())
     }
 }
@@ -1188,25 +1187,42 @@ async fn handle_message(
                     return Ok(MessageResult::StartShell);
                 } else if req_type == b"exec" {
                     // Handle exec request - supports command chaining with ; and &&
+                    crate::console::print("[SSH-EXEC] Got exec request!\n");
                     // Create per-session context (starts at /)
                     let mut exec_ctx = ShellContext::new();
                     offset += 1; // skip want_reply byte
                     if let Some(cmd_bytes) = read_string(payload, &mut offset) {
-                        log(&format!(
-                            "[SSH] Exec command: {:?}\n",
+                        crate::console::print(&alloc::format!(
+                            "[SSH-EXEC] Command: {:?}\n",
                             core::str::from_utf8(cmd_bytes)
                         ));
 
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
 
-                        // Use unified command chain executor
-                        let result =
-                            shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
+                        // Scope the channel_stream so borrows are released for send_packet below
+                        {
+                            // Create a channel stream for potential streaming output
+                            let mut channel_stream = SshChannelStream::new(stream, session);
 
-                        // Send collected output
-                        if !result.output.is_empty() {
-                            send_channel_data(stream, session, &result.output).await?;
+                            // Try streaming execution for simple external binaries
+                            if let Some(_streaming_result) = 
+                                shell::execute_command_streaming(
+                                    trimmed, &registry, &mut exec_ctx, &mut channel_stream,
+                                ).await 
+                            {
+                                // Output was already streamed
+                            } else {
+                                // Fall back to buffered execution for complex commands
+                                let _ = channel_stream.write(b"[DEBUG] Using buffered path\r\n").await;
+                                let result =
+                                    shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
+
+                                // Send collected output
+                                if !result.output.is_empty() {
+                                    let _ = channel_stream.write(&result.output).await;
+                                }
+                            }
                         }
                     }
                     // Send EOF after exec - client will send CLOSE, we respond to that
