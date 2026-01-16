@@ -1,24 +1,21 @@
-//! hello - Long-running process for testing ps command
+//! hello - Long-running process for testing argv and streaming
 //!
-//! Outputs "hello" periodically and runs for a configurable duration.
-//! Used to verify that `ps` can list running processes.
+//! Outputs "hello" periodically with configurable count and delay.
+//! Usage: hello [outputs] [delay_ms]
+//!   outputs  - Number of outputs (default: 10)
+//!   delay_ms - Delay between outputs in milliseconds (default: 1000)
 
 #![no_std]
 #![no_main]
 
-use libakuma::{exit, getpid, print, sleep};
-use format_no_std;
+use libakuma::{exit, getpid, print, arg, argc};
 
 // ============================================================================
-// Configuration
+// Configuration Defaults
 // ============================================================================
 
-/// Sleep duration between each "hello" output (in seconds)
-const SLEEP_SECONDS: u64 = 1;
-
-/// Total number of "hello" outputs before exiting
-/// 6 outputs × 10 seconds = 60 seconds total runtime
-const TOTAL_OUTPUTS: u32 = 10;
+const DEFAULT_OUTPUTS: u32 = 10;
+const DEFAULT_DELAY_MS: u64 = 1000;
 
 // ============================================================================
 // Implementation
@@ -27,30 +24,45 @@ const TOTAL_OUTPUTS: u32 = 10;
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
+    
+    // Parse command line arguments
+    let total_outputs = if argc() > 1 {
+        arg(1).and_then(|s| parse_u32(s)).unwrap_or(DEFAULT_OUTPUTS)
+    } else {
+        DEFAULT_OUTPUTS
+    };
+    
+    let delay_ms = if argc() > 2 {
+        arg(2).and_then(|s| parse_u64(s)).unwrap_or(DEFAULT_DELAY_MS)
+    } else {
+        DEFAULT_DELAY_MS
+    };
 
-    // Print startup message with PID
-    print("hello (fresh version with uptime syscall): started (PID ");
+    // Print startup message
+    print("hello: started (PID ");
     print_num(pid);
+    print(", outputs=");
+    print_num(total_outputs);
+    print(", delay_ms=");
+    print_num64(delay_ms);
     print(")\n");
 
     // Output "hello" periodically
-    for i in 0..TOTAL_OUTPUTS {
+    for i in 0..total_outputs {
         print("hello (");
         print_num(i + 1);
         print("/");
-        print_num(TOTAL_OUTPUTS);
+        print_num(total_outputs);
         print(")\n");
         
         // Print uptime for debugging
         let uptime = libakuma::uptime();
-        let mut buf = [0u8; 64];
-        let formatted = format_no_std::show(&mut buf, format_args!("{}\n", uptime),).unwrap();
-        print(&formatted);
+        print_num64(uptime);
+        print("\n");
 
-        // Don't sleep after the last output
-        if i + 1 < TOTAL_OUTPUTS {
-            // Sleep for 100ms to show streaming (uses nanosleep which yields)
-            libakuma::sleep_ms(100);
+        // Sleep between outputs (except after the last one)
+        if i + 1 < total_outputs {
+            libakuma::sleep_ms(delay_ms);
         }
     }
 
@@ -58,14 +70,45 @@ pub extern "C" fn _start() -> ! {
     exit(0);
 }
 
-/// Print a u32 number (simple implementation)
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_u32(s: &str) -> Option<u32> {
+    let mut result: u32 = 0;
+    for c in s.bytes() {
+        if c >= b'0' && c <= b'9' {
+            result = result.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+        } else {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn parse_u64(s: &str) -> Option<u64> {
+    let mut result: u64 = 0;
+    for c in s.bytes() {
+        if c >= b'0' && c <= b'9' {
+            result = result.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+        } else {
+            return None;
+        }
+    }
+    Some(result)
+}
+
 fn print_num(n: u32) {
+    print_num64(n as u64);
+}
+
+fn print_num64(n: u64) {
     if n == 0 {
         print("0");
         return;
     }
 
-    let mut buf = [0u8; 10];
+    let mut buf = [0u8; 20];
     let mut i = 0;
     let mut num = n;
 
@@ -79,7 +122,6 @@ fn print_num(n: u32) {
     while i > 0 {
         i -= 1;
         let s = [buf[i]];
-        // Use raw write syscall for single char
         libakuma::write(libakuma::fd::STDOUT, &s);
     }
 }
