@@ -84,43 +84,28 @@ sync_el1_handler:
 // Synchronous exception from EL0 (user mode)
 // Handles SVC syscalls and user faults
 sync_el0_handler:
-    // At this point: SP = SP_EL1 (kernel stack), ELR_EL1 = user PC
+    // At this point: SP = SP_EL1 (exception stack, set in run_user_until_exit)
+    // ELR_EL1 = user PC, SPSR_EL1 = user PSTATE
     // CRITICAL: We must save ALL user registers we're about to clobber!
     
-    // First, save user x8-x11 to kernel stack (we'll use x9, x10 for stack switching)
-    stp     x8, x9, [sp, #-32]!     // Push user x8, x9 (sp -= 32)
-    stp     x10, x11, [sp, #16]     // Save user x10, x11 at sp+16
+    // First, allocate space for the ENTIRE trap frame at once to avoid overlap issues.
+    // Trap frame: 280 bytes for user regs + 16 bytes for saved kernel SP = 296 bytes
+    sub     sp, sp, #296
     
-    // Now we can safely use x9 to hold kernel SP while switching stacks
-    add     x9, sp, #32             // x9 = original kernel SP (before we pushed)
+    // Now save user x8-x11 first (we'll clobber these for stack operations)
+    stp     x8, x9, [sp, #64]       // x8, x9 at offset 64, 72
+    stp     x10, x11, [sp, #80]     // x10, x11 at offset 80, 88
     
-    // Switch to dedicated exception stack
-    adrp    x10, EXCEPTION_STACK_TOP
-    add     x10, x10, :lo12:EXCEPTION_STACK_TOP
-    ldr     x10, [x10]
-    
-    // x11 = old kernel SP where we saved user x8-x11
-    mov     x11, sp
-    mov     sp, x10
-    
-    // Save original kernel SP at top of exception stack (we'll need it for return_to_kernel)
-    str     x9, [sp, #-16]!
-    
-    // Now allocate space for user registers on exception stack
-    // Order: x0-x30, then SP_EL0, ELR_EL1, SPSR_EL1
-    sub     sp, sp, #280            // 35 * 8 bytes
+    // Save kernel SP (for return_to_kernel) at the top of our frame
+    // Kernel SP = current SP + 296 (the value before we allocated)
+    add     x9, sp, #296
+    str     x9, [sp, #280]          // Saved at offset 280
     
     // Save x0-x7 (not clobbered)
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
     stp     x6, x7, [sp, #48]
-    
-    // Load user x8-x11 from old kernel stack and save to trap frame
-    ldp     x0, x1, [x11, #0]       // Load user x8->x0, user x9->x1
-    stp     x0, x1, [sp, #64]       // Store to proper slot [sp+64] = x8, [sp+72] = x9
-    ldp     x0, x1, [x11, #16]      // Load user x10->x0, user x11->x1
-    stp     x0, x1, [sp, #80]       // Store to proper slot [sp+80] = x10, [sp+88] = x11
     stp     x12, x13, [sp, #96]
     stp     x14, x15, [sp, #112]
     stp     x16, x17, [sp, #128]
@@ -144,7 +129,7 @@ sync_el0_handler:
     mrs     x0, spsr_el1
     str     x0, [sp, #264]
     
-    // Padding at [sp, #272] for alignment
+    // Padding at [sp, #272], kernel SP at [sp, #280]
     
     // Pass pointer to saved context as first arg
     mov     x0, sp
@@ -152,9 +137,9 @@ sync_el0_handler:
     // Call Rust handler - returns syscall result in x0
     bl      rust_sync_el0_handler
     
-    // x0 now has the return value
-    // Save it temporarily in x9 (will restore after we load other regs)
-    mov     x9, x0
+    // x0 now has the syscall return value
+    // Save it to scratch area while we restore other registers
+    str     x0, [sp, #272]
     
     // Restore SPSR_EL1
     ldr     x0, [sp, #264]
@@ -201,16 +186,8 @@ sync_el0_handler:
     // Restore x10-x11
     ldp     x10, x11, [sp, #80]
     
-    // Store return value temporarily on stack
-    str     x9, [sp, #272]          // Store return value in padding slot
-    
-    // Load the original kernel SP now (while we can still use x9)
-    // It's stored at [sp + 280] (after the trap frame)
-    ldr     x9, [sp, #280]          // Load original kernel SP
-    str     x9, [sp, #272 + 8]      // Store to second padding slot
-    
-    // Now restore user x8-x9
-    ldp     x8, x9, [sp, #64]       // Restore x8 and x9
+    // Restore x8-x9
+    ldp     x8, x9, [sp, #64]
     
     // Restore x6-x7
     ldp     x6, x7, [sp, #48]
@@ -221,73 +198,97 @@ sync_el0_handler:
     // Restore x2-x3
     ldp     x2, x3, [sp, #16]
     
-    // Restore x1 (x0 will be syscall return)
+    // Restore x1
     ldr     x1, [sp, #8]
     
     // Load syscall return value into x0
     ldr     x0, [sp, #272]
     
-    // Load original kernel SP into temporary location (use exception stack)
-    // We'll switch to it right before eret
-    ldr     x10, [sp, #272 + 8]     // x10 = original kernel SP (temporarily clobber x10)
-    
-    // Cleanup stack - skip past trap frame and kernel SP slot  
-    add     sp, sp, #296            // 280 (trap frame) + 16 (kernel SP slot)
-    
-    // Now restore x10 - we clobbered it, need to restore from trap frame
-    // But wait, trap frame is gone! We need a different approach.
-    // Let's use the user stack temporarily via SP_EL0
-    
-    // Actually, let's just accept that x10 is clobbered and switch to kernel stack
-    mov     sp, x10
-    
-    // Restore x10 from the saved value on kernel stack
-    // At kernel_sp - 16, we stored x10 during entry
-    ldr     x10, [sp, #-16]
+    // Cleanup stack frame (296 bytes)
+    add     sp, sp, #296
     
     // Return to user mode
     eret
 
-// IRQ from EL0 (user mode)
+// IRQ from EL0 (user mode)  
+// Uses a FIXED location relative to TPIDR_EL1, calculated fresh on both entry and exit.
+// Frame is at [tpidr_el1 - 768] to avoid overlap with sync_el0_handler.
 irq_el0_handler:
-    // Save full user context
-    sub     sp, sp, #256
-    stp     x0, x1, [sp, #0]
-    stp     x2, x3, [sp, #16]
-    stp     x4, x5, [sp, #32]
-    stp     x6, x7, [sp, #48]
-    stp     x8, x9, [sp, #64]
-    stp     x10, x11, [sp, #80]
-    stp     x12, x13, [sp, #96]
-    stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
-    stp     x18, x19, [sp, #144]
-    stp     x20, x21, [sp, #160]
-    stp     x22, x23, [sp, #176]
-    stp     x24, x25, [sp, #192]
-    stp     x26, x27, [sp, #208]
-    stp     x28, x29, [sp, #224]
-    str     x30, [sp, #240]
+    // At entry: all x0-x30 contain USER values, SP = SP_EL1
+    // Must save x10 BEFORE we clobber it for frame address calculation
+    
+    // Step 1: Push x10 to SP stack temporarily (SP = SP_EL1, which is exception stack)
+    str     x10, [sp, #-16]!
+    
+    // Step 2: Calculate frame address in x10
+    mrs     x10, tpidr_el1
+    sub     x10, x10, #768          // x10 = frame base
+    
+    // Step 3: Save x11 to frame
+    str     x11, [x10, #88]
+    
+    // Step 4: Retrieve saved x10 from stack and save to frame
+    ldr     x11, [sp], #16          // Pop saved x10 into x11, restore SP
+    str     x11, [x10, #80]         // Save user x10 to its slot
+    
+    // Step 5: Save x8, x9
+    stp     x8, x9, [x10, #64]
+    
+    // Step 6: Save all other registers
+    stp     x0, x1, [x10, #0]
+    stp     x2, x3, [x10, #16]
+    stp     x4, x5, [x10, #32]
+    stp     x6, x7, [x10, #48]
+    // x8-x11 already saved above
+    stp     x12, x13, [x10, #96]
+    stp     x14, x15, [x10, #112]
+    stp     x16, x17, [x10, #128]
+    stp     x18, x19, [x10, #144]
+    stp     x20, x21, [x10, #160]
+    stp     x22, x23, [x10, #176]
+    stp     x24, x25, [x10, #192]
+    stp     x26, x27, [x10, #208]
+    stp     x28, x29, [x10, #224]
+    str     x30, [x10, #240]
+    
+    // Save ELR_EL1 and SPSR_EL1
+    mrs     x0, elr_el1
+    mrs     x1, spsr_el1
+    stp     x0, x1, [x10, #248]
+    
+    // Set SP for function calls (below our frame)
+    sub     sp, x10, #256
 
     bl      rust_irq_handler
 
-    ldr     x30, [sp, #240]
-    ldp     x28, x29, [sp, #224]
-    ldp     x26, x27, [sp, #208]
-    ldp     x24, x25, [sp, #192]
-    ldp     x22, x23, [sp, #176]
-    ldp     x20, x21, [sp, #160]
-    ldp     x18, x19, [sp, #144]
-    ldp     x16, x17, [sp, #128]
-    ldp     x14, x15, [sp, #112]
-    ldp     x12, x13, [sp, #96]
-    ldp     x10, x11, [sp, #80]
-    ldp     x8, x9, [sp, #64]
-    ldp     x6, x7, [sp, #48]
-    ldp     x4, x5, [sp, #32]
-    ldp     x2, x3, [sp, #16]
-    ldp     x0, x1, [sp, #0]
-    add     sp, sp, #256
+    // After return (possibly from different thread via context switch),
+    // recalculate frame address from TPIDR_EL1 (which was updated by scheduler)
+    mrs     x10, tpidr_el1
+    sub     x10, x10, #768
+    
+    // Restore ELR_EL1 and SPSR_EL1
+    ldp     x0, x1, [x10, #248]
+    msr     elr_el1, x0
+    msr     spsr_el1, x1
+    
+    ldr     x30, [x10, #240]
+    ldp     x28, x29, [x10, #224]
+    ldp     x26, x27, [x10, #208]
+    ldp     x24, x25, [x10, #192]
+    ldp     x22, x23, [x10, #176]
+    ldp     x20, x21, [x10, #160]
+    ldp     x18, x19, [x10, #144]
+    ldp     x16, x17, [x10, #128]
+    ldp     x14, x15, [x10, #112]
+    ldp     x12, x13, [x10, #96]
+    ldp     x8, x9, [x10, #64]
+    ldp     x6, x7, [x10, #48]
+    ldp     x4, x5, [x10, #32]
+    ldp     x2, x3, [x10, #16]
+    ldp     x0, x1, [x10, #0]
+    // Finally restore x10, x11 - load x11 first using x10 as base
+    ldr     x11, [x10, #88]         // Load x11 from its slot
+    ldr     x10, [x10, #80]         // Load x10 last (clobbers base)
 
     eret
 
@@ -346,32 +347,61 @@ unsafe extern "C" {
     static exception_vector_table: u8;
 }
 
-/// Exception stack size (16KB should be plenty for syscall handling)
-const EXCEPTION_STACK_SIZE: usize = 16 * 1024;
+// ============================================================================
+// Per-Thread Exception Stacks
+// ============================================================================
+//
+// Each kernel thread has its own exception stack area reserved at the top of
+// its kernel stack. This allows safe context switching during syscalls because
+// each thread's trap frame is isolated.
+//
+// Stack layout (per thread):
+// |------------------| <- stack_top (highest address)
+// | Exception area   |  1KB reserved for UserTrapFrame + scratch
+// |------------------|
+// | Kernel stack     |  Rest of stack for normal kernel code
+// |------------------| <- stack_base (lowest address)
+//
+// The exception stack pointer is stored in TPIDR_EL1 (Thread Pointer ID Register).
+// This is a CPU register specifically designed for per-thread data access.
+// On every context switch, TPIDR_EL1 is set to the new thread's exception stack.
+// The sync_el0_handler reads TPIDR_EL1 directly - no global variable needed.
+//
+// To move exception stacks elsewhere (e.g., separate allocation):
+// 1. Allocate separate memory per thread
+// 2. Store pointer in ThreadSlot.exception_stack_top  
+// 3. No other changes needed - scheduler reads from ThreadSlot
+//
+// See docs/WAIT_QUEUES.md for detailed documentation.
+// ============================================================================
 
-/// Static exception stack - used by sync_el0_handler to avoid corrupting kernel stack
-#[repr(C, align(16))]
-struct ExceptionStack {
-    data: [u8; EXCEPTION_STACK_SIZE],
+/// Set the current exception stack for the running thread
+/// Called during context switch to update TPIDR_EL1
+#[inline]
+pub fn set_current_exception_stack(stack_top: u64) {
+    unsafe {
+        core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top);
+    }
 }
 
-static mut EXCEPTION_STACK: ExceptionStack = ExceptionStack {
-    data: [0; EXCEPTION_STACK_SIZE],
-};
+/// Get the current exception stack pointer from TPIDR_EL1
+#[inline]
+#[allow(dead_code)]
+pub fn get_current_exception_stack() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val);
+    }
+    val
+}
 
-/// Pointer to top of exception stack (stack grows down)
-#[unsafe(no_mangle)]
-static mut EXCEPTION_STACK_TOP: u64 = 0;
-
-/// Initialize the exception stack pointer
+/// Initialize the exception stack pointer for the boot thread
 /// Must be called before any user mode code runs
 pub fn init_exception_stack() {
-    unsafe {
-        let stack_bottom = core::ptr::addr_of!(EXCEPTION_STACK.data) as u64;
-        let stack_top = stack_bottom + EXCEPTION_STACK_SIZE as u64;
-        // Align to 16 bytes (required by AArch64 ABI)
-        EXCEPTION_STACK_TOP = stack_top & !0xF;
-    }
+    // Boot thread (thread 0) uses the boot stack at 0x42000000
+    // Its exception stack is at the very top
+    let boot_stack_top = 0x42000000u64;
+    set_current_exception_stack(boot_stack_top);
 }
 
 /// Saved user context from EL0 exception
@@ -467,6 +497,18 @@ extern "C" fn rust_default_exception_handler() {
 /// Rust IRQ handler called from assembly
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler() {
+    // Debug: read TPIDR_EL1 and SP
+    let tpidr: u64;
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr);
+        core::arch::asm!("mov {}, sp", out(reg) sp);
+    }
+    let tid_before = crate::threading::current_thread_id();
+    crate::console::print(&alloc::format!(
+        "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp
+    ));
+    
     // Acknowledge the interrupt and get IRQ number
     if let Some(irq) = crate::gic::acknowledge_irq() {
         // Special handling for scheduler SGI
@@ -479,6 +521,18 @@ extern "C" fn rust_irq_handler() {
             crate::gic::end_of_interrupt(irq);
         }
     }
+    
+    // Debug: after handling
+    let tpidr_after: u64;
+    let sp_after: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr_after);
+        core::arch::asm!("mov {}, sp", out(reg) sp_after);
+    }
+    let tid_after = crate::threading::current_thread_id();
+    crate::console::print(&alloc::format!(
+        "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after
+    ));
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)

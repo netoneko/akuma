@@ -611,6 +611,12 @@ pub struct KernelContext {
     pub x28: u64,
     pub x29: u64, // frame pointer
     pub x30: u64, // return address
+    // Debug: saved at execute() entry
+    pub entry_x30: u64,  // x30 when execute() was called (return addr to closure)
+    pub entry_sp: u64,   // SP when execute() was called
+    pub entry_x29: u64,  // frame pointer at entry
+    // Stack frame snapshot at entry (first 8 values)
+    pub entry_stack: [u64; 8],
 }
 
 impl Process {
@@ -709,6 +715,25 @@ impl Process {
     ///
     /// Returns the exit code
     pub fn execute(&mut self) -> i32 {
+        // FIRST THING: Save entry registers and stack before anything else
+        let entry_x30: u64;
+        let entry_sp: u64;
+        let entry_x29: u64;
+        unsafe {
+            core::arch::asm!("mov {}, x30", out(reg) entry_x30);
+            core::arch::asm!("mov {}, sp", out(reg) entry_sp);
+            core::arch::asm!("mov {}, x29", out(reg) entry_x29);
+        }
+        self.kernel_ctx.entry_x30 = entry_x30;
+        self.kernel_ctx.entry_sp = entry_sp;
+        self.kernel_ctx.entry_x29 = entry_x29;
+        // Save first 8 stack values
+        for i in 0..8 {
+            self.kernel_ctx.entry_stack[i] = unsafe { 
+                *((entry_sp + i as u64 * 8) as *const u64) 
+            };
+        }
+        
         self.state = ProcessState::Running;
 
         // Reset per-process I/O state
@@ -747,6 +772,7 @@ impl Process {
         // When user calls exit(), it sets proc.exited = true
         // and the exception handler calls return_to_kernel() to return here
         let ctx_ptr = &mut self.kernel_ctx as *mut KernelContext;
+        
         let exit_code = unsafe { run_user_until_exit(self.context.sp, self.context.pc, ctx_ptr) };
 
         // Unregister this process from the table
@@ -911,7 +937,28 @@ pub extern "C" fn check_process_exit() -> bool {
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // Get kernel context from current process
     let ctx_ptr = match current_process() {
-        Some(proc) => &proc.kernel_ctx as *const KernelContext,
+        Some(proc) => {
+            let ctx = &proc.kernel_ctx;
+            // Show entry values
+            console::print(&alloc::format!(
+                "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
+                proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30
+            ));
+            // Compare entry stack with current stack at entry_sp
+            console::print("  Stack comparison (entry vs now):\n");
+            for i in 0..8 {
+                let addr = ctx.entry_sp + i as u64 * 8;
+                let current = unsafe { *(addr as *const u64) };
+                let saved = ctx.entry_stack[i];
+                if current != saved {
+                    console::print(&alloc::format!(
+                        "  [entry_sp+{}]: was {:#x} now {:#x} CHANGED!\n", 
+                        i*8, saved, current
+                    ));
+                }
+            }
+            ctx as *const KernelContext
+        }
         None => {
             crate::console::print("[return_to_kernel] ERROR: no current process!\n");
             loop {
@@ -1002,6 +1049,13 @@ unsafe extern "C" fn run_user_until_exit(
         "mov x16, #0",
         "mov x17, #0",
         "mov x18, #0",
+        // CRITICAL: Set SP to exception stack before entering user mode.
+        // When IRQ fires from EL0, irq_el0_handler uses SP_EL1 (current SP).
+        // Without this, it would corrupt the kernel stack (execute()'s frame).
+        // Use x9 as scratch then clear it to avoid leaking kernel address to user.
+        "mrs x9, tpidr_el1",
+        "mov sp, x9",
+        "mov x9, #0",
         // Enter user mode
         // return_to_kernel() will restore context and ret back here
         "eret",
@@ -1140,12 +1194,17 @@ pub fn spawn_process_with_channel(
         // Remove channel registration
         remove_channel(tid);
 
+        console::print("[Thread] About to mark terminated\n");
+        
         // Mark thread as terminated when process exits
         crate::threading::mark_current_terminated();
 
+        console::print("[Thread] About to yield\n");
+        
         // This loop should never be reached, but just in case
         loop {
             crate::threading::yield_now();
+            console::print("[Thread] Yielded (shouldn't happen for terminated)\n");
         }
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;

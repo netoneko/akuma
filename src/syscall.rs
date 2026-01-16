@@ -87,9 +87,9 @@ fn sys_brk(new_brk: usize) -> u64 {
 
 /// sys_nanosleep - Sleep for a specified duration
 ///
-/// Sleeps in short intervals to allow interrupt checking (Ctrl+C).
-/// The thread cannot be preempted during the syscall, but will be
-/// preempted once it returns to EL0 (userspace).
+/// Uses the wait queue scheduler to yield during sleep, allowing other threads
+/// to run. Each thread has its own exception stack, so context switching during
+/// syscalls is safe.
 ///
 /// # Arguments
 /// * `seconds` - Number of seconds to sleep
@@ -99,23 +99,26 @@ fn sys_brk(new_brk: usize) -> u64 {
 /// 0 on success, EINTR if interrupted
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
     let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
-    let start = crate::timer::uptime_us();
-    let deadline = start + total_us;
+    let deadline = crate::timer::uptime_us() + total_us;
 
-    // NOTE: We cannot enable IRQs or yield during syscall handling because:
-    // 1. Syscalls run in EL1 exception context with specific ELR/SPSR state
-    // 2. Timer interrupts would trigger context switches that corrupt this state
-    // 3. The thread will be preempted naturally once it returns to EL0
+    // Wait queue based sleep:
+    // 1. Mark thread as WAITING with wake_time = deadline
+    // 2. Yield to scheduler (switches to another thread)
+    // 3. Scheduler periodically checks wake_time and marks us READY when elapsed
+    // 4. When scheduled again, we resume here and check if done
     //
-    // For long sleeps, we check for interrupts periodically.
+    // Each thread has its own exception stack (trap frame area), so the
+    // context switch during syscall handling is safe.
 
-    // Sleep in small increments to allow interrupt checking
-    const CHECK_INTERVAL_US: u64 = 10_000; // Check every 10ms
+    loop {
+        // Check if sleep is complete
+        if crate::timer::uptime_us() >= deadline {
+            return 0; // Done sleeping
+        }
 
-    while crate::timer::uptime_us() < deadline {
-        // Check for interrupt signal
+        // Check for interrupt signal (Ctrl+C)
         if crate::process::is_current_interrupted() {
-            // Interrupted by Ctrl+C
+            // Interrupted - mark process as exited
             if let Some(proc) = crate::process::current_process() {
                 proc.exited = true;
                 proc.exit_code = 130;
@@ -124,15 +127,11 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
             return EINTR;
         }
 
-        // Short delay
-        let remaining = deadline.saturating_sub(crate::timer::uptime_us());
-        let sleep_time = remaining.min(CHECK_INTERVAL_US);
-        if sleep_time > 0 {
-            crate::timer::delay_us(sleep_time);
-        }
+        // Block until deadline - yields to scheduler, wakes when time elapses
+        crate::threading::schedule_blocking(deadline);
+        
+        // We've been woken - loop to check if deadline passed or if interrupted
     }
-
-    0 // Success
 }
 
 fn sys_uptime() -> u64 {

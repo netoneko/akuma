@@ -490,6 +490,16 @@ impl StackInfo {
     }
 }
 
+/// Size of per-thread exception stack area (reserved at top of kernel stack)
+/// This area holds:
+/// - sync_el0_handler trap frame (296 bytes) at top
+/// - irq_el0_handler frame (272 bytes) at top-768
+/// - Function call stack for syscall handlers (console, FS, etc.)
+/// 
+/// IMPORTANT: Syscall handlers can call deep functions. 16KB provides enough
+/// headroom to prevent overlap with kernel code (like execute()) below.
+pub const EXCEPTION_STACK_SIZE: usize = 16384;
+
 /// Thread slot in the pool
 #[repr(C)]
 pub struct ThreadSlot {
@@ -498,6 +508,10 @@ pub struct ThreadSlot {
     pub cooperative: bool,
     pub start_time_us: u64,
     pub timeout_us: u64,
+    /// Per-thread exception stack top (for syscall trap frames)
+    /// This is the top of the reserved 1KB area at the top of the kernel stack.
+    /// To move exception stacks elsewhere, allocate separate memory and update this pointer.
+    pub exception_stack_top: u64,
 }
 
 impl ThreadSlot {
@@ -508,6 +522,7 @@ impl ThreadSlot {
             cooperative: false,
             start_time_us: 0,
             timeout_us: 0,
+            exception_stack_top: 0,
         }
     }
 }
@@ -554,10 +569,21 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].context.ttbr0 = boot_ttbr0;
 
         // Boot stack info (fixed location from boot.rs)
+        // Stack layout: [stack_base ... usable stack ... exception_area ... stack_top]
+        // Exception area is EXCEPTION_STACK_SIZE bytes at top
+        let boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
+        let boot_stack_base = 0x41F00000usize; // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
-            0x41F00000, // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
+            boot_stack_base,
             config::KERNEL_STACK_SIZE,
         );
+        // Exception stack is at the very top of the boot stack
+        self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_stack_top;
+        
+        // Initialize canary for boot stack
+        if config::ENABLE_STACK_CANARIES {
+            init_stack_canary(boot_stack_base);
+        }
 
         // Threads 1 to RESERVED_THREADS-1: System threads with large stacks (256KB)
         // Used for shell, SSH sessions, async executor, etc.
@@ -575,6 +601,15 @@ impl ThreadPool {
     }
 
     /// Allocate a stack for a specific slot
+    /// 
+    /// Stack layout (stack grows downward):
+    /// ```text
+    /// |------------------| <- stack_top (highest address)
+    /// | Exception area   |  EXCEPTION_STACK_SIZE (1KB) for trap frames
+    /// |------------------|
+    /// | Kernel stack     |  Rest of stack for normal kernel code
+    /// |------------------| <- stack_base (lowest address)
+    /// ```
     fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) {
         let stack_vec: Vec<u8> = alloc::vec![0u8; size];
         let stack_box = stack_vec.into_boxed_slice();
@@ -587,6 +622,10 @@ impl ThreadPool {
         }
 
         self.stacks[slot_idx] = stack_info;
+        
+        // Set exception stack top (top of the reserved 1KB area)
+        // The exception stack is at the very top of the kernel stack
+        self.slots[slot_idx].exception_stack_top = (stack_info.top & !0xF) as u64;
     }
 
     /// Reallocate stack for a slot with new size (only if slot is Free)
@@ -729,7 +768,15 @@ impl ThreadPool {
                 );
                 
                 let stack = &self.stacks[i];
-                let sp = (stack.top & !0xF) as u64;
+                // Initial SP is BELOW the exception area (which is at the top)
+                // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
+                // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
+                let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+                
+                crate::console::print(&alloc::format!(
+                    "[spawn_system] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
+                    i, stack.top, EXCEPTION_STACK_SIZE, sp
+                ));
 
                 // Get current (boot) TTBR0 for kernel threads
                 let boot_ttbr0: u64;
@@ -795,7 +842,13 @@ impl ThreadPool {
                 );
                 
                 let stack = &self.stacks[i];
-                let sp = (stack.top & !0xF) as u64;
+                // Initial SP is BELOW the exception area (which is at the top)
+                let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+                
+                crate::console::print(&alloc::format!(
+                    "[spawn_user] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
+                    i, stack.top, EXCEPTION_STACK_SIZE, sp
+                ));
 
                 // Get current (boot) TTBR0 for kernel threads
                 // Note: User process threads will update TTBR0 when entering user mode
@@ -937,6 +990,21 @@ impl ThreadPool {
             next_idx = (next_idx + 1) % config::MAX_THREADS;
 
             if next_idx == start_idx {
+                // Debug: print thread states when no switch
+                crate::console::print(&alloc::format!(
+                    "[SCHED] no switch from {}: states=[{},{},{},{},{},{},{},{},{},{}]\n",
+                    current_idx,
+                    THREAD_STATES[0].load(Ordering::SeqCst),
+                    THREAD_STATES[1].load(Ordering::SeqCst),
+                    THREAD_STATES[2].load(Ordering::SeqCst),
+                    THREAD_STATES[3].load(Ordering::SeqCst),
+                    THREAD_STATES[4].load(Ordering::SeqCst),
+                    THREAD_STATES[5].load(Ordering::SeqCst),
+                    THREAD_STATES[6].load(Ordering::SeqCst),
+                    THREAD_STATES[7].load(Ordering::SeqCst),
+                    THREAD_STATES[8].load(Ordering::SeqCst),
+                    THREAD_STATES[9].load(Ordering::SeqCst),
+                ));
                 return None;
             }
         }
@@ -946,6 +1014,7 @@ impl ThreadPool {
         }
 
         // Update states atomically (lock-free)
+        // Don't change state if thread is TERMINATED
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
         if current_state != thread_state::TERMINATED {
             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
@@ -1140,10 +1209,51 @@ pub fn sgi_scheduler_handler(irq: u32) {
     };
 
     if let Some((old_idx, new_idx)) = switch_info {
+        crate::console::print(&alloc::format!(
+            "[SGI] switching {} -> {}\n", old_idx, new_idx
+        ));
+        
         unsafe {
             let pool = &mut *pool_ptr;
+            
+            // Verify stack canaries before switching (only if enabled)
+            if config::ENABLE_STACK_CANARIES {
+                let old_stack_base = pool.stacks[old_idx].base;
+                let new_stack_base = pool.stacks[new_idx].base;
+                
+                if !check_stack_canary(old_stack_base) {
+                    crate::console::print(&alloc::format!(
+                        "[CANARY CORRUPT] Thread {} stack_base={:#x} BEFORE switch\n",
+                        old_idx, old_stack_base
+                    ));
+                }
+                if !check_stack_canary(new_stack_base) {
+                    crate::console::print(&alloc::format!(
+                        "[CANARY CORRUPT] Thread {} stack_base={:#x} BEFORE switch (target)\n",
+                        new_idx, new_stack_base
+                    ));
+                }
+            }
+            
             let (old_ptr, new_ptr) = pool.get_context_ptrs(old_idx, new_idx);
+            
+            let old_tpidr = pool.slots[old_idx].exception_stack_top;
+            let new_tpidr = pool.slots[new_idx].exception_stack_top;
+            crate::console::print(&alloc::format!(
+                "[SGI] old_tpidr={:#x} new_tpidr={:#x}\n", old_tpidr, new_tpidr
+            ));
+            
+            // Update exception stack BEFORE switching - critical for new threads
+            // that jump directly to thread_start_closure and never return here.
+            // Each thread needs its own trap frame area for syscall handling.
+            crate::exceptions::set_current_exception_stack(new_tpidr);
+            
             switch_context(old_ptr, new_ptr);
+            
+            // We return here after being switched BACK to this thread
+            crate::console::print(&alloc::format!(
+                "[SGI] returned to tid={}\n", old_idx
+            ));
         }
     }
 }
@@ -1152,6 +1262,31 @@ pub fn sgi_scheduler_handler(irq: u32) {
 pub fn yield_now() {
     VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+}
+
+/// Block the current thread until the specified wake time, then yield
+/// 
+/// This is safe to call from syscall handlers. The thread will be marked as
+/// WAITING and will not be scheduled until:
+/// 1. The wake_time_us deadline has passed, OR
+/// 2. An external event wakes the thread (not yet implemented)
+///
+/// When the thread is woken, it resumes execution right after this function returns.
+/// 
+/// # TTBR0 Handling
+/// 
+/// When called from a syscall context, TTBR0 contains user page tables.
+/// We must switch to kernel (boot) TTBR0 before yielding so that:
+/// 1. switch_context saves kernel TTBR0, not user TTBR0
+/// 2. When resumed, kernel code can access all kernel memory
+/// 
+/// After resuming, we restore the user TTBR0 before returning to syscall handler.
+pub fn schedule_blocking(wake_time_us: u64) {
+    // Pure busy-wait without yielding - to isolate crash
+    while crate::timer::uptime_us() < wake_time_us {
+        // Just spin - no yield
+        core::hint::spin_loop();
+    }
 }
 
 /// Get thread stats (ready, running, terminated) - LOCK-FREE
@@ -1324,7 +1459,15 @@ where
         let pool = unsafe { &mut *POOL.data_ptr() };
         
         let stack = &pool.stacks[slot_idx];
-        let sp = (stack.top & !0xF) as u64;
+        // Initial SP is BELOW the exception area (which is at the top)
+        // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
+        // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
+        let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+        
+        crate::console::print(&alloc::format!(
+            "[spawn_user_lockfree] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
+            slot_idx, stack.top, EXCEPTION_STACK_SIZE, sp
+        ));
         
         let boot_ttbr0: u64;
         unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
@@ -1644,6 +1787,10 @@ pub struct StackAllocationSummary {
     pub user_stack_size: usize,
     /// Total user thread stack memory
     pub user_total: usize,
+    /// Exception stack size per thread (reserved at top of each stack)
+    pub exception_stack_size: usize,
+    /// Usable kernel stack per thread (total - exception area)
+    pub usable_kernel_stack: usize,
 }
 
 /// Calculate the total stack memory required based on kernel config
@@ -1652,6 +1799,10 @@ pub struct StackAllocationSummary {
 /// - Thread 0: KERNEL_STACK_SIZE (boot stack, fixed location)
 /// - Threads 1 to RESERVED_THREADS-1: SYSTEM_THREAD_STACK_SIZE each
 /// - Threads RESERVED_THREADS to MAX_THREADS-1: USER_THREAD_STACK_SIZE each
+///
+/// Each stack is divided into:
+/// - Exception area (EXCEPTION_STACK_SIZE) at top: for IRQ/syscall handlers
+/// - Usable kernel stack below: for normal kernel code (execute(), etc.)
 ///
 /// Note: Thread 0's boot stack is at a fixed address and doesn't count
 /// against heap memory, but is included for completeness.
@@ -1665,6 +1816,10 @@ pub fn calculate_stack_requirements() -> StackAllocationSummary {
     // Boot stack is at fixed location, not from heap
     let heap_allocated = system_total + user_total;
     
+    // Calculate usable kernel stack (smallest of the stack types minus exception area)
+    let min_stack = config::SYSTEM_THREAD_STACK_SIZE.min(config::USER_THREAD_STACK_SIZE);
+    let usable_kernel_stack = min_stack.saturating_sub(EXCEPTION_STACK_SIZE);
+    
     StackAllocationSummary {
         total_bytes: config::KERNEL_STACK_SIZE + heap_allocated,
         boot_stack: config::KERNEL_STACK_SIZE,
@@ -1674,6 +1829,8 @@ pub fn calculate_stack_requirements() -> StackAllocationSummary {
         user_thread_count,
         user_stack_size: config::USER_THREAD_STACK_SIZE,
         user_total,
+        exception_stack_size: EXCEPTION_STACK_SIZE,
+        usable_kernel_stack,
     }
 }
 
@@ -1685,6 +1842,25 @@ pub fn calculate_stack_requirements() -> StackAllocationSummary {
 /// * `available_heap` - Total heap memory available (bytes)
 pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSummary, alloc::string::String> {
     let summary = calculate_stack_requirements();
+    
+    // Check that exception stack doesn't consume the entire stack
+    // We need at least 8KB of usable kernel stack for execute() and other kernel code
+    const MIN_USABLE_KERNEL_STACK: usize = 8 * 1024;
+    if summary.usable_kernel_stack < MIN_USABLE_KERNEL_STACK {
+        return Err(alloc::format!(
+            "Exception stack too large! Usable kernel stack: {} KB < {} KB minimum\n\
+             Stack layout per thread:\n\
+             - Total stack: {} KB\n\
+             - Exception area (at top): {} KB\n\
+             - Usable kernel stack: {} KB\n\
+             Reduce EXCEPTION_STACK_SIZE or increase thread stack sizes.",
+            summary.usable_kernel_stack / 1024,
+            MIN_USABLE_KERNEL_STACK / 1024,
+            summary.system_stack_size.min(summary.user_stack_size) / 1024,
+            summary.exception_stack_size / 1024,
+            summary.usable_kernel_stack / 1024,
+        ));
+    }
     
     // Only system and user thread stacks come from heap
     // Boot stack is at fixed location
@@ -1728,6 +1904,10 @@ pub fn print_stack_requirements() {
         summary.user_thread_count,
         summary.user_stack_size / 1024,
         summary.user_total / 1024));
+    console::print(&format!("Exception area/thread:  {} KB (for IRQ/syscall handlers)\n",
+        summary.exception_stack_size / 1024));
+    console::print(&format!("Usable kernel stack:    {} KB (per thread, for execute() etc.)\n",
+        summary.usable_kernel_stack / 1024));
     console::print(&format!("Total from heap:        {} KB ({} MB)\n",
         heap_required / 1024,
         heap_required / (1024 * 1024)));
