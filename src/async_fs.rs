@@ -1,26 +1,22 @@
 //! Async Filesystem API
 //!
-//! Provides async wrappers around the synchronous filesystem API,
-//! using Embassy's async primitives for non-blocking operation.
+//! Provides async wrappers around the synchronous filesystem API.
+//! These are thin wrappers that yield once before calling the sync FS,
+//! allowing other async tasks a chance to run.
+//!
+//! NOTE: No locking is needed here because:
+//! 1. The underlying VFS already uses spinlocks for thread safety
+//! 2. We disable preemption during async polls, so there's no concurrent access
+//! 3. Using async mutexes with our no-op waker block_on would cause deadlocks
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
 
 use crate::fs;
 pub use crate::fs::{DirEntry, FsError, FsStats, OpenMode};
-
-// ============================================================================
-// Async Mutex for Filesystem Access
-// ============================================================================
-
-/// Global mutex protecting filesystem operations
-/// This ensures only one async task can access the filesystem at a time
-static FS_MUTEX: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 // ============================================================================
 // Yield Helper
@@ -62,77 +58,66 @@ async fn yield_now() {
 
 /// Async wrapper for listing directory contents
 pub async fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::list_dir(path)
 }
 
 /// Async wrapper for reading entire file as bytes
 pub async fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::read_file(path)
 }
 
 /// Async wrapper for reading file as string
 pub async fn read_to_string(path: &str) -> Result<String, FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::read_to_string(path)
 }
 
 /// Async wrapper for writing to a file
 pub async fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::write_file(path, data)
 }
 
 /// Async wrapper for appending to a file
 pub async fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::append_file(path, data)
 }
 
 /// Async wrapper for creating a directory
 pub async fn create_dir(path: &str) -> Result<(), FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::create_dir(path)
 }
 
 /// Async wrapper for removing a file
 pub async fn remove_file(path: &str) -> Result<(), FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::remove_file(path)
 }
 
 /// Async wrapper for removing a directory
 pub async fn remove_dir(path: &str) -> Result<(), FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::remove_dir(path)
 }
 
 /// Async wrapper for checking if path exists
 pub async fn exists(path: &str) -> bool {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::exists(path)
 }
 
 /// Async wrapper for getting file size
 pub async fn file_size(path: &str) -> Result<u64, FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::file_size(path)
 }
 
 /// Async wrapper for getting filesystem stats
 pub async fn stats() -> Result<FsStats, FsError> {
-    let _guard = FS_MUTEX.lock().await;
     yield_now().await;
     fs::stats()
 }
@@ -151,7 +136,6 @@ pub struct AsyncFile {
 impl AsyncFile {
     /// Open a file with the specified mode
     pub async fn open(path: &str, mode: OpenMode) -> Result<Self, FsError> {
-        let _guard = FS_MUTEX.lock().await;
         yield_now().await;
 
         // Validate the file exists for read modes
@@ -187,7 +171,6 @@ impl AsyncFile {
             return Err(FsError::PermissionDenied);
         }
 
-        let _guard = FS_MUTEX.lock().await;
         yield_now().await;
 
         // Read entire file and extract the portion we need
@@ -213,7 +196,6 @@ impl AsyncFile {
             return Err(FsError::PermissionDenied);
         }
 
-        let _guard = FS_MUTEX.lock().await;
         yield_now().await;
 
         match self.mode {
@@ -270,7 +252,6 @@ impl AsyncFile {
 
     /// Seek to a position in the file
     pub async fn seek(&mut self, pos: SeekFrom) -> Result<u64, FsError> {
-        let _guard = FS_MUTEX.lock().await;
         yield_now().await;
 
         let file_size = fs::file_size(&self.path).unwrap_or(0);

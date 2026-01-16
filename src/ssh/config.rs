@@ -1,15 +1,26 @@
 //! SSH Server Configuration
 //!
 //! Parses and manages the SSH server configuration file at /etc/sshd/sshd.conf
+//!
+//! Configuration is loaded once at SSH server startup and cached.
+//! This avoids filesystem access on every connection.
 
 use crate::async_fs;
 use crate::console;
+use spinning_top::Spinlock;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 const CONFIG_PATH: &str = "/etc/sshd/sshd.conf";
+
+// ============================================================================
+// Cached Configuration
+// ============================================================================
+
+/// Cached configuration loaded at server startup
+static CACHED_CONFIG: Spinlock<Option<SshdConfig>> = Spinlock::new(None);
 
 // ============================================================================
 // Configuration Structure
@@ -79,32 +90,57 @@ fn parse_bool(s: &str) -> bool {
 // Config Loading
 // ============================================================================
 
+/// Get the cached configuration (must call load_config first!)
+/// 
+/// Returns the cached config, or default if not loaded yet.
+/// This is synchronous and safe to call from any thread.
+pub fn get_config() -> SshdConfig {
+    let guard = CACHED_CONFIG.lock();
+    guard.clone().unwrap_or_default()
+}
+
 /// Load the SSH server configuration from /etc/sshd/sshd.conf
-/// Returns default config if file doesn't exist or can't be parsed
+/// 
+/// This should be called once at SSH server startup.
+/// The configuration is cached for subsequent get_config() calls.
+/// Returns default config if file doesn't exist or can't be parsed.
 pub async fn load_config() -> SshdConfig {
+    // Check if already cached
+    {
+        let guard = CACHED_CONFIG.lock();
+        if let Some(ref config) = *guard {
+            return config.clone();
+        }
+    }
+
     let mut config = SshdConfig::default();
 
     if !async_fs::exists(CONFIG_PATH).await {
         log("[SSH Config] No config file found, using defaults\n");
-        return config;
+    } else {
+        match async_fs::read_to_string(CONFIG_PATH).await {
+            Ok(content) => {
+                for line in content.lines() {
+                    config.parse_line(line);
+                }
+                log(&alloc::format!(
+                    "[SSH Config] Loaded config: disable_key_verification={}\n",
+                    config.disable_key_verification
+                ));
+            }
+            Err(e) => {
+                log(&alloc::format!(
+                    "[SSH Config] Failed to read config: {}, using defaults\n",
+                    e
+                ));
+            }
+        }
     }
 
-    match async_fs::read_to_string(CONFIG_PATH).await {
-        Ok(content) => {
-            for line in content.lines() {
-                config.parse_line(line);
-            }
-            log(&alloc::format!(
-                "[SSH Config] Loaded config: disable_key_verification={}\n",
-                config.disable_key_verification
-            ));
-        }
-        Err(e) => {
-            log(&alloc::format!(
-                "[SSH Config] Failed to read config: {}, using defaults\n",
-                e
-            ));
-        }
+    // Cache the config
+    {
+        let mut guard = CACHED_CONFIG.lock();
+        *guard = Some(config.clone());
     }
 
     config

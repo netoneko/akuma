@@ -296,6 +296,8 @@ impl EmbassyVirtioDriver {
         });
         if let Some(w) = waker {
             w.wake();
+            // Signal executor to wake from WFE
+            crate::executor::signal_wake();
         }
     }
 
@@ -307,6 +309,8 @@ impl EmbassyVirtioDriver {
         });
         if let Some(w) = waker {
             w.wake();
+            // Signal executor to wake from WFE
+            crate::executor::signal_wake();
         }
     }
 }

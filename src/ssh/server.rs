@@ -262,8 +262,9 @@ pub async fn run(stack: Stack<'static>) {
     // Initialize shared host key from filesystem
     protocol::init_host_key_async().await;
 
-    // Ensure default config exists
+    // Ensure default config exists, then load and cache it
     super::config::ensure_default_config().await;
+    super::config::load_config().await;
 
     // Fallback connections (used when thread spawning fails)
     let mut fallback_connections: Vec<ActiveConnection> = Vec::new();

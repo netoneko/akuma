@@ -183,8 +183,15 @@ impl EmbassyTimeDriver {
         
         // Now wake all collected wakers OUTSIDE the critical section
         // This ensures waker.wake() can do whatever it needs without holding locks
+        let mut any_woken = false;
         for waker in wakers_to_wake.into_iter().flatten() {
             waker.wake();
+            any_woken = true;
+        }
+        
+        // Signal executor to wake from WFE if we woke any tasks
+        if any_woken {
+            crate::executor::signal_wake();
         }
     }
 }

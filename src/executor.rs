@@ -2,7 +2,16 @@
 //!
 //! This module provides async task execution using Embassy's executor.
 //! The executor integrates with our timer infrastructure for proper waking.
+//!
+//! ## ARM WFE/SEV Integration
+//!
+//! This executor uses ARM's Wait-For-Event (WFE) and Send-Event (SEV)
+//! instructions for efficient waking:
+//! - WFE puts the CPU in low-power state until an event is signaled
+//! - SEV signals all cores to wake from WFE
+//! - This avoids busy-polling while maintaining responsiveness
 
+use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::{Spawner, raw};
@@ -92,12 +101,45 @@ pub fn spawner() -> Option<Spawner> {
 
 /// Run the executor until explicitly stopped
 /// This is useful for running in a dedicated thread
+/// 
+/// Uses ARM WFE for efficient waiting between polls
 pub fn run_blocking() {
     loop {
         run_once();
-        // Yield to other threads
-        crate::threading::yield_now();
+        // Wait for event (interrupt or SEV from waker)
+        // This is more efficient than busy-polling
+        wait_for_event();
     }
+}
+
+// ============================================================================
+// ARM WFE/SEV Integration
+// ============================================================================
+
+/// Wait for an event using ARM WFE instruction
+/// 
+/// This puts the CPU in a low-power state until:
+/// - An interrupt occurs
+/// - SEV is executed (by signal_wake or another core)
+/// - A spurious wakeup occurs
+/// 
+/// This is more efficient than busy-polling or yield_now()
+#[inline(always)]
+pub fn wait_for_event() {
+    unsafe { asm!("wfe") }
+}
+
+/// Signal that async work is ready using ARM SEV instruction
+/// 
+/// This wakes any cores waiting in WFE, including:
+/// - The executor's run_blocking loop
+/// - Other cores waiting for work
+/// 
+/// Call this after waking a task (via Waker::wake) to ensure
+/// the executor processes it promptly.
+#[inline(always)]
+pub fn signal_wake() {
+    unsafe { asm!("sev") }
 }
 
 // ============================================================================

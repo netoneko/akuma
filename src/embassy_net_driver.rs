@@ -197,6 +197,8 @@ impl<'a> TxToken for LoopbackTxToken<'a> {
             if let Some(waker) = state.rx_waker.take() {
                 drop(state); // Release lock before waking
                 waker.wake();
+                // Signal executor to wake from WFE
+                crate::executor::signal_wake();
             }
         }
         // If queue is full, packet is dropped (like a real network)

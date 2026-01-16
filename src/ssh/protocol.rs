@@ -1375,8 +1375,8 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
 pub async fn handle_connection(mut stream: TcpStream) {
     log("[SSH] New SSH connection\n");
 
-    // Load configuration
-    let config = super::config::load_config().await;
+    // Get cached configuration (loaded at server startup)
+    let config = super::config::get_config();
     let mut session = SshSession::new(config);
 
     // Send our version
