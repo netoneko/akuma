@@ -24,12 +24,20 @@ pub mod thread_state {
     pub const RUNNING: u8 = 2;
     pub const TERMINATED: u8 = 3;
     pub const INITIALIZING: u8 = 4; // Thread claimed but context not yet set up
+    pub const WAITING: u8 = 5; // Thread blocked on wait queue (e.g., nanosleep)
 }
 
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
 static THREAD_STATES: [AtomicU8; config::MAX_THREADS] = {
     const INIT: AtomicU8 = AtomicU8::new(thread_state::FREE);
+    [INIT; config::MAX_THREADS]
+};
+
+/// Atomic wake times for WAITING threads - scheduler checks these
+/// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
+static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; config::MAX_THREADS]
 };
 
@@ -77,6 +85,23 @@ fn mark_thread_ready(idx: usize) {
 fn mark_thread_running(idx: usize) {
     if idx < config::MAX_THREADS {
         THREAD_STATES[idx].store(thread_state::RUNNING, Ordering::SeqCst);
+    }
+}
+
+/// Mark a thread as waiting with a wake time (lock-free)
+fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
+    if idx < config::MAX_THREADS {
+        WAKE_TIMES[idx].store(wake_time_us, Ordering::SeqCst);
+        THREAD_STATES[idx].store(thread_state::WAITING, Ordering::SeqCst);
+    }
+}
+
+/// Get thread wake time (lock-free read)
+fn get_wake_time(idx: usize) -> u64 {
+    if idx < config::MAX_THREADS {
+        WAKE_TIMES[idx].load(Ordering::Relaxed)
+    } else {
+        0
     }
 }
 
@@ -498,7 +523,7 @@ impl StackInfo {
 /// 
 /// IMPORTANT: Syscall handlers can call deep functions. 16KB provides enough
 /// headroom to prevent overlap with kernel code (like execute()) below.
-pub const EXCEPTION_STACK_SIZE: usize = 16384;
+pub const EXCEPTION_STACK_SIZE: usize = 16384*2;
 
 /// Thread slot in the pool
 #[repr(C)]
@@ -976,7 +1001,8 @@ impl ThreadPool {
                 let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
                 if thread0_state == thread_state::READY {
                     // Switch to thread 0
-                    if current_state != thread_state::TERMINATED {
+                    // Preserve TERMINATED and WAITING states
+                    if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
                         THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                     }
                     THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
@@ -984,6 +1010,19 @@ impl ThreadPool {
                     CURRENT_THREAD.store(0, Ordering::SeqCst);
                     self.current_idx = 0;
                     return Some((current_idx, 0));
+                }
+            }
+        }
+
+        // First pass: Wake any WAITING threads whose wake time has passed
+        let now = crate::timer::uptime_us();
+        for i in 0..config::MAX_THREADS {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
+                let wake_time = WAKE_TIMES[i].load(Ordering::Relaxed);
+                if wake_time > 0 && now >= wake_time {
+                    // Wake this thread - mark as READY and clear wake time
+                    WAKE_TIMES[i].store(0, Ordering::SeqCst);
+                    THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
                 }
             }
         }
@@ -1021,13 +1060,29 @@ impl ThreadPool {
         }
 
         if next_idx == current_idx {
+            // Debug: we found only ourselves
+            crate::console::print(&alloc::format!(
+                "[SCHED] only self {} found, states=[{},{},{},{},{},{},{},{},{},{}]\n",
+                current_idx,
+                THREAD_STATES[0].load(Ordering::SeqCst),
+                THREAD_STATES[1].load(Ordering::SeqCst),
+                THREAD_STATES[2].load(Ordering::SeqCst),
+                THREAD_STATES[3].load(Ordering::SeqCst),
+                THREAD_STATES[4].load(Ordering::SeqCst),
+                THREAD_STATES[5].load(Ordering::SeqCst),
+                THREAD_STATES[6].load(Ordering::SeqCst),
+                THREAD_STATES[7].load(Ordering::SeqCst),
+                THREAD_STATES[8].load(Ordering::SeqCst),
+                THREAD_STATES[9].load(Ordering::SeqCst),
+            ));
             return None;
         }
 
         // Update states atomically (lock-free)
-        // Don't change state if thread is TERMINATED
+        // Don't change state if thread is TERMINATED or WAITING
+        // WAITING threads keep their state - scheduler handles wake time
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-        if current_state != thread_state::TERMINATED {
+        if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
         }
         THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
@@ -1299,10 +1354,39 @@ pub fn yield_now() {
 /// 
 /// After resuming, we restore the user TTBR0 before returning to syscall handler.
 pub fn schedule_blocking(wake_time_us: u64) {
-    // Pure busy-wait without yielding - to isolate crash
-    while crate::timer::uptime_us() < wake_time_us {
-        // Just spin - no yield
-        core::hint::spin_loop();
+    let tid = current_thread_id();
+    let now = crate::timer::uptime_us();
+    
+    // Check if already past deadline - don't bother blocking
+    if now >= wake_time_us {
+        return;
+    }
+    
+    // Mark thread as WAITING with wake time
+    // Timer IRQs fire every 10ms and will preempt us naturally
+    // Scheduler will see WAITING state and switch to another thread
+    // When wake_time passes, scheduler wakes us
+    mark_thread_waiting(tid, wake_time_us);
+    
+    // Wait for timer to preempt us and for scheduler to wake us
+    // WFI halts CPU until interrupt
+    loop {
+        let state = THREAD_STATES[tid].load(Ordering::SeqCst);
+        if state != thread_state::WAITING {
+            // Scheduler woke us - we're now READY or RUNNING
+            return;
+        }
+        
+        if crate::process::is_current_interrupted() {
+            WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+            THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            return;
+        }
+        
+        // Wait for interrupt - timer IRQ will fire within 10ms
+        // When preempted, scheduler sees WAITING and switches away
+        // When wake_time passes and we're scheduled back, state != WAITING
+        unsafe { core::arch::asm!("wfi"); }
     }
 }
 

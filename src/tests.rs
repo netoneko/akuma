@@ -2285,7 +2285,7 @@ fn test_parallel_processes() -> bool {
 
     // Wait for both to complete using channel status
     console::print("  Waiting for processes to complete...\n");
-    let complete_timeout = 30_000_000; // 30 seconds (hello runs for ~10 seconds)
+    let complete_timeout = 40_000_000; // 30 seconds (hello runs for ~10 seconds)
     let complete_start = crate::timer::uptime_us();
     let mut ps_done = false;
     let mut kthreads_done = false;

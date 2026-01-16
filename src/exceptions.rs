@@ -134,8 +134,17 @@ sync_el0_handler:
     // Pass pointer to saved context as first arg
     mov     x0, sp
     
+    // Enable IRQs during syscall handling to allow preemption
+    // This is critical for schedule_blocking to work - timer IRQs must fire
+    msr     daifclr, #2
+    isb
+    
     // Call Rust handler - returns syscall result in x0
     bl      rust_sync_el0_handler
+    
+    // Disable IRQs before restoring registers
+    msr     daifset, #2
+    isb
     
     // x0 now has the syscall return value
     // Save it to scratch area while we restore other registers
