@@ -351,6 +351,7 @@ pub fn sleep_ms(milliseconds: u64) {
     }
 }
 
+// returns microseconds, not milliseconds
 #[inline(never)]
 pub fn uptime() -> u64 {
     syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)

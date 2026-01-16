@@ -1016,15 +1016,21 @@ impl ThreadPool {
 
         // First pass: Wake any WAITING threads whose wake time has passed
         let now = crate::timer::uptime_us();
+        let mut woke_any = false;
         for i in 0..config::MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
-                let wake_time = WAKE_TIMES[i].load(Ordering::Relaxed);
+                let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
                 if wake_time > 0 && now >= wake_time {
                     // Wake this thread - mark as READY and clear wake time
                     WAKE_TIMES[i].store(0, Ordering::SeqCst);
                     THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
+                    woke_any = true;
                 }
             }
+        }
+        // Send event to wake any threads in WFI
+        if woke_any {
+            unsafe { core::arch::asm!("sev"); }
         }
 
         // Find next ready thread using atomic state reads
@@ -1060,21 +1066,6 @@ impl ThreadPool {
         }
 
         if next_idx == current_idx {
-            // Debug: we found only ourselves
-            crate::console::print(&alloc::format!(
-                "[SCHED] only self {} found, states=[{},{},{},{},{},{},{},{},{},{}]\n",
-                current_idx,
-                THREAD_STATES[0].load(Ordering::SeqCst),
-                THREAD_STATES[1].load(Ordering::SeqCst),
-                THREAD_STATES[2].load(Ordering::SeqCst),
-                THREAD_STATES[3].load(Ordering::SeqCst),
-                THREAD_STATES[4].load(Ordering::SeqCst),
-                THREAD_STATES[5].load(Ordering::SeqCst),
-                THREAD_STATES[6].load(Ordering::SeqCst),
-                THREAD_STATES[7].load(Ordering::SeqCst),
-                THREAD_STATES[8].load(Ordering::SeqCst),
-                THREAD_STATES[9].load(Ordering::SeqCst),
-            ));
             return None;
         }
 

@@ -571,6 +571,7 @@ fn run_async_main() -> ! {
     let mut ssh_pinned = pin!(ssh::run(stack));
     let mut web_pinned = pin!(web_server::run(stack));
     let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
+
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
     // Enable IRQs for the main async loop
@@ -655,8 +656,9 @@ fn run_async_main() -> ! {
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
 
         POLL_STEP.store(8, Ordering::Relaxed);
-        // Poll the memory monitor
-        let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
+        if config::MEM_MONITOR_ENABLED {
+            let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
+        }
 
         POLL_STEP.store(9, Ordering::Relaxed);
         // Process pending IRQ work
@@ -720,6 +722,11 @@ fn is_irq_enabled() -> bool {
 
 /// Async task that periodically reports memory usage
 async fn memory_monitor() -> ! {
+    if !config::MEM_MONITOR_ENABLED {
+        loop {
+            threading::yield_now();
+        }
+    }
     use core::fmt::Write;
     use embassy_time::{Duration, Timer};
 

@@ -16,6 +16,7 @@ use libakuma::{exit, getpid, print, arg, argc};
 
 const DEFAULT_OUTPUTS: u32 = 10;
 const DEFAULT_DELAY_MS: u64 = 1000;
+const MICROSECONDS: u64 = 1000;
 
 // ============================================================================
 // Implementation
@@ -23,6 +24,7 @@ const DEFAULT_DELAY_MS: u64 = 1000;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    let start_time = libakuma::uptime();
     let pid = getpid();
     
     // Parse command line arguments
@@ -67,6 +69,18 @@ pub extern "C" fn _start() -> ! {
     }
 
     print("hello: done\n");
+    let end_time = libakuma::uptime();
+    let total_runtime_ms = (end_time - start_time)/MICROSECONDS;
+    let expected_runtime_ms = total_outputs as u64 * delay_ms;
+    print("hello: uptime=");
+    print_num64(total_runtime_ms);
+    print("ms ");
+    print("expected uptime=");
+    print_num64(expected_runtime_ms);
+    print("ms ");
+    print("difference=");
+    print_num64(total_runtime_ms - expected_runtime_ms);
+    print("ms\n");
     exit(0);
 }
 
