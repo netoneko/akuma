@@ -569,16 +569,27 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].context.ttbr0 = boot_ttbr0;
 
         // Boot stack info (fixed location from boot.rs)
-        // Stack layout: [stack_base ... usable stack ... exception_area ... stack_top]
-        // Exception area is EXCEPTION_STACK_SIZE bytes at top
+        // The boot stack was already in use before threading init, starting at
+        // 0x42000000 and growing down. We CANNOT reserve space at the top.
         let boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
         let boot_stack_base = 0x41F00000usize; // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             boot_stack_base,
             config::KERNEL_STACK_SIZE,
         );
-        // Exception stack is at the very top of the boot stack
-        self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_stack_top;
+        
+        // Allocate a SEPARATE exception stack for thread 0 (boot thread).
+        // Unlike spawned threads which reserve space at the top of their stack,
+        // the boot stack was already in use before we could reserve space.
+        // We allocate from heap to get a clean, separate area.
+        let boot_exception_stack: Vec<u8> = alloc::vec![0u8; EXCEPTION_STACK_SIZE];
+        let boot_exception_stack_box = boot_exception_stack.into_boxed_slice();
+        let boot_exception_stack_ptr = Box::into_raw(boot_exception_stack_box);
+        let boot_exception_stack_top = unsafe { 
+            (boot_exception_stack_ptr as *const u8).add(EXCEPTION_STACK_SIZE) as u64 
+        };
+        // Align to 16 bytes
+        self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
         
         // Initialize canary for boot stack
         if config::ENABLE_STACK_CANARIES {

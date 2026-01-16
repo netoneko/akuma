@@ -293,14 +293,22 @@ irq_el0_handler:
     eret
 
 // IRQ from EL1 (kernel mode)
+// Must save ELR_EL1 and SPSR_EL1 because context switch may modify them
 irq_handler:
-    // Save caller-saved registers
+    // Save x10, x11 FIRST (we need them as scratch for ELR/SPSR)
+    stp     x10, x11, [sp, #-16]!
+    
+    // Save ELR_EL1 and SPSR_EL1 (critical for nested IRQs + context switch)
+    mrs     x10, elr_el1
+    mrs     x11, spsr_el1
+    stp     x10, x11, [sp, #-16]!
+    
+    // Save remaining caller-saved registers
     stp     x0, x1, [sp, #-16]!
     stp     x2, x3, [sp, #-16]!
     stp     x4, x5, [sp, #-16]!
     stp     x6, x7, [sp, #-16]!
     stp     x8, x9, [sp, #-16]!
-    stp     x10, x11, [sp, #-16]!
     stp     x12, x13, [sp, #-16]!
     stp     x14, x15, [sp, #-16]!
     stp     x16, x17, [sp, #-16]!
@@ -324,20 +332,21 @@ irq_handler:
     ldp     x16, x17, [sp], #16
     ldp     x14, x15, [sp], #16
     ldp     x12, x13, [sp], #16
-    ldp     x10, x11, [sp], #16
     ldp     x8, x9, [sp], #16
     ldp     x6, x7, [sp], #16
     ldp     x4, x5, [sp], #16
     ldp     x2, x3, [sp], #16
-
-    // Ensure IRQs are enabled after returning from exception
-    // SPSR_EL1 bit 7 is the I (IRQ mask) flag - clear it
-    // Use x0 as scratch before restoring it
-    mrs     x0, spsr_el1
-    bic     x0, x0, #0x80           // Clear bit 7 (I flag)
-    msr     spsr_el1, x0
-
     ldp     x0, x1, [sp], #16
+    
+    // Restore ELR_EL1 and SPSR_EL1
+    ldp     x10, x11, [sp], #16
+    msr     elr_el1, x10
+    // Clear IRQ mask bit before restoring SPSR (ensure IRQs enabled after ERET)
+    bic     x11, x11, #0x80
+    msr     spsr_el1, x11
+    
+    // Restore original x10, x11
+    ldp     x10, x11, [sp], #16
     
     eret
 "#
