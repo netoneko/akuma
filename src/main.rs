@@ -780,6 +780,6 @@ async fn memory_monitor() -> ! {
         console::print(buf.as_str());
 
         // Report every 10 seconds
-        Timer::after(Duration::from_secs(10)).await;
+        Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;
     }
 }

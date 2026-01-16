@@ -118,6 +118,8 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 
+pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
+
 
 /// Enable async process execution with streaming output over SSH
 ///
