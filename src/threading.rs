@@ -150,11 +150,18 @@ static PREEMPTION_DISABLED_SINCE: [AtomicU64; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
+/// Track last time we ran the watchdog check (for detecting time jumps)
+static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
+
 /// Maximum time preemption can be disabled before watchdog warning (100ms)
 const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;
 
 /// Maximum time preemption can be disabled before watchdog panic (5 seconds)
 const PREEMPTION_WATCHDOG_PANIC_US: u64 = 5_000_000;
+
+/// Maximum expected gap between watchdog checks (100ms).
+/// If we see a gap larger than this, the host likely slept.
+const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
 
 /// Disable preemption for the current thread.
 ///
@@ -201,12 +208,33 @@ pub fn is_preemption_disabled() -> bool {
 /// - Some(duration_us): preemption disabled for this many microseconds
 pub fn check_preemption_watchdog() -> Option<u64> {
     let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let now = crate::timer::uptime_us();
+    
+    // Detect time jumps (host sleep/wake)
+    let last_check = LAST_WATCHDOG_CHECK_US.swap(now, Ordering::SeqCst);
+    if last_check > 0 {
+        let gap = now.saturating_sub(last_check);
+        if gap > MAX_EXPECTED_CHECK_GAP_US {
+            // Time jumped - host probably slept. Log and reset timestamps.
+            crate::console::print(&alloc::format!(
+                "[WATCHDOG] Time jump detected: {}ms (host sleep/wake)\n",
+                gap / 1000
+            ));
+            
+            // Reset timestamp for this thread to avoid false alarm
+            let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
+            if disabled_since != 0 {
+                PREEMPTION_DISABLED_SINCE[tid].store(now, Ordering::Release);
+            }
+            return None;
+        }
+    }
+    
     let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
     if disabled_since == 0 {
         return None;
     }
     
-    let now = crate::timer::uptime_us();
     let duration = now.saturating_sub(disabled_since);
     
     if duration >= PREEMPTION_WATCHDOG_PANIC_US {
