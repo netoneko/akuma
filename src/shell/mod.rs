@@ -31,7 +31,11 @@ pub use commands::CommandRegistry;
 pub struct ShellContext {
     /// Current working directory
     cwd: String,
+    /// Use async execution (spawns on user thread, yields properly)
     async_exec: bool,
+    /// Use streaming execution for external commands (real-time output)
+    /// WARNING: Streaming path may block other SSH connections - disabled by default
+    streaming_exec: bool,
 }
 
 impl ShellContext {
@@ -40,6 +44,7 @@ impl ShellContext {
         Self {
             cwd: String::from("/"),
             async_exec: crate::config::ENABLE_SSH_ASYNC_EXEC,
+            streaming_exec: false, // Disabled by default - can block SSH
         }
     }
 
@@ -333,6 +338,43 @@ async fn find_executable(name: &str) -> Option<alloc::string::String> {
     None
 }
 
+/// Parse command line arguments from a byte slice
+///
+/// Splits on whitespace and converts each argument to a String.
+/// Returns a vector of argument strings.
+fn parse_args(input: &[u8]) -> Vec<String> {
+    let mut args = Vec::new();
+    let trimmed = trim_bytes(input);
+    
+    if trimmed.is_empty() {
+        return args;
+    }
+    
+    // Simple whitespace splitting
+    let mut current = Vec::new();
+    for &byte in trimmed {
+        if byte.is_ascii_whitespace() {
+            if !current.is_empty() {
+                if let Ok(s) = core::str::from_utf8(&current) {
+                    args.push(String::from(s));
+                }
+                current.clear();
+            }
+        } else {
+            current.push(byte);
+        }
+    }
+    
+    // Don't forget the last argument
+    if !current.is_empty() {
+        if let Ok(s) = core::str::from_utf8(&current) {
+            args.push(String::from(s));
+        }
+    }
+    
+    args
+}
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Flag to indicate whether async execution is available (SSH server running)
@@ -352,15 +394,16 @@ pub fn is_async_exec_enabled() -> bool {
 /// Execute an external binary with stdin/stdout (buffered, for pipelines)
 async fn execute_external(
     path: &str,
+    args: Option<&[&str]>,
     stdin: Option<&[u8]>,
     stdout: &mut VecWriter,
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
     let result = if is_async_exec_enabled() {
-        crate::process::exec_async(path, stdin).await
+        crate::process::exec_async(path, args, stdin).await
     } else {
         // Synchronous fallback for boot-time tests
-        crate::process::exec_with_io(path, stdin)
+        crate::process::exec_with_io(path, args, stdin)
     };
 
     match result {
@@ -392,13 +435,14 @@ async fn execute_external(
 /// Execute an external binary with streaming output (for direct SSH output)
 pub async fn execute_external_streaming<W>(
     path: &str,
+    args: Option<&[&str]>,
     stdin: Option<&[u8]>,
     stdout: &mut W,
 ) -> Result<(), ShellError>
 where
     W: embedded_io_async::Write,
 {
-    match crate::process::exec_streaming(path, stdin, stdout).await {
+    match crate::process::exec_streaming(path, args, stdin, stdout).await {
         Ok(exit_code) => {
             if exit_code != 0 {
                 let msg = format!("[exit code: {}]\r\n", exit_code);
@@ -492,16 +536,42 @@ pub async fn check_streamable_command(
 pub async fn execute_command_streaming<W>(
     line: &[u8],
     registry: &CommandRegistry,
-    _ctx: &mut ShellContext,
-    output: &mut W,
+    ctx: &mut ShellContext,
+    _output: &mut W,
 ) -> Option<ChainExecutionResult>
 where
     W: embedded_io_async::Write,
 {
+    // Skip streaming check entirely if not enabled - avoid double filesystem lookups
+    if !ctx.streaming_exec {
+        // Just check for exit command, skip all filesystem operations
+        let trimmed = trim_bytes(line);
+        if trimmed == b"exit" || trimmed == b"quit" {
+            return Some(ChainExecutionResult {
+                output: Vec::new(),
+                success: true,
+                should_exit: true,
+            });
+        }
+        return None; // Fall back to buffered execution
+    }
+
+    // Streaming enabled - do the full check
     match check_streamable_command(line, registry).await {
         StreamableCommand::External(bin_path) => {
+            // Parse args from the command line
+            let trimmed = trim_bytes(line);
+            let (_cmd_name, args_bytes) = split_first_word(trimmed);
+            let arg_strings = parse_args(args_bytes);
+            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
+            full_args.push(&bin_path);  // argv[0] is the program path
+            for arg in &arg_strings {
+                full_args.push(arg.as_str());
+            }
+            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
+            
             // Execute with streaming output
-            let success = execute_external_streaming(&bin_path, None, output).await.is_ok();
+            let success = execute_external_streaming(&bin_path, args_slice, None, _output).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,
@@ -581,8 +651,17 @@ async fn execute_pipeline_internal(
 
         if let Some(bin_path) = find_executable(cmd_name_str).await {
             // Found an executable in /bin - run it
+            // Parse command line args (including program name as argv[0])
+            let arg_strings = parse_args(args);
+            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
+            full_args.push(&bin_path);  // argv[0] is the program path
+            for arg in &arg_strings {
+                full_args.push(arg.as_str());
+            }
+            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
+            
             if ctx.async_exec {
-                match execute_external(&bin_path, stdin_slice, &mut stdout).await {
+                match execute_external(&bin_path, args_slice, stdin_slice, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
@@ -597,7 +676,7 @@ async fn execute_pipeline_internal(
                 }
             } else {           
                 // DOES NOT WORK WITH SSH, blocks SSH connections entirely  
-                match execute_external_streaming(&bin_path, stdin_slice, &mut stdout).await {
+                match execute_external_streaming(&bin_path, args_slice, stdin_slice, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());

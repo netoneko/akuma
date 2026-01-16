@@ -4,11 +4,13 @@
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
-use crate::ssh::crypto::trim_bytes;
+use crate::ssh::crypto::{split_first_word, trim_bytes};
 
 /// Static instance of the exec command
 pub static EXEC_CMD: ExecCommand = ExecCommand;
@@ -30,7 +32,7 @@ impl Command for ExecCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "exec <path>\n\nExecute the specified binary file.\n\nExample:\n  exec /bin/echo2"
+        "exec <path> [args...]\n\nExecute the specified binary file with optional arguments.\n\nExample:\n  exec /bin/hello 5 2"
     }
 
     fn execute<'a>(
@@ -41,16 +43,17 @@ impl Command for ExecCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let args = trim_bytes(args);
+            let args_trimmed = trim_bytes(args);
 
-            if args.is_empty() {
+            if args_trimmed.is_empty() {
                 let _ =
-                    embedded_io_async::Write::write_all(stdout, b"Usage: exec <path>\r\n").await;
+                    embedded_io_async::Write::write_all(stdout, b"Usage: exec <path> [args...]\r\n").await;
                 return Ok(());
             }
 
-            // Parse path from args
-            let path = match core::str::from_utf8(args) {
+            // Parse path and remaining args
+            let (path_bytes, remaining_args) = split_first_word(args_trimmed);
+            let path = match core::str::from_utf8(path_bytes) {
                 Ok(s) => s.trim(),
                 Err(_) => {
                     let _ = embedded_io_async::Write::write_all(stdout, b"Error: Invalid path\r\n")
@@ -58,6 +61,15 @@ impl Command for ExecCommand {
                     return Ok(());
                 }
             };
+
+            // Parse remaining arguments
+            let arg_strings = parse_exec_args(remaining_args);
+            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
+            full_args.push(path);  // argv[0] is the program path
+            for arg in &arg_strings {
+                full_args.push(arg.as_str());
+            }
+            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
 
             // Check if user threads are available for process execution
             let available = crate::threading::user_threads_available();
@@ -71,7 +83,7 @@ impl Command for ExecCommand {
             }
 
             // Execute the binary asynchronously (non-blocking)
-            match crate::process::exec_async(path, stdin).await {
+            match crate::process::exec_async(path, args_slice, stdin).await {
                 Ok((exit_code, process_output)) => {
                     // Convert \n to \r\n for terminal
                     for &byte in &process_output {
@@ -103,4 +115,36 @@ impl Command for ExecCommand {
             Ok(())
         })
     }
+}
+
+/// Parse arguments from a byte slice (simple whitespace splitting)
+fn parse_exec_args(input: &[u8]) -> Vec<String> {
+    let mut args = Vec::new();
+    let trimmed = trim_bytes(input);
+    
+    if trimmed.is_empty() {
+        return args;
+    }
+    
+    let mut current = Vec::new();
+    for &byte in trimmed {
+        if byte.is_ascii_whitespace() {
+            if !current.is_empty() {
+                if let Ok(s) = core::str::from_utf8(&current) {
+                    args.push(String::from(s));
+                }
+                current.clear();
+            }
+        } else {
+            current.push(byte);
+        }
+    }
+    
+    if !current.is_empty() {
+        if let Ok(s) = core::str::from_utf8(&current) {
+            args.push(String::from(s));
+        }
+    }
+    
+    args
 }

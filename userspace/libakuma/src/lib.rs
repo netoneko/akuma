@@ -33,21 +33,33 @@ pub mod fd {
 /// before the process starts. Userspace can read but not modify.
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
+/// Maximum size of argument data in ProcessInfo
+pub const ARGV_DATA_SIZE: usize = 1024 - 16;
+
 /// Process info structure shared between kernel and userspace
 ///
 /// This is mapped read-only at PROCESS_INFO_ADDR.
 /// The kernel writes it, userspace reads it.
 ///
 /// WARNING: Must match kernel's ProcessInfo struct exactly!
-/// Must not exceed 1024 bytes.
+/// Layout:
+///   - pid: 4 bytes
+///   - ppid: 4 bytes
+///   - argc: 4 bytes
+///   - argv_len: 4 bytes (total bytes used in argv_data)
+///   - argv_data: 1008 bytes (null-separated argument strings)
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,
     /// Parent process ID  
     pub ppid: u32,
-    // Reserved space to reach 1KB
-    _reserved: [u8; 1024 - 8],
+    /// Number of command line arguments
+    pub argc: u32,
+    /// Total bytes used in argv_data
+    pub argv_len: u32,
+    /// Null-separated argument strings
+    pub argv_data: [u8; ARGV_DATA_SIZE],
 }
 
 /// Get the current process ID
@@ -64,6 +76,98 @@ pub fn getpid() -> u32 {
 #[inline]
 pub fn getppid() -> u32 {
     unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).ppid }
+}
+
+// ============================================================================
+// Command Line Arguments
+// ============================================================================
+
+/// Get the number of command line arguments
+///
+/// Returns the argc value set by the kernel.
+#[inline]
+pub fn argc() -> u32 {
+    unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).argc }
+}
+
+/// Get a command line argument by index
+///
+/// Returns `Some(&str)` if the index is valid, `None` otherwise.
+/// Index 0 is conventionally the program name/path.
+pub fn arg(index: u32) -> Option<&'static str> {
+    let info = unsafe { &*(PROCESS_INFO_ADDR as *const ProcessInfo) };
+    
+    if index >= info.argc {
+        return None;
+    }
+    
+    // Parse through null-separated strings to find the requested index
+    let data = &info.argv_data[..info.argv_len as usize];
+    let mut current_index = 0u32;
+    let mut start = 0;
+    
+    for (i, &byte) in data.iter().enumerate() {
+        if byte == 0 {
+            if current_index == index {
+                // Found the argument
+                return core::str::from_utf8(&data[start..i]).ok();
+            }
+            current_index += 1;
+            start = i + 1;
+        }
+    }
+    
+    None
+}
+
+/// Iterator over command line arguments
+pub struct Args {
+    data: &'static [u8],
+    pos: usize,
+    remaining: u32,
+}
+
+impl Iterator for Args {
+    type Item = &'static str;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 || self.pos >= self.data.len() {
+            return None;
+        }
+        
+        // Find the next null terminator
+        let start = self.pos;
+        while self.pos < self.data.len() && self.data[self.pos] != 0 {
+            self.pos += 1;
+        }
+        
+        let arg = core::str::from_utf8(&self.data[start..self.pos]).ok();
+        
+        // Skip past the null terminator
+        if self.pos < self.data.len() {
+            self.pos += 1;
+        }
+        
+        self.remaining -= 1;
+        arg
+    }
+}
+
+/// Get an iterator over all command line arguments
+///
+/// Returns an iterator that yields each argument as a `&str`.
+pub fn args() -> Args {
+    let info = unsafe { &*(PROCESS_INFO_ADDR as *const ProcessInfo) };
+    Args {
+        data: unsafe { 
+            core::slice::from_raw_parts(
+                info.argv_data.as_ptr(),
+                info.argv_len as usize
+            )
+        },
+        pos: 0,
+        remaining: info.argc,
+    }
 }
 
 /// Perform a syscall with up to 6 arguments

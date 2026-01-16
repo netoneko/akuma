@@ -50,31 +50,72 @@ use crate::pmm::PhysFrame;
 /// If ProcessInfo grows beyond 1KB, it will overflow into unmapped memory!
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
+/// Maximum size of argument data in ProcessInfo
+pub const ARGV_DATA_SIZE: usize = 1024 - 16;
+
 /// Process info structure shared between kernel and userspace
 ///
 /// The kernel writes this, userspace reads it (read-only mapping).
 /// Kernel reads it during syscalls to prevent PID spoofing.
 ///
-/// WARNING: Must not exceed 1024 bytes! Currently uses ~8 bytes.
-/// Add a compile-time assertion if adding fields.
+/// WARNING: Must not exceed 1024 bytes!
+/// Layout:
+///   - pid: 4 bytes
+///   - ppid: 4 bytes
+///   - argc: 4 bytes
+///   - argv_len: 4 bytes (total bytes used in argv_data)
+///   - argv_data: 1008 bytes (null-separated argument strings)
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,
     /// Parent process ID
     pub ppid: u32,
-    // Future fields: uid, gid, etc.
-    // Reserved space to reach 1KB
-    _reserved: [u8; 1024 - 8],
+    /// Number of command line arguments
+    pub argc: u32,
+    /// Total bytes used in argv_data
+    pub argv_len: u32,
+    /// Null-separated argument strings
+    pub argv_data: [u8; ARGV_DATA_SIZE],
 }
 
 impl ProcessInfo {
+    /// Create a new ProcessInfo with no arguments
     pub const fn new(pid: u32, ppid: u32) -> Self {
         Self {
             pid,
             ppid,
-            _reserved: [0u8; 1024 - 8],
+            argc: 0,
+            argv_len: 0,
+            argv_data: [0u8; ARGV_DATA_SIZE],
         }
+    }
+
+    /// Create a new ProcessInfo with command line arguments
+    ///
+    /// Arguments are stored as null-separated strings in argv_data.
+    /// Returns None if arguments don't fit in the available space.
+    pub fn with_args(pid: u32, ppid: u32, args: &[&str]) -> Option<Self> {
+        let mut info = Self::new(pid, ppid);
+        
+        let mut offset = 0;
+        for arg in args {
+            let arg_bytes = arg.as_bytes();
+            let needed = arg_bytes.len() + 1; // +1 for null terminator
+            
+            if offset + needed > ARGV_DATA_SIZE {
+                return None; // Arguments too large
+            }
+            
+            info.argv_data[offset..offset + arg_bytes.len()].copy_from_slice(arg_bytes);
+            info.argv_data[offset + arg_bytes.len()] = 0; // null terminator
+            offset += needed;
+        }
+        
+        info.argc = args.len() as u32;
+        info.argv_len = offset as u32;
+        
+        Some(info)
     }
 }
 
@@ -526,6 +567,10 @@ pub struct Process {
     /// The kernel writes to it (via phys_to_virt) before entering userspace.
     pub process_info_phys: usize,
 
+    // ========== Command line arguments ==========
+    /// Command line arguments (stored as strings, serialized to ProcessInfo on execute)
+    pub args: Vec<String>,
+
     // ========== Per-process I/O ==========
     /// Process stdin buffer (set before execution)
     pub stdin_buf: Vec<u8>,
@@ -622,6 +667,8 @@ impl Process {
             initial_brk: brk,
             memory,
             process_info_phys: process_info_frame.addr,
+            // Command line arguments - initialized empty
+            args: Vec::new(),
             // Per-process I/O - initialized empty
             stdin_buf: Vec::new(),
             stdin_pos: 0,
@@ -633,6 +680,13 @@ impl Process {
             // Dynamic page tables - for mmap-allocated page tables
             dynamic_page_tables: Vec::new(),
         })
+    }
+
+    /// Set command line arguments for this process
+    ///
+    /// Arguments will be passed to the process via the ProcessInfo page.
+    pub fn set_args(&mut self, args: &[&str]) {
+        self.args = args.iter().map(|s| String::from(*s)).collect();
     }
 
     /// Start executing this process (enters user mode)
@@ -665,7 +719,21 @@ impl Process {
         // is mapped read-only in the user's address space
         unsafe {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
-            core::ptr::write(info_ptr, ProcessInfo::new(self.pid, self.parent_pid));
+            
+            // Convert args to &str slices for ProcessInfo::with_args
+            let arg_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+            
+            let info = if arg_refs.is_empty() {
+                ProcessInfo::new(self.pid, self.parent_pid)
+            } else {
+                ProcessInfo::with_args(self.pid, self.parent_pid, &arg_refs)
+                    .unwrap_or_else(|| {
+                        console::print("[Process] Warning: args too large, truncating\n");
+                        ProcessInfo::new(self.pid, self.parent_pid)
+                    })
+            };
+            
+            core::ptr::write(info_ptr, info);
         }
 
         // Register this process in the table for PID-based lookup
@@ -947,11 +1015,12 @@ unsafe extern "C" fn run_user_until_exit(
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments (first arg is conventionally the program name)
 /// * `stdin` - Optional stdin data for the process
 ///
 /// # Returns
 /// Tuple of (exit_code, stdout_data), or error message
-pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
+pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
     // Read the ELF file
     let elf_data =
         crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
@@ -959,6 +1028,11 @@ pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), 
     // Create the process
     let mut process = Process::from_elf(path, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+
+    // Set up arguments if provided
+    if let Some(arg_slice) = args {
+        process.set_args(arg_slice);
+    }
 
     // Set up stdin if provided
     if let Some(data) = stdin {
@@ -981,7 +1055,7 @@ pub fn exec_with_io(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), 
 /// Exit code of the process, or error message
 #[allow(dead_code)]
 pub fn exec(path: &str) -> Result<i32, String> {
-    let (exit_code, _stdout) = exec_with_io(path, None)?;
+    let (exit_code, _stdout) = exec_with_io(path, None, None)?;
     Ok(exit_code)
 }
 
@@ -993,12 +1067,13 @@ pub fn exec(path: &str) -> Result<i32, String> {
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments
 /// * `stdin` - Optional stdin data for the process
 ///
 /// # Returns
 /// Thread ID of the spawned thread, or error message
-pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> {
-    let (thread_id, _channel) = spawn_process_with_channel(path, stdin)?;
+pub fn spawn_process(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<usize, String> {
+    let (thread_id, _channel) = spawn_process_with_channel(path, args, stdin)?;
     Ok(thread_id)
 }
 
@@ -1009,12 +1084,14 @@ pub fn spawn_process(path: &str, stdin: Option<&[u8]>) -> Result<usize, String> 
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments
 /// * `stdin` - Optional stdin data for the process
 ///
 /// # Returns
 /// Tuple of (thread_id, channel) or error message
 pub fn spawn_process_with_channel(
     path: &str,
+    args: Option<&[&str]>,
     stdin: Option<&[u8]>,
 ) -> Result<(usize, Arc<ProcessChannel>), String> {
     // Check if user threads are available
@@ -1033,6 +1110,11 @@ pub fn spawn_process_with_channel(
     // Create the process
     let mut process = Process::from_elf(path, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+
+    // Set up arguments if provided
+    if let Some(arg_slice) = args {
+        process.set_args(arg_slice);
+    }
 
     // Set up stdin if provided
     if let Some(data) = stdin {
@@ -1082,14 +1164,15 @@ pub fn spawn_process_with_channel(
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments
 /// * `stdin` - Optional stdin data for the process
 ///
 /// # Returns
 /// Tuple of (exit_code, stdout_data) or error message
-pub async fn exec_async(path: &str, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
+pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
 
     // Spawn process with channel
-    let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
+    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
 
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
@@ -1136,17 +1219,18 @@ pub fn get_process_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments
 /// * `stdin` - Optional stdin data for the process
 /// * `output` - Async writer to stream output to
 ///
 /// # Returns
 /// Exit code or error message
-pub async fn exec_streaming<W>(path: &str, stdin: Option<&[u8]>, output: &mut W) -> Result<i32, String>
+pub async fn exec_streaming<W>(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, output: &mut W) -> Result<i32, String>
 where
     W: embedded_io_async::Write,
 {
     // Spawn process with channel
-    let (thread_id, channel) = spawn_process_with_channel(path, stdin)?;
+    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
 
     // Poll for output and completion
     loop {
