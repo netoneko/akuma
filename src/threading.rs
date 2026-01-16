@@ -228,8 +228,9 @@ pub fn check_preemption_watchdog() -> Option<u64> {
 // Thread Constants
 // ============================================================================
 
-/// Default timeout for cooperative threads in microseconds (5 seconds)
-pub const COOPERATIVE_TIMEOUT_US: u64 = 5_000_000;
+/// Default timeout for cooperative threads in microseconds (100ms)
+/// Reduced from 5 seconds to ensure network loop runs frequently
+pub const COOPERATIVE_TIMEOUT_US: u64 = 100_000;
 
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 const IDLE_THREAD_IDX: usize = 0;
@@ -873,6 +874,25 @@ impl ThreadPool {
                 }
             } else {
                 return None;
+            }
+        }
+
+        if config::MAIN_THREAD_PRIORITY_BOOST {
+        // Priority boost for thread 0 (network loop): Always prefer it if ready
+        // This ensures the network remains responsive even when user processes are running
+            if current_idx != 0 {
+                let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
+                if thread0_state == thread_state::READY {
+                    // Switch to thread 0
+                    if current_state != thread_state::TERMINATED {
+                        THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
+                    }
+                    THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
+                    self.slots[0].start_time_us = crate::timer::uptime_us();
+                    CURRENT_THREAD.store(0, Ordering::SeqCst);
+                    self.current_idx = 0;
+                    return Some((current_idx, 0));
+                }
             }
         }
 

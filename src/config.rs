@@ -112,7 +112,11 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
 /// Both modes are now safe due to preemption control around embassy-net polling.
 /// The polling loop uses disable_preemption()/enable_preemption() to protect
 /// embassy-net's internal RefCells from re-entrant access during timer preemption.
-pub const COOPERATIVE_MAIN_THREAD: bool = true;
+pub const COOPERATIVE_MAIN_THREAD: bool = false;
+
+pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the main thread to 100
+
+pub const IGNORE_THREADING_TESTS: bool = false;
 
 
 /// Enable async process execution with streaming output over SSH

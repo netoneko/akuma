@@ -101,6 +101,10 @@ pub fn run_threading_tests() -> bool {
     all_pass &= test_spawn_cooperative();
     all_pass &= test_yield_cycle();
     all_pass &= test_mixed_cooperative_preemptible();
+    
+    // Waker mechanism tests
+    all_pass &= test_waker_mechanism();
+    all_pass &= test_block_on_noop_waker();
 
     // Parallel process tests (requires /bin/hello)
     all_pass &= test_parallel_processes();
@@ -2397,6 +2401,172 @@ fn test_parallel_processes() -> bool {
                                tid1, tid2, p1_done, p2_done, ps_done, kthreads_done));
     }
     
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Waker mechanism works correctly
+/// 
+/// Tests that async wakers properly signal when a future should be polled again.
+/// This is critical for embassy-net and other async operations.
+pub fn test_waker_mechanism() -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    
+    console::print("\n[TEST] Waker mechanism\n");
+    
+    // Counters to track waker activity
+    static WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    
+    // Reset counters
+    WAKE_COUNT.store(0, Ordering::SeqCst);
+    CLONE_COUNT.store(0, Ordering::SeqCst);
+    
+    // Create a waker vtable that tracks calls
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        // clone
+        |_| {
+            CLONE_COUNT.fetch_add(1, Ordering::SeqCst);
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        },
+        // wake
+        |_| {
+            WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        },
+        // wake_by_ref
+        |_| {
+            WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        },
+        // drop
+        |_| {},
+    );
+    
+    // Create a simple future that returns Pending once, then Ready
+    struct TestFuture {
+        polled_once: bool,
+    }
+    
+    impl Future for TestFuture {
+        type Output = i32;
+        
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+            if self.polled_once {
+                Poll::Ready(42)
+            } else {
+                self.polled_once = true;
+                // Schedule a wake - this is what embassy does when waiting for I/O
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    
+    let mut future = TestFuture { polled_once: false };
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+    
+    // Create waker
+    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
+    
+    // First poll - should return Pending and call wake_by_ref
+    let result1 = future.as_mut().poll(&mut cx);
+    let pending = matches!(result1, Poll::Pending);
+    console::print(&format!("  First poll: {} (expected Pending)\n", 
+                           if pending { "Pending" } else { "Ready" }));
+    
+    // Check wake was called
+    let wakes_after_first = WAKE_COUNT.load(Ordering::SeqCst);
+    console::print(&format!("  Wake count after first poll: {} (expected 1)\n", wakes_after_first));
+    
+    // Second poll - should return Ready
+    let result2 = future.as_mut().poll(&mut cx);
+    let ready = matches!(result2, Poll::Ready(42));
+    console::print(&format!("  Second poll: {} (expected Ready(42))\n",
+                           if ready { "Ready(42)" } else { "unexpected" }));
+    
+    let ok = pending && wakes_after_first == 1 && ready;
+    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    ok
+}
+
+/// Test: Block-on executor with no-op waker
+///
+/// Tests that a block_on style executor works even with a no-op waker
+/// (which is what we use in SSH sessions). Verifies the polling loop 
+/// continues despite wake() doing nothing.
+pub fn test_block_on_noop_waker() -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    
+    console::print("\n[TEST] Block-on with no-op waker\n");
+    
+    static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    
+    POLL_COUNT.store(0, Ordering::SeqCst);
+    
+    // A future that requires multiple polls
+    struct MultiPollFuture {
+        polls_needed: usize,
+        polls_done: usize,
+    }
+    
+    impl Future for MultiPollFuture {
+        type Output = usize;
+        
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+            self.polls_done += 1;
+            POLL_COUNT.fetch_add(1, Ordering::SeqCst);
+            
+            if self.polls_done >= self.polls_needed {
+                Poll::Ready(self.polls_done)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    
+    // No-op waker (like we use in block_on)
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    
+    // Simulate block_on with limited iterations
+    fn block_on_limited<F: Future>(mut future: F, max_iters: usize) -> Option<F::Output> {
+        let mut future = unsafe { Pin::new_unchecked(&mut future) };
+        
+        for _ in 0..max_iters {
+            let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+            let waker = unsafe { Waker::from_raw(raw_waker) };
+            let mut cx = Context::from_waker(&waker);
+            
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return Some(output),
+                Poll::Pending => {
+                    // In real block_on, we'd yield here
+                    // For test, just continue
+                }
+            }
+        }
+        None
+    }
+    
+    let future = MultiPollFuture { polls_needed: 5, polls_done: 0 };
+    let result = block_on_limited(future, 10);
+    
+    let poll_count = POLL_COUNT.load(Ordering::SeqCst);
+    console::print(&format!("  Total polls: {} (expected 5)\n", poll_count));
+    console::print(&format!("  Result: {:?} (expected Some(5))\n", result));
+    
+    let ok = result == Some(5) && poll_count == 5;
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
     ok
 }
