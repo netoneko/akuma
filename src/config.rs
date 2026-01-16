@@ -158,3 +158,7 @@ pub const TX_QUEUE_SLOTS: usize = 8;
 /// plus any virtio headers. 2048 is a safe default that matches virtio
 /// buffer sizes.
 pub const TX_PACKET_BUFFER_SIZE: usize = 2048;
+
+// Debug prints
+pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
+pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;

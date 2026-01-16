@@ -1220,9 +1220,11 @@ pub fn sgi_scheduler_handler(irq: u32) {
     };
 
     if let Some((old_idx, new_idx)) = switch_info {
-        crate::console::print(&alloc::format!(
-            "[SGI] switching {} -> {}\n", old_idx, new_idx
-        ));
+        if config::ENABLE_SGI_DEBUG_PRINTS {
+            crate::console::print(&alloc::format!(
+                "[SGI] switching {} -> {}\n", old_idx, new_idx
+            ));
+        }
         
         unsafe {
             let pool = &mut *pool_ptr;
@@ -1250,9 +1252,11 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             let old_tpidr = pool.slots[old_idx].exception_stack_top;
             let new_tpidr = pool.slots[new_idx].exception_stack_top;
-            crate::console::print(&alloc::format!(
-                "[SGI] old_tpidr={:#x} new_tpidr={:#x}\n", old_tpidr, new_tpidr
-            ));
+            if config::ENABLE_SGI_DEBUG_PRINTS {
+                crate::console::print(&alloc::format!(
+                    "[SGI] old_tpidr={:#x} new_tpidr={:#x}\n", old_tpidr, new_tpidr
+                ));
+            }
             
             // Update exception stack BEFORE switching - critical for new threads
             // that jump directly to thread_start_closure and never return here.
@@ -1262,9 +1266,11 @@ pub fn sgi_scheduler_handler(irq: u32) {
             switch_context(old_ptr, new_ptr);
             
             // We return here after being switched BACK to this thread
-            crate::console::print(&alloc::format!(
-                "[SGI] returned to tid={}\n", old_idx
-            ));
+            if config::ENABLE_SGI_DEBUG_PRINTS {
+                crate::console::print(&alloc::format!(
+                    "[SGI] returned to tid={}\n", old_idx
+                ));
+            }
         }
     }
 }

@@ -514,9 +514,11 @@ extern "C" fn rust_irq_handler() {
         core::arch::asm!("mov {}, sp", out(reg) sp);
     }
     let tid_before = crate::threading::current_thread_id();
-    crate::console::print(&alloc::format!(
-        "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp
-    ));
+    if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
+        crate::console::print(&alloc::format!(
+            "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp
+        ));
+    }
     
     // Acknowledge the interrupt and get IRQ number
     if let Some(irq) = crate::gic::acknowledge_irq() {
@@ -539,9 +541,11 @@ extern "C" fn rust_irq_handler() {
         core::arch::asm!("mov {}, sp", out(reg) sp_after);
     }
     let tid_after = crate::threading::current_thread_id();
-    crate::console::print(&alloc::format!(
-        "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after
-    ));
+    if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
+        crate::console::print(&alloc::format!(
+            "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after
+        ));
+    }
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)
