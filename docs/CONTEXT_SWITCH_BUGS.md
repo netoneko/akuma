@@ -97,15 +97,32 @@ Disabled `ENABLE_SGI_DEBUG_PRINTS`. For production, avoid any allocation in IRQ 
 3. IRQs must stay masked during switch_context to prevent nested corruption
 4. No allocations in IRQ handlers to prevent deadlock
 
-## Remaining Investigation
+## Bug 5: NULL Pointer Dereference (FAR=0xfffffffffffffffd)
 
-The most recent crash shows:
+### Symptoms
 ```
-FAR=0xfffffffffffffffd
+EC=0x25, ISS=0x4
+ELR=0x40090618, FAR=0xfffffffffffffffd
 SPSR=0x80000345 (correct EL1h)
+Thread=0, only 1 thread exists
 ```
+- Crash very early in boot (37K allocations vs 3M+ in normal runs)
+- Test output: `kthreads check: waiting (tid1=8 found=false, tid2=9 found=false)`
 
-This is a different bug - a NULL pointer dereference or corrupted pointer (FAR = -3 in signed). The SPSR fix worked (it's now EL1h), but there's another bug causing invalid memory access.
+### Analysis
+- `FAR=0xfffffffffffffffd` = `-3` in signed, suggesting `NULL - 3` or similar
+- `ISS=0x4` = Translation fault level 0 (reading from completely unmapped address)
+- `SPSR=0x80000345` = Correct EL1h with IRQ masked - **SPSR fix is working**
+- Occurred after SPSR/irq_handler fixes were applied
+
+### Root Cause
+**Under investigation.** Possible causes:
+1. Test waiting for threads 8,9 that were never spawned
+2. Corrupted pointer from earlier changes
+3. Race condition in thread spawning during tests
+
+### Status
+This is a new bug introduced after the SPSR fixes. The context switch SPSR corruption is fixed (SPSR is now correct EL1h), but something else is broken.
 
 ## Files Modified
 - `src/threading.rs`: SPSR initialization, DAIF handling, deadlock fixes
