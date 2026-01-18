@@ -196,6 +196,19 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // Clear termination time
             TERMINATION_TIME[i].store(0, Ordering::SeqCst);
             
+            // CRITICAL: Zero the context to prevent stale ELR/SPSR/TTBR0 from leaking
+            // This prevents a newly spawned thread from accidentally getting user-mode
+            // ELR/SPSR from a previous process execution.
+            {
+                let mut pool = POOL.lock();
+                // Zero the context completely
+                pool.slots[i].context = Context::zero();
+                // Also clear other slot state
+                pool.slots[i].cooperative = false;
+                pool.slots[i].start_time_us = 0;
+                pool.slots[i].timeout_us = 0;
+            }
+            
             // Re-initialize canary for reuse
             // Note: This reads from POOL but doesn't need the lock
             // because the slot is now FREE and no one else will touch it
@@ -1325,6 +1338,22 @@ pub fn sgi_scheduler_handler(irq: u32) {
             ));
         }
         
+        // Debug: For user threads (8+), log current TTBR0 that will be saved
+        if old_idx >= 8 {
+            let current_ttbr0: u64;
+            let current_spsr: u64;
+            let current_elr: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
+                core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
+                core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
+            }
+            crate::console::print(&alloc::format!(
+                "[SGI] tid={} saving TTBR0={:#x} SPSR={:#x} ELR={:#x}\n",
+                old_idx, current_ttbr0, current_spsr, current_elr
+            ));
+        }
+        
         unsafe {
             let pool = &mut *pool_ptr;
             
@@ -1351,6 +1380,38 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             let old_tpidr = pool.slots[old_idx].exception_stack_top;
             let new_tpidr = pool.slots[new_idx].exception_stack_top;
+            
+            // Debug: Check the TTBR0 we're about to load for the new thread
+            // If this is already boot TTBR0 for a user thread, the context was corrupted
+            let new_saved_ttbr0 = pool.slots[new_idx].context.ttbr0;
+            let new_saved_spsr = pool.slots[new_idx].context.spsr;
+            let new_saved_elr = pool.slots[new_idx].context.elr;
+            let new_saved_x30 = pool.slots[new_idx].context.x30;
+            
+            // User threads are 8+, check if TTBR0 looks wrong
+            // Only flag corruption if:
+            // 1. This is NOT a new thread (new threads have ELR=0)
+            // 2. ELR points to user space (< 0x40000000)
+            // 3. SPSR indicates EL0 (user mode) - bits[3:0] == 0
+            // 4. But TTBR0 is boot tables
+            if new_idx >= 8 {
+                let is_boot_ttbr0 = new_saved_ttbr0 >= 0x4020_0000 && new_saved_ttbr0 < 0x4040_0000;
+                let is_user_elr = new_saved_elr > 0 && new_saved_elr < 0x4000_0000;
+                let is_user_spsr = (new_saved_spsr & 0xF) == 0;
+                let is_new_thread = new_saved_elr == 0; // New threads have ELR=0
+                
+                if !is_new_thread && is_user_elr && is_user_spsr && is_boot_ttbr0 {
+                    crate::console::print(&alloc::format!(
+                        "[SGI CORRUPT] tid={} returning to user ELR={:#x} but boot TTBR0={:#x}!\n",
+                        new_idx, new_saved_elr, new_saved_ttbr0
+                    ));
+                    crate::console::print(&alloc::format!(
+                        "  SPSR={:#x}, x30={:#x}\n",
+                        new_saved_spsr, new_saved_x30
+                    ));
+                }
+            }
+            
             if config::ENABLE_SGI_DEBUG_PRINTS {
                 crate::console::print(&alloc::format!(
                     "[SGI] old_tpidr={:#x} new_tpidr={:#x}\n", old_tpidr, new_tpidr
@@ -1365,10 +1426,43 @@ pub fn sgi_scheduler_handler(irq: u32) {
             switch_context(old_ptr, new_ptr);
             
             // We return here after being switched BACK to this thread
+            // CRITICAL: Mask IRQs immediately to prevent nested timer interrupts
+            // before we finish this handler. switch_context enabled IRQs, but we
+            // need to complete the handler atomically.
+            unsafe {
+                core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+            }
+            
+            // Check for TTBR0/SPSR mismatch - detect context corruption early
+            let current_ttbr0: u64;
+            let current_spsr: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
+                core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
+            }
+            
+            // SPSR bits [3:0] = 0 means EL0 (user mode)
+            let returning_to_user = (current_spsr & 0xF) == 0;
+            // Boot TTBR0 is typically in 0x402xxxxx range
+            let has_boot_ttbr0 = current_ttbr0 >= 0x4020_0000 && current_ttbr0 < 0x4040_0000;
+            
+            if returning_to_user && has_boot_ttbr0 {
+                crate::console::print(&alloc::format!(
+                    "[SGI DANGER] tid={} returning to EL0 with boot TTBR0={:#x}! SPSR={:#x}\n",
+                    old_idx, current_ttbr0, current_spsr
+                ));
+            }
+            
             if config::ENABLE_SGI_DEBUG_PRINTS {
                 crate::console::print(&alloc::format!(
                     "[SGI] returned to tid={}\n", old_idx
                 ));
+            }
+            
+            // Re-enable IRQs before returning from handler
+            // This is safe now - we've finished all critical handler work
+            unsafe {
+                core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
             }
         }
     }

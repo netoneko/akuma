@@ -1043,8 +1043,29 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                 crate::console::print("  TTBR0 looks like boot page tables - no user process active!\n");
             }
             
+            // RECOVERY: Clean up this thread properly instead of spinning forever
+            // 1. Mark any ProcessChannel as exited with error
+            if let Some(channel) = remove_channel(tid) {
+                channel.set_exited(-1);  // Signal error exit to SSH
+                crate::console::print(&alloc::format!(
+                    "[return_to_kernel] Cleaned up ProcessChannel for thread {}\n", tid
+                ));
+            }
+            
+            // 2. Restore boot TTBR0 so kernel can continue safely
+            crate::mmu::UserAddressSpace::deactivate();
+            
+            // 3. Mark thread as terminated so scheduler stops scheduling it
+            crate::threading::mark_current_terminated();
+            
+            crate::console::print(&alloc::format!(
+                "[return_to_kernel] Thread {} marked terminated, yielding\n", tid
+            ));
+            
+            // 4. Yield and let other threads run
+            // This thread will be cleaned up by Thread 0's cleanup routine
             loop {
-                core::hint::spin_loop();
+                crate::threading::yield_now();
             }
         }
     };
