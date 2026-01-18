@@ -335,7 +335,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
 
     console::print("Enabling timer...\n");
-    timer::enable_timer_interrupts(10_000); // 10ms intervals
+    timer::enable_timer_interrupts(config::TIMER_INTERVAL_US); // 10ms intervals
     console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
 
     // Enable IRQ-safe allocations now that preemption is active
@@ -437,10 +437,34 @@ fn run_async_main_preemptive() -> ! {
 
     match thread_result {
         Ok(thread_id) => {
+            let mut loop_counter = 0u64;
             loop {
                 if threading::is_thread_terminated(thread_id) {
                     break;
                 }
+                
+                loop_counter = loop_counter.wrapping_add(1);
+                
+                // Thread 0 is responsible for cleanup when DEFERRED_THREAD_CLEANUP is enabled
+                // Clean up every 10 iterations (not too frequent to avoid overhead)
+                if loop_counter % 10 == 0 {
+                    let cleaned = threading::cleanup_terminated();
+                    if cleaned > 0 {
+                        console::print(&alloc::format!(
+                            "[Thread0] Cleaned {} terminated threads\n", cleaned
+                        ));
+                    }
+                }
+                
+                // Heartbeat every 10000 iterations to show thread 0 is alive
+                if loop_counter % 10000 == 0 {
+                    console::print(&alloc::format!(
+                        "[Thread0] Idle loop {} | zombies: {}\n",
+                        loop_counter,
+                        threading::thread_stats().2  // terminated count
+                    ));
+                }
+                
                 threading::yield_now();
             }
 

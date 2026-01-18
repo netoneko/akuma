@@ -493,23 +493,57 @@ pub fn init() {
 }
 
 /// Default exception handler - logs unexpected exceptions
+/// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
 #[unsafe(no_mangle)]
 extern "C" fn rust_default_exception_handler() {
     let esr: u64;
     let elr: u64;
     let spsr: u64;
+    let ttbr0: u64;
+    let sp: u64;
     unsafe {
         core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
         core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+        core::arch::asm!("mov {}, sp", out(reg) sp);
     }
     let ec = (esr >> 26) & 0x3F;
+    let tid = crate::threading::current_thread_id();
+    
     crate::console::print(&alloc::format!(
         "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
         ec,
         elr,
         spsr
     ));
+    crate::console::print(&alloc::format!(
+        "  Thread={}, TTBR0={:#x}, SP={:#x}\n",
+        tid, ttbr0, sp
+    ));
+    
+    // Check for dangerous ERET conditions
+    let target_el = spsr & 0xF;
+    if target_el == 0 {
+        crate::console::print("  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
+    }
+    if elr == 0 {
+        crate::console::print("  WARNING: ELR=0 - ERET would jump to address 0!\n");
+    }
+    if elr < 0x4000_0000 && target_el != 0 {
+        crate::console::print(&alloc::format!(
+            "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n",
+            elr
+        ));
+    }
+    
+    // If ERET would be dangerous, halt instead of returning
+    if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
+        crate::console::print("  HALTING to prevent invalid ERET\n");
+        loop {
+            unsafe { core::arch::asm!("wfe"); }
+        }
+    }
 }
 
 /// Rust IRQ handler called from assembly
@@ -565,15 +599,22 @@ extern "C" fn rust_sync_el1_handler() {
     let elr: u64;
     let far: u64;
     let spsr: u64;
+    let ttbr0: u64;
+    let ttbr1: u64;
+    let sp: u64;
     unsafe {
         core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
         core::arch::asm!("mrs {}, far_el1", out(reg) far);
         core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+        core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+        core::arch::asm!("mov {}, sp", out(reg) sp);
     }
 
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
+    let tid = crate::threading::current_thread_id();
 
     crate::console::print(&alloc::format!(
         "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
@@ -583,6 +624,16 @@ extern "C" fn rust_sync_el1_handler() {
         far,
         spsr
     ));
+    crate::console::print(&alloc::format!(
+        "  Thread={}, TTBR0={:#x}, TTBR1={:#x}, SP={:#x}\n",
+        tid, ttbr0, ttbr1, sp
+    ));
+    
+    // Check if FAR is in user space (below 0x40000000)
+    if far < 0x4000_0000 {
+        crate::console::print("  WARNING: Kernel accessing user-space address!\n");
+        crate::console::print("  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
+    }
 
     // Halt on kernel exceptions - they indicate bugs
     loop {
@@ -663,11 +714,41 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             crate::process::return_to_kernel(-11) // never returns
         }
         _ => {
+            // Capture additional state for debugging
+            let elr: u64;
+            let far: u64;
+            let spsr: u64;
+            let ttbr0: u64;
+            let sp: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
+                core::arch::asm!("mrs {}, far_el1", out(reg) far);
+                core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+                core::arch::asm!("mov {}, sp", out(reg) sp);
+            }
+            let tid = crate::threading::current_thread_id();
+            
             crate::console::print(&alloc::format!(
                 "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n",
                 ec,
                 iss
             ));
+            crate::console::print(&alloc::format!(
+                "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
+                tid, elr, far, spsr
+            ));
+            crate::console::print(&alloc::format!(
+                "  TTBR0={:#x}, SP={:#x}\n",
+                ttbr0, sp
+            ));
+            
+            // Check if this looks like a kernel TTBR0 (boot page tables)
+            // Boot TTBR0 is typically around 0x43xxxxxx
+            if ttbr0 & 0xFFFF_0000_0000_0000 == 0 && ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
+                crate::console::print("  WARNING: TTBR0 looks like boot page tables, not user process!\n");
+            }
+            
             crate::process::return_to_kernel(-1) // never returns
         }
     }

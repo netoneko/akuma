@@ -1010,7 +1010,39 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             ctx as *const KernelContext
         }
         None => {
+            // Capture diagnostic info
+            let ttbr0: u64;
+            let elr: u64;
+            let spsr: u64;
+            let sp: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
+                core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
+                core::arch::asm!("mov {}, sp", out(reg) sp);
+            }
+            let tid = crate::threading::current_thread_id();
+            
+            // Try to read PID from ProcessInfo (might fail if unmapped)
+            let raw_pid = unsafe { 
+                core::ptr::read_volatile(PROCESS_INFO_ADDR as *const u32) 
+            };
+            
             crate::console::print("[return_to_kernel] ERROR: no current process!\n");
+            crate::console::print(&alloc::format!(
+                "  Thread={}, raw_pid_at_0x1000={}, TTBR0={:#x}\n",
+                tid, raw_pid, ttbr0
+            ));
+            crate::console::print(&alloc::format!(
+                "  ELR={:#x}, SPSR={:#x}, SP={:#x}\n",
+                elr, spsr, sp
+            ));
+            
+            // Check if TTBR0 looks like boot page tables
+            if ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
+                crate::console::print("  TTBR0 looks like boot page tables - no user process active!\n");
+            }
+            
             loop {
                 core::hint::spin_loop();
             }
