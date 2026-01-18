@@ -163,3 +163,6 @@ pub const TX_PACKET_BUFFER_SIZE: usize = 2048;
 // Debug prints
 pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
 pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
+
+// Timer interval in microseconds
+pub const TIMER_INTERVAL_US: u64 = 10_000;

@@ -71,15 +71,22 @@ pub extern "C" fn _start() -> ! {
     print("hello: done\n");
     let end_time = libakuma::uptime();
     let total_runtime_ms = (end_time - start_time)/MICROSECONDS;
-    let expected_runtime_ms = total_outputs as u64 * delay_ms;
+    // Only (n-1) sleeps happen (no sleep after last output)
+    let expected_runtime_ms = (total_outputs - 1) as u64 * delay_ms;
     print("hello: uptime=");
     print_num64(total_runtime_ms);
     print("ms ");
-    print("expected uptime=");
+    print("expected=");
     print_num64(expected_runtime_ms);
     print("ms ");
-    print("difference=");
-    print_num64(total_runtime_ms - expected_runtime_ms);
+    // Use saturating_sub to avoid underflow, then show signed difference
+    if total_runtime_ms >= expected_runtime_ms {
+        print("overhead=+");
+        print_num64(total_runtime_ms - expected_runtime_ms);
+    } else {
+        print("overhead=-");
+        print_num64(expected_runtime_ms - total_runtime_ms);
+    }
     print("ms\n");
     exit(0);
 }
