@@ -151,6 +151,25 @@ pub fn flush_tlb_all() {
     }
 }
 
+/// Get the boot TTBR0 value (stored by boot code)
+///
+/// This returns the original kernel page table address, NOT the current TTBR0.
+/// Use this when spawning new threads to ensure they get the kernel's page tables,
+/// not a user process's page tables that might be active.
+pub fn get_boot_ttbr0() -> u64 {
+    unsafe {
+        let addr: u64;
+        core::arch::asm!(
+            "adrp {tmp}, boot_ttbr0_addr",
+            "add {tmp}, {tmp}, :lo12:boot_ttbr0_addr",
+            "ldr {out}, [{tmp}]",
+            tmp = out(reg) _,
+            out = out(reg) addr,
+        );
+        addr
+    }
+}
+
 /// Invalidate TLB entries for a specific ASID
 pub fn flush_tlb_asid(asid: u16) {
     unsafe {

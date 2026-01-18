@@ -637,11 +637,9 @@ impl ThreadPool {
     /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each) - preemptible
     /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each) - preemptible
     pub fn init(&mut self) {
-        // Get the current (boot) TTBR0 value - all kernel threads will use this
-        let boot_ttbr0: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0);
-        }
+        // Get the STORED boot TTBR0 value - all kernel threads will use this
+        // CRITICAL: Must use stored value, not current TTBR0 which could be a user process's!
+        let boot_ttbr0: u64 = crate::mmu::get_boot_ttbr0();
 
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         // It runs the async executor and network runner, so mark it cooperative
@@ -797,9 +795,8 @@ impl ThreadPool {
                 let entry_addr = entry as *const () as u64;
 
                 // Write context fields individually
-                // Get current (boot) TTBR0 for kernel threads
-                let boot_ttbr0: u64;
-                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+                // Get STORED boot TTBR0 (not current, which could be user process's!)
+                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
                 self.slots[i].context.x19 = entry_addr;
                 self.slots[i].context.x20 = 0;
@@ -875,9 +872,8 @@ impl ThreadPool {
                     i, stack.top, EXCEPTION_STACK_SIZE, sp
                 ));
 
-                // Get current (boot) TTBR0 for kernel threads
-                let boot_ttbr0: u64;
-                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+                // Get STORED boot TTBR0 (not current, which could be user process's!)
+                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
@@ -947,10 +943,9 @@ impl ThreadPool {
                     i, stack.top, EXCEPTION_STACK_SIZE, sp
                 ));
 
-                // Get current (boot) TTBR0 for kernel threads
+                // Get STORED boot TTBR0 (not current, which could be user process's!)
                 // Note: User process threads will update TTBR0 when entering user mode
-                let boot_ttbr0: u64;
-                unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
@@ -1522,8 +1517,8 @@ where
         let stack = &pool.stacks[slot_idx];
         let sp = (stack.top & !0xF) as u64;
         
-        let boot_ttbr0: u64;
-        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+        // Get STORED boot TTBR0 (not current, which could be user process's!)
+        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
         pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
         pool.slots[slot_idx].context.x20 = closure_ptr as u64;
@@ -1622,8 +1617,8 @@ where
             slot_idx, stack.top, EXCEPTION_STACK_SIZE, sp
         ));
         
-        let boot_ttbr0: u64;
-        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) boot_ttbr0); }
+        // Get STORED boot TTBR0 (not current, which could be user process's!)
+        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
         pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
         pool.slots[slot_idx].context.x20 = closure_ptr as u64;
