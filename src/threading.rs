@@ -587,9 +587,12 @@ impl StackInfo {
 pub const EXCEPTION_STACK_SIZE: usize = 16384*2;
 
 /// Thread slot in the pool
+/// 
+/// Note: Thread state is stored in the global THREAD_STATES atomic array,
+/// NOT in this struct. This allows lock-free state checks during scheduling.
 #[repr(C)]
 pub struct ThreadSlot {
-    pub state: ThreadState,
+    // NOTE: state removed - use THREAD_STATES[idx] instead for lock-free access
     pub context: Context,
     pub cooperative: bool,
     pub start_time_us: u64,
@@ -603,7 +606,6 @@ pub struct ThreadSlot {
 impl ThreadSlot {
     pub const fn empty() -> Self {
         Self {
-            state: ThreadState::Free,
             context: Context::zero(),
             cooperative: false,
             start_time_us: 0,
@@ -645,7 +647,6 @@ impl ThreadPool {
         // It runs the async executor and network runner, so mark it cooperative
         // to avoid preemption during critical I/O operations. It still gets
         // preempted after the timeout to allow other threads to run.
-        self.slots[IDLE_THREAD_IDX].state = ThreadState::Running;
         THREAD_STATES[IDLE_THREAD_IDX].store(thread_state::RUNNING, Ordering::SeqCst);
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
@@ -826,7 +827,6 @@ impl ThreadPool {
                 };
 
                 // Set state last (makes thread visible to scheduler)
-                self.slots[i].state = ThreadState::Ready;
                 THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
@@ -900,7 +900,6 @@ impl ThreadPool {
                 self.slots[i].start_time_us = 0;
                 self.slots[i].timeout_us = 0;
 
-                self.slots[i].state = ThreadState::Ready;
                 THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
@@ -975,7 +974,6 @@ impl ThreadPool {
                     0
                 };
 
-                self.slots[i].state = ThreadState::Ready;
                 THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
 
                 return Ok(i);
@@ -990,7 +988,6 @@ impl ThreadPool {
         if idx > 0 && idx < config::MAX_THREADS && 
            THREAD_STATES[idx].load(Ordering::SeqCst) == thread_state::TERMINATED
         {
-            self.slots[idx].state = ThreadState::Free;
             THREAD_STATES[idx].store(thread_state::FREE, Ordering::SeqCst);
             // Re-initialize canary for reuse
             if config::ENABLE_STACK_CANARIES && self.stacks[idx].is_allocated() {
@@ -1004,7 +1001,6 @@ impl ThreadPool {
         let mut count = 0;
         for i in 1..config::MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::TERMINATED {
-                self.slots[i].state = ThreadState::Free;
                 THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
                 // Re-initialize canary for reuse
                 if config::ENABLE_STACK_CANARIES && self.stacks[i].is_allocated() {
@@ -1148,21 +1144,22 @@ impl ThreadPool {
         let mut ready = 0;
         let mut running = 0;
         let mut terminated = 0;
-        for slot in &self.slots {
-            match slot.state {
-                ThreadState::Free => {}
-                ThreadState::Ready => ready += 1,
-                ThreadState::Running => running += 1,
-                ThreadState::Terminated => terminated += 1,
+        // Use atomic THREAD_STATES array (source of truth)
+        for i in 0..config::MAX_THREADS {
+            match THREAD_STATES[i].load(Ordering::Relaxed) {
+                thread_state::READY => ready += 1,
+                thread_state::RUNNING => running += 1,
+                thread_state::TERMINATED => terminated += 1,
+                _ => {}
             }
         }
         (ready, running, terminated)
     }
 
     pub fn thread_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.state != ThreadState::Free)
+        // Use atomic THREAD_STATES array (source of truth)
+        (0..config::MAX_THREADS)
+            .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
             .count()
     }
 
@@ -1542,9 +1539,6 @@ where
         pool.slots[slot_idx].start_time_us = 0;
         pool.slots[slot_idx].timeout_us = 0;
         
-        // Sync slot state
-        pool.slots[slot_idx].state = ThreadState::Ready;
-        
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
     });
@@ -1641,9 +1635,6 @@ where
         pool.slots[slot_idx].cooperative = cooperative;
         pool.slots[slot_idx].start_time_us = 0;
         pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
-        
-        // Sync slot state
-        pool.slots[slot_idx].state = ThreadState::Ready;
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
@@ -1764,10 +1755,9 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
 
 /// Check if there are any threads ready to run
 pub fn has_ready_threads() -> bool {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.slots.iter().any(|s| s.state == ThreadState::Ready)
-    })
+    // Use atomic THREAD_STATES array (lock-free)
+    (0..config::MAX_THREADS)
+        .any(|i| THREAD_STATES[i].load(Ordering::Relaxed) == thread_state::READY)
 }
 
 // ============================================================================

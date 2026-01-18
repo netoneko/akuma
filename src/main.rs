@@ -456,10 +456,10 @@ fn run_async_main_preemptive() -> ! {
                     }
                 }
                 
-                // Heartbeat every 10000 iterations to show thread 0 is alive
-                if loop_counter % 10000 == 0 {
+                // Heartbeat every 1000 iterations to show thread 0 is alive
+                if loop_counter % 1000 == 0 {
                     console::print(&alloc::format!(
-                        "[Thread0] Idle loop {} | zombies: {}\n",
+                        "[Thread0] loop={} | zombies={}\n",
                         loop_counter,
                         threading::thread_stats().2  // terminated count
                     ));

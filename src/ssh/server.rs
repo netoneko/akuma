@@ -312,6 +312,19 @@ pub async fn run(stack: Stack<'static>) {
         // =====================================================================
         let active_sessions = ACTIVE_SESSIONS.load(Ordering::Relaxed);
         let total_active = active_sessions + fallback_connections.len();
+        let sys_threads_avail = crate::threading::system_threads_available();
+
+        // Periodic status log (every ~1000 iterations when idle)
+        static mut ACCEPT_COUNTER: u32 = 0;
+        unsafe {
+            ACCEPT_COUNTER = ACCEPT_COUNTER.wrapping_add(1);
+            if ACCEPT_COUNTER % 10000 == 0 {
+                log(&alloc::format!(
+                    "[SSH Status] active={} fallback={} sys_avail={} max={}\n",
+                    active_sessions, fallback_connections.len(), sys_threads_avail, MAX_CONNECTIONS
+                ));
+            }
+        }
 
         if total_active < MAX_CONNECTIONS {
             // Ensure we have a listening socket
