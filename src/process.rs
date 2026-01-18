@@ -787,7 +787,16 @@ impl Process {
 
         // Activate the user address space (sets TTBR0)
         // After this, reading from PROCESS_INFO_ADDR will return our ProcessInfo
+        //
+        // NOTE: For user threads (spawn_process), IRQs are already disabled from
+        // the start of the closure. For system threads (blocking exec), IRQs may
+        // be enabled. Either way, after activate() we can safely enable IRQs
+        // since TTBR0 is now set to user tables.
         self.address_space.activate();
+
+        // Now safe to enable IRQs - TTBR0 is set to user tables
+        // This is safe to call even if IRQs were already enabled (for blocking exec)
+        crate::irq::enable_irqs();
 
         // Enter user mode - this will ERET to user code
         // When user calls exit(), it sets proc.exited = true
@@ -799,22 +808,47 @@ impl Process {
         // Unregister this process from the table
         unregister_process(self.pid);
 
+        // CRITICAL: Disable IRQs before deactivate!
+        // 
+        // The race condition: after deactivate() sets TTBR0 to boot tables,
+        // if a timer fires, this thread gets saved with boot TTBR0. But there
+        // may be nested exception frames on the stack with user ELR/SPSR from
+        // earlier syscalls. When resumed, returning through those frames will
+        // ERET to user code with boot TTBR0 -> crash.
+        //
+        // Fix: disable IRQs before deactivate. For blocking execution (Thread 0),
+        // we re-enable after cleanup. For preemptive threads (spawn_process),
+        // the caller marks thread as terminated before re-enabling IRQs.
+        crate::irq::disable_irqs();
+
         // Deactivate user address space
         UserAddressSpace::deactivate();
 
         // Free dynamically allocated page table frames (from mmap calls)
+        // Now safe because TTBR0 points to boot tables
         for frame in self.dynamic_page_tables.drain(..) {
             crate::pmm::free_page(frame);
         }
 
         self.state = ProcessState::Zombie(exit_code);
 
-        console::print(&alloc::format!(
-            "[Process] '{}' (PID {}) exited with code {}\n",
-            self.name,
-            self.pid,
-            exit_code
-        ));
+        // Check if we're on a cooperative (system) thread vs preemptive (user) thread.
+        // System threads are 0-7, user threads are 8+.
+        let tid = crate::threading::current_thread_id();
+        
+        if tid < 8 {
+            // Blocking execution on system thread - safe to print and re-enable IRQs
+            console::print(&alloc::format!(
+                "[Process] '{}' (PID {}) exited with code {}\n",
+                self.name,
+                self.pid,
+                exit_code
+            ));
+            crate::irq::enable_irqs();
+        }
+        // For user threads (8+), IRQs stay disabled until caller marks terminated.
+        // Skip the print here to avoid potential deadlock with console lock.
+        // The caller can print after re-enabling IRQs if needed.
 
         exit_code
     }
@@ -1197,6 +1231,7 @@ pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> 
     }
 
     // Execute and capture output
+    // Note: execute() now calls deactivate() internally before freeing page tables
     let exit_code = process.execute();
     let stdout_data = process.take_stdout();
 
@@ -1284,30 +1319,53 @@ pub fn spawn_process_with_channel(
 
     // Spawn on a user thread
     let thread_id = crate::threading::spawn_user_thread_fn(move || {
+        // CRITICAL: Disable IRQs immediately!
+        // 
+        // Race condition: timer can fire at ANY point before activate() is called,
+        // saving the thread with boot TTBR0. Later, user code runs and exception
+        // frames with user ELR accumulate. When thread is loaded with saved boot
+        // TTBR0, returning through those frames causes crash.
+        //
+        // Fix: disable IRQs from thread start until after activate() in execute().
+        // execute() will enable IRQs after activate() sets user TTBR0.
+        crate::irq::disable_irqs();
+        
         // Register channel for this thread so syscalls can find it
         let tid = crate::threading::current_thread_id();
         register_channel(tid, channel_for_thread.clone());
 
         // Execute the process
+        // NOTE: execute() expects IRQs disabled on entry (for user threads).
+        // It enables IRQs after activate(), and disables them before deactivate().
+        // It returns with IRQs disabled so we can mark terminated atomically.
         let exit_code = process.execute();
 
+        // IRQs are already disabled (for user threads), and deactivate() already called.
+        // Complete the cleanup while still protected from timer interrupts.
+        
         // Mark channel as exited
         channel_for_thread.set_exited(exit_code);
 
         // Remove channel registration
         remove_channel(tid);
-
-        console::print("[Thread] About to mark terminated\n");
         
-        // Mark thread as terminated when process exits
+        // Mark thread as terminated - scheduler won't pick it anymore
         crate::threading::mark_current_terminated();
-
-        console::print("[Thread] About to yield\n");
         
+        // Now safe to re-enable IRQs - thread is terminated so won't be scheduled
+        crate::irq::enable_irqs();
+        
+        // Print exit info now that IRQs are enabled (safe to acquire console lock)
+        console::print(&alloc::format!(
+            "[Process] Thread {} exited with code {}\n",
+            tid, exit_code
+        ));
+
         // This loop should never be reached, but just in case
+        // Thread is terminated, so scheduler won't pick it, but we yield
+        // to let other threads run
         loop {
             crate::threading::yield_now();
-            console::print("[Thread] Yielded (shouldn't happen for terminated)\n");
         }
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;

@@ -48,6 +48,24 @@ pub fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
     f()
 }
 
+/// Disable IRQs. Caller is responsible for re-enabling with enable_irqs().
+/// Use with_irqs_disabled() when possible for automatic cleanup.
+#[inline]
+pub fn disable_irqs() {
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+}
+
+/// Enable IRQs. Only call after disable_irqs().
+#[inline]
+pub fn enable_irqs() {
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+    }
+}
+
 // ============================================================================
 // IRQ Handler Registration
 // ============================================================================

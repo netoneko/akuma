@@ -1418,6 +1418,16 @@ pub fn sgi_scheduler_handler(irq: u32) {
                 ));
             }
             
+            // Debug: For user threads, show what x30/SP we're about to load
+            if new_idx >= 8 {
+                let new_x30 = pool.slots[new_idx].context.x30;
+                let new_sp = pool.slots[new_idx].context.sp;
+                crate::console::print(&alloc::format!(
+                    "[SGI] loading tid={} x30={:#x} SP={:#x}\n", 
+                    new_idx, new_x30, new_sp
+                ));
+            }
+            
             // Update exception stack BEFORE switching - critical for new threads
             // that jump directly to thread_start_closure and never return here.
             // Each thread needs its own trap frame area for syscall handling.
@@ -1454,8 +1464,21 @@ pub fn sgi_scheduler_handler(irq: u32) {
             }
             
             if config::ENABLE_SGI_DEBUG_PRINTS {
+                // Add sequence number, SP, and x30 to help debug double-return issue
+                static RETURN_SEQ: core::sync::atomic::AtomicU64 = 
+                    core::sync::atomic::AtomicU64::new(0);
+                let seq = RETURN_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let current_sp: u64;
+                let current_x30: u64;
+                let current_elr: u64;
+                unsafe {
+                    core::arch::asm!("mov {}, sp", out(reg) current_sp);
+                    core::arch::asm!("mov {}, x30", out(reg) current_x30);
+                    core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
+                }
                 crate::console::print(&alloc::format!(
-                    "[SGI] returned to tid={}\n", old_idx
+                    "[SGI] returned to tid={} seq={} SP={:#x} x30={:#x} ELR={:#x}\n", 
+                    old_idx, seq, current_sp, current_x30, current_elr
                 ));
             }
             
