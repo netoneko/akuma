@@ -1318,17 +1318,13 @@ pub fn spawn_process_with_channel(
     let channel_for_thread = channel.clone();
 
     // Spawn on a user thread
-    let thread_id = crate::threading::spawn_user_thread_fn(move || {
-        // CRITICAL: Disable IRQs immediately!
-        // 
-        // Race condition: timer can fire at ANY point before activate() is called,
-        // saving the thread with boot TTBR0. Later, user code runs and exception
-        // frames with user ELR accumulate. When thread is loaded with saved boot
-        // TTBR0, returning through those frames causes crash.
-        //
-        // Fix: disable IRQs from thread start until after activate() in execute().
-        // execute() will enable IRQs after activate() sets user TTBR0.
-        crate::irq::disable_irqs();
+    // Use spawn_user_thread_fn_for_process which starts with IRQs disabled
+    // to prevent the race where timer fires before activate() sets user TTBR0.
+    let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
+        // NOTE: IRQs are already disabled from thread creation.
+        // spawn_user_thread_fn_for_process starts the thread with DAIF.I set,
+        // preventing timer from preempting before activate() sets user TTBR0.
+        // execute() will enable IRQs after activate().
         
         // Register channel for this thread so syscalls can find it
         let tid = crate::threading::current_thread_id();

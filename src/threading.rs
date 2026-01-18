@@ -415,15 +415,14 @@ switch_context:
     ldr x9, [x1, #96]
     mov sp, x9
     
-    // Load DAIF (but we'll override IRQ mask below)
+    // Load DAIF from saved context
+    // NOTE: We do NOT force-enable IRQs here anymore!
+    // - For NEW threads: DAIF should be 0x80 (IRQ masked) so the thread
+    //   starts with IRQs disabled, preventing preemption before setup.
+    // - For RETURNING threads: they go through ERET which restores SPSR
+    //   (including IRQ enable state) anyway.
     ldr x9, [x1, #104]
     msr daif, x9
-    
-    // Always enable IRQs after context switch
-    // This is necessary because context switches happen inside exception handlers
-    // (SGI handler), where DAIF.I is automatically set by the CPU.
-    // Without this, threads would inherit the masked IRQ state.
-    msr daifclr, #2
     isb  // Ensure DAIF update takes effect
     
     // Load ELR_EL1
@@ -460,8 +459,12 @@ thread_start:
 // x19 holds pointer to the closure trampoline function
 // x20 holds the raw pointer to the boxed closure data
 thread_start_closure:
-    // Enable IRQs for this thread
-    msr daifclr, #2
+    // NOTE: Do NOT enable IRQs here!
+    // For user process threads, IRQs must stay disabled until activate() sets
+    // the correct TTBR0. The closure is responsible for enabling IRQs at the
+    // appropriate time (after setting up user page tables).
+    // For system threads that need IRQs, they can enable them at the start
+    // of their closure.
     
     // Call the trampoline with closure pointer as argument
     // x19 = trampoline function pointer
@@ -1709,11 +1712,34 @@ pub fn spawn_user_thread_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    spawn_user_thread_fn_with_options(f, false)
+    spawn_user_thread_fn_internal(f, false, false)
 }
 
-/// Spawn a user thread with cooperative option - LOCK-FREE
+/// Spawn a user thread for running a user PROCESS
+///
+/// This variant starts with IRQs DISABLED to prevent the race condition where
+/// timer fires before activate() sets the user TTBR0. The closure MUST call
+/// enable_irqs() after setting up the user address space.
+pub fn spawn_user_thread_fn_for_process<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_user_thread_fn_internal(f, false, true)
+}
+
+/// Spawn a user thread with cooperative option - LOCK-FREE (legacy wrapper)
 pub fn spawn_user_thread_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_user_thread_fn_internal(f, cooperative, false)
+}
+
+/// Internal implementation for spawning user threads
+/// 
+/// - cooperative: if true, thread runs cooperatively (longer time slice, no forced preemption)
+/// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
+fn spawn_user_thread_fn_internal<F>(f: F, cooperative: bool, start_irqs_disabled: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
@@ -1759,7 +1785,11 @@ where
         pool.slots[slot_idx].context.x29 = 0;
         pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
         pool.slots[slot_idx].context.sp = sp;
-        pool.slots[slot_idx].context.daif = 0;
+        // DAIF.I = bit 7 = 0x80 means IRQs disabled
+        // For process threads (start_irqs_disabled=true): start disabled to prevent
+        // preemption before activate() sets the correct TTBR0.
+        // For other threads: start with IRQs enabled (normal preemptive behavior).
+        pool.slots[slot_idx].context.daif = if start_irqs_disabled { 0x80 } else { 0 };
         pool.slots[slot_idx].context.elr = 0;
         pool.slots[slot_idx].context.spsr = 0;
         pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
