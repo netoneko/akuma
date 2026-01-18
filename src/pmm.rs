@@ -465,6 +465,17 @@ pub fn stats() -> (usize, usize, usize) {
     (total, allocated, free)
 }
 
+/// Get number of free pages
+pub fn free_count() -> usize {
+    let (total, allocated, _) = stats();
+    total.saturating_sub(allocated)
+}
+
+/// Get total number of pages
+pub fn total_count() -> usize {
+    TOTAL_PAGES.load(Ordering::Relaxed)
+}
+
 /// Allocate a zeroed page
 pub fn alloc_page_zeroed() -> Option<PhysFrame> {
     use crate::mmu::phys_to_virt;

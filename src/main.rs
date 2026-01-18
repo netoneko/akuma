@@ -688,6 +688,12 @@ fn run_async_main() -> ! {
         // Process pending IRQ work
         executor::process_irq_work();
 
+        // Process deferred buffer frees from terminated SSH sessions.
+        // This MUST happen after polling the network runner, which ensures
+        // embassy-net has finished cleaning up aborted sockets before we
+        // free their buffers for reuse.
+        ssh::server::process_pending_buffer_frees();
+
         POLL_STEP.store(10, Ordering::Relaxed);
         // Poll the executor for any other tasks
         executor::run_once();

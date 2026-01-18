@@ -592,8 +592,11 @@ extern "C" fn rust_irq_handler() {
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)
+/// Uses static buffers to avoid heap allocation during crash
 #[unsafe(no_mangle)]
 extern "C" fn rust_sync_el1_handler() {
+    use core::fmt::Write;
+    
     // Read ESR_EL1 to determine exception type
     let esr: u64;
     let elr: u64;
@@ -602,6 +605,7 @@ extern "C" fn rust_sync_el1_handler() {
     let ttbr0: u64;
     let ttbr1: u64;
     let sp: u64;
+    let sp_el0: u64;
     unsafe {
         core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
@@ -610,30 +614,33 @@ extern "C" fn rust_sync_el1_handler() {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
         core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
         core::arch::asm!("mov {}, sp", out(reg) sp);
+        core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0);
     }
 
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
     let tid = crate::threading::current_thread_id();
 
-    crate::console::print(&alloc::format!(
-        "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
-        ec,
-        iss,
-        elr,
-        far,
-        spsr
-    ));
-    crate::console::print(&alloc::format!(
-        "  Thread={}, TTBR0={:#x}, TTBR1={:#x}, SP={:#x}\n",
-        tid, ttbr0, ttbr1, sp
-    ));
+    // Use static buffer for formatting (no heap allocation)
+    let mut w = StaticWriter::new();
+    
+    let _ = write!(w, "[Exception] Sync from EL1: EC={:#x}, ISS={:#x}\n", ec, iss);
+    w.flush();
+    let _ = write!(w, "  ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", elr, far, spsr);
+    w.flush();
+    let _ = write!(w, "  Thread={}, TTBR0={:#x}, TTBR1={:#x}\n", tid, ttbr0, ttbr1);
+    w.flush();
+    let _ = write!(w, "  SP={:#x}, SP_EL0={:#x}\n", sp, sp_el0);
+    w.flush();
     
     // Check if FAR is in user space (below 0x40000000)
     if far < 0x4000_0000 {
         crate::console::print("  WARNING: Kernel accessing user-space address!\n");
         crate::console::print("  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
     }
+    
+    // Log memory stats for debugging
+    log_memory_stats_on_crash(tid, sp, sp_el0);
 
     // Halt on kernel exceptions - they indicate bugs
     loop {
@@ -641,6 +648,169 @@ extern "C" fn rust_sync_el1_handler() {
             core::arch::asm!("wfe");
         }
     }
+}
+
+// ============================================================================
+// Static buffer formatting for crash handlers (no heap allocation)
+// ============================================================================
+
+/// Static buffer writer for crash-safe formatting
+/// Uses a fixed-size buffer on the stack to avoid heap allocations
+struct StaticWriter {
+    buf: [u8; 256],
+    pos: usize,
+}
+
+impl StaticWriter {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            pos: 0,
+        }
+    }
+    
+    fn as_str(&self) -> &str {
+        // Safety: we only write valid UTF-8 via core::fmt::Write
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.pos]) }
+    }
+    
+    fn clear(&mut self) {
+        self.pos = 0;
+    }
+    
+    /// Write and flush to console, then clear buffer
+    fn flush(&mut self) {
+        if self.pos > 0 {
+            crate::console::print(self.as_str());
+            self.clear();
+        }
+    }
+}
+
+impl core::fmt::Write for StaticWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let to_write = bytes.len().min(remaining);
+        if to_write > 0 {
+            self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
+            self.pos += to_write;
+        }
+        Ok(()) // Always succeed, just truncate if full
+    }
+}
+
+/// Log comprehensive memory stats when a crash occurs
+/// Uses static buffer to avoid heap allocations during crash
+fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
+    use core::fmt::Write;
+    let mut w = StaticWriter::new();
+    
+    crate::console::print("\n=== Memory Stats at Crash ===\n");
+    
+    // Kernel heap stats
+    let heap_stats = crate::allocator::stats();
+    let _ = write!(w, "  Heap: {}/{} bytes used ({} allocs, peak={})\n",
+        heap_stats.allocated,
+        heap_stats.heap_size,
+        heap_stats.allocation_count,
+        heap_stats.peak_allocated
+    );
+    w.flush();
+    
+    // PMM stats
+    let pmm_free = crate::pmm::free_count();
+    let pmm_total = crate::pmm::total_count();
+    let _ = write!(w, "  PMM: {}/{} pages free ({} KB / {} KB)\n",
+        pmm_free, pmm_total,
+        pmm_free * 4, pmm_total * 4
+    );
+    w.flush();
+    
+    // Frame tracking stats if enabled
+    if let Some(frame_stats) = crate::pmm::tracking_stats() {
+        let _ = write!(w, "  Frames: kernel={}, user_pt={}, user_data={}, elf={}\n",
+            frame_stats.kernel_count,
+            frame_stats.user_page_table_count,
+            frame_stats.user_data_count,
+            frame_stats.elf_loader_count
+        );
+        w.flush();
+    }
+    
+    // Thread stack info
+    let (thread_count, running, terminated) = crate::threading::thread_stats();
+    let _ = write!(w, "  Threads: {} total, {} running, {} terminated\n",
+        thread_count, running, terminated
+    );
+    w.flush();
+    
+    // Current thread's kernel stack info
+    if let Some(stack_info) = crate::threading::get_thread_stack_info(tid) {
+        let kernel_stack_used = if kernel_sp >= stack_info.0 as u64 && kernel_sp <= stack_info.1 as u64 {
+            stack_info.1 - kernel_sp as usize
+        } else {
+            0 // SP outside expected range
+        };
+        let _ = write!(w, "  Thread {} kernel stack: base={:#x}, top={:#x}\n",
+            tid, stack_info.0, stack_info.1
+        );
+        w.flush();
+        let _ = write!(w, "    SP={:#x}, used={} bytes\n", kernel_sp, kernel_stack_used);
+        w.flush();
+        if kernel_sp < stack_info.0 as u64 || kernel_sp > stack_info.1 as u64 {
+            crate::console::print("  WARNING: Kernel SP outside thread's stack bounds!\n");
+        }
+    }
+    
+    // User process info (if any)
+    if let Some(proc) = crate::process::current_process() {
+        let mem = &proc.memory;
+        let stack_size = mem.stack_top - mem.stack_bottom;
+        let stack_used = if user_sp >= mem.stack_bottom as u64 && user_sp < mem.stack_top as u64 {
+            mem.stack_top - user_sp as usize
+        } else {
+            0 // SP outside expected range (might be corrupted)
+        };
+        let heap_used = proc.brk.saturating_sub(proc.initial_brk);
+        let mmap_used = mem.next_mmap.saturating_sub(0x1000_0000);
+        
+        // Print in smaller chunks to fit in static buffer
+        let _ = write!(w, "  Process PID={} '{}'\n", proc.pid, proc.name);
+        w.flush();
+        
+        let _ = write!(w, "    Stack: {:#x}-{:#x} ({} KB)\n",
+            mem.stack_bottom, mem.stack_top, stack_size / 1024
+        );
+        w.flush();
+        
+        // Calculate percentage without floating point (integer percentage)
+        let stack_pct = if stack_size > 0 { (stack_used * 100) / stack_size } else { 0 };
+        let _ = write!(w, "    SP_EL0={:#x}, used={} bytes ({}%)\n",
+            user_sp, stack_used, stack_pct
+        );
+        w.flush();
+        
+        let _ = write!(w, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes\n",
+            proc.brk, proc.initial_brk, heap_used
+        );
+        w.flush();
+        
+        let _ = write!(w, "    Mmap: next={:#x}, limit={:#x}, used={} bytes\n",
+            mem.next_mmap, mem.mmap_limit, mmap_used
+        );
+        w.flush();
+        
+        if user_sp < mem.stack_bottom as u64 {
+            crate::console::print("    WARNING: User SP below stack bottom - STACK OVERFLOW!\n");
+        } else if user_sp >= mem.stack_top as u64 {
+            crate::console::print("    WARNING: User SP above stack top - SP corrupted!\n");
+        }
+    } else {
+        crate::console::print("  No current user process\n");
+    }
+    
+    crate::console::print("=============================\n");
 }
 
 /// Synchronous exception handler from EL0 (user mode)

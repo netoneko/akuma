@@ -1463,6 +1463,21 @@ pub fn thread_count() -> usize {
         .count()
 }
 
+/// Get stack info for a specific thread (base, top)
+/// Returns None if thread index is invalid
+pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
+    if tid >= config::MAX_THREADS {
+        return None;
+    }
+    let pool = POOL.lock();
+    let stack = &pool.stacks[tid];
+    if stack.base == 0 {
+        None
+    } else {
+        Some((stack.base, stack.top))
+    }
+}
+
 /// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
 pub fn mark_current_terminated() {
     let idx = CURRENT_THREAD.load(Ordering::SeqCst);

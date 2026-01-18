@@ -1483,10 +1483,6 @@ pub async fn handle_connection(mut stream: TcpStream) {
                     }
                 }
             }
-            Err(_) => {
-                log("[SSH] Read error\n");
-                break;
-            }
         }
     }
 

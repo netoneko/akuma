@@ -363,6 +363,14 @@ pub struct TcpStream {
     socket: TcpSocket<'static>,
 }
 
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        // Abort the socket to ensure it's properly cleaned up in embassy-net
+        // This releases the port binding and cleans up internal state
+        self.socket.abort();
+    }
+}
+
 impl TcpStream {
     /// Create a TcpStream from an already-connected socket
     pub fn from_socket(socket: TcpSocket<'static>) -> Self {

@@ -107,12 +107,49 @@ static BUFFER_POOL: BufferPool = BufferPool::new();
 /// Count of active SSH sessions
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
+// ============================================================================
+// Deferred Buffer Free Queue
+// ============================================================================
+//
+// When a session ends, we can't free the buffer immediately because embassy-net
+// may still reference it until the network runner is polled. Session threads
+// add their buffer slots to this queue, and the main async loop frees them
+// AFTER polling the network runner (ensuring cleanup is complete).
+
+use spinning_top::Spinlock;
+
+/// Queue of buffer slots pending free (protected by spinlock for cross-thread access)
+static PENDING_BUFFER_FREE: Spinlock<Vec<usize>> = Spinlock::new(Vec::new());
+
+/// Queue a buffer slot for deferred free (called from session threads)
+fn queue_buffer_free(slot: usize) {
+    let mut queue = PENDING_BUFFER_FREE.lock();
+    queue.push(slot);
+}
+
+/// Process the pending buffer free queue (called from main async loop after polling)
+/// Returns number of buffers freed
+pub fn process_pending_buffer_frees() -> usize {
+    // Take all pending slots under the lock
+    let slots: Vec<usize> = {
+        let mut queue = PENDING_BUFFER_FREE.lock();
+        core::mem::take(&mut *queue)
+    };
+    
+    // Free them outside the lock
+    let count = slots.len();
+    for slot in slots {
+        BUFFER_POOL.free(slot);
+    }
+    count
+}
+
 /// Allocate a buffer slot
 fn alloc_buffer_slot() -> Option<usize> {
     BUFFER_POOL.alloc()
 }
 
-/// Free a buffer slot
+/// Free a buffer slot immediately (use queue_buffer_free for cross-thread)
 fn free_buffer_slot(slot: usize) {
     BUFFER_POOL.free(slot);
 }
@@ -218,8 +255,12 @@ fn run_session_on_thread(stream: SendableTcpStream, session_id: usize, buffer_sl
         ACTIVE_SESSIONS.load(Ordering::Relaxed)
     ));
 
-    // Free the buffer slot
-    free_buffer_slot(buffer_slot);
+    // IMPORTANT: The TcpStream was dropped when handle_connection returned,
+    // which called socket.abort(). However, embassy-net doesn't fully clean up
+    // the socket until the network runner is polled. We queue the buffer for
+    // deferred free - the main async loop will free it AFTER polling the
+    // network runner, ensuring the cleanup is complete.
+    queue_buffer_free(buffer_slot);
 
     // Mark this thread as terminated and yield
     crate::threading::mark_current_terminated();
@@ -408,10 +449,12 @@ pub async fn run(stack: Stack<'static>) {
                     }
                     Ok(Err(e)) => {
                         log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
+                        // Must abort before dropping to properly release the port in embassy-net
+                        socket.abort();
                         listen_socket = None;
                     }
                     Err(_) => {
-                        // Timeout - abort and recreate socket
+                        // Timeout from with_timeout - abort and recreate socket
                         socket.abort();
                         listen_socket = None;
                     }
