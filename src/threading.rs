@@ -199,7 +199,12 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // CRITICAL: Zero the context to prevent stale ELR/SPSR/TTBR0 from leaking
             // This prevents a newly spawned thread from accidentally getting user-mode
             // ELR/SPSR from a previous process execution.
+            //
+            // We must disable IRQs while holding the pool lock to prevent deadlock:
+            // if a timer fires while we hold the lock, the SGI handler will try to
+            // acquire the same lock and spin forever (single CPU = deadlock).
             {
+                let _guard = crate::irq::IrqGuard::new();
                 let mut pool = POOL.lock();
                 // Zero the context completely
                 pool.slots[i].context = Context::zero();
@@ -368,6 +373,7 @@ global_asm!(
 .section .text
 .global switch_context
 .global thread_start
+.global thread_start_closure
 
 // void switch_context(Context* old, const Context* new)
 // x0 = pointer to old context (save here)
@@ -415,15 +421,20 @@ switch_context:
     ldr x9, [x1, #96]
     mov sp, x9
     
-    // Load DAIF from saved context
-    // NOTE: We do NOT force-enable IRQs here anymore!
-    // - For NEW threads: DAIF should be 0x80 (IRQ masked) so the thread
-    //   starts with IRQs disabled, preventing preemption before setup.
-    // - For RETURNING threads: they go through ERET which restores SPSR
-    //   (including IRQ enable state) anyway.
-    ldr x9, [x1, #104]
-    msr daif, x9
-    isb  // Ensure DAIF update takes effect
+    // CRITICAL: Do NOT restore DAIF here!
+    // 
+    // Restoring DAIF could unmask IRQs mid-switch, allowing a nested timer
+    // interrupt. Since CURRENT_THREAD was already updated, the nested handler
+    // would save the wrong thread's context, causing corruption.
+    //
+    // IRQs must stay MASKED throughout switch_context.
+    //
+    // For RETURNING threads: sgi_scheduler_handler's epilog will unmask IRQs,
+    // then ERET restores SPSR (which includes original IRQ state).
+    //
+    // For NEW threads: they ret to thread_start_closure which handles IRQ
+    // enabling based on thread type (process threads stay masked until
+    // activate(), others enable immediately).
     
     // Load ELR_EL1
     ldr x9, [x1, #112]
@@ -458,14 +469,14 @@ thread_start:
 // Thread entry trampoline for Rust closures
 // x19 holds pointer to the closure trampoline function
 // x20 holds the raw pointer to the boxed closure data
+// x21 holds IRQ enable flag: 0 = enable IRQs now, non-zero = keep disabled
 thread_start_closure:
-    // NOTE: Do NOT enable IRQs here!
-    // For user process threads, IRQs must stay disabled until activate() sets
-    // the correct TTBR0. The closure is responsible for enabling IRQs at the
-    // appropriate time (after setting up user page tables).
-    // For system threads that need IRQs, they can enable them at the start
-    // of their closure.
-    
+    // Check if we should enable IRQs (x21 == 0 means enable)
+    // For process threads: x21 != 0, keep IRQs disabled until activate()
+    // For system/test threads: x21 == 0, enable IRQs now
+    cbnz x21, 1f           // Skip IRQ enable if x21 != 0
+    msr daifclr, #2        // Enable IRQs
+1:
     // Call the trampoline with closure pointer as argument
     // x19 = trampoline function pointer
     // x20 = closure data pointer (passed as x0)
@@ -830,7 +841,8 @@ impl ThreadPool {
                 self.slots[i].context.sp = sp;
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
-                self.slots[i].context.spsr = 0;
+                // SPSR for kernel threads: EL1h (bits[3:0]=5)
+                self.slots[i].context.spsr = 0x00000005; // EL1h
                 self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 // Write slot metadata
@@ -908,7 +920,8 @@ impl ThreadPool {
                 self.slots[i].context.sp = sp;
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
-                self.slots[i].context.spsr = 0;
+                // SPSR for kernel threads: EL1h (bits[3:0]=5)
+                self.slots[i].context.spsr = 0x00000005; // EL1h
                 self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 // System threads are preemptible (not cooperative)
@@ -979,7 +992,9 @@ impl ThreadPool {
                 self.slots[i].context.sp = sp;
                 self.slots[i].context.daif = 0;
                 self.slots[i].context.elr = 0;
-                self.slots[i].context.spsr = 0;
+                // SPSR for kernel code: EL1h (bits[3:0]=5)
+                // The closure runs in kernel mode before entering user mode via ERET
+                self.slots[i].context.spsr = 0x00000005; // EL1h
                 self.slots[i].context.ttbr0 = boot_ttbr0;
 
                 self.slots[i].cooperative = cooperative;
@@ -1342,7 +1357,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
         }
         
         // Debug: For user threads (8+), log current TTBR0 that will be saved
-        if old_idx >= 8 {
+        if config::ENABLE_SGI_DEBUG_PRINTS && old_idx >= 8 {
             let current_ttbr0: u64;
             let current_spsr: u64;
             let current_elr: u64;
@@ -1392,18 +1407,30 @@ pub fn sgi_scheduler_handler(irq: u32) {
             let new_saved_x30 = pool.slots[new_idx].context.x30;
             
             // User threads are 8+, check if TTBR0 looks wrong
-            // Only flag corruption if:
-            // 1. This is NOT a new thread (new threads have ELR=0)
-            // 2. ELR points to user space (< 0x40000000)
-            // 3. SPSR indicates EL0 (user mode) - bits[3:0] == 0
-            // 4. But TTBR0 is boot tables
-            if new_idx >= 8 {
+            // Check for context corruption
+            let is_user_spsr = (new_saved_spsr & 0xF) == 0;
+            let is_new_thread = new_saved_elr == 0 && new_saved_spsr == 0;
+            
+            // CRITICAL: System threads (0-7) should NEVER have user-mode SPSR!
+            // If they do, their context was corrupted.
+            if new_idx < 8 && !is_new_thread && is_user_spsr {
+                crate::console::print(&alloc::format!(
+                    "[SGI CORRUPT] SYSTEM thread {} has user SPSR={:#x}! ELR={:#x}\n",
+                    new_idx, new_saved_spsr, new_saved_elr
+                ));
+                // Try to recover by forcing kernel mode in SPSR
+                // SPSR bits[3:0] = 5 means EL1h (kernel mode, SP_EL1)
+                let mut pool = POOL.lock();
+                pool.slots[new_idx].context.spsr = 0x00000345; // EL1h, IRQs enabled
+                crate::console::print("[SGI CORRUPT] Recovered: forced SPSR to kernel mode\n");
+            }
+            
+            // For user process threads (8+), check for boot TTBR0 with user ELR
+            if new_idx >= 8 && !is_new_thread {
                 let is_boot_ttbr0 = new_saved_ttbr0 >= 0x4020_0000 && new_saved_ttbr0 < 0x4040_0000;
                 let is_user_elr = new_saved_elr > 0 && new_saved_elr < 0x4000_0000;
-                let is_user_spsr = (new_saved_spsr & 0xF) == 0;
-                let is_new_thread = new_saved_elr == 0; // New threads have ELR=0
                 
-                if !is_new_thread && is_user_elr && is_user_spsr && is_boot_ttbr0 {
+                if is_user_elr && is_user_spsr && is_boot_ttbr0 {
                     crate::console::print(&alloc::format!(
                         "[SGI CORRUPT] tid={} returning to user ELR={:#x} but boot TTBR0={:#x}!\n",
                         new_idx, new_saved_elr, new_saved_ttbr0
@@ -1422,7 +1449,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             }
             
             // Debug: For user threads, show what x30/SP we're about to load
-            if new_idx >= 8 {
+            if config::ENABLE_SGI_DEBUG_PRINTS && new_idx >= 8 {
                 let new_x30 = pool.slots[new_idx].context.x30;
                 let new_sp = pool.slots[new_idx].context.sp;
                 crate::console::print(&alloc::format!(
@@ -1589,13 +1616,16 @@ pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
     if tid >= config::MAX_THREADS {
         return None;
     }
-    let pool = POOL.lock();
-    let stack = &pool.stacks[tid];
-    if stack.base == 0 {
-        None
-    } else {
-        Some((stack.base, stack.top))
-    }
+    // Disable IRQs to prevent deadlock if timer fires while we hold the lock
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let stack = &pool.stacks[tid];
+        if stack.base == 0 {
+            None
+        } else {
+            Some((stack.base, stack.top))
+        }
+    })
 }
 
 /// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
@@ -1667,7 +1697,9 @@ where
         pool.slots[slot_idx].context.sp = sp;
         pool.slots[slot_idx].context.daif = 0;
         pool.slots[slot_idx].context.elr = 0;
-        pool.slots[slot_idx].context.spsr = 0;
+        // SPSR for kernel threads: EL1h (bits[3:0]=5) with interrupts enabled
+        // This prevents accidentally ERETing to EL0 or EL1t if SPSR is used
+        pool.slots[slot_idx].context.spsr = 0x00000005; // EL1h
         pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
 
         pool.slots[slot_idx].cooperative = false; // System threads are preemptible
@@ -1764,17 +1796,14 @@ where
         // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
         let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
         
-        crate::console::print(&alloc::format!(
-            "[spawn_user_lockfree] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
-            slot_idx, stack.top, EXCEPTION_STACK_SIZE, sp
-        ));
-        
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
         pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
         pool.slots[slot_idx].context.x20 = closure_ptr as u64;
-        pool.slots[slot_idx].context.x21 = 0;
+        // x21 = IRQ enable flag for thread_start_closure:
+        // 0 = enable IRQs immediately, non-zero = keep disabled (for process threads)
+        pool.slots[slot_idx].context.x21 = if start_irqs_disabled { 1 } else { 0 };
         pool.slots[slot_idx].context.x22 = 0;
         pool.slots[slot_idx].context.x23 = 0;
         pool.slots[slot_idx].context.x24 = 0;
@@ -1785,13 +1814,14 @@ where
         pool.slots[slot_idx].context.x29 = 0;
         pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
         pool.slots[slot_idx].context.sp = sp;
-        // DAIF.I = bit 7 = 0x80 means IRQs disabled
-        // For process threads (start_irqs_disabled=true): start disabled to prevent
-        // preemption before activate() sets the correct TTBR0.
-        // For other threads: start with IRQs enabled (normal preemptive behavior).
+        // DAIF is no longer restored by switch_context (to prevent nested IRQs)
+        // but we still save it for consistency. thread_start_closure uses x21 to
+        // decide whether to enable IRQs.
         pool.slots[slot_idx].context.daif = if start_irqs_disabled { 0x80 } else { 0 };
         pool.slots[slot_idx].context.elr = 0;
-        pool.slots[slot_idx].context.spsr = 0;
+        // SPSR for kernel code: EL1h (bits[3:0]=5)
+        // The closure runs in kernel mode before entering user mode via ERET
+        pool.slots[slot_idx].context.spsr = 0x00000005; // EL1h
         pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
 
         pool.slots[slot_idx].cooperative = cooperative;

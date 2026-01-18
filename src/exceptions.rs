@@ -352,6 +352,37 @@ irq_handler:
     msr     elr_el1, x10
     // Clear IRQ mask bit before restoring SPSR (ensure IRQs enabled after ERET)
     bic     x11, x11, #0x80
+    
+    // SAFETY CHECK: Ensure we're returning to EL1h (kernel mode with SP_EL1)
+    // Valid SPSR bits[3:0] for kernel:
+    //   5 = EL1h (EL1 with SP_EL1) - CORRECT
+    //   4 = EL1t (EL1 with SP_EL0) - WRONG, would use user stack
+    //   0 = EL0 (user mode) - only valid if ELR is user address
+    and     x9, x11, #0xF           // Extract exception level bits
+    cmp     x9, #5                  // Check if already EL1h
+    b.eq    1f                      // Good, skip fix
+    
+    // Check if EL1t - definitely wrong for kernel IRQ return
+    cmp     x9, #4
+    b.ne    2f                      // Not EL1t, check EL0
+    // Fix EL1t -> EL1h: clear bit 0, set bit 2 (4 -> 5)
+    bic     x11, x11, #0xF          // Clear EL bits
+    mov     x9, #5
+    orr     x11, x11, x9            // Set to EL1h
+    b       1f
+    
+2:  // Check if EL0 with kernel ELR (ELR >= 0x40000000)
+    cmp     x9, #0                  // Is it EL0?
+    b.ne    1f                      // No, something else - don't touch
+    // EL0 - check if ELR is kernel address
+    mov     x9, #0x40000000
+    cmp     x10, x9                 // Compare ELR with 0x40000000
+    b.lo    1f                      // ELR < 0x40000000, user addr, OK
+    // ELR is kernel addr but SPSR says EL0 - fix it
+    mov     x9, #5
+    orr     x11, x11, x9            // Set to EL1h
+    
+1:
     msr     spsr_el1, x11
     
     // Restore original x10, x11
