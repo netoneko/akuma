@@ -67,9 +67,17 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
     None
 }
 
+/// Per-thread termination timestamp (for cooldown tracking)
+static TERMINATION_TIME: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; config::MAX_THREADS]
+};
+
 /// Mark a thread as terminated (lock-free)
 pub fn mark_thread_terminated(idx: usize) {
     if idx != IDLE_THREAD_IDX && idx < config::MAX_THREADS {
+        // Record termination time for cooldown tracking
+        TERMINATION_TIME[idx].store(crate::timer::uptime_us(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);
     }
 }
@@ -128,9 +136,49 @@ fn count_free_slots(start: usize, end: usize) -> usize {
 
 /// Cleanup terminated threads - atomically mark as free (lock-free)
 /// Returns number of threads cleaned up
+///
+/// When DEFERRED_THREAD_CLEANUP is enabled:
+/// - Only cleans up if called from thread 0 (main thread)
+/// - Respects THREAD_CLEANUP_COOLDOWN_US before recycling slots
 pub fn cleanup_terminated_lockfree() -> usize {
+    cleanup_terminated_internal(false)
+}
+
+/// Force cleanup of terminated threads - bypasses thread check and cooldown
+/// Use for tests or when you know it's safe to recycle immediately
+pub fn cleanup_terminated_force() -> usize {
+    cleanup_terminated_internal(true)
+}
+
+/// Internal cleanup implementation
+fn cleanup_terminated_internal(force: bool) -> usize {
+    // In deferred mode (unless forced), only allow cleanup from thread 0
+    if !force && config::DEFERRED_THREAD_CLEANUP {
+        let current = CURRENT_THREAD.load(Ordering::SeqCst);
+        if current != IDLE_THREAD_IDX {
+            // Not main thread - skip cleanup
+            return 0;
+        }
+    }
+    
+    let now = crate::timer::uptime_us();
     let mut count = 0;
+    
     for i in 1..config::MAX_THREADS {
+        // Check if thread is terminated
+        if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::TERMINATED {
+            continue;
+        }
+        
+        // In deferred mode (unless forced), check cooldown period
+        if !force && config::DEFERRED_THREAD_CLEANUP {
+            let term_time = TERMINATION_TIME[i].load(Ordering::SeqCst);
+            if term_time > 0 && now.saturating_sub(term_time) < config::THREAD_CLEANUP_COOLDOWN_US {
+                // Thread hasn't been terminated long enough - skip
+                continue;
+            }
+        }
+        
         // Try to atomically change TERMINATED -> FREE
         if THREAD_STATES[i]
             .compare_exchange(
@@ -141,6 +189,13 @@ pub fn cleanup_terminated_lockfree() -> usize {
             )
             .is_ok()
         {
+            // Calculate cooldown before clearing
+            let term_time = TERMINATION_TIME[i].load(Ordering::SeqCst);
+            let cooldown = now.saturating_sub(term_time);
+            
+            // Clear termination time
+            TERMINATION_TIME[i].store(0, Ordering::SeqCst);
+            
             // Re-initialize canary for reuse
             // Note: This reads from POOL but doesn't need the lock
             // because the slot is now FREE and no one else will touch it
@@ -150,6 +205,12 @@ pub fn cleanup_terminated_lockfree() -> usize {
                     init_stack_canary(stack_base);
                 }
             }
+            
+            crate::console::print(&alloc::format!(
+                "[Cleanup] Thread {} recycled after {}us cooldown\n",
+                i, cooldown
+            ));
+            
             count += 1;
         }
     }

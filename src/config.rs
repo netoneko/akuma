@@ -166,3 +166,21 @@ pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
 
 // Timer interval in microseconds
 pub const TIMER_INTERVAL_US: u64 = 10_000;
+
+/// Deferred thread cleanup mode
+///
+/// When enabled, cleanup_terminated() becomes a no-op except when called from
+/// thread 0 (main/boot thread). This serializes all cleanup to a single point,
+/// avoiding potential races between cleanup and spawn operations.
+///
+/// Enable this to debug thread slot synchronization issues.
+pub const DEFERRED_THREAD_CLEANUP: bool = true;
+
+/// Minimum time (microseconds) a thread must be TERMINATED before cleanup
+///
+/// This adds a "cooldown" period after termination to ensure exception handlers
+/// and context switches have fully completed before the slot is recycled.
+/// Only applies when DEFERRED_THREAD_CLEANUP is enabled.
+///
+/// 10ms is enough for context switches to complete while not blocking tests.
+pub const THREAD_CLEANUP_COOLDOWN_US: u64 = 10_000; // 10ms

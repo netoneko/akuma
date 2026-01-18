@@ -745,6 +745,18 @@ impl Process {
         unsafe {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
             
+            // DEBUG: Check if info_ptr is anywhere near the kernel stack
+            // If this fires, we have a memory corruption bug
+            let info_ptr_val = info_ptr as u64;
+            let stack_region_start = 0x41F00000u64; // Approximate stack region start
+            let stack_region_end = 0x43000000u64;   // Approximate stack region end
+            if info_ptr_val >= stack_region_start && info_ptr_val < stack_region_end {
+                console::print(&alloc::format!(
+                    "[CRITICAL] process_info_phys={:#x} points into stack region! info_ptr={:#x} entry_sp={:#x}\n",
+                    self.process_info_phys, info_ptr_val, entry_sp
+                ));
+            }
+            
             // Convert args to &str slices for ProcessInfo::with_args
             let arg_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
             
@@ -759,6 +771,15 @@ impl Process {
             };
             
             core::ptr::write(info_ptr, info);
+            
+            // DEBUG: Check if writing ProcessInfo corrupted entry_sp
+            let current_val = *((entry_sp) as *const u64);
+            if current_val != self.kernel_ctx.entry_stack[0] {
+                console::print(&alloc::format!(
+                    "[CORRUPT] entry_sp[0] changed AFTER ProcessInfo write! was={:#x} now={:#x} info_ptr={:#x}\n",
+                    self.kernel_ctx.entry_stack[0], current_val, info_ptr_val
+                ));
+            }
         }
 
         // Register this process in the table for PID-based lookup
@@ -939,24 +960,53 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let ctx_ptr = match current_process() {
         Some(proc) => {
             let ctx = &proc.kernel_ctx;
-            // Show entry values
-            console::print(&alloc::format!(
-                "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
-                proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30
-            ));
-            // Compare entry stack with current stack at entry_sp
-            console::print("  Stack comparison (entry vs now):\n");
-            for i in 0..8 {
-                let addr = ctx.entry_sp + i as u64 * 8;
-                let current = unsafe { *(addr as *const u64) };
-                let saved = ctx.entry_stack[i];
-                if current != saved {
-                    console::print(&alloc::format!(
-                        "  [entry_sp+{}]: was {:#x} now {:#x} CHANGED!\n", 
-                        i*8, saved, current
-                    ));
+            
+            // Check for ProcessInfo corruption pattern:
+            // - PID at entry_sp+0 (small number matching proc.pid)
+            // - Path string at entry_sp+24 (ASCII "/bin/...")
+            let mut corruption_detected = false;
+            
+            // Check entry_sp+0 for PID (critical - indicates ProcessInfo written to stack)
+            let val_at_0 = unsafe { *(ctx.entry_sp as *const u64) };
+            if ctx.entry_stack[0] == 0 && val_at_0 == proc.pid as u64 {
+                console::print(&alloc::format!(
+                    "[STACK CORRUPTION] PID {} found at entry_sp+0! ProcessInfo written to stack.\n",
+                    proc.pid
+                ));
+                corruption_detected = true;
+            }
+            
+            // Check entry_sp+24 for path string signature (starts with '/')
+            let val_at_24 = unsafe { *((ctx.entry_sp + 24) as *const u64) };
+            if ctx.entry_stack[3] == 0 && (val_at_24 & 0xFF) == 0x2F {
+                // 0x2F is '/' - likely path string corruption
+                console::print(&alloc::format!(
+                    "[STACK CORRUPTION] Path string detected at entry_sp+24: {:#x}\n",
+                    val_at_24
+                ));
+                corruption_detected = true;
+            }
+            
+            if corruption_detected {
+                // Full diagnostic dump for debugging
+                console::print(&alloc::format!(
+                    "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
+                    proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30
+                ));
+                console::print("  Full stack comparison:\n");
+                for i in 0..8 {
+                    let addr = ctx.entry_sp + i as u64 * 8;
+                    let current = unsafe { *(addr as *const u64) };
+                    let saved = ctx.entry_stack[i];
+                    if current != saved {
+                        console::print(&alloc::format!(
+                            "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
+                            i*8, saved, current
+                        ));
+                    }
                 }
             }
+            
             ctx as *const KernelContext
         }
         None => {
