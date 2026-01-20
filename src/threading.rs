@@ -179,11 +179,21 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             }
         }
         
-        // Try to atomically change TERMINATED -> FREE
+        // CRITICAL: Use INITIALIZING as intermediate state to prevent race with spawn!
+        // 
+        // Race condition without this:
+        // 1. Cleanup: TERMINATED -> FREE
+        // 2. Spawn: claim_free_slot sees FREE, changes to INITIALIZING
+        // 3. Spawn: sets up context in THREAD_CONTEXTS[i]
+        // 4. Cleanup: still running, zeros THREAD_CONTEXTS[i] -> OVERWRITES spawn's context!
+        // 5. Spawn: sets state to READY
+        // 6. Scheduler: switches to thread with zeroed context -> CRASH
+        //
+        // Solution: Use INITIALIZING so spawn's claim_free_slot fails while cleanup runs.
         if THREAD_STATES[i]
             .compare_exchange(
                 thread_state::TERMINATED,
-                thread_state::FREE,
+                thread_state::INITIALIZING,  // Block spawns from claiming this slot
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
@@ -225,6 +235,9 @@ fn cleanup_terminated_internal(force: bool) -> usize {
                     init_stack_canary(stack_base);
                 }
             }
+            
+            // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
+            THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
             
             crate::console::print(&alloc::format!(
                 "[Cleanup] Thread {} recycled after {}us cooldown\n",
