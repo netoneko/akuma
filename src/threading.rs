@@ -226,11 +226,6 @@ fn cleanup_terminated_internal(force: bool) -> usize {
                 }
             }
             
-            // Zero out the context for security
-            unsafe {
-                *get_context_mut(i) = Context::zero();
-            }
-            
             crate::console::print(&alloc::format!(
                 "[Cleanup] Thread {} recycled after {}us cooldown\n",
                 i, cooldown
@@ -1439,16 +1434,11 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // Verify stack canaries before switching (only if enabled)
             if config::ENABLE_STACK_CANARIES {
                 if !check_stack_canary(old_stack_base) {
-                    crate::console::print(&alloc::format!(
-                        "[CANARY CORRUPT] Thread {} stack_base={:#x} BEFORE switch\n",
-                        old_idx, old_stack_base
-                    ));
+                    // Don't allocate in IRQ context!
+                    crate::console::print("[CANARY] old thread stack corrupt\n");
                 }
                 if !check_stack_canary(new_stack_base) {
-                    crate::console::print(&alloc::format!(
-                        "[CANARY CORRUPT] Thread {} stack_base={:#x} BEFORE switch (target)\n",
-                        new_idx, new_stack_base
-                    ));
+                    crate::console::print("[CANARY] new thread stack corrupt\n");
                 }
             }
             
@@ -1458,6 +1448,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             // Read context values for corruption checks
             let new_ctx = &*new_ptr;
+            
             let new_saved_ttbr0 = new_ctx.ttbr0;
             let new_saved_spsr = new_ctx.spsr;
             let new_saved_elr = new_ctx.elr;
@@ -1469,13 +1460,10 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             // CRITICAL: System threads (0-7) should NEVER have user-mode SPSR!
             if new_idx < 8 && !is_new_thread && is_user_spsr {
-                crate::console::print(&alloc::format!(
-                    "[SGI CORRUPT] SYSTEM thread {} has user SPSR={:#x}! ELR={:#x}\n",
-                    new_idx, new_saved_spsr, new_saved_elr
-                ));
+                // Don't allocate in IRQ context!
+                crate::console::print("[SGI CORRUPT] system thread has user SPSR - recovering\n");
                 // Try to recover by forcing kernel mode in SPSR
                 (*get_context_mut(new_idx)).spsr = 0x00000345; // EL1h, IRQs enabled
-                crate::console::print("[SGI CORRUPT] Recovered: forced SPSR to kernel mode\n");
             }
             
             // For user process threads (8+), check for boot TTBR0 with user ELR
@@ -1484,10 +1472,8 @@ pub fn sgi_scheduler_handler(irq: u32) {
                 let is_user_elr = new_saved_elr > 0 && new_saved_elr < 0x4000_0000;
                 
                 if is_user_elr && is_user_spsr && is_boot_ttbr0 {
-                    crate::console::print(&alloc::format!(
-                        "[SGI CORRUPT] tid={} returning to user ELR={:#x} but boot TTBR0={:#x}!\n",
-                        new_idx, new_saved_elr, new_saved_ttbr0
-                    ));
+                    // Don't allocate in IRQ context!
+                    crate::console::print("[SGI CORRUPT] user thread has boot TTBR0\n");
                 }
             }
             
@@ -1514,10 +1500,8 @@ pub fn sgi_scheduler_handler(irq: u32) {
             let has_boot_ttbr0 = current_ttbr0 >= 0x4020_0000 && current_ttbr0 < 0x4040_0000;
             
             if returning_to_user && has_boot_ttbr0 {
-                crate::console::print(&alloc::format!(
-                    "[SGI DANGER] tid={} returning to EL0 with boot TTBR0={:#x}! SPSR={:#x}\n",
-                    old_idx, current_ttbr0, current_spsr
-                ));
+                // Don't allocate in IRQ context!
+                crate::console::print("[SGI DANGER] returning to EL0 with boot TTBR0\n");
             }
             
             if config::ENABLE_SGI_DEBUG_PRINTS {
@@ -1877,17 +1861,7 @@ where
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
-        
-        // Debug: verify state was set
-        let verify = THREAD_STATES[slot_idx].load(Ordering::SeqCst);
-        if verify != thread_state::READY {
-            crate::console::print("[SPAWN BUG] State not READY after store!\n");
-        }
     });
-    
-    // Debug: print spawn success
-    crate::console::print(&alloc::format!("[SPAWN] tid={} state={}\n", 
-        slot_idx, THREAD_STATES[slot_idx].load(Ordering::SeqCst)));
     
     Ok(slot_idx)
 }
@@ -2066,15 +2040,6 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
             cooperative[i] = pool.slots[i].cooperative;
             // Read SP from THREAD_CONTEXTS (not from slot)
             sps[i] = unsafe { (*get_context(i)).sp };
-        }
-        
-        // Debug: check states 8 and 9
-        let s8 = THREAD_STATES[8].load(Ordering::SeqCst);
-        let s9 = THREAD_STATES[9].load(Ordering::SeqCst);
-        if s8 != thread_state::FREE || s9 != thread_state::FREE {
-            crate::console::print(&alloc::format!(
-                "[KTHREADS] state8={} state9={}\n", s8, s9
-            ));
         }
         
         ThreadPoolSnapshot {
