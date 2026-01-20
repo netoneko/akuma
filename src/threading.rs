@@ -165,8 +165,26 @@ fn cleanup_terminated_internal(force: bool) -> usize {
     let mut count = 0;
     
     for i in 1..config::MAX_THREADS {
+        let current_state = THREAD_STATES[i].load(Ordering::SeqCst);
+        
+        // Also clean up INITIALIZING slots that are stuck (spawn failed between claim and setup)
+        // A slot in INITIALIZING for more than 1 second is definitely stuck
+        if current_state == thread_state::INITIALIZING {
+            // Check if this slot has been INITIALIZING for too long (stuck spawn)
+            // Since we don't track INITIALIZING time, just clean it up on force
+            if force {
+                // Reset to FREE - spawn failed before context was set up
+                THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
+                crate::console::print("[Cleanup] Thread ");
+                crate::console::print_dec(i);
+                crate::console::print(" was stuck in INITIALIZING, reset to FREE\n");
+                count += 1;
+            }
+            continue;
+        }
+        
         // Check if thread is terminated
-        if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::TERMINATED {
+        if current_state != thread_state::TERMINATED {
             continue;
         }
         

@@ -300,9 +300,32 @@ pub fn interrupt_thread(thread_id: usize) {
 /// During a syscall, TTBR0 is still set to the user's page tables,
 /// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
 /// This prevents PID spoofing since the page is read-only for userspace.
+///
+/// Returns None if:
+/// - No process is running (PID = 0)
+/// - TTBR0 is boot page tables (kernel-only context)
+///
+/// NOTE: We only check TTBR0, not thread ID, because:
+/// - Thread 0 can run blocking process execution (tests)
+/// - During syscalls, TTBR0 is still user page tables regardless of thread
 pub fn read_current_pid() -> Option<Pid> {
+    // Check if TTBR0 points to user page tables
+    // Boot TTBR0 is in the 0x402xxxxx range (kernel page tables)
+    // User TTBR0 is in the 0x44xxxxxx+ range (user page tables from PMM)
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+    }
+    
+    // Boot TTBR0 is typically in 0x4020_0000 - 0x4400_0000 range
+    // If we have boot TTBR0, we're not in a user process context
+    let is_boot_ttbr0 = ttbr0 >= 0x4020_0000 && ttbr0 < 0x4400_0000;
+    if is_boot_ttbr0 {
+        return None; // Not in user process context
+    }
+    
     // Read from the fixed address in the current address space
-    // SAFETY: If a process is running, this address is mapped and contains valid ProcessInfo
+    // SAFETY: TTBR0 is user page tables, so PROCESS_INFO_ADDR is mapped
     let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
     if pid == 0 { None } else { Some(pid) }
 }

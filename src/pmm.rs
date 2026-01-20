@@ -16,7 +16,11 @@ use crate::mmu::PAGE_SIZE;
 
 /// Enable debug frame tracking (adds overhead but helps find leaks)
 /// Set to true to track all frame allocations with metadata
-pub const DEBUG_FRAME_TRACKING: bool = true;
+/// 
+/// WARNING: If you see memory corruption (garbage console output, FAR=0x5 crashes),
+/// try setting this to false. The BTreeMap operations can corrupt heap under
+/// certain conditions.
+pub const DEBUG_FRAME_TRACKING: bool = false;
 
 /// Allocation source for debug tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
