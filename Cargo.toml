@@ -61,6 +61,9 @@ rhai = { version = "1.19", default-features = false, features = ["no_std", "sync
 # ELF parser (no_std)
 elf = { version = "0.7", default-features = false }
 
+# Safe formatting without heap allocation (for panic-resilient printing)
+format_no_std = "1.2"
+
 # TLS support (no_std compatible)
 # Using fork with exposed handshake/extensions modules for custom TlsVerifier
 embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }

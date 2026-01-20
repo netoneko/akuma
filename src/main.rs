@@ -69,11 +69,19 @@ fn panic(info: &PanicInfo) -> ! {
         console::print("Location: ");
         console::print(location.file());
         console::print(":");
-        console::print(&location.line().to_string());
+        console::print_dec(location.line() as usize);
         console::print("\n");
     }
+    // Use stack-based formatting to avoid heap allocation during panic
+    // This prevents double-panic if the heap is corrupted
     console::print("Message: ");
-    console::print(&alloc::format!("{}\n", info.message()));
+    {
+        use core::fmt::Write;
+        let mut buf = console::StackWriter::<256>::new();
+        let _ = write!(buf, "{}", info.message());
+        console::print(buf.as_str());
+    }
+    console::print("\n");
     halt()
 }
 
@@ -450,19 +458,32 @@ fn run_async_main_preemptive() -> ! {
                 if loop_counter % 10 == 0 {
                     let cleaned = threading::cleanup_terminated();
                     if cleaned > 0 {
-                        console::print(&alloc::format!(
-                            "[Thread0] Cleaned {} terminated threads\n", cleaned
-                        ));
+                        // Safe print without heap allocation to prevent panics
+                        console::print("[Thread0] Cleaned ");
+                        console::print_dec(cleaned);
+                        console::print(" terminated threads\n");
                     }
                 }
                 
                 // Heartbeat every 1000 iterations to show thread 0 is alive
                 if loop_counter % 1000 == 0 {
-                    console::print(&alloc::format!(
-                        "[Thread0] loop={} | zombies={}\n",
-                        loop_counter,
-                        threading::thread_stats().2  // terminated count
-                    ));
+                    // Safe print without heap allocation to prevent panics
+                    let stats = threading::thread_stats_full();
+                    console::print("[Thread0] loop=");
+                    console::print_u64(loop_counter);
+                    console::print(" | run=");
+                    console::print_dec(stats.running);
+                    console::print(" rdy=");
+                    console::print_dec(stats.ready);
+                    console::print(" wait=");
+                    console::print_dec(stats.waiting);
+                    console::print(" term=");
+                    console::print_dec(stats.terminated);
+                    console::print(" init=");
+                    console::print_dec(stats.initializing);
+                    console::print(" free=");
+                    console::print_dec(stats.free);
+                    console::print("\n");
                 }
                 
                 threading::yield_now();
@@ -710,9 +731,11 @@ fn run_async_main() -> ! {
         if canary_count % 1000 == 0 && config::ENABLE_STACK_CANARIES {
             let bad = threading::check_all_stack_canaries();
             if !bad.is_empty() {
+                // Safe print without heap allocation
                 console::print("[WARN] Stack overflow detected in threads: ");
                 for tid in &bad {
-                    console::print(&alloc::format!("{} ", tid));
+                    console::print_dec(*tid);
+                    console::print(" ");
                 }
                 console::print("\n");
             }
@@ -730,11 +753,12 @@ fn run_async_main() -> ! {
         static STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
         let step_count = STEP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
         if step_count % 1_000_000 == 0 {
-            console::print(&alloc::format!(
-                "[PollStep] {} million loops, step: {}\n",
-                step_count / 1_000_000,
-                POLL_STEP.load(Ordering::Relaxed)
-            ));
+            // Safe print without heap allocation
+            console::print("[PollStep] ");
+            console::print_u64(step_count / 1_000_000);
+            console::print(" million loops, step: ");
+            console::print_dec(POLL_STEP.load(Ordering::Relaxed) as usize);
+            console::print("\n");
         }
     }
 }

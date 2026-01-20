@@ -1,5 +1,6 @@
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 // ============================================================================
 // UART Driver - Encapsulates all MMIO access
@@ -117,6 +118,94 @@ pub fn print_dec(n: usize) {
     for c in &buf[i..] {
         UART.write(*c);
     }
+}
+
+/// Print a u64 in decimal (no heap allocation)
+pub fn print_u64(n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    let mut val = n;
+
+    if val == 0 {
+        UART.write(b'0');
+        return;
+    }
+
+    while val > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+
+    for c in &buf[i..] {
+        UART.write(*c);
+    }
+}
+
+// ============================================================================
+// Stack-based formatting (no heap allocation, panic-safe)
+// ============================================================================
+
+/// A stack-allocated buffer for formatting without heap allocation.
+/// Use with `core::fmt::Write` or the `format_no_std` crate.
+pub struct StackWriter<const N: usize> {
+    buf: [u8; N],
+    pos: usize,
+}
+
+impl<const N: usize> StackWriter<N> {
+    /// Create a new stack writer with the given buffer size
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            pos: 0,
+        }
+    }
+
+    /// Get the formatted string (returns empty on invalid UTF-8)
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.pos]).unwrap_or("")
+    }
+
+    /// Print the buffer contents to console and clear
+    pub fn flush(&mut self) {
+        print(self.as_str());
+        self.pos = 0;
+    }
+
+    /// Clear the buffer
+    pub fn clear(&mut self) {
+        self.pos = 0;
+    }
+}
+
+impl<const N: usize> Write for StackWriter<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let to_copy = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+        self.pos += to_copy;
+        // Don't return error on truncation - just truncate silently for safety
+        Ok(())
+    }
+}
+
+/// Safe formatting macro that writes to a stack buffer and prints.
+/// Unlike `format!`, this cannot panic from allocation failures.
+///
+/// Usage:
+/// ```
+/// safe_print!(64, "[Thread0] loop={} | zombies={}\n", counter, zombies);
+/// ```
+#[macro_export]
+macro_rules! safe_print {
+    ($size:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut writer = $crate::console::StackWriter::<$size>::new();
+        let _ = write!(writer, $($arg)*);
+        writer.flush();
+    }};
 }
 
 /// Check if a character is available for reading

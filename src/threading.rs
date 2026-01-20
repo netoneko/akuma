@@ -239,10 +239,12 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
             
-            crate::console::print(&alloc::format!(
-                "[Cleanup] Thread {} recycled after {}us cooldown\n",
-                i, cooldown
-            ));
+            // Safe print without heap allocation
+            crate::console::print("[Cleanup] Thread ");
+            crate::console::print_dec(i);
+            crate::console::print(" recycled after ");
+            crate::console::print_u64(cooldown);
+            crate::console::print("us cooldown\n");
             
             count += 1;
         }
@@ -335,10 +337,10 @@ pub fn check_preemption_watchdog() -> Option<u64> {
         let gap = now.saturating_sub(last_check);
         if gap > MAX_EXPECTED_CHECK_GAP_US {
             // Time jumped - host probably slept. Log and reset timestamps.
-            crate::console::print(&alloc::format!(
-                "[WATCHDOG] Time jump detected: {}ms (host sleep/wake)\n",
-                gap / 1000
-            ));
+            // Safe print without heap allocation
+            crate::console::print("[WATCHDOG] Time jump detected: ");
+            crate::console::print_u64(gap / 1000);
+            crate::console::print("ms (host sleep/wake)\n");
             
             // Reset timestamp for this thread to avoid false alarm
             let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
@@ -976,10 +978,16 @@ impl ThreadPool {
                 // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
                 let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
                 
-                crate::console::print(&alloc::format!(
-                    "[spawn_system] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
-                    i, stack.top, EXCEPTION_STACK_SIZE, sp
-                ));
+                // Safe print without heap allocation
+                crate::console::print("[spawn_system] tid=");
+                crate::console::print_dec(i);
+                crate::console::print(" stack_top=0x");
+                crate::console::print_hex(stack.top as u64);
+                crate::console::print(" exc_size=0x");
+                crate::console::print_hex(EXCEPTION_STACK_SIZE as u64);
+                crate::console::print(" initial_sp=0x");
+                crate::console::print_hex(sp);
+                crate::console::print("\n");
 
                 // Get STORED boot TTBR0 (not current, which could be user process's!)
                 let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
@@ -1051,10 +1059,16 @@ impl ThreadPool {
                 // Initial SP is BELOW the exception area (which is at the top)
                 let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
                 
-                crate::console::print(&alloc::format!(
-                    "[spawn_user] tid={} stack_top={:#x} exc_size={:#x} initial_sp={:#x}\n",
-                    i, stack.top, EXCEPTION_STACK_SIZE, sp
-                ));
+                // Safe print without heap allocation
+                crate::console::print("[spawn_user] tid=");
+                crate::console::print_dec(i);
+                crate::console::print(" stack_top=0x");
+                crate::console::print_hex(stack.top as u64);
+                crate::console::print(" exc_size=0x");
+                crate::console::print_hex(EXCEPTION_STACK_SIZE as u64);
+                crate::console::print(" initial_sp=0x");
+                crate::console::print_hex(sp);
+                crate::console::print("\n");
 
                 // Get STORED boot TTBR0 (not current, which could be user process's!)
                 // Note: User process threads will update TTBR0 when entering user mode
@@ -1438,9 +1452,12 @@ pub fn sgi_scheduler_handler(irq: u32) {
 
     if let Some((old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)) = switch_info {
         if config::ENABLE_SGI_DEBUG_PRINTS {
-            crate::console::print(&alloc::format!(
-                "[SGI] switching {} -> {}\n", old_idx, new_idx
-            ));
+            // Safe print without heap allocation (critical in IRQ context!)
+            crate::console::print("[SGI] switching ");
+            crate::console::print_dec(old_idx);
+            crate::console::print(" -> ");
+            crate::console::print_dec(new_idx);
+            crate::console::print("\n");
         }
         
         unsafe {
@@ -1519,6 +1536,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             if config::ENABLE_SGI_DEBUG_PRINTS {
                 // Add sequence number, SP, and x30 to help debug double-return issue
+                // Safe print without heap allocation (critical in IRQ context!)
                 static RETURN_SEQ: core::sync::atomic::AtomicU64 = 
                     core::sync::atomic::AtomicU64::new(0);
                 let seq = RETURN_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1530,10 +1548,17 @@ pub fn sgi_scheduler_handler(irq: u32) {
                     core::arch::asm!("mov {}, x30", out(reg) current_x30);
                     core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
                 }
-                crate::console::print(&alloc::format!(
-                    "[SGI] returned to tid={} seq={} SP={:#x} x30={:#x} ELR={:#x}\n", 
-                    old_idx, seq, current_sp, current_x30, current_elr
-                ));
+                crate::console::print("[SGI] returned to tid=");
+                crate::console::print_dec(old_idx);
+                crate::console::print(" seq=");
+                crate::console::print_u64(seq);
+                crate::console::print(" SP=0x");
+                crate::console::print_hex(current_sp);
+                crate::console::print(" x30=0x");
+                crate::console::print_hex(current_x30);
+                crate::console::print(" ELR=0x");
+                crate::console::print_hex(current_elr);
+                crate::console::print("\n");
             }
             
             // Re-enable IRQs before returning from handler
@@ -1619,6 +1644,40 @@ pub fn thread_stats() -> (usize, usize, usize) {
         }
     }
     (ready, running, terminated)
+}
+
+/// Thread state counts for all states
+pub struct ThreadStatsFull {
+    pub free: usize,
+    pub ready: usize,
+    pub running: usize,
+    pub terminated: usize,
+    pub initializing: usize,
+    pub waiting: usize,
+}
+
+/// Get counts for all thread states (lock-free)
+pub fn thread_stats_full() -> ThreadStatsFull {
+    let mut stats = ThreadStatsFull {
+        free: 0,
+        ready: 0,
+        running: 0,
+        terminated: 0,
+        initializing: 0,
+        waiting: 0,
+    };
+    for i in 0..config::MAX_THREADS {
+        match THREAD_STATES[i].load(Ordering::Relaxed) {
+            thread_state::FREE => stats.free += 1,
+            thread_state::READY => stats.ready += 1,
+            thread_state::RUNNING => stats.running += 1,
+            thread_state::TERMINATED => stats.terminated += 1,
+            thread_state::INITIALIZING => stats.initializing += 1,
+            thread_state::WAITING => stats.waiting += 1,
+            _ => {}
+        }
+    }
+    stats
 }
 
 /// Clean up terminated threads (mark slots as free) - LOCK-FREE
