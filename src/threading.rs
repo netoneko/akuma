@@ -205,23 +205,30 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // acquire the same lock and spin forever (single CPU = deadlock).
             {
                 let _guard = crate::irq::IrqGuard::new();
+                
+                // Zero the context in THREAD_CONTEXTS
+                unsafe {
+                    *get_context_mut(i) = Context::zero();
+                }
+                
+                // Clear slot state
                 let mut pool = POOL.lock();
-                // Zero the context completely
-                pool.slots[i].context = Context::zero();
-                // Also clear other slot state
                 pool.slots[i].cooperative = false;
                 pool.slots[i].start_time_us = 0;
                 pool.slots[i].timeout_us = 0;
             }
             
             // Re-initialize canary for reuse
-            // Note: This reads from POOL but doesn't need the lock
-            // because the slot is now FREE and no one else will touch it
             if config::ENABLE_STACK_CANARIES {
-                let stack_base = unsafe { (*POOL.data_ptr()).stacks[i].base };
+                let stack_base = POOL.lock().stacks[i].base;
                 if stack_base != 0 {
                     init_stack_canary(stack_base);
                 }
+            }
+            
+            // Zero out the context for security
+            unsafe {
+                *get_context_mut(i) = Context::zero();
             }
             
             crate::console::print(&alloc::format!(
@@ -546,6 +553,66 @@ impl Context {
     }
 }
 
+// ============================================================================
+// Thread Contexts - Separate Static Array for Lock-Free Access
+// ============================================================================
+//
+// Thread contexts are stored in a separate static array, NOT behind the POOL
+// spinlock. This allows the scheduler to access contexts without holding the
+// lock across switch_context, which would cause deadlock.
+//
+// Safety invariants:
+// 1. Only the scheduler (with IRQs masked) modifies contexts during switch
+// 2. A thread's context is only accessed when that thread is NOT running
+// 3. Context must be fully initialized before state becomes READY
+// 4. Context is zeroed when state becomes FREE
+// ============================================================================
+
+use core::cell::UnsafeCell;
+
+/// Wrapper to make UnsafeCell<Context> Sync
+/// SAFETY: THREAD_CONTEXTS is safe to share because:
+/// 1. Each context is only modified by the scheduler with IRQs masked
+/// 2. A context is only accessed when its thread is not running on any CPU
+/// 3. We're single-CPU, so no concurrent access is possible
+#[repr(transparent)]
+struct SyncContext(UnsafeCell<Context>);
+
+// SAFETY: See above - single CPU with IRQs masked during access
+unsafe impl Sync for SyncContext {}
+
+impl SyncContext {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(Context::zero()))
+    }
+    
+    #[inline]
+    fn get(&self) -> *mut Context {
+        self.0.get()
+    }
+}
+
+/// Per-thread CPU contexts - accessed without POOL lock
+/// Safety: Access only when IRQs are masked and thread state is valid
+static THREAD_CONTEXTS: [SyncContext; config::MAX_THREADS] = {
+    const INIT: SyncContext = SyncContext::new();
+    [INIT; config::MAX_THREADS]
+};
+
+/// Get a mutable pointer to a thread's context
+/// SAFETY: Caller must ensure IRQs are masked and thread is not running
+#[inline]
+fn get_context_mut(idx: usize) -> *mut Context {
+    THREAD_CONTEXTS[idx].get()
+}
+
+/// Get an immutable pointer to a thread's context  
+/// SAFETY: Caller must ensure thread is not running
+#[inline]
+fn get_context(idx: usize) -> *const Context {
+    THREAD_CONTEXTS[idx].get()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
     Free,       // Slot is available
@@ -620,7 +687,7 @@ pub const EXCEPTION_STACK_SIZE: usize = 16384*2;
 #[repr(C)]
 pub struct ThreadSlot {
     // NOTE: state removed - use THREAD_STATES[idx] instead for lock-free access
-    pub context: Context,
+    // NOTE: context removed - use THREAD_CONTEXTS[idx] instead for lock-free access
     pub cooperative: bool,
     pub start_time_us: u64,
     pub timeout_us: u64,
@@ -633,7 +700,6 @@ pub struct ThreadSlot {
 impl ThreadSlot {
     pub const fn empty() -> Self {
         Self {
-            context: Context::zero(),
             cooperative: false,
             start_time_us: 0,
             timeout_us: 0,
@@ -678,7 +744,11 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
         self.slots[IDLE_THREAD_IDX].start_time_us = crate::timer::uptime_us();
-        self.slots[IDLE_THREAD_IDX].context.ttbr0 = boot_ttbr0;
+        
+        // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
+        unsafe {
+            (*get_context_mut(IDLE_THREAD_IDX)).ttbr0 = boot_ttbr0;
+        }
 
         // Boot stack info (fixed location from boot.rs)
         // The boot stack was already in use before threading init, starting at
@@ -822,28 +892,31 @@ impl ThreadPool {
                 let sp = (stack.top & !0xF) as u64;
                 let entry_addr = entry as *const () as u64;
 
-                // Write context fields individually
+                // Write context fields to THREAD_CONTEXTS (not in slot)
                 // Get STORED boot TTBR0 (not current, which could be user process's!)
                 let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
-                self.slots[i].context.x19 = entry_addr;
-                self.slots[i].context.x20 = 0;
-                self.slots[i].context.x21 = 0;
-                self.slots[i].context.x22 = 0;
-                self.slots[i].context.x23 = 0;
-                self.slots[i].context.x24 = 0;
-                self.slots[i].context.x25 = 0;
-                self.slots[i].context.x26 = 0;
-                self.slots[i].context.x27 = 0;
-                self.slots[i].context.x28 = 0;
-                self.slots[i].context.x29 = 0;
-                self.slots[i].context.x30 = thread_start as *const () as u64;
-                self.slots[i].context.sp = sp;
-                self.slots[i].context.daif = 0;
-                self.slots[i].context.elr = 0;
-                // SPSR for kernel threads: EL1h (bits[3:0]=5)
-                self.slots[i].context.spsr = 0x00000005; // EL1h
-                self.slots[i].context.ttbr0 = boot_ttbr0;
+                unsafe {
+                    let ctx = &mut *get_context_mut(i);
+                    ctx.x19 = entry_addr;
+                    ctx.x20 = 0;
+                    ctx.x21 = 0;
+                    ctx.x22 = 0;
+                    ctx.x23 = 0;
+                    ctx.x24 = 0;
+                    ctx.x25 = 0;
+                    ctx.x26 = 0;
+                    ctx.x27 = 0;
+                    ctx.x28 = 0;
+                    ctx.x29 = 0;
+                    ctx.x30 = thread_start as *const () as u64;
+                    ctx.sp = sp;
+                    ctx.daif = 0;
+                    ctx.elr = 0;
+                    // SPSR for kernel threads: EL1h (bits[3:0]=5)
+                    ctx.spsr = 0x00000005; // EL1h
+                    ctx.ttbr0 = boot_ttbr0;
+                }
 
                 // Write slot metadata
                 self.slots[i].cooperative = cooperative;
@@ -905,24 +978,28 @@ impl ThreadPool {
 
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
-                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
-                self.slots[i].context.x20 = closure_ptr as u64;
-                self.slots[i].context.x21 = 0;
-                self.slots[i].context.x22 = 0;
-                self.slots[i].context.x23 = 0;
-                self.slots[i].context.x24 = 0;
-                self.slots[i].context.x25 = 0;
-                self.slots[i].context.x26 = 0;
-                self.slots[i].context.x27 = 0;
-                self.slots[i].context.x28 = 0;
-                self.slots[i].context.x29 = 0;
-                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
-                self.slots[i].context.sp = sp;
-                self.slots[i].context.daif = 0;
-                self.slots[i].context.elr = 0;
-                // SPSR for kernel threads: EL1h (bits[3:0]=5)
-                self.slots[i].context.spsr = 0x00000005; // EL1h
-                self.slots[i].context.ttbr0 = boot_ttbr0;
+                // Write context to THREAD_CONTEXTS (not in slot)
+                unsafe {
+                    let ctx = &mut *get_context_mut(i);
+                    ctx.x19 = trampoline_fn as *const () as u64;
+                    ctx.x20 = closure_ptr as u64;
+                    ctx.x21 = 0;
+                    ctx.x22 = 0;
+                    ctx.x23 = 0;
+                    ctx.x24 = 0;
+                    ctx.x25 = 0;
+                    ctx.x26 = 0;
+                    ctx.x27 = 0;
+                    ctx.x28 = 0;
+                    ctx.x29 = 0;
+                    ctx.x30 = thread_start_closure as *const () as u64;
+                    ctx.sp = sp;
+                    ctx.daif = 0;
+                    ctx.elr = 0;
+                    // SPSR for kernel threads: EL1h (bits[3:0]=5)
+                    ctx.spsr = 0x00000005; // EL1h
+                    ctx.ttbr0 = boot_ttbr0;
+                }
 
                 // System threads are preemptible (not cooperative)
                 self.slots[i].cooperative = false;
@@ -977,25 +1054,29 @@ impl ThreadPool {
 
                 // x19 = trampoline function pointer
                 // x20 = closure data pointer
-                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
-                self.slots[i].context.x20 = closure_ptr as u64;
-                self.slots[i].context.x21 = 0;
-                self.slots[i].context.x22 = 0;
-                self.slots[i].context.x23 = 0;
-                self.slots[i].context.x24 = 0;
-                self.slots[i].context.x25 = 0;
-                self.slots[i].context.x26 = 0;
-                self.slots[i].context.x27 = 0;
-                self.slots[i].context.x28 = 0;
-                self.slots[i].context.x29 = 0;
-                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
-                self.slots[i].context.sp = sp;
-                self.slots[i].context.daif = 0;
-                self.slots[i].context.elr = 0;
-                // SPSR for kernel code: EL1h (bits[3:0]=5)
-                // The closure runs in kernel mode before entering user mode via ERET
-                self.slots[i].context.spsr = 0x00000005; // EL1h
-                self.slots[i].context.ttbr0 = boot_ttbr0;
+                // Write context to THREAD_CONTEXTS (not in slot)
+                unsafe {
+                    let ctx = &mut *get_context_mut(i);
+                    ctx.x19 = trampoline_fn as *const () as u64;
+                    ctx.x20 = closure_ptr as u64;
+                    ctx.x21 = 0;
+                    ctx.x22 = 0;
+                    ctx.x23 = 0;
+                    ctx.x24 = 0;
+                    ctx.x25 = 0;
+                    ctx.x26 = 0;
+                    ctx.x27 = 0;
+                    ctx.x28 = 0;
+                    ctx.x29 = 0;
+                    ctx.x30 = thread_start_closure as *const () as u64;
+                    ctx.sp = sp;
+                    ctx.daif = 0;
+                    ctx.elr = 0;
+                    // SPSR for kernel code: EL1h (bits[3:0]=5)
+                    // The closure runs in kernel mode before entering user mode via ERET
+                    ctx.spsr = 0x00000005; // EL1h
+                    ctx.ttbr0 = boot_ttbr0;
+                }
 
                 self.slots[i].cooperative = cooperative;
                 self.slots[i].start_time_us = 0;
@@ -1129,21 +1210,6 @@ impl ThreadPool {
             next_idx = (next_idx + 1) % config::MAX_THREADS;
 
             if next_idx == start_idx {
-                // Debug: print thread states when no switch
-                crate::console::print(&alloc::format!(
-                    "[SCHED] no switch from {}: states=[{},{},{},{},{},{},{},{},{},{}]\n",
-                    current_idx,
-                    THREAD_STATES[0].load(Ordering::SeqCst),
-                    THREAD_STATES[1].load(Ordering::SeqCst),
-                    THREAD_STATES[2].load(Ordering::SeqCst),
-                    THREAD_STATES[3].load(Ordering::SeqCst),
-                    THREAD_STATES[4].load(Ordering::SeqCst),
-                    THREAD_STATES[5].load(Ordering::SeqCst),
-                    THREAD_STATES[6].load(Ordering::SeqCst),
-                    THREAD_STATES[7].load(Ordering::SeqCst),
-                    THREAD_STATES[8].load(Ordering::SeqCst),
-                    THREAD_STATES[9].load(Ordering::SeqCst),
-                ));
                 return None;
             }
         }
@@ -1199,8 +1265,9 @@ impl ThreadPool {
         old_idx: usize,
         new_idx: usize,
     ) -> (*mut Context, *const Context) {
-        let old_ptr = &mut self.slots[old_idx].context as *mut Context;
-        let new_ptr = &self.slots[new_idx].context as *const Context;
+        // Contexts are now in THREAD_CONTEXTS static array, not in slots
+        let old_ptr = get_context_mut(old_idx);
+        let new_ptr = get_context(new_idx);
         (old_ptr, new_ptr)
     }
 }
@@ -1343,43 +1410,34 @@ pub fn sgi_scheduler_handler(irq: u32) {
 
     let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
 
-    let (switch_info, pool_ptr) = {
+    // CRITICAL: Copy all needed metadata while holding lock, then release lock BEFORE switch_context.
+    // We cannot hold the lock across switch_context because:
+    // 1. The new thread might get a timer IRQ and try to acquire the same lock → deadlock
+    // 2. The lock guard is on the old thread's stack which we're switching away from
+    //
+    // Solution: Contexts are stored in THREAD_CONTEXTS static array (not behind lock).
+    // We copy stack bases and exception stack pointer while locked, then release.
+    let switch_info = {
         let mut pool = POOL.lock();
-        let ptr = &mut *pool as *mut ThreadPool;
-        (pool.schedule_indices(voluntary), ptr)
-    };
+        pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
+            // Copy all metadata we need - lock will be released after this block
+            let old_stack_base = pool.stacks[old_idx].base;
+            let new_stack_base = pool.stacks[new_idx].base;
+            let new_tpidr = pool.slots[new_idx].exception_stack_top;
+            (old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)
+        })
+    };  // Lock released here - safe because contexts are in separate static array
 
-    if let Some((old_idx, new_idx)) = switch_info {
+    if let Some((old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)) = switch_info {
         if config::ENABLE_SGI_DEBUG_PRINTS {
             crate::console::print(&alloc::format!(
                 "[SGI] switching {} -> {}\n", old_idx, new_idx
             ));
         }
         
-        // Debug: For user threads (8+), log current TTBR0 that will be saved
-        if config::ENABLE_SGI_DEBUG_PRINTS && old_idx >= 8 {
-            let current_ttbr0: u64;
-            let current_spsr: u64;
-            let current_elr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
-                core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
-                core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
-            }
-            crate::console::print(&alloc::format!(
-                "[SGI] tid={} saving TTBR0={:#x} SPSR={:#x} ELR={:#x}\n",
-                old_idx, current_ttbr0, current_spsr, current_elr
-            ));
-        }
-        
         unsafe {
-            let pool = &mut *pool_ptr;
-            
             // Verify stack canaries before switching (only if enabled)
             if config::ENABLE_STACK_CANARIES {
-                let old_stack_base = pool.stacks[old_idx].base;
-                let new_stack_base = pool.stacks[new_idx].base;
-                
                 if !check_stack_canary(old_stack_base) {
                     crate::console::print(&alloc::format!(
                         "[CANARY CORRUPT] Thread {} stack_base={:#x} BEFORE switch\n",
@@ -1394,34 +1452,29 @@ pub fn sgi_scheduler_handler(irq: u32) {
                 }
             }
             
-            let (old_ptr, new_ptr) = pool.get_context_ptrs(old_idx, new_idx);
+            // Access contexts from THREAD_CONTEXTS - no lock needed!
+            let old_ptr = get_context_mut(old_idx);
+            let new_ptr = get_context(new_idx);
             
-            let old_tpidr = pool.slots[old_idx].exception_stack_top;
-            let new_tpidr = pool.slots[new_idx].exception_stack_top;
+            // Read context values for corruption checks
+            let new_ctx = &*new_ptr;
+            let new_saved_ttbr0 = new_ctx.ttbr0;
+            let new_saved_spsr = new_ctx.spsr;
+            let new_saved_elr = new_ctx.elr;
+            let new_saved_x30 = new_ctx.x30;
             
-            // Debug: Check the TTBR0 we're about to load for the new thread
-            // If this is already boot TTBR0 for a user thread, the context was corrupted
-            let new_saved_ttbr0 = pool.slots[new_idx].context.ttbr0;
-            let new_saved_spsr = pool.slots[new_idx].context.spsr;
-            let new_saved_elr = pool.slots[new_idx].context.elr;
-            let new_saved_x30 = pool.slots[new_idx].context.x30;
-            
-            // User threads are 8+, check if TTBR0 looks wrong
             // Check for context corruption
             let is_user_spsr = (new_saved_spsr & 0xF) == 0;
             let is_new_thread = new_saved_elr == 0 && new_saved_spsr == 0;
             
             // CRITICAL: System threads (0-7) should NEVER have user-mode SPSR!
-            // If they do, their context was corrupted.
             if new_idx < 8 && !is_new_thread && is_user_spsr {
                 crate::console::print(&alloc::format!(
                     "[SGI CORRUPT] SYSTEM thread {} has user SPSR={:#x}! ELR={:#x}\n",
                     new_idx, new_saved_spsr, new_saved_elr
                 ));
                 // Try to recover by forcing kernel mode in SPSR
-                // SPSR bits[3:0] = 5 means EL1h (kernel mode, SP_EL1)
-                let mut pool = POOL.lock();
-                pool.slots[new_idx].context.spsr = 0x00000345; // EL1h, IRQs enabled
+                (*get_context_mut(new_idx)).spsr = 0x00000345; // EL1h, IRQs enabled
                 crate::console::print("[SGI CORRUPT] Recovered: forced SPSR to kernel mode\n");
             }
             
@@ -1435,51 +1488,25 @@ pub fn sgi_scheduler_handler(irq: u32) {
                         "[SGI CORRUPT] tid={} returning to user ELR={:#x} but boot TTBR0={:#x}!\n",
                         new_idx, new_saved_elr, new_saved_ttbr0
                     ));
-                    crate::console::print(&alloc::format!(
-                        "  SPSR={:#x}, x30={:#x}\n",
-                        new_saved_spsr, new_saved_x30
-                    ));
                 }
             }
             
-            if config::ENABLE_SGI_DEBUG_PRINTS {
-                crate::console::print(&alloc::format!(
-                    "[SGI] old_tpidr={:#x} new_tpidr={:#x}\n", old_tpidr, new_tpidr
-                ));
-            }
-            
-            // Debug: For user threads, show what x30/SP we're about to load
-            if config::ENABLE_SGI_DEBUG_PRINTS && new_idx >= 8 {
-                let new_x30 = pool.slots[new_idx].context.x30;
-                let new_sp = pool.slots[new_idx].context.sp;
-                crate::console::print(&alloc::format!(
-                    "[SGI] loading tid={} x30={:#x} SP={:#x}\n", 
-                    new_idx, new_x30, new_sp
-                ));
-            }
-            
-            // Update exception stack BEFORE switching - critical for new threads
-            // that jump directly to thread_start_closure and never return here.
-            // Each thread needs its own trap frame area for syscall handling.
+            // Update exception stack BEFORE switching
             crate::exceptions::set_current_exception_stack(new_tpidr);
+            
+            // Note: CURRENT_THREAD is already updated by schedule_indices
             
             switch_context(old_ptr, new_ptr);
             
             // We return here after being switched BACK to this thread
             // CRITICAL: Mask IRQs immediately to prevent nested timer interrupts
-            // before we finish this handler. switch_context enabled IRQs, but we
-            // need to complete the handler atomically.
-            unsafe {
-                core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-            }
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
             
             // Check for TTBR0/SPSR mismatch - detect context corruption early
             let current_ttbr0: u64;
             let current_spsr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
-                core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
-            }
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
+            core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
             
             // SPSR bits [3:0] = 0 means EL0 (user mode)
             let returning_to_user = (current_spsr & 0xF) == 0;
@@ -1670,41 +1697,49 @@ where
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    // Step 3: Set up context (brief POOL access - only touching our claimed slot)
-    // We own this slot (it's READY), so this is safe
-    let setup_result = with_irqs_disabled(|| {
-        // Brief lock just to access context and stack info
-        let pool = unsafe { &mut *POOL.data_ptr() };
-        
-        let stack = &pool.stacks[slot_idx];
-        let sp = (stack.top & !0xF) as u64;
+    // Step 3: Set up context and slot metadata
+    // Context is in THREAD_CONTEXTS (no lock needed), slot metadata needs POOL lock
+    with_irqs_disabled(|| {
+        // Get stack info from POOL (brief lock)
+        let sp = {
+            let pool = POOL.lock();
+            let stack = &pool.stacks[slot_idx];
+            (stack.top & !0xF) as u64
+        };
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
-        pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
-        pool.slots[slot_idx].context.x20 = closure_ptr as u64;
-        pool.slots[slot_idx].context.x21 = 0;
-        pool.slots[slot_idx].context.x22 = 0;
-        pool.slots[slot_idx].context.x23 = 0;
-        pool.slots[slot_idx].context.x24 = 0;
-        pool.slots[slot_idx].context.x25 = 0;
-        pool.slots[slot_idx].context.x26 = 0;
-        pool.slots[slot_idx].context.x27 = 0;
-        pool.slots[slot_idx].context.x28 = 0;
-        pool.slots[slot_idx].context.x29 = 0;
-        pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
-        pool.slots[slot_idx].context.sp = sp;
-        pool.slots[slot_idx].context.daif = 0;
-        pool.slots[slot_idx].context.elr = 0;
-        // SPSR for kernel threads: EL1h (bits[3:0]=5) with interrupts enabled
-        // This prevents accidentally ERETing to EL0 or EL1t if SPSR is used
-        pool.slots[slot_idx].context.spsr = 0x00000005; // EL1h
-        pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
+        // Write context to THREAD_CONTEXTS (no lock needed, thread is INITIALIZING)
+        unsafe {
+            let ctx = &mut *get_context_mut(slot_idx);
+            ctx.x19 = trampoline as *const () as u64;
+            ctx.x20 = closure_ptr as u64;
+            ctx.x21 = 0;
+            ctx.x22 = 0;
+            ctx.x23 = 0;
+            ctx.x24 = 0;
+            ctx.x25 = 0;
+            ctx.x26 = 0;
+            ctx.x27 = 0;
+            ctx.x28 = 0;
+            ctx.x29 = 0;
+            ctx.x30 = thread_start_closure as *const () as u64;
+            ctx.sp = sp;
+            ctx.daif = 0;
+            ctx.elr = 0;
+            // SPSR for kernel threads: EL1h (bits[3:0]=5)
+            ctx.spsr = 0x00000005; // EL1h
+            ctx.ttbr0 = boot_ttbr0;
+        }
 
-        pool.slots[slot_idx].cooperative = false; // System threads are preemptible
-        pool.slots[slot_idx].start_time_us = 0;
-        pool.slots[slot_idx].timeout_us = 0;
+        // Write slot metadata (needs POOL lock)
+        {
+            let mut pool = POOL.lock();
+            pool.slots[slot_idx].cooperative = false; // System threads are preemptible
+            pool.slots[slot_idx].start_time_us = 0;
+            pool.slots[slot_idx].timeout_us = 0;
+        }
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
@@ -1786,51 +1821,73 @@ where
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    // Step 3: Set up context (brief access to POOL data - only our claimed slot)
+    // Step 3: Set up context and slot metadata
+    // Context is in THREAD_CONTEXTS (no lock needed), slot metadata needs POOL lock
     with_irqs_disabled(|| {
-        let pool = unsafe { &mut *POOL.data_ptr() };
-        
-        let stack = &pool.stacks[slot_idx];
-        // Initial SP is BELOW the exception area (which is at the top)
-        // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
-        // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
-        let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+        // Get stack info from POOL (brief lock)
+        let sp = {
+            let pool = POOL.lock();
+            let stack = &pool.stacks[slot_idx];
+            // Initial SP is BELOW the exception area (which is at the top)
+            // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
+            // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
+            ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64
+        };
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
-        pool.slots[slot_idx].context.x19 = trampoline as *const () as u64;
-        pool.slots[slot_idx].context.x20 = closure_ptr as u64;
-        // x21 = IRQ enable flag for thread_start_closure:
-        // 0 = enable IRQs immediately, non-zero = keep disabled (for process threads)
-        pool.slots[slot_idx].context.x21 = if start_irqs_disabled { 1 } else { 0 };
-        pool.slots[slot_idx].context.x22 = 0;
-        pool.slots[slot_idx].context.x23 = 0;
-        pool.slots[slot_idx].context.x24 = 0;
-        pool.slots[slot_idx].context.x25 = 0;
-        pool.slots[slot_idx].context.x26 = 0;
-        pool.slots[slot_idx].context.x27 = 0;
-        pool.slots[slot_idx].context.x28 = 0;
-        pool.slots[slot_idx].context.x29 = 0;
-        pool.slots[slot_idx].context.x30 = thread_start_closure as *const () as u64;
-        pool.slots[slot_idx].context.sp = sp;
-        // DAIF is no longer restored by switch_context (to prevent nested IRQs)
-        // but we still save it for consistency. thread_start_closure uses x21 to
-        // decide whether to enable IRQs.
-        pool.slots[slot_idx].context.daif = if start_irqs_disabled { 0x80 } else { 0 };
-        pool.slots[slot_idx].context.elr = 0;
-        // SPSR for kernel code: EL1h (bits[3:0]=5)
-        // The closure runs in kernel mode before entering user mode via ERET
-        pool.slots[slot_idx].context.spsr = 0x00000005; // EL1h
-        pool.slots[slot_idx].context.ttbr0 = boot_ttbr0;
+        // Write context to THREAD_CONTEXTS (no lock needed, thread is INITIALIZING)
+        // SAFETY: Thread state is INITIALIZING, scheduler ignores it
+        unsafe {
+            let ctx = &mut *get_context_mut(slot_idx);
+            ctx.x19 = trampoline as *const () as u64;
+            ctx.x20 = closure_ptr as u64;
+            // x21 = IRQ enable flag for thread_start_closure:
+            // 0 = enable IRQs immediately, non-zero = keep disabled (for process threads)
+            ctx.x21 = if start_irqs_disabled { 1 } else { 0 };
+            ctx.x22 = 0;
+            ctx.x23 = 0;
+            ctx.x24 = 0;
+            ctx.x25 = 0;
+            ctx.x26 = 0;
+            ctx.x27 = 0;
+            ctx.x28 = 0;
+            ctx.x29 = 0;
+            ctx.x30 = thread_start_closure as *const () as u64;
+            ctx.sp = sp;
+            // DAIF is no longer restored by switch_context (to prevent nested IRQs)
+            // but we still save it for consistency. thread_start_closure uses x21 to
+            // decide whether to enable IRQs.
+            ctx.daif = if start_irqs_disabled { 0x80 } else { 0 };
+            ctx.elr = 0;
+            // SPSR for kernel code: EL1h (bits[3:0]=5)
+            // The closure runs in kernel mode before entering user mode via ERET
+            ctx.spsr = 0x00000005; // EL1h
+            ctx.ttbr0 = boot_ttbr0;
+        }
 
-        pool.slots[slot_idx].cooperative = cooperative;
-        pool.slots[slot_idx].start_time_us = 0;
-        pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
+        // Write slot metadata (needs POOL lock)
+        {
+            let mut pool = POOL.lock();
+            pool.slots[slot_idx].cooperative = cooperative;
+            pool.slots[slot_idx].start_time_us = 0;
+            pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
+        }
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
+        
+        // Debug: verify state was set
+        let verify = THREAD_STATES[slot_idx].load(Ordering::SeqCst);
+        if verify != thread_state::READY {
+            crate::console::print("[SPAWN BUG] State not READY after store!\n");
+        }
     });
+    
+    // Debug: print spawn success
+    crate::console::print(&alloc::format!("[SPAWN] tid={} state={}\n", 
+        slot_idx, THREAD_STATES[slot_idx].load(Ordering::SeqCst)));
     
     Ok(slot_idx)
 }
@@ -2003,10 +2060,21 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 thread_state::RUNNING => ThreadState::Running,
                 thread_state::TERMINATED => ThreadState::Terminated,
                 thread_state::INITIALIZING => ThreadState::Ready, // Show as ready (being set up)
+                thread_state::WAITING => ThreadState::Ready, // Show waiting threads
                 _ => ThreadState::Free,
             };
             cooperative[i] = pool.slots[i].cooperative;
-            sps[i] = pool.slots[i].context.sp;
+            // Read SP from THREAD_CONTEXTS (not from slot)
+            sps[i] = unsafe { (*get_context(i)).sp };
+        }
+        
+        // Debug: check states 8 and 9
+        let s8 = THREAD_STATES[8].load(Ordering::SeqCst);
+        let s9 = THREAD_STATES[9].load(Ordering::SeqCst);
+        if s8 != thread_state::FREE || s9 != thread_state::FREE {
+            crate::console::print(&alloc::format!(
+                "[KTHREADS] state8={} state9={}\n", s8, s9
+            ));
         }
         
         ThreadPoolSnapshot {
