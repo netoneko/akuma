@@ -5,6 +5,7 @@ target = "aarch64-unknown-none"
 # Runner with user-mode networking
 # Force legacy virtio mode (version 1) for better compatibility
 runner = """qemu-system-aarch64 \
+  -semihosting \
   -machine virt \
   -cpu max \
   -m 128M \

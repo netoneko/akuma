@@ -55,6 +55,29 @@ use core::panic::PanicInfo;
 /// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
 #[inline]
 fn halt() -> ! {
+    halt_with_code(1)
+}
+
+/// Exit QEMU with a specific exit code using ARM semihosting.
+/// Requires QEMU to be started with `-semihosting` flag.
+/// Falls back to wfi loop if semihosting is not available.
+#[inline]
+fn halt_with_code(code: u32) -> ! {
+    // Use ARM semihosting SYS_EXIT_EXTENDED (0x20) to exit QEMU with a code
+    // The parameter block contains [reason, exit_code]
+    // ADP_Stopped_ApplicationExit = 0x20026
+    let block: [u64; 2] = [0x20026, code as u64];
+
+    unsafe {
+        core::arch::asm!(
+            "hlt #0xf000",
+            in("x0") 0x20u64,        // SYS_EXIT_EXTENDED
+            in("x1") block.as_ptr(),
+            options(nomem, nostack)
+        );
+    }
+
+    // If semihosting is not available, fall back to wfi loop
     loop {
         // SAFETY: wfi just puts CPU in low-power state until next interrupt.
         // It has no memory safety implications.
