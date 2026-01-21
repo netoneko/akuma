@@ -285,8 +285,8 @@ impl UserAddressSpace {
         // Track L0 frame (PID=0 since we don't have the process yet)
         pmm::track_frame(l0_frame, pmm::FrameSource::UserPageTable, 0);
 
-        // Allocate an ASID
-        let asid = ASID_ALLOCATOR.lock().alloc()?;
+        // Allocate an ASID (with IRQ protection to prevent deadlock)
+        let asid = crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
 
         let mut addr_space = Self {
             l0_frame,
@@ -637,8 +637,8 @@ impl Drop for UserAddressSpace {
         // Free L0 table
         pmm::free_page(self.l0_frame);
 
-        // Free ASID
-        ASID_ALLOCATOR.lock().free(self.asid);
+        // Free ASID (with IRQ protection to prevent deadlock)
+        crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
 
         // Flush TLB for this ASID
         flush_tlb_asid(self.asid);

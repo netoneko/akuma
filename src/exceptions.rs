@@ -664,6 +664,21 @@ extern "C" fn rust_sync_el1_handler() {
     let _ = write!(w, "  SP={:#x}, SP_EL0={:#x}\n", sp, sp_el0);
     w.flush();
     
+    // Try to read the faulting instruction (if ELR is in kernel range)
+    if elr >= 0x4000_0000 && elr < 0x8000_0000 {
+        let instr = unsafe { *(elr as *const u32) };
+        let _ = write!(w, "  Instruction at ELR: {:#010x}\n", instr);
+        w.flush();
+        
+        // Decode ARM64 load/store instruction to find base register
+        // LDR/STR format: opc[31:30] | 111 | V[26] | 00 | opc2[23:22] | imm9 | op[11:10] | Rn[9:5] | Rt[4:0]
+        // Or: opc[31:30] | 111 | V[26] | 01 | opc2[23:22] | imm12[21:10] | Rn[9:5] | Rt[4:0]
+        let rn = ((instr >> 5) & 0x1F) as usize;
+        let rt = (instr & 0x1F) as usize;
+        let _ = write!(w, "  Likely: Rn(base)=x{}, Rt(dest)=x{}\n", rn, rt);
+        w.flush();
+    }
+    
     // Check if FAR is in user space (below 0x40000000)
     if far < 0x4000_0000 {
         crate::console::print("  WARNING: Kernel accessing user-space address!\n");
