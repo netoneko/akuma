@@ -542,16 +542,10 @@ extern "C" fn rust_default_exception_handler() {
     let ec = (esr >> 26) & 0x3F;
     let tid = crate::threading::current_thread_id();
     
-    crate::console::print(&alloc::format!(
-        "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
-        ec,
-        elr,
-        spsr
-    ));
-    crate::console::print(&alloc::format!(
-        "  Thread={}, TTBR0={:#x}, SP={:#x}\n",
-        tid, ttbr0, sp
-    ));
+    // Use stack-only print to avoid heap allocation in exception context
+    crate::safe_print!(128, "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
+        ec, elr, spsr);
+    crate::safe_print!(96, "  Thread={}, TTBR0={:#x}, SP={:#x}\n", tid, ttbr0, sp);
     
     // Check for dangerous ERET conditions
     let target_el = spsr & 0xF;
@@ -562,10 +556,7 @@ extern "C" fn rust_default_exception_handler() {
         crate::console::print("  WARNING: ELR=0 - ERET would jump to address 0!\n");
     }
     if elr < 0x4000_0000 && target_el != 0 {
-        crate::console::print(&alloc::format!(
-            "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n",
-            elr
-        ));
+        crate::safe_print!(96, "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n", elr);
     }
     
     // If ERET would be dangerous, halt instead of returning
@@ -589,9 +580,8 @@ extern "C" fn rust_irq_handler() {
     }
     let tid_before = crate::threading::current_thread_id();
     if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
-        crate::console::print(&alloc::format!(
-            "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp
-        ));
+        // Use stack-only print to avoid heap allocation in IRQ context
+        crate::safe_print!(128, "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp);
     }
     
     // Acknowledge the interrupt and get IRQ number
@@ -616,9 +606,8 @@ extern "C" fn rust_irq_handler() {
     }
     let tid_after = crate::threading::current_thread_id();
     if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
-        crate::console::print(&alloc::format!(
-            "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after
-        ));
+        // Use stack-only print to avoid heap allocation in IRQ context
+        crate::safe_print!(128, "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after);
     }
 }
 
@@ -957,8 +946,16 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Check if process exited - if so, return to kernel
             if let Some(proc) = crate::process::current_process() {
                 if proc.exited {
+                    // Use stack-only print to avoid heap allocation in exception context
+                    crate::safe_print!(96, "[exception] Process {} exited, calling return_to_kernel({})\n",
+                        proc.pid, proc.exit_code);
                     // Don't ERET back to user - return to kernel instead
                     crate::process::return_to_kernel(proc.exit_code);
+                }
+            } else {
+                // Only log if we just handled EXIT syscall
+                if syscall_num == 93 {
+                    crate::console::print("[exception] WARNING: EXIT syscall but no current_process!\n");
                 }
             }
 
@@ -972,12 +969,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
-            crate::console::print(&alloc::format!(
-                "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
-                far,
-                elr,
-                iss
-            ));
+            crate::safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
+                far, elr, iss);
             // Terminate process
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
@@ -987,11 +980,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
-            crate::console::print(&alloc::format!(
-                "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
-                far,
-                iss
-            ));
+            crate::safe_print!(96, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
+                far, iss);
             crate::process::return_to_kernel(-11) // never returns
         }
         _ => {
@@ -1010,19 +1000,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
             let tid = crate::threading::current_thread_id();
             
-            crate::console::print(&alloc::format!(
-                "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n",
-                ec,
-                iss
-            ));
-            crate::console::print(&alloc::format!(
-                "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n",
-                tid, elr, far, spsr
-            ));
-            crate::console::print(&alloc::format!(
-                "  TTBR0={:#x}, SP={:#x}\n",
-                ttbr0, sp
-            ));
+            crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n", ec, iss);
+            crate::safe_print!(128, "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", tid, elr, far, spsr);
+            crate::safe_print!(64, "  TTBR0={:#x}, SP={:#x}\n", ttbr0, sp);
             
             // Check if this looks like a kernel TTBR0 (boot page tables)
             // Boot TTBR0 is typically around 0x43xxxxxx

@@ -65,7 +65,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::UPTIME => sys_uptime(),
         _ => {
-            console::print(&format!("[Syscall] Unknown syscall: {}\n", syscall_num));
+            crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
         }
     }
@@ -225,11 +225,17 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
+    let tid = crate::threading::current_thread_id();
+    crate::safe_print!(64, "[sys_exit] Thread {} exiting with code {}\n", tid, code);
+    
     // Update per-process state only
     if let Some(proc) = crate::process::current_process() {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
+        crate::safe_print!(64, "[sys_exit] Set proc.exited=true for PID {}\n", proc.pid);
+    } else {
+        crate::console::print("[sys_exit] WARNING: No current process!\n");
     }
 
     // Return won't matter - process is terminated

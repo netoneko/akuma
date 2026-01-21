@@ -68,10 +68,8 @@ pub fn timer_irq_handler(_irq: u32) {
         unsafe {
             if now.saturating_sub(LAST_WARN_US) > 1_000_000 {
                 LAST_WARN_US = now;
-                crate::console::print(&alloc::format!(
-                    "[WATCHDOG] Preemption disabled for {}ms\n",
-                    duration_us / 1000
-                ));
+                // Use stack-only print to avoid heap allocation in IRQ context
+                crate::safe_print!(64, "[WATCHDOG] Preemption disabled for {}ms\n", duration_us / 1000);
             }
         }
     }
