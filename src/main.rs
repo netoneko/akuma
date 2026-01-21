@@ -108,28 +108,81 @@ fn panic(info: &PanicInfo) -> ! {
     halt()
 }
 
+// Import boot_x0_at_entry from assembly
+unsafe extern "C" {
+    static boot_x0_at_entry: u64;
+}
+
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     // Early debug: print raw DTB pointer before anything else
-    console::print("DTB ptr from boot: 0x");
+    console::print("DTB ptr from boot (x0 arg): 0x");
     console::print_hex(dtb_ptr as u64);
     console::print("\n");
+    
+    // Also print what was stored at very first instruction
+    let x0_at_entry = unsafe { boot_x0_at_entry };
+    console::print("x0 at _boot entry: 0x");
+    console::print_hex(x0_at_entry);
+    console::print("\n");
+
     kernel_main(dtb_ptr)
+}
+
+/// DTB magic number (big-endian: 0xd00dfeed)
+const DTB_MAGIC: u32 = 0xd00dfeed;
+
+/// Fixed address where we tell QEMU to load the DTB via loader device
+/// Use: -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on
+const DTB_FIXED_ADDR: usize = 0x47f00000;
+
+/// Check for DTB at fixed address, or scan if not found
+fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
+    // First check the fixed address where we ask QEMU to load DTB
+    let magic = unsafe { core::ptr::read_volatile(DTB_FIXED_ADDR as *const u32) };
+    if magic == 0xedfe0dd0 {
+        console::print("[DTB] Found DTB at fixed address 0x");
+        console::print_hex(DTB_FIXED_ADDR as u64);
+        console::print("\n");
+        return DTB_FIXED_ADDR;
+    }
+    
+    console::print("[DTB] No DTB at fixed address 0x");
+    console::print_hex(DTB_FIXED_ADDR as u64);
+    console::print("\n");
+    console::print("[DTB] Add to QEMU: -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on\n");
+    0
 }
 
 /// Detect memory from Device Tree Blob
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x40000000;
     const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024; // Must match QEMU -m setting
+    // Reserve space at end of RAM for QEMU's DTB and other internal data
+    // QEMU places the DTB somewhere in RAM but doesn't tell bare-metal ELFs where
+    const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2MB should be plenty
 
-    if dtb_ptr == 0 {
-        console::print("[Memory] No DTB pointer, using defaults\n");
-        return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
+    // If no DTB pointer provided, try to find it by scanning memory
+    // Use kernel_phys_end as scan start (DTB won't be in kernel area)
+    unsafe extern "C" {
+        static _kernel_phys_end: u8;
+    }
+    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+    
+    let actual_dtb_ptr = if dtb_ptr == 0 {
+        find_dtb(DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE, kernel_end)
+    } else {
+        dtb_ptr
+    };
+
+    if actual_dtb_ptr == 0 {
+        console::print("[Memory] No DTB found, reserving last 2MB for QEMU data\n");
+        return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE);
     }
 
-    // SAFETY: QEMU passes a valid DTB pointer in x0
-    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
+    // SAFETY: We found a valid DTB magic at this address
+    let fdt = match unsafe { fdt::Fdt::from_ptr(actual_dtb_ptr as *const u8) } {
         Ok(fdt) => fdt,
         Err(_) => {
             console::print("[Memory] Invalid DTB, using defaults\n");
@@ -141,16 +194,29 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     let memory = fdt.memory();
     if let Some(region) = memory.regions().next() {
         let base = region.starting_address as usize;
-        let size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
+        let dtb_size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
+        
+        // Reserve memory from DTB location to end of RAM
+        // DTB is at actual_dtb_ptr, so usable RAM ends there
+        let usable_size = if actual_dtb_ptr > base {
+            actual_dtb_ptr - base
+        } else {
+            dtb_size
+        };
+        
         console::print("[Memory] Detected from DTB: base=0x");
-        console::print(&alloc::format!("{:x}", base));
-        console::print(", size=");
-        console::print(&(size / 1024 / 1024).to_string());
-        console::print(" MB\n");
-        (base, size)
+        console::print_hex(base as u64);
+        console::print(", total=");
+        console::print_dec(dtb_size / 1024 / 1024);
+        console::print(" MB, usable=");
+        console::print_dec(usable_size / 1024 / 1024);
+        console::print(" MB (DTB at 0x");
+        console::print_hex(actual_dtb_ptr as u64);
+        console::print(")\n");
+        (base, usable_size)
     } else {
         console::print("[Memory] No memory region in DTB, using defaults\n");
-        (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE)
+        (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE)
     }
 }
 

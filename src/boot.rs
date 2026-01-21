@@ -44,6 +44,11 @@ global_asm!(
 .equ NORMAL_BLOCK, (PT_VALID | PT_BLOCK | PT_AF | PT_SH_INNER | PT_ATTR_NORMAL)
 
 _boot:
+    // DEBUG: Store x0 immediately at entry (before ANY modification)
+    adrp    x1, boot_x0_at_entry
+    add     x1, x1, :lo12:boot_x0_at_entry
+    str     x0, [x1]
+    
     // Save DTB pointer
     mov     x19, x0
     
@@ -190,6 +195,10 @@ boot_ttbr0_addr:
 .global boot_ttbr1_addr
 boot_ttbr1_addr:
     .quad   0
+// Debug: store x0 at entry for verification
+.global boot_x0_at_entry
+boot_x0_at_entry:
+    .quad   0xDEADBEEF
 
 // Reserve space for boot page tables (3 pages = 12KB)
 // Must be 4KB aligned
