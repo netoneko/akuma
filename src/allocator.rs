@@ -254,7 +254,7 @@ unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
 // ============================================================================
 
 unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
-    // with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let result = TALC
             .lock()
             .malloc(layout)
@@ -282,7 +282,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         }
 
         result
-    // })
+    })
 }}
 
 unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
@@ -294,30 +294,73 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
 }}
 
 unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    unsafe {
-        if new_size == 0 {
-            talc_dealloc(ptr, layout);
-            return ptr::null_mut();
-        }
-
-        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
-            Ok(layout) => layout,
-            Err(_) => return ptr::null_mut(),
-        };
-
-        let new_ptr = talc_alloc(new_layout);
-        if new_ptr.is_null() {
-            return ptr::null_mut();
-        }
-
-        if !ptr.is_null() && layout.size() > 0 {
-            let copy_size = core::cmp::min(layout.size(), new_size);
-            if copy_size > 0 {
-                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+    // CRITICAL: Wrap entire realloc operation in IRQ protection!
+    //
+    // Previously, only talc_alloc and talc_dealloc were individually protected,
+    // but the memory copy between them was not. If a timer fired during the copy:
+    // 1. Thread A starts copying from old to new allocation
+    // 2. Timer fires, scheduler switches to Thread B
+    // 3. Thread B allocates/deallocates, modifying heap metadata
+    // 4. Thread A resumes, continues copying, then frees old allocation
+    //
+    // While the heap metadata stays consistent (alloc/dealloc are atomic),
+    // the timing window could cause subtle issues. Wrapping the entire operation
+    // ensures atomicity of the full realloc sequence.
+    with_irqs_disabled(|| {
+        unsafe {
+            if new_size == 0 {
+                // Just call internal dealloc (we're already IRQ-protected)
+                TALC.lock()
+                    .free(core::ptr::NonNull::new_unchecked(ptr), layout);
+                ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+                return ptr::null_mut();
             }
-            talc_dealloc(ptr, layout);
-        }
 
-        new_ptr
-    }
+            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+                Ok(layout) => layout,
+                Err(_) => return ptr::null_mut(),
+            };
+
+            // Allocate new memory (inline, not calling talc_alloc to avoid double IRQ guard)
+            let new_ptr = TALC
+                .lock()
+                .malloc(new_layout)
+                .map(|p| p.as_ptr())
+                .unwrap_or(ptr::null_mut());
+            
+            if new_ptr.is_null() {
+                return ptr::null_mut();
+            }
+
+            // Update allocation stats for new allocation
+            let new_allocated = ALLOCATED_BYTES.fetch_add(new_layout.size(), Ordering::Relaxed) + new_layout.size();
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+            while new_allocated > peak {
+                match PEAK_ALLOCATED.compare_exchange_weak(
+                    peak,
+                    new_allocated,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(p) => peak = p,
+                }
+            }
+
+            // Copy old data to new allocation
+            if !ptr.is_null() && layout.size() > 0 {
+                let copy_size = core::cmp::min(layout.size(), new_size);
+                if copy_size > 0 {
+                    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+                }
+                // Free old allocation (inline)
+                TALC.lock()
+                    .free(core::ptr::NonNull::new_unchecked(ptr), layout);
+                ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            }
+
+            new_ptr
+        }
+    })
 }

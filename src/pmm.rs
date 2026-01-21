@@ -16,10 +16,6 @@ use crate::mmu::PAGE_SIZE;
 
 /// Enable debug frame tracking (adds overhead but helps find leaks)
 /// Set to true to track all frame allocations with metadata
-/// 
-/// WARNING: If you see memory corruption (garbage console output, FAR=0x5 crashes),
-/// try setting this to false. The BTreeMap operations can corrupt heap under
-/// certain conditions.
 pub const DEBUG_FRAME_TRACKING: bool = false;
 
 /// Allocation source for debug tracking
@@ -424,22 +420,30 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
 
 /// Allocate a single physical page
 pub fn alloc_page() -> Option<PhysFrame> {
-    let mut pmm = PMM.lock();
-    let result = pmm.alloc_page();
-    if result.is_some() {
-        ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
-    }
-    result
+    // CRITICAL: Disable IRQs to prevent deadlock!
+    // If a timer fires while holding PMM lock, scheduler switches to another
+    // thread which tries to allocate -> spins forever waiting for lock.
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        let result = pmm.alloc_page();
+        if result.is_some() {
+            ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    })
 }
 
 /// Allocate contiguous physical pages
 pub fn alloc_pages(count: usize) -> Option<PhysFrame> {
-    let mut pmm = PMM.lock();
-    let result = pmm.alloc_pages(count);
-    if result.is_some() {
-        ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
-    }
-    result
+    // CRITICAL: Disable IRQs to prevent deadlock!
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        let result = pmm.alloc_pages(count);
+        if result.is_some() {
+            ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
+        }
+        result
+    })
 }
 
 /// Free a single physical page
@@ -449,16 +453,22 @@ pub fn free_page(frame: PhysFrame) {
     // frame and track it before we untrack, causing us to remove their tracking.
     untrack_frame(frame);
 
-    let mut pmm = PMM.lock();
-    pmm.free_page(frame);
-    ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+    // CRITICAL: Disable IRQs to prevent deadlock!
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        pmm.free_page(frame);
+        ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+    })
 }
 
 /// Free contiguous physical pages
 pub fn free_pages(frame: PhysFrame, count: usize) {
-    let mut pmm = PMM.lock();
-    pmm.free_pages(frame, count);
-    ALLOCATED_PAGES.fetch_sub(count, Ordering::Relaxed);
+    // CRITICAL: Disable IRQs to prevent deadlock!
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        pmm.free_pages(frame, count);
+        ALLOCATED_PAGES.fetch_sub(count, Ordering::Relaxed);
+    })
 }
 
 /// Get physical memory statistics

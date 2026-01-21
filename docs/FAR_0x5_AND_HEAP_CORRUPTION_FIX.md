@@ -175,3 +175,249 @@ After fixes, verify:
 3. **Heap corruption manifests randomly** - The symptom (FAR=0x5) was consistent, but the code path varied. This is a hallmark of heap corruption.
 
 4. **Device memory reads are undefined** - Reading from device memory regions without actual hardware returns garbage, not a clean fault.
+
+---
+
+## Bug 3: PMM Spinlock without IRQ Protection (January 2026)
+
+### Symptoms
+
+Potential deadlock during parallel process execution. If a timer fires while a thread holds the PMM lock, the scheduler switches to another thread. If that thread tries to allocate/free pages, it spins forever waiting for the lock held by the preempted thread.
+
+While primarily a deadlock issue, the unpredictable timing could contribute to corruption symptoms when combined with other issues.
+
+### Root Cause
+
+PMM functions (`alloc_page`, `free_page`, etc.) used `Spinlock` without disabling IRQs:
+
+```rust
+// BEFORE (buggy):
+pub fn alloc_page() -> Option<PhysFrame> {
+    let mut pmm = PMM.lock();  // Timer can fire here!
+    // ...
+}
+```
+
+### Fix
+
+Wrapped all PMM operations in `with_irqs_disabled()`:
+
+```rust
+pub fn alloc_page() -> Option<PhysFrame> {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        // ...
+    })
+}
+```
+
+**File**: `src/pmm.rs`
+
+---
+
+## Bug 4: talc_realloc Gap in IRQ Protection (January 2026)
+
+### Symptoms
+
+Heap corruption during parallel execution with many reallocations (Vec growth, String push_str, etc.).
+
+### Root Cause
+
+`talc_realloc` called `talc_alloc` and `talc_dealloc` which were individually IRQ-protected, but the memory copy between them was not:
+
+```rust
+// BEFORE (buggy):
+unsafe fn talc_realloc(...) {
+    let new_ptr = talc_alloc(new_layout);     // IRQs disabled during this
+    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);  // IRQs ENABLED here!
+    talc_dealloc(ptr, layout);                 // IRQs disabled during this
+}
+```
+
+While the heap metadata stayed consistent (alloc/dealloc are atomic), the timing window during the copy could cause subtle issues when combined with context switches.
+
+### Fix
+
+Wrapped the entire realloc operation in a single `with_irqs_disabled()` block:
+
+```rust
+unsafe fn talc_realloc(...) {
+    with_irqs_disabled(|| {
+        // Inline alloc, copy, and dealloc - all atomic
+    })
+}
+```
+
+**File**: `src/allocator.rs`
+
+---
+
+## Bug 5: PROCESS_TABLE Lock without IRQ Protection (January 2026)
+
+### Symptoms
+
+Potential deadlock when `list_processes()` (used by `ps` command) is called during parallel execution.
+
+### Fix
+
+Added `with_irqs_disabled()` wrapper to `list_processes()`:
+
+```rust
+pub fn list_processes() -> Vec<ProcessInfo2> {
+    crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        // ... collect process info ...
+    })
+}
+```
+
+**File**: `src/process.rs`
+
+---
+
+## Summary of All Fixes
+
+| Bug | Issue | File | Fix |
+|-----|-------|------|-----|
+| 1 | TTBR0 check before user address access | `process.rs` | Check TTBR0 in `read_current_pid()` |
+| 2 | Asymmetric IRQ protection in allocator | `allocator.rs` | Wrap `talc_alloc` in `with_irqs_disabled()` |
+| 3 | PMM lock without IRQ protection | `pmm.rs` | Wrap all PMM functions in `with_irqs_disabled()` |
+| 4 | Realloc gap in IRQ protection | `allocator.rs` | Wrap entire realloc in single `with_irqs_disabled()` |
+| 5 | PROCESS_TABLE lock without IRQ protection | `process.rs` | Wrap `list_processes()` in `with_irqs_disabled()` |
+
+The key principle: **Any Spinlock acquisition must happen with IRQs disabled** to prevent deadlock when a timer fires and the scheduler tries to switch threads.
+
+---
+
+## Bug 6: Missing TLB Flush in activate() (January 2026)
+
+### Symptoms
+
+External abort on translation table walk (DFSC=0x21) during memory access after switching address spaces.
+FAR=0x5 with ISS=0x61 indicates the MMU failed to read the L1 page table during translation.
+
+### Root Cause
+
+When switching TTBR0 from boot page tables to user address space (in `activate()`), the TLB was not flushed. The `deactivate()` function correctly flushed TLB, but `activate()` did not:
+
+```rust
+// BEFORE (buggy):
+pub fn activate(&self) {
+    let ttbr0 = self.ttbr0();
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr0}",
+            "isb",
+            // No TLB flush!
+        );
+    }
+}
+```
+
+Stale TLB entries from the previous address space could cause:
+- Wrong physical addresses being accessed
+- External aborts during translation table walk
+- Permission faults
+
+### Fix
+
+Added `dsb ishst` before the switch and `flush_tlb_all()` after:
+
+```rust
+pub fn activate(&self) {
+    let ttbr0 = self.ttbr0();
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",           // Ensure previous writes complete
+            "msr ttbr0_el1, {ttbr0}",
+            "isb",
+        );
+    }
+    flush_tlb_all();               // Remove stale entries
+}
+```
+
+**File**: `src/mmu.rs`
+
+---
+
+## Updated Summary of All Fixes
+
+| Bug | Issue | File | Fix |
+|-----|-------|------|-----|
+| 1 | TTBR0 check before user address access | `process.rs` | Check TTBR0 in `read_current_pid()` |
+| 2 | Asymmetric IRQ protection in allocator | `allocator.rs` | Wrap `talc_alloc` in `with_irqs_disabled()` |
+| 3 | PMM lock without IRQ protection | `pmm.rs` | Wrap all PMM functions in `with_irqs_disabled()` |
+| 4 | Realloc gap in IRQ protection | `allocator.rs` | Wrap entire realloc in single `with_irqs_disabled()` |
+| 5 | PROCESS_TABLE lock without IRQ protection | `process.rs` | Wrap `list_processes()` in `with_irqs_disabled()` |
+| 6 | Missing TLB flush in activate() | `mmu.rs` | Add `flush_tlb_all()` after TTBR0 switch |
+| 7 | Missing TLB flush in switch_context | `threading.rs` | Add TLBI after TTBR0 switch in asm |
+| 8 | Incomplete TLB flush in activate/deactivate | `mmu.rs` | Flush TLB both BEFORE and AFTER switch |
+| 9 | ProcessChannel lock without IRQ protection | `process.rs` | Wrap write/try_read/read_all |
+| 10 | PROCESS_TABLE ops without IRQ protection | `process.rs` | Wrap register/unregister/lookup |
+| 11 | PROCESS_CHANNELS ops without IRQ protection | `process.rs` | Wrap register/get/remove_channel |
+
+---
+
+## Bug 7: Missing TLB Flush in switch_context (January 2026)
+
+### Symptoms
+
+External abort on translation table walk (DFSC=0x21) occurring intermittently after context switches.
+Page tables appear valid in crash handler, but fault occurs during access.
+
+### Root Cause
+
+The `switch_context` assembly was switching TTBR0 without TLB flush:
+
+```asm
+// BEFORE:
+ldr x9, [x1, #128]
+msr ttbr0_el1, x9
+isb
+ret  // No TLB flush!
+```
+
+### Fix
+
+Added full TLB flush sequence:
+
+```asm
+ldr x9, [x1, #128]
+dsb ish
+msr ttbr0_el1, x9
+isb
+tlbi vmalle1
+dsb ish
+isb
+ret
+```
+
+**File**: `src/threading.rs`
+
+---
+
+## Bug 8: Incomplete TLB Flush in activate/deactivate
+
+### Fix
+
+Modified both functions to flush TLB BEFORE and AFTER the TTBR0 switch for maximum safety.
+
+**File**: `src/mmu.rs`
+
+---
+
+## Bugs 9-11: ProcessChannel and Tables Without IRQ Protection
+
+### Symptoms
+
+Garbled output (0xFF bytes in output stream), heap corruption.
+
+### Fix
+
+Wrapped all Spinlock operations in `with_irqs_disabled()`:
+- `ProcessChannel::write`, `try_read`, `read_all`
+- `register_process`, `unregister_process`, `lookup_process`
+- `register_channel`, `get_channel`, `remove_channel`
+
+**File**: `src/process.rs`

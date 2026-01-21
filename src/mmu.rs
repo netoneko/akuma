@@ -551,13 +551,32 @@ impl UserAddressSpace {
     /// to this user address space.
     pub fn activate(&self) {
         let ttbr0 = self.ttbr0();
+        
+        // CRITICAL: Proper TTBR0 switch sequence:
+        // 1. Flush TLB BEFORE switch - remove stale entries from old address space
+        // 2. DSB to complete pending operations
+        // 3. Switch TTBR0
+        // 4. ISB to ensure instruction stream sees new page tables
+        // 5. Flush TLB AFTER switch - ensure no speculative entries from old TTBR0
+        //
+        // The double flush is paranoid but avoids any window where stale entries
+        // could cause issues.
+        
+        flush_tlb_all();  // Pre-switch flush
+        
         unsafe {
             core::arch::asm!(
+                // Ensure TLB flush and all previous memory accesses complete
+                "dsb ish",
+                // Switch TTBR0 to user address space
                 "msr ttbr0_el1, {ttbr0}",
+                // Synchronization barrier for the switch
                 "isb",
                 ttbr0 = in(reg) ttbr0
             );
         }
+        
+        flush_tlb_all();  // Post-switch flush
     }
 
     /// Deactivate user address space (restore boot page tables to TTBR0)
@@ -577,16 +596,29 @@ impl UserAddressSpace {
             addr
         };
 
+        // CRITICAL: Proper TTBR0 switch sequence (same as activate)
+        // 1. Pre-switch flush - remove stale user space entries
+        // 2. DSB to complete pending operations  
+        // 3. Switch TTBR0 back to boot page tables
+        // 4. ISB to ensure instruction stream sees new page tables
+        // 5. Post-switch flush - ensure clean state
+        
+        flush_tlb_all();  // Pre-switch flush
+        
         unsafe {
             // Restore boot page tables
             core::arch::asm!(
+                // Ensure TLB flush and all previous memory accesses complete
+                "dsb ish",
+                // Switch TTBR0 back to boot page tables
                 "msr ttbr0_el1, {ttbr0}",
+                // Synchronization barrier for the switch
                 "isb",
                 ttbr0 = in(reg) boot_ttbr0
             );
         }
-        // Flush TLB
-        flush_tlb_all();
+        
+        flush_tlb_all();  // Post-switch flush
     }
 }
 

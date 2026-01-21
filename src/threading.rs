@@ -165,26 +165,8 @@ fn cleanup_terminated_internal(force: bool) -> usize {
     let mut count = 0;
     
     for i in 1..config::MAX_THREADS {
-        let current_state = THREAD_STATES[i].load(Ordering::SeqCst);
-        
-        // Also clean up INITIALIZING slots that are stuck (spawn failed between claim and setup)
-        // A slot in INITIALIZING for more than 1 second is definitely stuck
-        if current_state == thread_state::INITIALIZING {
-            // Check if this slot has been INITIALIZING for too long (stuck spawn)
-            // Since we don't track INITIALIZING time, just clean it up on force
-            if force {
-                // Reset to FREE - spawn failed before context was set up
-                THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
-                crate::console::print("[Cleanup] Thread ");
-                crate::console::print_dec(i);
-                crate::console::print(" was stuck in INITIALIZING, reset to FREE\n");
-                count += 1;
-            }
-            continue;
-        }
-        
         // Check if thread is terminated
-        if current_state != thread_state::TERMINATED {
+        if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::TERMINATED {
             continue;
         }
         
@@ -481,9 +463,21 @@ switch_context:
     
     // Load TTBR0_EL1 (user address space)
     // Must restore before returning so the thread sees the correct address space
+    //
+    // CRITICAL: Must flush TLB after TTBR0 switch!
+    // When switching between threads with different TTBR0 (kernel vs user),
+    // stale TLB entries from the old address space could cause:
+    // - Wrong physical addresses being accessed
+    // - External aborts during translation table walk (DFSC=0x21)
+    // 
+    // Sequence: DSB -> switch TTBR0 -> ISB -> flush TLB -> DSB -> ISB
     ldr x9, [x1, #128]
-    msr ttbr0_el1, x9
-    isb  // Ensure TTBR0 change takes effect before any memory access
+    dsb ish                   // Complete pending memory accesses
+    msr ttbr0_el1, x9         // Switch TTBR0
+    isb                       // Ensure TTBR0 change visible
+    tlbi vmalle1              // Flush all EL1 TLB entries
+    dsb ish                   // Wait for TLB flush to complete
+    isb                       // Ensure clean state before execution continues
     
     // Return
     ret

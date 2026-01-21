@@ -1741,9 +1741,6 @@ fn get_test_flag() -> bool {
 fn test_spawn_thread() -> bool {
     console::print("\n[TEST] Thread spawn\n");
 
-    // Clean up any stuck threads from previous tests first
-    let _ = threading::cleanup_terminated_force();
-    
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
@@ -1764,15 +1761,6 @@ fn test_spawn_thread() -> bool {
 
             let ok = count_after == count_before + 1;
             console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
-            
-            // Clean up the spawned thread before returning
-            // Give it a moment to run and terminate, then yield
-            for _ in 0..5 {
-                threading::yield_now();
-            }
-            let cleaned = threading::cleanup_terminated_force();
-            console::print(&format!("  Cleaned: {} threads\n", cleaned));
-            
             ok
         }
         Err(e) => {
@@ -2147,19 +2135,13 @@ fn get_preempt_done() -> bool {
 /// Test: Mixed cooperative and preemptible threads
 /// - 1 cooperative thread: yields for 5ms then exits
 /// - 1 preemptible thread: loops for 15ms then exits  
-/// - Verify both complete and thread count returns to baseline after cleanup
+/// - Verify both complete and only idle thread remains after cleanup
 fn test_mixed_cooperative_preemptible() -> bool {
     console::print("\n[TEST] Mixed cooperative & preemptible threads\n");
 
     set_coop_done(false);
     set_preempt_done(false);
 
-    // Clean up any stuck threads from previous tests first
-    let pre_cleaned = threading::cleanup_terminated_force();
-    if pre_cleaned > 0 {
-        console::print(&format!("  Pre-cleaned: {} threads\n", pre_cleaned));
-    }
-    
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
@@ -2243,19 +2225,8 @@ fn test_mixed_cooperative_preemptible() -> bool {
     let count_after = threading::thread_count();
     console::print(&format!("  Threads after cleanup: {}\n", count_after));
 
-    // Verify: both threads completed and thread count returned to baseline
-    let ok = coop_done && preempt_done && count_after == count_before;
-    if !ok {
-        if !coop_done {
-            console::print("  FAIL: Cooperative thread didn't complete\n");
-        }
-        if !preempt_done {
-            console::print("  FAIL: Preemptible thread didn't complete\n");
-        }
-        if count_after != count_before {
-            console::print(&format!("  FAIL: Thread count {} != expected {}\n", count_after, count_before));
-        }
-    }
+    // Verify: both threads completed and only idle remains
+    let ok = coop_done && preempt_done && count_after == 1;
     console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
     ok
 }

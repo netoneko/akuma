@@ -148,12 +148,16 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, ProcessPtr>> =
 
 /// Register a process in the table
 fn register_process(pid: Pid, proc: *mut Process) {
-    PROCESS_TABLE.lock().insert(pid, ProcessPtr(proc));
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_TABLE.lock().insert(pid, ProcessPtr(proc));
+    })
 }
 
 /// Unregister a process from the table
 fn unregister_process(pid: Pid) {
-    PROCESS_TABLE.lock().remove(&pid);
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_TABLE.lock().remove(&pid);
+    })
 }
 
 // ============================================================================
@@ -192,25 +196,34 @@ impl ProcessChannel {
 
     /// Write data to the channel buffer
     pub fn write(&self, data: &[u8]) {
-        let mut buf = self.buffer.lock();
-        buf.extend(data);
+        // CRITICAL: Disable IRQs while holding the lock!
+        // If timer fires while locked, another thread accessing channel = deadlock.
+        // Also, VecDeque operations can trigger heap allocations which need IRQ protection.
+        crate::irq::with_irqs_disabled(|| {
+            let mut buf = self.buffer.lock();
+            buf.extend(data);
+        })
     }
 
     /// Read available data from the channel (non-blocking)
     /// Returns None if no data is available
     pub fn try_read(&self) -> Option<Vec<u8>> {
-        let mut buf = self.buffer.lock();
-        if buf.is_empty() {
-            None
-        } else {
-            Some(buf.drain(..).collect())
-        }
+        crate::irq::with_irqs_disabled(|| {
+            let mut buf = self.buffer.lock();
+            if buf.is_empty() {
+                None
+            } else {
+                Some(buf.drain(..).collect())
+            }
+        })
     }
 
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
-        let mut buf = self.buffer.lock();
-        buf.drain(..).collect()
+        crate::irq::with_irqs_disabled(|| {
+            let mut buf = self.buffer.lock();
+            buf.drain(..).collect()
+        })
     }
 
     /// Mark the process as exited with the given exit code
@@ -257,17 +270,23 @@ static PROCESS_CHANNELS: Spinlock<alloc::collections::BTreeMap<usize, Arc<Proces
 
 /// Register a process channel for a thread
 pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
-    PROCESS_CHANNELS.lock().insert(thread_id, channel);
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_CHANNELS.lock().insert(thread_id, channel);
+    })
 }
 
 /// Get the process channel for a thread (if any)
 pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    PROCESS_CHANNELS.lock().get(&thread_id).cloned()
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_CHANNELS.lock().get(&thread_id).cloned()
+    })
 }
 
 /// Remove and return the process channel for a thread
 pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    PROCESS_CHANNELS.lock().remove(&thread_id)
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_CHANNELS.lock().remove(&thread_id)
+    })
 }
 
 /// Get channel for the current thread (used by syscall handlers)
@@ -301,27 +320,24 @@ pub fn interrupt_thread(thread_id: usize) {
 /// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
 /// This prevents PID spoofing since the page is read-only for userspace.
 ///
-/// Returns None if:
-/// - No process is running (PID = 0)
-/// - TTBR0 is boot page tables (kernel-only context)
-///
-/// NOTE: We only check TTBR0, not thread ID, because:
-/// - Thread 0 can run blocking process execution (tests)
-/// - During syscalls, TTBR0 is still user page tables regardless of thread
+/// Returns None if TTBR0 points to boot page tables (no user process context).
 pub fn read_current_pid() -> Option<Pid> {
-    // Check if TTBR0 points to user page tables
-    // Boot TTBR0 is in the 0x402xxxxx range (kernel page tables)
-    // User TTBR0 is in the 0x44xxxxxx+ range (user page tables from PMM)
+    // CRITICAL: Check TTBR0 before reading from user address space!
+    //
+    // PROCESS_INFO_ADDR (0x1000) is only mapped in USER page tables.
+    // With boot TTBR0, address 0x1000 is in the device memory region (0x0-0x40000000)
+    // and reading from it returns garbage, causing FAR=0x5 crashes.
     let ttbr0: u64;
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
     }
     
-    // Boot TTBR0 is typically in 0x4020_0000 - 0x4400_0000 range
-    // If we have boot TTBR0, we're not in a user process context
-    let is_boot_ttbr0 = ttbr0 >= 0x4020_0000 && ttbr0 < 0x4400_0000;
-    if is_boot_ttbr0 {
-        return None; // Not in user process context
+    // Boot TTBR0 is in 0x402xxxxx range (stored physical address of boot page tables)
+    // User TTBR0 has ASID in upper bits and user L0 address in lower bits (0x44xxxxxx+)
+    // We check if the lower 48 bits are in the boot range
+    let ttbr0_addr = ttbr0 & 0x0000_FFFF_FFFF_FFFF; // Mask off ASID bits
+    if ttbr0_addr >= 0x4020_0000 && ttbr0_addr < 0x4400_0000 {
+        return None; // Boot TTBR0 - no user process context
     }
     
     // Read from the fixed address in the current address space
@@ -335,8 +351,10 @@ pub fn read_current_pid() -> Option<Pid> {
 /// Returns a mutable reference to the process if found.
 /// SAFETY: The caller must ensure no other code is mutating the process.
 pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
-    let table = PROCESS_TABLE.lock();
-    table.get(&pid).map(|&ProcessPtr(ptr)| unsafe { &mut *ptr })
+    crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.get(&pid).map(|&ProcessPtr(ptr)| unsafe { &mut *ptr })
+    })
 }
 
 /// Get the current process (for syscall handlers)
@@ -393,26 +411,31 @@ pub struct ProcessInfo2 {
 ///
 /// Returns a vector of process info for display.
 pub fn list_processes() -> Vec<ProcessInfo2> {
-    let table = PROCESS_TABLE.lock();
-    let mut result = Vec::new();
+    // Take a quick snapshot while holding lock with IRQs disabled
+    // to prevent deadlock if timer fires while holding PROCESS_TABLE lock.
+    // We collect data into a local Vec while locked, then return it.
+    crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        let mut result = Vec::new();
 
-    for (&pid, &ProcessPtr(ptr)) in table.iter() {
-        let proc = unsafe { &*ptr };
-        let state = match proc.state {
-            ProcessState::Ready => "ready",
-            ProcessState::Running => "running",
-            ProcessState::Blocked => "blocked",
-            ProcessState::Zombie(_) => "zombie",
-        };
-        result.push(ProcessInfo2 {
-            pid,
-            ppid: proc.parent_pid,
-            name: proc.name.clone(),
-            state,
-        });
-    }
+        for (&pid, &ProcessPtr(ptr)) in table.iter() {
+            let proc = unsafe { &*ptr };
+            let state = match proc.state {
+                ProcessState::Ready => "ready",
+                ProcessState::Running => "running",
+                ProcessState::Blocked => "blocked",
+                ProcessState::Zombie(_) => "zombie",
+            };
+            result.push(ProcessInfo2 {
+                pid,
+                ppid: proc.parent_pid,
+                name: proc.name.clone(),
+                state,
+            });
+        }
 
-    result
+        result
+    })
 }
 
 /// Process state

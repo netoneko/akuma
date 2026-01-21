@@ -670,6 +670,71 @@ extern "C" fn rust_sync_el1_handler() {
         crate::console::print("  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
     }
     
+    // Check for page table corruption on translation table walk faults
+    let dfsc = iss & 0x3F;
+    if dfsc == 0x21 || dfsc == 0x22 || dfsc == 0x23 {
+        // External abort on translation table walk (level 1/2/3)
+        crate::console::print("  PAGE TABLE WALK FAULT - checking page table integrity:\n");
+        
+        // Get expected boot TTBR0
+        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+        let _ = write!(w, "    Expected boot_ttbr0: {:#x}\n", boot_ttbr0);
+        w.flush();
+        let _ = write!(w, "    Current TTBR0:       {:#x}\n", ttbr0);
+        w.flush();
+        
+        if ttbr0 != boot_ttbr0 {
+            crate::console::print("    WARNING: TTBR0 mismatch!\n");
+        }
+        
+        // Read L0[0] entry to check if it points to valid L1
+        let l0_base = ttbr0 & !0xFFF; // Mask off ASID etc
+        let l0_entry = unsafe { *(l0_base as *const u64) };
+        let _ = write!(w, "    L0[0] entry: {:#018x}\n", l0_entry);
+        w.flush();
+        
+        // Check if L0[0] looks valid (should be table descriptor)
+        let is_valid = (l0_entry & 0x1) == 1;
+        let is_table = (l0_entry & 0x2) == 2;
+        let l1_addr = l0_entry & 0x0000_FFFF_FFFF_F000;
+        let _ = write!(w, "    L0[0]: valid={}, table={}, L1_addr={:#x}\n", 
+            is_valid, is_table, l1_addr);
+        w.flush();
+        
+        // Expected L1 address should be boot_ttbr0 + 8192 (2 pages)
+        let expected_l1 = boot_ttbr0 + 8192;
+        let _ = write!(w, "    Expected L1 addr: {:#x}\n", expected_l1);
+        w.flush();
+        
+        if l1_addr != expected_l1 {
+            crate::console::print("    WARNING: L1 address mismatch - page table corrupted!\n");
+        }
+        
+        // Now read L1[0] to check the device memory block entry
+        if is_valid && is_table && l1_addr >= 0x4000_0000 && l1_addr < 0x8000_0000 {
+            let l1_entry = unsafe { *(l1_addr as *const u64) };
+            let _ = write!(w, "    L1[0] entry: {:#018x}\n", l1_entry);
+            w.flush();
+            
+            // L1[0] should be a 1GB block descriptor for device memory
+            // Valid block: bits[1:0] = 01, bits[47:30] = physical address
+            let is_l1_valid = (l1_entry & 0x1) == 1;
+            let is_block = (l1_entry & 0x2) == 0; // Block, not table
+            let block_addr = l1_entry & 0x0000_FFFF_C000_0000;
+            let _ = write!(w, "    L1[0]: valid={}, block={}, phys_addr={:#x}\n", 
+                is_l1_valid, is_block, block_addr);
+            w.flush();
+            
+            // L1[0] should point to physical 0 (device memory)
+            if !is_l1_valid {
+                crate::console::print("    WARNING: L1[0] is INVALID!\n");
+            }
+            if block_addr != 0 {
+                crate::console::print("    WARNING: L1[0] block address wrong!\n");
+            }
+        }
+    }
+    
     // Log memory stats for debugging
     log_memory_stats_on_crash(tid, sp, sp_el0);
 
