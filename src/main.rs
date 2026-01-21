@@ -111,6 +111,10 @@ fn panic(info: &PanicInfo) -> ! {
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
+    // Early debug: print raw DTB pointer before anything else
+    console::print("DTB ptr from boot: 0x");
+    console::print_hex(dtb_ptr as u64);
+    console::print("\n");
     kernel_main(dtb_ptr)
 }
 

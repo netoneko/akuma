@@ -58,17 +58,19 @@ SECTIONS
         *(.data .data.*)
     }
     
-    .bss : {
+    .bss (NOLOAD) : {
         __bss_start = .;
+        /* Capture all BSS sections EXCEPT .bss.boot */
         *(.bss .bss.*)
+        *(COMMON)
         __bss_end = .;
     }
     _data_end = .;
     
-    /* Boot BSS - at physical address but after main BSS */
-    .bss.boot : {
-        *(.bss.boot)
-    }
+    /* Boot BSS - contains boot page tables */
+    /* Note: .bss.boot will be merged into .bss above due to .bss.* pattern */
+    /* The boot_page_tables symbol location doesn't matter as long as it's */
+    /* within the kernel's BSS and before _kernel_phys_end */
     
     /* Record where kernel ends (physical) */
     _kernel_phys_end = .;
