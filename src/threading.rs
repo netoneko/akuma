@@ -249,7 +249,12 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             
             // Re-initialize canary for reuse
             if config::ENABLE_STACK_CANARIES {
-                let stack_base = POOL.lock().stacks[i].base;
+                // Must disable IRQs when acquiring POOL lock to prevent deadlock
+                // if timer fires - SGI handler would try to acquire the same lock
+                let stack_base = {
+                    let _guard = crate::irq::IrqGuard::new();
+                    POOL.lock().stacks[i].base
+                };
                 if stack_base != 0 {
                     init_stack_canary(stack_base);
                 }
@@ -434,11 +439,14 @@ switch_context:
     mrs x9, daif
     str x9, [x0, #112]
     
-    // Save ELR_EL1 (exception return address)
+    // Save ELR_EL1 and SPSR_EL1 to context
+    // CRITICAL: We MUST save/restore these here because:
+    // - irq_handler pushes ELR/SPSR to the OLD thread's stack
+    // - switch_context switches to the NEW thread's stack  
+    // - irq_handler would pop from the WRONG stack without this!
+    // Each thread needs its own saved ELR/SPSR in its context.
     mrs x9, elr_el1
     str x9, [x0, #120]
-    
-    // Save SPSR_EL1 (exception saved processor state)
     mrs x9, spsr_el1
     str x9, [x0, #128]
     
@@ -475,11 +483,11 @@ switch_context:
     // enabling based on thread type (process threads stay masked until
     // activate(), others enable immediately).
     
-    // Load ELR_EL1
+    // Load ELR_EL1 and SPSR_EL1 from new context
+    // This ensures irq_handler's ERET uses this thread's saved values,
+    // not garbage from the stack (which belongs to a different thread after switch).
     ldr x9, [x1, #120]
     msr elr_el1, x9
-    
-    // Load SPSR_EL1
     ldr x9, [x1, #128]
     msr spsr_el1, x9
     
@@ -1626,11 +1634,40 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             // Note: TPIDR_EL0 (thread ID) is already updated by schedule_indices
             
+            // Debug: Print context SPs before switch AND actual SP register
+            if config::ENABLE_SGI_DEBUG_PRINTS {
+                let actual_sp: u64;
+                core::arch::asm!("mov {}, sp", out(reg) actual_sp);
+                let old_sp = (*old_ptr).sp;
+                let new_sp = (*new_ptr).sp;
+                let new_elr = (*new_ptr).elr;
+                let new_spsr = (*new_ptr).spsr;
+                crate::console::print("  SP_now=0x");
+                crate::console::print_hex(actual_sp);
+                crate::console::print(" new_ctx.sp=0x");
+                crate::console::print_hex(new_sp);
+                crate::console::print(" new_ctx.elr=0x");
+                crate::console::print_hex(new_elr);
+                if new_elr == 0 && new_idx != 0 {
+                    crate::console::print(" *** ELR=0 BUG! ***");
+                }
+                crate::console::print("\n");
+            }
+            
             switch_context(old_ptr, new_ptr);
             
             // We return here after being switched BACK to this thread
             // CRITICAL: Mask IRQs immediately to prevent nested timer interrupts
             core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+            
+            // Debug: Print SP after return
+            if config::ENABLE_SGI_DEBUG_PRINTS {
+                let current_sp: u64;
+                core::arch::asm!("mov {}, sp", out(reg) current_sp);
+                crate::console::print("[SGI] back, SP=0x");
+                crate::console::print_hex(current_sp);
+                crate::console::print("\n");
+            }
             
             // Check for TTBR0/SPSR mismatch - detect context corruption early
             let current_ttbr0: u64;
@@ -1873,11 +1910,25 @@ where
     // Context is in THREAD_CONTEXTS (no lock needed), slot metadata needs POOL lock
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
-        let sp = {
+        let (sp, stack_base, stack_top) = {
             let pool = POOL.lock();
             let stack = &pool.stacks[slot_idx];
-            (stack.top & !0xF) as u64
+            // Initial SP is BELOW the exception area (which is at the top)
+            // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
+            let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+            (sp, stack.base, stack.top)
         };
+        
+        // Debug: print stack setup
+        crate::console::print("[spawn_system_fn] tid=");
+        crate::console::print_dec(slot_idx);
+        crate::console::print(" stack=0x");
+        crate::console::print_hex(stack_base as u64);
+        crate::console::print("-0x");
+        crate::console::print_hex(stack_top as u64);
+        crate::console::print(" sp=0x");
+        crate::console::print_hex(sp);
+        crate::console::print("\n");
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();

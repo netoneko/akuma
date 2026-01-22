@@ -125,6 +125,25 @@ pub const IGNORE_THREADING_TESTS: bool = false;
 /// be caused by test-induced heap corruption or thread scheduling issues.
 pub const DISABLE_ALL_TESTS: bool = true;
 
+/// Minimal idle loop (for debugging EC=0xe crashes)
+///
+/// When enabled, the idle loop does nothing but yield. No cleanup, no stats,
+/// no prints. Use this to isolate whether the crash is caused by something
+/// in the cleanup or stats code vs the core timer/ERET path.
+pub const MINIMAL_IDLE_LOOP: bool = true;
+
+/// Skip async network initialization (for debugging crashes)
+///
+/// When enabled, skips the async network stack and services (SSH, HTTP, etc.).
+/// Use this to isolate whether crashes are caused by network code.
+pub const SKIP_ASYNC_NETWORK: bool = true;
+
+/// Skip filesystem initialization (for debugging crashes)
+///
+/// When enabled, skips block device and filesystem init.
+/// Use this to isolate whether crashes are caused by fs code.
+pub const SKIP_FILESYSTEM_INIT: bool = true;
+
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;
 

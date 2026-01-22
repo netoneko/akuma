@@ -347,6 +347,66 @@ irq_handler:
 
     bl      rust_irq_handler
 
+    // ELR/SPSR handling after potential context switch:
+    // 
+    // CRITICAL: Do NOT load ELR/SPSR from the stack!
+    // If a context switch happened (via switch_context), we're now on a
+    // DIFFERENT thread's stack. The ELR/SPSR at [sp+240] belong to the
+    // OLD thread, not the thread we're returning to.
+    //
+    // switch_context saves/restores ELR_EL1 and SPSR_EL1 to/from the
+    // context struct, so the system registers already have the correct
+    // values for the current thread.
+    //
+    // For the no-context-switch case: ELR/SPSR system registers are
+    // unchanged from when we entered the IRQ handler.
+    //
+    // We just need to apply safety fixes to the current SPSR value.
+    
+    // Read current ELR and SPSR from system registers
+    mrs     x10, elr_el1
+    mrs     x11, spsr_el1
+    
+    // Clear IRQ mask bit and IL bit
+    bic     x11, x11, #0x80         // Clear I bit (IRQ mask)
+    bic     x11, x11, #0x100000     // Clear IL bit (Illegal state)
+    
+    // SAFETY CHECK: Ensure we're returning to EL1h for kernel code
+    and     x9, x11, #0xF           // Extract exception level bits
+    cmp     x9, #5                  // Check if EL1h
+    b.eq    1f                      // Good, skip fix
+    
+    cmp     x9, #4                  // Check if EL1t
+    b.ne    2f
+    // Fix EL1t -> EL1h
+    bic     x11, x11, #0xF
+    mov     x9, #5
+    orr     x11, x11, x9
+    b       1f
+    
+2:  cmp     x9, #0                  // Check if EL0
+    b.ne    1f
+    // Check if ELR is kernel address
+    mov     x9, #0x40000000
+    cmp     x10, x9
+    b.lo    1f                      // ELR < 0x40000000, user addr, OK for EL0
+    // Fix: ELR is kernel but SPSR says EL0
+    bic     x11, x11, #0xF          // Clear EL bits
+    mov     x9, #5
+    orr     x11, x11, x9            // Set to EL1h
+    
+1:
+    // Write fixed SPSR back to system register
+    msr     spsr_el1, x11
+    
+    // Restore all general-purpose registers from stack
+    // Stack layout (17 pushes = 272 bytes):
+    //   [sp+0]:   x30
+    //   [sp+16]:  x28, x29
+    //   ... (GPRs) ...
+    //   [sp+240]: ELR, SPSR (saved but NOT restored from here - see above)
+    //   [sp+256]: orig x10, x11
+    
     ldr     x30, [sp], #16
     ldp     x28, x29, [sp], #16
     ldp     x26, x27, [sp], #16
@@ -363,46 +423,8 @@ irq_handler:
     ldp     x2, x3, [sp], #16
     ldp     x0, x1, [sp], #16
     
-    // Restore ELR_EL1 and SPSR_EL1
-    ldp     x10, x11, [sp], #16
-    msr     elr_el1, x10
-    // Clear IRQ mask bit before restoring SPSR (ensure IRQs enabled after ERET)
-    // Also clear IL bit (bit 20) - if set due to stack corruption, would cause
-    // Illegal Execution State exception (EC=0xe) after ERET
-    bic     x11, x11, #0x80         // Clear I bit (IRQ mask)
-    bic     x11, x11, #0x100000     // Clear IL bit (Illegal state)
-    
-    // SAFETY CHECK: Ensure we're returning to EL1h (kernel mode with SP_EL1)
-    // Valid SPSR bits[3:0] for kernel:
-    //   5 = EL1h (EL1 with SP_EL1) - CORRECT
-    //   4 = EL1t (EL1 with SP_EL0) - WRONG, would use user stack
-    //   0 = EL0 (user mode) - only valid if ELR is user address
-    and     x9, x11, #0xF           // Extract exception level bits
-    cmp     x9, #5                  // Check if already EL1h
-    b.eq    1f                      // Good, skip fix
-    
-    // Check if EL1t - definitely wrong for kernel IRQ return
-    cmp     x9, #4
-    b.ne    2f                      // Not EL1t, check EL0
-    // Fix EL1t -> EL1h: clear bit 0, set bit 2 (4 -> 5)
-    bic     x11, x11, #0xF          // Clear EL bits
-    mov     x9, #5
-    orr     x11, x11, x9            // Set to EL1h
-    b       1f
-    
-2:  // Check if EL0 with kernel ELR (ELR >= 0x40000000)
-    cmp     x9, #0                  // Is it EL0?
-    b.ne    1f                      // No, something else - don't touch
-    // EL0 - check if ELR is kernel address
-    mov     x9, #0x40000000
-    cmp     x10, x9                 // Compare ELR with 0x40000000
-    b.lo    1f                      // ELR < 0x40000000, user addr, OK
-    // ELR is kernel addr but SPSR says EL0 - fix it
-    mov     x9, #5
-    orr     x11, x11, x9            // Set to EL1h
-    
-1:
-    msr     spsr_el1, x11
+    // Skip the ELR/SPSR slot (not restored from stack)
+    add     sp, sp, #16
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16

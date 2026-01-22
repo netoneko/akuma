@@ -463,70 +463,74 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Filesystem initialization
     // =========================================================================
-    console::print("\n--- Filesystem Initialization ---\n");
+    if !config::SKIP_FILESYSTEM_INIT {
+        console::print("\n--- Filesystem Initialization ---\n");
 
-    // Initialize block device first
-    match block::init() {
-        Ok(()) => {
-            console::print("[Block] Block device initialized successfully\n");
+        // Initialize block device first
+        match block::init() {
+            Ok(()) => {
+                console::print("[Block] Block device initialized successfully\n");
 
-            // Now initialize filesystem
-            match fs::init() {
-                Ok(()) => {
-                    console::print("[FS] Filesystem mounted successfully\n");
+                // Now initialize filesystem
+                match fs::init() {
+                    Ok(()) => {
+                        console::print("[FS] Filesystem mounted successfully\n");
 
-                    // List root directory contents
-                    if let Ok(entries) = fs::list_dir("/") {
-                        console::print("[FS] Root directory contents:\n");
-                        for entry in entries {
-                            if entry.is_dir {
-                                crate::safe_print!(64, "  [DIR]  {}\n", entry.name);
-                            } else {
-                                crate::safe_print!(64, 
-                                    "  [FILE] {} ({} bytes)\n",
-                                    entry.name,
-                                    entry.size
-                                );
-                            }
-                        }
-                    }
-
-                    if !config::DISABLE_ALL_TESTS {
-                        // Run filesystem tests
-                        fs_tests::run_all_tests();
-
-                        // Run threading tests (requires fs for parallel process tests)
-                        if !tests::run_threading_tests() {
-                            console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
-                            if !config::IGNORE_THREADING_TESTS {
-                                halt();
-                            } else {
-                                console::print("WARNING: Threading tests failed but continuing...\n");
+                        // List root directory contents
+                        if let Ok(entries) = fs::list_dir("/") {
+                            console::print("[FS] Root directory contents:\n");
+                            for entry in entries {
+                                if entry.is_dir {
+                                    crate::safe_print!(64, "  [DIR]  {}\n", entry.name);
+                                } else {
+                                    crate::safe_print!(64, 
+                                        "  [FILE] {} ({} bytes)\n",
+                                        entry.name,
+                                        entry.size
+                                    );
+                                }
                             }
                         }
 
-                        // Run process execution tests
-                        process_tests::run_all_tests();
+                        if !config::DISABLE_ALL_TESTS {
+                            // Run filesystem tests
+                            fs_tests::run_all_tests();
 
-                        // Run shell tests (pipelines with /bin binaries)
-                        shell_tests::run_all_tests();
+                            // Run threading tests (requires fs for parallel process tests)
+                            if !tests::run_threading_tests() {
+                                console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
+                                if !config::IGNORE_THREADING_TESTS {
+                                    halt();
+                                } else {
+                                    console::print("WARNING: Threading tests failed but continuing...\n");
+                                }
+                            }
+
+                            // Run process execution tests
+                            process_tests::run_all_tests();
+
+                            // Run shell tests (pipelines with /bin binaries)
+                            shell_tests::run_all_tests();
+                        }
                     }
-                }
-                Err(e) => {
-                    console::print("[FS] Filesystem init failed: ");
-                    crate::safe_print!(32, "{}\n", e);
-                    console::print("[FS] Continuing without filesystem...\n");
+                    Err(e) => {
+                        console::print("[FS] Filesystem init failed: ");
+                        crate::safe_print!(32, "{}\n", e);
+                        console::print("[FS] Continuing without filesystem...\n");
+                    }
                 }
             }
+            Err(e) => {
+                console::print("[Block] Block device not found: ");
+                crate::safe_print!(32, "{}\n", e);
+                console::print("[Block] Continuing without filesystem...\n");
+            }
         }
-        Err(e) => {
-            console::print("[Block] Block device not found: ");
-            crate::safe_print!(32, "{}\n", e);
-            console::print("[Block] Continuing without filesystem...\n");
-        }
-    }
 
-    console::print("--- Filesystem Initialization Done ---\n\n");
+        console::print("--- Filesystem Initialization Done ---\n\n");
+    } else {
+        console::print("[FS] Filesystem SKIPPED via config::SKIP_FILESYSTEM_INIT\n");
+    }
 
     if crate::config::COOPERATIVE_MAIN_THREAD {
         run_async_main();
@@ -548,6 +552,12 @@ fn run_async_main_preemptive() -> ! {
             loop {
                 if threading::is_thread_terminated(thread_id) {
                     break;
+                }
+                
+                if config::MINIMAL_IDLE_LOOP {
+                    // Minimal loop for debugging - just yield, no cleanup/stats/prints
+                    threading::yield_now();
+                    continue;
                 }
                 
                 loop_counter = loop_counter.wrapping_add(1);
@@ -613,6 +623,23 @@ fn run_async_main() -> ! {
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // =========================================================================
+    // Skip async network if disabled (for debugging)
+    // =========================================================================
+    if config::SKIP_ASYNC_NETWORK {
+        console::print("[AsyncMain] Network SKIPPED via config::SKIP_ASYNC_NETWORK\n");
+        console::print("[Idle] Entering minimal idle loop...\n");
+        
+        // Enable IRQs so timer can fire
+        unsafe {
+            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+        }
+        
+        loop {
+            threading::yield_now();
+        }
+    }
 
     // =========================================================================
     // Async Network initialization and main loop
