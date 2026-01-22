@@ -443,17 +443,21 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::enable_preemption_safe_alloc();
 
     // Run memory tests (no filesystem dependency)
-    if !tests::run_memory_tests() {
-        console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
-        halt();
-    }
+    if !config::DISABLE_ALL_TESTS {
+        if !tests::run_memory_tests() {
+            console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
+            halt();
+        }
 
-    // =========================================================================
-    // Run async tests (before network takes over the main loop)
-    // =========================================================================
-    if !async_tests::run_all() {
-        console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
-        halt();
+        // =========================================================================
+        // Run async tests (before network takes over the main loop)
+        // =========================================================================
+        if !async_tests::run_all() {
+            console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
+            halt();
+        }
+    } else {
+        console::print("[TESTS] All tests DISABLED via config::DISABLE_ALL_TESTS\n");
     }
 
     // =========================================================================
@@ -487,24 +491,26 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                         }
                     }
 
-                    // Run filesystem tests
-                    fs_tests::run_all_tests();
+                    if !config::DISABLE_ALL_TESTS {
+                        // Run filesystem tests
+                        fs_tests::run_all_tests();
 
-                    // Run threading tests (requires fs for parallel process tests)
-                    if !tests::run_threading_tests() {
-                        console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
-                        if !config::IGNORE_THREADING_TESTS {
-                            halt();
-                        } else {
-                            console::print("WARNING: Threading tests failed but continuing...\n");
+                        // Run threading tests (requires fs for parallel process tests)
+                        if !tests::run_threading_tests() {
+                            console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
+                            if !config::IGNORE_THREADING_TESTS {
+                                halt();
+                            } else {
+                                console::print("WARNING: Threading tests failed but continuing...\n");
+                            }
                         }
+
+                        // Run process execution tests
+                        process_tests::run_all_tests();
+
+                        // Run shell tests (pipelines with /bin binaries)
+                        shell_tests::run_all_tests();
                     }
-
-                    // Run process execution tests
-                    process_tests::run_all_tests();
-
-                    // Run shell tests (pipelines with /bin binaries)
-                    shell_tests::run_all_tests();
                 }
                 Err(e) => {
                     console::print("[FS] Filesystem init failed: ");

@@ -118,6 +118,13 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 
+/// Disable all tests at boot
+///
+/// When enabled, skips memory tests, threading tests, filesystem tests,
+/// process tests, and shell tests. Use this to debug crashes that might
+/// be caused by test-induced heap corruption or thread scheduling issues.
+pub const DISABLE_ALL_TESTS: bool = true;
+
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;
 
