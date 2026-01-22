@@ -62,7 +62,13 @@ exception_vector_table:
 default_exception_handler:
     stp     x0, x1, [sp, #-16]!
     stp     x29, x30, [sp, #-16]!
+    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
     bl      rust_default_exception_handler
+    // Clear IL bit in SPSR before ERET to prevent EC=0xe
+    mrs     x2, spsr_el1
+    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
+    msr     spsr_el1, x2
+    ldp     x2, x3, [sp], #16
     ldp     x29, x30, [sp], #16
     ldp     x0, x1, [sp], #16
     eret
@@ -72,11 +78,18 @@ sync_el1_handler:
     // Save minimal context
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
+    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
     
     // Call Rust handler
     bl      rust_sync_el1_handler
     
+    // Clear IL bit in SPSR before ERET to prevent EC=0xe
+    mrs     x2, spsr_el1
+    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
+    msr     spsr_el1, x2
+    
     // Restore and return
+    ldp     x2, x3, [sp], #16
     ldp     x0, x1, [sp], #16
     ldp     x29, x30, [sp], #16
     eret
@@ -150,8 +163,9 @@ sync_el0_handler:
     // Save it to scratch area while we restore other registers
     str     x0, [sp, #272]
     
-    // Restore SPSR_EL1
+    // Restore SPSR_EL1 (clear IL bit to prevent EC=0xe)
     ldr     x0, [sp, #264]
+    bic     x0, x0, #0x100000       // Clear IL bit (bit 20)
     msr     spsr_el1, x0
     
     // Restore ELR_EL1
