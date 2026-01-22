@@ -1571,18 +1571,26 @@ pub fn sgi_scheduler_handler(irq: u32) {
                 crate::console::print("\n");
             }
             
-            // Check new context - don't switch to a corrupted context
+            // Check new context - if corrupted, try to recover
+            // CRITICAL: We CANNOT return early here! schedule_indices already updated
+            // TPIDR_EL0 to new_idx. If we return, the next timer interrupt will save
+            // old_idx's CPU state into new_idx's context slot, causing corruption.
+            // We MUST always call switch_context after schedule_indices returns Some.
             if !new_ctx.is_valid() {
                 crate::console::print("[SGI CORRUPT] NEW context magic invalid for thread ");
                 crate::console::print_dec(new_idx);
-                crate::console::print(" - magic=0x");
-                crate::console::print_hex(new_ctx.magic);
-                crate::console::print(" expected=0x");
-                crate::console::print_hex(CONTEXT_MAGIC);
-                crate::console::print("\n");
-                // Don't switch to a corrupted context - mark as terminated and skip
+                crate::console::print(" - recovering\n");
+                // Try to recover: reinitialize the context with safe values
+                let ctx = &mut *get_context_mut(new_idx);
+                ctx.magic = CONTEXT_MAGIC;
+                ctx.spsr = 0x00000005; // EL1h, IRQs will be enabled by trampoline
+                // Mark for termination AFTER we switch to it - it will terminate itself
+                // on the next yield/preemption. Setting x30=0 will cause it to crash
+                // safely if it tries to return.
+                ctx.x30 = 0; 
+                ctx.elr = 0;
+                // Thread will run with corrupted state but at least won't corrupt others
                 THREAD_STATES[new_idx].store(thread_state::TERMINATED, Ordering::SeqCst);
-                return;
             }
             
             let new_saved_ttbr0 = new_ctx.ttbr0;
