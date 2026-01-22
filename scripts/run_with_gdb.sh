@@ -19,7 +19,7 @@ echo ""
 
 qemu-system-aarch64 \
   -machine virt \
-  -cpu cortex-a72 \
+  -cpu max \
   -m 128M \
   -nographic \
   -serial mon:stdio \
@@ -29,6 +29,7 @@ qemu-system-aarch64 \
   -drive file=disk.img,if=none,format=raw,id=hd0 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
+  -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on \
   -s \
   -S \
   -kernel "$KERNEL_PATH"

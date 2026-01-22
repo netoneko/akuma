@@ -638,9 +638,12 @@ pub struct Process {
     pub dynamic_page_tables: Vec<PhysFrame>,
 }
 
+/// Magic value for KernelContext integrity check
+const KERNEL_CTX_MAGIC: u64 = 0xDEAD_BEEF_CAFE_1234;
+
 /// Kernel context - callee-saved registers that must be preserved across user mode execution
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct KernelContext {
     pub sp: u64,
     pub x19: u64,
@@ -661,6 +664,28 @@ pub struct KernelContext {
     pub entry_x29: u64,  // frame pointer at entry
     // Stack frame snapshot at entry (first 8 values)
     pub entry_stack: [u64; 8],
+    // Integrity check
+    pub magic: u64,
+}
+
+impl Default for KernelContext {
+    fn default() -> Self {
+        Self {
+            sp: 0,
+            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
+            x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+            entry_x30: 0, entry_sp: 0, entry_x29: 0,
+            entry_stack: [0; 8],
+            magic: KERNEL_CTX_MAGIC,
+        }
+    }
+}
+
+impl KernelContext {
+    /// Check if the context magic is intact
+    pub fn is_valid(&self) -> bool {
+        self.magic == KERNEL_CTX_MAGIC
+    }
 }
 
 impl Process {
@@ -1019,22 +1044,77 @@ pub extern "C" fn check_process_exit() -> bool {
 /// Called from exception handler when process exits
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    // ========== EXIT CODE VALIDATION ==========
+    // Detect corrupted exit codes that look like memory addresses
+    let exit_code_u32 = exit_code as u32;
+    let exit_code_looks_like_ptr = exit_code_u32 >= 0x40000000 && exit_code_u32 < 0x50000000;
+    
+    if exit_code_looks_like_ptr {
+        // Exit code looks like a kernel heap/stack address - likely corruption
+        crate::console::print("[return_to_kernel] CORRUPT EXIT CODE DETECTED!\n");
+        crate::safe_print!(96, "  exit_code={} (0x{:x}) looks like memory address\n", 
+            exit_code, exit_code_u32);
+        
+        // Dump registers to help debug
+        let sp: u64;
+        let x30: u64;
+        let elr: u64;
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp);
+            core::arch::asm!("mov {}, x30", out(reg) x30);
+            core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
+        }
+        crate::safe_print!(96, "  SP=0x{:x}, x30=0x{:x}, ELR=0x{:x}\n", sp, x30, elr);
+    }
+
     // Get kernel context from current process
     let ctx_ptr = match current_process() {
         Some(proc) => {
             let ctx = &proc.kernel_ctx;
             
+            // ========== KERNEL CONTEXT VALIDATION ==========
+            let mut ctx_corruption = false;
+            
+            // Check magic value first - detects if struct was overwritten
+            if !ctx.is_valid() {
+                crate::console::print("[CTX CORRUPT] KernelContext MAGIC INVALID!\n");
+                crate::safe_print!(96, "  magic=0x{:x}, expected=0x{:x}\n", 
+                    ctx.magic, KERNEL_CTX_MAGIC);
+                crate::safe_print!(64, "  ctx addr=0x{:x}\n", ctx as *const _ as usize);
+                ctx_corruption = true;
+            }
+            
+            // Check if saved SP looks valid (should be in kernel stack range 0x41xxxxxx - 0x43xxxxxx)
+            if ctx.sp < 0x41000000 || ctx.sp > 0x44000000 {
+                crate::safe_print!(96, "[CTX CORRUPT] saved SP=0x{:x} outside kernel stack range\n", ctx.sp);
+                ctx_corruption = true;
+            }
+            
+            // Check if saved x30 (return address) looks valid (should be in kernel code 0x40000000-0x40600000)
+            if ctx.x30 != 0 && (ctx.x30 < 0x40000000 || ctx.x30 > 0x40800000) {
+                crate::safe_print!(96, "[CTX CORRUPT] saved x30=0x{:x} outside kernel code range\n", ctx.x30);
+                ctx_corruption = true;
+            }
+            
+            // Check if callee-saved registers have suspicious values (all same, or all look like small ints)
+            let suspicious_pattern = ctx.x19 == ctx.x20 && ctx.x20 == ctx.x21 && ctx.x21 == ctx.x22
+                && ctx.x19 != 0 && ctx.x19 < 0x100;
+            if suspicious_pattern {
+                crate::safe_print!(96, "[CTX CORRUPT] callee-saved regs have suspicious pattern: x19-x22 all = 0x{:x}\n", ctx.x19);
+                ctx_corruption = true;
+            }
+            
             // Check for ProcessInfo corruption pattern:
             // - PID at entry_sp+0 (small number matching proc.pid)
             // - Path string at entry_sp+24 (ASCII "/bin/...")
-            let mut corruption_detected = false;
+            let mut stack_corruption = false;
             
             // Check entry_sp+0 for PID (critical - indicates ProcessInfo written to stack)
             let val_at_0 = unsafe { *(ctx.entry_sp as *const u64) };
             if ctx.entry_stack[0] == 0 && val_at_0 == proc.pid as u64 {
                 crate::safe_print!(96, "[STACK CORRUPTION] PID {} found at entry_sp+0! ProcessInfo written to stack.\n",
                     proc.pid);
-                corruption_detected = true;
+                stack_corruption = true;
             }
             
             // Check entry_sp+24 for path string signature (starts with '/')
@@ -1043,21 +1123,31 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                 // 0x2F is '/' - likely path string corruption
                 crate::safe_print!(96, "[STACK CORRUPTION] Path string detected at entry_sp+24: {:#x}\n",
                     val_at_24);
-                corruption_detected = true;
+                stack_corruption = true;
             }
             
-            if corruption_detected {
+            if ctx_corruption || stack_corruption || exit_code_looks_like_ptr {
                 // Full diagnostic dump for debugging
-                crate::safe_print!(160, "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
-                    proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30);
-                console::print("  Full stack comparison:\n");
-                for i in 0..8 {
-                    let addr = ctx.entry_sp + i as u64 * 8;
-                    let current = unsafe { *(addr as *const u64) };
-                    let saved = ctx.entry_stack[i];
-                    if current != saved {
-                        crate::safe_print!(64, "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
-                            i*8, saved, current);
+                crate::safe_print!(160, "[return_to_kernel] PID={} exit_code={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
+                    proc.pid, exit_code, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30);
+                console::print("  Callee-saved regs:\n");
+                crate::safe_print!(96, "    x19={:#x} x20={:#x} x21={:#x} x22={:#x}\n",
+                    ctx.x19, ctx.x20, ctx.x21, ctx.x22);
+                crate::safe_print!(96, "    x23={:#x} x24={:#x} x25={:#x} x26={:#x}\n",
+                    ctx.x23, ctx.x24, ctx.x25, ctx.x26);
+                crate::safe_print!(96, "    x27={:#x} x28={:#x} x29={:#x}\n",
+                    ctx.x27, ctx.x28, ctx.x29);
+                    
+                if stack_corruption {
+                    console::print("  Stack comparison:\n");
+                    for i in 0..8 {
+                        let addr = ctx.entry_sp + i as u64 * 8;
+                        let current = unsafe { *(addr as *const u64) };
+                        let saved = ctx.entry_stack[i];
+                        if current != saved {
+                            crate::safe_print!(64, "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
+                                i*8, saved, current);
+                        }
                     }
                 }
             }

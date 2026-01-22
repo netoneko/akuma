@@ -22,11 +22,14 @@ pub const USE_PAGE_ALLOCATOR: bool = false; // DOES NOT ACTUALLY WORK
 
 /// Enable allocation registry for debugging heap corruption
 /// This tracks all allocations and detects overlaps, double frees, and invalid frees
-pub const ENABLE_ALLOCATION_REGISTRY: bool = true;
+/// WARNING: Canaries break virtio-drivers which does address comparisons on DMA buffers
+/// WARNING: Registry causes performance issues - iterates 4096 entries per alloc
+pub const ENABLE_ALLOCATION_REGISTRY: bool = false;
 
 /// Enable canary bytes around allocations (requires ENABLE_ALLOCATION_REGISTRY)
 /// Adds 8 bytes before and after each allocation with magic values
-pub const ENABLE_CANARIES: bool = true;
+/// WARNING: This breaks virtio-drivers! Only enable for targeted debugging.
+pub const ENABLE_CANARIES: bool = false;
 
 /// Canary magic values
 const CANARY_BEFORE: u64 = 0xDEAD_BEEF_CAFE_BABE;

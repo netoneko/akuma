@@ -223,11 +223,24 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
+    // Validate exit code at syscall entry - detect if userspace passed garbage
+    let code_u32 = code as u32;
+    if code_u32 >= 0x40000000 && code_u32 < 0x50000000 {
+        crate::console::print("[sys_exit] WARNING: exit code looks like kernel address!\n");
+        crate::safe_print!(64, "  code={} (0x{:x})\n", code, code_u32);
+    }
+    
     // Update per-process state only
     if let Some(proc) = crate::process::current_process() {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
+        
+        // Debug: verify the write happened correctly
+        if proc.exit_code != code {
+            crate::safe_print!(64, "[sys_exit] EXIT CODE MISMATCH! wrote {} but read {}\n",
+                code, proc.exit_code);
+        }
     }
     // Note: If no current process, this is a kernel thread calling exit which is harmless
 

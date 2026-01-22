@@ -965,11 +965,27 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Check if process exited - if so, return to kernel
             if let Some(proc) = crate::process::current_process() {
                 if proc.exited {
+                    let exit_code = proc.exit_code;
+                    
+                    // Validate exit code - detect corruption (pointer-like values)
+                    let exit_code_u32 = exit_code as u32;
+                    if exit_code_u32 >= 0x40000000 && exit_code_u32 < 0x50000000 {
+                        crate::console::print("[exception] CORRUPT EXIT CODE DETECTED!\n");
+                        crate::safe_print!(128, "  PID={}, exit_code={} (0x{:x}) looks like kernel address\n",
+                            proc.pid, exit_code, exit_code_u32);
+                        crate::safe_print!(96, "  proc ptr=0x{:x}, &exit_code=0x{:x}\n",
+                            proc as *const _ as usize, 
+                            &proc.exit_code as *const _ as usize);
+                        // Also check if the syscall frame x0 matches
+                        let frame_x0 = unsafe { (*frame).x0 };
+                        crate::safe_print!(64, "  frame.x0=0x{:x} (syscall arg)\n", frame_x0);
+                    }
+                    
                     // Use stack-only print to avoid heap allocation in exception context
                     crate::safe_print!(96, "[exception] Process {} exited, calling return_to_kernel({})\n",
-                        proc.pid, proc.exit_code);
+                        proc.pid, exit_code);
                     // Don't ERET back to user - return to kernel instead
-                    crate::process::return_to_kernel(proc.exit_code);
+                    crate::process::return_to_kernel(exit_code);
                 }
             } else {
                 // Only log if we just handled EXIT syscall
