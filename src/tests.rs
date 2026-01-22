@@ -81,13 +81,13 @@ pub fn run_memory_tests() -> bool {
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
     } else {
-        console::print(&format!(
+        crate::safe_print!(64, 
             "Memory Tests: {} FAILED\n",
             failed_tests.len()
-        ));
+        );
         console::print("Failed tests:\n");
         for test_name in &failed_tests {
-            console::print(&format!("  - {}\n", test_name));
+            crate::safe_print!(32, "  - {}\n", test_name);
         }
     }
     console::print("==================================\n\n");
@@ -139,13 +139,13 @@ pub fn run_threading_tests() -> bool {
     if all_pass {
         console::print("Threading Tests: ALL PASSED\n");
     } else {
-        console::print(&format!(
+        crate::safe_print!(64, 
             "Threading Tests: {} FAILED\n",
             failed_tests.len()
-        ));
+        );
         console::print("Failed tests:\n");
         for test_name in &failed_tests {
-            console::print(&format!("  - {}\n", test_name));
+            crate::safe_print!(32, "  - {}\n", test_name);
         }
     }
     console::print("==================================\n\n");
@@ -180,20 +180,20 @@ fn test_allocator_vec() -> bool {
 
     // Test basic operations
     let len_ok = test_vec.len() == 10;
-    console::print(&format!("  Vec length: {} (expect 10)\n", test_vec.len()));
+    crate::safe_print!(64, "  Vec length: {} (expect 10)\n", test_vec.len());
 
     // Test remove and insert
     test_vec.remove(0);
     test_vec.insert(0, 99);
     let first_ok = test_vec[0] == 99;
-    console::print(&format!("  First element: {} (expect 99)\n", test_vec[0]));
+    crate::safe_print!(64, "  First element: {} (expect 99)\n", test_vec[0]);
 
     // Test drop (implicit when vec goes out of scope)
     drop(test_vec);
     console::print("  Drop completed\n");
 
     let ok = len_ok && first_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -204,22 +204,22 @@ fn test_allocator_box() -> bool {
     // Allocate a boxed value
     let boxed: Box<u64> = Box::new(42);
     let val_ok = *boxed == 42;
-    console::print(&format!("  Box value: {} (expect 42)\n", *boxed));
+    crate::safe_print!(64, "  Box value: {} (expect 42)\n", *boxed);
 
     // Allocate a boxed array
     let boxed_arr: Box<[u8; 256]> = Box::new([0xAB; 256]);
     let arr_ok = boxed_arr[0] == 0xAB && boxed_arr[255] == 0xAB;
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  Box array: first=0x{:02X}, last=0x{:02X} (expect 0xAB)\n",
         boxed_arr[0], boxed_arr[255]
-    ));
+    );
 
     drop(boxed);
     drop(boxed_arr);
     console::print("  Drop completed\n");
 
     let ok = val_ok && arr_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -229,7 +229,7 @@ fn test_allocator_large() -> bool {
 
     // Allocate 1MB
     const SIZE: usize = 1024 * 1024;
-    console::print(&format!("  Allocating {} KB...", SIZE / 1024));
+    crate::safe_print!(64, "  Allocating {} KB...", SIZE / 1024);
 
     let mut large_vec: Vec<u8> = Vec::with_capacity(SIZE);
     for _ in 0..SIZE {
@@ -238,23 +238,23 @@ fn test_allocator_large() -> bool {
     console::print(" done\n");
 
     let len_ok = large_vec.len() == SIZE;
-    console::print(&format!("  Size: {} bytes\n", large_vec.len()));
+    crate::safe_print!(64, "  Size: {} bytes\n", large_vec.len());
 
     // Write and verify
     large_vec[0] = 0x12;
     large_vec[SIZE - 1] = 0x34;
     let write_ok = large_vec[0] == 0x12 && large_vec[SIZE - 1] == 0x34;
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  First: 0x{:02X}, Last: 0x{:02X}\n",
         large_vec[0],
         large_vec[SIZE - 1]
-    ));
+    );
 
     drop(large_vec);
     console::print("  Drop completed\n");
 
     let ok = len_ok && write_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -263,7 +263,7 @@ fn test_realloc_grow() -> bool {
     console::print("\n[TEST] Realloc grow (Vec capacity growth)\n");
 
     let mut vec: Vec<u64> = Vec::with_capacity(4);
-    console::print(&format!("  Initial capacity: {}\n", vec.capacity()));
+    crate::safe_print!(64, "  Initial capacity: {}\n", vec.capacity());
 
     // Fill with known pattern (use wrapping_mul to avoid overflow panic)
     for i in 0..4u64 {
@@ -274,28 +274,28 @@ fn test_realloc_grow() -> bool {
     for i in 4..20u64 {
         vec.push(i.wrapping_mul(0x1111_1111_1111_1111));
     }
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  New capacity: {} (should be >= 20)\n",
         vec.capacity()
-    ));
+    );
 
     // Verify all data preserved
     let mut data_ok = true;
     for i in 0..20u64 {
         if vec[i as usize] != i.wrapping_mul(0x1111_1111_1111_1111) {
-            console::print(&format!("  Data mismatch at index {}\n", i));
+            crate::safe_print!(64, "  Data mismatch at index {}\n", i);
             data_ok = false;
             break;
         }
     }
 
     let capacity_ok = vec.capacity() >= 20;
-    console::print(&format!("  Data preserved: {}\n", data_ok));
+    crate::safe_print!(64, "  Data preserved: {}\n", data_ok);
 
     drop(vec);
 
     let ok = capacity_ok && data_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -304,7 +304,7 @@ fn test_realloc_shrink() -> bool {
     console::print("\n[TEST] Realloc shrink (shrink_to_fit)\n");
 
     let mut vec: Vec<u32> = Vec::with_capacity(100);
-    console::print(&format!("  Initial capacity: {}\n", vec.capacity()));
+    crate::safe_print!(64, "  Initial capacity: {}\n", vec.capacity());
 
     // Add just a few elements
     for i in 0..5u32 {
@@ -313,7 +313,7 @@ fn test_realloc_shrink() -> bool {
 
     // Shrink to fit
     vec.shrink_to_fit();
-    console::print(&format!("  After shrink_to_fit: {}\n", vec.capacity()));
+    crate::safe_print!(64, "  After shrink_to_fit: {}\n", vec.capacity());
 
     // Verify data
     let mut data_ok = true;
@@ -325,12 +325,12 @@ fn test_realloc_shrink() -> bool {
     }
 
     let shrunk = vec.capacity() <= 10; // Should shrink to close to 5
-    console::print(&format!("  Data preserved: {}\n", data_ok));
+    crate::safe_print!(64, "  Data preserved: {}\n", data_ok);
 
     drop(vec);
 
     let ok = shrunk && data_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -346,25 +346,25 @@ fn test_realloc_preserves_data() -> bool {
     for _ in 0..INITIAL_SIZE {
         vec.push(PATTERN);
     }
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Filled {} bytes with 0x{:02X}\n",
         INITIAL_SIZE, PATTERN
-    ));
+    );
 
     // Force multiple reallocations
     for _ in INITIAL_SIZE..FINAL_SIZE {
         vec.push(0xAD); // Different pattern for new data
     }
-    console::print(&format!("  Grew to {} bytes\n", vec.len()));
+    crate::safe_print!(64, "  Grew to {} bytes\n", vec.len());
 
     // Verify original data unchanged
     let mut original_ok = true;
     for i in 0..INITIAL_SIZE {
         if vec[i] != PATTERN {
-            console::print(&format!(
+            crate::safe_print!(96, 
                 "  Corruption at byte {} (got 0x{:02X})\n",
                 i, vec[i]
-            ));
+            );
             original_ok = false;
             break;
         }
@@ -379,13 +379,13 @@ fn test_realloc_preserves_data() -> bool {
         }
     }
 
-    console::print(&format!("  Original data intact: {}\n", original_ok));
-    console::print(&format!("  New data correct: {}\n", new_ok));
+    crate::safe_print!(64, "  Original data intact: {}\n", original_ok);
+    crate::safe_print!(64, "  New data correct: {}\n", new_ok);
 
     drop(vec);
 
     let ok = original_ok && new_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -400,24 +400,24 @@ fn test_alloc_zeroed_basic() -> bool {
     let mut all_zero = true;
     for (i, &byte) in vec.iter().enumerate() {
         if byte != 0 {
-            console::print(&format!("  Non-zero at index {}: 0x{:02X}\n", i, byte));
+            crate::safe_print!(96, "  Non-zero at index {}: 0x{:02X}\n", i, byte);
             all_zero = false;
             break;
         }
     }
 
-    console::print(&format!("  {} bytes all zero: {}\n", SIZE, all_zero));
+    crate::safe_print!(96, "  {} bytes all zero: {}\n", SIZE, all_zero);
 
     // Also test with Box
     let boxed: Box<[u8; 256]> = Box::new([0u8; 256]);
     let box_ok = boxed.iter().all(|&b| b == 0);
-    console::print(&format!("  Boxed array all zero: {}\n", box_ok));
+    crate::safe_print!(64, "  Boxed array all zero: {}\n", box_ok);
 
     drop(vec);
     drop(boxed);
 
     let ok = all_zero && box_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -433,7 +433,7 @@ fn test_alloc_zeroed_after_dirty() -> bool {
         for _ in 0..SIZE {
             dirty.push(0xFF);
         }
-        console::print(&format!("  Filled {} bytes with 0xFF, dropping...\n", SIZE));
+        crate::safe_print!(64, "  Filled {} bytes with 0xFF, dropping...\n", SIZE);
         drop(dirty);
     }
 
@@ -443,20 +443,20 @@ fn test_alloc_zeroed_after_dirty() -> bool {
     let mut all_zero = true;
     for (i, &byte) in clean.iter().enumerate() {
         if byte != 0 {
-            console::print(&format!("  Residual dirty data at {}: 0x{:02X}\n", i, byte));
+            crate::safe_print!(96, "  Residual dirty data at {}: 0x{:02X}\n", i, byte);
             all_zero = false;
             break;
         }
     }
 
-    console::print(&format!("  Zeroed allocation clean: {}\n", all_zero));
+    crate::safe_print!(64, "  Zeroed allocation clean: {}\n", all_zero);
 
     drop(clean);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if all_zero { "PASS" } else { "FAIL" }
-    ));
+    );
     all_zero
 }
 
@@ -487,25 +487,25 @@ fn test_alignment_various() -> bool {
     let a8: Box<Align8> = Box::new(Align8([0; 8]));
     let ptr8 = &*a8 as *const Align8 as usize;
     let ok8 = ptr8 % 8 == 0;
-    console::print(&format!("  Align 8: ptr=0x{:x}, ok={}\n", ptr8, ok8));
+    crate::safe_print!(96, "  Align 8: ptr=0x{:x}, ok={}\n", ptr8, ok8);
     all_aligned &= ok8;
 
     let a16: Box<Align16> = Box::new(Align16([0; 16]));
     let ptr16 = &*a16 as *const Align16 as usize;
     let ok16 = ptr16 % 16 == 0;
-    console::print(&format!("  Align 16: ptr=0x{:x}, ok={}\n", ptr16, ok16));
+    crate::safe_print!(96, "  Align 16: ptr=0x{:x}, ok={}\n", ptr16, ok16);
     all_aligned &= ok16;
 
     let a32: Box<Align32> = Box::new(Align32([0; 32]));
     let ptr32 = &*a32 as *const Align32 as usize;
     let ok32 = ptr32 % 32 == 0;
-    console::print(&format!("  Align 32: ptr=0x{:x}, ok={}\n", ptr32, ok32));
+    crate::safe_print!(96, "  Align 32: ptr=0x{:x}, ok={}\n", ptr32, ok32);
     all_aligned &= ok32;
 
     let a64: Box<Align64> = Box::new(Align64([0; 64]));
     let ptr64 = &*a64 as *const Align64 as usize;
     let ok64 = ptr64 % 64 == 0;
-    console::print(&format!("  Align 64: ptr=0x{:x}, ok={}\n", ptr64, ok64));
+    crate::safe_print!(96, "  Align 64: ptr=0x{:x}, ok={}\n", ptr64, ok64);
     all_aligned &= ok64;
 
     drop(a8);
@@ -513,10 +513,10 @@ fn test_alignment_various() -> bool {
     drop(a32);
     drop(a64);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if all_aligned { "PASS" } else { "FAIL" }
-    ));
+    );
     all_aligned
 }
 
@@ -666,33 +666,33 @@ fn test_vec_remove_regression() -> bool {
     for i in 0..10 {
         vec.push(i * 100);
     }
-    console::print(&format!("  Initial vec: {:?}\n", &vec[..3]));
+    crate::safe_print!(64, "  Initial vec: {:?}\n", &vec[..3]);
 
     // This was the original failure case
     let removed = vec.remove(0);
-    console::print(&format!("  Removed index 0: {}\n", removed));
+    crate::safe_print!(64, "  Removed index 0: {}\n", removed);
 
     let remove_ok = removed == 0;
     let first_ok = vec[0] == 100;
     let len_ok = vec.len() == 9;
 
-    console::print(&format!("  New first element: {} (expect 100)\n", vec[0]));
-    console::print(&format!("  New length: {} (expect 9)\n", vec.len()));
+    crate::safe_print!(64, "  New first element: {} (expect 100)\n", vec[0]);
+    crate::safe_print!(64, "  New length: {} (expect 9)\n", vec.len());
 
     // Remove from middle
     let mid = vec.remove(4);
-    console::print(&format!("  Removed index 4: {} (expect 500)\n", mid));
+    crate::safe_print!(64, "  Removed index 4: {} (expect 500)\n", mid);
     let mid_ok = mid == 500;
 
     // Remove from end
     let end = vec.remove(vec.len() - 1);
-    console::print(&format!("  Removed last: {} (expect 900)\n", end));
+    crate::safe_print!(64, "  Removed last: {} (expect 900)\n", end);
     let end_ok = end == 900;
 
     drop(vec);
 
     let ok = remove_ok && first_ok && len_ok && mid_ok && end_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -717,26 +717,26 @@ fn test_rapid_push_pop() -> bool {
         for i in (0..ITEMS).rev() {
             let val = vec.pop().unwrap();
             if val != (iter * ITEMS + i) as u64 {
-                console::print(&format!("  Mismatch at iter {} index {}\n", iter, i));
+                crate::safe_print!(96, "  Mismatch at iter {} index {}\n", iter, i);
                 all_ok = false;
                 break;
             }
         }
 
         if vec.len() != 0 {
-            console::print(&format!("  Vec not empty after iteration {}\n", iter));
+            crate::safe_print!(64, "  Vec not empty after iteration {}\n", iter);
             all_ok = false;
         }
     }
 
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  {} iterations of {} push/pop: {}\n",
         ITERATIONS, ITEMS, all_ok
-    ));
-    console::print(&format!(
+    );
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if all_ok { "PASS" } else { "FAIL" }
-    ));
+    );
     all_ok
 }
 
@@ -750,7 +750,7 @@ fn test_string_operations() -> bool {
     s.push_str("Hello");
     s.push_str(", ");
     s.push_str("World!");
-    console::print(&format!("  Built string: \"{}\"\n", s));
+    crate::safe_print!(64, "  Built string: \"{}\"\n", s);
 
     let hello_ok = s == "Hello, World!";
 
@@ -759,12 +759,12 @@ fn test_string_operations() -> bool {
     for i in 0..50 {
         long.push_str(&format!("{} ", i));
     }
-    console::print(&format!("  Long string len: {}\n", long.len()));
+    crate::safe_print!(64, "  Long string len: {}\n", long.len());
     let long_ok = long.starts_with("0 1 2 ");
 
     // Truncate
     s.truncate(5);
-    console::print(&format!("  Truncated: \"{}\"\n", s));
+    crate::safe_print!(64, "  Truncated: \"{}\"\n", s);
     let trunc_ok = s == "Hello";
 
     // Clear and rebuild
@@ -776,7 +776,7 @@ fn test_string_operations() -> bool {
     drop(long);
 
     let ok = hello_ok && long_ok && trunc_ok && rebuild_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -795,39 +795,39 @@ fn test_string_push_str_realloc() -> bool {
     v.push(2);
     v.push(3);
     let v_ptr = v.as_ptr() as usize;
-    console::print(&format!("    Vec ptr: {:#x}, len: {}\n", v_ptr, v.len()));
+    crate::safe_print!(96, "    Vec ptr: {:#x}, len: {}\n", v_ptr, v.len());
 
     // Step 2: String::from allocation (like userspace test_string_from)
     console::print("  Step 2: String::from allocation...\n");
     let s = String::from("Hello");
     let s_ptr = s.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(128, 
         "    String ptr: {:#x}, len: {}, cap: {}\n",
         s_ptr,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // Step 3: push_str triggers reallocation (THE BUG!)
     console::print("  Step 3: push_str (triggers realloc)...\n");
     let mut s2 = s.clone();
     let s2_ptr_before = s2.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(96, 
         "    Before push_str: ptr={:#x}, cap={}\n",
         s2_ptr_before,
         s2.capacity()
-    ));
+    );
 
     // This is where userspace crashes - realloc corrupts the allocator head
     s2.push_str(", World!");
 
     let s2_ptr_after = s2.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(96, 
         "    After push_str: ptr={:#x}, cap={}\n",
         s2_ptr_after,
         s2.capacity()
-    ));
-    console::print(&format!("    Result: \"{}\"\n", s2));
+    );
+    crate::safe_print!(64, "    Result: \"{}\"\n", s2);
 
     // Verify data integrity
     let vec_ok = v.len() == 3 && v[0] == 1 && v[2] == 3;
@@ -836,10 +836,10 @@ fn test_string_push_str_realloc() -> bool {
     // Check for suspicious pointer values (like 0x814000 in userspace bug)
     let ptr_suspicious = s2_ptr_after > 0x800000 && s2_ptr_after < 0x900000;
     if ptr_suspicious {
-        console::print(&format!(
+        crate::safe_print!(96, 
             "  WARNING: Suspicious pointer {:#x} (similar to userspace bug pattern)\n",
             s2_ptr_after
-        ));
+        );
     }
 
     drop(v);
@@ -847,7 +847,7 @@ fn test_string_push_str_realloc() -> bool {
     drop(s2);
 
     let ok = vec_ok && string_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -858,55 +858,55 @@ fn test_string_realloc_detailed() -> bool {
 
     // Create with small capacity to force realloc
     let mut s = String::with_capacity(5);
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  Initial: ptr={:#x}, len={}, cap={}\n",
         s.as_ptr() as usize,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // Push small string (no realloc needed)
     s.push_str("Hi");
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  After 'Hi': ptr={:#x}, len={}, cap={}\n",
         s.as_ptr() as usize,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // Push more to trigger realloc
     s.push_str("!!!"); // Still within capacity
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  After '!!!': ptr={:#x}, len={}, cap={}\n",
         s.as_ptr() as usize,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // This should trigger realloc (capacity 5, current len 5, adding 6 more)
     let ptr_before = s.as_ptr() as usize;
     s.push_str(" World");
     let ptr_after = s.as_ptr() as usize;
 
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  After ' World': ptr={:#x}, len={}, cap={}\n",
         s.as_ptr() as usize,
         s.len(),
         s.capacity()
-    ));
+    );
 
     let reallocated = ptr_before != ptr_after;
-    console::print(&format!("  Reallocation occurred: {}\n", reallocated));
+    crate::safe_print!(64, "  Reallocation occurred: {}\n", reallocated);
 
     let content_ok = s == "Hi!!! World";
-    console::print(&format!("  Content: \"{}\" (expect \"Hi!!! World\")\n", s));
+    crate::safe_print!(64, "  Content: \"{}\" (expect \"Hi!!! World\")\n", s);
 
     drop(s);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if content_ok { "PASS" } else { "FAIL" }
-    ));
+    );
     content_ok
 }
 
@@ -927,14 +927,14 @@ fn test_vec_of_vecs() -> bool {
         }
         outer.push(inner);
     }
-    console::print(&format!("  Created {}x{} nested vecs\n", OUTER, INNER));
+    crate::safe_print!(96, "  Created {}x{} nested vecs\n", OUTER, INNER);
 
     // Verify data
     let mut all_ok = true;
     for i in 0..OUTER {
         for j in 0..INNER {
             if outer[i][j] != (i * INNER + j) as u8 {
-                console::print(&format!("  Mismatch at [{i}][{j}]\n"));
+                crate::safe_print!(96, "  Mismatch at [{i}][{j}]\n");
                 all_ok = false;
                 break;
             }
@@ -947,18 +947,18 @@ fn test_vec_of_vecs() -> bool {
     // Remove some inner vecs
     outer.remove(5);
     outer.remove(3);
-    console::print(&format!("  After removals: {} outer vecs\n", outer.len()));
+    crate::safe_print!(64, "  After removals: {} outer vecs\n", outer.len());
 
     let len_ok = outer.len() == OUTER - 2;
 
     // Add new inner vec
     outer.push(vec![0xAB; 30]);
-    console::print(&format!("  After push: {} outer vecs\n", outer.len()));
+    crate::safe_print!(64, "  After push: {} outer vecs\n", outer.len());
 
     drop(outer);
 
     let ok = all_ok && len_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1012,7 +1012,7 @@ fn test_mmap_single_page() -> bool {
     // Allocate a small buffer (will use one page in mmap mode)
     let buf: Vec<u8> = vec![0u8; 100];
     let ptr = buf.as_ptr() as usize;
-    console::print(&format!("  Allocated 100 bytes at {:#x}\n", ptr));
+    crate::safe_print!(64, "  Allocated 100 bytes at {:#x}\n", ptr);
 
     // Write pattern
     let mut buf = buf;
@@ -1024,19 +1024,19 @@ fn test_mmap_single_page() -> bool {
     let mut ok = true;
     for i in 0..100 {
         if buf[i] != (i & 0xFF) as u8 {
-            console::print(&format!(
+            crate::safe_print!(128, 
                 "  Mismatch at {}: got {}, expected {}\n",
                 i,
                 buf[i],
                 i & 0xFF
-            ));
+            );
             ok = false;
             break;
         }
     }
 
     drop(buf);
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1049,7 +1049,7 @@ fn test_mmap_multi_page() -> bool {
 
     let mut buf: Vec<u8> = vec![0u8; SIZE];
     let ptr = buf.as_ptr() as usize;
-    console::print(&format!("  Allocated {} bytes at {:#x}\n", SIZE, ptr));
+    crate::safe_print!(96, "  Allocated {} bytes at {:#x}\n", SIZE, ptr);
 
     // Write to first byte of each page
     buf[0] = 0x11;
@@ -1060,16 +1060,16 @@ fn test_mmap_multi_page() -> bool {
     // Verify
     let ok = buf[0] == 0x11 && buf[4096] == 0x22 && buf[8192] == 0x33 && buf[SIZE - 1] == 0x44;
 
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  Page boundaries: {:#x}, {:#x}, {:#x}, {:#x}\n",
         buf[0],
         buf[4096],
         buf[8192],
         buf[SIZE - 1]
-    ));
+    );
 
     drop(buf);
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1088,21 +1088,21 @@ fn test_mmap_page_boundary_write() -> bool {
     buf[PAGE_SIZE - 1] = 0xAA; // Last byte of page 1
     buf[PAGE_SIZE] = 0xBB; // First byte of page 2
 
-    console::print(&format!("  Ptr: {:#x}\n", ptr));
-    console::print(&format!(
+    crate::safe_print!(64, "  Ptr: {:#x}\n", ptr);
+    crate::safe_print!(96, 
         "  buf[{}] = {:#x} (last of page 1)\n",
         PAGE_SIZE - 1,
         buf[PAGE_SIZE - 1]
-    ));
-    console::print(&format!(
+    );
+    crate::safe_print!(96, 
         "  buf[{}] = {:#x} (first of page 2)\n",
         PAGE_SIZE, buf[PAGE_SIZE]
-    ));
+    );
 
     let ok = buf[PAGE_SIZE - 1] == 0xAA && buf[PAGE_SIZE] == 0xBB;
 
     drop(buf);
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1116,7 +1116,7 @@ fn test_mmap_rapid_alloc_dealloc() -> bool {
     for i in 0..100 {
         let buf: Vec<u8> = vec![(i & 0xFF) as u8; 256];
         if buf[0] != (i & 0xFF) as u8 || buf[255] != (i & 0xFF) as u8 {
-            console::print(&format!("  Cycle {} failed\n", i));
+            crate::safe_print!(64, "  Cycle {} failed\n", i);
             ok = false;
             break;
         }
@@ -1127,7 +1127,7 @@ fn test_mmap_rapid_alloc_dealloc() -> bool {
         console::print("  All 100 cycles passed\n");
     }
 
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1139,11 +1139,11 @@ fn test_mmap_realloc_pattern() -> bool {
     // Small initial allocation
     let mut v: Vec<u64> = Vec::with_capacity(2);
     let ptr1 = v.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Initial: ptr={:#x}, cap={}\n",
         ptr1,
         v.capacity()
-    ));
+    );
 
     v.push(0x1111111111111111);
     v.push(0x2222222222222222);
@@ -1153,11 +1153,11 @@ fn test_mmap_realloc_pattern() -> bool {
     v.push(0x4444444444444444);
     v.push(0x5555555555555555);
     let ptr2 = v.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  After growth: ptr={:#x}, cap={}\n",
         ptr2,
         v.capacity()
-    ));
+    );
 
     // Immediately use the new memory (this is where userspace fails)
     v.push(0x6666666666666666);
@@ -1170,13 +1170,13 @@ fn test_mmap_realloc_pattern() -> bool {
         && v[5] == 0x6666666666666666
         && v[6] == 0x7777777777777777;
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Data integrity: {}\n",
         if ok { "OK" } else { "CORRUPTED" }
-    ));
+    );
 
     drop(v);
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1187,22 +1187,22 @@ fn test_mmap_string_growth_pattern() -> bool {
     // This is the exact pattern that crashes in userspace
     let mut s = String::from("Hello");
     let ptr1 = s.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  Initial: ptr={:#x}, len={}, cap={}\n",
         ptr1,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // Trigger realloc by pushing more data
     s.push_str(", World!");
     let ptr2 = s.as_ptr() as usize;
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  After push_str: ptr={:#x}, len={}, cap={}\n",
         ptr2,
         s.len(),
         s.capacity()
-    ));
+    );
 
     // Critical: access the string after realloc
     let content_ok = s == "Hello, World!";
@@ -1212,12 +1212,12 @@ fn test_mmap_string_growth_pattern() -> bool {
     s.push_str(" This is a test.");
     let final_ok = s == "Hello, World! This is a test.";
 
-    console::print(&format!("  Content: \"{}\"\n", s));
+    crate::safe_print!(64, "  Content: \"{}\"\n", s);
 
     drop(s);
 
     let ok = content_ok && len_ok && final_ok;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1240,26 +1240,26 @@ fn test_mmap_vec_capacity_doubling() -> bool {
         last_ptr = ptr_after;
     }
 
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Final: len={}, cap={}, ptr={:#x}\n",
         v.len(),
         v.capacity(),
         last_ptr
-    ));
-    console::print(&format!("  Realloc count: {}\n", reallocs));
+    );
+    crate::safe_print!(64, "  Realloc count: {}\n", reallocs);
 
     // Verify all data
     let mut ok = true;
     for i in 0..1024 {
         if v[i] != i as u32 {
-            console::print(&format!("  Mismatch at {}: got {}\n", i, v[i]));
+            crate::safe_print!(96, "  Mismatch at {}: got {}\n", i, v[i]);
             ok = false;
             break;
         }
     }
 
     drop(v);
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1272,9 +1272,9 @@ fn test_mmap_interleaved_strings() -> bool {
     let mut s2 = String::from("BBB");
     let mut s3 = String::from("CCC");
 
-    console::print(&format!("  s1: ptr={:#x}\n", s1.as_ptr() as usize));
-    console::print(&format!("  s2: ptr={:#x}\n", s2.as_ptr() as usize));
-    console::print(&format!("  s3: ptr={:#x}\n", s3.as_ptr() as usize));
+    crate::safe_print!(64, "  s1: ptr={:#x}\n", s1.as_ptr() as usize);
+    crate::safe_print!(64, "  s2: ptr={:#x}\n", s2.as_ptr() as usize);
+    crate::safe_print!(64, "  s3: ptr={:#x}\n", s3.as_ptr() as usize);
 
     // Interleaved modifications (triggers reallocs in different orders)
     s1.push_str("111");
@@ -1285,10 +1285,10 @@ fn test_mmap_interleaved_strings() -> bool {
     s1.push_str("even more");
     s3.push_str("and more");
 
-    console::print(&format!("  After modifications:\n"));
-    console::print(&format!("    s1: \"{}\"\n", s1));
-    console::print(&format!("    s2: \"{}\"\n", s2));
-    console::print(&format!("    s3: \"{}\"\n", s3));
+    crate::safe_print!(32, "  After modifications:\n");
+    crate::safe_print!(64, "    s1: \"{}\"\n", s1);
+    crate::safe_print!(64, "    s2: \"{}\"\n", s2);
+    crate::safe_print!(64, "    s3: \"{}\"\n", s3);
 
     let ok = s1 == "AAA111even more" && s2 == "BBB222more" && s3 == "CCC333and more";
 
@@ -1296,7 +1296,7 @@ fn test_mmap_interleaved_strings() -> bool {
     drop(s2);
     drop(s3);
 
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1636,8 +1636,8 @@ fn test_scheduler_init() -> bool {
     let count = threading::thread_count();
     let ok = count >= 1; // At least idle thread
 
-    console::print(&format!("  Thread count: {} (expect >= 1)\n", count));
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Thread count: {} (expect >= 1)\n", count);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
 
     ok
 }
@@ -1649,11 +1649,11 @@ fn test_thread_stats() -> bool {
     let (ready, running, terminated) = threading::thread_stats();
     let ok = running >= 1; // Current thread should be running
 
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  Ready: {}, Running: {}, Terminated: {}\n",
         ready, running, terminated
-    ));
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    );
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
 
     ok
 }
@@ -1677,15 +1677,15 @@ fn test_cooperative_timeout() -> bool {
     let timeout = threading::COOPERATIVE_TIMEOUT_US;
     let ok = timeout > 0;
 
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Timeout: {} us ({} seconds)\n",
         timeout,
         timeout / 1_000_000
-    ));
-    console::print(&format!(
+    );
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if ok { "PASS" } else { "DISABLED (0)" }
-    ));
+    );
 
     ok
 }
@@ -1697,22 +1697,22 @@ fn test_thread_cleanup() -> bool {
     // Get initial state
     let count_before = threading::thread_count();
     let (ready, running, terminated) = threading::thread_stats();
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  State: {} threads (R:{} U:{} T:{})\n",
         count_before, ready, running, terminated
-    ));
+    );
 
     // Run cleanup (should be safe even with no terminated threads)
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {} threads\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
 
     // Verify state is still valid
     let count_after = threading::thread_count();
     let (ready2, running2, terminated2) = threading::thread_stats();
-    console::print(&format!(
+    crate::safe_print!(128, 
         "  After: {} threads (R:{} U:{} T:{})\n",
         count_after, ready2, running2, terminated2
-    ));
+    );
 
     // Test passes if:
     // 1. Count decreased by amount cleaned (or stayed same if 0 cleaned)
@@ -1721,7 +1721,7 @@ fn test_thread_cleanup() -> bool {
     let has_idle = count_after >= 1;
     let ok = count_ok && has_idle;
 
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
 
     ok
 }
@@ -1742,7 +1742,7 @@ fn test_spawn_thread() -> bool {
     console::print("\n[TEST] Thread spawn\n");
 
     let count_before = threading::thread_count();
-    console::print(&format!("  Threads before: {}\n", count_before));
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Try to spawn - simple thread that just marks itself terminated immediately
     console::print("  Spawning test thread...");
@@ -1754,17 +1754,17 @@ fn test_spawn_thread() -> bool {
         }
     }) {
         Ok(tid) => {
-            console::print(&format!(" OK (tid={})\n", tid));
+            crate::safe_print!(64, " OK (tid={})\n", tid);
 
             let count_after = threading::thread_count();
-            console::print(&format!("  Threads after: {}\n", count_after));
+            crate::safe_print!(64, "  Threads after: {}\n", count_after);
 
             let ok = count_after == count_before + 1;
-            console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+            crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
             ok
         }
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             console::print("  Result: FAIL\n");
             false
         }
@@ -1789,7 +1789,7 @@ fn test_spawn_and_run() -> bool {
         }
     }) {
         Ok(tid) => {
-            console::print(&format!(" OK (tid={})\n", tid));
+            crate::safe_print!(64, " OK (tid={})\n", tid);
 
             // Yield a few times to let the thread run
             console::print("  Yielding to let thread run...");
@@ -1800,20 +1800,20 @@ fn test_spawn_and_run() -> bool {
 
             // Check if flag was set
             let ran = get_test_flag();
-            console::print(&format!("  Thread ran: {}\n", ran));
+            crate::safe_print!(64, "  Thread ran: {}\n", ran);
 
             // Cleanup
             let cleaned = threading::cleanup_terminated_force();
-            console::print(&format!("  Cleaned up: {} threads\n", cleaned));
+            crate::safe_print!(64, "  Cleaned up: {} threads\n", cleaned);
 
-            console::print(&format!(
+            crate::safe_print!(64, 
                 "  Result: {}\n",
                 if ran { "PASS" } else { "FAIL" }
-            ));
+            );
             ran
         }
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             console::print("  Result: FAIL\n");
             false
         }
@@ -1825,7 +1825,7 @@ fn test_spawn_and_cleanup() -> bool {
     console::print("\n[TEST] Spawn and cleanup\n");
 
     let count_before = threading::thread_count();
-    console::print(&format!("  Threads before: {}\n", count_before));
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Spawn thread
     console::print("  Spawning...");
@@ -1837,11 +1837,11 @@ fn test_spawn_and_cleanup() -> bool {
         }
     }) {
         Ok(t) => {
-            console::print(&format!(" tid={}\n", t));
+            crate::safe_print!(32, " tid={}\n", t);
             t
         }
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     };
@@ -1855,17 +1855,17 @@ fn test_spawn_and_cleanup() -> bool {
 
     // Check it's terminated
     let (_, _, terminated) = threading::thread_stats();
-    console::print(&format!("  Terminated count: {}\n", terminated));
+    crate::safe_print!(64, "  Terminated count: {}\n", terminated);
 
     // Cleanup
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {}\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {}\n", cleaned);
 
     let count_after = threading::thread_count();
-    console::print(&format!("  Threads after: {}\n", count_after));
+    crate::safe_print!(64, "  Threads after: {}\n", count_after);
 
     let ok = count_after == count_before && cleaned >= 1;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1890,11 +1890,11 @@ fn test_spawn_multiple() -> bool {
 
     reset_counter();
     let count_before = threading::thread_count();
-    console::print(&format!("  Threads before: {}\n", count_before));
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Spawn 3 threads
     const NUM_THREADS: usize = 3;
-    console::print(&format!("  Spawning {} threads...", NUM_THREADS));
+    crate::safe_print!(64, "  Spawning {} threads...", NUM_THREADS);
 
     for i in 0..NUM_THREADS {
         match threading::spawn_fn(|| {
@@ -1907,7 +1907,7 @@ fn test_spawn_multiple() -> bool {
         }) {
             Ok(_) => {}
             Err(e) => {
-                console::print(&format!(" FAILED at {}: {}\n", i, e));
+                crate::safe_print!(64, " FAILED at {}: {}\n", i, e);
                 return false;
             }
         }
@@ -1915,7 +1915,7 @@ fn test_spawn_multiple() -> bool {
     console::print(" done\n");
 
     let count_mid = threading::thread_count();
-    console::print(&format!("  Threads after spawn: {}\n", count_mid));
+    crate::safe_print!(64, "  Threads after spawn: {}\n", count_mid);
 
     // Yield to let them all run
     console::print("  Yielding...");
@@ -1925,20 +1925,20 @@ fn test_spawn_multiple() -> bool {
     console::print(" done\n");
 
     let counter_val = get_counter();
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Counter value: {} (expect {})\n",
         counter_val, NUM_THREADS
-    ));
+    );
 
     // Cleanup
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {}\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {}\n", cleaned);
 
     let count_after = threading::thread_count();
-    console::print(&format!("  Threads after cleanup: {}\n", count_after));
+    crate::safe_print!(64, "  Threads after cleanup: {}\n", count_after);
 
     let ok = counter_val == NUM_THREADS as u32 && count_after == count_before;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -1976,9 +1976,9 @@ fn test_spawn_and_yield() -> bool {
             unsafe { core::arch::asm!("wfi") };
         }
     }) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     }
@@ -1991,13 +1991,13 @@ fn test_spawn_and_yield() -> bool {
     console::print(" done\n");
 
     let count = get_yield_count();
-    console::print(&format!("  Yield count: {} (expect 5)\n", count));
+    crate::safe_print!(64, "  Yield count: {} (expect 5)\n", count);
 
     // Cleanup
     threading::cleanup_terminated_force();
 
     let ok = count == 5;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -2016,9 +2016,9 @@ fn test_spawn_cooperative() -> bool {
             unsafe { core::arch::asm!("wfi") };
         }
     }) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     }
@@ -2031,15 +2031,15 @@ fn test_spawn_cooperative() -> bool {
     console::print(" done\n");
 
     let ran = get_test_flag();
-    console::print(&format!("  Thread ran: {}\n", ran));
+    crate::safe_print!(64, "  Thread ran: {}\n", ran);
 
     // Cleanup
     threading::cleanup_terminated_force();
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if ran { "PASS" } else { "FAIL" }
-    ));
+    );
     ran
 }
 
@@ -2066,7 +2066,7 @@ fn test_yield_cycle() -> bool {
 
     const CYCLES: u32 = 10;
 
-    console::print(&format!("  Spawning thread for {} yield cycles...", CYCLES));
+    crate::safe_print!(64, "  Spawning thread for {} yield cycles...", CYCLES);
     match threading::spawn_fn(|| {
         // Perform multiple yield-resume cycles
         for _ in 0..CYCLES {
@@ -2079,9 +2079,9 @@ fn test_yield_cycle() -> bool {
             unsafe { core::arch::asm!("wfi") };
         }
     }) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     }
@@ -2098,17 +2098,17 @@ fn test_yield_cycle() -> bool {
     console::print(" done\n");
 
     let cycles = get_yield_cycle();
-    console::print(&format!(
+    crate::safe_print!(96, 
         "  Completed cycles: {} (expect {})\n",
         cycles, CYCLES
-    ));
+    );
 
     // Cleanup
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {} threads\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
 
     let ok = cycles == CYCLES;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -2143,7 +2143,7 @@ fn test_mixed_cooperative_preemptible() -> bool {
     set_preempt_done(false);
 
     let count_before = threading::thread_count();
-    console::print(&format!("  Threads before: {}\n", count_before));
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Spawn cooperative thread: yields for ~5ms total
     console::print("  Spawning cooperative thread (5ms)...");
@@ -2162,9 +2162,9 @@ fn test_mixed_cooperative_preemptible() -> bool {
             unsafe { core::arch::asm!("wfi") };
         }
     }) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     }
@@ -2188,15 +2188,15 @@ fn test_mixed_cooperative_preemptible() -> bool {
             unsafe { core::arch::asm!("wfi") };
         }
     }) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             return false;
         }
     }
 
     let count_mid = threading::thread_count();
-    console::print(&format!("  Threads after spawn: {}\n", count_mid));
+    crate::safe_print!(64, "  Threads after spawn: {}\n", count_mid);
 
     // Wait for both to complete (max 30ms with some margin)
     console::print("  Waiting for threads to complete...");
@@ -2210,24 +2210,24 @@ fn test_mixed_cooperative_preemptible() -> bool {
     }
 
     let elapsed = (crate::timer::uptime_us() - wait_start) / 1000;
-    console::print(&format!(" {}ms\n", elapsed));
+    crate::safe_print!(32, " {}ms\n", elapsed);
 
     // Check completion
     let coop_done = get_coop_done();
     let preempt_done = get_preempt_done();
-    console::print(&format!("  Cooperative done: {}\n", coop_done));
-    console::print(&format!("  Preemptible done: {}\n", preempt_done));
+    crate::safe_print!(64, "  Cooperative done: {}\n", coop_done);
+    crate::safe_print!(64, "  Preemptible done: {}\n", preempt_done);
 
     // Cleanup
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {} threads\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
 
     let count_after = threading::thread_count();
-    console::print(&format!("  Threads after cleanup: {}\n", count_after));
+    crate::safe_print!(64, "  Threads after cleanup: {}\n", count_after);
 
     // Verify: both threads completed and only idle remains
     let ok = coop_done && preempt_done && count_after == 1;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -2258,7 +2258,7 @@ fn test_parallel_processes() -> bool {
     PROCESS2_DONE.store(false, Ordering::Release);
 
     let thread_count_before = threading::thread_count();
-    console::print(&format!("  Threads before: {}\n", thread_count_before));
+    crate::safe_print!(64, "  Threads before: {}\n", thread_count_before);
 
     // Check if hello binary exists by trying to read it
     if crate::fs::read_file("/bin/hello").is_err() {
@@ -2279,12 +2279,12 @@ fn test_parallel_processes() -> bool {
     
     let (tid1, channel1) = match result1 {
         Ok((tid, channel)) => {
-            console::print(&format!(" tid={}\n", tid));
+            crate::safe_print!(32, " tid={}\n", tid);
             PROCESS1_STARTED.store(true, Ordering::Release);
             (tid, channel)
         }
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             console::print("  Result: FAIL\n");
             return false;
         }
@@ -2296,18 +2296,18 @@ fn test_parallel_processes() -> bool {
 
     let (tid2, channel2) = match result2 {
         Ok((tid, channel)) => {
-            console::print(&format!(" tid={}\n", tid));
+            crate::safe_print!(32, " tid={}\n", tid);
             PROCESS2_STARTED.store(true, Ordering::Release);
             (tid, channel)
         }
         Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
+            crate::safe_print!(64, " FAILED: {}\n", e);
             console::print("  Result: FAIL\n");
             return false;
         }
     };
 
-    console::print(&format!("  Spawned threads {} and {}\n", tid1, tid2));
+    crate::safe_print!(96, "  Spawned threads {} and {}\n", tid1, tid2);
     
     // The fact that we spawned two processes on different threads (tid1 != tid2)
     // and they both complete successfully proves parallel execution capability.
@@ -2343,7 +2343,7 @@ fn test_parallel_processes() -> bool {
                     match ps_result {
                         Ok(value) => {
                             let value_as_str = String::from_utf8_lossy(&value);
-                            console::print(&format!("ps output:\n{}\n", value_as_str));
+                            crate::safe_print!(64, "ps output:\n{}\n", value_as_str);
 
                             let values_split = value_as_str.split('\n').collect::<Vec<&str>>();
                             let process_name = String::from("/bin/hello");
@@ -2372,7 +2372,7 @@ fn test_parallel_processes() -> bool {
                     match kthreads_result {
                         Ok(value) => {
                             let value_as_str = String::from_utf8_lossy(&value);
-                            console::print(&format!("kthreads output:\n{}\n", value_as_str));
+                            crate::safe_print!(64, "kthreads output:\n{}\n", value_as_str);
 
                             // Check that both thread IDs appear as user-process threads
                             let tid1_str = format!("{:>4}", tid1);
@@ -2387,10 +2387,10 @@ fn test_parallel_processes() -> bool {
                             // change kthreads to list at least one user-process
                             if has_tid1 || has_tid2 {
                                 kthreads_done = true;
-                                console::print(&format!("  kthreads check: PASS (threads {} or {} visible as user-process)\n", tid1, tid2));
+                                crate::safe_print!(128, "  kthreads check: PASS (threads {} or {} visible as user-process)\n", tid1, tid2);
                             } else {
-                                console::print(&format!("  kthreads check: waiting (tid1={} found={}, tid2={} found={})\n", 
-                                    tid1, has_tid1, tid2, has_tid2));
+                                crate::safe_print!(160, "  kthreads check: waiting (tid1={} found={}, tid2={} found={})\n", 
+                                    tid1, has_tid1, tid2, has_tid2);
                             }
                         }
                         Err(_) => {
@@ -2403,7 +2403,7 @@ fn test_parallel_processes() -> bool {
 
         if crate::timer::uptime_us() - complete_start > complete_timeout {
             console::print(" TIMEOUT\n");
-            console::print(&format!("    P1 done: {}, P2 done: {}\n", p1_done, p2_done));
+            crate::safe_print!(96, "    P1 done: {}, P2 done: {}\n", p1_done, p2_done);
             // Continue to cleanup even on timeout
             break;
         }
@@ -2411,10 +2411,10 @@ fn test_parallel_processes() -> bool {
 
     // Cleanup
     let cleaned = threading::cleanup_terminated_force();
-    console::print(&format!("  Cleaned: {} threads\n", cleaned));
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
 
     let thread_count_after = threading::thread_count();
-    console::print(&format!("  Threads after: {}\n", thread_count_after));
+    crate::safe_print!(64, "  Threads after: {}\n", thread_count_after);
 
     // Verify results
     let p1_done = PROCESS1_DONE.load(Ordering::Acquire);
@@ -2429,11 +2429,11 @@ fn test_parallel_processes() -> bool {
     let ok = threads_different && p1_done && p2_done && ps_done && kthreads_done;
     
     if !ok {
-        console::print(&format!("  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}\n", 
-                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done));
+        crate::safe_print!(192, "  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}\n", 
+                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done);
     }
     
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -2507,21 +2507,21 @@ pub fn test_waker_mechanism() -> bool {
     // First poll - should return Pending and call wake_by_ref
     let result1 = future.as_mut().poll(&mut cx);
     let pending = matches!(result1, Poll::Pending);
-    console::print(&format!("  First poll: {} (expected Pending)\n", 
-                           if pending { "Pending" } else { "Ready" }));
+    crate::safe_print!(64, "  First poll: {} (expected Pending)\n", 
+                           if pending { "Pending" } else { "Ready" });
     
     // Check wake was called
     let wakes_after_first = WAKE_COUNT.load(Ordering::SeqCst);
-    console::print(&format!("  Wake count after first poll: {} (expected 1)\n", wakes_after_first));
+    crate::safe_print!(96, "  Wake count after first poll: {} (expected 1)\n", wakes_after_first);
     
     // Second poll - should return Ready
     let result2 = future.as_mut().poll(&mut cx);
     let ready = matches!(result2, Poll::Ready(42));
-    console::print(&format!("  Second poll: {} (expected Ready(42))\n",
-                           if ready { "Ready(42)" } else { "unexpected" }));
+    crate::safe_print!(64, "  Second poll: {} (expected Ready(42))\n",
+                           if ready { "Ready(42)" } else { "unexpected" });
     
     let ok = pending && wakes_after_first == 1 && ready;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
 
@@ -2595,10 +2595,10 @@ pub fn test_block_on_noop_waker() -> bool {
     let result = block_on_limited(future, 10);
     
     let poll_count = POLL_COUNT.load(Ordering::SeqCst);
-    console::print(&format!("  Total polls: {} (expected 5)\n", poll_count));
-    console::print(&format!("  Result: {:?} (expected Some(5))\n", result));
+    crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
+    crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
     
     let ok = result == Some(5) && poll_count == 5;
-    console::print(&format!("  Result: {}\n", if ok { "PASS" } else { "FAIL" }));
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }

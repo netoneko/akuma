@@ -95,11 +95,11 @@ pub fn init() -> Result<(), FsError> {
         Ok(entries) => {
             log("[FS] Root directory accessible\n");
             log("[FS] Files in root: ");
-            console::print(&alloc::format!("{}\n", entries.len()));
+            crate::safe_print!(32, "{}\n", entries.len());
         }
         Err(e) => {
             log("[FS] Failed to list root directory: ");
-            console::print(&alloc::format!("{}\n", e));
+            crate::safe_print!(32, "{}\n", e);
             return Err(e);
         }
     }

@@ -166,7 +166,7 @@ pub fn init() -> Result<NetworkInit, &'static str> {
         }
 
         log("[AsyncNet] Found virtio-net at slot ");
-        console::print(&alloc::format!("{}\n", i));
+        crate::safe_print!(32, "{}\n", i);
 
         let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
             Some(p) => p,
@@ -203,7 +203,7 @@ pub fn init() -> Result<NetworkInit, &'static str> {
         if i > 0 {
             console::print(":");
         }
-        console::print(&alloc::format!("{:02x}", b));
+        crate::safe_print!(32, "{:02x}", b);
     }
     log("\n");
 
@@ -235,7 +235,7 @@ pub fn init() -> Result<NetworkInit, &'static str> {
 /// Falls back to static QEMU defaults if DHCP times out
 pub async fn wait_for_ip(stack: &Stack<'static>) {
     log("[AsyncNet] Waiting for DHCP (");
-    console::print(&alloc::format!("{}s timeout)...\n", DHCP_TIMEOUT_SECS));
+    crate::safe_print!(64, "{}s timeout)...\n", DHCP_TIMEOUT_SECS);
 
     let deadline = embassy_time::Instant::now() + Duration::from_secs(DHCP_TIMEOUT_SECS);
 
@@ -244,23 +244,23 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
         if let Some(config) = stack.config_v4() {
             let addr = config.address;
             log("[AsyncNet] Got IP via DHCP: ");
-            console::print(&alloc::format!(
+            crate::safe_print!(128, 
                 "{}.{}.{}.{}/{}\n",
                 addr.address().octets()[0],
                 addr.address().octets()[1],
                 addr.address().octets()[2],
                 addr.address().octets()[3],
                 addr.prefix_len()
-            ));
+            );
             if let Some(gw) = config.gateway {
                 log("[AsyncNet] Gateway: ");
-                console::print(&alloc::format!(
+                crate::safe_print!(96, 
                     "{}.{}.{}.{}\n",
                     gw.octets()[0],
                     gw.octets()[1],
                     gw.octets()[2],
                     gw.octets()[3]
-                ));
+                );
             }
             // Log DNS servers
             if config.dns_servers.is_empty() {
@@ -271,13 +271,13 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
                     if i > 0 {
                         console::print(", ");
                     }
-                    console::print(&alloc::format!(
+                    crate::safe_print!(96, 
                         "{}.{}.{}.{}",
                         dns.octets()[0],
                         dns.octets()[1],
                         dns.octets()[2],
                         dns.octets()[3]
-                    ));
+                    );
                 }
                 log("\n");
             }
@@ -297,7 +297,7 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
             stack.set_config_v4(ConfigV4::Static(static_config));
 
             log("[AsyncNet] Static IP: ");
-            console::print(&alloc::format!(
+            crate::safe_print!(256, 
                 "{}.{}.{}.{}/{}, Gateway: {}.{}.{}.{}\n",
                 DEFAULT_IP.octets()[0],
                 DEFAULT_IP.octets()[1],
@@ -308,7 +308,7 @@ pub async fn wait_for_ip(stack: &Stack<'static>) {
                 DEFAULT_GATEWAY.octets()[1],
                 DEFAULT_GATEWAY.octets()[2],
                 DEFAULT_GATEWAY.octets()[3]
-            ));
+            );
             log("[AsyncNet] WARNING: No DNS servers configured (static fallback)\n");
             return;
         }

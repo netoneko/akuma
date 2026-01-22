@@ -211,11 +211,11 @@ impl Ext2Filesystem {
         let inodes_per_group = superblock.inodes_per_group;
 
         if magic != EXT2_MAGIC {
-            console::print(&alloc::format!(
+            crate::safe_print!(96, 
                 "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
                 magic,
                 EXT2_MAGIC
-            ));
+            );
             return Err(FsError::NoFilesystem);
         }
 
@@ -227,13 +227,13 @@ impl Ext2Filesystem {
         };
         let block_group_count = (total_blocks + blocks_per_group - 1) / blocks_per_group;
 
-        console::print(&alloc::format!(
+        crate::safe_print!(160, 
             "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups\n",
             total_blocks,
             total_inodes,
             block_size,
             block_group_count
-        ));
+        );
 
         let state = Ext2State {
             superblock,

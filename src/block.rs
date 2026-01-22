@@ -236,7 +236,7 @@ pub fn init() -> Result<(), BlockError> {
         }
 
         log("[Block] Found virtio-blk at slot ");
-        console::print(&alloc::format!("{}\n", i));
+        crate::safe_print!(32, "{}\n", i);
 
         let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
             Some(p) => p,
@@ -262,11 +262,11 @@ pub fn init() -> Result<(), BlockError> {
 
         let device = VirtioBlockDevice::new(blk);
         log("[Block] Capacity: ");
-        console::print(&alloc::format!(
+        crate::safe_print!(64, 
             "{} MB ({} sectors)\n",
             device.capacity_bytes() / 1024 / 1024,
             device.capacity_sectors()
-        ));
+        );
 
         found_device = Some(device);
         break;

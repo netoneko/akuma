@@ -794,7 +794,7 @@ pub fn protect_kernel_code() {
     let data_start = unsafe { &_data_start as *const u8 as usize };
     let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
 
-    crate::console::print(&alloc::format!(
+    crate::safe_print!(384, 
         "[MMU] Kernel sections:\n  .text:   0x{:08x}-0x{:08x} ({} KB)\n  .rodata: 0x{:08x}-0x{:08x} ({} KB)\n  .data:   0x{:08x}-0x{:08x} ({} KB)\n",
         text_start,
         text_end,
@@ -805,7 +805,7 @@ pub fn protect_kernel_code() {
         data_start,
         kernel_end,
         (kernel_end - data_start) / 1024,
-    ));
+    );
 
     // TODO: Implement fine-grained page table protection
     // For now, the boot stack fix (placing stack at 0x42000000) prevents

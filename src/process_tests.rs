@@ -2,8 +2,6 @@
 //!
 //! Tests for user process execution during boot.
 
-use alloc::format;
-
 use crate::config;
 use crate::console;
 use crate::fs;
@@ -34,11 +32,11 @@ fn test_elftest() {
 
     match fs::read_file(ELFTEST_PATH) {
         Ok(data) => {
-            console::print(&format!(
+            crate::safe_print!(96, 
                 "[Test] Found {} ({} bytes), verifying ELF loading...\n",
                 ELFTEST_PATH,
                 data.len()
-            ));
+            );
 
             match process::Process::from_elf("elftest", &data) {
                 Ok(mut proc) => {
@@ -49,29 +47,29 @@ fn test_elftest() {
                     if exit_code == 42 {
                         console::print("[Test] elftest PASSED (ELF loading verified)\n");
                     } else {
-                        console::print(&format!(
+                        crate::safe_print!(96, 
                             "[Test] elftest FAILED: expected exit code 42, got {}\n",
                             exit_code
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
-                    console::print(&format!("[Test] Failed to load elftest: {}\n", e));
+                    crate::safe_print!(64, "[Test] Failed to load elftest: {}\n", e);
                 }
             }
         }
         Err(_) => {
             if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                console::print(&format!(
+                crate::safe_print!(64, 
                     "[Test] {} not found - FAIL\n",
                     ELFTEST_PATH
-                ));
+                );
                 panic!("Required test binary not found");
             } else {
-                console::print(&format!(
+                crate::safe_print!(96, 
                     "[Test] {} not found, skipping ELF loading test\n",
                     ELFTEST_PATH
-                ));
+                );
             }
         }
     }
@@ -83,18 +81,18 @@ fn test_stdcheck() {
 
     match fs::read_file(STDCHECK_PATH) {
         Ok(data) => {
-            console::print(&format!(
+            crate::safe_print!(128, 
                 "[Test] Found {} ({} bytes), executing with mmap allocator...\n",
                 STDCHECK_PATH,
                 data.len()
-            ));
+            );
 
             match process::Process::from_elf("stdcheck", &data) {
                 Ok(mut proc) => {
-                    console::print(&format!(
+                    crate::safe_print!(96, 
                         "[Test] Process created: PID={}, entry={:#x}\n",
                         proc.pid, proc.context.pc
-                    ));
+                    );
 
                     // Actually execute the process
                     let exit_code = proc.execute();
@@ -102,29 +100,29 @@ fn test_stdcheck() {
                     if exit_code == 0 {
                         console::print("[Test] stdcheck PASSED\n");
                     } else {
-                        console::print(&format!(
+                        crate::safe_print!(64, 
                             "[Test] stdcheck FAILED with exit code {}\n",
                             exit_code
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
-                    console::print(&format!("[Test] Failed to load stdcheck: {}\n", e));
+                    crate::safe_print!(64, "[Test] Failed to load stdcheck: {}\n", e);
                 }
             }
         }
         Err(_) => {
             if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                console::print(&format!(
+                crate::safe_print!(64, 
                     "[Test] {} not found - FAIL\n",
                     STDCHECK_PATH
-                ));
+                );
                 panic!("Required test binary not found");
             } else {
-                console::print(&format!(
+                crate::safe_print!(96, 
                     "[Test] {} not found, skipping mmap allocator test\n",
                     STDCHECK_PATH
-                ));
+                );
             }
         }
     }
@@ -138,19 +136,19 @@ fn test_echo2() {
     // Check if the binary exists
     match fs::read_file(ECHO2_PATH) {
         Ok(data) => {
-            console::print(&format!(
+            crate::safe_print!(96, 
                 "[Test] Found {} ({} bytes), attempting to execute...\n",
                 ECHO2_PATH,
                 data.len()
-            ));
+            );
 
             // Try to create a process from the ELF
             match process::Process::from_elf("echo2", &data) {
                 Ok(proc) => {
-                    console::print(&format!(
+                    crate::safe_print!(96, 
                         "[Test] Process created: PID={}, entry={:#x}\n",
                         proc.pid, proc.context.pc
-                    ));
+                    );
                     console::print("[Test] echo2 test PASSED (process creation succeeded)\n");
 
                     // Note: Actually executing the process would require
@@ -158,17 +156,17 @@ fn test_echo2() {
                     // that the ELF can be loaded.
                 }
                 Err(e) => {
-                    console::print(&format!("[Test] Failed to load echo2: {}\n", e));
+                    crate::safe_print!(64, "[Test] Failed to load echo2: {}\n", e);
                     console::print("[Test] echo2 test FAILED\n");
                 }
             }
         }
         Err(_) => {
             if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                console::print(&format!("[Test] {} not found - FAIL\n", ECHO2_PATH));
+                crate::safe_print!(64, "[Test] {} not found - FAIL\n", ECHO2_PATH);
                 panic!("Required test binary not found");
             } else {
-                console::print(&format!("[Test] {} not found, skipping test\n", ECHO2_PATH));
+                crate::safe_print!(64, "[Test] {} not found, skipping test\n", ECHO2_PATH);
             }
         }
     }

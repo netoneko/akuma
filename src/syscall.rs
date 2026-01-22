@@ -3,8 +3,6 @@
 //! Implements the syscall interface for user programs.
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
-use alloc::format;
-
 use crate::console;
 
 /// Syscall numbers (Linux-compatible subset)

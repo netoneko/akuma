@@ -361,12 +361,12 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Print PMM stats (now that allocator is ready for format!)
     let (total, allocated, free) = pmm::stats();
-    console::print(&alloc::format!(
+    crate::safe_print!(128, 
         "PMM stats: {} total pages, {} allocated, {} free\n",
         total,
         allocated,
         free
-    ));
+    );
 
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
@@ -389,7 +389,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         }
         Err(e) => {
             console::print("[RNG] Hardware RNG not available: ");
-            console::print(&alloc::format!("{}\n", e));
+            crate::safe_print!(32, "{}\n", e);
         }
     }
 
@@ -476,13 +476,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                         console::print("[FS] Root directory contents:\n");
                         for entry in entries {
                             if entry.is_dir {
-                                console::print(&alloc::format!("  [DIR]  {}\n", entry.name));
+                                crate::safe_print!(64, "  [DIR]  {}\n", entry.name);
                             } else {
-                                console::print(&alloc::format!(
+                                crate::safe_print!(64, 
                                     "  [FILE] {} ({} bytes)\n",
                                     entry.name,
                                     entry.size
-                                ));
+                                );
                             }
                         }
                     }
@@ -508,14 +508,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                 }
                 Err(e) => {
                     console::print("[FS] Filesystem init failed: ");
-                    console::print(&alloc::format!("{}\n", e));
+                    crate::safe_print!(32, "{}\n", e);
                     console::print("[FS] Continuing without filesystem...\n");
                 }
             }
         }
         Err(e) => {
             console::print("[Block] Block device not found: ");
-            console::print(&alloc::format!("{}\n", e));
+            crate::safe_print!(32, "{}\n", e);
             console::print("[Block] Continuing without filesystem...\n");
         }
     }
@@ -752,10 +752,10 @@ fn run_async_main() -> ! {
                 (0, "sys-512KB")
             };
             
-            console::print(&alloc::format!(
+            crate::safe_print!(160, 
                 "[Heartbeat] Loop {} | T{} | SP:{:#x} | Used:{}KB | Mode:{}\n",
                 count, tid, sp, stack_used_kb, stack_mode
-            ));
+            );
         }
 
         // Disable preemption during polling to protect embassy-net's internal RefCells.

@@ -7,8 +7,6 @@
 //!
 //! Run these tests after network initialization via `run_all()`.
 
-use alloc::format;
-
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::console;
@@ -40,14 +38,14 @@ pub fn run_all() -> bool {
     all_pass &= test_loopback_stack_init();
 
     console::print("\n==================================\n");
-    console::print(&format!(
+    crate::safe_print!(64, 
         "Async Tests: {}\n",
         if all_pass {
             "ALL PASSED"
         } else {
             "SOME FAILED"
         }
-    ));
+    );
     console::print("==================================\n\n");
 
     // Re-enabled to investigate EC=0x0 crash
@@ -79,10 +77,10 @@ fn test_embassy_timer() -> bool {
     // Run the test synchronously using a simple poll loop
     let success = run_async_test(test_future);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if success { "PASS" } else { "FAIL" }
-    ));
+    );
     success
 }
 
@@ -106,10 +104,10 @@ fn test_timer_multiple() -> bool {
 
     let success = run_async_test(test_future);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if success { "PASS" } else { "FAIL" }
-    ));
+    );
     success
 }
 
@@ -126,17 +124,17 @@ fn test_timer_accuracy() -> bool {
         let elapsed = start.elapsed().as_millis();
 
         // Should be between 50ms and 100ms (generous tolerance for bare metal)
-        console::print(&format!("  Elapsed: {}ms (expected ~50ms)\n", elapsed));
+        crate::safe_print!(64, "  Elapsed: {}ms (expected ~50ms)\n", elapsed);
 
         elapsed >= 50 && elapsed < 200
     };
 
     let success = run_async_test(test_future);
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if success { "PASS" } else { "FAIL" }
-    ));
+    );
     success
 }
 
@@ -151,14 +149,14 @@ fn test_loopback_device_creation() -> bool {
     let device = LoopbackDevice::new();
     let caps = embassy_net_driver::Driver::capabilities(&device);
 
-    console::print(&format!("  MTU: {}\n", caps.max_transmission_unit));
+    crate::safe_print!(32, "  MTU: {}\n", caps.max_transmission_unit);
 
     let success = caps.max_transmission_unit > 0;
 
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if success { "PASS" } else { "FAIL" }
-    ));
+    );
     success
 }
 
@@ -172,10 +170,10 @@ fn test_loopback_stack_init() -> bool {
     let success = true; // Stack creation is tested in compile
 
     console::print("  Stack types compile correctly\n");
-    console::print(&format!(
+    crate::safe_print!(64, 
         "  Result: {}\n",
         if success { "PASS" } else { "FAIL" }
-    ));
+    );
     success
 }
 
@@ -294,14 +292,14 @@ pub fn run_multi_session_tests() -> bool {
     all_pass &= test_async_tcp_primitives();
 
     console::print("\n====================================\n");
-    console::print(&format!(
+    crate::safe_print!(64, 
         "Multi-Session Tests: {}\n",
         if all_pass {
             "ALL PASSED"
         } else {
             "SOME FAILED"
         }
-    ));
+    );
     console::print("====================================\n\n");
 
     all_pass

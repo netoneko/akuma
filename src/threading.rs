@@ -2200,14 +2200,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
 
 pub fn dump_stack_info() {
     use crate::threading;
-    use crate::console;
-    use alloc::format;
     let threads = threading::list_kernel_threads();
 
     for t in threads {
         let size_kb = t.stack_size / 1024;
         let used_kb = t.stack_used / 1024;
-        console::print(&format!("Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb));
+        crate::safe_print!(192, "Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb);
     }
 }
 
@@ -2336,29 +2334,28 @@ pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSumma
 /// Print stack allocation summary to console
 pub fn print_stack_requirements() {
     use crate::console;
-    use alloc::format;
     
     let summary = calculate_stack_requirements();
     let heap_required = summary.system_total + summary.user_total;
     
     console::print("=== Stack Memory Requirements ===\n");
-    console::print(&format!("Boot stack (fixed):     {} KB\n", summary.boot_stack / 1024));
-    console::print(&format!("System threads:         {} × {} KB = {} KB\n",
+    crate::safe_print!(64, "Boot stack (fixed):     {} KB\n", summary.boot_stack / 1024);
+    crate::safe_print!(128, "System threads:         {} × {} KB = {} KB\n",
         summary.system_thread_count,
         summary.system_stack_size / 1024,
-        summary.system_total / 1024));
-    console::print(&format!("User threads:           {} × {} KB = {} KB\n",
+        summary.system_total / 1024);
+    crate::safe_print!(128, "User threads:           {} × {} KB = {} KB\n",
         summary.user_thread_count,
         summary.user_stack_size / 1024,
-        summary.user_total / 1024));
-    console::print(&format!("Exception area/thread:  {} KB (for IRQ/syscall handlers)\n",
-        summary.exception_stack_size / 1024));
-    console::print(&format!("Usable kernel stack:    {} KB (per thread, for execute() etc.)\n",
-        summary.usable_kernel_stack / 1024));
-    console::print(&format!("Total from heap:        {} KB ({} MB)\n",
+        summary.user_total / 1024);
+    crate::safe_print!(96, "Exception area/thread:  {} KB (for IRQ/syscall handlers)\n",
+        summary.exception_stack_size / 1024);
+    crate::safe_print!(96, "Usable kernel stack:    {} KB (per thread, for execute() etc.)\n",
+        summary.usable_kernel_stack / 1024);
+    crate::safe_print!(96, "Total from heap:        {} KB ({} MB)\n",
         heap_required / 1024,
-        heap_required / (1024 * 1024)));
-    console::print(&format!("Grand total:            {} KB ({} MB)\n",
+        heap_required / (1024 * 1024));
+    crate::safe_print!(96, "Grand total:            {} KB ({} MB)\n",
         summary.total_bytes / 1024,
-        summary.total_bytes / (1024 * 1024)));
+        summary.total_bytes / (1024 * 1024));
 }

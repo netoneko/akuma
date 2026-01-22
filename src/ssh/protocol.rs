@@ -1192,10 +1192,10 @@ async fn handle_message(
                     let mut exec_ctx = ShellContext::new();
                     offset += 1; // skip want_reply byte
                     if let Some(cmd_bytes) = read_string(payload, &mut offset) {
-                        crate::console::print(&alloc::format!(
+                        crate::safe_print!(64, 
                             "[SSH-EXEC] Command: {:?}\n",
                             core::str::from_utf8(cmd_bytes)
-                        ));
+                        );
 
                         let registry = create_default_registry();
                         let trimmed = trim_bytes(cmd_bytes);
