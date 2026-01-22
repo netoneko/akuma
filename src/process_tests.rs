@@ -150,15 +150,11 @@ fn test_echo2() {
                         proc.pid, proc.context.pc
                     );
                     console::print("[Test] echo2 test PASSED (process creation succeeded)\n");
-                    console::print("[Test] About to drop Process...\n");
 
                     // Note: Actually executing the process would require
                     // the full scheduler integration. For now, we just verify
                     // that the ELF can be loaded.
-                    
-                    // DEBUG: explicitly drop to trigger drop debug prints
                     drop(proc);
-                    console::print("[Test] Process dropped successfully\n");
                 }
                 Err(e) => {
                     crate::safe_print!(64, "[Test] Failed to load echo2: {}\n", e);

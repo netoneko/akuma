@@ -624,36 +624,17 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
-        crate::safe_print!(64, "[UAS] Drop ASID {} start\n", self.asid);
-        
-        // Debug: print Vec internal pointers
-        let user_ptr = self.user_frames.as_ptr() as usize;
-        let pt_ptr = self.page_table_frames.as_ptr() as usize;
-        crate::safe_print!(128, "[UAS] user_frames: len={} cap={} ptr=0x{:x}\n", 
-            self.user_frames.len(), self.user_frames.capacity(), user_ptr);
-        crate::safe_print!(128, "[UAS] page_table_frames: len={} cap={} ptr=0x{:x}\n", 
-            self.page_table_frames.len(), self.page_table_frames.capacity(), pt_ptr);
-        
         // Free all user pages
-        for (i, frame) in self.user_frames.iter().enumerate() {
-            if i < 3 || i >= self.user_frames.len().saturating_sub(1) {
-                crate::safe_print!(64, "[UAS] free user[{}]=0x{:x}\n", i, frame.addr);
-            }
+        for frame in &self.user_frames {
             pmm::free_page(*frame);
         }
-        crate::console::print("[UAS] user frames done\n");
 
         // Free all page table frames
-        for (i, frame) in self.page_table_frames.iter().enumerate() {
-            if i < 3 || i >= self.page_table_frames.len().saturating_sub(1) {
-                crate::safe_print!(64, "[UAS] free pt[{}]=0x{:x}\n", i, frame.addr);
-            }
+        for frame in &self.page_table_frames {
             pmm::free_page(*frame);
         }
-        crate::console::print("[UAS] pt frames done\n");
 
         // Free L0 table
-        crate::safe_print!(64, "[UAS] free L0=0x{:x}\n", self.l0_frame.addr);
         pmm::free_page(self.l0_frame);
 
         // Free ASID (with IRQ protection to prevent deadlock)
@@ -661,7 +642,6 @@ impl Drop for UserAddressSpace {
 
         // Flush TLB for this ASID
         flush_tlb_asid(self.asid);
-        crate::console::print("[UAS] Drop complete\n");
     }
 }
 

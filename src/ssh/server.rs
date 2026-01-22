@@ -116,30 +116,51 @@ static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 // add their buffer slots to this queue, and the main async loop frees them
 // AFTER polling the network runner (ensuring cleanup is complete).
 
-use spinning_top::Spinlock;
-
-/// Queue of buffer slots pending free (protected by spinlock for cross-thread access)
-static PENDING_BUFFER_FREE: Spinlock<Vec<usize>> = Spinlock::new(Vec::new());
+/// Static ring buffer for pending buffer frees - no heap allocation
+const PENDING_FREE_QUEUE_SIZE: usize = 32;
+static PENDING_FREE_SLOTS: [AtomicUsize; PENDING_FREE_QUEUE_SIZE] = {
+    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = empty slot
+    [INIT; PENDING_FREE_QUEUE_SIZE]
+};
+static PENDING_FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
+static PENDING_FREE_TAIL: AtomicUsize = AtomicUsize::new(0);
 
 /// Queue a buffer slot for deferred free (called from session threads)
 fn queue_buffer_free(slot: usize) {
-    let mut queue = PENDING_BUFFER_FREE.lock();
-    queue.push(slot);
+    let tail = PENDING_FREE_TAIL.load(Ordering::Relaxed);
+    let next_tail = (tail + 1) % PENDING_FREE_QUEUE_SIZE;
+    let head = PENDING_FREE_HEAD.load(Ordering::Relaxed);
+    
+    // Check if queue is full
+    if next_tail == head {
+        // Queue full - free immediately (less safe but better than dropping)
+        BUFFER_POOL.free(slot);
+        return;
+    }
+    
+    PENDING_FREE_SLOTS[tail].store(slot, Ordering::Release);
+    PENDING_FREE_TAIL.store(next_tail, Ordering::Release);
 }
 
 /// Process the pending buffer free queue (called from main async loop after polling)
 /// Returns number of buffers freed
 pub fn process_pending_buffer_frees() -> usize {
-    // Take all pending slots under the lock
-    let slots: Vec<usize> = {
-        let mut queue = PENDING_BUFFER_FREE.lock();
-        core::mem::take(&mut *queue)
-    };
-    
-    // Free them outside the lock
-    let count = slots.len();
-    for slot in slots {
-        BUFFER_POOL.free(slot);
+    let mut count = 0;
+    loop {
+        let head = PENDING_FREE_HEAD.load(Ordering::Acquire);
+        let tail = PENDING_FREE_TAIL.load(Ordering::Acquire);
+        
+        if head == tail {
+            break; // Queue empty
+        }
+        
+        let slot = PENDING_FREE_SLOTS[head].load(Ordering::Acquire);
+        PENDING_FREE_HEAD.store((head + 1) % PENDING_FREE_QUEUE_SIZE, Ordering::Release);
+        
+        if slot != usize::MAX {
+            BUFFER_POOL.free(slot);
+            count += 1;
+        }
     }
     count
 }

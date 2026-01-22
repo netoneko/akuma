@@ -13,7 +13,7 @@
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use embassy_executor::{Spawner, raw};
 
 use crate::console;
@@ -174,41 +174,82 @@ pub fn has_tasks() -> bool {
 // IRQ Work Queue (kept for interrupt -> task communication)
 // ============================================================================
 
-use alloc::vec::Vec;
-use spinning_top::Spinlock;
-
 /// Types of work that can be queued from interrupt context
+#[derive(Clone, Copy)]
 pub enum IrqWork {
+    /// No work (empty slot)
+    None,
     /// Signal that the executor should poll
     RunExecutorOnce,
     /// Wake a specific task (by signaling via waker)
     WakeTask,
 }
 
-static IRQ_WORK_QUEUE: Spinlock<Vec<IrqWork>> = Spinlock::new(Vec::new());
+/// Lock-free IRQ work queue using a static ring buffer
+/// No heap allocation - safe for IRQ context
+const IRQ_QUEUE_SIZE: usize = 16;
 
-/// Queue work from IRQ context (safe to call from interrupts)
-pub fn queue_irq_work(work: IrqWork) {
-    if let Some(mut queue) = IRQ_WORK_QUEUE.try_lock() {
-        queue.push(work);
+static IRQ_WORK_QUEUE: [AtomicU8; IRQ_QUEUE_SIZE] = {
+    const INIT: AtomicU8 = AtomicU8::new(0);
+    [INIT; IRQ_QUEUE_SIZE]
+};
+
+static IRQ_QUEUE_HEAD: AtomicUsize = AtomicUsize::new(0);
+static IRQ_QUEUE_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+impl IrqWork {
+    fn to_u8(self) -> u8 {
+        match self {
+            IrqWork::None => 0,
+            IrqWork::RunExecutorOnce => 1,
+            IrqWork::WakeTask => 2,
+        }
     }
+    
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => IrqWork::RunExecutorOnce,
+            2 => IrqWork::WakeTask,
+            _ => IrqWork::None,
+        }
+    }
+}
+
+/// Queue work from IRQ context (safe to call from interrupts - no allocation!)
+pub fn queue_irq_work(work: IrqWork) {
+    // Simple ring buffer push - if full, just drop the work
+    let tail = IRQ_QUEUE_TAIL.load(Ordering::Relaxed);
+    let next_tail = (tail + 1) % IRQ_QUEUE_SIZE;
+    let head = IRQ_QUEUE_HEAD.load(Ordering::Relaxed);
+    
+    // Check if queue is full
+    if next_tail == head {
+        return; // Queue full, drop work
+    }
+    
+    // Store the work item
+    IRQ_WORK_QUEUE[tail].store(work.to_u8(), Ordering::Release);
+    IRQ_QUEUE_TAIL.store(next_tail, Ordering::Release);
 }
 
 /// Process pending IRQ work (call from main loop)
 pub fn process_irq_work() {
-    let work_items = {
-        if let Some(mut queue) = IRQ_WORK_QUEUE.try_lock() {
-            core::mem::take(&mut *queue)
-        } else {
-            return;
+    loop {
+        let head = IRQ_QUEUE_HEAD.load(Ordering::Acquire);
+        let tail = IRQ_QUEUE_TAIL.load(Ordering::Acquire);
+        
+        if head == tail {
+            break; // Queue empty
         }
-    };
-
-    for work in work_items {
+        
+        let work = IrqWork::from_u8(IRQ_WORK_QUEUE[head].load(Ordering::Acquire));
+        IRQ_QUEUE_HEAD.store((head + 1) % IRQ_QUEUE_SIZE, Ordering::Release);
+        
         match work {
             IrqWork::RunExecutorOnce | IrqWork::WakeTask => {
                 run_once();
             }
+            IrqWork::None => {}
         }
     }
 }
