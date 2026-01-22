@@ -8,11 +8,7 @@
 
 use crate::mmu::{phys_to_virt, virt_to_phys};
 use core::ptr::NonNull;
-use spinning_top::Spinlock;
 use virtio_drivers::Hal;
-
-// Track which IRQs are registered for cleanup
-static REGISTERED_IRQS: Spinlock<alloc::vec::Vec<u32>> = Spinlock::new(alloc::vec::Vec::new());
 
 pub struct VirtioHal;
 

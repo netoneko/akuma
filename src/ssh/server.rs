@@ -8,8 +8,6 @@
 //! Each SSH session runs on its own kernel thread, allowing true concurrent
 //! execution and preemption via the timer interrupt.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -291,17 +289,6 @@ fn run_session_on_thread(stream: SendableTcpStream, session_id: usize, buffer_sl
 }
 
 // ============================================================================
-// Connection State (for fallback async handling)
-// ============================================================================
-
-/// Active SSH connection being handled (used when thread spawning fails)
-struct ActiveConnection {
-    future: Pin<Box<dyn Future<Output = ()>>>,
-    id: usize,
-    buffer_slot: usize,
-}
-
-// ============================================================================
 // SSH Server with Concurrent Connections
 // ============================================================================
 
@@ -328,67 +315,32 @@ pub async fn run(stack: Stack<'static>) {
     super::config::ensure_default_config().await;
     super::config::load_config().await;
 
-    // Fallback connections (used when thread spawning fails)
-    let mut fallback_connections: Vec<ActiveConnection> = Vec::new();
     let mut next_id: usize = 0;
 
     // Listening socket state
     let mut listen_socket: Option<TcpSocket<'static>> = None;
     let mut listen_buffer_slot: Option<usize> = None;
 
-    // Create waker for manual polling
-    static VTABLE_POLL: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE_POLL),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-
     loop {
-        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE_POLL);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
-        let mut cx = Context::from_waker(&waker);
-
-        // =====================================================================
-        // Poll fallback connections (sessions that couldn't get a thread)
-        // =====================================================================
-        let mut i = 0;
-        while i < fallback_connections.len() {
-            match fallback_connections[i].future.as_mut().poll(&mut cx) {
-                Poll::Ready(()) => {
-                    let conn = fallback_connections.swap_remove(i);
-                    log(&alloc::format!(
-                        "[SSH Server] Fallback connection {} ended\n",
-                        conn.id
-                    ));
-                    free_buffer_slot(conn.buffer_slot);
-                }
-                Poll::Pending => {
-                    i += 1;
-                }
-            }
-        }
-
         // =====================================================================
         // Accept new connections
         // =====================================================================
         let active_sessions = ACTIVE_SESSIONS.load(Ordering::Relaxed);
-        let total_active = active_sessions + fallback_connections.len();
         let sys_threads_avail = crate::threading::system_threads_available();
 
-        // Periodic status log (every ~1000 iterations when idle)
+        // Periodic status log (every ~10000 iterations when idle)
         static mut ACCEPT_COUNTER: u32 = 0;
         unsafe {
             ACCEPT_COUNTER = ACCEPT_COUNTER.wrapping_add(1);
             if ACCEPT_COUNTER % 10000 == 0 {
                 log(&alloc::format!(
-                    "[SSH Status] active={} fallback={} sys_avail={} max={}\n",
-                    active_sessions, fallback_connections.len(), sys_threads_avail, MAX_CONNECTIONS
+                    "[SSH Status] active={} sys_avail={} max={}\n",
+                    active_sessions, sys_threads_avail, MAX_CONNECTIONS
                 ));
             }
         }
 
-        if total_active < MAX_CONNECTIONS {
+        if active_sessions < MAX_CONNECTIONS && sys_threads_avail > 0 {
             // Ensure we have a listening socket
             if listen_socket.is_none() {
                 let slot = listen_buffer_slot
@@ -403,7 +355,7 @@ pub async fn run(stack: Stack<'static>) {
 
             if let Some(ref mut socket) = listen_socket {
                 // Use short timeout to keep the loop responsive
-                let accept_timeout = if total_active == 0 {
+                let accept_timeout = if active_sessions == 0 {
                     Duration::from_millis(100)
                 } else {
                     Duration::from_millis(10)
@@ -419,53 +371,30 @@ pub async fn run(stack: Stack<'static>) {
 
                         let connected_socket = listen_socket.take().unwrap();
                         let stream = TcpStream::from_socket(connected_socket);
+                        let sendable = SendableTcpStream(stream);
 
-                        // Try to spawn a system thread for this session
-                        let available = crate::threading::system_threads_available();
-                        if available > 0 {
-                            let sendable = SendableTcpStream(stream);
-                            match crate::threading::spawn_system_thread_fn(move || {
-                                run_session_on_thread(sendable, id, buffer_slot)
-                            }) {
-                                Ok(thread_id) => {
-                                    log(&alloc::format!(
-                                        "[SSH Server] Connection {} spawned on thread {} (active: {})\n",
-                                        id,
-                                        thread_id,
-                                        ACTIVE_SESSIONS.load(Ordering::Relaxed) + 1
-                                    ));
-                                }
-                                Err(e) => {
-                                    log(&alloc::format!(
-                                        "[SSH Server] Thread spawn failed: {}, using fallback\n",
-                                        e
-                                    ));
-                                    // Reconstruct stream (can't unwrap sendable) - use fallback
-                                    // Note: The sendable was moved into the closure, so we need
-                                    // to handle this case differently. For now, just allocate new buffers.
-                                    let slot2 = alloc_buffer_slot();
-                                    if let Some(new_slot) = slot2 {
-                                        let (rx2, tx2) = unsafe { get_buffer_refs(new_slot) };
-                                        let mut sock2 = TcpSocket::new(stack, rx2, tx2);
-                                        sock2.set_timeout(Some(Duration::from_secs(60)));
-                                        // Can't reuse the stream, it was consumed
-                                        free_buffer_slot(new_slot);
-                                    }
-                                    free_buffer_slot(buffer_slot);
-                                }
+                        // Spawn system thread for this session
+                        // Note: we already checked sys_threads_avail > 0 before entering this block
+                        match crate::threading::spawn_system_thread_fn(move || {
+                            run_session_on_thread(sendable, id, buffer_slot)
+                        }) {
+                            Ok(thread_id) => {
+                                log(&alloc::format!(
+                                    "[SSH Server] Connection {} spawned on thread {} (active: {})\n",
+                                    id,
+                                    thread_id,
+                                    ACTIVE_SESSIONS.load(Ordering::Relaxed) + 1
+                                ));
                             }
-                        } else {
-                            // No system threads available - use fallback async mode
-                            log(&alloc::format!(
-                                "[SSH Server] No system threads, connection {} using fallback async\n",
-                                id
-                            ));
-                            let future = Box::pin(handle_connection_wrapper(stream, id));
-                            fallback_connections.push(ActiveConnection {
-                                future,
-                                id,
-                                buffer_slot,
-                            });
+                            Err(e) => {
+                                // Thread spawn failed - just log and drop the connection
+                                // The sendable was moved into the closure so we can't recover it
+                                log(&alloc::format!(
+                                    "[SSH Server] Thread spawn failed: {}, dropping connection\n",
+                                    e
+                                ));
+                                free_buffer_slot(buffer_slot);
+                            }
                         }
                     }
                     Ok(Err(e)) => {
@@ -503,16 +432,6 @@ pub async fn run(stack: Stack<'static>) {
 }
 
 /// Wrapper for handle_connection that logs start/end (used for fallback async mode)
-async fn handle_connection_wrapper(stream: TcpStream, id: usize) {
-    log(&alloc::format!(
-        "[SSH {}] Starting fallback async session on thread {}\n",
-        id,
-        crate::threading::current_thread_id()
-    ));
-    protocol::handle_connection(stream).await;
-    log(&alloc::format!("[SSH {}] Fallback session ended\n", id));
-}
-
 fn log(msg: &str) {
     console::print(msg);
 }
