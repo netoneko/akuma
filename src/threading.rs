@@ -41,8 +41,27 @@ static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
-/// Current running thread - lock-free access
-static CURRENT_THREAD: AtomicUsize = AtomicUsize::new(0);
+/// Current running thread - stored in TPIDR_EL0 register
+/// Using a CPU register avoids race conditions with global atomics.
+/// TPIDR_EL0 is accessible from EL1 and provides per-CPU thread tracking.
+
+/// Set the current thread ID in TPIDR_EL0
+#[inline]
+fn set_current_thread_register(tid: usize) {
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) tid as u64);
+    }
+}
+
+/// Get the current thread ID from TPIDR_EL0
+#[inline]
+fn get_current_thread_register() -> usize {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) val);
+    }
+    val as usize
+}
 
 /// Atomically claim a free slot in the given range
 /// Returns the slot index if successful, None if no free slots
@@ -154,7 +173,7 @@ pub fn cleanup_terminated_force() -> usize {
 fn cleanup_terminated_internal(force: bool) -> usize {
     // In deferred mode (unless forced), only allow cleanup from thread 0
     if !force && config::DEFERRED_THREAD_CLEANUP {
-        let current = CURRENT_THREAD.load(Ordering::SeqCst);
+        let current = get_current_thread_register();
         if current != IDLE_THREAD_IDX {
             // Not main thread - skip cleanup
             return 0;
@@ -293,7 +312,7 @@ const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
 /// Use this to protect code that uses RefCell or other non-thread-safe structures.
 #[inline]
 pub fn disable_preemption() {
-    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let tid = get_current_thread_register();
     let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
     // Record timestamp on first disable (nesting level 0 -> 1)
     if prev == 0 {
@@ -306,7 +325,7 @@ pub fn disable_preemption() {
 /// Must be called once for each call to `disable_preemption()`.
 #[inline]
 pub fn enable_preemption() {
-    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let tid = get_current_thread_register();
     let prev = PREEMPTION_DISABLED[tid].fetch_sub(1, Ordering::SeqCst);
     debug_assert!(prev > 0, "enable_preemption called without matching disable");
     // Clear timestamp when fully re-enabled (nesting level 1 -> 0)
@@ -318,7 +337,7 @@ pub fn enable_preemption() {
 /// Check if preemption is currently disabled for the current thread.
 #[inline]
 pub fn is_preemption_disabled() -> bool {
-    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let tid = get_current_thread_register();
     PREEMPTION_DISABLED[tid].load(Ordering::SeqCst) > 0
 }
 
@@ -328,7 +347,7 @@ pub fn is_preemption_disabled() -> bool {
 /// - None: preemption not disabled or within normal time
 /// - Some(duration_us): preemption disabled for this many microseconds
 pub fn check_preemption_watchdog() -> Option<u64> {
-    let tid = CURRENT_THREAD.load(Ordering::SeqCst);
+    let tid = get_current_thread_register();
     let now = crate::timer::uptime_us();
     
     // Detect time jumps (host sleep/wake)
@@ -444,7 +463,7 @@ switch_context:
     // CRITICAL: Do NOT restore DAIF here!
     // 
     // Restoring DAIF could unmask IRQs mid-switch, allowing a nested timer
-    // interrupt. Since CURRENT_THREAD was already updated, the nested handler
+    // interrupt. Since TPIDR_EL0 was already updated, the nested handler
     // would save the wrong thread's context, causing corruption.
     //
     // IRQs must stay MASKED throughout switch_context.
@@ -1215,8 +1234,8 @@ impl ThreadPool {
     ///   - Cooperative threads (thread 0): Only switch after timeout elapses
     ///   - Non-cooperative threads (sessions, user processes): Always preemptible
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
-        // Use atomic CURRENT_THREAD instead of self.current_idx
-        let current_idx = CURRENT_THREAD.load(Ordering::SeqCst);
+        // Use TPIDR_EL0 register for current thread ID - more reliable than atomic
+        let current_idx = get_current_thread_register();
         let current = &self.slots[current_idx];
 
         // For timer-triggered preemption, first check if preemption is explicitly disabled.
@@ -1253,7 +1272,7 @@ impl ThreadPool {
                     }
                     THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
                     self.slots[0].start_time_us = crate::timer::uptime_us();
-                    CURRENT_THREAD.store(0, Ordering::SeqCst);
+                    set_current_thread_register(0);
                     self.current_idx = 0;
                     return Some((current_idx, 0));
                 }
@@ -1312,8 +1331,8 @@ impl ThreadPool {
         // Update timing (still in slot, but we own it)
         self.slots[next_idx].start_time_us = crate::timer::uptime_us();
 
-        // Update current thread atomically
-        CURRENT_THREAD.store(next_idx, Ordering::SeqCst);
+        // Update current thread in CPU register (authoritative source of truth)
+        set_current_thread_register(next_idx);
         self.current_idx = next_idx; // Keep in sync for context access
         
         Some((current_idx, next_idx))
@@ -1417,7 +1436,7 @@ pub fn init() {
     for i in 1..config::MAX_THREADS {
         THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
     }
-    CURRENT_THREAD.store(0, Ordering::SeqCst);
+    set_current_thread_register(0);  // Initialize CPU register for boot thread
 }
 
 /// Spawn a new preemptible thread with extern "C" entry and default stack
@@ -1597,7 +1616,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // Update exception stack BEFORE switching
             crate::exceptions::set_current_exception_stack(new_tpidr);
             
-            // Note: CURRENT_THREAD is already updated by schedule_indices
+            // Note: TPIDR_EL0 (thread ID) is already updated by schedule_indices
             
             switch_context(old_ptr, new_ptr);
             
@@ -1800,15 +1819,17 @@ pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
 
 /// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
 pub fn mark_current_terminated() {
-    let idx = CURRENT_THREAD.load(Ordering::SeqCst);
+    let idx = get_current_thread_register();
     if idx != IDLE_THREAD_IDX {
         mark_thread_terminated(idx);
     }
 }
 
-/// Get current thread ID - LOCK-FREE
+/// Get current thread ID from TPIDR_EL0 register
+/// This is more reliable than a global atomic as it's per-CPU
+#[inline]
 pub fn current_thread_id() -> usize {
-    CURRENT_THREAD.load(Ordering::SeqCst)
+    get_current_thread_register()
 }
 
 /// Get max thread count
