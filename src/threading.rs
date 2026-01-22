@@ -359,12 +359,14 @@ pub fn check_preemption_watchdog() -> Option<u64> {
     let duration = now.saturating_sub(disabled_since);
     
     if duration >= PREEMPTION_WATCHDOG_PANIC_US {
-        // Critical: been disabled way too long - panic
-        panic!(
-            "WATCHDOG: Thread {} preemption disabled for {}ms - system stuck!",
-            tid,
-            duration / 1000
-        );
+        // Critical: been disabled way too long - just log and continue
+        // DO NOT use panic! here - we're in IRQ context
+        crate::console::print("[WATCHDOG] Thread ");
+        crate::console::print_dec(tid);
+        crate::console::print(" preemption disabled ");
+        crate::console::print_u64(duration / 1000);
+        crate::console::print("ms (critical)\n");
+        return Some(duration);
     } else if duration >= PREEMPTION_WATCHDOG_WARN_US {
         // Warning: something is slow
         return Some(duration);
