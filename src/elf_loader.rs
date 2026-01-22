@@ -107,15 +107,11 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let flags = phdr.p_flags;
 
         if DEBUG_ELF_LOADING {
-            crate::console::print(&alloc::format!(
-                "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
-                vaddr,
-                filesz,
-                memsz,
+            crate::safe_print!(128, "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+                vaddr, filesz, memsz,
                 if flags & PF_R != 0 { "R" } else { "-" },
                 if flags & PF_W != 0 { "W" } else { "-" },
-                if flags & PF_X != 0 { "X" } else { "-" },
-            ));
+                if flags & PF_X != 0 { "X" } else { "-" });
         }
 
         // Use appropriate flags based on segment permissions
@@ -180,12 +176,8 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     }
 
     if DEBUG_ELF_LOADING {
-        crate::console::print(&alloc::format!(
-            "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
-            entry_point,
-            brk,
-            mapped_pages.len()
-        ));
+        crate::safe_print!(80, "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
+            entry_point, brk, mapped_pages.len());
     }
 
     Ok(LoadedElf {
@@ -262,14 +254,8 @@ pub fn load_elf_with_stack(
     let initial_sp_local = (stack_end - 16) & !0xF;
 
     if DEBUG_ELF_LOADING {
-        crate::console::print(&alloc::format!(
-            "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), guard=0x{:x}, SP=0x{:x}\n",
-            stack_bottom_aligned,
-            stack_end,
-            stack_pages,
-            guard_page,
-            initial_sp_local
-        ));
+        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), guard=0x{:x}, SP=0x{:x}\n",
+            stack_bottom_aligned, stack_end, stack_pages, guard_page, initial_sp_local);
     }
 
     // Pre-allocate heap pages (64KB = 16 pages, unrolled)
@@ -294,10 +280,7 @@ pub fn load_elf_with_stack(
     let _ = loaded.address_space.alloc_and_map(hs + 0xf000, f);
 
     if DEBUG_ELF_LOADING {
-        crate::console::print(&alloc::format!(
-            "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n",
-            hs
-        ));
+        crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
     }
 
     // The allocator expects brk(0) to return current brk, then allocates FROM that address.

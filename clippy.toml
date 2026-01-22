@@ -1,0 +1,24 @@
+# Clippy configuration for Akuma kernel
+#
+# CRITICAL: Heap-allocating macros are banned in the kernel!
+# Using format!, vec!, etc. in exception handlers, IRQ handlers, or any
+# code that runs with IRQs disabled can cause heap corruption and crashes.
+#
+# Use safe_print! macro instead, which allocates on the stack.
+
+# Ban heap-allocating formatting macros
+disallowed-macros = [
+    # format! allocates a String on the heap
+    { path = "alloc::format", reason = "Use safe_print! macro instead - format! allocates on heap which can corrupt memory in IRQ/exception handlers" },
+    { path = "core::format_args", reason = "Prefer safe_print! for kernel printing" },
+    
+    # vec! allocates on heap - use arrays or static allocation
+    # Note: vec! is sometimes needed, so this is a warning to be careful
+    # { path = "alloc::vec", reason = "Consider using fixed-size arrays instead of heap allocation" },
+]
+
+# Also warn about these patterns
+disallowed-methods = [
+    # String::from and to_string allocate
+    # These are too common to ban outright, but be aware
+]

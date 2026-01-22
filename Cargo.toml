@@ -14,6 +14,10 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+# Clippy lints - deny heap-allocating macros that can cause corruption
+[lints.clippy]
+disallowed_macros = "deny"
+
 [dependencies]
 talc = "4"
 spinning_top = "0.3"

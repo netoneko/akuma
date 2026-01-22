@@ -278,6 +278,8 @@ irq_el0_handler:
     // Restore ELR_EL1 and SPSR_EL1
     ldp     x0, x1, [x10, #248]
     msr     elr_el1, x0
+    // Clear IL bit (bit 20) in case of stack corruption - prevents EC=0xe
+    bic     x1, x1, #0x100000
     msr     spsr_el1, x1
     
     ldr     x30, [x10, #240]
@@ -351,7 +353,10 @@ irq_handler:
     ldp     x10, x11, [sp], #16
     msr     elr_el1, x10
     // Clear IRQ mask bit before restoring SPSR (ensure IRQs enabled after ERET)
-    bic     x11, x11, #0x80
+    // Also clear IL bit (bit 20) - if set due to stack corruption, would cause
+    // Illegal Execution State exception (EC=0xe) after ERET
+    bic     x11, x11, #0x80         // Clear I bit (IRQ mask)
+    bic     x11, x11, #0x100000     // Clear IL bit (Illegal state)
     
     // SAFETY CHECK: Ensure we're returning to EL1h (kernel mode with SP_EL1)
     // Valid SPSR bits[3:0] for kernel:

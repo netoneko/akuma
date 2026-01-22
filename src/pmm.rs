@@ -72,14 +72,9 @@ impl FrameTracker {
     }
 
     fn track(&mut self, addr: usize, source: FrameSource, pid: u32) {
-        if let Some(old) = self.allocations.insert(addr, FrameInfo { source, pid }) {
-            // Double allocation detected!
-            crate::console::print(&alloc::format!(
-                "[PMM WARN] Double allocation at 0x{:x}! Old: {:?}, New: {:?}\n",
-                addr,
-                old.source,
-                source
-            ));
+        if let Some(_old) = self.allocations.insert(addr, FrameInfo { source, pid }) {
+            // Double allocation detected! Use stack-only print to avoid heap in PMM
+            crate::console::print("[PMM WARN] Double allocation detected!\n");
         }
         match source {
             FrameSource::Kernel => self.kernel_count += 1,
@@ -109,10 +104,8 @@ impl FrameTracker {
             self.total_untracked += 1;
             Some(info)
         } else {
-            crate::console::print(&alloc::format!(
-                "[PMM WARN] Freeing untracked frame at 0x{:x}\n",
-                addr
-            ));
+            // Use stack-only print to avoid heap in PMM
+            crate::console::print("[PMM WARN] Freeing untracked frame\n");
             None
         }
     }

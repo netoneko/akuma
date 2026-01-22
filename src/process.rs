@@ -332,11 +332,12 @@ pub fn read_current_pid() -> Option<Pid> {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
     }
     
-    // Boot TTBR0 is in 0x402xxxxx range (stored physical address of boot page tables)
-    // User TTBR0 has ASID in upper bits and user L0 address in lower bits (0x44xxxxxx+)
-    // We check if the lower 48 bits are in the boot range
+    // Compare against actual boot TTBR0, not a range check.
+    // User page tables are allocated from the same physical memory pool,
+    // so they can have addresses in the same range as boot tables.
+    let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
     let ttbr0_addr = ttbr0 & 0x0000_FFFF_FFFF_FFFF; // Mask off ASID bits
-    if ttbr0_addr >= 0x4020_0000 && ttbr0_addr < 0x4400_0000 {
+    if ttbr0_addr == boot_ttbr0 {
         return None; // Boot TTBR0 - no user process context
     }
     
@@ -381,10 +382,7 @@ pub fn alloc_mmap(size: usize) -> usize {
     match proc.memory.alloc_mmap(size) {
         Some(addr) => addr,
         None => {
-            console::print(&alloc::format!(
-                "[mmap] REJECT: size 0x{:x} exceeds limit\n",
-                size
-            ));
+            crate::safe_print!(64, "[mmap] REJECT: size 0x{:x} exceeds limit\n", size);
             0
         }
     }
@@ -698,15 +696,8 @@ impl Process {
         // Initialize per-process memory tracking
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
 
-        console::print(&alloc::format!(
-            "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
-            pid,
-            brk,
-            stack_bottom,
-            stack_top,
-            memory.next_mmap,
-            memory.mmap_limit
-        ));
+        crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
 
         Ok(Self {
             pid,
@@ -797,10 +788,8 @@ impl Process {
             let stack_region_start = 0x41F00000u64; // Approximate stack region start
             let stack_region_end = 0x43000000u64;   // Approximate stack region end
             if info_ptr_val >= stack_region_start && info_ptr_val < stack_region_end {
-                console::print(&alloc::format!(
-                    "[CRITICAL] process_info_phys={:#x} points into stack region! info_ptr={:#x} entry_sp={:#x}\n",
-                    self.process_info_phys, info_ptr_val, entry_sp
-                ));
+                crate::safe_print!(128, "[CRITICAL] process_info_phys={:#x} points into stack region! info_ptr={:#x} entry_sp={:#x}\n",
+                    self.process_info_phys, info_ptr_val, entry_sp);
             }
             
             // Convert args to &str slices for ProcessInfo::with_args
@@ -821,10 +810,8 @@ impl Process {
             // DEBUG: Check if writing ProcessInfo corrupted entry_sp
             let current_val = *((entry_sp) as *const u64);
             if current_val != self.kernel_ctx.entry_stack[0] {
-                console::print(&alloc::format!(
-                    "[CORRUPT] entry_sp[0] changed AFTER ProcessInfo write! was={:#x} now={:#x} info_ptr={:#x}\n",
-                    self.kernel_ctx.entry_stack[0], current_val, info_ptr_val
-                ));
+                crate::safe_print!(128, "[CORRUPT] entry_sp[0] changed AFTER ProcessInfo write! was={:#x} now={:#x} info_ptr={:#x}\n",
+                    self.kernel_ctx.entry_stack[0], current_val, info_ptr_val);
             }
         }
 
@@ -884,12 +871,8 @@ impl Process {
         
         if tid < 8 {
             // Blocking execution on system thread - safe to print and re-enable IRQs
-            console::print(&alloc::format!(
-                "[Process] '{}' (PID {}) exited with code {}\n",
-                self.name,
-                self.pid,
-                exit_code
-            ));
+            crate::safe_print!(96, "[Process] '{}' (PID {}) exited with code {}\n",
+                self.name, self.pid, exit_code);
             crate::irq::enable_irqs();
         }
         // For user threads (8+), IRQs stay disabled until caller marks terminated.
@@ -1049,10 +1032,8 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // Check entry_sp+0 for PID (critical - indicates ProcessInfo written to stack)
             let val_at_0 = unsafe { *(ctx.entry_sp as *const u64) };
             if ctx.entry_stack[0] == 0 && val_at_0 == proc.pid as u64 {
-                console::print(&alloc::format!(
-                    "[STACK CORRUPTION] PID {} found at entry_sp+0! ProcessInfo written to stack.\n",
-                    proc.pid
-                ));
+                crate::safe_print!(96, "[STACK CORRUPTION] PID {} found at entry_sp+0! ProcessInfo written to stack.\n",
+                    proc.pid);
                 corruption_detected = true;
             }
             
@@ -1060,29 +1041,23 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             let val_at_24 = unsafe { *((ctx.entry_sp + 24) as *const u64) };
             if ctx.entry_stack[3] == 0 && (val_at_24 & 0xFF) == 0x2F {
                 // 0x2F is '/' - likely path string corruption
-                console::print(&alloc::format!(
-                    "[STACK CORRUPTION] Path string detected at entry_sp+24: {:#x}\n",
-                    val_at_24
-                ));
+                crate::safe_print!(96, "[STACK CORRUPTION] Path string detected at entry_sp+24: {:#x}\n",
+                    val_at_24);
                 corruption_detected = true;
             }
             
             if corruption_detected {
                 // Full diagnostic dump for debugging
-                console::print(&alloc::format!(
-                    "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
-                    proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30
-                ));
+                crate::safe_print!(160, "[return_to_kernel] PID={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
+                    proc.pid, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30);
                 console::print("  Full stack comparison:\n");
                 for i in 0..8 {
                     let addr = ctx.entry_sp + i as u64 * 8;
                     let current = unsafe { *(addr as *const u64) };
                     let saved = ctx.entry_stack[i];
                     if current != saved {
-                        console::print(&alloc::format!(
-                            "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
-                            i*8, saved, current
-                        ));
+                        crate::safe_print!(64, "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
+                            i*8, saved, current);
                     }
                 }
             }
@@ -1109,14 +1084,10 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             };
             
             crate::console::print("[return_to_kernel] ERROR: no current process!\n");
-            crate::console::print(&alloc::format!(
-                "  Thread={}, raw_pid_at_0x1000={}, TTBR0={:#x}\n",
-                tid, raw_pid, ttbr0
-            ));
-            crate::console::print(&alloc::format!(
-                "  ELR={:#x}, SPSR={:#x}, SP={:#x}\n",
-                elr, spsr, sp
-            ));
+            crate::safe_print!(96, "  Thread={}, raw_pid_at_0x1000={}, TTBR0={:#x}\n",
+                tid, raw_pid, ttbr0);
+            crate::safe_print!(64, "  ELR={:#x}, SPSR={:#x}, SP={:#x}\n",
+                elr, spsr, sp);
             
             // Check if TTBR0 looks like boot page tables
             if ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
@@ -1127,9 +1098,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // 1. Mark any ProcessChannel as exited with error
             if let Some(channel) = remove_channel(tid) {
                 channel.set_exited(-1);  // Signal error exit to SSH
-                crate::console::print(&alloc::format!(
-                    "[return_to_kernel] Cleaned up ProcessChannel for thread {}\n", tid
-                ));
+                crate::safe_print!(64, "[return_to_kernel] Cleaned up ProcessChannel for thread {}\n", tid);
             }
             
             // 2. Restore boot TTBR0 so kernel can continue safely
@@ -1138,9 +1107,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // 3. Mark thread as terminated so scheduler stops scheduling it
             crate::threading::mark_current_terminated();
             
-            crate::console::print(&alloc::format!(
-                "[return_to_kernel] Thread {} marked terminated, yielding\n", tid
-            ));
+            crate::safe_print!(64, "[return_to_kernel] Thread {} marked terminated, yielding\n", tid);
             
             // 4. Yield and let other threads run
             // This thread will be cleaned up by Thread 0's cleanup routine
@@ -1334,9 +1301,7 @@ pub fn spawn_process_with_channel(
 ) -> Result<(usize, Arc<ProcessChannel>), String> {
     // Check if user threads are available
     let avail = crate::threading::user_threads_available();
-    crate::console::print(&alloc::format!(
-        "[spawn_process] path={} user_threads_available={}\n", path, avail
-    ));
+    crate::safe_print!(64, "[spawn_process] path={} user_threads_available={}\n", path, avail);
     if avail == 0 {
         return Err("No available user threads for process execution".into());
     }
@@ -1398,10 +1363,7 @@ pub fn spawn_process_with_channel(
         crate::irq::enable_irqs();
         
         // Print exit info now that IRQs are enabled (safe to acquire console lock)
-        console::print(&alloc::format!(
-            "[Process] Thread {} exited with code {}\n",
-            tid, exit_code
-        ));
+        crate::safe_print!(64, "[Process] Thread {} exited with code {}\n", tid, exit_code);
 
         // This loop should never be reached, but just in case
         // Thread is terminated, so scheduler won't pick it, but we yield
@@ -1412,9 +1374,7 @@ pub fn spawn_process_with_channel(
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
-    crate::console::print(&alloc::format!(
-        "[spawn_process] spawned thread {} for {}\n", thread_id, path
-    ));
+    crate::safe_print!(64, "[spawn_process] spawned thread {} for {}\n", thread_id, path);
     Ok((thread_id, channel))
 }
 

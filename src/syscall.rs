@@ -225,18 +225,13 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// # Arguments
 /// * `code` - Exit code
 fn sys_exit(code: i32) -> u64 {
-    let tid = crate::threading::current_thread_id();
-    crate::safe_print!(64, "[sys_exit] Thread {} exiting with code {}\n", tid, code);
-    
     // Update per-process state only
     if let Some(proc) = crate::process::current_process() {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
-        crate::safe_print!(64, "[sys_exit] Set proc.exited=true for PID {}\n", proc.pid);
-    } else {
-        crate::console::print("[sys_exit] WARNING: No current process!\n");
     }
+    // Note: If no current process, this is a kernel thread calling exit which is harmless
 
     // Return won't matter - process is terminated
     code as u64
