@@ -627,10 +627,6 @@ pub struct Process {
     /// Exit code (valid when exited=true)
     pub exit_code: i32,
 
-    // ========== Kernel context for return ==========
-    /// Saved kernel context (callee-saved registers for returning after exit)
-    pub kernel_ctx: KernelContext,
-
     // ========== Dynamic page table tracking ==========
     /// Page table frames allocated during mmap (for cleanup on exit)
     /// These are allocated by map_user_page() and need to be freed separately
@@ -638,55 +634,6 @@ pub struct Process {
     pub dynamic_page_tables: Vec<PhysFrame>,
 }
 
-/// Magic value for KernelContext integrity check
-const KERNEL_CTX_MAGIC: u64 = 0xDEAD_BEEF_CAFE_1234;
-
-/// Kernel context - callee-saved registers that must be preserved across user mode execution
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct KernelContext {
-    pub sp: u64,
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64, // frame pointer
-    pub x30: u64, // return address
-    // Debug: saved at execute() entry
-    pub entry_x30: u64,  // x30 when execute() was called (return addr to closure)
-    pub entry_sp: u64,   // SP when execute() was called
-    pub entry_x29: u64,  // frame pointer at entry
-    // Stack frame snapshot at entry (first 8 values)
-    pub entry_stack: [u64; 8],
-    // Integrity check
-    pub magic: u64,
-}
-
-impl Default for KernelContext {
-    fn default() -> Self {
-        Self {
-            sp: 0,
-            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
-            x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-            entry_x30: 0, entry_sp: 0, entry_x29: 0,
-            entry_stack: [0; 8],
-            magic: KERNEL_CTX_MAGIC,
-        }
-    }
-}
-
-impl KernelContext {
-    /// Check if the context magic is intact
-    pub fn is_valid(&self) -> bool {
-        self.magic == KERNEL_CTX_MAGIC
-    }
-}
 
 impl Process {
     /// Create a new process from ELF data
@@ -743,8 +690,6 @@ impl Process {
             stdout_buf: Vec::new(),
             exited: false,
             exit_code: 0,
-            // Kernel context - set before entering user mode
-            kernel_ctx: KernelContext::default(),
             // Dynamic page tables - for mmap-allocated page tables
             dynamic_page_tables: Vec::new(),
         })
@@ -773,29 +718,16 @@ impl Process {
         }
     }
 
-    /// Execute the process synchronously, returning when it exits
+    /// Execute the process - enters user mode and never returns
     ///
-    /// Returns the exit code
-    pub fn execute(&mut self) -> i32 {
-        // FIRST THING: Save entry registers and stack before anything else
-        let entry_x30: u64;
-        let entry_sp: u64;
-        let entry_x29: u64;
-        unsafe {
-            core::arch::asm!("mov {}, x30", out(reg) entry_x30);
-            core::arch::asm!("mov {}, sp", out(reg) entry_sp);
-            core::arch::asm!("mov {}, x29", out(reg) entry_x29);
-        }
-        self.kernel_ctx.entry_x30 = entry_x30;
-        self.kernel_ctx.entry_sp = entry_sp;
-        self.kernel_ctx.entry_x29 = entry_x29;
-        // Save first 8 stack values
-        for i in 0..8 {
-            self.kernel_ctx.entry_stack[i] = unsafe { 
-                *((entry_sp + i as u64 * 8) as *const u64) 
-            };
-        }
-        
+    /// UNIFIED CONTEXT ARCHITECTURE:
+    /// This function enters user mode via ERET and never returns.
+    /// When the user process exits, return_to_kernel() is called from
+    /// the exception handler, which terminates the thread.
+    ///
+    /// The exit code is communicated via ProcessChannel for async callers.
+    /// Synchronous execution should use exec_async() and poll for completion.
+    pub fn execute(&mut self) -> ! {
         self.state = ProcessState::Running;
 
         // Reset per-process I/O state
@@ -806,16 +738,6 @@ impl Process {
         // is mapped read-only in the user's address space
         unsafe {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
-            
-            // DEBUG: Check if info_ptr is anywhere near the kernel stack
-            // If this fires, we have a memory corruption bug
-            let info_ptr_val = info_ptr as u64;
-            let stack_region_start = 0x41F00000u64; // Approximate stack region start
-            let stack_region_end = 0x43000000u64;   // Approximate stack region end
-            if info_ptr_val >= stack_region_start && info_ptr_val < stack_region_end {
-                crate::safe_print!(128, "[CRITICAL] process_info_phys={:#x} points into stack region! info_ptr={:#x} entry_sp={:#x}\n",
-                    self.process_info_phys, info_ptr_val, entry_sp);
-            }
             
             // Convert args to &str slices for ProcessInfo::with_args
             let arg_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
@@ -831,80 +753,23 @@ impl Process {
             };
             
             core::ptr::write(info_ptr, info);
-            
-            // DEBUG: Check if writing ProcessInfo corrupted entry_sp
-            let current_val = *((entry_sp) as *const u64);
-            if current_val != self.kernel_ctx.entry_stack[0] {
-                crate::safe_print!(128, "[CORRUPT] entry_sp[0] changed AFTER ProcessInfo write! was={:#x} now={:#x} info_ptr={:#x}\n",
-                    self.kernel_ctx.entry_stack[0], current_val, info_ptr_val);
-            }
         }
 
         // Register this process in the table for PID-based lookup
         register_process(self.pid, self as *mut Process);
 
         // Activate the user address space (sets TTBR0)
-        // After this, reading from PROCESS_INFO_ADDR will return our ProcessInfo
-        //
-        // NOTE: For user threads (spawn_process), IRQs are already disabled from
-        // the start of the closure. For system threads (blocking exec), IRQs may
-        // be enabled. Either way, after activate() we can safely enable IRQs
-        // since TTBR0 is now set to user tables.
         self.address_space.activate();
 
         // Now safe to enable IRQs - TTBR0 is set to user tables
-        // This is safe to call even if IRQs were already enabled (for blocking exec)
         crate::irq::enable_irqs();
 
-        // Enter user mode - this will ERET to user code
-        // When user calls exit(), it sets proc.exited = true
-        // and the exception handler calls return_to_kernel() to return here
-        let ctx_ptr = &mut self.kernel_ctx as *mut KernelContext;
-        
-        let exit_code = unsafe { run_user_until_exit(self.context.sp, self.context.pc, ctx_ptr) };
-
-        // Unregister this process from the table
-        unregister_process(self.pid);
-
-        // CRITICAL: Disable IRQs before deactivate!
-        // 
-        // The race condition: after deactivate() sets TTBR0 to boot tables,
-        // if a timer fires, this thread gets saved with boot TTBR0. But there
-        // may be nested exception frames on the stack with user ELR/SPSR from
-        // earlier syscalls. When resumed, returning through those frames will
-        // ERET to user code with boot TTBR0 -> crash.
-        //
-        // Fix: disable IRQs before deactivate. For blocking execution (Thread 0),
-        // we re-enable after cleanup. For preemptive threads (spawn_process),
-        // the caller marks thread as terminated before re-enabling IRQs.
-        crate::irq::disable_irqs();
-
-        // Deactivate user address space
-        UserAddressSpace::deactivate();
-
-        // Free dynamically allocated page table frames (from mmap calls)
-        // Now safe because TTBR0 points to boot tables
-        for frame in self.dynamic_page_tables.drain(..) {
-            crate::pmm::free_page(frame);
+        // Enter user mode via ERET - this never returns
+        // When user calls exit(), the exception handler calls return_to_kernel()
+        // which terminates the thread
+        unsafe {
+            enter_user_mode(&self.context);
         }
-
-        self.state = ProcessState::Zombie(exit_code);
-
-        // Check if we're on a cooperative (system) thread vs preemptive (user) thread.
-        // System threads are 0-7, user threads are 8+.
-        let tid = crate::threading::current_thread_id();
-        
-        if tid < 8 {
-            // Blocking execution on system thread - safe to print and re-enable IRQs
-            crate::safe_print!(96, "[Process] '{}' (PID {}) exited with code {}\n",
-                self.name, self.pid, exit_code);
-            crate::irq::enable_irqs();
-        }
-        // For user threads (8+), IRQs stay disabled until caller marks terminated.
-        // Skip the print here to avoid potential deadlock with console lock.
-        // The caller can print after re-enabling IRQs if needed.
-
-        exit_code
     }
 
     // ========== Per-Process I/O Methods ==========
@@ -1041,271 +906,62 @@ pub extern "C" fn check_process_exit() -> bool {
 }
 
 /// Return to kernel after process exit
-/// Called from exception handler when process exits
+/// 
+/// Called from exception handler when process exits.
+/// 
+/// UNIFIED CONTEXT ARCHITECTURE:
+/// Instead of restoring from KernelContext and returning to run_user_until_exit,
+/// we now clean up directly and terminate the thread. This eliminates the dual
+/// context system (THREAD_CONTEXTS vs KernelContext) that was a source of bugs.
+/// 
+/// The thread is marked as terminated and the scheduler will reclaim it.
+/// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
-    // ========== EXIT CODE VALIDATION ==========
-    // Detect corrupted exit codes that look like memory addresses
-    let exit_code_u32 = exit_code as u32;
-    let exit_code_looks_like_ptr = exit_code_u32 >= 0x40000000 && exit_code_u32 < 0x50000000;
+    let tid = crate::threading::current_thread_id();
     
-    if exit_code_looks_like_ptr {
-        // Exit code looks like a kernel heap/stack address - likely corruption
-        crate::console::print("[return_to_kernel] CORRUPT EXIT CODE DETECTED!\n");
-        crate::safe_print!(96, "  exit_code={} (0x{:x}) looks like memory address\n", 
-            exit_code, exit_code_u32);
-        
-        // Dump registers to help debug
-        let sp: u64;
-        let x30: u64;
-        let elr: u64;
-        unsafe {
-            core::arch::asm!("mov {}, sp", out(reg) sp);
-            core::arch::asm!("mov {}, x30", out(reg) x30);
-            core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-        }
-        crate::safe_print!(96, "  SP=0x{:x}, x30=0x{:x}, ELR=0x{:x}\n", sp, x30, elr);
-    }
-
-    // Get kernel context from current process
-    let ctx_ptr = match current_process() {
-        Some(proc) => {
-            let ctx = &proc.kernel_ctx;
-            
-            // ========== KERNEL CONTEXT VALIDATION ==========
-            let mut ctx_corruption = false;
-            
-            // Check magic value first - detects if struct was overwritten
-            if !ctx.is_valid() {
-                crate::console::print("[CTX CORRUPT] KernelContext MAGIC INVALID!\n");
-                crate::safe_print!(96, "  magic=0x{:x}, expected=0x{:x}\n", 
-                    ctx.magic, KERNEL_CTX_MAGIC);
-                crate::safe_print!(64, "  ctx addr=0x{:x}\n", ctx as *const _ as usize);
-                ctx_corruption = true;
-            }
-            
-            // Check if saved SP looks valid (should be in kernel stack range 0x41xxxxxx - 0x43xxxxxx)
-            if ctx.sp < 0x41000000 || ctx.sp > 0x44000000 {
-                crate::safe_print!(96, "[CTX CORRUPT] saved SP=0x{:x} outside kernel stack range\n", ctx.sp);
-                ctx_corruption = true;
-            }
-            
-            // Check if saved x30 (return address) looks valid (should be in kernel code 0x40000000-0x40600000)
-            if ctx.x30 != 0 && (ctx.x30 < 0x40000000 || ctx.x30 > 0x40800000) {
-                crate::safe_print!(96, "[CTX CORRUPT] saved x30=0x{:x} outside kernel code range\n", ctx.x30);
-                ctx_corruption = true;
-            }
-            
-            // Check if callee-saved registers have suspicious values (all same, or all look like small ints)
-            let suspicious_pattern = ctx.x19 == ctx.x20 && ctx.x20 == ctx.x21 && ctx.x21 == ctx.x22
-                && ctx.x19 != 0 && ctx.x19 < 0x100;
-            if suspicious_pattern {
-                crate::safe_print!(96, "[CTX CORRUPT] callee-saved regs have suspicious pattern: x19-x22 all = 0x{:x}\n", ctx.x19);
-                ctx_corruption = true;
-            }
-            
-            // Check for ProcessInfo corruption pattern:
-            // - PID at entry_sp+0 (small number matching proc.pid)
-            // - Path string at entry_sp+24 (ASCII "/bin/...")
-            let mut stack_corruption = false;
-            
-            // Check entry_sp+0 for PID (critical - indicates ProcessInfo written to stack)
-            let val_at_0 = unsafe { *(ctx.entry_sp as *const u64) };
-            if ctx.entry_stack[0] == 0 && val_at_0 == proc.pid as u64 {
-                crate::safe_print!(96, "[STACK CORRUPTION] PID {} found at entry_sp+0! ProcessInfo written to stack.\n",
-                    proc.pid);
-                stack_corruption = true;
-            }
-            
-            // Check entry_sp+24 for path string signature (starts with '/')
-            let val_at_24 = unsafe { *((ctx.entry_sp + 24) as *const u64) };
-            if ctx.entry_stack[3] == 0 && (val_at_24 & 0xFF) == 0x2F {
-                // 0x2F is '/' - likely path string corruption
-                crate::safe_print!(96, "[STACK CORRUPTION] Path string detected at entry_sp+24: {:#x}\n",
-                    val_at_24);
-                stack_corruption = true;
-            }
-            
-            if ctx_corruption || stack_corruption || exit_code_looks_like_ptr {
-                // Full diagnostic dump for debugging
-                crate::safe_print!(160, "[return_to_kernel] PID={} exit_code={}\n  entry: x30={:#x} sp={:#x} x29={:#x}\n  saved: sp={:#x} x30={:#x}\n",
-                    proc.pid, exit_code, ctx.entry_x30, ctx.entry_sp, ctx.entry_x29, ctx.sp, ctx.x30);
-                console::print("  Callee-saved regs:\n");
-                crate::safe_print!(96, "    x19={:#x} x20={:#x} x21={:#x} x22={:#x}\n",
-                    ctx.x19, ctx.x20, ctx.x21, ctx.x22);
-                crate::safe_print!(96, "    x23={:#x} x24={:#x} x25={:#x} x26={:#x}\n",
-                    ctx.x23, ctx.x24, ctx.x25, ctx.x26);
-                crate::safe_print!(96, "    x27={:#x} x28={:#x} x29={:#x}\n",
-                    ctx.x27, ctx.x28, ctx.x29);
-                    
-                if stack_corruption {
-                    console::print("  Stack comparison:\n");
-                    for i in 0..8 {
-                        let addr = ctx.entry_sp + i as u64 * 8;
-                        let current = unsafe { *(addr as *const u64) };
-                        let saved = ctx.entry_stack[i];
-                        if current != saved {
-                            crate::safe_print!(64, "  [entry_sp+{}]: was {:#x} now {:#x}\n", 
-                                i*8, saved, current);
-                        }
-                    }
-                }
-            }
-            
-            ctx as *const KernelContext
-        }
-        None => {
-            // Capture diagnostic info
-            let ttbr0: u64;
-            let elr: u64;
-            let spsr: u64;
-            let sp: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-                core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
-                core::arch::asm!("mov {}, sp", out(reg) sp);
-            }
-            let tid = crate::threading::current_thread_id();
-            
-            // Try to read PID from ProcessInfo (might fail if unmapped)
-            let raw_pid = unsafe { 
-                core::ptr::read_volatile(PROCESS_INFO_ADDR as *const u32) 
-            };
-            
-            crate::console::print("[return_to_kernel] ERROR: no current process!\n");
-            crate::safe_print!(96, "  Thread={}, raw_pid_at_0x1000={}, TTBR0={:#x}\n",
-                tid, raw_pid, ttbr0);
-            crate::safe_print!(64, "  ELR={:#x}, SPSR={:#x}, SP={:#x}\n",
-                elr, spsr, sp);
-            
-            // Check if TTBR0 looks like boot page tables
-            if ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
-                crate::console::print("  TTBR0 looks like boot page tables - no user process active!\n");
-            }
-            
-            // RECOVERY: Clean up this thread properly instead of spinning forever
-            // 1. Mark any ProcessChannel as exited with error
-            if let Some(channel) = remove_channel(tid) {
-                channel.set_exited(-1);  // Signal error exit to SSH
-                crate::safe_print!(64, "[return_to_kernel] Cleaned up ProcessChannel for thread {}\n", tid);
-            }
-            
-            // 2. Restore boot TTBR0 so kernel can continue safely
-            crate::mmu::UserAddressSpace::deactivate();
-            
-            // 3. Mark thread as terminated so scheduler stops scheduling it
-            crate::threading::mark_current_terminated();
-            
-            crate::safe_print!(64, "[return_to_kernel] Thread {} marked terminated, yielding\n", tid);
-            
-            // 4. Yield and let other threads run
-            // This thread will be cleaned up by Thread 0's cleanup routine
-            loop {
-                crate::threading::yield_now();
-            }
-        }
+    // Get process info before cleanup
+    let pid = if let Some(proc) = current_process() {
+        let pid = proc.pid;
+        // Unregister from process table
+        unregister_process(pid);
+        Some(pid)
+    } else {
+        None
     };
-
-    unsafe {
-        // Restore all callee-saved registers from context, then return
-        core::arch::asm!(
-            // Use x9 as scratch register for context pointer
-            "mov x9, {ctx}",
-            // Restore callee-saved registers
-            "ldp x19, x20, [x9, #8]",
-            "ldp x21, x22, [x9, #24]",
-            "ldp x23, x24, [x9, #40]",
-            "ldp x25, x26, [x9, #56]",
-            "ldp x27, x28, [x9, #72]",
-            "ldp x29, x30, [x9, #88]",
-            // Restore sp last
-            "ldr x9, [x9, #0]",
-            "mov sp, x9",
-            // Enable IRQs before returning
-            // We're returning from an exception handler context where IRQs are masked.
-            // The thread that called run_user_until_exit expects to have IRQs enabled.
-            "msr daifclr, #2",
-            // Set return value and return
-            "mov x0, {exit_code}",
-            "ret",
-            ctx = in(reg) ctx_ptr,
-            exit_code = in(reg) exit_code as i64,
-            options(noreturn)
-        );
+    
+    // Set exit code on ProcessChannel if registered for this thread
+    // This notifies async callers (SSH shell, etc.) that the process exited
+    if let Some(channel) = remove_channel(tid) {
+        channel.set_exited(exit_code);
+    }
+    
+    // Deactivate user address space - restore boot TTBR0
+    // This must happen before thread termination to prevent stale TLB issues
+    crate::mmu::UserAddressSpace::deactivate();
+    
+    // Mark thread as terminated so scheduler stops scheduling it
+    crate::threading::mark_current_terminated();
+    
+    // Log exit (use safe print to avoid heap allocation in this context)
+    if let Some(pid) = pid {
+        crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
+    } else {
+        crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
+    }
+    
+    // Yield forever - thread is terminated, scheduler will reclaim it
+    // Thread 0's cleanup routine will free the thread slot
+    loop {
+        crate::threading::yield_now();
     }
 }
 
-/// Run a user process until it exits
-///
-/// This saves kernel context, enters user mode (EL0) via ERET.
-/// When exit() is called, return_to_kernel() jumps back here.
-///
-/// Arguments passed via x0-x2:
-/// - x0: user_sp
-/// - x1: user_pc  
-/// - x2: kernel context pointer
-///
-/// Returns exit code in x0
-#[unsafe(naked)]
-unsafe extern "C" fn run_user_until_exit(
-    user_sp: u64,
-    user_pc: u64,
-    ctx_ptr: *mut KernelContext,
-) -> i32 {
-    core::arch::naked_asm!(
-        // Save callee-saved registers to context struct (x2 = ctx_ptr)
-        "mov x9, sp",
-        "str x9, [x2, #0]", // sp at offset 0
-        "stp x19, x20, [x2, #8]",
-        "stp x21, x22, [x2, #24]",
-        "stp x23, x24, [x2, #40]",
-        "stp x25, x26, [x2, #56]",
-        "stp x27, x28, [x2, #72]",
-        "stp x29, x30, [x2, #88]",
-        // Set up user context (x0 = user_sp, x1 = user_pc)
-        "msr sp_el0, x0",
-        "msr elr_el1, x1",
-        "mov x9, #0", // SPSR for EL0
-        "msr spsr_el1, x9",
-        "isb",
-        // Clear user registers
-        "mov x0, #0",
-        "mov x1, #0",
-        "mov x2, #0",
-        "mov x3, #0",
-        "mov x4, #0",
-        "mov x5, #0",
-        "mov x6, #0",
-        "mov x7, #0",
-        "mov x8, #0",
-        "mov x9, #0",
-        "mov x10, #0",
-        "mov x11, #0",
-        "mov x12, #0",
-        "mov x13, #0",
-        "mov x14, #0",
-        "mov x15, #0",
-        "mov x16, #0",
-        "mov x17, #0",
-        "mov x18, #0",
-        // CRITICAL: Set SP to exception stack before entering user mode.
-        // When IRQ fires from EL0, irq_el0_handler uses SP_EL1 (current SP).
-        // Without this, it would corrupt the kernel stack (execute()'s frame).
-        // Use x9 as scratch then clear it to avoid leaking kernel address to user.
-        "mrs x9, tpidr_el1",
-        "mov sp, x9",
-        "mov x9, #0",
-        // Enter user mode
-        // return_to_kernel() will restore context and ret back here
-        "eret",
-        // After eret, we never reach here in normal flow
-        // return_to_kernel() will restore registers and ret,
-        // which returns to the caller of run_user_until_exit
-    )
-}
 
-/// Execute an ELF binary from the filesystem with per-process I/O
+/// Execute an ELF binary from the filesystem with per-process I/O (blocking)
+///
+/// This spawns the process on a user thread and polls for completion.
+/// Use exec_async() for non-blocking execution.
 ///
 /// # Arguments
 /// * `path` - Path to the ELF binary
@@ -1315,30 +971,28 @@ unsafe extern "C" fn run_user_until_exit(
 /// # Returns
 /// Tuple of (exit_code, stdout_data), or error message
 pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    // Read the ELF file
-    let elf_data =
-        crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
-
-    // Create the process
-    let mut process = Process::from_elf(path, &elf_data)
-        .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
-
-    // Set up arguments if provided
-    if let Some(arg_slice) = args {
-        process.set_args(arg_slice);
+    // Spawn process with channel
+    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
+    
+    // Poll until process exits (blocking)
+    loop {
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            break;
+        }
+        // Yield to let process run
+        crate::threading::yield_now();
     }
-
-    // Set up stdin if provided
-    if let Some(data) = stdin {
-        process.set_stdin(data);
+    
+    // Collect output
+    let mut stdout_data = Vec::new();
+    while let Some(data) = channel.try_read() {
+        stdout_data.extend_from_slice(&data);
     }
-
-    // Execute and capture output
-    // Note: execute() now calls deactivate() internally before freeing page tables
-    let exit_code = process.execute();
-    let stdout_data = process.take_stdout();
-
-    Ok((exit_code, stdout_data))
+    
+    // Cleanup terminated thread
+    crate::threading::cleanup_terminated();
+    
+    Ok((channel.exit_code(), stdout_data))
 }
 
 /// Execute an ELF binary from the filesystem (legacy API for backwards compatibility)
@@ -1425,42 +1079,20 @@ pub fn spawn_process_with_channel(
         // NOTE: IRQs are already disabled from thread creation.
         // spawn_user_thread_fn_for_process starts the thread with DAIF.I set,
         // preventing timer from preempting before activate() sets user TTBR0.
-        // execute() will enable IRQs after activate().
         
         // Register channel for this thread so syscalls can find it
+        // return_to_kernel() will call remove_channel() and set_exited() when process exits
         let tid = crate::threading::current_thread_id();
-        register_channel(tid, channel_for_thread.clone());
+        register_channel(tid, channel_for_thread);
 
-        // Execute the process
-        // NOTE: execute() expects IRQs disabled on entry (for user threads).
-        // It enables IRQs after activate(), and disables them before deactivate().
-        // It returns with IRQs disabled so we can mark terminated atomically.
-        let exit_code = process.execute();
-
-        // IRQs are already disabled (for user threads), and deactivate() already called.
-        // Complete the cleanup while still protected from timer interrupts.
-        
-        // Mark channel as exited
-        channel_for_thread.set_exited(exit_code);
-
-        // Remove channel registration
-        remove_channel(tid);
-        
-        // Mark thread as terminated - scheduler won't pick it anymore
-        crate::threading::mark_current_terminated();
-        
-        // Now safe to re-enable IRQs - thread is terminated so won't be scheduled
-        crate::irq::enable_irqs();
-        
-        // Print exit info now that IRQs are enabled (safe to acquire console lock)
-        crate::safe_print!(64, "[Process] Thread {} exited with code {}\n", tid, exit_code);
-
-        // This loop should never be reached, but just in case
-        // Thread is terminated, so scheduler won't pick it, but we yield
-        // to let other threads run
-        loop {
-            crate::threading::yield_now();
-        }
+        // Execute the process - this never returns
+        // When user calls exit(), return_to_kernel() handles cleanup:
+        // - Sets exit code on channel
+        // - Removes channel registration  
+        // - Deactivates address space
+        // - Marks thread as terminated
+        // - Yields forever
+        process.execute()
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 

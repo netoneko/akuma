@@ -399,45 +399,46 @@ global_asm!(
 // x1 = pointer to new context (load from here)
 switch_context:
     // Save old context
-    stp x19, x20, [x0, #0]
-    stp x21, x22, [x0, #16]
-    stp x23, x24, [x0, #32]
-    stp x25, x26, [x0, #48]
-    stp x27, x28, [x0, #64]
-    stp x29, x30, [x0, #80]
+    // NOTE: magic field is at offset 0, registers start at offset 8
+    stp x19, x20, [x0, #8]
+    stp x21, x22, [x0, #24]
+    stp x23, x24, [x0, #40]
+    stp x25, x26, [x0, #56]
+    stp x27, x28, [x0, #72]
+    stp x29, x30, [x0, #88]
     
     // Save stack pointer
     mov x9, sp
-    str x9, [x0, #96]
+    str x9, [x0, #104]
     
     // Save DAIF (interrupt mask)
     mrs x9, daif
-    str x9, [x0, #104]
+    str x9, [x0, #112]
     
     // Save ELR_EL1 (exception return address)
     mrs x9, elr_el1
-    str x9, [x0, #112]
+    str x9, [x0, #120]
     
     // Save SPSR_EL1 (exception saved processor state)
     mrs x9, spsr_el1
-    str x9, [x0, #120]
+    str x9, [x0, #128]
     
     // Save TTBR0_EL1 (user address space)
     // This is critical for thread safety: each thread may have different TTBR0
     // (kernel threads use boot TTBR0, user processes use their own)
     mrs x9, ttbr0_el1
-    str x9, [x0, #128]
+    str x9, [x0, #136]
     
     // Load new context
-    ldp x19, x20, [x1, #0]
-    ldp x21, x22, [x1, #16]
-    ldp x23, x24, [x1, #32]
-    ldp x25, x26, [x1, #48]
-    ldp x27, x28, [x1, #64]
-    ldp x29, x30, [x1, #80]
+    ldp x19, x20, [x1, #8]
+    ldp x21, x22, [x1, #24]
+    ldp x23, x24, [x1, #40]
+    ldp x25, x26, [x1, #56]
+    ldp x27, x28, [x1, #72]
+    ldp x29, x30, [x1, #88]
     
     // Load stack pointer
-    ldr x9, [x1, #96]
+    ldr x9, [x1, #104]
     mov sp, x9
     
     // CRITICAL: Do NOT restore DAIF here!
@@ -456,11 +457,11 @@ switch_context:
     // activate(), others enable immediately).
     
     // Load ELR_EL1
-    ldr x9, [x1, #112]
+    ldr x9, [x1, #120]
     msr elr_el1, x9
     
     // Load SPSR_EL1
-    ldr x9, [x1, #120]
+    ldr x9, [x1, #128]
     msr spsr_el1, x9
     
     // Load TTBR0_EL1 (user address space)
@@ -473,7 +474,7 @@ switch_context:
     // - External aborts during translation table walk (DFSC=0x21)
     // 
     // Sequence: DSB -> switch TTBR0 -> ISB -> flush TLB -> DSB -> ISB
-    ldr x9, [x1, #128]
+    ldr x9, [x1, #136]
     dsb ish                   // Complete pending memory accesses
     msr ttbr0_el1, x9         // Switch TTBR0
     isb                       // Ensure TTBR0 change visible
@@ -530,10 +531,16 @@ unsafe extern "C" {
     fn thread_start_closure() -> !;
 }
 
+/// Magic value for Context integrity check
+pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
+
 /// CPU context saved during context switch
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
+    // Magic value FIRST for easy detection of corruption
+    pub magic: u64,
+    // Callee-saved registers
     pub x19: u64,
     pub x20: u64,
     pub x21: u64,
@@ -551,11 +558,16 @@ pub struct Context {
     pub elr: u64,  // Exception Link Register
     pub spsr: u64, // Saved Program Status Register
     pub ttbr0: u64, // User address space (TTBR0_EL1)
+    // User process fields (unified context architecture)
+    pub user_entry: u64,     // User PC for first ERET (0 for kernel threads)
+    pub user_sp: u64,        // User SP for first ERET (0 for kernel threads)
+    pub is_user_process: u64, // 1 if this is a user process thread, 0 for kernel threads
 }
 
 impl Context {
     pub const fn zero() -> Self {
         Self {
+            magic: CONTEXT_MAGIC,
             x19: 0,
             x20: 0,
             x21: 0,
@@ -573,7 +585,15 @@ impl Context {
             elr: 0,
             spsr: 0,
             ttbr0: 0, // Will be initialized to boot TTBR0
+            user_entry: 0,
+            user_sp: 0,
+            is_user_process: 0,
         }
+    }
+    
+    /// Check if the context magic is intact
+    pub fn is_valid(&self) -> bool {
+        self.magic == CONTEXT_MAGIC
     }
 }
 
@@ -771,7 +791,15 @@ impl ThreadPool {
         
         // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
         unsafe {
-            (*get_context_mut(IDLE_THREAD_IDX)).ttbr0 = boot_ttbr0;
+            let boot_ctx = &mut *get_context_mut(IDLE_THREAD_IDX);
+            boot_ctx.magic = CONTEXT_MAGIC;
+            boot_ctx.ttbr0 = boot_ttbr0;
+            // Boot thread starts with kernel mode SPSR
+            boot_ctx.spsr = 0x00000005; // EL1h
+            // Other fields stay zero (callee-saved regs saved on first context switch)
+            boot_ctx.user_entry = 0;
+            boot_ctx.user_sp = 0;
+            boot_ctx.is_user_process = 0;
         }
 
         // Boot stack info (fixed location from boot.rs)
@@ -922,6 +950,8 @@ impl ThreadPool {
 
                 unsafe {
                     let ctx = &mut *get_context_mut(i);
+                    // Magic value for integrity checking
+                    ctx.magic = CONTEXT_MAGIC;
                     ctx.x19 = entry_addr;
                     ctx.x20 = 0;
                     ctx.x21 = 0;
@@ -940,6 +970,10 @@ impl ThreadPool {
                     // SPSR for kernel threads: EL1h (bits[3:0]=5)
                     ctx.spsr = 0x00000005; // EL1h
                     ctx.ttbr0 = boot_ttbr0;
+                    // User process fields - 0 for kernel threads
+                    ctx.user_entry = 0;
+                    ctx.user_sp = 0;
+                    ctx.is_user_process = 0;
                 }
 
                 // Write slot metadata
@@ -1011,6 +1045,8 @@ impl ThreadPool {
                 // Write context to THREAD_CONTEXTS (not in slot)
                 unsafe {
                     let ctx = &mut *get_context_mut(i);
+                    // Magic value for integrity checking
+                    ctx.magic = CONTEXT_MAGIC;
                     ctx.x19 = trampoline_fn as *const () as u64;
                     ctx.x20 = closure_ptr as u64;
                     ctx.x21 = 0;
@@ -1029,6 +1065,10 @@ impl ThreadPool {
                     // SPSR for kernel threads: EL1h (bits[3:0]=5)
                     ctx.spsr = 0x00000005; // EL1h
                     ctx.ttbr0 = boot_ttbr0;
+                    // User process fields - 0 for kernel threads (closure-based)
+                    ctx.user_entry = 0;
+                    ctx.user_sp = 0;
+                    ctx.is_user_process = 0;
                 }
 
                 // System threads are preemptible (not cooperative)
@@ -1093,6 +1133,8 @@ impl ThreadPool {
                 // Write context to THREAD_CONTEXTS (not in slot)
                 unsafe {
                     let ctx = &mut *get_context_mut(i);
+                    // Magic value for integrity checking
+                    ctx.magic = CONTEXT_MAGIC;
                     ctx.x19 = trampoline_fn as *const () as u64;
                     ctx.x20 = closure_ptr as u64;
                     ctx.x21 = 0;
@@ -1112,6 +1154,10 @@ impl ThreadPool {
                     // The closure runs in kernel mode before entering user mode via ERET
                     ctx.spsr = 0x00000005; // EL1h
                     ctx.ttbr0 = boot_ttbr0;
+                    // User process fields - 0 for kernel threads (closure-based)
+                    ctx.user_entry = 0;
+                    ctx.user_sp = 0;
+                    ctx.is_user_process = 0;
                 }
 
                 self.slots[i].cooperative = cooperative;
@@ -1493,6 +1539,33 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // Read context values for corruption checks
             let new_ctx = &*new_ptr;
             
+            // PHASE 3: Check context magic values before switching
+            // If magic is corrupted, the context has been overwritten
+            
+            // Check old context - if corrupted, we're already in trouble
+            let old_ctx = &*old_ptr;
+            if !old_ctx.is_valid() {
+                crate::console::print("[SGI CORRUPT] OLD context magic invalid for thread ");
+                crate::console::print_dec(old_idx);
+                crate::console::print(" - magic=0x");
+                crate::console::print_hex(old_ctx.magic);
+                crate::console::print("\n");
+            }
+            
+            // Check new context - don't switch to a corrupted context
+            if !new_ctx.is_valid() {
+                crate::console::print("[SGI CORRUPT] NEW context magic invalid for thread ");
+                crate::console::print_dec(new_idx);
+                crate::console::print(" - magic=0x");
+                crate::console::print_hex(new_ctx.magic);
+                crate::console::print(" expected=0x");
+                crate::console::print_hex(CONTEXT_MAGIC);
+                crate::console::print("\n");
+                // Don't switch to a corrupted context - mark as terminated and skip
+                THREAD_STATES[new_idx].store(thread_state::TERMINATED, Ordering::SeqCst);
+                return;
+            }
+            
             let new_saved_ttbr0 = new_ctx.ttbr0;
             let new_saved_spsr = new_ctx.spsr;
             let new_saved_elr = new_ctx.elr;
@@ -1783,6 +1856,8 @@ where
         // Write context to THREAD_CONTEXTS (no lock needed, thread is INITIALIZING)
         unsafe {
             let ctx = &mut *get_context_mut(slot_idx);
+            // Magic value for integrity checking
+            ctx.magic = CONTEXT_MAGIC;
             ctx.x19 = trampoline as *const () as u64;
             ctx.x20 = closure_ptr as u64;
             ctx.x21 = 0;
@@ -1801,6 +1876,10 @@ where
             // SPSR for kernel threads: EL1h (bits[3:0]=5)
             ctx.spsr = 0x00000005; // EL1h
             ctx.ttbr0 = boot_ttbr0;
+            // User process fields - 0 for kernel threads (closure-based)
+            ctx.user_entry = 0;
+            ctx.user_sp = 0;
+            ctx.is_user_process = 0;
         }
 
         // Write slot metadata (needs POOL lock)
@@ -1911,6 +1990,8 @@ where
         // SAFETY: Thread state is INITIALIZING, scheduler ignores it
         unsafe {
             let ctx = &mut *get_context_mut(slot_idx);
+            // Magic value for integrity checking
+            ctx.magic = CONTEXT_MAGIC;
             ctx.x19 = trampoline as *const () as u64;
             ctx.x20 = closure_ptr as u64;
             // x21 = IRQ enable flag for thread_start_closure:
@@ -1935,6 +2016,10 @@ where
             // The closure runs in kernel mode before entering user mode via ERET
             ctx.spsr = 0x00000005; // EL1h
             ctx.ttbr0 = boot_ttbr0;
+            // User process fields - 0 for kernel threads (closure-based)
+            ctx.user_entry = 0;
+            ctx.user_sp = 0;
+            ctx.is_user_process = 0;
         }
 
         // Write slot metadata (needs POOL lock)

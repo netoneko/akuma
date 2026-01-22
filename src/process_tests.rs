@@ -30,47 +30,39 @@ pub fn run_all_tests() {
 fn test_elftest() {
     const ELFTEST_PATH: &str = "/bin/elftest";
 
-    match fs::read_file(ELFTEST_PATH) {
-        Ok(data) => {
-            crate::safe_print!(96, 
-                "[Test] Found {} ({} bytes), verifying ELF loading...\n",
-                ELFTEST_PATH,
-                data.len()
+    // Check if file exists first
+    if fs::read_file(ELFTEST_PATH).is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, 
+                "[Test] {} not found - FAIL\n",
+                ELFTEST_PATH
             );
-
-            match process::Process::from_elf("elftest", &data) {
-                Ok(mut proc) => {
-                    // Execute the process
-                    let exit_code = proc.execute();
-
-                    // elftest exits with code 42 on success
-                    if exit_code == 42 {
-                        console::print("[Test] elftest PASSED (ELF loading verified)\n");
-                    } else {
-                        crate::safe_print!(96, 
-                            "[Test] elftest FAILED: expected exit code 42, got {}\n",
-                            exit_code
-                        );
-                    }
-                }
-                Err(e) => {
-                    crate::safe_print!(64, "[Test] Failed to load elftest: {}\n", e);
-                }
-            }
+            panic!("Required test binary not found");
+        } else {
+            crate::safe_print!(96, 
+                "[Test] {} not found, skipping ELF loading test\n",
+                ELFTEST_PATH
+            );
+            return;
         }
-        Err(_) => {
-            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                crate::safe_print!(64, 
-                    "[Test] {} not found - FAIL\n",
-                    ELFTEST_PATH
-                );
-                panic!("Required test binary not found");
+    }
+
+    crate::safe_print!(96, "[Test] Executing {}...\n", ELFTEST_PATH);
+    
+    match process::exec_with_io(ELFTEST_PATH, None, None) {
+        Ok((exit_code, _stdout)) => {
+            // elftest exits with code 42 on success
+            if exit_code == 42 {
+                console::print("[Test] elftest PASSED (ELF loading verified)\n");
             } else {
                 crate::safe_print!(96, 
-                    "[Test] {} not found, skipping ELF loading test\n",
-                    ELFTEST_PATH
+                    "[Test] elftest FAILED: expected exit code 42, got {}\n",
+                    exit_code
                 );
             }
+        }
+        Err(e) => {
+            crate::safe_print!(64, "[Test] Failed to execute elftest: {}\n", e);
         }
     }
 }
@@ -79,51 +71,38 @@ fn test_elftest() {
 fn test_stdcheck() {
     const STDCHECK_PATH: &str = "/bin/stdcheck";
 
-    match fs::read_file(STDCHECK_PATH) {
-        Ok(data) => {
-            crate::safe_print!(128, 
-                "[Test] Found {} ({} bytes), executing with mmap allocator...\n",
-                STDCHECK_PATH,
-                data.len()
+    // Check if file exists first
+    if fs::read_file(STDCHECK_PATH).is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, 
+                "[Test] {} not found - FAIL\n",
+                STDCHECK_PATH
             );
+            panic!("Required test binary not found");
+        } else {
+            crate::safe_print!(96, 
+                "[Test] {} not found, skipping mmap allocator test\n",
+                STDCHECK_PATH
+            );
+            return;
+        }
+    }
 
-            match process::Process::from_elf("stdcheck", &data) {
-                Ok(mut proc) => {
-                    crate::safe_print!(96, 
-                        "[Test] Process created: PID={}, entry={:#x}\n",
-                        proc.pid, proc.context.pc
-                    );
+    crate::safe_print!(128, "[Test] Executing {} with mmap allocator...\n", STDCHECK_PATH);
 
-                    // Actually execute the process
-                    let exit_code = proc.execute();
-
-                    if exit_code == 0 {
-                        console::print("[Test] stdcheck PASSED\n");
-                    } else {
-                        crate::safe_print!(64, 
-                            "[Test] stdcheck FAILED with exit code {}\n",
-                            exit_code
-                        );
-                    }
-                }
-                Err(e) => {
-                    crate::safe_print!(64, "[Test] Failed to load stdcheck: {}\n", e);
-                }
+    match process::exec_with_io(STDCHECK_PATH, None, None) {
+        Ok((exit_code, _stdout)) => {
+            if exit_code == 0 {
+                console::print("[Test] stdcheck PASSED\n");
+            } else {
+                crate::safe_print!(64, 
+                    "[Test] stdcheck FAILED with exit code {}\n",
+                    exit_code
+                );
             }
         }
-        Err(_) => {
-            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                crate::safe_print!(64, 
-                    "[Test] {} not found - FAIL\n",
-                    STDCHECK_PATH
-                );
-                panic!("Required test binary not found");
-            } else {
-                crate::safe_print!(96, 
-                    "[Test] {} not found, skipping mmap allocator test\n",
-                    STDCHECK_PATH
-                );
-            }
+        Err(e) => {
+            crate::safe_print!(64, "[Test] Failed to execute stdcheck: {}\n", e);
         }
     }
 }
