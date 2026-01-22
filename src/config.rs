@@ -121,6 +121,13 @@ pub const IGNORE_THREADING_TESTS: bool = false;
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;
 
+/// Enable preemption watchdog
+///
+/// When enabled, the timer IRQ handler checks if any thread has held
+/// preemption disabled for too long and logs a warning.
+/// Disable to rule out watchdog as a source of issues.
+pub const ENABLE_PREEMPTION_WATCHDOG: bool = false;
+
 
 /// Enable async process execution with streaming output over SSH
 ///

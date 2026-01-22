@@ -60,17 +60,19 @@ pub fn timer_irq_handler(_irq: u32) {
     }
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
-    if let Some(duration_us) = crate::threading::check_preemption_watchdog() {
-        // Log warning (watchdog will halt if critically stuck)
-        // Use AtomicU64 instead of static mut to avoid data races
-        static LAST_WARN_US: AtomicU64 = AtomicU64::new(0);
-        let now = uptime_us();
-        let last = LAST_WARN_US.load(Ordering::Relaxed);
-        // Rate-limit warnings to once per second
-        if now.saturating_sub(last) > 1_000_000 {
-            LAST_WARN_US.store(now, Ordering::Relaxed);
-            // Use stack-only print to avoid heap allocation in IRQ context
-            crate::safe_print!(64, "[WATCHDOG] Preemption disabled for {}ms\n", duration_us / 1000);
+    if crate::config::ENABLE_PREEMPTION_WATCHDOG {
+        if let Some(duration_us) = crate::threading::check_preemption_watchdog() {
+            // Log warning
+            // Use AtomicU64 instead of static mut to avoid data races
+            static LAST_WARN_US: AtomicU64 = AtomicU64::new(0);
+            let now = uptime_us();
+            let last = LAST_WARN_US.load(Ordering::Relaxed);
+            // Rate-limit warnings to once per second
+            if now.saturating_sub(last) > 1_000_000 {
+                LAST_WARN_US.store(now, Ordering::Relaxed);
+                // Use stack-only print to avoid heap allocation in IRQ context
+                crate::safe_print!(64, "[WATCHDOG] Preemption disabled for {}ms\n", duration_us / 1000);
+            }
         }
     }
 
