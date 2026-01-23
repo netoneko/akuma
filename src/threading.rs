@@ -1885,6 +1885,13 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // Save current SP (from IRQ frame) to old context
             (*old_ctx).sp = current_sp;
             
+            // Save current TTBR0 to old context
+            // CRITICAL: Processes set their own TTBR0 via activate(), 
+            // so we must save it here to restore correctly later
+            let current_ttbr0: u64;
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
+            (*old_ctx).ttbr0 = current_ttbr0;
+            
             // Load new SP from new context
             let new_sp = (*new_ctx).sp;
             
