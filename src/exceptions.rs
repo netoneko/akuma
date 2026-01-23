@@ -318,17 +318,23 @@ irq_el0_handler:
     eret
 
 // IRQ from EL1 (kernel mode)
-// Must save ELR_EL1 and SPSR_EL1 because context switch may modify them
+// SIMPLIFIED: Stack-based save/restore for ALL registers including ELR/SPSR
+// Context switch: Rust handler returns new SP, assembly does the actual switch
 irq_handler:
-    // Save x10, x11 FIRST (we need them as scratch for ELR/SPSR)
+    // ============================================================
+    // SAVE PHASE: Push all registers to stack in fixed layout
+    // IRQ frame: 272 bytes total
+    // ============================================================
+    
+    // First save x10, x11 (need them for ELR/SPSR)
     stp     x10, x11, [sp, #-16]!
     
-    // Save ELR_EL1 and SPSR_EL1 (critical for nested IRQs + context switch)
+    // Save ELR_EL1 and SPSR_EL1 to stack
     mrs     x10, elr_el1
     mrs     x11, spsr_el1
     stp     x10, x11, [sp, #-16]!
     
-    // Save remaining caller-saved registers
+    // Save all other registers
     stp     x0, x1, [sp, #-16]!
     stp     x2, x3, [sp, #-16]!
     stp     x4, x5, [sp, #-16]!
@@ -344,69 +350,23 @@ irq_handler:
     stp     x26, x27, [sp, #-16]!
     stp     x28, x29, [sp, #-16]!
     str     x30, [sp, #-16]!
-
-    bl      rust_irq_handler
-
-    // ELR/SPSR handling after potential context switch:
-    // 
-    // CRITICAL: Do NOT load ELR/SPSR from the stack!
-    // If a context switch happened (via switch_context), we're now on a
-    // DIFFERENT thread's stack. The ELR/SPSR at [sp+240] belong to the
-    // OLD thread, not the thread we're returning to.
-    //
-    // switch_context saves/restores ELR_EL1 and SPSR_EL1 to/from the
-    // context struct, so the system registers already have the correct
-    // values for the current thread.
-    //
-    // For the no-context-switch case: ELR/SPSR system registers are
-    // unchanged from when we entered the IRQ handler.
-    //
-    // We just need to apply safety fixes to the current SPSR value.
     
-    // Read current ELR and SPSR from system registers
-    mrs     x10, elr_el1
-    mrs     x11, spsr_el1
+    // Pass current SP as argument (x0)
+    mov     x0, sp
     
-    // Clear IRQ mask bit and IL bit
-    bic     x11, x11, #0x80         // Clear I bit (IRQ mask)
-    bic     x11, x11, #0x100000     // Clear IL bit (Illegal state)
+    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
+    bl      rust_irq_handler_with_sp
     
-    // SAFETY CHECK: Ensure we're returning to EL1h for kernel code
-    and     x9, x11, #0xF           // Extract exception level bits
-    cmp     x9, #5                  // Check if EL1h
-    b.eq    1f                      // Good, skip fix
+    // Check if context switch needed (x0 != 0)
+    cbz     x0, 3f
+    mov     sp, x0              // Switch SP in assembly!
+3:
     
-    cmp     x9, #4                  // Check if EL1t
-    b.ne    2f
-    // Fix EL1t -> EL1h
-    bic     x11, x11, #0xF
-    mov     x9, #5
-    orr     x11, x11, x9
-    b       1f
+    // ============================================================
+    // RESTORE PHASE: Pop all registers from (possibly new) stack
+    // ============================================================
     
-2:  cmp     x9, #0                  // Check if EL0
-    b.ne    1f
-    // Check if ELR is kernel address
-    mov     x9, #0x40000000
-    cmp     x10, x9
-    b.lo    1f                      // ELR < 0x40000000, user addr, OK for EL0
-    // Fix: ELR is kernel but SPSR says EL0
-    bic     x11, x11, #0xF          // Clear EL bits
-    mov     x9, #5
-    orr     x11, x11, x9            // Set to EL1h
-    
-1:
-    // Write fixed SPSR back to system register
-    msr     spsr_el1, x11
-    
-    // Restore all general-purpose registers from stack
-    // Stack layout (17 pushes = 272 bytes):
-    //   [sp+0]:   x30
-    //   [sp+16]:  x28, x29
-    //   ... (GPRs) ...
-    //   [sp+240]: ELR, SPSR (saved but NOT restored from here - see above)
-    //   [sp+256]: orig x10, x11
-    
+    // Restore general registers (reverse order of save)
     ldr     x30, [sp], #16
     ldp     x28, x29, [sp], #16
     ldp     x26, x27, [sp], #16
@@ -423,23 +383,25 @@ irq_handler:
     ldp     x2, x3, [sp], #16
     ldp     x0, x1, [sp], #16
     
-    // Skip the ELR/SPSR slot (not restored from stack)
-    add     sp, sp, #16
+    // Restore ELR and SPSR FROM STACK
+    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
     
-    // Skip ELR/SPSR slot on stack, but DON'T restore x10/x11 yet - need scratch for ELR check
-    add     sp, sp, #16
+    // Clear IL bit in SPSR to prevent EC=0xe
+    bic     x11, x11, #0x100000
     
-    // CRITICAL: Final ELR=0 check right before ERET
-    // Use x10/x11 which are still on stack (not yet restored)
-    mrs     x10, elr_el1
-    cbnz    x10, 3f             // If ELR != 0, proceed to restore and ERET
-    // ELR is 0! Halt the system to debug.
+    // Write to system registers
+    msr     elr_el1, x10
+    msr     spsr_el1, x11
+    
+    // CRITICAL: Check for ELR=0 bug
+    cbnz    x10, 1f
     mov     x0, #0xDEAD
     movk    x0, #0xBEEF, lsl #16
-4:  wfi
-    b       4b
-3:
-    // NOW restore original x10, x11 right before eret
+2:  wfi
+    b       2b
+1:
+    
+    // Restore original x10, x11
     ldp     x10, x11, [sp], #16
     
     eret
@@ -676,6 +638,27 @@ extern "C" fn rust_irq_handler() {
         // Use stack-only print to avoid heap allocation in IRQ context
         crate::safe_print!(128, "[IRQ] exit: tid={} tpidr={:#x} sp={:#x} elr={:#x}\n", tid_after, tpidr_after, sp_after, elr_after);
     }
+}
+
+/// SIMPLIFIED IRQ handler for stack-based context switching
+/// 
+/// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
+/// The assembly does the actual SP switch AFTER this returns.
+#[unsafe(no_mangle)]
+extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+    // Acknowledge the interrupt and get IRQ number
+    if let Some(irq) = crate::gic::acknowledge_irq() {
+        // Special handling for scheduler SGI
+        if irq == crate::gic::SGI_SCHEDULER {
+            // Returns new SP if switch needed, or 0 if not
+            return crate::threading::sgi_scheduler_handler_with_sp(irq, current_sp);
+        } else {
+            // Normal IRQs: call handler then EOI
+            crate::irq::dispatch_irq(irq);
+            crate::gic::end_of_interrupt(irq);
+        }
+    }
+    0  // No context switch
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)
