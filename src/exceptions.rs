@@ -426,7 +426,20 @@ irq_handler:
     // Skip the ELR/SPSR slot (not restored from stack)
     add     sp, sp, #16
     
-    // Restore original x10, x11
+    // Skip ELR/SPSR slot on stack, but DON'T restore x10/x11 yet - need scratch for ELR check
+    add     sp, sp, #16
+    
+    // CRITICAL: Final ELR=0 check right before ERET
+    // Use x10/x11 which are still on stack (not yet restored)
+    mrs     x10, elr_el1
+    cbnz    x10, 3f             // If ELR != 0, proceed to restore and ERET
+    // ELR is 0! Halt the system to debug.
+    mov     x0, #0xDEAD
+    movk    x0, #0xBEEF, lsl #16
+4:  wfi
+    b       4b
+3:
+    // NOW restore original x10, x11 right before eret
     ldp     x10, x11, [sp], #16
     
     eret
@@ -641,14 +654,27 @@ extern "C" fn rust_irq_handler() {
     // Debug: after handling
     let tpidr_after: u64;
     let sp_after: u64;
+    let elr_after: u64;
     unsafe {
         core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr_after);
         core::arch::asm!("mov {}, sp", out(reg) sp_after);
+        core::arch::asm!("mrs {}, elr_el1", out(reg) elr_after);
     }
     let tid_after = crate::threading::current_thread_id();
+    
+    // CRITICAL: Check for ELR=0 bug before ERET
+    // If ELR is 0, ERET will jump to address 0 and crash
+    if elr_after == 0 {
+        crate::safe_print!(128, "[IRQ FATAL] ELR=0 before ERET! tid={} sp={:#x}\n", tid_after, sp_after);
+        // Try to recover by halting instead of crashing
+        loop {
+            unsafe { core::arch::asm!("wfi"); }
+        }
+    }
+    
     if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
         // Use stack-only print to avoid heap allocation in IRQ context
-        crate::safe_print!(128, "[IRQ] exit: tid={} tpidr={:#x} sp={:#x}\n", tid_after, tpidr_after, sp_after);
+        crate::safe_print!(128, "[IRQ] exit: tid={} tpidr={:#x} sp={:#x} elr={:#x}\n", tid_after, tpidr_after, sp_after, elr_after);
     }
 }
 

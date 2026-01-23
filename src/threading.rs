@@ -54,13 +54,29 @@ fn set_current_thread_register(tid: usize) {
 }
 
 /// Get the current thread ID from TPIDR_EL0
+/// Halts the system if the register contains an invalid value (>= MAX_THREADS)
+/// since this indicates serious corruption that cannot be recovered from.
 #[inline]
 fn get_current_thread_register() -> usize {
     let val: u64;
     unsafe {
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) val);
     }
-    val as usize
+    let tid = val as usize;
+    // Bounds check - if corrupted, halt immediately
+    if tid >= config::MAX_THREADS {
+        // Log corruption and halt - we cannot safely continue
+        crate::console::print("[FATAL] TPIDR_EL0 CORRUPT: tid=");
+        crate::console::print_hex(val);
+        crate::console::print(" >= MAX_THREADS (");
+        crate::console::print_dec(config::MAX_THREADS);
+        crate::console::print(")\n");
+        crate::console::print("System halted - cannot determine current thread\n");
+        loop {
+            unsafe { core::arch::asm!("wfi"); }
+        }
+    }
+    tid
 }
 
 /// Atomically claim a free slot in the given range
@@ -456,6 +472,9 @@ switch_context:
     mrs x9, ttbr0_el1
     str x9, [x0, #136]
     
+    // Ensure all writes to new context memory are visible before loading
+    dsb ish
+    
     // Load new context
     ldp x19, x20, [x1, #8]
     ldp x21, x22, [x1, #24]
@@ -490,6 +509,7 @@ switch_context:
     msr elr_el1, x9
     ldr x9, [x1, #128]
     msr spsr_el1, x9
+    isb                       // Ensure ELR/SPSR changes visible before continuing
     
     // Load TTBR0_EL1 (user address space)
     // Must restore before returning so the thread sees the correct address space
@@ -852,6 +872,12 @@ impl ThreadPool {
         // Align to 16 bytes
         self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
         
+        // CRITICAL: Update TPIDR_EL1 to point to Thread 0's new exception stack!
+        // exceptions::init() set it to 0x42000000 (boot stack top) initially,
+        // but we've now allocated a proper exception stack from the heap.
+        // Without this, the first IRQ would use the wrong exception stack pointer.
+        crate::exceptions::set_current_exception_stack(self.slots[IDLE_THREAD_IDX].exception_stack_top);
+        
         // Initialize canary for boot stack
         if config::ENABLE_STACK_CANARIES {
             init_stack_canary(boot_stack_base);
@@ -993,7 +1019,9 @@ impl ThreadPool {
                     ctx.x30 = thread_start as *const () as u64;
                     ctx.sp = sp;
                     ctx.daif = 0;
-                    ctx.elr = 0;
+                    // Set ELR to thread entry point - if any code path accidentally ERETs,
+                    // we'll jump to a valid address instead of crashing with ELR=0
+                    ctx.elr = thread_start as *const () as u64;
                     // SPSR for kernel threads: EL1h (bits[3:0]=5)
                     ctx.spsr = 0x00000005; // EL1h
                     ctx.ttbr0 = boot_ttbr0;
@@ -1088,7 +1116,9 @@ impl ThreadPool {
                     ctx.x30 = thread_start_closure as *const () as u64;
                     ctx.sp = sp;
                     ctx.daif = 0;
-                    ctx.elr = 0;
+                    // Set ELR to thread entry point - if any code path accidentally ERETs,
+                    // we'll jump to a valid address instead of crashing with ELR=0
+                    ctx.elr = thread_start_closure as *const () as u64;
                     // SPSR for kernel threads: EL1h (bits[3:0]=5)
                     ctx.spsr = 0x00000005; // EL1h
                     ctx.ttbr0 = boot_ttbr0;
@@ -1176,7 +1206,9 @@ impl ThreadPool {
                     ctx.x30 = thread_start_closure as *const () as u64;
                     ctx.sp = sp;
                     ctx.daif = 0;
-                    ctx.elr = 0;
+                    // Set ELR to thread entry point - if any code path accidentally ERETs,
+                    // we'll jump to a valid address instead of crashing with ELR=0
+                    ctx.elr = thread_start_closure as *const () as u64;
                     // SPSR for kernel code: EL1h (bits[3:0]=5)
                     // The closure runs in kernel mode before entering user mode via ERET
                     ctx.spsr = 0x00000005; // EL1h
@@ -1606,6 +1638,19 @@ pub fn sgi_scheduler_handler(irq: u32) {
             let new_saved_elr = new_ctx.elr;
             let new_saved_x30 = new_ctx.x30;
             
+            // CRITICAL: Detect context bugs that would cause jumps to address 0
+            // This check runs ALWAYS (not behind debug flag) since it's critical
+            let new_x19 = new_ctx.x19;
+            if new_saved_elr == 0 && new_idx != 0 {
+                crate::safe_print!(64, "[CTX BUG] tid={} ELR=0 x30={:#x}\n", new_idx, new_saved_x30);
+            }
+            if new_x19 == 0 && new_idx != 0 {
+                crate::safe_print!(64, "[CTX BUG] tid={} x19=0 (trampoline)\n", new_idx);
+            }
+            if new_saved_x30 == 0 && new_idx != 0 {
+                crate::safe_print!(64, "[CTX BUG] tid={} x30=0 (link reg)\n", new_idx);
+            }
+            
             // Check for context corruption
             let is_user_spsr = (new_saved_spsr & 0xF) == 0;
             let is_new_thread = new_saved_elr == 0 && new_saved_spsr == 0;
@@ -1919,16 +1964,9 @@ where
             (sp, stack.base, stack.top)
         };
         
-        // Debug: print stack setup
-        crate::console::print("[spawn_system_fn] tid=");
-        crate::console::print_dec(slot_idx);
-        crate::console::print(" stack=0x");
-        crate::console::print_hex(stack_base as u64);
-        crate::console::print("-0x");
-        crate::console::print_hex(stack_top as u64);
-        crate::console::print(" sp=0x");
-        crate::console::print_hex(sp);
-        crate::console::print("\n");
+        // Debug: print stack setup (ELR_FIX marker confirms fix is deployed)
+        crate::safe_print!(128, "[spawn_system_fn ELR_FIX] tid={} stack={:#x}-{:#x} sp={:#x}\n",
+            slot_idx, stack_base, stack_top, sp);
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
@@ -1952,7 +1990,9 @@ where
             ctx.x30 = thread_start_closure as *const () as u64;
             ctx.sp = sp;
             ctx.daif = 0;
-            ctx.elr = 0;
+            // Set ELR to thread entry point - if any code path accidentally ERETs,
+            // we'll jump to a valid address instead of crashing with ELR=0
+            ctx.elr = thread_start_closure as *const () as u64;
             // SPSR for kernel threads: EL1h (bits[3:0]=5)
             ctx.spsr = 0x00000005; // EL1h
             ctx.ttbr0 = boot_ttbr0;
@@ -2091,7 +2131,9 @@ where
             // but we still save it for consistency. thread_start_closure uses x21 to
             // decide whether to enable IRQs.
             ctx.daif = if start_irqs_disabled { 0x80 } else { 0 };
-            ctx.elr = 0;
+            // Set ELR to thread entry point - if any code path accidentally ERETs,
+            // we'll jump to a valid address instead of crashing with ELR=0
+            ctx.elr = thread_start_closure as *const () as u64;
             // SPSR for kernel code: EL1h (bits[3:0]=5)
             // The closure runs in kernel mode before entering user mode via ERET
             ctx.spsr = 0x00000005; // EL1h

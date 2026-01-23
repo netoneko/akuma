@@ -776,16 +776,11 @@ unsafe extern "C" {
 
 /// Protect kernel code by marking it read-only
 ///
-/// This should be called after boot when the kernel is running normally.
-/// Currently uses the boot page tables which have 1GB block mappings,
-/// so we can't do fine-grained protection without switching to 4KB pages.
+/// This function uses 4KB page granularity to precisely protect only the
+/// .text and .rodata sections, leaving .data/.bss writable.
 ///
-/// For now, this function just logs the section boundaries.
-/// A full implementation would need to:
-/// 1. Allocate L2/L3 page tables for the kernel region
-/// 2. Remap kernel .text as read-only + executable
-/// 3. Remap kernel .rodata as read-only + no-execute
-/// 4. Remap kernel .data/.bss as read-write + no-execute
+/// The function dynamically determines which 2MB blocks need fine-grained
+/// (4KB) protection based on where .text/.rodata/.data actually reside.
 pub fn protect_kernel_code() {
     let text_start = unsafe { &_text_start as *const u8 as usize };
     let text_end = unsafe { &_text_end as *const u8 as usize };
@@ -807,10 +802,129 @@ pub fn protect_kernel_code() {
         (kernel_end - data_start) / 1024,
     );
 
-    // TODO: Implement fine-grained page table protection
-    // For now, the boot stack fix (placing stack at 0x42000000) prevents
-    // stack from overwriting kernel code, but the code is still writable.
-    crate::console::print(
-        "[MMU] Note: Kernel code protection not yet implemented (uses 1GB block mappings)\n",
-    );
+    const BLOCK_SIZE_2MB: usize = 2 * 1024 * 1024;
+    const RAM_BASE: usize = 0x40000000;
+    
+    // Calculate which 2MB blocks contain code that needs protection
+    // We need L3 tables for any 2MB block that contains BOTH:
+    // - Read-only sections (.text or .rodata)
+    // - Read-write sections (.data or beyond)
+    // If a block contains only RO or only RW, we can use a 2MB block descriptor
+    
+    // Find the 2MB block indices for section boundaries
+    let text_block_start = (text_start - RAM_BASE) / BLOCK_SIZE_2MB;
+    let rodata_block_end = (rodata_end - RAM_BASE + BLOCK_SIZE_2MB - 1) / BLOCK_SIZE_2MB;
+    let data_block_start = (data_start - RAM_BASE) / BLOCK_SIZE_2MB;
+    
+    // Blocks that need L3 tables: those containing both RO and RW data
+    // This is the range from where RO starts to where RW starts (inclusive)
+    let l3_block_start = text_block_start;
+    let l3_block_end = if data_block_start > rodata_block_end {
+        rodata_block_end  // .data starts in a later block, only need L3 up to rodata
+    } else {
+        data_block_start + 1  // .data starts in same or earlier block as rodata ends
+    };
+    let num_l3_blocks = l3_block_end - l3_block_start;
+    
+    crate::safe_print!(128, "[MMU] Need L3 tables for blocks {}-{} ({} blocks)\n", 
+        l3_block_start, l3_block_end - 1, num_l3_blocks);
+    
+    // Allocate L2 table for the 0x40000000-0x7FFFFFFF region
+    let l2_table = match crate::pmm::alloc_page() {
+        Some(frame) => frame.start_address(),
+        None => {
+            crate::console::print("[MMU] ERROR: Cannot allocate L2 table\n");
+            return;
+        }
+    };
+    unsafe { core::ptr::write_bytes(l2_table as *mut u8, 0, PAGE_SIZE); }
+    
+    // Allocate L3 tables for blocks that need fine-grained protection
+    let mut l3_tables: [usize; 16] = [0; 16];  // Support up to 16 L3 tables (32MB of kernel)
+    if num_l3_blocks > 16 {
+        crate::console::print("[MMU] ERROR: Kernel too large for protection\n");
+        return;
+    }
+    
+    for i in 0..num_l3_blocks {
+        let l3_table = match crate::pmm::alloc_page() {
+            Some(frame) => frame.start_address(),
+            None => {
+                crate::console::print("[MMU] ERROR: Cannot allocate L3 table\n");
+                return;
+            }
+        };
+        unsafe { core::ptr::write_bytes(l3_table as *mut u8, 0, PAGE_SIZE); }
+        l3_tables[i] = l3_table;
+    }
+    
+    let l2_ptr = l2_table as *mut u64;
+    
+    // L2 block descriptor flags (2MB blocks)
+    const BLOCK_RW: u64 = flags::VALID | (3 << 2) | flags::SH_INNER | flags::AF;
+    
+    // L3 page descriptor flags (4KB pages)
+    const PAGE_RW: u64 = flags::VALID | flags::TABLE | (3 << 2) | flags::SH_INNER | flags::AF;
+    const PAGE_RO: u64 = flags::VALID | flags::TABLE | (3 << 2) | flags::SH_INNER | flags::AF | flags::AP_RO_EL1;
+    
+    // Fill L2 table
+    for i in 0..512 {
+        let block_addr = RAM_BASE + i * BLOCK_SIZE_2MB;
+        
+        if i >= l3_block_start && i < l3_block_end {
+            // This block needs L3 table for fine-grained protection
+            let l3_idx = i - l3_block_start;
+            let l3_table = l3_tables[l3_idx];
+            let l3_ptr = l3_table as *mut u64;
+            
+            // Fill L3 table with 4KB page mappings
+            for j in 0..512 {
+                let page_addr = block_addr + j * PAGE_SIZE;
+                
+                let in_text = page_addr >= text_start && page_addr < text_end;
+                let in_rodata = page_addr >= rodata_start && page_addr < rodata_end;
+                let is_read_only = in_text || in_rodata;
+                
+                let entry = if is_read_only {
+                    (page_addr as u64) | PAGE_RO
+                } else {
+                    (page_addr as u64) | PAGE_RW
+                };
+                
+                unsafe { l3_ptr.add(j).write_volatile(entry); }
+            }
+            
+            // L2 entry points to L3 table
+            let l3_table_entry = (l3_table as u64) | flags::VALID | flags::TABLE;
+            unsafe { l2_ptr.add(i).write_volatile(l3_table_entry); }
+        } else {
+            // This block can use 2MB block descriptor (all RW)
+            let entry = (block_addr as u64) | BLOCK_RW;
+            unsafe { l2_ptr.add(i).write_volatile(entry); }
+        }
+    }
+    
+    // Update L1[1] to point to our L2 table
+    let l2_table_entry = (l2_table as u64) | flags::VALID | flags::TABLE;
+    let l0_table = get_boot_ttbr0() as *mut u64;
+    
+    unsafe {
+        let l0_entry = l0_table.add(0).read_volatile();
+        let l1_table = (l0_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        
+        crate::safe_print!(96, "[MMU] L0={:#x}, L1={:#x}, L2={:#x}\n", 
+            l0_table as u64, l1_table as u64, l2_table as u64);
+        
+        core::arch::asm!("dsb ishst");
+        l1_table.add(1).write_volatile(l2_table_entry);
+        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
+    }
+    
+    // Count protected pages
+    let text_pages = (text_end - text_start + PAGE_SIZE - 1) / PAGE_SIZE;
+    let rodata_pages = (rodata_end - rodata_start + PAGE_SIZE - 1) / PAGE_SIZE;
+    crate::safe_print!(128, "[MMU] Protected {} text + {} rodata pages (4KB each)\n", 
+        text_pages, rodata_pages);
+    
+    crate::console::print("[MMU] Kernel code protection ENABLED\n");
 }
