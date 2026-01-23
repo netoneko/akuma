@@ -136,7 +136,7 @@ pub const MINIMAL_IDLE_LOOP: bool = false;
 ///
 /// When enabled, skips the async network stack and services (SSH, HTTP, etc.).
 /// Use this to isolate whether crashes are caused by network code.
-pub const SKIP_ASYNC_NETWORK: bool = true;
+pub const SKIP_ASYNC_NETWORK: bool = false;
 
 /// Skip filesystem initialization (for debugging crashes)
 ///

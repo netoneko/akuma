@@ -611,16 +611,17 @@ unsafe extern "C" {
 /// Magic value for Context integrity check
 pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
 
-/// Size of the IRQ frame saved on stack (17 pairs of u64 = 272 bytes)
-pub const IRQ_FRAME_SIZE: usize = 272;
+/// Size of the UNIFIED IRQ frame saved on stack (288 bytes)
+/// Both EL0 and EL1 IRQ handlers now use this same layout.
+pub const IRQ_FRAME_SIZE: usize = 288;
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
 /// This allows the simplified stack-based context switch to work for new threads.
 /// When the IRQ handler restores from this stack, it will load these values.
 /// 
-/// The frame layout matches what irq_handler saves:
-///   [sp+0]:   x30
+/// UNIFIED frame layout (288 bytes) - used by both EL0 and EL1 handlers:
+///   [sp+0]:   x30 + padding
 ///   [sp+16]:  x28, x29
 ///   [sp+32]:  x26, x27
 ///   [sp+48]:  x24, x25
@@ -636,7 +637,8 @@ pub const IRQ_FRAME_SIZE: usize = 272;
 ///   [sp+208]: x2, x3
 ///   [sp+224]: x0, x1
 ///   [sp+240]: ELR, SPSR
-///   [sp+256]: x10, x11
+///   [sp+256]: SP_EL0 + padding
+///   [sp+272]: x10, x11
 /// 
 /// Returns the SP value pointing to the fake IRQ frame
 pub fn setup_fake_irq_frame(
@@ -671,11 +673,22 @@ pub fn setup_fake_irq_frame(
         
         // [sp+240]: ELR, SPSR
         frame.add(30).write_volatile(entry_point);  // ELR - where to jump
-        frame.add(31).write_volatile(0x00000345);   // SPSR - EL1h, IRQs enabled
+        // SPSR bits: [9:7]=DAI masks, [6]=F mask, [3:0]=M (EL1h=5)
+        // 0x345 = F=1, I=0 (IRQ enabled), A=1, D=1
+        // 0x3C5 = F=1, I=1 (IRQ disabled), A=1, D=1
+        let spsr = if x21 != 0 {
+            0x000003C5  // EL1h, IRQs DISABLED
+        } else {
+            0x00000345  // EL1h, IRQs ENABLED
+        };
+        frame.add(31).write_volatile(spsr);
         
-        // [sp+256]: x10, x11
-        frame.add(32).write_volatile(0);  // x10
-        frame.add(33).write_volatile(0);  // x11
+        // [sp+256]: SP_EL0 + padding (user stack pointer, 0 for new threads)
+        frame.add(32).write_volatile(0);  // SP_EL0
+        
+        // [sp+272]: x10, x11
+        frame.add(34).write_volatile(0);  // x10
+        frame.add(35).write_volatile(0);  // x11
     }
     
     frame_base
@@ -1626,7 +1639,14 @@ where
 }
 
 
-/// SGI handler for scheduling
+/// DEPRECATED: Old SGI handler using switch_context
+/// 
+/// This handler used the old context switching mechanism with `switch_context`.
+/// It has been replaced by `sgi_scheduler_handler_with_sp` which uses a unified
+/// stack-based approach for both EL0 and EL1 IRQs.
+/// 
+/// Kept for reference and potential fallback.
+#[allow(dead_code)]
 pub fn sgi_scheduler_handler(irq: u32) {
     crate::gic::end_of_interrupt(irq);
 

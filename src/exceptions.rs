@@ -233,101 +233,159 @@ sync_el0_handler:
     // Return to user mode
     eret
 
-// IRQ from EL0 (user mode)  
-// Uses a FIXED location relative to TPIDR_EL1, calculated fresh on both entry and exit.
-// Frame is at [tpidr_el1 - 768] to avoid overlap with sync_el0_handler.
+// IRQ from EL0 (user mode)
+// UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
+// Context switch: Rust handler returns new SP, assembly does the actual switch.
+// 
+// EL0 IRQ frame layout (288 bytes total):
+//   [sp+0]:   x30 + padding
+//   [sp+16]:  x28, x29
+//   [sp+32]:  x26, x27
+//   [sp+48]:  x24, x25
+//   [sp+64]:  x22, x23
+//   [sp+80]:  x20, x21
+//   [sp+96]:  x18, x19
+//   [sp+112]: x16, x17
+//   [sp+128]: x14, x15
+//   [sp+144]: x12, x13
+//   [sp+160]: x8, x9
+//   [sp+176]: x6, x7
+//   [sp+192]: x4, x5
+//   [sp+208]: x2, x3
+//   [sp+224]: x0, x1
+//   [sp+240]: ELR_EL1, SPSR_EL1
+//   [sp+256]: SP_EL0 + padding
+//   [sp+272]: x10, x11
 irq_el0_handler:
-    // At entry: all x0-x30 contain USER values, SP = SP_EL1
-    // Must save x10 BEFORE we clobber it for frame address calculation
+    // ============================================================
+    // SAVE PHASE: Push all registers to stack in fixed layout
+    // EL0 IRQ frame: 288 bytes (includes SP_EL0)
+    // ============================================================
     
-    // Step 1: Push x10 to SP stack temporarily (SP = SP_EL1, which is exception stack)
-    str     x10, [sp, #-16]!
+    // First save x10, x11 (need them for ELR/SPSR/SP_EL0)
+    stp     x10, x11, [sp, #-16]!
     
-    // Step 2: Calculate frame address in x10
-    mrs     x10, tpidr_el1
-    sub     x10, x10, #768          // x10 = frame base
+    // Save SP_EL0 (user stack pointer) - unique to EL0 handler
+    mrs     x10, sp_el0
+    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
     
-    // Step 3: Save x11 to frame
-    str     x11, [x10, #88]
+    // Save ELR_EL1 and SPSR_EL1 to stack
+    mrs     x10, elr_el1
+    mrs     x11, spsr_el1
+    stp     x10, x11, [sp, #-16]!
     
-    // Step 4: Retrieve saved x10 from stack and save to frame
-    ldr     x11, [sp], #16          // Pop saved x10 into x11, restore SP
-    str     x11, [x10, #80]         // Save user x10 to its slot
+    // Save all other registers
+    stp     x0, x1, [sp, #-16]!
+    stp     x2, x3, [sp, #-16]!
+    stp     x4, x5, [sp, #-16]!
+    stp     x6, x7, [sp, #-16]!
+    stp     x8, x9, [sp, #-16]!
+    stp     x12, x13, [sp, #-16]!
+    stp     x14, x15, [sp, #-16]!
+    stp     x16, x17, [sp, #-16]!
+    stp     x18, x19, [sp, #-16]!
+    stp     x20, x21, [sp, #-16]!
+    stp     x22, x23, [sp, #-16]!
+    stp     x24, x25, [sp, #-16]!
+    stp     x26, x27, [sp, #-16]!
+    stp     x28, x29, [sp, #-16]!
+    str     x30, [sp, #-16]!
     
-    // Step 5: Save x8, x9
-    stp     x8, x9, [x10, #64]
+    // Pass current SP as argument (x0)
+    mov     x0, sp
     
-    // Step 6: Save all other registers
-    stp     x0, x1, [x10, #0]
-    stp     x2, x3, [x10, #16]
-    stp     x4, x5, [x10, #32]
-    stp     x6, x7, [x10, #48]
-    // x8-x11 already saved above
-    stp     x12, x13, [x10, #96]
-    stp     x14, x15, [x10, #112]
-    stp     x16, x17, [x10, #128]
-    stp     x18, x19, [x10, #144]
-    stp     x20, x21, [x10, #160]
-    stp     x22, x23, [x10, #176]
-    stp     x24, x25, [x10, #192]
-    stp     x26, x27, [x10, #208]
-    stp     x28, x29, [x10, #224]
-    str     x30, [x10, #240]
+    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
+    bl      rust_irq_handler_with_sp
     
-    // Save ELR_EL1 and SPSR_EL1
-    mrs     x0, elr_el1
-    mrs     x1, spsr_el1
-    stp     x0, x1, [x10, #248]
+    // Check if context switch needed (x0 != 0)
+    cbz     x0, 4f
+    mov     sp, x0              // Switch SP in assembly!
+4:
     
-    // Set SP for function calls (below our frame)
-    sub     sp, x10, #256
-
-    bl      rust_irq_handler
-
-    // After return (possibly from different thread via context switch),
-    // recalculate frame address from TPIDR_EL1 (which was updated by scheduler)
-    mrs     x10, tpidr_el1
-    sub     x10, x10, #768
+    // ============================================================
+    // RESTORE PHASE: Pop all registers from (possibly new) stack
+    // ============================================================
     
-    // Restore ELR_EL1 and SPSR_EL1
-    ldp     x0, x1, [x10, #248]
-    msr     elr_el1, x0
-    // Clear IL bit (bit 20) in case of stack corruption - prevents EC=0xe
-    bic     x1, x1, #0x100000
-    msr     spsr_el1, x1
+    // Restore general registers (reverse order of save)
+    ldr     x30, [sp], #16
+    ldp     x28, x29, [sp], #16
+    ldp     x26, x27, [sp], #16
+    ldp     x24, x25, [sp], #16
+    ldp     x22, x23, [sp], #16
+    ldp     x20, x21, [sp], #16
+    ldp     x18, x19, [sp], #16
+    ldp     x16, x17, [sp], #16
+    ldp     x14, x15, [sp], #16
+    ldp     x12, x13, [sp], #16
+    ldp     x8, x9, [sp], #16
+    ldp     x6, x7, [sp], #16
+    ldp     x4, x5, [sp], #16
+    ldp     x2, x3, [sp], #16
+    ldp     x0, x1, [sp], #16
     
-    ldr     x30, [x10, #240]
-    ldp     x28, x29, [x10, #224]
-    ldp     x26, x27, [x10, #208]
-    ldp     x24, x25, [x10, #192]
-    ldp     x22, x23, [x10, #176]
-    ldp     x20, x21, [x10, #160]
-    ldp     x18, x19, [x10, #144]
-    ldp     x16, x17, [x10, #128]
-    ldp     x14, x15, [x10, #112]
-    ldp     x12, x13, [x10, #96]
-    ldp     x8, x9, [x10, #64]
-    ldp     x6, x7, [x10, #48]
-    ldp     x4, x5, [x10, #32]
-    ldp     x2, x3, [x10, #16]
-    ldp     x0, x1, [x10, #0]
-    // Finally restore x10, x11 - load x11 first using x10 as base
-    ldr     x11, [x10, #88]         // Load x11 from its slot
-    ldr     x10, [x10, #80]         // Load x10 last (clobbers base)
-
+    // Restore ELR and SPSR FROM STACK
+    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
+    
+    // Clear IL bit in SPSR to prevent EC=0xe
+    bic     x11, x11, #0x100000
+    
+    // Write to system registers
+    msr     elr_el1, x10
+    msr     spsr_el1, x11
+    
+    // CRITICAL: Check for ELR=0 bug before ERET
+    cbnz    x10, 5f
+    mov     x0, #0xDEAD
+    movk    x0, #0xBEEF, lsl #16
+6:  wfi
+    b       6b
+5:
+    
+    // Restore SP_EL0 (user stack pointer)
+    ldr     x10, [sp], #16           // Load SP_EL0 from stack
+    msr     sp_el0, x10
+    
+    // Restore original x10, x11
+    ldp     x10, x11, [sp], #16
+    
     eret
 
 // IRQ from EL1 (kernel mode)
-// SIMPLIFIED: Stack-based save/restore for ALL registers including ELR/SPSR
-// Context switch: Rust handler returns new SP, assembly does the actual switch
+// UNIFIED: Stack-based save/restore, same frame layout as EL0 IRQ handler.
+// Context switch: Rust handler returns new SP, assembly does the actual switch.
+//
+// UNIFIED IRQ frame layout (288 bytes total) - same as EL0:
+//   [sp+0]:   x30 + padding
+//   [sp+16]:  x28, x29
+//   [sp+32]:  x26, x27
+//   [sp+48]:  x24, x25
+//   [sp+64]:  x22, x23
+//   [sp+80]:  x20, x21
+//   [sp+96]:  x18, x19
+//   [sp+112]: x16, x17
+//   [sp+128]: x14, x15
+//   [sp+144]: x12, x13
+//   [sp+160]: x8, x9
+//   [sp+176]: x6, x7
+//   [sp+192]: x4, x5
+//   [sp+208]: x2, x3
+//   [sp+224]: x0, x1
+//   [sp+240]: ELR_EL1, SPSR_EL1
+//   [sp+256]: SP_EL0 + padding (preserved for user stack during syscalls)
+//   [sp+272]: x10, x11
 irq_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
-    // IRQ frame: 272 bytes total
+    // IRQ frame: 288 bytes total (unified with EL0 handler)
     // ============================================================
     
-    // First save x10, x11 (need them for ELR/SPSR)
+    // First save x10, x11 (need them for ELR/SPSR/SP_EL0)
     stp     x10, x11, [sp, #-16]!
+    
+    // Save SP_EL0 - preserves user stack during syscalls and enables
+    // unified frame layout between EL0 and EL1 handlers
+    mrs     x10, sp_el0
+    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
     
     // Save ELR_EL1 and SPSR_EL1 to stack
     mrs     x10, elr_el1
@@ -400,6 +458,10 @@ irq_handler:
 2:  wfi
     b       2b
 1:
+    
+    // Restore SP_EL0 (user stack pointer) - matches EL0 handler frame layout
+    ldr     x10, [sp], #16
+    msr     sp_el0, x10
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16
@@ -584,63 +646,9 @@ extern "C" fn rust_default_exception_handler() {
     }
 }
 
-/// Rust IRQ handler called from assembly
-#[unsafe(no_mangle)]
-extern "C" fn rust_irq_handler() {
-    // Debug: read TPIDR_EL1 and SP
-    let tpidr: u64;
-    let sp: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr);
-        core::arch::asm!("mov {}, sp", out(reg) sp);
-    }
-    let tid_before = crate::threading::current_thread_id();
-    if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
-        // Use stack-only print to avoid heap allocation in IRQ context
-        crate::safe_print!(128, "[IRQ] entry: tid={} tpidr={:#x} sp={:#x}\n", tid_before, tpidr, sp);
-    }
-    
-    // Acknowledge the interrupt and get IRQ number
-    if let Some(irq) = crate::gic::acknowledge_irq() {
-        // Special handling for scheduler SGI
-        if irq == crate::gic::SGI_SCHEDULER {
-            // SGI handler calls EOI itself before context switching
-            crate::threading::sgi_scheduler_handler(irq);
-        } else {
-            // Normal IRQs: call handler then EOI
-            crate::irq::dispatch_irq(irq);
-            crate::gic::end_of_interrupt(irq);
-        }
-    }
-    
-    // Debug: after handling
-    let tpidr_after: u64;
-    let sp_after: u64;
-    let elr_after: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr_after);
-        core::arch::asm!("mov {}, sp", out(reg) sp_after);
-        core::arch::asm!("mrs {}, elr_el1", out(reg) elr_after);
-    }
-    let tid_after = crate::threading::current_thread_id();
-    
-    // CRITICAL: Check for ELR=0 bug before ERET
-    // If ELR is 0, ERET will jump to address 0 and crash
-    if elr_after == 0 {
-        crate::safe_print!(128, "[IRQ FATAL] ELR=0 before ERET! tid={} sp={:#x}\n", tid_after, sp_after);
-        // Try to recover by halting instead of crashing
-        loop {
-            unsafe { core::arch::asm!("wfi"); }
-        }
-    }
-    
-    if crate::config::ENABLE_IRQ_DEBUG_PRINTS {
-        // Use stack-only print to avoid heap allocation in IRQ context
-        crate::safe_print!(128, "[IRQ] exit: tid={} tpidr={:#x} sp={:#x} elr={:#x}\n", tid_after, tpidr_after, sp_after, elr_after);
-    }
-}
-
-/// SIMPLIFIED IRQ handler for stack-based context switching
+/// UNIFIED IRQ handler for stack-based context switching
+/// 
+/// Used by both irq_el0_handler (user mode IRQs) and irq_handler (kernel mode IRQs).
 /// 
 /// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
 /// The assembly does the actual SP switch AFTER this returns.
