@@ -123,14 +123,14 @@ pub const IGNORE_THREADING_TESTS: bool = false;
 /// When enabled, skips memory tests, threading tests, filesystem tests,
 /// process tests, and shell tests. Use this to debug crashes that might
 /// be caused by test-induced heap corruption or thread scheduling issues.
-pub const DISABLE_ALL_TESTS: bool = true;
+pub const DISABLE_ALL_TESTS: bool = false;
 
 /// Minimal idle loop (for debugging EC=0xe crashes)
 ///
 /// When enabled, the idle loop does nothing but yield. No cleanup, no stats,
 /// no prints. Use this to isolate whether the crash is caused by something
 /// in the cleanup or stats code vs the core timer/ERET path.
-pub const MINIMAL_IDLE_LOOP: bool = true;
+pub const MINIMAL_IDLE_LOOP: bool = false;
 
 /// Skip async network initialization (for debugging crashes)
 ///
@@ -152,7 +152,7 @@ pub const MEM_MONITOR_ENABLED: bool = false;
 /// When enabled, the timer IRQ handler checks if any thread has held
 /// preemption disabled for too long and logs a warning.
 /// Disable to rule out watchdog as a source of issues.
-pub const ENABLE_PREEMPTION_WATCHDOG: bool = false;
+pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 
 
 /// Enable async process execution with streaming output over SSH
