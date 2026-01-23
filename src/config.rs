@@ -142,7 +142,7 @@ pub const SKIP_ASYNC_NETWORK: bool = true;
 ///
 /// When enabled, skips block device and filesystem init.
 /// Use this to isolate whether crashes are caused by fs code.
-pub const SKIP_FILESYSTEM_INIT: bool = true;
+pub const SKIP_FILESYSTEM_INIT: bool = false;
 
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;

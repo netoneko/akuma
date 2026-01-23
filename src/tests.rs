@@ -2325,7 +2325,12 @@ fn test_parallel_processes() -> bool {
         
         let p1_done = channel1.has_exited() || crate::threading::is_thread_terminated(tid1);
         let p2_done = channel2.has_exited() || crate::threading::is_thread_terminated(tid2);
-        
+        let exit_code1 = channel1.exit_code();
+        let exit_code2 = channel2.exit_code();
+        if exit_code1 != 0 || exit_code2 != 0 {
+            crate::safe_print!(64, "  Processes failed with exit codes {} and {}\n", exit_code1, exit_code2);
+            break;
+        }
 
         if p1_done && p2_done {
             console::print(" done\n");

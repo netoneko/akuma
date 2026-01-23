@@ -1269,56 +1269,35 @@ impl ThreadPool {
                 );
                 
                 let stack = &self.stacks[i];
-                // Initial SP is BELOW the exception area (which is at the top)
-                let sp = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+                let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
                 
-                // Safe print without heap allocation
-                crate::console::print("[spawn_user] tid=");
-                crate::console::print_dec(i);
-                crate::console::print(" stack_top=0x");
-                crate::console::print_hex(stack.top as u64);
-                crate::console::print(" exc_size=0x");
-                crate::console::print_hex(EXCEPTION_STACK_SIZE as u64);
-                crate::console::print(" initial_sp=0x");
-                crate::console::print_hex(sp);
-                crate::console::print("\n");
-
-                // Get STORED boot TTBR0 (not current, which could be user process's!)
-                // Note: User process threads will update TTBR0 when entering user mode
+                // Get STORED boot TTBR0
                 let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
-                // x19 = trampoline function pointer
-                // x20 = closure data pointer
-                // Write context to THREAD_CONTEXTS (not in slot)
+                // Set up fake IRQ frame for stack-based context switching
+                let sp = setup_fake_irq_frame(
+                    stack_top,
+                    thread_start_closure as *const () as u64,  // ELR
+                    trampoline_fn as *const () as u64,          // x19 - trampoline
+                    closure_ptr as u64,                         // x20 - closure data
+                    0,                                          // x21 - enable IRQs
+                );
+                
+                crate::safe_print!(96, "[spawn_user] tid={} stack_top={:#x} irq_sp={:#x}\n",
+                    i, stack_top, sp);
+
+                // Write minimal context
                 unsafe {
                     let ctx = &mut *get_context_mut(i);
-                    // Magic value for integrity checking
                     ctx.magic = CONTEXT_MAGIC;
+                    ctx.sp = sp;
+                    ctx.ttbr0 = boot_ttbr0;
+                    // Legacy fields
                     ctx.x19 = trampoline_fn as *const () as u64;
                     ctx.x20 = closure_ptr as u64;
-                    ctx.x21 = 0;
-                    ctx.x22 = 0;
-                    ctx.x23 = 0;
-                    ctx.x24 = 0;
-                    ctx.x25 = 0;
-                    ctx.x26 = 0;
-                    ctx.x27 = 0;
-                    ctx.x28 = 0;
-                    ctx.x29 = 0;
                     ctx.x30 = thread_start_closure as *const () as u64;
-                    ctx.sp = sp;
-                    ctx.daif = 0;
-                    // Set ELR to thread entry point - if any code path accidentally ERETs,
-                    // we'll jump to a valid address instead of crashing with ELR=0
                     ctx.elr = thread_start_closure as *const () as u64;
-                    // SPSR for kernel code: EL1h (bits[3:0]=5)
-                    // The closure runs in kernel mode before entering user mode via ERET
-                    ctx.spsr = 0x00000005; // EL1h
-                    ctx.ttbr0 = boot_ttbr0;
-                    // User process fields - 0 for kernel threads (closure-based)
-                    ctx.user_entry = 0;
-                    ctx.user_sp = 0;
-                    ctx.is_user_process = 0;
+                    ctx.spsr = 0x00000345;
                 }
 
                 self.slots[i].cooperative = cooperative;
@@ -2250,58 +2229,45 @@ where
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    // Step 3: Set up context and slot metadata
-    // Context is in THREAD_CONTEXTS (no lock needed), slot metadata needs POOL lock
+    // Step 3: Set up fake IRQ frame and minimal context
+    // This enables stack-based context switching
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
-        let sp = {
+        let stack_top = {
             let pool = POOL.lock();
             let stack = &pool.stacks[slot_idx];
-            // Initial SP is BELOW the exception area (which is at the top)
-            // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
-            // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
+            // Initial stack top is BELOW the exception area
             ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64
         };
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
 
-        // Write context to THREAD_CONTEXTS (no lock needed, thread is INITIALIZING)
-        // SAFETY: Thread state is INITIALIZING, scheduler ignores it
+        // x21 = IRQ enable flag: 0 = enable, non-zero = keep disabled
+        let x21 = if start_irqs_disabled { 1u64 } else { 0u64 };
+
+        // Set up fake IRQ frame for stack-based context switching
+        let sp = setup_fake_irq_frame(
+            stack_top,
+            thread_start_closure as *const () as u64,  // ELR - where to jump
+            trampoline as *const () as u64,            // x19 - trampoline
+            closure_ptr as u64,                        // x20 - closure data
+            x21,                                       // x21 - IRQ enable flag
+        );
+
+        // Write minimal context - only SP and TTBR0 needed for stack-based switching
         unsafe {
             let ctx = &mut *get_context_mut(slot_idx);
-            // Magic value for integrity checking
             ctx.magic = CONTEXT_MAGIC;
+            ctx.sp = sp;
+            ctx.ttbr0 = boot_ttbr0;
+            // Legacy fields for compatibility with old scheduler path
             ctx.x19 = trampoline as *const () as u64;
             ctx.x20 = closure_ptr as u64;
-            // x21 = IRQ enable flag for thread_start_closure:
-            // 0 = enable IRQs immediately, non-zero = keep disabled (for process threads)
-            ctx.x21 = if start_irqs_disabled { 1 } else { 0 };
-            ctx.x22 = 0;
-            ctx.x23 = 0;
-            ctx.x24 = 0;
-            ctx.x25 = 0;
-            ctx.x26 = 0;
-            ctx.x27 = 0;
-            ctx.x28 = 0;
-            ctx.x29 = 0;
+            ctx.x21 = x21;
             ctx.x30 = thread_start_closure as *const () as u64;
-            ctx.sp = sp;
-            // DAIF is no longer restored by switch_context (to prevent nested IRQs)
-            // but we still save it for consistency. thread_start_closure uses x21 to
-            // decide whether to enable IRQs.
-            ctx.daif = if start_irqs_disabled { 0x80 } else { 0 };
-            // Set ELR to thread entry point - if any code path accidentally ERETs,
-            // we'll jump to a valid address instead of crashing with ELR=0
             ctx.elr = thread_start_closure as *const () as u64;
-            // SPSR for kernel code: EL1h (bits[3:0]=5)
-            // The closure runs in kernel mode before entering user mode via ERET
-            ctx.spsr = 0x00000005; // EL1h
-            ctx.ttbr0 = boot_ttbr0;
-            // User process fields - 0 for kernel threads (closure-based)
-            ctx.user_entry = 0;
-            ctx.user_sp = 0;
-            ctx.is_user_process = 0;
+            ctx.spsr = 0x00000345; // EL1h, IRQs enabled
         }
 
         // Write slot metadata (needs POOL lock)
