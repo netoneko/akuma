@@ -1142,7 +1142,23 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Get thread_id before cleanup (needed for channel removal and thread termination)
     let thread_id = proc.thread_id.ok_or("Process has no thread_id (not yet started?)")?;
     
+    // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
+    // to detect the interrupt and properly abort their sockets before we clean up.
+    // The interrupt check in syscalls will cause them to return EINTR and clean up
+    // their own resources (e.g., abort TcpSocket in block_on_accept).
+    if let Some(channel) = get_channel(thread_id) {
+        channel.set_interrupted();
+    }
+    
+    // Yield a few times to give the blocked thread a chance to detect the interrupt
+    // and abort its sockets. This is important for listening sockets in accept().
+    for _ in 0..5 {
+        crate::threading::yield_now();
+    }
+    
     // Clean up all open sockets for this process
+    // Note: This cleans up sockets in the fd_table, but sockets created inside
+    // syscalls (like the TcpSocket in accept()) are handled by the interrupt mechanism.
     cleanup_process_sockets(proc);
     
     // Mark process as killed (using signal 9 = SIGKILL)
