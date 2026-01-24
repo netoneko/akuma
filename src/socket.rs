@@ -353,10 +353,16 @@ impl Default for SocketHandle {
 
 impl Drop for SocketHandle {
     fn drop(&mut self) {
-        // Abort the socket if it exists to release embassy-net resources
+        // Release embassy-net resources
         // SAFETY: We're in drop, have exclusive access
+        // Note: socket.close() should have been called already for graceful shutdown
+        // If not, we abort as a fallback to release resources
         if let Some(mut boxed) = unsafe { (*self.socket.get()).take() } {
-            boxed.abort();
+            // Check if socket is still open - if so, abort it
+            // (This is the fallback case - normally socket_close() already called close())
+            if boxed.may_send() || boxed.may_recv() {
+                boxed.abort();
+            }
         }
     }
 }
@@ -641,8 +647,30 @@ pub fn socket_close(idx: usize) -> Result<(), i32> {
         socket.state = SocketState::Closing;
     });
 
+    // Gracefully close the socket - flush and close instead of abort
+    // This ensures buffered data is transmitted before the connection is terminated
+    crate::threading::disable_preemption();
+    let close_result = crate::irq::with_irqs_disabled(|| {
+        if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+            return;
+        }
+        unsafe {
+            if let Some(ks) = (*SOCKET_TABLE[idx].socket.get()).as_mut() {
+                if let Some(socket) = ks.handle.get() {
+                    // Graceful close - sends FIN and allows buffered data to be transmitted
+                    socket.close();
+                }
+            }
+        }
+    });
+    crate::threading::enable_preemption();
+    
+    // Yield a few times to give the network stack time to transmit data
+    for _ in 0..10 {
+        crate::threading::yield_now();
+    }
+
     // Then remove from table (this will trigger Drop which queues buffer cleanup)
-    // The SocketHandle's Drop impl will call abort() on the TcpSocket
     remove_socket(idx);
     Ok(())
 }

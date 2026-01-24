@@ -778,7 +778,32 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             Ok(Ok(n)) if n > 0 => {
                 total_written += n;
                 if total_written >= len {
-                    // All data written
+                    // All data written - flush to ensure transmission
+                    let _ = socket::with_socket_handle(socket_idx, |socket| {
+                        use core::future::Future;
+                        use core::pin::Pin;
+                        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+                        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+                            |_| RawWaker::new(core::ptr::null(), &VTABLE),
+                            |_| {}, |_| {}, |_| {},
+                        );
+
+                        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+                        let mut cx = Context::from_waker(&waker);
+
+                        // Poll flush a few times to help push data out
+                        for _ in 0..100 {
+                            let mut flush_future = socket.flush();
+                            let pinned = unsafe { Pin::new_unchecked(&mut flush_future) };
+                            match pinned.poll(&mut cx) {
+                                Poll::Ready(_) => break,
+                                Poll::Pending => {
+                                    crate::threading::yield_now();
+                                }
+                            }
+                        }
+                    });
                     socket::socket_dec_ref(socket_idx);
                     return total_written as u64;
                 }
