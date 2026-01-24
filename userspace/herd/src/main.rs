@@ -138,6 +138,69 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() {
+    // Check for command-line arguments
+    let argc = libakuma::argc();
+    
+    if argc > 1 {
+        // Command mode - handle subcommand
+        let subcommand = libakuma::arg(1).unwrap_or("");
+        let service_name = libakuma::arg(2);
+        
+        match subcommand {
+            "daemon" | "run" => {
+                // Run as daemon (fall through to supervisor loop)
+            }
+            "status" => {
+                cmd_status();
+                return;
+            }
+            "config" => {
+                if let Some(name) = service_name {
+                    cmd_config(name);
+                } else {
+                    print("Usage: herd config <service>\n");
+                }
+                return;
+            }
+            "enable" => {
+                if let Some(name) = service_name {
+                    cmd_enable(name);
+                } else {
+                    print("Usage: herd enable <service>\n");
+                }
+                return;
+            }
+            "disable" => {
+                if let Some(name) = service_name {
+                    cmd_disable(name);
+                } else {
+                    print("Usage: herd disable <service>\n");
+                }
+                return;
+            }
+            "log" => {
+                if let Some(name) = service_name {
+                    cmd_log(name);
+                } else {
+                    print("Usage: herd log <service>\n");
+                }
+                return;
+            }
+            "help" | "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            _ => {
+                print("Unknown command: ");
+                print(subcommand);
+                print("\n");
+                print_usage();
+                return;
+            }
+        }
+    }
+
+    // Daemon mode - run supervisor loop
     print("[herd] Userspace supervisor starting...\n");
 
     let mut state = HerdState::new();
@@ -561,4 +624,158 @@ fn append_file(path: &str, data: &[u8]) {
 
 fn print_dec(val: usize) {
     libakuma::print_dec(val);
+}
+
+// ============================================================================
+// Command Implementations
+// ============================================================================
+
+fn print_usage() {
+    print("Usage: herd <command> [args]\n");
+    print("\n");
+    print("Commands:\n");
+    print("  daemon, run    Run the supervisor daemon\n");
+    print("  status         List enabled services\n");
+    print("  config <svc>   Show service configuration\n");
+    print("  enable <svc>   Enable a service\n");
+    print("  disable <svc>  Disable a service\n");
+    print("  log <svc>      Show service log\n");
+    print("  help           Show this help\n");
+    print("\n");
+    print("Without arguments, runs as daemon.\n");
+}
+
+fn cmd_status() {
+    print("Enabled services:\n");
+    
+    match read_dir(HERD_ENABLED_DIR) {
+        Some(dir) => {
+            let mut found = false;
+            for entry in dir {
+                if entry.name.ends_with(".conf") {
+                    let name = entry.name.trim_end_matches(".conf");
+                    print("  ");
+                    print(name);
+                    print("\n");
+                    found = true;
+                }
+            }
+            if !found {
+                print("  (none)\n");
+            }
+        }
+        None => {
+            print("  Cannot read ");
+            print(HERD_ENABLED_DIR);
+            print("/\n");
+        }
+    }
+}
+
+fn cmd_config(name: &str) {
+    // Try enabled directory first
+    let enabled_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
+    if let Some(content) = read_file_string(&enabled_path) {
+        print("Config for '");
+        print(name);
+        print("' (enabled):\n\n");
+        print(&content);
+        if !content.ends_with('\n') {
+            print("\n");
+        }
+        return;
+    }
+    
+    // Try available directory
+    let available_path = format!("/etc/herd/available/{}.conf", name);
+    if let Some(content) = read_file_string(&available_path) {
+        print("Config for '");
+        print(name);
+        print("' (not enabled):\n\n");
+        print(&content);
+        if !content.ends_with('\n') {
+            print("\n");
+        }
+        return;
+    }
+    
+    print("Service '");
+    print(name);
+    print("' not found.\n");
+    print("Check /etc/herd/available/ and /etc/herd/enabled/\n");
+}
+
+fn cmd_enable(name: &str) {
+    let src_path = format!("/etc/herd/available/{}.conf", name);
+    let dst_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
+    
+    // Check if already enabled
+    if read_file_bytes(&dst_path).is_some() {
+        print("Service '");
+        print(name);
+        print("' is already enabled.\n");
+        return;
+    }
+    
+    // Read source config
+    let content = match read_file_bytes(&src_path) {
+        Some(c) => c,
+        None => {
+            print("Service '");
+            print(name);
+            print("' not found in /etc/herd/available/\n");
+            return;
+        }
+    };
+    
+    // Write to enabled
+    write_file(&dst_path, &content);
+    print("Enabled service '");
+    print(name);
+    print("'\n");
+    print("Service will start on next config reload (within 20s) or reboot.\n");
+}
+
+fn cmd_disable(name: &str) {
+    let path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
+    
+    // Check if enabled
+    if read_file_bytes(&path).is_none() {
+        print("Service '");
+        print(name);
+        print("' is not enabled.\n");
+        return;
+    }
+    
+    // Remove from enabled (we don't have unlink syscall, so just write empty file)
+    // TODO: Add proper file deletion when unlink syscall is available
+    // For now, we can't actually delete files - just inform the user
+    print("Note: File deletion not yet supported.\n");
+    print("Manually remove: ");
+    print(&path);
+    print("\n");
+}
+
+fn cmd_log(name: &str) {
+    let log_path = format!("{}/{}.log", HERD_LOG_DIR, name);
+    
+    match read_file_string(&log_path) {
+        Some(content) => {
+            if content.is_empty() {
+                print("Log for '");
+                print(name);
+                print("' is empty.\n");
+            } else {
+                print(&content);
+                if !content.ends_with('\n') {
+                    print("\n");
+                }
+            }
+        }
+        None => {
+            print("No log found for '");
+            print(name);
+            print("'\n");
+        }
+    }
 }
