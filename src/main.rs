@@ -50,8 +50,13 @@ mod virtio_hal;
 mod web_server;
 
 use alloc::string::ToString;
+use core::sync::atomic::AtomicU64;
 
 use core::panic::PanicInfo;
+
+/// Global poll step counter for debugging hangs.
+/// Used by the timer watchdog to report which step is blocking.
+pub static GLOBAL_POLL_STEP: AtomicU64 = AtomicU64::new(0);
 
 /// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
 #[inline]
@@ -439,18 +444,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Register virtual timer IRQ (27) for Embassy async wakeups
     // Embassy uses CNTV (virtual timer) to avoid conflict with scheduler's CNTP
     irq::register_handler(27, |_irq| {
-        static VIRT_TIMER_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let count = VIRT_TIMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if count < 10 || count % 100 == 0 {
-            console::print("[VIRT-TIMER] IRQ 27 fired, count=");
-            console::print_u64(count);
-            console::print("\n");
-        }
-        // Check embassy alarms when virtual timer fires
         embassy_time_driver::on_timer_interrupt();
     });
     gic::enable_irq(27); // Enable virtual timer interrupt
-    console::print("[TIMER] Virtual timer IRQ 27 enabled\n");
 
     console::print("Enabling timer...\n");
     timer::enable_timer_interrupts(config::TIMER_INTERVAL_US); // 10ms intervals
@@ -773,11 +769,11 @@ fn run_async_main() -> ! {
     }
 
     // Auto-start herd process supervisor (AFTER IRQs enabled so scheduler works)
-    let (herd_tid, herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
-        // const HERD_PATH: &str = "/bin/herd";
-        // const HERD_ARGS: &[&str] = &["daemon"];
-        const HERD_PATH: &str = "/bin/hello";
-        const HERD_ARGS: &[&str] = &["10", "50"];
+    let (_herd_tid, mut herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
+        const HERD_PATH: &str = "/bin/herd";
+        const HERD_ARGS: &[&str] = &["daemon"];
+        // const HERD_PATH: &str = "/bin/hello";
+        // const HERD_ARGS: &[&str] = &["10", "50"];
         if fs::exists(HERD_PATH) {
             crate::safe_print!(64, "[AsyncMain] Starting herd supervisor...\n");
             match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
@@ -803,6 +799,24 @@ fn run_async_main() -> ! {
     static LOOP_COUNTER: AtomicU64 = AtomicU64::new(0);
     static LAST_HEARTBEAT_US: AtomicU64 = AtomicU64::new(0);
     const HEARTBEAT_INTERVAL_US: u64 = 30_000_000; // 30 seconds
+    
+    // Pre-initialization phase: Poll SSH server with preemption ENABLED until
+    // its filesystem initialization is complete. This avoids deadlocks with
+    // other threads (like herd) that may hold VFS locks.
+    crate::safe_print!(64, "[AsyncMain] SSH server initialization...\n");
+    while !ssh::server::is_initialized() {
+        // Poll network runners to keep network alive
+        let _ = runner_pinned.as_mut().poll(&mut cx);
+        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
+        // Poll SSH server - this progresses its initialization
+        let _ = ssh_pinned.as_mut().poll(&mut cx);
+        // Process any pending work
+        executor::process_irq_work();
+        executor::run_once();
+        // Yield to other threads (preemption is enabled here)
+        threading::yield_now();
+    }
+    crate::safe_print!(64, "[AsyncMain] SSH server initialized, entering main loop\n");
 
     loop {
         // Periodic heartbeat that doesn't rely on async (for debugging hangs)
@@ -833,82 +847,87 @@ fn run_async_main() -> ! {
             );
         }
 
-        // Disable preemption during polling to protect embassy-net's internal RefCells.
+        // Disable preemption during embassy-net polling to protect RefCells.
         // Embassy-net uses RefCell for interior mutability, which panics on re-entrant
         // borrows. Timer preemption mid-poll would cause this panic.
         threading::disable_preemption();
-
-        // Debug: Track which poll step we're on (for diagnosing hangs)
-        static POLL_STEP: AtomicU64 = AtomicU64::new(0);
         
-        POLL_STEP.store(1, Ordering::Relaxed);
+        GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
         // Poll the main network runner
         let _ = runner_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(2, Ordering::Relaxed);
+        
+        GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
         // Poll loopback runner - process any pending packets
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(3, Ordering::Relaxed);
+        
+        GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
         // Poll the SSH server (runs curl commands that send to loopback)
         let _ = ssh_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(4, Ordering::Relaxed);
+        
+        GLOBAL_POLL_STEP.store(4, Ordering::Relaxed);
         // Poll loopback runner again - process packets sent by curl
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(5, Ordering::Relaxed);
-        // Poll the HTTP web servers
-        // let _ = web_pinned.as_mut().poll(&mut cx);
         
-        POLL_STEP.store(6, Ordering::Relaxed);
-        // let _ = web_loopback_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(7, Ordering::Relaxed);
+        GLOBAL_POLL_STEP.store(5, Ordering::Relaxed);
         // Poll loopback runner again - process response packets from web server
         let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-
-        POLL_STEP.store(8, Ordering::Relaxed);
+        
+        GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
-
-
-        // Process pending IRQ work
+        
+        GLOBAL_POLL_STEP.store(7, Ordering::Relaxed);
+        // Process pending IRQ work - may poll embassy tasks
         executor::process_irq_work();
-
+        
+        GLOBAL_POLL_STEP.store(8, Ordering::Relaxed);
+        // Poll the executor for any other tasks - may access embassy-net
+        executor::run_once();
+        
+        GLOBAL_POLL_STEP.store(9, Ordering::Relaxed);
         // Process deferred buffer frees from terminated SSH sessions.
         // This MUST happen after polling the network runner, which ensures
         // embassy-net has finished cleaning up aborted sockets before we
         // free their buffers for reuse.
         ssh::server::process_pending_buffer_frees();
         
+        GLOBAL_POLL_STEP.store(10, Ordering::Relaxed);
         // Process deferred buffer frees from closed userspace sockets.
-        // Same rationale as SSH buffers - must happen after network poll.
         socket::process_buffer_cleanup();
+        
+        GLOBAL_POLL_STEP.store(11, Ordering::Relaxed);
+        // Re-enable preemption - safe now that embassy-net operations are done
+        threading::enable_preemption();
 
+        GLOBAL_POLL_STEP.store(12, Ordering::Relaxed);
         // Poll herd's output and print to console (if running)
+        // This is safe outside preemption-disabled: uses Spinlock, not RefCells
         if let Some(ref channel) = herd_channel {
-            crate::safe_print!(64, "[Herd] Reading output...\n");
-            let output = channel.read_all();
-            crate::safe_print!(64, "[Herd] Finished reading output: {} bytes\n", output.len());
-            if !output.is_empty() {
-                // Print herd's output to console
+            // Check for output (non-blocking)
+            if let Some(output) = channel.try_read() {
                 for &byte in &output {
                     console::print_char(byte as char);
                 }
             }
+            
+            // Check if process has exited
+            if channel.has_exited() {
+                // Read any remaining output
+                let output = channel.read_all();
+                if !output.is_empty() {
+                    for &byte in &output {
+                        console::print_char(byte as char);
+                    }
+                }
+                let exit_code = channel.exit_code();
+                crate::safe_print!(64, "[Herd] Process exited with code {}\n", exit_code);
+                // Clear the channel to stop polling
+                herd_channel = None;
+            }
         }
-
-        POLL_STEP.store(11, Ordering::Relaxed);
-        // Poll the executor for any other tasks
-        executor::run_once();
-
-        POLL_STEP.store(12, Ordering::Relaxed);
-        // Re-enable preemption - safe now that all RefCell borrows are released
-        threading::enable_preemption();
         
-        POLL_STEP.store(13, Ordering::Relaxed);
+        GLOBAL_POLL_STEP.store(13, Ordering::Relaxed);
         
         // Periodic stack canary check (every ~1000 iterations to reduce overhead)
         static CANARY_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -926,11 +945,11 @@ fn run_async_main() -> ! {
             }
         }
 
-        POLL_STEP.store(14, Ordering::Relaxed);
+        GLOBAL_POLL_STEP.store(14, Ordering::Relaxed);
         // Yield to other threads (cooperative multitasking)
         threading::yield_now();
         
-        POLL_STEP.store(14, Ordering::Relaxed);
+        GLOBAL_POLL_STEP.store(14, Ordering::Relaxed);
         // We're back from yield - loop continues
         
         // Periodically log poll step (to catch where we hang)
@@ -942,7 +961,7 @@ fn run_async_main() -> ! {
             console::print("[PollStep] ");
             console::print_u64(step_count / 1_000_000);
             console::print(" million loops, step: ");
-            console::print_dec(POLL_STEP.load(Ordering::Relaxed) as usize);
+            console::print_dec(GLOBAL_POLL_STEP.load(Ordering::Relaxed) as usize);
             console::print("\n");
         }
     }

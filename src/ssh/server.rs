@@ -292,6 +292,17 @@ fn run_session_on_thread(stream: SendableTcpStream, session_id: usize, buffer_sl
 // SSH Server with Concurrent Connections
 // ============================================================================
 
+/// Flag to track whether SSH server initialization is complete.
+/// Used to allow the main loop to poll SSH server with preemption enabled
+/// during initialization (which does filesystem I/O), then with preemption
+/// disabled once initialization is done (accept loop).
+static SSH_INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Check if SSH server initialization is complete
+pub fn is_initialized() -> bool {
+    SSH_INIT_DONE.load(Ordering::Acquire)
+}
+
 /// Run the SSH server with thread-per-session architecture
 ///
 /// This is the main accept loop that runs on thread 0. When a connection
@@ -309,11 +320,17 @@ pub async fn run(stack: Stack<'static>) {
     crate::shell::enable_async_exec();
 
     // Initialize shared host key from filesystem
+    // NOTE: This does filesystem I/O which can block, so it must run with
+    // preemption enabled to avoid deadlocks with other threads holding VFS locks.
     protocol::init_host_key_async().await;
 
     // Ensure default config exists, then load and cache it
     super::config::ensure_default_config().await;
     super::config::load_config().await;
+    
+    // Mark initialization as complete - main loop can now poll with preemption disabled
+    SSH_INIT_DONE.store(true, Ordering::Release);
+    log("[SSH Server] Initialization complete, entering accept loop\n");
 
     let mut next_id: usize = 0;
 

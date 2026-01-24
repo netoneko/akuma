@@ -150,15 +150,6 @@ impl EmbassyTimeDriver {
         if earliest != u64::MAX {
             // Set virtual timer compare value (CNTV to avoid conflict with scheduler's CNTP)
             let counter_target = ticks_to_counter(earliest);
-            let current = read_counter();
-            
-            // Debug: Log when setting virtual timer
-            static SET_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let count = SET_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if count < 5 {
-                crate::safe_print!(192, "[EMBASSY] Setting CNTV: target={} cur={} diff={}\n",
-                    counter_target, current, counter_target.saturating_sub(current));
-            }
             
             unsafe {
                 asm!("msr cntv_cval_el0, {}", in(reg) counter_target);
