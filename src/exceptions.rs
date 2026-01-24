@@ -1000,9 +1000,20 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             // Handle syscall
             let ret = crate::syscall::handle_syscall(syscall_num, &args);
+            
+            // Debug: print immediately after syscall returns (for ALL syscalls)
+            if syscall_num == 202 { // nr::ACCEPT = 202
+                crate::console::print("[EXC] accept done\n");
+            }
 
             // Check if process exited - if so, return to kernel
+            if syscall_num == 202 {
+                crate::console::print("[EXC] checking process\n");
+            }
             if let Some(proc) = crate::process::current_process() {
+                if syscall_num == 202 {
+                    crate::console::print("[EXC] got process\n");
+                }
                 if proc.exited {
                     let exit_code = proc.exit_code;
                     
@@ -1033,6 +1044,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            if syscall_num == 202 {
+                crate::console::print("[EXC] returning to asm\n");
+            }
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {

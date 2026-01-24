@@ -579,8 +579,9 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 
     crate::safe_print!(64, "[accept] Waiting on port {} (slot {})\n", local_addr.port, new_slot);
 
-    // Use block_on_accept which handles socket creation and ownership internally
-    let (tcp_socket, remote_ep) = match block_on_accept(stack, rx_buf, tx_buf, local_addr.port) {
+    // Use block_on_accept which stores socket directly in table to avoid
+    // returning TcpSocket by value (which causes stack corruption)
+    let new_socket_idx = match block_on_accept(stack, rx_buf, tx_buf, local_addr.port, new_slot, local_addr) {
         Ok(v) => v,
         Err(e) => {
             crate::safe_print!(48, "[accept] failed: errno={}\n", e);
@@ -593,55 +594,21 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     // Decrement ref count on listening socket (we're done using it)
     socket::socket_dec_ref(socket_idx);
 
-    // Get remote address
-    let remote_addr = match remote_ep {
-        Some(ep) => socket::SocketAddrV4::from_endpoint(ep).unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
-        None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
-    };
-
-    crate::console::print("[accept] Got remote addr\n");
-    crate::safe_print!(80, "[accept] ip={}.{}.{}.{} port={}\n", 
-        remote_addr.ip[0], remote_addr.ip[1], remote_addr.ip[2], remote_addr.ip[3], remote_addr.port);
-
-    crate::console::print("[accept] Storing socket handle...\n");
-    
-    // Create new socket entry with the connected TcpSocket
-    let new_socket_idx = socket::alloc_socket_with_handle(
-        socket::socket_const::SOCK_STREAM,
-        new_slot,
-        tcp_socket,
-        socket::SocketState::Connected { local_addr, remote_addr },
-    );
-
-    crate::safe_print!(48, "[accept] Socket idx={}\n", new_socket_idx);
+    // MINIMAL VERSION - no remote_addr lookup, no extra logging
+    let _ = (addr_ptr, addr_len_ptr); // silence warnings
 
     // Allocate FD for new socket
     let proc = match crate::process::current_process() {
         Some(p) => p,
         None => {
-            // Cleanup on error
             socket::socket_close(new_socket_idx).ok();
             return (-libc_errno::EBADF as i64) as u64;
         }
     };
 
     let new_fd = proc.alloc_fd(FileDescriptor::Socket(new_socket_idx));
-
-    crate::safe_print!(48, "[accept] Allocated fd={}\n", new_fd);
-
-    // Write remote address to user if requested
-    if addr_ptr != 0 && addr_len_ptr != 0 {
-        let sockaddr = socket::SockAddrIn::from_addr(&remote_addr);
-        unsafe {
-            core::ptr::write(addr_ptr as *mut socket::SockAddrIn, sockaddr);
-            core::ptr::write(addr_len_ptr as *mut u32, socket::SockAddrIn::SIZE as u32);
-        }
-    }
-
-    crate::console::print("[accept] Done!\n");
-    let ret_val = new_fd as u64;
-    crate::safe_print!(48, "[accept] Returning fd={}\n", ret_val);
-    ret_val
+    crate::safe_print!(48, "[accept] fd={} idx={}\n", new_fd, new_socket_idx);
+    new_fd as u64
 }
 
 /// sys_connect - Connect to remote address (blocking)
@@ -1450,12 +1417,17 @@ where
 /// 1. The accept future borrows the socket mutably
 /// 2. We need to access the socket after the future completes
 /// 3. We carefully manage the lifetime - socket is only accessed when future is done
+/// Accepts a connection and stores the socket directly in the socket table.
+/// Returns socket_idx on success. Remote address can be retrieved from socket state.
+/// This avoids returning TcpSocket or IpEndpoint by value which can cause stack issues.
 fn block_on_accept(
     stack: embassy_net::Stack<'static>,
     rx_buf: &'static mut [u8],
     tx_buf: &'static mut [u8],
     port: u16,
-) -> Result<(embassy_net::tcp::TcpSocket<'static>, Option<embassy_net::IpEndpoint>), i32> {
+    buffer_slot: usize,
+    local_addr: socket::SocketAddrV4,
+) -> Result<usize, i32> {
     use core::cell::UnsafeCell;
     use embassy_net::tcp::TcpSocket;
 
@@ -1514,20 +1486,33 @@ fn block_on_accept(
         match result {
             Poll::Ready(Ok(())) => {
                 // CRITICAL: Drop the future first to release the mutable borrow!
-                // The future still exists on the stack even though poll() returned Ready.
-                // We must drop it before we can safely access the socket.
                 drop(accept_fut);
                 
-                // Now we can safely access socket
+                // Get socket and remote endpoint
                 let socket = unsafe { socket_cell.into_inner() };
+                
                 crate::threading::disable_preemption();
-                let remote = socket.remote_endpoint();
+                let remote_ep = socket.remote_endpoint();
                 crate::threading::enable_preemption();
-                return Ok((socket, remote));
+                
+                let remote_addr = match remote_ep {
+                    Some(ep) => socket::SocketAddrV4::from_endpoint(ep)
+                        .unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
+                    None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
+                };
+                
+                // Store socket directly in table - AVOID returning TcpSocket by value
+                let socket_idx = socket::alloc_socket_with_handle(
+                    socket::socket_const::SOCK_STREAM,
+                    buffer_slot,
+                    socket,
+                    socket::SocketState::Connected { local_addr, remote_addr },
+                );
+                
+                return Ok(socket_idx);
             }
             Poll::Ready(Err(e)) => {
                 crate::safe_print!(64, "[block_on_accept] embassy error: {:?}\n", e);
-                // Drop future first to release borrow
                 drop(accept_fut);
                 let socket = unsafe { socket_cell.into_inner() };
                 drop(socket);

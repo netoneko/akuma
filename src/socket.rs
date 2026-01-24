@@ -10,12 +10,12 @@
 //! - Buffer cleanup is deferred to network runner thread (thread 0)
 //! - Reference counting prevents close-during-use races
 
-use alloc::collections::BTreeMap;
+// Fixed-size socket table - no BTreeMap needed
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use embassy_net::tcp::TcpSocket;
-use spinning_top::Spinlock;
+// Spinlock no longer needed - using fixed array with atomic flags
 
 // ============================================================================
 // Constants
@@ -452,22 +452,60 @@ impl Drop for KernelSocket {
 }
 
 // ============================================================================
-// Global Socket Table
+// Global Socket Table (Fixed Array - avoids heap allocation and moving sockets)
 // ============================================================================
 
-/// Next socket index
+/// Next socket index (wraps around, we check slot availability)
 static NEXT_SOCKET_IDX: AtomicUsize = AtomicUsize::new(0);
 
-/// Global socket table
-static SOCKET_TABLE: Spinlock<BTreeMap<usize, KernelSocket>> = Spinlock::new(BTreeMap::new());
+/// Socket slot - stores KernelSocket in a fixed location
+struct SocketSlot {
+    socket: UnsafeCell<Option<KernelSocket>>,
+    in_use: AtomicBool,
+}
+
+// SAFETY: Access is serialized via in_use flag and IRQ disable
+unsafe impl Sync for SocketSlot {}
+
+impl SocketSlot {
+    const fn new() -> Self {
+        Self {
+            socket: UnsafeCell::new(None),
+            in_use: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Global socket table - fixed array to avoid BTreeMap heap allocations
+/// and to keep sockets at fixed memory locations (important for TcpSocket)
+static SOCKET_TABLE: [SocketSlot; MAX_SOCKETS] = {
+    const SLOT_INIT: SocketSlot = SocketSlot::new();
+    [SLOT_INIT; MAX_SOCKETS]
+};
+
+/// Find a free socket slot
+fn find_free_slot() -> Option<usize> {
+    for i in 0..MAX_SOCKETS {
+        if SOCKET_TABLE[i].in_use
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
 
 /// Allocate a new socket and add it to the table
 pub fn alloc_socket(socket_type: i32) -> Option<usize> {
     let socket = KernelSocket::new(socket_type)?;
-    let idx = NEXT_SOCKET_IDX.fetch_add(1, Ordering::SeqCst);
+    let idx = find_free_slot()?;
 
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().insert(idx, socket);
+        // SAFETY: We have exclusive access via in_use flag
+        unsafe {
+            *SOCKET_TABLE[idx].socket.get() = Some(socket);
+        }
     });
 
     Some(idx)
@@ -475,22 +513,38 @@ pub fn alloc_socket(socket_type: i32) -> Option<usize> {
 
 /// Get socket state (cloned) - does not hold lock
 pub fn get_socket_state(idx: usize) -> Option<SocketState> {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().get(&idx).map(|s| s.state.clone())
+        // SAFETY: Slot is in use, we have IRQs disabled
+        unsafe {
+            (*SOCKET_TABLE[idx].socket.get()).as_ref().map(|s| s.state.clone())
+        }
     })
 }
 
 /// Increment socket reference count
 pub fn socket_inc_ref(idx: usize) -> Option<u32> {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().get(&idx).map(|s| s.inc_ref())
+        unsafe {
+            (*SOCKET_TABLE[idx].socket.get()).as_ref().map(|s| s.inc_ref())
+        }
     })
 }
 
 /// Decrement socket reference count
 pub fn socket_dec_ref(idx: usize) -> Option<bool> {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().get(&idx).map(|s| s.dec_ref())
+        unsafe {
+            (*SOCKET_TABLE[idx].socket.get()).as_ref().map(|s| s.dec_ref())
+        }
     })
 }
 
@@ -499,23 +553,37 @@ pub fn with_socket<F, R>(idx: usize, f: F) -> Option<R>
 where
     F: FnOnce(&mut KernelSocket) -> R,
 {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        let mut table = SOCKET_TABLE.lock();
-        table.get_mut(&idx).map(f)
+        unsafe {
+            (*SOCKET_TABLE[idx].socket.get()).as_mut().map(f)
+        }
     })
 }
 
 /// Remove a socket from the table
 pub fn remove_socket(idx: usize) -> Option<KernelSocket> {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().remove(&idx)
+        let socket = unsafe { (*SOCKET_TABLE[idx].socket.get()).take() };
+        SOCKET_TABLE[idx].in_use.store(false, Ordering::Release);
+        socket
     })
 }
 
 /// Get socket buffer slot
 pub fn get_socket_buffer_slot(idx: usize) -> Option<usize> {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return None;
+    }
     crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().get(&idx).map(|s| s.buffer_slot)
+        unsafe {
+            (*SOCKET_TABLE[idx].socket.get()).as_ref().map(|s| s.buffer_slot)
+        }
     })
 }
 
@@ -602,11 +670,14 @@ pub unsafe fn get_buffers(slot: usize) -> (&'static mut [u8], &'static mut [u8])
 ///
 /// SAFETY: Must be called with preemption disabled
 pub fn store_socket_handle(idx: usize, socket: TcpSocket<'static>) {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return;
+    }
     crate::irq::with_irqs_disabled(|| {
-        let mut table = SOCKET_TABLE.lock();
-        if let Some(ks) = table.get_mut(&idx) {
-            // SAFETY: We have exclusive access via table lock and IRQs disabled
-            unsafe { ks.handle.store(socket); }
+        unsafe {
+            if let Some(ks) = (*SOCKET_TABLE[idx].socket.get()).as_mut() {
+                ks.handle.store(socket);
+            }
         }
     });
 }
@@ -618,41 +689,53 @@ pub fn alloc_socket_with_handle(
     tcp_socket: TcpSocket<'static>,
     state: SocketState,
 ) -> usize {
-    crate::console::print("[alloc_socket_with_handle] Creating KernelSocket\n");
-    
-    let handle = SocketHandle::with_socket(tcp_socket);
-    crate::console::print("[alloc_socket_with_handle] Created SocketHandle\n");
-    
-    let socket = KernelSocket {
-        state,
-        buffer_slot,
-        ref_count: AtomicU32::new(1),
-        socket_type,
-        is_listener: false,
-        handle,
+    // Find a free slot first
+    let idx = match find_free_slot() {
+        Some(i) => i,
+        None => {
+            crate::console::print("[alloc_socket_with_handle] No free slots!\n");
+            // Return a sentinel value - caller should check
+            return MAX_SOCKETS;
+        }
     };
-    crate::console::print("[alloc_socket_with_handle] Created KernelSocket struct\n");
     
-    let idx = NEXT_SOCKET_IDX.fetch_add(1, Ordering::SeqCst);
     crate::safe_print!(48, "[alloc_socket_with_handle] idx={}\n", idx);
     
+    // Now store the socket directly in the slot (no moving!)
     crate::irq::with_irqs_disabled(|| {
-        crate::console::print("[alloc_socket_with_handle] Inserting into table\n");
-        SOCKET_TABLE.lock().insert(idx, socket);
-        crate::console::print("[alloc_socket_with_handle] Inserted\n");
+        unsafe {
+            let slot = &SOCKET_TABLE[idx];
+            let socket_ptr = slot.socket.get();
+            
+            // Initialize KernelSocket in place
+            (*socket_ptr) = Some(KernelSocket {
+                state,
+                buffer_slot,
+                ref_count: AtomicU32::new(1),
+                socket_type,
+                is_listener: false,
+                handle: SocketHandle::with_socket(tcp_socket),
+            });
+        }
     });
     
+    crate::console::print("[alloc_socket_with_handle] Inserted\n");
     idx
 }
 
 /// Check if a socket has a TcpSocket handle
 pub fn socket_has_handle(idx: usize) -> bool {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return false;
+    }
     crate::irq::with_irqs_disabled(|| {
         crate::threading::disable_preemption();
-        let result = SOCKET_TABLE.lock()
-            .get(&idx)
-            .map(|s| unsafe { s.handle.is_some() })
-            .unwrap_or(false);
+        let result = unsafe {
+            (*SOCKET_TABLE[idx].socket.get())
+                .as_ref()
+                .map(|s| s.handle.is_some())
+                .unwrap_or(false)
+        };
         crate::threading::enable_preemption();
         result
     })
@@ -669,6 +752,10 @@ pub fn with_socket_handle<F, R>(idx: usize, f: F) -> Result<R, i32>
 where
     F: FnOnce(&mut TcpSocket<'static>) -> R,
 {
+    if idx >= MAX_SOCKETS || !SOCKET_TABLE[idx].in_use.load(Ordering::Acquire) {
+        return Err(libc_errno::EBADF);
+    }
+    
     // First verify socket exists and is connected
     let state = get_socket_state(idx).ok_or(libc_errno::EBADF)?;
     match state {
@@ -680,17 +767,18 @@ where
     // Access the socket handle with preemption disabled
     crate::threading::disable_preemption();
     let result = crate::irq::with_irqs_disabled(|| {
-        let mut table = SOCKET_TABLE.lock();
-        if let Some(ks) = table.get_mut(&idx) {
-            // SAFETY: Preemption is disabled, we have exclusive access
-            let socket_opt = unsafe { ks.handle.get() };
-            if let Some(socket) = socket_opt.as_mut() {
-                Some(f(socket))
+        unsafe {
+            if let Some(ks) = (*SOCKET_TABLE[idx].socket.get()).as_mut() {
+                // SAFETY: Preemption is disabled, we have exclusive access
+                let socket_opt = ks.handle.get();
+                if let Some(socket) = socket_opt.as_mut() {
+                    Some(f(socket))
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
         }
     });
     crate::threading::enable_preemption();
@@ -729,9 +817,13 @@ pub mod libc_errno {
 
 /// Get number of active sockets
 pub fn active_socket_count() -> usize {
-    crate::irq::with_irqs_disabled(|| {
-        SOCKET_TABLE.lock().len()
-    })
+    let mut count = 0;
+    for i in 0..MAX_SOCKETS {
+        if SOCKET_TABLE[i].in_use.load(Ordering::Relaxed) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Get number of allocated buffer slots
