@@ -6,3 +6,4 @@ target
 authorized_keys
 bootstrap/bin
 *.log
+.opencode
