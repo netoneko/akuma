@@ -828,3 +828,74 @@ impl Command for PmmCommand {
 
 /// Static instance
 pub static PMM_CMD: PmmCommand = PmmCommand;
+
+// ============================================================================
+// Kill Command
+// ============================================================================
+
+/// Kill command - terminate a process by PID
+pub struct KillCommand;
+
+impl Command for KillCommand {
+    fn name(&self) -> &'static str {
+        "kill"
+    }
+    fn description(&self) -> &'static str {
+        "Terminate a process by PID"
+    }
+    fn usage(&self) -> &'static str {
+        "kill <pid>"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            use crate::process;
+
+            // Parse the PID argument
+            let args_str = match core::str::from_utf8(args) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    let _ = stdout.write(b"Error: Invalid UTF-8 in arguments\r\n").await;
+                    return Err(ShellError::ExecutionFailed("invalid UTF-8"));
+                }
+            };
+
+            if args_str.is_empty() {
+                let _ = stdout.write(b"Usage: kill <pid>\r\n").await;
+                return Err(ShellError::ExecutionFailed("missing PID argument"));
+            }
+
+            let pid: u32 = match args_str.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    let msg = format!("Error: Invalid PID: {}\r\n", args_str);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Err(ShellError::ExecutionFailed("invalid PID"));
+                }
+            };
+
+            // Try to kill the process
+            match process::kill_process(pid) {
+                Ok(()) => {
+                    let msg = format!("Killed process {}\r\n", pid);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("Failed to kill process {}: {}\r\n", pid, e);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    Err(ShellError::ExecutionFailed("kill failed"))
+                }
+            }
+        })
+    }
+}
+
+/// Static instance
+pub static KILL_CMD: KillCommand = KillCommand;

@@ -690,6 +690,10 @@ pub struct Process {
     pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
     /// Next available file descriptor number
     pub next_fd: AtomicU32,
+
+    // ========== Thread tracking ==========
+    /// Thread ID running this process (set after spawn, used for kill)
+    pub thread_id: Option<usize>,
 }
 
 
@@ -759,6 +763,8 @@ impl Process {
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
+            // Thread ID - set when spawned
+            thread_id: None,
         })
     }
 
@@ -1034,32 +1040,45 @@ pub extern "C" fn check_process_exit() -> bool {
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let tid = crate::threading::current_thread_id();
     
-    // Get process info before cleanup
-    let pid = if let Some(proc) = current_process() {
-        let pid = proc.pid;
-        
-        // Clean up all open sockets for this process
-        // This must happen before unregistering the process so we can access fd_table
-        cleanup_process_sockets(proc);
-        
-        // Unregister from process table
-        unregister_process(pid);
-        Some(pid)
+    // Check if this thread was already killed externally (by kill_process).
+    // If so, cleanup has already been done - just skip to the yield loop.
+    // This handles the race where kill_process() terminates the thread while
+    // it's still running, and it later reaches this exit path.
+    let already_terminated = crate::threading::is_thread_terminated(tid);
+    
+    // Get process info before cleanup (skip if already killed)
+    let pid = if !already_terminated {
+        if let Some(proc) = current_process() {
+            let pid = proc.pid;
+            
+            // Clean up all open sockets for this process
+            // This must happen before unregistering the process so we can access fd_table
+            cleanup_process_sockets(proc);
+            
+            // Unregister from process table
+            unregister_process(pid);
+            Some(pid)
+        } else {
+            None
+        }
     } else {
         None
     };
     
     // Set exit code on ProcessChannel if registered for this thread
     // This notifies async callers (SSH shell, etc.) that the process exited
+    // Safe to call even if already removed by kill_process - just returns None
     if let Some(channel) = remove_channel(tid) {
         channel.set_exited(exit_code);
     }
     
     // Deactivate user address space - restore boot TTBR0
     // This must happen before thread termination to prevent stale TLB issues
+    // Safe to call multiple times - just writes to TTBR0 register
     crate::mmu::UserAddressSpace::deactivate();
     
     // Mark thread as terminated so scheduler stops scheduling it
+    // Idempotent - safe to call even if already marked by kill_process
     crate::threading::mark_current_terminated();
     
     // Log exit (use safe print to avoid heap allocation in this context)
@@ -1100,6 +1119,51 @@ fn cleanup_process_sockets(proc: &Process) {
         // socket_close handles abort() and deferred buffer cleanup
         let _ = crate::socket::socket_close(socket_idx);
     }
+}
+
+/// Kill a process by PID
+///
+/// Terminates the process and cleans up all associated resources:
+/// - Closes all open sockets and file descriptors
+/// - Removes process from process table
+/// - Removes process channel
+/// - Marks the thread as terminated
+///
+/// # Arguments
+/// * `pid` - Process ID to kill
+///
+/// # Returns
+/// * `Ok(())` if the process was successfully killed
+/// * `Err(message)` if the process was not found or could not be killed
+pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
+    // Look up the process
+    let proc = lookup_process(pid).ok_or("Process not found")?;
+    
+    // Get thread_id before cleanup (needed for channel removal and thread termination)
+    let thread_id = proc.thread_id.ok_or("Process has no thread_id (not yet started?)")?;
+    
+    // Clean up all open sockets for this process
+    cleanup_process_sockets(proc);
+    
+    // Mark process as killed (using signal 9 = SIGKILL)
+    proc.exited = true;
+    proc.exit_code = 137; // 128 + SIGKILL(9)
+    proc.state = ProcessState::Zombie(137);
+    
+    // Unregister from process table
+    unregister_process(pid);
+    
+    // Remove and notify the process channel
+    if let Some(channel) = remove_channel(thread_id) {
+        channel.set_exited(137);
+    }
+    
+    // Mark the thread as terminated so scheduler stops scheduling it
+    crate::threading::mark_thread_terminated(thread_id);
+    
+    crate::safe_print!(64, "[kill] Killed PID {} (thread {})\n", pid, thread_id);
+    
+    Ok(())
 }
 
 
@@ -1229,6 +1293,10 @@ pub fn spawn_process_with_channel(
         // return_to_kernel() will call remove_channel() and set_exited() when process exits
         let tid = crate::threading::current_thread_id();
         register_channel(tid, channel_for_thread);
+
+        // Set thread_id on process for kill support
+        let mut process = process;
+        process.thread_id = Some(tid);
 
         // Execute the process - this never returns
         // When user calls exit(), return_to_kernel() handles cleanup:
