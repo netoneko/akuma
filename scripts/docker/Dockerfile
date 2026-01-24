@@ -2,7 +2,8 @@ FROM alpine:latest
 
 RUN apk add --no-cache qemu-system-aarch64
 
-COPY akuma /kernel/akuma
+# Kernel binary and disk image are mounted as volumes at runtime
+RUN mkdir -p /kernel /data
 
 EXPOSE 22 8080
 

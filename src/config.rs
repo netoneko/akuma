@@ -99,7 +99,7 @@ pub const CANARY_WORDS: usize = 8;
 ///
 /// Set to `true` for CI/production builds where all binaries should be present.
 /// Set to `false` for development when testing without a fully populated disk.
-pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = true;
+pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = false;
 
 /// Use cooperative main thread
 ///

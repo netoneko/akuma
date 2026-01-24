@@ -1,0 +1,47 @@
+services:
+  akuma:
+    # image: akuma-qemu
+    build:
+      context: ../../
+      dockerfile: scripts/docker/Dockerfile
+      args:
+        - TARGET=akuma
+        - ARCH=aarch64
+        - PLATFORM=linux/arm64
+        - SERIAL=mon:stdio
+        - NETDEV=user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080
+        - GLOBAL=virtio-mmio.force-legacy=true
+        - DEVICE=virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0
+        - DRIVE=file=/data/disk.img,if=none,format=raw,id=hd0
+        - DEVICE=virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1
+        - DEVICE=virtio-rng-device,bus=virtio-mmio-bus.2
+        - DEVICE=loader,file=virt.dtb,addr=0x47f00000,force-raw=on
+        - KERNEL=/kernel/akuma
+    platform: linux/arm64
+    stdin_open: true
+    tty: true
+    ports:
+      - "2222:22"   # SSH
+      - "8080:8080" # HTTP
+    volumes:
+      - ../../target/aarch64-unknown-none/release/akuma:/kernel/akuma
+      - ../../disk.img:/data/disk.img
+    restart: always
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/index.html"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  autoheal:
+    image: willfarrell/autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=5
+      - AUTOHEAL_START_PERIOD=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
