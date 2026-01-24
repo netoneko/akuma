@@ -14,6 +14,7 @@ use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+use embassy_net::tcp::TcpSocket;
 use spinning_top::Spinlock;
 
 // ============================================================================
@@ -266,6 +267,88 @@ pub fn process_buffer_cleanup() -> usize {
 }
 
 // ============================================================================
+// Socket Handle (embassy-net TcpSocket wrapper)
+// ============================================================================
+
+/// Wrapper for TcpSocket that allows cross-thread access
+///
+/// SAFETY: Access is serialized via:
+/// 1. Preemption control (disable_preemption/enable_preemption)
+/// 2. Socket table lock during state transitions
+///
+/// Embassy-net's TcpSocket is not Send, but we can safely share it because:
+/// - All access happens with preemption disabled (no concurrent access)
+/// - Thread 0 polls the network runner, other threads poll individual sockets
+pub struct SocketHandle {
+    socket: UnsafeCell<Option<TcpSocket<'static>>>,
+}
+
+// SAFETY: Access is serialized via preemption control and socket table lock
+unsafe impl Send for SocketHandle {}
+unsafe impl Sync for SocketHandle {}
+
+impl SocketHandle {
+    /// Create a new empty socket handle
+    pub fn new() -> Self {
+        Self {
+            socket: UnsafeCell::new(None),
+        }
+    }
+
+    /// Create a socket handle with an existing TcpSocket
+    pub fn with_socket(socket: TcpSocket<'static>) -> Self {
+        Self {
+            socket: UnsafeCell::new(Some(socket)),
+        }
+    }
+
+    /// Get mutable socket reference
+    ///
+    /// SAFETY: Must be called with preemption disabled
+    pub unsafe fn get(&self) -> &mut Option<TcpSocket<'static>> {
+        &mut *self.socket.get()
+    }
+
+    /// Take the socket out of the handle
+    ///
+    /// SAFETY: Must be called with preemption disabled
+    pub unsafe fn take(&self) -> Option<TcpSocket<'static>> {
+        (*self.socket.get()).take()
+    }
+
+    /// Store a socket in the handle
+    ///
+    /// SAFETY: Must be called with preemption disabled
+    pub unsafe fn store(&self, socket: TcpSocket<'static>) {
+        *self.socket.get() = Some(socket);
+    }
+
+    /// Check if handle contains a socket
+    ///
+    /// SAFETY: Must be called with preemption disabled
+    pub unsafe fn is_some(&self) -> bool {
+        (*self.socket.get()).is_some()
+    }
+}
+
+impl Default for SocketHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SocketHandle {
+    fn drop(&mut self) {
+        // Abort the socket if it exists to release embassy-net resources
+        // SAFETY: Called during socket cleanup, preemption should be disabled
+        // or we're the only reference
+        if let Some(mut socket) = unsafe { self.take() } {
+            socket.abort();
+        }
+    }
+}
+
+// ============================================================================
 // Kernel Socket
 // ============================================================================
 
@@ -281,6 +364,8 @@ pub struct KernelSocket {
     pub socket_type: i32,
     /// Whether this socket is a listener (accept returns new sockets)
     pub is_listener: bool,
+    /// Embassy-net TcpSocket handle (for connected sockets)
+    pub handle: SocketHandle,
 }
 
 impl KernelSocket {
@@ -293,10 +378,11 @@ impl KernelSocket {
             ref_count: AtomicU32::new(1),
             socket_type,
             is_listener: false,
+            handle: SocketHandle::new(),
         })
     }
 
-    /// Create a connected socket (for accept)
+    /// Create a connected socket (for accept) with a TcpSocket handle
     pub fn new_connected(
         buffer_slot: usize,
         local_addr: SocketAddrV4,
@@ -308,6 +394,24 @@ impl KernelSocket {
             ref_count: AtomicU32::new(1),
             socket_type: socket_const::SOCK_STREAM,
             is_listener: false,
+            handle: SocketHandle::new(),
+        }
+    }
+
+    /// Create a connected socket with an existing TcpSocket handle
+    pub fn new_connected_with_handle(
+        buffer_slot: usize,
+        local_addr: SocketAddrV4,
+        remote_addr: SocketAddrV4,
+        socket: TcpSocket<'static>,
+    ) -> Self {
+        Self {
+            state: SocketState::Connected { local_addr, remote_addr },
+            buffer_slot,
+            ref_count: AtomicU32::new(1),
+            socket_type: socket_const::SOCK_STREAM,
+            is_listener: false,
+            handle: SocketHandle::with_socket(socket),
         }
     }
 
@@ -329,7 +433,8 @@ impl KernelSocket {
     /// Get buffer references
     /// SAFETY: Must have exclusive access to the socket
     pub unsafe fn get_buffers(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        BUFFER_POOL.get_buffers(self.buffer_slot)
+        // SAFETY: Caller ensures exclusive access
+        unsafe { BUFFER_POOL.get_buffers(self.buffer_slot) }
     }
 }
 
@@ -456,8 +561,126 @@ pub fn socket_close(idx: usize) -> Result<(), i32> {
     });
 
     // Then remove from table (this will trigger Drop which queues buffer cleanup)
+    // The SocketHandle's Drop impl will call abort() on the TcpSocket
     remove_socket(idx);
     Ok(())
+}
+
+// ============================================================================
+// Buffer Pool Public Interface
+// ============================================================================
+
+/// Allocate a buffer slot from the pool
+pub fn alloc_buffer_slot() -> Option<usize> {
+    BUFFER_POOL.alloc()
+}
+
+/// Free a buffer slot back to the pool
+pub fn free_buffer_slot(slot: usize) {
+    BUFFER_POOL.free(slot);
+}
+
+/// Get buffer references for an allocated slot
+///
+/// SAFETY: Caller must have successfully allocated this slot and not freed it.
+/// The slot must not be accessed concurrently.
+pub unsafe fn get_buffers(slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
+    BUFFER_POOL.get_buffers(slot)
+}
+
+// ============================================================================
+// Socket Handle Operations
+// ============================================================================
+
+/// Store a TcpSocket handle in an existing socket entry
+///
+/// SAFETY: Must be called with preemption disabled
+pub fn store_socket_handle(idx: usize, socket: TcpSocket<'static>) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(ks) = table.get_mut(&idx) {
+            // SAFETY: We have exclusive access via table lock and IRQs disabled
+            unsafe { ks.handle.store(socket); }
+        }
+    });
+}
+
+/// Allocate a new socket with an existing TcpSocket handle
+pub fn alloc_socket_with_handle(
+    socket_type: i32,
+    buffer_slot: usize,
+    tcp_socket: TcpSocket<'static>,
+    state: SocketState,
+) -> usize {
+    let socket = KernelSocket {
+        state,
+        buffer_slot,
+        ref_count: AtomicU32::new(1),
+        socket_type,
+        is_listener: false,
+        handle: SocketHandle::with_socket(tcp_socket),
+    };
+    
+    let idx = NEXT_SOCKET_IDX.fetch_add(1, Ordering::SeqCst);
+    
+    crate::irq::with_irqs_disabled(|| {
+        SOCKET_TABLE.lock().insert(idx, socket);
+    });
+    
+    idx
+}
+
+/// Check if a socket has a TcpSocket handle
+pub fn socket_has_handle(idx: usize) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        crate::threading::disable_preemption();
+        let result = SOCKET_TABLE.lock()
+            .get(&idx)
+            .map(|s| unsafe { s.handle.is_some() })
+            .unwrap_or(false);
+        crate::threading::enable_preemption();
+        result
+    })
+}
+
+/// Execute a function with the socket's TcpSocket handle
+///
+/// This is the safe way to access a socket's TcpSocket for I/O operations.
+/// The closure is called with preemption disabled to protect embassy-net's RefCell.
+///
+/// Returns Err(EBADF) if socket doesn't exist or has no handle.
+/// Returns Err(ENOTCONN) if socket is not connected.
+pub fn with_socket_handle<F, R>(idx: usize, f: F) -> Result<R, i32>
+where
+    F: FnOnce(&mut TcpSocket<'static>) -> R,
+{
+    // First verify socket exists and is connected
+    let state = get_socket_state(idx).ok_or(libc_errno::EBADF)?;
+    match state {
+        SocketState::Connected { .. } => {}
+        SocketState::Closing | SocketState::Closed => return Err(libc_errno::EBADF),
+        _ => return Err(libc_errno::ENOTCONN),
+    }
+
+    // Access the socket handle with preemption disabled
+    crate::threading::disable_preemption();
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(ks) = table.get_mut(&idx) {
+            // SAFETY: Preemption is disabled, we have exclusive access
+            let socket_opt = unsafe { ks.handle.get() };
+            if let Some(socket) = socket_opt.as_mut() {
+                Some(f(socket))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    crate::threading::enable_preemption();
+
+    result.ok_or(libc_errno::EBADF)
 }
 
 // ============================================================================
@@ -471,11 +694,15 @@ pub mod libc_errno {
     pub const EBADF: i32 = 9;        // Bad file descriptor
     pub const EAGAIN: i32 = 11;      // Try again
     pub const EWOULDBLOCK: i32 = 11; // Same as EAGAIN
+    pub const ENOMEM: i32 = 12;      // Out of memory
     pub const EFAULT: i32 = 14;      // Bad address
     pub const EINVAL: i32 = 22;      // Invalid argument
     pub const ENOTSOCK: i32 = 88;    // Socket operation on non-socket
     pub const EADDRINUSE: i32 = 98;  // Address already in use
+    pub const ENETDOWN: i32 = 100;   // Network is down
+    pub const EISCONN: i32 = 106;    // Transport endpoint is already connected
     pub const ENOTCONN: i32 = 107;   // Transport endpoint not connected
+    pub const ETIMEDOUT: i32 = 110;  // Connection timed out
     pub const ECONNREFUSED: i32 = 111; // Connection refused
     pub const EHOSTUNREACH: i32 = 113; // No route to host
     pub const EINPROGRESS: i32 = 115;  // Operation now in progress

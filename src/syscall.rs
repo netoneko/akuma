@@ -519,13 +519,16 @@ fn sys_listen(fd: u32, backlog: i32) -> u64 {
 /// sys_accept - Accept a connection (blocking)
 ///
 /// This blocks until a connection is available, yielding to the scheduler.
+/// Creates a new socket for the accepted connection.
 fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+    use embassy_net::tcp::TcpSocket;
+    
     let socket_idx = match get_socket_from_fd(fd) {
         Some(idx) => idx,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
 
-    // Verify socket is listening
+    // Verify socket is listening and get local address
     let state = match socket::get_socket_state(socket_idx) {
         Some(s) => s,
         None => return (-libc_errno::EBADF as i64) as u64,
@@ -536,34 +539,102 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         _ => return (-libc_errno::EINVAL as i64) as u64,
     };
 
-    // Blocking accept loop
-    // In a real implementation, we'd poll embassy-net TcpSocket here.
-    // For now, we create a placeholder that yields and checks for connections.
-    loop {
-        // Check for interrupt
-        if crate::process::is_current_interrupted() {
-            return (-libc_errno::EINTR as i64) as u64;
-        }
-
-        // TODO: Actually poll embassy-net for incoming connections
-        // For now, we just yield and return EAGAIN after a few iterations
-        // This will be properly implemented when we integrate with embassy-net
-
-        // Yield to let network runner poll
-        crate::threading::yield_now();
-
-        // Placeholder: In real implementation, check if connection available
-        // For now, return EAGAIN to indicate non-blocking would block
-        // Real implementation needs embassy-net integration
-        break;
+    // Increment ref count on listening socket to prevent close during accept
+    if socket::socket_inc_ref(socket_idx).is_none() {
+        return (-libc_errno::EBADF as i64) as u64;
     }
 
-    // Placeholder return - real implementation would create new socket
-    (-libc_errno::EAGAIN as i64) as u64
+    // Get the network stack
+    let stack = match crate::async_net::get_global_stack() {
+        Some(s) => s,
+        None => {
+            socket::socket_dec_ref(socket_idx);
+            return (-libc_errno::ENETDOWN as i64) as u64;
+        }
+    };
+
+    // Allocate buffer slot for the NEW connection socket
+    let new_slot = match socket::alloc_buffer_slot() {
+        Some(s) => s,
+        None => {
+            socket::socket_dec_ref(socket_idx);
+            return (-libc_errno::ENOMEM as i64) as u64;
+        }
+    };
+
+    // Get buffers for the new socket
+    let (rx_buf, tx_buf) = unsafe { socket::get_buffers(new_slot) };
+
+    // Create the accept future
+    // This creates a NEW TcpSocket that will be bound to the accepted connection
+    let accept_future = async {
+        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(60)));
+        match socket.accept(local_addr.port).await {
+            Ok(()) => {
+                let remote = socket.remote_endpoint();
+                Ok((socket, remote))
+            }
+            Err(_) => Err(embassy_net::tcp::Error::ConnectionReset),
+        }
+    };
+
+    // Block on the accept - this yields to scheduler, allowing thread 0 to poll network
+    let (tcp_socket, remote_ep) = match block_on_socket(accept_future) {
+        Ok(v) => v,
+        Err(e) => {
+            // CRITICAL: Free the buffer slot on error to prevent leak
+            socket::free_buffer_slot(new_slot);
+            socket::socket_dec_ref(socket_idx);
+            return (-e as i64) as u64;
+        }
+    };
+
+    // Decrement ref count on listening socket (we're done using it)
+    socket::socket_dec_ref(socket_idx);
+
+    // Get remote address
+    let remote_addr = match remote_ep {
+        Some(ep) => socket::SocketAddrV4::from_endpoint(ep).unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
+        None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
+    };
+
+    // Create new socket entry with the connected TcpSocket
+    let new_socket_idx = socket::alloc_socket_with_handle(
+        socket::socket_const::SOCK_STREAM,
+        new_slot,
+        tcp_socket,
+        socket::SocketState::Connected { local_addr, remote_addr },
+    );
+
+    // Allocate FD for new socket
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => {
+            // Cleanup on error
+            socket::socket_close(new_socket_idx).ok();
+            return (-libc_errno::EBADF as i64) as u64;
+        }
+    };
+
+    let new_fd = proc.alloc_fd(FileDescriptor::Socket(new_socket_idx));
+
+    // Write remote address to user if requested
+    if addr_ptr != 0 && addr_len_ptr != 0 {
+        let sockaddr = socket::SockAddrIn::from_addr(&remote_addr);
+        unsafe {
+            core::ptr::write(addr_ptr as *mut socket::SockAddrIn, sockaddr);
+            core::ptr::write(addr_len_ptr as *mut u32, socket::SockAddrIn::SIZE as u32);
+        }
+    }
+
+    new_fd as u64
 }
 
 /// sys_connect - Connect to remote address (blocking)
 fn sys_connect(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
+    use embassy_net::tcp::TcpSocket;
+    
     if addr_len < SockAddrIn::SIZE {
         return (-libc_errno::EINVAL as i64) as u64;
     }
@@ -573,89 +644,272 @@ fn sys_connect(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
         None => return (-libc_errno::EBADF as i64) as u64,
     };
 
+    // Verify socket is in correct state (unbound or bound)
+    let state = match socket::get_socket_state(socket_idx) {
+        Some(s) => s,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    match state {
+        socket::SocketState::Unbound | socket::SocketState::Bound { .. } => {}
+        socket::SocketState::Connected { .. } => {
+            return (-libc_errno::EISCONN as i64) as u64;
+        }
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    }
+
     // Read sockaddr from user memory
     let sockaddr = unsafe {
         core::ptr::read(addr_ptr as *const SockAddrIn)
     };
     let remote_addr = sockaddr.to_addr();
 
-    // Get local address (ephemeral port)
-    let local_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
-
-    // Blocking connect loop
-    loop {
-        if crate::process::is_current_interrupted() {
-            return (-libc_errno::EINTR as i64) as u64;
-        }
-
-        // TODO: Actually connect via embassy-net
-        // For now, mark as connected and return success
-        match socket::socket_set_connected(socket_idx, local_addr, remote_addr) {
-            Ok(()) => return 0,
-            Err(e) => return (-e as i64) as u64,
-        }
+    // Increment ref count to prevent close during connect
+    if socket::socket_inc_ref(socket_idx).is_none() {
+        return (-libc_errno::EBADF as i64) as u64;
     }
+
+    // Get the network stack
+    let stack = match crate::async_net::get_global_stack() {
+        Some(s) => s,
+        None => {
+            socket::socket_dec_ref(socket_idx);
+            return (-libc_errno::ENETDOWN as i64) as u64;
+        }
+    };
+
+    // Get buffer slot for this socket
+    let buffer_slot = match socket::get_socket_buffer_slot(socket_idx) {
+        Some(s) => s,
+        None => {
+            socket::socket_dec_ref(socket_idx);
+            return (-libc_errno::EBADF as i64) as u64;
+        }
+    };
+
+    // Get buffers
+    let (rx_buf, tx_buf) = unsafe { socket::get_buffers(buffer_slot) };
+
+    // Create the connect future
+    let connect_future = async {
+        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(30)));
+        match socket.connect(remote_addr.to_endpoint()).await {
+            Ok(()) => {
+                let local = socket.local_endpoint();
+                Ok((socket, local))
+            }
+            Err(_) => Err(embassy_net::tcp::Error::ConnectionReset),
+        }
+    };
+
+    // Block on the connect
+    let (tcp_socket, local_ep) = match block_on_socket(connect_future) {
+        Ok(v) => v,
+        Err(e) => {
+            socket::socket_dec_ref(socket_idx);
+            return (-e as i64) as u64;
+        }
+    };
+
+    // Get local address
+    let local_addr = match local_ep {
+        Some(ep) => socket::SocketAddrV4::from_endpoint(ep).unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
+        None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
+    };
+
+    // Store the socket handle and update state
+    socket::store_socket_handle(socket_idx, tcp_socket);
+    let _ = socket::socket_set_connected(socket_idx, local_addr, remote_addr);
+
+    // Decrement ref count
+    socket::socket_dec_ref(socket_idx);
+
+    0
 }
 
-/// sys_sendto - Send data on socket
+/// sys_sendto - Send data on socket (blocking)
+///
+/// Writes data to a connected socket. Blocks until data is sent or an error occurs.
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let socket_idx = match get_socket_from_fd(fd) {
         Some(idx) => idx,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
 
-    // Verify socket is connected
-    let state = match socket::get_socket_state(socket_idx) {
-        Some(s) => s,
-        None => return (-libc_errno::EBADF as i64) as u64,
-    };
-
-    match state {
-        socket::SocketState::Connected { .. } => {}
-        _ => return (-libc_errno::ENOTCONN as i64) as u64,
-    }
-
     if buf_ptr == 0 || len == 0 {
         return 0;
     }
 
-    // TODO: Actually send via embassy-net TcpSocket
-    // For now, return success with bytes "sent"
-    len as u64
+    // Increment ref count to prevent close during write
+    if socket::socket_inc_ref(socket_idx).is_none() {
+        return (-libc_errno::EBADF as i64) as u64;
+    }
+
+    // Get user data (SAFETY: We trust the user buffer - TODO: add validation)
+    let user_data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+
+    // We need to poll the write operation in a loop since we can't create a proper
+    // future that captures the socket handle (it's behind a lock).
+    // Instead, we use a spin-yield pattern with preemption control.
+    let mut total_written = 0usize;
+    let mut iterations = 0usize;
+    const MAX_ITERATIONS: usize = 100_000;
+
+    loop {
+        // Check for interrupt
+        if crate::process::is_current_interrupted() {
+            socket::socket_dec_ref(socket_idx);
+            return if total_written > 0 {
+                total_written as u64
+            } else {
+                (-libc_errno::EINTR as i64) as u64
+            };
+        }
+
+        // Try to write with socket handle
+        let result = socket::with_socket_handle(socket_idx, |socket| {
+            // Create a one-shot future for this write attempt
+            let remaining = &user_data[total_written..];
+            if remaining.is_empty() {
+                return Ok(0);
+            }
+
+            // Try non-blocking write by polling once
+            use core::future::Future;
+            use core::pin::Pin;
+            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(core::ptr::null(), &VTABLE),
+                |_| {}, |_| {}, |_| {},
+            );
+
+            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+
+            let mut write_future = socket.write(remaining);
+            let pinned = unsafe { Pin::new_unchecked(&mut write_future) };
+
+            match pinned.poll(&mut cx) {
+                Poll::Ready(Ok(n)) => Ok(n),
+                Poll::Ready(Err(_)) => Err(libc_errno::EIO),
+                Poll::Pending => Ok(0), // Would block, return 0 to indicate retry
+            }
+        });
+
+        match result {
+            Ok(Ok(n)) if n > 0 => {
+                total_written += n;
+                if total_written >= len {
+                    // All data written
+                    socket::socket_dec_ref(socket_idx);
+                    return total_written as u64;
+                }
+                // More data to write, continue loop
+                iterations = 0; // Reset timeout since we made progress
+            }
+            Ok(Ok(_)) => {
+                // Would block - yield and retry
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    socket::socket_dec_ref(socket_idx);
+                    return if total_written > 0 {
+                        total_written as u64
+                    } else {
+                        (-libc_errno::ETIMEDOUT as i64) as u64
+                    };
+                }
+                crate::threading::yield_now();
+                for _ in 0..100 { core::hint::spin_loop(); }
+            }
+            Ok(Err(e)) | Err(e) => {
+                socket::socket_dec_ref(socket_idx);
+                return if total_written > 0 {
+                    total_written as u64
+                } else {
+                    (-e as i64) as u64
+                };
+            }
+        }
+    }
 }
 
 /// sys_recvfrom - Receive data from socket (blocking)
+///
+/// Reads data from a connected socket. Blocks until data is available or an error occurs.
 fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let socket_idx = match get_socket_from_fd(fd) {
         Some(idx) => idx,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
 
-    // Verify socket is connected
-    let state = match socket::get_socket_state(socket_idx) {
-        Some(s) => s,
-        None => return (-libc_errno::EBADF as i64) as u64,
-    };
-
-    match state {
-        socket::SocketState::Connected { .. } => {}
-        _ => return (-libc_errno::ENOTCONN as i64) as u64,
-    }
-
     if buf_ptr == 0 || len == 0 {
         return 0;
     }
 
-    // Blocking receive loop
+    // Increment ref count to prevent close during read
+    if socket::socket_inc_ref(socket_idx).is_none() {
+        return (-libc_errno::EBADF as i64) as u64;
+    }
+
+    // Get user buffer
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+
+    let mut iterations = 0usize;
+    const MAX_ITERATIONS: usize = 100_000;
+
     loop {
+        // Check for interrupt
         if crate::process::is_current_interrupted() {
+            socket::socket_dec_ref(socket_idx);
             return (-libc_errno::EINTR as i64) as u64;
         }
 
-        // TODO: Actually receive via embassy-net TcpSocket
-        // For now, yield and return 0 (EOF)
-        crate::threading::yield_now();
-        return 0;
+        // Try to read with socket handle
+        let result = socket::with_socket_handle(socket_idx, |socket| {
+            use core::future::Future;
+            use core::pin::Pin;
+            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(core::ptr::null(), &VTABLE),
+                |_| {}, |_| {}, |_| {},
+            );
+
+            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+
+            let mut read_future = socket.read(user_buf);
+            let pinned = unsafe { Pin::new_unchecked(&mut read_future) };
+
+            match pinned.poll(&mut cx) {
+                Poll::Ready(Ok(n)) => Ok(n as isize),
+                Poll::Ready(Err(_)) => Ok(0), // EOF or error, return 0
+                Poll::Pending => Ok(-1), // Would block
+            }
+        });
+
+        match result {
+            Ok(Ok(n)) if n >= 0 => {
+                socket::socket_dec_ref(socket_idx);
+                return n as u64;
+            }
+            Ok(Ok(_)) => {
+                // Would block (-1) - yield and retry
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    socket::socket_dec_ref(socket_idx);
+                    return (-libc_errno::ETIMEDOUT as i64) as u64;
+                }
+                crate::threading::yield_now();
+                for _ in 0..100 { core::hint::spin_loop(); }
+            }
+            Ok(Err(e)) | Err(e) => {
+                socket::socket_dec_ref(socket_idx);
+                return (-e as i64) as u64;
+            }
+        }
     }
 }
 
@@ -1028,6 +1282,133 @@ fn block_on_dns<F: Future>(mut future: F) -> F::Output {
                 crate::threading::yield_now();
 
                 // Small spin delay
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Socket Blocking Helper
+// ============================================================================
+
+/// Block on an async socket future with proper error handling
+///
+/// This is the main blocking helper for socket operations. It:
+/// 1. Polls the future with preemption disabled (protects embassy RefCell)
+/// 2. Yields to scheduler when pending (allows thread 0 to poll network runner)
+/// 3. Checks for interrupts (Ctrl+C)
+/// 4. Times out after MAX_ITERATIONS to prevent hangs
+///
+/// Returns Ok(T) on success, Err(errno) on failure.
+fn block_on_socket<F, T>(mut future: F) -> Result<T, i32>
+where
+    F: Future<Output = Result<T, embassy_net::tcp::Error>>,
+{
+    // Pin the future on the stack
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+
+    // Create a no-op waker (we poll manually)
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 100_000; // ~100 seconds with 1ms yield
+
+    loop {
+        // Check for interrupt BEFORE polling (fast path for Ctrl+C)
+        if crate::process::is_current_interrupted() {
+            return Err(libc_errno::EINTR);
+        }
+
+        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        // CRITICAL: Disable preemption during poll
+        // Embassy-net uses RefCell internally which panics on re-entrant borrow.
+        // If we get preempted while holding a RefCell borrow, another thread
+        // might try to borrow it too.
+        crate::threading::disable_preemption();
+        let poll_result = future.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match poll_result {
+            Poll::Ready(Ok(val)) => return Ok(val),
+            Poll::Ready(Err(e)) => {
+                // Map embassy-net errors to errno
+                return Err(map_tcp_error(e));
+            }
+            Poll::Pending => {
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    return Err(libc_errno::ETIMEDOUT);
+                }
+
+                // Yield to scheduler - this allows thread 0 to poll the network runner
+                // which processes actual network I/O
+                crate::threading::yield_now();
+
+                // Small spin delay to reduce scheduler overhead
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Map embassy-net TCP errors to errno values
+fn map_tcp_error(e: embassy_net::tcp::Error) -> i32 {
+    match e {
+        embassy_net::tcp::Error::ConnectionReset => libc_errno::ECONNREFUSED,
+    }
+}
+
+/// Simpler block_on for socket operations that don't return Result
+fn block_on_socket_infallible<F, T>(mut future: F) -> Result<T, i32>
+where
+    F: Future<Output = T>,
+{
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 100_000;
+
+    loop {
+        if crate::process::is_current_interrupted() {
+            return Err(libc_errno::EINTR);
+        }
+
+        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        crate::threading::disable_preemption();
+        let poll_result = future.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match poll_result {
+            Poll::Ready(val) => return Ok(val),
+            Poll::Pending => {
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    return Err(libc_errno::ETIMEDOUT);
+                }
+                crate::threading::yield_now();
                 for _ in 0..100 {
                     core::hint::spin_loop();
                 }

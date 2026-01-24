@@ -576,7 +576,7 @@ fn run_async_main_preemptive() -> ! {
                 }
                 
                 // Heartbeat every 1000 iterations to show thread 0 is alive
-                if loop_counter % 1000 == 0 {
+                if loop_counter % crate::config::THREADING_HEARTBEAT_INTERVAL == 0 {
                     // Safe print without heap allocation to prevent panics
                     let stats = threading::thread_stats_full();
                     console::print("[Thread0] loop=");
@@ -741,8 +741,8 @@ fn run_async_main() -> ! {
     let mut runner_pinned = pin!(runner.run());
     let mut loopback_runner_pinned = pin!(loopback_runner.run());
     let mut ssh_pinned = pin!(ssh::run(stack));
-    let mut web_pinned = pin!(web_server::run(stack));
-    let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
+    // let mut web_pinned = pin!(web_server::run(stack));
+    // let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
 
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
@@ -818,10 +818,10 @@ fn run_async_main() -> ! {
 
         POLL_STEP.store(5, Ordering::Relaxed);
         // Poll the HTTP web servers
-        let _ = web_pinned.as_mut().poll(&mut cx);
+        // let _ = web_pinned.as_mut().poll(&mut cx);
         
         POLL_STEP.store(6, Ordering::Relaxed);
-        let _ = web_loopback_pinned.as_mut().poll(&mut cx);
+        // let _ = web_loopback_pinned.as_mut().poll(&mut cx);
 
         POLL_STEP.store(7, Ordering::Relaxed);
         // Poll loopback runner again - process response packets from web server
@@ -841,6 +841,10 @@ fn run_async_main() -> ! {
         // embassy-net has finished cleaning up aborted sockets before we
         // free their buffers for reuse.
         ssh::server::process_pending_buffer_frees();
+        
+        // Process deferred buffer frees from closed userspace sockets.
+        // Same rationale as SSH buffers - must happen after network poll.
+        socket::process_buffer_cleanup();
 
         POLL_STEP.store(10, Ordering::Relaxed);
         // Poll the executor for any other tasks

@@ -1037,6 +1037,11 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // Get process info before cleanup
     let pid = if let Some(proc) = current_process() {
         let pid = proc.pid;
+        
+        // Clean up all open sockets for this process
+        // This must happen before unregistering the process so we can access fd_table
+        cleanup_process_sockets(proc);
+        
         // Unregister from process table
         unregister_process(pid);
         Some(pid)
@@ -1068,6 +1073,32 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // Thread 0's cleanup routine will free the thread slot
     loop {
         crate::threading::yield_now();
+    }
+}
+
+/// Clean up all sockets owned by a process
+///
+/// Called during process exit to close all open sockets and free resources.
+/// This prevents socket/buffer leaks when processes exit without properly closing their sockets.
+fn cleanup_process_sockets(proc: &Process) {
+    // Get all socket FDs from the process's fd_table
+    let socket_fds: alloc::vec::Vec<(u32, usize)> = {
+        let table = proc.fd_table.lock();
+        table.iter()
+            .filter_map(|(&fd, desc)| {
+                if let FileDescriptor::Socket(idx) = desc {
+                    Some((fd, *idx))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    
+    // Close each socket
+    for (_fd, socket_idx) in socket_fds {
+        // socket_close handles abort() and deferred buffer cleanup
+        let _ = crate::socket::socket_close(socket_idx);
     }
 }
 
