@@ -115,7 +115,7 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = false;
 /// embassy-net's internal RefCells from re-entrant access during timer preemption.
 pub const COOPERATIVE_MAIN_THREAD: bool = false;
 
-pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the main thread to 100
+pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the main thread (network loop)
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 
@@ -232,8 +232,4 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-///
-/// NOTE: Currently disabled by default due to potential scheduling issues
-/// with userspace processes and the async network loop. Enable when testing
-/// the herd supervisor specifically.
 pub const AUTO_START_HERD: bool = false;

@@ -737,23 +737,6 @@ fn run_async_main() -> ! {
     async_net::set_global_stack(stack);
     async_net::set_loopback_stack(loopback_stack);
 
-    // Auto-start herd process supervisor
-    if config::AUTO_START_HERD && fs::is_initialized() {
-        if fs::exists("/bin/herd") {
-            console::print("[AsyncMain] Starting herd supervisor...\n");
-            match process::spawn_process("/bin/herd", None, None) {
-                Ok(tid) => {
-                    crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
-                }
-                Err(e) => {
-                    crate::safe_print!(64, "[AsyncMain] ERROR: Failed to start herd: {}\n", e);
-                }
-            }
-        } else {
-            console::print("[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
-        }
-    }
-
     // Pin the futures directly using the pin! macro (no unsafe needed)
     let mut runner_pinned = pin!(runner.run());
     let mut loopback_runner_pinned = pin!(loopback_runner.run());
@@ -773,6 +756,28 @@ fn run_async_main() -> ! {
         // Clear the IRQ mask bit (bit 1 of DAIF, which is bit 7 of the value)
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
     }
+
+    // Auto-start herd process supervisor (AFTER IRQs enabled so scheduler works)
+    let herd_channel = if config::AUTO_START_HERD && fs::is_initialized() {
+        if fs::exists("/bin/herd") {
+            console::print("[AsyncMain] Starting herd supervisor...\n");
+            match process::spawn_process_with_channel("/bin/herd", None, None) {
+                Ok((tid, channel)) => {
+                    crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
+                    Some(channel)
+                }
+                Err(e) => {
+                    crate::safe_print!(64, "[AsyncMain] ERROR: Failed to start herd: {}\n", e);
+                    None
+                }
+            }
+        } else {
+            console::print("[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
+            None
+        }
+    } else {
+        None
+    };
 
     // Loop iteration counter for debugging hangs (using atomics for safety)
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -862,6 +867,17 @@ fn run_async_main() -> ! {
         // Process deferred buffer frees from closed userspace sockets.
         // Same rationale as SSH buffers - must happen after network poll.
         socket::process_buffer_cleanup();
+
+        // Poll herd's output and print to console (if running)
+        if let Some(ref channel) = herd_channel {
+            let output = channel.read_all();
+            if !output.is_empty() {
+                // Print herd's output to console
+                for &byte in &output {
+                    console::print_char(byte as char);
+                }
+            }
+        }
 
         POLL_STEP.store(11, Ordering::Relaxed);
         // Poll the executor for any other tasks
