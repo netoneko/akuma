@@ -639,7 +639,9 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     }
 
     crate::console::print("[accept] Done!\n");
-    new_fd as u64
+    let ret_val = new_fd as u64;
+    crate::safe_print!(48, "[accept] Returning fd={}\n", ret_val);
+    ret_val
 }
 
 /// sys_connect - Connect to remote address (blocking)
@@ -744,12 +746,11 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
         return (-libc_errno::EBADF as i64) as u64;
     }
 
-    // Get user data (SAFETY: We trust the user buffer - TODO: add validation)
-    let user_data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+    // Use a kernel buffer for embassy-net, then copy from user space
+    // Embassy-net can't safely access user buffers directly
+    const KERNEL_BUF_SIZE: usize = 4096;
+    let mut kernel_buf = [0u8; KERNEL_BUF_SIZE];
 
-    // We need to poll the write operation in a loop since we can't create a proper
-    // future that captures the socket handle (it's behind a lock).
-    // Instead, we use a spin-yield pattern with preemption control.
     let mut total_written = 0usize;
     let mut iterations = 0usize;
     const MAX_ITERATIONS: usize = 100_000;
@@ -765,15 +766,25 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             };
         }
 
-        // Try to write with socket handle
-        let result = socket::with_socket_handle(socket_idx, |socket| {
-            // Create a one-shot future for this write attempt
-            let remaining = &user_data[total_written..];
-            if remaining.is_empty() {
-                return Ok(0);
-            }
+        // Calculate how much to write this iteration
+        let remaining = len - total_written;
+        if remaining == 0 {
+            socket::socket_dec_ref(socket_idx);
+            return total_written as u64;
+        }
+        let chunk_size = core::cmp::min(remaining, KERNEL_BUF_SIZE);
 
-            // Try non-blocking write by polling once
+        // Copy from user buffer to kernel buffer
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buf_ptr as *const u8).add(total_written),
+                kernel_buf.as_mut_ptr(),
+                chunk_size,
+            );
+        }
+
+        // Try to write with socket handle using KERNEL buffer
+        let result = socket::with_socket_handle(socket_idx, |socket| {
             use core::future::Future;
             use core::pin::Pin;
             use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -786,7 +797,7 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
             let mut cx = Context::from_waker(&waker);
 
-            let mut write_future = socket.write(remaining);
+            let mut write_future = socket.write(&kernel_buf[..chunk_size]);
             let pinned = unsafe { Pin::new_unchecked(&mut write_future) };
 
             match pinned.poll(&mut cx) {
@@ -851,8 +862,11 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
         return (-libc_errno::EBADF as i64) as u64;
     }
 
-    // Get user buffer
-    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+    // Use a kernel buffer for embassy-net, then copy to user space
+    // Embassy-net can't safely access user buffers directly
+    const KERNEL_BUF_SIZE: usize = 4096;
+    let mut kernel_buf = [0u8; KERNEL_BUF_SIZE];
+    let read_len = core::cmp::min(len, KERNEL_BUF_SIZE);
 
     let mut iterations = 0usize;
     const MAX_ITERATIONS: usize = 100_000;
@@ -864,7 +878,7 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             return (-libc_errno::EINTR as i64) as u64;
         }
 
-        // Try to read with socket handle
+        // Try to read with socket handle into KERNEL buffer
         let result = socket::with_socket_handle(socket_idx, |socket| {
             use core::future::Future;
             use core::pin::Pin;
@@ -878,7 +892,7 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
             let mut cx = Context::from_waker(&waker);
 
-            let mut read_future = socket.read(user_buf);
+            let mut read_future = socket.read(&mut kernel_buf[..read_len]);
             let pinned = unsafe { Pin::new_unchecked(&mut read_future) };
 
             match pinned.poll(&mut cx) {
@@ -890,6 +904,17 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
 
         match result {
             Ok(Ok(n)) if n >= 0 => {
+                // Copy from kernel buffer to user buffer
+                let bytes_read = n as usize;
+                if bytes_read > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            kernel_buf.as_ptr(),
+                            buf_ptr as *mut u8,
+                            bytes_read,
+                        );
+                    }
+                }
                 socket::socket_dec_ref(socket_idx);
                 return n as u64;
             }
@@ -1488,7 +1513,11 @@ fn block_on_accept(
 
         match result {
             Poll::Ready(Ok(())) => {
-                // Success! Future is consumed, borrow ends
+                // CRITICAL: Drop the future first to release the mutable borrow!
+                // The future still exists on the stack even though poll() returned Ready.
+                // We must drop it before we can safely access the socket.
+                drop(accept_fut);
+                
                 // Now we can safely access socket
                 let socket = unsafe { socket_cell.into_inner() };
                 crate::threading::disable_preemption();
@@ -1498,7 +1527,8 @@ fn block_on_accept(
             }
             Poll::Ready(Err(e)) => {
                 crate::safe_print!(64, "[block_on_accept] embassy error: {:?}\n", e);
-                // Future is consumed, borrow ends
+                // Drop future first to release borrow
+                drop(accept_fut);
                 let socket = unsafe { socket_cell.into_inner() };
                 drop(socket);
                 return Err(libc_errno::ECONNREFUSED);
@@ -1575,6 +1605,8 @@ fn block_on_connect(
 
         match result {
             Poll::Ready(Ok(())) => {
+                // CRITICAL: Drop the future first to release the mutable borrow!
+                drop(connect_fut);
                 let socket = unsafe { socket_cell.into_inner() };
                 crate::threading::disable_preemption();
                 let local = socket.local_endpoint();
@@ -1583,6 +1615,8 @@ fn block_on_connect(
             }
             Poll::Ready(Err(e)) => {
                 crate::safe_print!(64, "[block_on_connect] embassy error: {:?}\n", e);
+                // Drop future first to release borrow
+                drop(connect_fut);
                 let socket = unsafe { socket_cell.into_inner() };
                 drop(socket);
                 return Err(libc_errno::ECONNREFUSED);

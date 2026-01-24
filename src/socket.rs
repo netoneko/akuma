@@ -342,8 +342,13 @@ impl Drop for SocketHandle {
         // Abort the socket if it exists to release embassy-net resources
         // SAFETY: Called during socket cleanup, preemption should be disabled
         // or we're the only reference
+        crate::console::print("[SocketHandle::drop] called\n");
         if let Some(mut socket) = unsafe { self.take() } {
+            crate::console::print("[SocketHandle::drop] aborting socket\n");
             socket.abort();
+            crate::console::print("[SocketHandle::drop] aborted\n");
+        } else {
+            crate::console::print("[SocketHandle::drop] no socket to abort\n");
         }
     }
 }
@@ -440,6 +445,7 @@ impl KernelSocket {
 
 impl Drop for KernelSocket {
     fn drop(&mut self) {
+        crate::safe_print!(48, "[KernelSocket::drop] slot={}\n", self.buffer_slot);
         // Queue buffer for deferred cleanup
         queue_buffer_cleanup(self.buffer_slot);
     }
