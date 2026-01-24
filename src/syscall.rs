@@ -28,6 +28,7 @@ pub mod nr {
     pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
+    pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
@@ -94,6 +95,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
+        nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
         nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
@@ -1188,6 +1190,34 @@ fn sys_openat(_dirfd: i32, pathname_ptr: u64, pathname_len: usize, flags: u32, _
 
     let fd = proc.alloc_fd(FileDescriptor::File(file));
     fd as u64
+}
+
+/// sys_mkdirat - Create a directory
+///
+/// # Arguments
+/// * `dirfd` - Directory file descriptor (ignored, always uses absolute path)
+/// * `pathname_ptr` - Pointer to pathname string
+/// * `pathname_len` - Length of pathname
+/// * `mode` - Directory mode (ignored)
+fn sys_mkdirat(_dirfd: i32, pathname_ptr: u64, pathname_len: usize, _mode: u32) -> u64 {
+    if pathname_ptr == 0 || pathname_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    // Read pathname from user memory
+    let pathname_bytes = unsafe {
+        core::slice::from_raw_parts(pathname_ptr as *const u8, pathname_len)
+    };
+    let pathname = match core::str::from_utf8(pathname_bytes) {
+        Ok(s) => s,
+        Err(_) => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Create directory
+    match crate::fs::create_dir(pathname) {
+        Ok(()) => 0,
+        Err(_) => (-libc_errno::EIO as i64) as u64,
+    }
 }
 
 /// sys_lseek - Reposition file offset

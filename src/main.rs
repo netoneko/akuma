@@ -24,7 +24,6 @@ mod executor;
 mod fs;
 mod fs_tests;
 mod gic;
-mod herd;
 mod irq;
 mod mmu;
 mod netcat_server;
@@ -738,16 +737,20 @@ fn run_async_main() -> ! {
     async_net::set_global_stack(stack);
     async_net::set_loopback_stack(loopback_stack);
 
-    // Auto-start userspace herd if it exists and kernel herd is disabled
-    if !config::ENABLE_KERNEL_HERD && fs::is_initialized() && fs::exists("/bin/herd") {
-        console::print("[AsyncMain] Starting userspace herd supervisor...\n");
-        match process::spawn_process("/bin/herd", None, None) {
-            Ok(tid) => {
-                crate::safe_print!(64, "[AsyncMain] Userspace herd started (tid={})\n", tid);
+    // Auto-start herd process supervisor
+    if config::AUTO_START_HERD && fs::is_initialized() {
+        if fs::exists("/bin/herd") {
+            console::print("[AsyncMain] Starting herd supervisor...\n");
+            match process::spawn_process("/bin/herd", None, None) {
+                Ok(tid) => {
+                    crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
+                }
+                Err(e) => {
+                    crate::safe_print!(64, "[AsyncMain] ERROR: Failed to start herd: {}\n", e);
+                }
             }
-            Err(e) => {
-                crate::safe_print!(64, "[AsyncMain] Failed to start herd: {}\n", e);
-            }
+        } else {
+            console::print("[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
         }
     }
 
@@ -759,10 +762,6 @@ fn run_async_main() -> ! {
     // let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
 
     let mut mem_monitor_pinned = pin!(memory_monitor());
-    
-    // Herd supervisor (kernel-integrated, disabled by default)
-    // When ENABLE_KERNEL_HERD is false, herd runs as userspace binary at /bin/herd
-    let mut herd_pinned = pin!(herd::herd_supervisor());
 
     // Enable IRQs for the main async loop
     // The boot thread (thread 0) starts with all exceptions masked.
@@ -850,11 +849,6 @@ fn run_async_main() -> ! {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
 
-        // Poll herd process supervisor (kernel-integrated, configurable)
-        POLL_STEP.store(9, Ordering::Relaxed);
-        if config::ENABLE_KERNEL_HERD {
-            let _ = herd_pinned.as_mut().poll(&mut cx);
-        }
 
         // Process pending IRQ work
         executor::process_irq_work();

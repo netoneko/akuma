@@ -33,6 +33,7 @@ pub mod syscall {
     pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222;
     pub const GETDENTS64: u64 = 61;
+    pub const MKDIRAT: u64 = 34;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
@@ -691,6 +692,57 @@ pub fn write_fd(fd: i32, buf: &[u8]) -> isize {
         buf.len() as u64,
         0, 0, 0,
     ) as isize
+}
+
+/// Create a directory
+///
+/// Returns 0 on success, negative errno on failure.
+pub fn mkdir(path: &str) -> i32 {
+    syscall(
+        syscall::MKDIRAT,
+        -100i32 as u64, // AT_FDCWD
+        path.as_ptr() as u64,
+        path.len() as u64,
+        0o755u64, // mode
+        0, 0,
+    ) as i32
+}
+
+/// Create a directory and all parent directories
+///
+/// Returns true on success (directory exists or was created).
+pub fn mkdir_p(path: &str) -> bool {
+    // First check if it already exists by trying to open it
+    let fd = open(path, open_flags::O_RDONLY);
+    if fd >= 0 {
+        close(fd);
+        return true; // Already exists
+    }
+
+    // Try to create parent directories
+    let mut current = alloc::string::String::new();
+    for component in path.split('/') {
+        if component.is_empty() {
+            current.push('/');
+            continue;
+        }
+        if !current.is_empty() && !current.ends_with('/') {
+            current.push('/');
+        }
+        current.push_str(component);
+        
+        // Try to create this directory (ignore errors for existing dirs)
+        let _ = mkdir(&current);
+    }
+
+    // Check if final path exists now
+    let fd = open(path, open_flags::O_RDONLY);
+    if fd >= 0 {
+        close(fd);
+        true
+    } else {
+        false
+    }
 }
 
 /// Print a string to stdout

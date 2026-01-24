@@ -1,15 +1,19 @@
 # Herd Process Supervisor
 
-Herd is a process supervisor for managing background services. Named "herd" because herding cats is an apt metaphor for managing processes.
+Herd is a userspace process supervisor for managing background services. Named "herd" because herding cats is an apt metaphor for managing processes.
 
 ## Architecture
 
-Herd can run in two modes:
+Herd runs as a userspace binary at `/bin/herd`. The kernel can automatically start it after the network stack is initialized (controlled by `config::AUTO_START_HERD`, disabled by default due to scheduling issues).
 
-1. **Kernel-integrated** (`config::ENABLE_KERNEL_HERD = true`): Runs as part of the kernel's async main loop
-2. **Userspace binary** (`config::ENABLE_KERNEL_HERD = false`, default): Runs as `/bin/herd`
+To enable automatic startup, set `AUTO_START_HERD = true` in `src/config.rs`.
 
-The userspace mode is preferred as it provides better isolation and follows Unix design principles.
+Alternatively, run herd manually from the shell:
+```bash
+/bin/herd &
+```
+
+If `/bin/herd` is not found when auto-start is enabled, the kernel logs a warning.
 
 ## Features
 
@@ -21,6 +25,8 @@ The userspace mode is preferred as it provides better isolation and follows Unix
 - Periodic config reload every 20 seconds
 
 ## Directory Structure
+
+Herd automatically creates these directories at startup if they don't exist:
 
 ```
 /etc/herd/
@@ -85,18 +91,7 @@ herd help
 
 The kernel shell also has a built-in `herd` command with the same interface.
 
-When using kernel-integrated mode (`ENABLE_KERNEL_HERD=true`), additional commands are available:
-
-```bash
-# Start a service immediately
-herd run httpd
-
-# Stop a running service
-herd stop httpd
-
-# Restart a service
-herd restart httpd
-```
+To restart a service, use `kill <pid>` - herd will automatically restart services that exit with a non-zero exit code.
 
 ## Syscalls (for userspace herd)
 

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
     open_flags, seek_mode, spawn, kill, waitpid, read_dir, uptime,
-    sleep_ms, SpawnResult,
+    sleep_ms, mkdir_p, SpawnResult,
 };
 
 // ============================================================================
@@ -40,7 +40,36 @@ const DEFAULT_MAX_RETRIES: u32 = 0;
 
 /// Herd directories
 const HERD_ENABLED_DIR: &str = "/etc/herd/enabled";
+const HERD_AVAILABLE_DIR: &str = "/etc/herd/available";
 const HERD_LOG_DIR: &str = "/var/log/herd";
+
+// ============================================================================
+// Directory Setup
+// ============================================================================
+
+/// Ensure all required directories exist
+fn ensure_directories() {
+    // Create /etc/herd/enabled
+    if mkdir_p(HERD_ENABLED_DIR) {
+        print("[herd] Created ");
+        print(HERD_ENABLED_DIR);
+        print("\n");
+    }
+    
+    // Create /etc/herd/available
+    if mkdir_p(HERD_AVAILABLE_DIR) {
+        print("[herd] Created ");
+        print(HERD_AVAILABLE_DIR);
+        print("\n");
+    }
+    
+    // Create /var/log/herd
+    if mkdir_p(HERD_LOG_DIR) {
+        print("[herd] Created ");
+        print(HERD_LOG_DIR);
+        print("\n");
+    }
+}
 
 // ============================================================================
 // Service State
@@ -147,8 +176,8 @@ fn main() {
         let service_name = libakuma::arg(2);
         
         match subcommand {
-            "daemon" | "run" => {
-                // Run as daemon (fall through to supervisor loop)
+            "daemon" | "run" | "foreground" | "fg" => {
+                // Run as daemon in foreground (fall through to supervisor loop)
             }
             "status" => {
                 cmd_status();
@@ -202,6 +231,9 @@ fn main() {
 
     // Daemon mode - run supervisor loop
     print("[herd] Userspace supervisor starting...\n");
+
+    // Ensure required directories exist
+    ensure_directories();
 
     let mut state = HerdState::new();
 
@@ -634,7 +666,7 @@ fn print_usage() {
     print("Usage: herd <command> [args]\n");
     print("\n");
     print("Commands:\n");
-    print("  daemon, run    Run the supervisor daemon\n");
+    print("  daemon         Run supervisor in foreground\n");
     print("  status         List enabled services\n");
     print("  config <svc>   Show service configuration\n");
     print("  enable <svc>   Enable a service\n");
@@ -642,7 +674,7 @@ fn print_usage() {
     print("  log <svc>      Show service log\n");
     print("  help           Show this help\n");
     print("\n");
-    print("Without arguments, runs as daemon.\n");
+    print("Without arguments, runs as daemon in foreground.\n");
 }
 
 fn cmd_status() {
@@ -687,7 +719,7 @@ fn cmd_config(name: &str) {
     }
     
     // Try available directory
-    let available_path = format!("/etc/herd/available/{}.conf", name);
+    let available_path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
     if let Some(content) = read_file_string(&available_path) {
         print("Config for '");
         print(name);
@@ -702,11 +734,15 @@ fn cmd_config(name: &str) {
     print("Service '");
     print(name);
     print("' not found.\n");
-    print("Check /etc/herd/available/ and /etc/herd/enabled/\n");
+    print("Check ");
+    print(HERD_AVAILABLE_DIR);
+    print("/ and ");
+    print(HERD_ENABLED_DIR);
+    print("/\n");
 }
 
 fn cmd_enable(name: &str) {
-    let src_path = format!("/etc/herd/available/{}.conf", name);
+    let src_path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
     let dst_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
     
     // Check if already enabled
@@ -723,7 +759,9 @@ fn cmd_enable(name: &str) {
         None => {
             print("Service '");
             print(name);
-            print("' not found in /etc/herd/available/\n");
+            print("' not found in ");
+            print(HERD_AVAILABLE_DIR);
+            print("/\n");
             return;
         }
     };

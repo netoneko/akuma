@@ -227,11 +227,13 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 // Herd Process Supervisor Configuration
 // ============================================================================
 
-/// Enable kernel-integrated herd supervisor
+/// Auto-start the herd process supervisor at boot
 ///
-/// When enabled, the herd process supervisor runs as part of the kernel's
-/// async main loop. When disabled, herd should be run as a userspace binary
-/// at /bin/herd.
+/// When enabled, the kernel will spawn /bin/herd as a userspace process
+/// after the network stack is initialized. Herd manages background services
+/// defined in /etc/herd/enabled/.
 ///
-/// Set to `false` when using the userspace herd binary.
-pub const ENABLE_KERNEL_HERD: bool = false;
+/// NOTE: Currently disabled by default due to potential scheduling issues
+/// with userspace processes and the async network loop. Enable when testing
+/// the herd supervisor specifically.
+pub const AUTO_START_HERD: bool = false;
