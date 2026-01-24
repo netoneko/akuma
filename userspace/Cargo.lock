@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "httpd"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
 name = "libakuma"
 version = "0.1.0"
 
@@ -43,6 +50,13 @@ dependencies = [
 
 [[package]]
 name = "stdcheck"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
+name = "wget"
 version = "0.1.0"
 dependencies = [
  "libakuma",

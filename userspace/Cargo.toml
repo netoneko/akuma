@@ -5,8 +5,10 @@ members = [
     "echo2",
     "elftest",
     "hello",
+    "httpd",
     "stackstress",
     "stdcheck",
+    "wget",
 ]
 
 [profile.dev]

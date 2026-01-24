@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+pub mod net;
+
 use core::arch::asm;
 
 /// Syscall numbers
@@ -14,10 +16,24 @@ pub mod syscall {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const LSEEK: u64 = 62;
+    pub const FSTAT: u64 = 80;
     pub const NANOSLEEP: u64 = 101;
-    pub const MMAP: u64 = 222;
+    pub const SOCKET: u64 = 198;
+    pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
+    pub const CONNECT: u64 = 203;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SHUTDOWN: u64 = 210;
     pub const MUNMAP: u64 = 215;
     pub const UPTIME: u64 = 216;
+    pub const MMAP: u64 = 222;
+    // Custom syscalls
+    pub const RESOLVE_HOST: u64 = 300;
 }
 
 /// File descriptors
@@ -328,6 +344,349 @@ pub fn sleep_ms(milliseconds: u64) {
 #[inline(never)]
 pub fn uptime() -> u64 {
     syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
+}
+
+// ============================================================================
+// Socket Syscalls
+// ============================================================================
+
+/// Socket address families
+pub mod socket_const {
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_STREAM: i32 = 1;
+    pub const SOCK_DGRAM: i32 = 2;
+    pub const IPPROTO_TCP: i32 = 6;
+    pub const SHUT_RD: i32 = 0;
+    pub const SHUT_WR: i32 = 1;
+    pub const SHUT_RDWR: i32 = 2;
+}
+
+/// IPv4 socket address
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketAddrV4 {
+    pub ip: [u8; 4],
+    pub port: u16,
+}
+
+impl SocketAddrV4 {
+    pub const fn new(ip: [u8; 4], port: u16) -> Self {
+        Self { ip, port }
+    }
+
+    /// Parse from "ip:port" string
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split(':');
+        let ip_str = parts.next()?;
+        let port_str = parts.next()?;
+
+        // Parse IP
+        let mut ip = [0u8; 4];
+        let mut octets = ip_str.split('.');
+        for i in 0..4 {
+            let octet_str = octets.next()?;
+            ip[i] = parse_u8(octet_str)?;
+        }
+
+        // Parse port
+        let port = parse_u16(port_str)?;
+
+        Some(Self { ip, port })
+    }
+}
+
+fn parse_u8(s: &str) -> Option<u8> {
+    let mut result: u8 = 0;
+    for c in s.bytes() {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        result = result.checked_mul(10)?.checked_add(c - b'0')?;
+    }
+    Some(result)
+}
+
+fn parse_u16(s: &str) -> Option<u16> {
+    let mut result: u16 = 0;
+    for c in s.bytes() {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        result = result.checked_mul(10)?.checked_add((c - b'0') as u16)?;
+    }
+    Some(result)
+}
+
+/// Linux sockaddr_in structure
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SockAddrIn {
+    pub sin_family: u16,
+    pub sin_port: u16,     // Network byte order
+    pub sin_addr: u32,     // Network byte order
+    pub sin_zero: [u8; 8],
+}
+
+impl SockAddrIn {
+    pub const SIZE: usize = 16;
+
+    pub fn from_addr(addr: &SocketAddrV4) -> Self {
+        Self {
+            sin_family: 2, // AF_INET
+            sin_port: addr.port.to_be(),
+            sin_addr: u32::from_be_bytes(addr.ip),
+            sin_zero: [0u8; 8],
+        }
+    }
+
+    pub fn to_addr(&self) -> SocketAddrV4 {
+        SocketAddrV4 {
+            ip: self.sin_addr.to_be_bytes(),
+            port: u16::from_be(self.sin_port),
+        }
+    }
+}
+
+/// Create a socket
+pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> i32 {
+    syscall(
+        syscall::SOCKET,
+        domain as u64,
+        sock_type as u64,
+        protocol as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Bind a socket to an address
+pub fn bind(fd: i32, addr: &SocketAddrV4) -> i32 {
+    let sockaddr = SockAddrIn::from_addr(addr);
+    syscall(
+        syscall::BIND,
+        fd as u64,
+        &sockaddr as *const _ as u64,
+        SockAddrIn::SIZE as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Listen for connections
+pub fn listen(fd: i32, backlog: i32) -> i32 {
+    syscall(
+        syscall::LISTEN,
+        fd as u64,
+        backlog as u64,
+        0, 0, 0, 0,
+    ) as i32
+}
+
+/// Accept a connection
+pub fn accept(fd: i32) -> i32 {
+    let mut sockaddr = SockAddrIn {
+        sin_family: 0,
+        sin_port: 0,
+        sin_addr: 0,
+        sin_zero: [0u8; 8],
+    };
+    let mut addrlen: u32 = SockAddrIn::SIZE as u32;
+    syscall(
+        syscall::ACCEPT,
+        fd as u64,
+        &mut sockaddr as *mut _ as u64,
+        &mut addrlen as *mut _ as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Connect to a remote address
+pub fn connect(fd: i32, addr: &SocketAddrV4) -> i32 {
+    let sockaddr = SockAddrIn::from_addr(addr);
+    syscall(
+        syscall::CONNECT,
+        fd as u64,
+        &sockaddr as *const _ as u64,
+        SockAddrIn::SIZE as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Send data on a socket
+pub fn send(fd: i32, buf: &[u8], flags: i32) -> isize {
+    syscall(
+        syscall::SENDTO,
+        fd as u64,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+        flags as u64,
+        0, 0,
+    ) as isize
+}
+
+/// Receive data from a socket
+pub fn recv(fd: i32, buf: &mut [u8], flags: i32) -> isize {
+    syscall(
+        syscall::RECVFROM,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        flags as u64,
+        0, 0,
+    ) as isize
+}
+
+/// Shutdown a socket
+pub fn shutdown(fd: i32, how: i32) -> i32 {
+    syscall(
+        syscall::SHUTDOWN,
+        fd as u64,
+        how as u64,
+        0, 0, 0, 0,
+    ) as i32
+}
+
+/// Close a file descriptor
+pub fn close(fd: i32) -> i32 {
+    syscall(
+        syscall::CLOSE,
+        fd as u64,
+        0, 0, 0, 0, 0,
+    ) as i32
+}
+
+// ============================================================================
+// DNS Syscall
+// ============================================================================
+
+/// Resolve a hostname to an IPv4 address
+///
+/// Returns Ok([a, b, c, d]) on success, Err(errno) on failure.
+pub fn resolve_host(hostname: &str) -> Result<[u8; 4], i32> {
+    let mut result = [0u8; 4];
+    let ret = syscall(
+        syscall::RESOLVE_HOST,
+        hostname.as_ptr() as u64,
+        hostname.len() as u64,
+        result.as_mut_ptr() as u64,
+        0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(result)
+    }
+}
+
+// ============================================================================
+// File I/O Syscalls
+// ============================================================================
+
+/// Open flags
+pub mod open_flags {
+    pub const O_RDONLY: u32 = 0;
+    pub const O_WRONLY: u32 = 1;
+    pub const O_RDWR: u32 = 2;
+    pub const O_CREAT: u32 = 0o100;
+    pub const O_TRUNC: u32 = 0o1000;
+    pub const O_APPEND: u32 = 0o2000;
+}
+
+/// Seek modes
+pub mod seek_mode {
+    pub const SEEK_SET: i32 = 0;
+    pub const SEEK_CUR: i32 = 1;
+    pub const SEEK_END: i32 = 2;
+}
+
+/// File stat structure (simplified)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i32; 2],
+}
+
+/// Open a file
+///
+/// Returns file descriptor on success, negative errno on failure.
+pub fn open(path: &str, flags: u32) -> i32 {
+    syscall(
+        syscall::OPENAT,
+        -100i32 as u64, // AT_FDCWD
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags as u64,
+        0o644u64, // mode
+        0,
+    ) as i32
+}
+
+/// Get file status
+pub fn fstat(fd: i32) -> Result<Stat, i32> {
+    let mut stat = Stat::default();
+    let ret = syscall(
+        syscall::FSTAT,
+        fd as u64,
+        &mut stat as *mut _ as u64,
+        0, 0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(stat)
+    }
+}
+
+/// Seek in a file
+///
+/// Returns new position on success, negative errno on failure.
+pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    syscall(
+        syscall::LSEEK,
+        fd as u64,
+        offset as u64,
+        whence as u64,
+        0, 0, 0,
+    ) as i64
+}
+
+/// Read from a file descriptor (generic version)
+pub fn read_fd(fd: i32, buf: &mut [u8]) -> isize {
+    syscall(
+        syscall::READ,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0,
+    ) as isize
+}
+
+/// Write to a file descriptor (generic version)
+pub fn write_fd(fd: i32, buf: &[u8]) -> isize {
+    syscall(
+        syscall::WRITE,
+        fd as u64,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0,
+    ) as isize
 }
 
 /// Print a string to stdout

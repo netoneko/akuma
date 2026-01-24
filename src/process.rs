@@ -125,6 +125,57 @@ const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 /// Process ID type
 pub type Pid = u32;
 
+// ============================================================================
+// File Descriptor Table
+// ============================================================================
+
+/// File descriptor types for the per-process FD table
+#[derive(Debug, Clone)]
+pub enum FileDescriptor {
+    /// Standard input (fd 0)
+    Stdin,
+    /// Standard output (fd 1)
+    Stdout,
+    /// Standard error (fd 2)
+    Stderr,
+    /// Socket file descriptor - index into global socket table
+    Socket(usize),
+    /// File file descriptor
+    File(KernelFile),
+}
+
+/// Kernel file handle for open files
+#[derive(Debug, Clone)]
+pub struct KernelFile {
+    /// Path to the file
+    pub path: String,
+    /// Current read/write position
+    pub position: usize,
+    /// Open flags (O_RDONLY, O_WRONLY, O_RDWR, etc.)
+    pub flags: u32,
+}
+
+impl KernelFile {
+    /// Create a new kernel file handle
+    pub fn new(path: String, flags: u32) -> Self {
+        Self {
+            path,
+            position: 0,
+            flags,
+        }
+    }
+}
+
+/// File open flags (Linux compatible)
+pub mod open_flags {
+    pub const O_RDONLY: u32 = 0;
+    pub const O_WRONLY: u32 = 1;
+    pub const O_RDWR: u32 = 2;
+    pub const O_CREAT: u32 = 0o100;
+    pub const O_TRUNC: u32 = 0o1000;
+    pub const O_APPEND: u32 = 0o2000;
+}
+
 /// Next available PID
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
@@ -632,6 +683,13 @@ pub struct Process {
     /// These are allocated by map_user_page() and need to be freed separately
     /// from address_space.page_table_frames since they're created dynamically.
     pub dynamic_page_tables: Vec<PhysFrame>,
+
+    // ========== File Descriptor Table ==========
+    /// Per-process file descriptor table
+    /// Maps FD numbers to FileDescriptor entries (sockets, files, etc.)
+    pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
+    /// Next available file descriptor number
+    pub next_fd: AtomicU32,
 }
 
 
@@ -671,6 +729,12 @@ impl Process {
         crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
 
+        // Initialize FD table with stdin/stdout/stderr pre-allocated
+        let mut fd_map = alloc::collections::BTreeMap::new();
+        fd_map.insert(0, FileDescriptor::Stdin);
+        fd_map.insert(1, FileDescriptor::Stdout);
+        fd_map.insert(2, FileDescriptor::Stderr);
+
         Ok(Self {
             pid,
             name: String::from(name),
@@ -692,6 +756,9 @@ impl Process {
             exit_code: 0,
             // Dynamic page tables - for mmap-allocated page tables
             dynamic_page_tables: Vec::new(),
+            // File descriptor table - stdin/stdout/stderr pre-allocated
+            fd_table: Spinlock::new(fd_map),
+            next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
         })
     }
 
@@ -822,6 +889,53 @@ impl Process {
         self.stdout_buf.clear();
         self.exited = false;
         self.exit_code = 0;
+    }
+
+    // ========== File Descriptor Table Methods ==========
+
+    /// Allocate a new file descriptor and insert the entry atomically
+    ///
+    /// This is the correct pattern to avoid race conditions:
+    /// the FD number is allocated and inserted while holding the lock.
+    pub fn alloc_fd(&self, entry: FileDescriptor) -> u32 {
+        crate::irq::with_irqs_disabled(|| {
+            let mut table = self.fd_table.lock();
+            let fd = self.next_fd.fetch_add(1, Ordering::SeqCst);
+            table.insert(fd, entry);
+            fd
+        })
+    }
+
+    /// Get a file descriptor entry (cloned)
+    ///
+    /// Returns a clone of the entry to avoid holding the lock.
+    pub fn get_fd(&self, fd: u32) -> Option<FileDescriptor> {
+        crate::irq::with_irqs_disabled(|| {
+            self.fd_table.lock().get(&fd).cloned()
+        })
+    }
+
+    /// Remove and return a file descriptor entry
+    pub fn remove_fd(&self, fd: u32) -> Option<FileDescriptor> {
+        crate::irq::with_irqs_disabled(|| {
+            self.fd_table.lock().remove(&fd)
+        })
+    }
+
+    /// Update a file descriptor entry (for file position updates, etc.)
+    pub fn update_fd<F>(&self, fd: u32, f: F) -> bool
+    where
+        F: FnOnce(&mut FileDescriptor),
+    {
+        crate::irq::with_irqs_disabled(|| {
+            let mut table = self.fd_table.lock();
+            if let Some(entry) = table.get_mut(&fd) {
+                f(entry);
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 

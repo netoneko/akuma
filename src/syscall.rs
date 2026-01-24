@@ -11,10 +11,24 @@ pub mod nr {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const BRK: u64 = 3;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const LSEEK: u64 = 62;
+    pub const FSTAT: u64 = 80;
     pub const NANOSLEEP: u64 = 101; // Linux arm64 nanosleep
-    pub const MMAP: u64 = 222; // Linux arm64 mmap
+    pub const SOCKET: u64 = 198;
+    pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
+    pub const CONNECT: u64 = 203;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SHUTDOWN: u64 = 210;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const UPTIME: u64 = 216;
+    pub const MMAP: u64 = 222; // Linux arm64 mmap
+    // Custom syscalls (300+)
+    pub const RESOLVE_HOST: u64 = 300;
 }
 
 /// Error code for interrupted syscall
@@ -53,7 +67,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::BRK => sys_brk(args[0] as usize),
+        nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
+        nr::CLOSE => sys_close(args[0] as u32),
+        nr::LSEEK => sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
+        nr::FSTAT => sys_fstat(args[0] as u32, args[1]),
         nr::NANOSLEEP => sys_nanosleep(args[0], args[1]),
+        nr::SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        nr::BIND => sys_bind(args[0] as u32, args[1], args[2] as usize),
+        nr::LISTEN => sys_listen(args[0] as u32, args[1] as i32),
+        nr::ACCEPT => sys_accept(args[0] as u32, args[1], args[2]),
+        nr::CONNECT => sys_connect(args[0] as u32, args[1], args[2] as usize),
+        nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
+        nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
+        nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::MMAP => sys_mmap(
             args[0] as usize,
             args[1] as usize,
@@ -62,6 +88,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         ),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::UPTIME => sys_uptime(),
+        nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -251,82 +278,760 @@ fn sys_exit(code: i32) -> u64 {
 /// sys_read - Read from a file descriptor
 ///
 /// # Arguments
-/// * `fd` - File descriptor (0 = stdin)
+/// * `fd` - File descriptor
 /// * `buf` - User buffer pointer
 /// * `count` - Number of bytes to read
 ///
 /// # Returns
 /// Number of bytes read, or negative error code
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
-    if fd_num != fd::STDIN {
-        return (-1i64) as u64; // EBADF - bad file descriptor
-    }
-
     if buf_ptr == 0 || count == 0 {
         return 0;
     }
 
-    // Get the current process for per-process stdin
     let proc = match crate::process::current_process() {
         Some(p) => p,
-        None => return (-1i64) as u64,
+        None => return (-libc_errno::EBADF as i64) as u64,
     };
 
-    // Create a temporary buffer to read into
-    let mut temp_buf = alloc::vec![0u8; count];
-    let bytes_read = proc.read_stdin(&mut temp_buf);
+    // Get file descriptor entry
+    let fd_entry = match proc.get_fd(fd_num as u32) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
 
-    if bytes_read == 0 {
-        return 0; // EOF
+    match fd_entry {
+        FileDescriptor::Stdin => {
+            // Read from process stdin buffer
+            let mut temp_buf = alloc::vec![0u8; count];
+            let bytes_read = proc.read_stdin(&mut temp_buf);
+            if bytes_read > 0 {
+                unsafe {
+                    let dst = buf_ptr as *mut u8;
+                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), dst, bytes_read);
+                }
+            }
+            bytes_read as u64
+        }
+        FileDescriptor::File(ref file) => {
+            // Read from file
+            let path = file.path.clone();
+            let position = file.position;
+
+            // Read entire file (TODO: optimize with partial reads)
+            let file_data = match crate::fs::read_file(&path) {
+                Ok(data) => data,
+                Err(_) => return (-libc_errno::EIO as i64) as u64,
+            };
+
+            // Calculate how much to read
+            if position >= file_data.len() {
+                return 0; // EOF
+            }
+            let available = file_data.len() - position;
+            let to_read = count.min(available);
+
+            // Copy to user buffer
+            unsafe {
+                let dst = buf_ptr as *mut u8;
+                core::ptr::copy_nonoverlapping(
+                    file_data[position..].as_ptr(),
+                    dst,
+                    to_read,
+                );
+            }
+
+            // Update file position
+            proc.update_fd(fd_num as u32, |entry| {
+                if let FileDescriptor::File(f) = entry {
+                    f.position += to_read;
+                }
+            });
+
+            to_read as u64
+        }
+        FileDescriptor::Socket(_socket_idx) => {
+            // TODO: Read from socket via embassy-net
+            // For now, return EAGAIN
+            (-libc_errno::EAGAIN as i64) as u64
+        }
+        _ => (-libc_errno::EBADF as i64) as u64,
     }
-
-    // Copy to user buffer
-    unsafe {
-        let dst = buf_ptr as *mut u8;
-        core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), dst, bytes_read);
-    }
-
-    bytes_read as u64
 }
 
 /// sys_write - Write to a file descriptor
 ///
 /// # Arguments
-/// * `fd` - File descriptor (1 = stdout, 2 = stderr)
+/// * `fd` - File descriptor
 /// * `buf` - User buffer pointer
 /// * `count` - Number of bytes to write
 ///
 /// # Returns
 /// Number of bytes written, or negative error code
 fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
-    if fd_num != fd::STDOUT && fd_num != fd::STDERR {
-        return (-1i64) as u64; // EBADF
-    }
-
     if buf_ptr == 0 || count == 0 {
         return 0;
     }
 
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Get file descriptor entry
+    let fd_entry = match proc.get_fd(fd_num as u32) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
     // SAFETY: We trust the user buffer is valid (TODO: add proper validation)
-    // In a real implementation, we'd validate that buf_ptr..buf_ptr+count
-    // is within the user's address space
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
-    // Write to process channel for streaming output (if one exists)
-    if let Some(channel) = crate::process::current_channel() {
-        channel.write(buf);
+    match fd_entry {
+        FileDescriptor::Stdout | FileDescriptor::Stderr => {
+            // Write to process channel for streaming output
+            if let Some(channel) = crate::process::current_channel() {
+                channel.write(buf);
+            }
+
+            // Write to per-process stdout buffer
+            proc.write_stdout(buf);
+
+            // Print to kernel console
+            if let Ok(s) = core::str::from_utf8(buf) {
+                console::print(s);
+            }
+
+            count as u64
+        }
+        FileDescriptor::File(ref file) => {
+            // Write to file
+            let path = file.path.clone();
+            let flags = file.flags;
+
+            // Check if file was opened for writing
+            use crate::process::open_flags;
+            if flags & open_flags::O_WRONLY == 0 && flags & open_flags::O_RDWR == 0 {
+                return (-libc_errno::EBADF as i64) as u64;
+            }
+
+            // For append mode, always append
+            // For regular write, we overwrite (simple implementation)
+            let result = if flags & open_flags::O_APPEND != 0 {
+                crate::fs::append_file(&path, buf)
+            } else {
+                crate::fs::write_file(&path, buf)
+            };
+
+            match result {
+                Ok(()) => count as u64,
+                Err(_) => (-libc_errno::EIO as i64) as u64,
+            }
+        }
+        FileDescriptor::Socket(_socket_idx) => {
+            // TODO: Write to socket via embassy-net
+            // For now, return success with bytes "written"
+            count as u64
+        }
+        _ => (-libc_errno::EBADF as i64) as u64,
+    }
+}
+
+// ============================================================================
+// Socket Syscalls
+// ============================================================================
+
+use crate::process::FileDescriptor;
+use crate::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
+
+/// sys_socket - Create a socket
+///
+/// # Arguments
+/// * `domain` - Address family (AF_INET = 2)
+/// * `sock_type` - Socket type (SOCK_STREAM = 1)
+/// * `protocol` - Protocol (0 or IPPROTO_TCP = 6)
+fn sys_socket(domain: i32, sock_type: i32, _protocol: i32) -> u64 {
+    // Only support AF_INET + SOCK_STREAM for now
+    if domain != socket::socket_const::AF_INET {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+    if sock_type != socket::socket_const::SOCK_STREAM {
+        return (-libc_errno::EINVAL as i64) as u64;
     }
 
-    // Write to per-process stdout buffer (for legacy exec_with_io)
-    if let Some(proc) = crate::process::current_process() {
-        proc.write_stdout(buf);
+    // Allocate kernel socket
+    let socket_idx = match socket::alloc_socket(sock_type) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EAGAIN as i64) as u64,
+    };
+
+    // Allocate FD in process
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => {
+            socket::remove_socket(socket_idx);
+            return (-libc_errno::EBADF as i64) as u64;
+        }
+    };
+
+    let fd = proc.alloc_fd(FileDescriptor::Socket(socket_idx));
+    fd as u64
+}
+
+/// sys_bind - Bind socket to address
+fn sys_bind(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
+    if addr_len < SockAddrIn::SIZE {
+        return (-libc_errno::EINVAL as i64) as u64;
     }
 
-    // Debug: print to kernel console (comment out for production)
-    // This helps verify parallel execution is actually happening
-    if let Ok(s) = core::str::from_utf8(buf) {
-        console::print(s);
+    // Get socket index from FD
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Read sockaddr from user memory
+    let sockaddr = unsafe {
+        core::ptr::read(addr_ptr as *const SockAddrIn)
+    };
+    let addr = sockaddr.to_addr();
+
+    // Bind the socket
+    match socket::socket_bind(socket_idx, addr) {
+        Ok(()) => 0,
+        Err(e) => (-e as i64) as u64,
     }
-    
-    count as u64
+}
+
+/// sys_listen - Mark socket as listening
+fn sys_listen(fd: u32, backlog: i32) -> u64 {
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    match socket::socket_listen(socket_idx, backlog as usize) {
+        Ok(()) => 0,
+        Err(e) => (-e as i64) as u64,
+    }
+}
+
+/// sys_accept - Accept a connection (blocking)
+///
+/// This blocks until a connection is available, yielding to the scheduler.
+fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Verify socket is listening
+    let state = match socket::get_socket_state(socket_idx) {
+        Some(s) => s,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let local_addr = match state {
+        socket::SocketState::Listening { local_addr, .. } => local_addr,
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Blocking accept loop
+    // In a real implementation, we'd poll embassy-net TcpSocket here.
+    // For now, we create a placeholder that yields and checks for connections.
+    loop {
+        // Check for interrupt
+        if crate::process::is_current_interrupted() {
+            return (-libc_errno::EINTR as i64) as u64;
+        }
+
+        // TODO: Actually poll embassy-net for incoming connections
+        // For now, we just yield and return EAGAIN after a few iterations
+        // This will be properly implemented when we integrate with embassy-net
+
+        // Yield to let network runner poll
+        crate::threading::yield_now();
+
+        // Placeholder: In real implementation, check if connection available
+        // For now, return EAGAIN to indicate non-blocking would block
+        // Real implementation needs embassy-net integration
+        break;
+    }
+
+    // Placeholder return - real implementation would create new socket
+    (-libc_errno::EAGAIN as i64) as u64
+}
+
+/// sys_connect - Connect to remote address (blocking)
+fn sys_connect(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
+    if addr_len < SockAddrIn::SIZE {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Read sockaddr from user memory
+    let sockaddr = unsafe {
+        core::ptr::read(addr_ptr as *const SockAddrIn)
+    };
+    let remote_addr = sockaddr.to_addr();
+
+    // Get local address (ephemeral port)
+    let local_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
+
+    // Blocking connect loop
+    loop {
+        if crate::process::is_current_interrupted() {
+            return (-libc_errno::EINTR as i64) as u64;
+        }
+
+        // TODO: Actually connect via embassy-net
+        // For now, mark as connected and return success
+        match socket::socket_set_connected(socket_idx, local_addr, remote_addr) {
+            Ok(()) => return 0,
+            Err(e) => return (-e as i64) as u64,
+        }
+    }
+}
+
+/// sys_sendto - Send data on socket
+fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Verify socket is connected
+    let state = match socket::get_socket_state(socket_idx) {
+        Some(s) => s,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    match state {
+        socket::SocketState::Connected { .. } => {}
+        _ => return (-libc_errno::ENOTCONN as i64) as u64,
+    }
+
+    if buf_ptr == 0 || len == 0 {
+        return 0;
+    }
+
+    // TODO: Actually send via embassy-net TcpSocket
+    // For now, return success with bytes "sent"
+    len as u64
+}
+
+/// sys_recvfrom - Receive data from socket (blocking)
+fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Verify socket is connected
+    let state = match socket::get_socket_state(socket_idx) {
+        Some(s) => s,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    match state {
+        socket::SocketState::Connected { .. } => {}
+        _ => return (-libc_errno::ENOTCONN as i64) as u64,
+    }
+
+    if buf_ptr == 0 || len == 0 {
+        return 0;
+    }
+
+    // Blocking receive loop
+    loop {
+        if crate::process::is_current_interrupted() {
+            return (-libc_errno::EINTR as i64) as u64;
+        }
+
+        // TODO: Actually receive via embassy-net TcpSocket
+        // For now, yield and return 0 (EOF)
+        crate::threading::yield_now();
+        return 0;
+    }
+}
+
+/// sys_shutdown - Shutdown socket
+fn sys_shutdown(fd: u32, how: i32) -> u64 {
+    let socket_idx = match get_socket_from_fd(fd) {
+        Some(idx) => idx,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Validate shutdown mode
+    if how < 0 || how > 2 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    // TODO: Actually shutdown via embassy-net
+    let _ = socket_idx;
+    0
+}
+
+/// sys_close - Close a file descriptor
+fn sys_close(fd: u32) -> u64 {
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Remove FD from process table
+    let entry = match proc.remove_fd(fd) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Handle based on FD type
+    match entry {
+        FileDescriptor::Socket(socket_idx) => {
+            // Close the kernel socket
+            match socket::socket_close(socket_idx) {
+                Ok(()) => 0,
+                Err(e) => (-e as i64) as u64,
+            }
+        }
+        FileDescriptor::File(_) => {
+            // TODO: Close file handle
+            0
+        }
+        FileDescriptor::Stdin | FileDescriptor::Stdout | FileDescriptor::Stderr => {
+            // Don't actually close stdio
+            0
+        }
+    }
+}
+
+/// Helper: Get socket index from file descriptor
+fn get_socket_from_fd(fd: u32) -> Option<usize> {
+    let proc = crate::process::current_process()?;
+    match proc.get_fd(fd)? {
+        FileDescriptor::Socket(idx) => Some(idx),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// DNS Syscall
+// ============================================================================
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+/// sys_resolve_host - Resolve hostname to IPv4 address
+///
+/// # Arguments
+/// * `hostname_ptr` - Pointer to hostname string
+/// * `hostname_len` - Length of hostname string
+/// * `result_ptr` - Pointer to write 4-byte IPv4 result
+///
+/// # Returns
+/// 0 on success, negative error code on failure
+fn sys_resolve_host(hostname_ptr: u64, hostname_len: usize, result_ptr: u64) -> u64 {
+    // Validate pointers
+    if hostname_ptr == 0 || result_ptr == 0 || hostname_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    // Read hostname from user memory
+    let hostname_bytes = unsafe {
+        core::slice::from_raw_parts(hostname_ptr as *const u8, hostname_len)
+    };
+    let hostname = match core::str::from_utf8(hostname_bytes) {
+        Ok(s) => s,
+        Err(_) => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Handle localhost specially (no network needed)
+    if hostname == "localhost" {
+        unsafe {
+            let result = result_ptr as *mut [u8; 4];
+            *result = [127, 0, 0, 1];
+        }
+        return 0;
+    }
+
+    // Try to parse as IPv4 literal
+    if let Ok(ipv4) = hostname.parse::<embassy_net::Ipv4Address>() {
+        unsafe {
+            let result = result_ptr as *mut [u8; 4];
+            *result = ipv4.octets();
+        }
+        return 0;
+    }
+
+    // Get the network stack
+    let stack = match crate::async_net::get_global_stack() {
+        Some(s) => s,
+        None => return (-libc_errno::EHOSTUNREACH as i64) as u64,
+    };
+
+    // Create the DNS query future
+    // We need to own the hostname since the future is async
+    let hostname_owned = alloc::string::String::from(hostname);
+    let dns_future = async move {
+        crate::dns::resolve_host(&hostname_owned, &stack).await
+    };
+
+    // Block on the async DNS resolution
+    let result = block_on_dns(dns_future);
+
+    match result {
+        Ok((embassy_net::IpAddress::Ipv4(ipv4), _duration)) => {
+            unsafe {
+                let result = result_ptr as *mut [u8; 4];
+                *result = ipv4.octets();
+            }
+            0
+        }
+        _ => (-libc_errno::EHOSTUNREACH as i64) as u64,
+    }
+}
+
+// ============================================================================
+// File I/O Syscalls
+// ============================================================================
+
+use crate::process::KernelFile;
+
+/// Linux stat structure (simplified)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i32; 2],
+}
+
+/// sys_openat - Open a file
+///
+/// # Arguments
+/// * `dirfd` - Directory file descriptor (ignored, always use absolute paths)
+/// * `pathname_ptr` - Pointer to pathname string
+/// * `pathname_len` - Length of pathname
+/// * `flags` - Open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
+/// * `mode` - File mode (for O_CREAT)
+fn sys_openat(_dirfd: i32, pathname_ptr: u64, pathname_len: usize, flags: u32, _mode: u32) -> u64 {
+    if pathname_ptr == 0 || pathname_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    // Read pathname from user memory
+    let pathname_bytes = unsafe {
+        core::slice::from_raw_parts(pathname_ptr as *const u8, pathname_len)
+    };
+    let pathname = match core::str::from_utf8(pathname_bytes) {
+        Ok(s) => s,
+        Err(_) => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Check if file exists (unless O_CREAT)
+    use crate::process::open_flags;
+    if !crate::fs::exists(pathname) {
+        if flags & open_flags::O_CREAT == 0 {
+            return (-libc_errno::ENOENT as i64) as u64;
+        }
+        // Create empty file
+        if crate::fs::write_file(pathname, &[]).is_err() {
+            return (-libc_errno::EIO as i64) as u64;
+        }
+    }
+
+    // Truncate if O_TRUNC
+    if flags & open_flags::O_TRUNC != 0 {
+        if crate::fs::write_file(pathname, &[]).is_err() {
+            return (-libc_errno::EIO as i64) as u64;
+        }
+    }
+
+    // Create kernel file handle
+    let file = KernelFile::new(alloc::string::String::from(pathname), flags);
+
+    // Allocate FD
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let fd = proc.alloc_fd(FileDescriptor::File(file));
+    fd as u64
+}
+
+/// sys_lseek - Reposition file offset
+///
+/// # Arguments
+/// * `fd` - File descriptor
+/// * `offset` - Offset value
+/// * `whence` - SEEK_SET (0), SEEK_CUR (1), SEEK_END (2)
+fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let fd_entry = match proc.get_fd(fd) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let file = match fd_entry {
+        FileDescriptor::File(f) => f,
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Get file size for SEEK_END
+    let file_size = match crate::fs::file_size(&file.path) {
+        Ok(s) => s as i64,
+        Err(_) => return (-libc_errno::EIO as i64) as u64,
+    };
+
+    // Calculate new position
+    let current_pos = file.position as i64;
+    let new_pos = match whence {
+        0 => offset,                    // SEEK_SET
+        1 => current_pos + offset,      // SEEK_CUR
+        2 => file_size + offset,        // SEEK_END
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    if new_pos < 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    // Update file position
+    proc.update_fd(fd, |entry| {
+        if let FileDescriptor::File(f) = entry {
+            f.position = new_pos as usize;
+        }
+    });
+
+    new_pos as u64
+}
+
+/// sys_fstat - Get file status
+///
+/// # Arguments
+/// * `fd` - File descriptor
+/// * `statbuf_ptr` - Pointer to stat structure to fill
+fn sys_fstat(fd: u32, statbuf_ptr: u64) -> u64 {
+    if statbuf_ptr == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let fd_entry = match proc.get_fd(fd) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let file = match fd_entry {
+        FileDescriptor::File(f) => f,
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    // Get file size
+    let file_size = match crate::fs::file_size(&file.path) {
+        Ok(s) => s as i64,
+        Err(_) => return (-libc_errno::EIO as i64) as u64,
+    };
+
+    // Fill stat structure
+    let stat = Stat {
+        st_size: file_size,
+        st_mode: 0o100644, // Regular file, rw-r--r--
+        st_blksize: 4096,
+        st_blocks: (file_size + 511) / 512,
+        ..Default::default()
+    };
+
+    // Write to user memory
+    unsafe {
+        core::ptr::write(statbuf_ptr as *mut Stat, stat);
+    }
+
+    0
+}
+
+/// Block on an async DNS future
+///
+/// Similar to SSH's block_on but specifically for DNS operations.
+/// Polls the future in a loop, yielding to scheduler between polls.
+fn block_on_dns<F: Future>(mut future: F) -> F::Output {
+    // Pin the future on the stack
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+
+    // Create a no-op waker
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 10000; // Timeout after ~10 seconds
+
+    loop {
+        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        // Disable preemption during poll (embassy-net uses RefCell)
+        crate::threading::disable_preemption();
+        let poll_result = future.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match poll_result {
+            Poll::Ready(output) => return output,
+            Poll::Pending => {
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    // Timeout - return with whatever we have
+                    // This prevents infinite loops
+                    panic!("DNS resolution timeout");
+                }
+
+                // Check for interrupt
+                if crate::process::is_current_interrupted() {
+                    panic!("DNS resolution interrupted");
+                }
+
+                // Yield to scheduler
+                crate::threading::yield_now();
+
+                // Small spin delay
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
 }
