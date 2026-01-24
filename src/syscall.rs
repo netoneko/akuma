@@ -1929,6 +1929,10 @@ fn sys_getdents64(fd: u32, buf_ptr: u64, buf_size: usize) -> u64 {
 
     const DT_REG: u8 = 8;  // Regular file
     const DT_DIR: u8 = 4;  // Directory
+    
+    // Linux dirent64 header size (without struct padding): d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) = 19
+    // Note: size_of::<Dirent64>() is 24 due to alignment padding, but Linux expects 19
+    const DIRENT64_HEADER_SIZE: usize = 19;
 
     let mut written = 0usize;
     let mut entries_returned = 0usize;
@@ -1936,7 +1940,7 @@ fn sys_getdents64(fd: u32, buf_ptr: u64, buf_size: usize) -> u64 {
 
     for (i, entry) in entries.iter().skip(skip_count).enumerate() {
         let name_bytes = entry.name.as_bytes();
-        let record_len = core::mem::size_of::<Dirent64>() + name_bytes.len() + 1;
+        let record_len = DIRENT64_HEADER_SIZE + name_bytes.len() + 1;
         // Align to 8 bytes
         let aligned_len = (record_len + 7) & !7;
 
@@ -1953,8 +1957,8 @@ fn sys_getdents64(fd: u32, buf_ptr: u64, buf_size: usize) -> u64 {
             (*dirent_ptr).d_reclen = aligned_len as u16;
             (*dirent_ptr).d_type = d_type;
 
-            // Copy name after the header
-            let name_ptr = buf.add(written + core::mem::size_of::<Dirent64>());
+            // Copy name after the header (at offset 19, not size_of which includes padding)
+            let name_ptr = buf.add(written + DIRENT64_HEADER_SIZE);
             core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, name_bytes.len());
             *name_ptr.add(name_bytes.len()) = 0; // Null terminator
         }
