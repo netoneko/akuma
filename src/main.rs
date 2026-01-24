@@ -24,6 +24,7 @@ mod executor;
 mod fs;
 mod fs_tests;
 mod gic;
+mod herd;
 mod irq;
 mod mmu;
 mod netcat_server;
@@ -745,6 +746,7 @@ fn run_async_main() -> ! {
     // let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
 
     let mut mem_monitor_pinned = pin!(memory_monitor());
+    let mut herd_pinned = pin!(herd::herd_supervisor());
 
     // Enable IRQs for the main async loop
     // The boot thread (thread 0) starts with all exceptions masked.
@@ -832,7 +834,10 @@ fn run_async_main() -> ! {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
 
+        // Poll herd process supervisor
         POLL_STEP.store(9, Ordering::Relaxed);
+        let _ = herd_pinned.as_mut().poll(&mut cx);
+
         // Process pending IRQ work
         executor::process_irq_work();
 
@@ -846,15 +851,15 @@ fn run_async_main() -> ! {
         // Same rationale as SSH buffers - must happen after network poll.
         socket::process_buffer_cleanup();
 
-        POLL_STEP.store(10, Ordering::Relaxed);
+        POLL_STEP.store(11, Ordering::Relaxed);
         // Poll the executor for any other tasks
         executor::run_once();
 
-        POLL_STEP.store(11, Ordering::Relaxed);
+        POLL_STEP.store(12, Ordering::Relaxed);
         // Re-enable preemption - safe now that all RefCell borrows are released
         threading::enable_preemption();
         
-        POLL_STEP.store(12, Ordering::Relaxed);
+        POLL_STEP.store(13, Ordering::Relaxed);
         
         // Periodic stack canary check (every ~1000 iterations to reduce overhead)
         static CANARY_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -872,7 +877,7 @@ fn run_async_main() -> ! {
             }
         }
 
-        POLL_STEP.store(13, Ordering::Relaxed);
+        POLL_STEP.store(14, Ordering::Relaxed);
         // Yield to other threads (cooperative multitasking)
         threading::yield_now();
         

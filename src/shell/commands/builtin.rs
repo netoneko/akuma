@@ -4,7 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -899,3 +899,334 @@ impl Command for KillCommand {
 
 /// Static instance
 pub static KILL_CMD: KillCommand = KillCommand;
+
+// ============================================================================
+// Herd Command
+// ============================================================================
+
+/// Herd command - process supervisor management
+pub struct HerdCommand;
+
+impl Command for HerdCommand {
+    fn name(&self) -> &'static str {
+        "herd"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["service"]
+    }
+    fn description(&self) -> &'static str {
+        "Process supervisor management"
+    }
+    fn usage(&self) -> &'static str {
+        "herd <status|config|run|stop|restart|enable|disable|log> [service]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            use crate::herd;
+
+            // Check if herd is initialized
+            if !herd::is_initialized() {
+                let _ = stdout.write(b"Error: Herd supervisor not initialized\r\n").await;
+                return Err(ShellError::ExecutionFailed("herd not initialized"));
+            }
+
+            // Parse arguments
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+            let mut parts = args_str.split_whitespace();
+            let subcommand = parts.next().unwrap_or("status");
+            let service_name = parts.next();
+
+            match subcommand {
+                "status" => {
+                    // List all services and their status
+                    let services = herd::list_services();
+                    if services.is_empty() {
+                        let _ = stdout.write(b"No services configured.\r\n").await;
+                        let _ = stdout.write(b"Add config files to /etc/herd/enabled/\r\n").await;
+                    } else {
+                        let _ = stdout.write(b"SERVICE          STATE        EXIT\r\n").await;
+                        let _ = stdout.write(b"-----------------------------------\r\n").await;
+                        for (name, state, exit_code) in services {
+                            let exit_str = match exit_code {
+                                Some(code) => format!("{}", code),
+                                None => "-".to_string(),
+                            };
+                            let line = format!(
+                                "{:<16} {:<12} {}\r\n",
+                                name,
+                                state.as_str(),
+                                exit_str
+                            );
+                            let _ = stdout.write(line.as_bytes()).await;
+                        }
+                    }
+                    Ok(())
+                }
+
+                "config" => {
+                    // Show config for a specific service
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd config <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    match herd::get_service_info(name) {
+                        Some(info) => {
+                            let args_str = info.config.args.join(" ");
+                            let output = format!(
+                                "Service: {}\r\n\
+                                 State: {}\r\n\
+                                 \r\n\
+                                 Configuration:\r\n\
+                                   command: {}\r\n\
+                                   args: {}\r\n\
+                                   restart_delay: {}ms\r\n\
+                                   max_retries: {}\r\n\
+                                 \r\n\
+                                 Runtime:\r\n\
+                                   thread_id: {}\r\n\
+                                   restart_count: {}\r\n\
+                                   last_exit_code: {}\r\n",
+                                info.name,
+                                info.state.as_str(),
+                                info.config.command,
+                                if args_str.is_empty() { "(none)" } else { &args_str },
+                                info.config.restart_delay_ms,
+                                if info.config.max_retries == 0 { "unlimited".to_string() } else { info.config.max_retries.to_string() },
+                                info.thread_id.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
+                                info.restart_count,
+                                info.last_exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                            );
+                            let _ = stdout.write(output.as_bytes()).await;
+                            Ok(())
+                        }
+                        None => {
+                            let msg = format!("Service '{}' not found\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed("service not found"))
+                        }
+                    }
+                }
+
+                "run" | "start" => {
+                    // Start a service
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd run <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    match herd::request_start(name) {
+                        Ok(()) => {
+                            let msg = format!("Starting service '{}'\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to start '{}': {}\r\n", name, e);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed(e))
+                        }
+                    }
+                }
+
+                "stop" => {
+                    // Stop a service
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd stop <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    match herd::request_stop(name) {
+                        Ok(()) => {
+                            let msg = format!("Stopping service '{}'\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to stop '{}': {}\r\n", name, e);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed(e))
+                        }
+                    }
+                }
+
+                "restart" => {
+                    // Restart a service (stop then start)
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd restart <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    // Stop first (ignore error if already stopped)
+                    let _ = herd::request_stop(name);
+                    
+                    // Brief delay for cleanup
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+
+                    // Then start
+                    match herd::request_start(name) {
+                        Ok(()) => {
+                            let msg = format!("Restarting service '{}'\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to restart '{}': {}\r\n", name, e);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed(e))
+                        }
+                    }
+                }
+
+                "enable" => {
+                    // Enable a service (copy from available to enabled)
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd enable <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    let src_path = format!("/etc/herd/available/{}.conf", name);
+                    let dst_path = format!("/etc/herd/enabled/{}.conf", name);
+
+                    // Read from available
+                    match crate::async_fs::read_file(&src_path).await {
+                        Ok(data) => {
+                            // Write to enabled
+                            match crate::async_fs::write_file(&dst_path, &data).await {
+                                Ok(()) => {
+                                    let msg = format!("Enabled service '{}'\r\n", name);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                    let _ = stdout.write(b"Config will be loaded on next reload (within 20s)\r\n").await;
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    let msg = format!("Failed to write enabled config: {:?}\r\n", e);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                    Err(ShellError::ExecutionFailed("write failed"))
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let msg = format!("Service '{}' not found in /etc/herd/available/\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed("service not found"))
+                        }
+                    }
+                }
+
+                "disable" => {
+                    // Disable a service (remove from enabled)
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd disable <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    let config_path = format!("/etc/herd/enabled/{}.conf", name);
+
+                    match crate::async_fs::remove_file(&config_path).await {
+                        Ok(()) => {
+                            let msg = format!("Disabled service '{}'\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            let _ = stdout.write(b"Service will be removed on next reload (within 20s)\r\n").await;
+                            let _ = stdout.write(b"Use 'herd stop' to stop a running service immediately\r\n").await;
+                            Ok(())
+                        }
+                        Err(_) => {
+                            let msg = format!("Service '{}' is not enabled\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Err(ShellError::ExecutionFailed("service not enabled"))
+                        }
+                    }
+                }
+
+                "log" => {
+                    // Show log for a service
+                    let name = match service_name {
+                        Some(n) => n,
+                        None => {
+                            let _ = stdout.write(b"Usage: herd log <service>\r\n").await;
+                            return Err(ShellError::ExecutionFailed("missing service name"));
+                        }
+                    };
+
+                    let log_path = format!("/var/log/herd/{}.log", name);
+
+                    match crate::async_fs::read_file(&log_path).await {
+                        Ok(data) => {
+                            if data.is_empty() {
+                                let _ = stdout.write(b"(log is empty)\r\n").await;
+                            } else {
+                                // Show last 4KB of log
+                                let start = if data.len() > 4096 { data.len() - 4096 } else { 0 };
+                                if start > 0 {
+                                    let _ = stdout.write(b"... (truncated) ...\r\n").await;
+                                }
+                                // Convert \n to \r\n for terminal
+                                for &byte in &data[start..] {
+                                    if byte == b'\n' {
+                                        let _ = stdout.write(b"\r\n").await;
+                                    } else {
+                                        let _ = stdout.write(&[byte]).await;
+                                    }
+                                }
+                                // Ensure we end with newline
+                                if !data.ends_with(&[b'\n']) {
+                                    let _ = stdout.write(b"\r\n").await;
+                                }
+                            }
+                            Ok(())
+                        }
+                        Err(_) => {
+                            let msg = format!("No log file for '{}'\r\n", name);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                            Ok(()) // Not an error, just no log yet
+                        }
+                    }
+                }
+
+                _ => {
+                    let _ = stdout.write(b"Usage: herd <status|config|run|stop|restart|enable|disable|log> [service]\r\n").await;
+                    let _ = stdout.write(b"\r\n").await;
+                    let _ = stdout.write(b"Commands:\r\n").await;
+                    let _ = stdout.write(b"  status           List all services and their state\r\n").await;
+                    let _ = stdout.write(b"  config <name>    Show config for a service\r\n").await;
+                    let _ = stdout.write(b"  run <name>       Start a service\r\n").await;
+                    let _ = stdout.write(b"  stop <name>      Stop a running service\r\n").await;
+                    let _ = stdout.write(b"  restart <name>   Restart a service\r\n").await;
+                    let _ = stdout.write(b"  enable <name>    Enable service for auto-start\r\n").await;
+                    let _ = stdout.write(b"  disable <name>   Disable service auto-start\r\n").await;
+                    let _ = stdout.write(b"  log <name>       Show service log\r\n").await;
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
+/// Static instance
+pub static HERD_CMD: HerdCommand = HerdCommand;

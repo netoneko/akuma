@@ -487,6 +487,22 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
     })
 }
 
+/// Find a process PID by thread ID
+///
+/// Returns the PID of the process running on the given thread, if any.
+pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
+    crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        for (&pid, &ProcessPtr(ptr)) in table.iter() {
+            let proc = unsafe { &*ptr };
+            if proc.thread_id == Some(thread_id) {
+                return Some(pid);
+            }
+        }
+        None
+    })
+}
+
 /// Process state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
