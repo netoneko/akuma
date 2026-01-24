@@ -612,19 +612,28 @@ pub fn alloc_socket_with_handle(
     tcp_socket: TcpSocket<'static>,
     state: SocketState,
 ) -> usize {
+    crate::console::print("[alloc_socket_with_handle] Creating KernelSocket\n");
+    
+    let handle = SocketHandle::with_socket(tcp_socket);
+    crate::console::print("[alloc_socket_with_handle] Created SocketHandle\n");
+    
     let socket = KernelSocket {
         state,
         buffer_slot,
         ref_count: AtomicU32::new(1),
         socket_type,
         is_listener: false,
-        handle: SocketHandle::with_socket(tcp_socket),
+        handle,
     };
+    crate::console::print("[alloc_socket_with_handle] Created KernelSocket struct\n");
     
     let idx = NEXT_SOCKET_IDX.fetch_add(1, Ordering::SeqCst);
+    crate::safe_print!(48, "[alloc_socket_with_handle] idx={}\n", idx);
     
     crate::irq::with_irqs_disabled(|| {
+        crate::console::print("[alloc_socket_with_handle] Inserting into table\n");
         SOCKET_TABLE.lock().insert(idx, socket);
+        crate::console::print("[alloc_socket_with_handle] Inserted\n");
     });
     
     idx

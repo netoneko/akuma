@@ -47,15 +47,29 @@ impl Error {
         let (kind, msg) = match errno {
             2 => (ErrorKind::NotFound, "No such file or directory"),
             4 => (ErrorKind::Interrupted, "Interrupted"),
+            5 => (ErrorKind::Other, "I/O error"),
             9 => (ErrorKind::InvalidInput, "Bad file descriptor"),
             11 => (ErrorKind::WouldBlock, "Would block"),
+            12 => (ErrorKind::Other, "Out of memory"),
             22 => (ErrorKind::InvalidInput, "Invalid argument"),
             98 => (ErrorKind::AddrInUse, "Address in use"),
+            100 => (ErrorKind::Other, "Network is down"),
+            106 => (ErrorKind::Other, "Already connected"),
             107 => (ErrorKind::NotConnected, "Not connected"),
+            110 => (ErrorKind::TimedOut, "Connection timed out"),
             111 => (ErrorKind::ConnectionRefused, "Connection refused"),
             113 => (ErrorKind::Other, "Host unreachable"),
             _ => (ErrorKind::Other, "Unknown error"),
         };
+        // For unknown errors, include the errno in the message for debugging
+        if errno != 2 && errno != 4 && errno != 5 && errno != 9 && errno != 11 && 
+           errno != 12 && errno != 22 && errno != 98 && errno != 100 && errno != 106 &&
+           errno != 107 && errno != 110 && errno != 111 && errno != 113 {
+            return Self {
+                kind: ErrorKind::Other,
+                message: alloc::format!("Unknown error (errno={})", errno),
+            };
+        }
         Self::new(kind, msg)
     }
 

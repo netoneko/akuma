@@ -525,22 +525,32 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     
     let socket_idx = match get_socket_from_fd(fd) {
         Some(idx) => idx,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => {
+            crate::console::print("[accept] EBADF: fd not found\n");
+            return (-libc_errno::EBADF as i64) as u64;
+        }
     };
 
     // Verify socket is listening and get local address
     let state = match socket::get_socket_state(socket_idx) {
         Some(s) => s,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => {
+            crate::console::print("[accept] EBADF: socket state not found\n");
+            return (-libc_errno::EBADF as i64) as u64;
+        }
     };
 
     let local_addr = match state {
         socket::SocketState::Listening { local_addr, .. } => local_addr,
-        _ => return (-libc_errno::EINVAL as i64) as u64,
+        _ => {
+            crate::console::print("[accept] EINVAL: socket not listening\n");
+            return (-libc_errno::EINVAL as i64) as u64;
+        }
     };
 
     // Increment ref count on listening socket to prevent close during accept
     if socket::socket_inc_ref(socket_idx).is_none() {
+        crate::console::print("[accept] EBADF: inc_ref failed\n");
         return (-libc_errno::EBADF as i64) as u64;
     }
 
@@ -548,6 +558,7 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let stack = match crate::async_net::get_global_stack() {
         Some(s) => s,
         None => {
+            crate::console::print("[accept] ENETDOWN: no global stack\n");
             socket::socket_dec_ref(socket_idx);
             return (-libc_errno::ENETDOWN as i64) as u64;
         }
@@ -557,6 +568,7 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let new_slot = match socket::alloc_buffer_slot() {
         Some(s) => s,
         None => {
+            crate::console::print("[accept] ENOMEM: no buffer slots\n");
             socket::socket_dec_ref(socket_idx);
             return (-libc_errno::ENOMEM as i64) as u64;
         }
@@ -565,25 +577,13 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     // Get buffers for the new socket
     let (rx_buf, tx_buf) = unsafe { socket::get_buffers(new_slot) };
 
-    // Create the accept future
-    // This creates a NEW TcpSocket that will be bound to the accepted connection
-    let accept_future = async {
-        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(60)));
-        match socket.accept(local_addr.port).await {
-            Ok(()) => {
-                let remote = socket.remote_endpoint();
-                Ok((socket, remote))
-            }
-            Err(_) => Err(embassy_net::tcp::Error::ConnectionReset),
-        }
-    };
+    crate::safe_print!(64, "[accept] Waiting on port {} (slot {})\n", local_addr.port, new_slot);
 
-    // Block on the accept - this yields to scheduler, allowing thread 0 to poll network
-    let (tcp_socket, remote_ep) = match block_on_socket(accept_future) {
+    // Use block_on_accept which handles socket creation and ownership internally
+    let (tcp_socket, remote_ep) = match block_on_accept(stack, rx_buf, tx_buf, local_addr.port) {
         Ok(v) => v,
         Err(e) => {
-            // CRITICAL: Free the buffer slot on error to prevent leak
+            crate::safe_print!(48, "[accept] failed: errno={}\n", e);
             socket::free_buffer_slot(new_slot);
             socket::socket_dec_ref(socket_idx);
             return (-e as i64) as u64;
@@ -599,6 +599,12 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
     };
 
+    crate::console::print("[accept] Got remote addr\n");
+    crate::safe_print!(80, "[accept] ip={}.{}.{}.{} port={}\n", 
+        remote_addr.ip[0], remote_addr.ip[1], remote_addr.ip[2], remote_addr.ip[3], remote_addr.port);
+
+    crate::console::print("[accept] Storing socket handle...\n");
+    
     // Create new socket entry with the connected TcpSocket
     let new_socket_idx = socket::alloc_socket_with_handle(
         socket::socket_const::SOCK_STREAM,
@@ -606,6 +612,8 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         tcp_socket,
         socket::SocketState::Connected { local_addr, remote_addr },
     );
+
+    crate::safe_print!(48, "[accept] Socket idx={}\n", new_socket_idx);
 
     // Allocate FD for new socket
     let proc = match crate::process::current_process() {
@@ -619,6 +627,8 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 
     let new_fd = proc.alloc_fd(FileDescriptor::Socket(new_socket_idx));
 
+    crate::safe_print!(48, "[accept] Allocated fd={}\n", new_fd);
+
     // Write remote address to user if requested
     if addr_ptr != 0 && addr_len_ptr != 0 {
         let sockaddr = socket::SockAddrIn::from_addr(&remote_addr);
@@ -628,6 +638,7 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         }
     }
 
+    crate::console::print("[accept] Done!\n");
     new_fd as u64
 }
 
@@ -690,21 +701,8 @@ fn sys_connect(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
     // Get buffers
     let (rx_buf, tx_buf) = unsafe { socket::get_buffers(buffer_slot) };
 
-    // Create the connect future
-    let connect_future = async {
-        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(30)));
-        match socket.connect(remote_addr.to_endpoint()).await {
-            Ok(()) => {
-                let local = socket.local_endpoint();
-                Ok((socket, local))
-            }
-            Err(_) => Err(embassy_net::tcp::Error::ConnectionReset),
-        }
-    };
-
-    // Block on the connect
-    let (tcp_socket, local_ep) = match block_on_socket(connect_future) {
+    // Block on connect
+    let (tcp_socket, local_ep) = match block_on_connect(stack, rx_buf, tx_buf, remote_addr.to_endpoint()) {
         Ok(v) => v,
         Err(e) => {
             socket::socket_dec_ref(socket_idx);
@@ -1406,6 +1404,195 @@ where
             Poll::Pending => {
                 iterations += 1;
                 if iterations >= MAX_ITERATIONS {
+                    return Err(libc_errno::ETIMEDOUT);
+                }
+                crate::threading::yield_now();
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Block on TCP accept - creates socket and waits for connection
+///
+/// This is a specialized blocking helper for accept that handles the
+/// TcpSocket lifetime properly. The socket is created inside and returned
+/// on success.
+///
+/// SAFETY: We use UnsafeCell to work around the borrow checker because:
+/// 1. The accept future borrows the socket mutably
+/// 2. We need to access the socket after the future completes
+/// 3. We carefully manage the lifetime - socket is only accessed when future is done
+fn block_on_accept(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &'static mut [u8],
+    tx_buf: &'static mut [u8],
+    port: u16,
+) -> Result<(embassy_net::tcp::TcpSocket<'static>, Option<embassy_net::IpEndpoint>), i32> {
+    use core::cell::UnsafeCell;
+    use embassy_net::tcp::TcpSocket;
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    // Create socket with preemption disabled
+    crate::threading::disable_preemption();
+    let socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    crate::threading::enable_preemption();
+
+    // Use UnsafeCell to allow mutable access to socket for both future and timeout
+    let socket_cell = UnsafeCell::new(socket);
+
+    let mut iterations = 0usize;
+    // Longer timeout for accept - we want to wait indefinitely for connections
+    // Each iteration is ~1ms, so 10_000_000 is ~2.7 hours
+    // The embassy socket timeout (60s) will handle actual network timeouts
+    const MAX_ITERATIONS: usize = 10_000_000;
+
+    // Create the accept future using unsafe to get mutable reference
+    // SAFETY: We have exclusive access to socket_cell
+    let socket_ref = unsafe { &mut *socket_cell.get() };
+    
+    // No timeout for listener - we want to wait indefinitely for connections
+    crate::threading::disable_preemption();
+    socket_ref.set_timeout(None);
+    crate::threading::enable_preemption();
+    
+    let mut accept_fut = socket_ref.accept(port);
+    let mut accept_fut = unsafe { Pin::new_unchecked(&mut accept_fut) };
+
+    loop {
+        // Check for interrupt
+        if crate::process::is_current_interrupted() {
+            // Drop the future first to release borrow, then abort socket
+            drop(accept_fut);
+            let socket = unsafe { socket_cell.into_inner() };
+            // Note: can't abort a moved socket easily, just drop it
+            drop(socket);
+            return Err(libc_errno::EINTR);
+        }
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll with preemption disabled
+        crate::threading::disable_preemption();
+        let result = accept_fut.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match result {
+            Poll::Ready(Ok(())) => {
+                // Success! Future is consumed, borrow ends
+                // Now we can safely access socket
+                let socket = unsafe { socket_cell.into_inner() };
+                crate::threading::disable_preemption();
+                let remote = socket.remote_endpoint();
+                crate::threading::enable_preemption();
+                return Ok((socket, remote));
+            }
+            Poll::Ready(Err(e)) => {
+                crate::safe_print!(64, "[block_on_accept] embassy error: {:?}\n", e);
+                // Future is consumed, borrow ends
+                let socket = unsafe { socket_cell.into_inner() };
+                drop(socket);
+                return Err(libc_errno::ECONNREFUSED);
+            }
+            Poll::Pending => {
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    // Drop future first to release borrow
+                    drop(accept_fut);
+                    let socket = unsafe { socket_cell.into_inner() };
+                    drop(socket);
+                    return Err(libc_errno::ETIMEDOUT);
+                }
+                crate::threading::yield_now();
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Block on TCP connect - creates socket and connects to remote endpoint
+fn block_on_connect(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &'static mut [u8],
+    tx_buf: &'static mut [u8],
+    endpoint: embassy_net::IpEndpoint,
+) -> Result<(embassy_net::tcp::TcpSocket<'static>, Option<embassy_net::IpEndpoint>), i32> {
+    use core::cell::UnsafeCell;
+    use embassy_net::tcp::TcpSocket;
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    // Create socket with preemption disabled
+    crate::threading::disable_preemption();
+    let socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    crate::threading::enable_preemption();
+
+    let socket_cell = UnsafeCell::new(socket);
+
+    let mut iterations = 0usize;
+    const MAX_ITERATIONS: usize = 100_000;
+
+    // Get mutable reference for connect
+    let socket_ref = unsafe { &mut *socket_cell.get() };
+    
+    crate::threading::disable_preemption();
+    socket_ref.set_timeout(Some(embassy_time::Duration::from_secs(30)));
+    crate::threading::enable_preemption();
+    
+    let mut connect_fut = socket_ref.connect(endpoint);
+    let mut connect_fut = unsafe { Pin::new_unchecked(&mut connect_fut) };
+
+    loop {
+        if crate::process::is_current_interrupted() {
+            drop(connect_fut);
+            let socket = unsafe { socket_cell.into_inner() };
+            drop(socket);
+            return Err(libc_errno::EINTR);
+        }
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+
+        crate::threading::disable_preemption();
+        let result = connect_fut.as_mut().poll(&mut cx);
+        crate::threading::enable_preemption();
+
+        match result {
+            Poll::Ready(Ok(())) => {
+                let socket = unsafe { socket_cell.into_inner() };
+                crate::threading::disable_preemption();
+                let local = socket.local_endpoint();
+                crate::threading::enable_preemption();
+                return Ok((socket, local));
+            }
+            Poll::Ready(Err(e)) => {
+                crate::safe_print!(64, "[block_on_connect] embassy error: {:?}\n", e);
+                let socket = unsafe { socket_cell.into_inner() };
+                drop(socket);
+                return Err(libc_errno::ECONNREFUSED);
+            }
+            Poll::Pending => {
+                iterations += 1;
+                if iterations >= MAX_ITERATIONS {
+                    drop(connect_fut);
+                    let socket = unsafe { socket_cell.into_inner() };
+                    drop(socket);
                     return Err(libc_errno::ETIMEDOUT);
                 }
                 crate::threading::yield_now();
