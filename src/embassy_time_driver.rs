@@ -1,7 +1,8 @@
 //! Embassy time driver implementation for ARM Generic Timer
 //!
 //! This bridges the ARM timer hardware to Embassy's async timing primitives.
-//! Uses the physical timer counter (CNTPCT_EL0) as the time source.
+//! Uses the VIRTUAL timer (CNTV) to avoid conflict with the scheduler which uses
+//! the physical timer (CNTP) for preemptive scheduling.
 
 use core::arch::asm;
 use core::cell::RefCell;
@@ -48,12 +49,13 @@ impl EmbassyTimeDriver {
 /// Global driver instance - used by the embassy_time_driver macro
 embassy_time_driver::time_driver_impl!(static DRIVER: EmbassyTimeDriver = EmbassyTimeDriver::new());
 
-/// Read the ARM physical timer counter
+/// Read the ARM virtual timer counter
+/// Uses CNTVCT to match the virtual timer compare register (CNTV_CVAL)
 #[inline]
 fn read_counter() -> u64 {
     let counter: u64;
     unsafe {
-        asm!("mrs {}, cntpct_el0", out(reg) counter);
+        asm!("mrs {}, cntvct_el0", out(reg) counter);
     }
     counter
 }
@@ -146,12 +148,27 @@ impl EmbassyTimeDriver {
         }
 
         if earliest != u64::MAX {
-            // Set hardware timer compare value
+            // Set virtual timer compare value (CNTV to avoid conflict with scheduler's CNTP)
             let counter_target = ticks_to_counter(earliest);
+            let current = read_counter();
+            
+            // Debug: Log when setting virtual timer
+            static SET_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let count = SET_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 5 {
+                crate::safe_print!(192, "[EMBASSY] Setting CNTV: target={} cur={} diff={}\n",
+                    counter_target, current, counter_target.saturating_sub(current));
+            }
+            
             unsafe {
-                asm!("msr cntp_cval_el0, {}", in(reg) counter_target);
-                // Make sure timer is enabled
-                asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+                asm!("msr cntv_cval_el0, {}", in(reg) counter_target);
+                // Make sure virtual timer is enabled
+                asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
+            }
+        } else {
+            // No pending alarms - disable the virtual timer to stop interrupts
+            unsafe {
+                asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
             }
         }
     }
@@ -205,9 +222,11 @@ pub fn on_timer_interrupt() {
 /// Call this early in boot, before using any Embassy async functionality
 pub fn init() {
     // The driver is statically initialized, but we can do any runtime setup here
-    // Make sure the physical timer is disabled initially
+    // Initialize the virtual timer (used by embassy) - will be enabled when alarms are set
+    // Note: We use CNTV (virtual timer) to avoid conflict with CNTP (physical timer)
+    // which is used by the scheduler for preemptive scheduling.
     unsafe {
-        asm!("msr cntp_ctl_el0, {}", in(reg) 0u64);
+        asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
     }
 }
 

@@ -38,10 +38,15 @@ pub fn enable_timer_interrupts(interval_us: u64) {
 
     let freq = read_frequency();
     let ticks = (freq * interval_us) / 1_000_000;
+    let counter = read_counter();
+    let new_cval = counter + ticks;
+
+    crate::safe_print!(192, "[TIMER-INIT] freq={} int_us={} ticks={} cnt={} cval={}\n",
+        freq, interval_us, ticks, counter, new_cval);
 
     unsafe {
         // Set the timer compare value
-        asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + ticks);
+        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
 
         // Enable the timer (bit 0 = enable, bit 1 = !mask)
         asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
@@ -50,13 +55,34 @@ pub fn enable_timer_interrupts(interval_us: u64) {
 
 // Timer interrupt handler - called from IRQ handler
 pub fn timer_irq_handler(_irq: u32) {
+    // Debug: track timer handler entry
+    static TIMER_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let count = TIMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::threading::current_thread_id();
+    // Always print for user threads, or every 500th call
+    if tid >= crate::config::RESERVED_THREADS || count % 500 == 0 {
+        crate::console::print("[TIMER] tid=");
+        crate::console::print_dec(tid);
+        crate::console::print(" count=");
+        crate::console::print_u64(count);
+        crate::console::print("\n");
+    }
+
     // Acknowledge interrupt by setting next compare value
     let freq = read_frequency();
     let interval_us = TIMER_INTERVAL_US.load(Ordering::Relaxed);
     let interval_ticks = (freq * interval_us) / 1_000_000;
+    let counter = read_counter();
+    let new_cval = counter + interval_ticks;
+
+    // Debug: log timer values for first 5 calls and every 500th after
+    if count < 5 || count % 500 == 0 {
+        crate::safe_print!(192, "[TIMER-DBG] freq={} int_us={} ticks={} cnt={} new_cval={}\n",
+            freq, interval_us, interval_ticks, counter, new_cval);
+    }
 
     unsafe {
-        asm!("msr cntp_cval_el0, {}", in(reg) read_counter() + interval_ticks);
+        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
     }
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long

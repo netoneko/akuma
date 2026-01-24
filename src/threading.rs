@@ -136,6 +136,19 @@ fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
     if idx < config::MAX_THREADS {
         WAKE_TIMES[idx].store(wake_time_us, Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::WAITING, Ordering::SeqCst);
+        // Debug: log when user threads (8+) go to sleep
+        if idx >= config::RESERVED_THREADS {
+            let now = crate::timer::uptime_us();
+            crate::safe_print!(64, "[SCHED] Thread ");
+            crate::safe_print!(64, "{}", idx);
+            crate::safe_print!(64, " WAITING until ");
+            crate::safe_print!(64, "{}", wake_time_us);
+            crate::safe_print!(64, " (now=");
+            crate::safe_print!(64, "{}", now);
+            crate::safe_print!(64, ", sleep_ms=");
+            crate::safe_print!(64, "{}", (wake_time_us - now) / 1000);
+            crate::safe_print!(64, ")\n");
+        }
     }
 }
 
@@ -1372,6 +1385,18 @@ impl ThreadPool {
         let current_idx = get_current_thread_register();
         let current = &self.slots[current_idx];
 
+        // Debug: Track scheduler calls for user threads
+        static SCHED_CALL_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let call_count = SCHED_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Print every 1000 calls to avoid spam, or always for user threads
+        if current_idx >= config::RESERVED_THREADS || call_count % 1000 == 0 {
+            let t8_state = THREAD_STATES[8].load(Ordering::Relaxed);
+            let t8_wake = WAKE_TIMES[8].load(Ordering::Relaxed);
+            let now = crate::timer::uptime_us();
+            crate::safe_print!(128, "[SCHED-DBG] call={} cur={} vol={} t8_state={} t8_wake={} now={}\n",
+                call_count, current_idx, voluntary as u8, t8_state, t8_wake, now);
+        }
+
         // For timer-triggered preemption, first check if preemption is explicitly disabled.
         if !voluntary && is_preemption_disabled() {
             return None;
@@ -1424,6 +1449,16 @@ impl ThreadPool {
                     WAKE_TIMES[i].store(0, Ordering::SeqCst);
                     THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
                     woke_any = true;
+                    // Debug: log when user threads (8+) are woken
+                    if i >= config::RESERVED_THREADS {
+                        crate::console::print("[SCHED] Woke thread ");
+                        crate::console::print_dec(i);
+                        crate::console::print(" now=");
+                        crate::console::print_u64(now);
+                        crate::console::print(" wake=");
+                        crate::console::print_u64(wake_time);
+                        crate::console::print("\n");
+                    }
                 }
             }
         }
@@ -1982,10 +2017,39 @@ pub fn schedule_blocking(wake_time_us: u64) {
     
     // Wait for timer to preempt us and for scheduler to wake us
     // WFI halts CPU until interrupt
+    let mut wfi_loops = 0u64;
+    
+    // Debug: Check IRQ status before entering WFI loop
+    if tid >= config::RESERVED_THREADS {
+        let daif: u64;
+        let vbar: u64;
+        let cntp_ctl: u64;
+        let cntp_cval: u64;
+        let cntpct: u64;
+        unsafe { 
+            core::arch::asm!("mrs {}, daif", out(reg) daif);
+            core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
+            core::arch::asm!("mrs {}, cntp_ctl_el0", out(reg) cntp_ctl);
+            core::arch::asm!("mrs {}, cntp_cval_el0", out(reg) cntp_cval);
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cntpct);
+        }
+        let irq_enabled = (daif & 0x80) == 0;
+        let timer_enabled = (cntp_ctl & 1) != 0;
+        let timer_masked = (cntp_ctl & 2) != 0;
+        crate::safe_print!(192, "[WFI-ENTER] tid={} irq={} daif={:#x} vbar={:#x}\n", 
+            tid, irq_enabled as u8, daif, vbar);
+        crate::safe_print!(192, "[WFI-TIMER] enabled={} masked={} cval={} cnt={} diff={}\n",
+            timer_enabled as u8, timer_masked as u8, cntp_cval, cntpct, 
+            cntp_cval.saturating_sub(cntpct));
+    }
+    
     loop {
         let state = THREAD_STATES[tid].load(Ordering::SeqCst);
         if state != thread_state::WAITING {
             // Scheduler woke us - we're now READY or RUNNING
+            if tid >= config::RESERVED_THREADS {
+                crate::safe_print!(64, "[SCHED] Thread {} woke after {} WFI loops\n", tid, wfi_loops);
+            }
             return;
         }
         
@@ -1995,10 +2059,18 @@ pub fn schedule_blocking(wake_time_us: u64) {
             return;
         }
         
+        wfi_loops += 1;
+        
         // Wait for interrupt - timer IRQ will fire within 10ms
         // When preempted, scheduler sees WAITING and switches away
         // When wake_time passes and we're scheduled back, state != WAITING
         unsafe { core::arch::asm!("wfi"); }
+        
+        // Debug: print IMMEDIATELY after WFI returns for user threads (first few times)
+        if tid >= config::RESERVED_THREADS && wfi_loops <= 3 {
+            let now = crate::timer::uptime_us();
+            crate::safe_print!(96, "[WFI-WAKE] tid={} loop={} now={}\n", tid, wfi_loops, now);
+        }
     }
 }
 

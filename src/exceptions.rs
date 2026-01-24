@@ -654,8 +654,35 @@ extern "C" fn rust_default_exception_handler() {
 /// The assembly does the actual SP switch AFTER this returns.
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+    // Debug: track IRQ handler entry
+    static IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static LAST_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let count = IRQ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::threading::current_thread_id();
+    let last_tid = LAST_TID.swap(tid, core::sync::atomic::Ordering::Relaxed);
+    
+    // ALWAYS print for user threads, or every 500th, or on tid change
+    if tid >= crate::config::RESERVED_THREADS || count % 500 == 0 || tid != last_tid {
+        crate::safe_print!(64, "[IRQ] tid=");
+        crate::safe_print!(64, "{}", tid);
+        crate::safe_print!(64, " count=");
+        crate::safe_print!(64, "{}", count);
+        crate::safe_print!(64, "\n");
+    }
+    
     // Acknowledge the interrupt and get IRQ number
-    if let Some(irq) = crate::gic::acknowledge_irq() {
+    let irq_opt = crate::gic::acknowledge_irq();
+    // Debug for user threads
+    if tid >= crate::config::RESERVED_THREADS {
+        crate::safe_print!(64, "[IRQ-ACK] irq=");
+        match irq_opt {
+            Some(i) => crate::safe_print!(64, "{}", i as usize),
+            None => crate::safe_print!(64, "None"),
+        }
+        crate::safe_print!(64, "\n");
+    }
+    
+    if let Some(irq) = irq_opt {
         // Special handling for scheduler SGI
         if irq == crate::gic::SGI_SCHEDULER {
             // Returns new SP if switch needed, or 0 if not

@@ -861,18 +861,19 @@ impl Process {
         unsafe {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
             
-            // Convert args to &str slices for ProcessInfo::with_args
-            let arg_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+            // Build full argv with program name as argv[0] (Unix convention)
+            // self.args contains only the extra arguments, not argv[0]
+            let mut full_args: Vec<&str> = Vec::with_capacity(self.args.len() + 1);
+            full_args.push(self.name.as_str());  // argv[0] = program name/path
+            for arg in &self.args {
+                full_args.push(arg.as_str());
+            }
             
-            let info = if arg_refs.is_empty() {
-                ProcessInfo::new(self.pid, self.parent_pid)
-            } else {
-                ProcessInfo::with_args(self.pid, self.parent_pid, &arg_refs)
-                    .unwrap_or_else(|| {
-                        console::print("[Process] Warning: args too large, truncating\n");
-                        ProcessInfo::new(self.pid, self.parent_pid)
-                    })
-            };
+            let info = ProcessInfo::with_args(self.pid, self.parent_pid, &full_args)
+                .unwrap_or_else(|| {
+                    console::print("[Process] Warning: args too large, truncating\n");
+                    ProcessInfo::new(self.pid, self.parent_pid)
+                });
             
             core::ptr::write(info_ptr, info);
         }

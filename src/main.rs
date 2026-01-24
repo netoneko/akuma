@@ -435,6 +435,22 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     console::print("Registering timer IRQ...\n");
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
+    
+    // Register virtual timer IRQ (27) for Embassy async wakeups
+    // Embassy uses CNTV (virtual timer) to avoid conflict with scheduler's CNTP
+    irq::register_handler(27, |_irq| {
+        static VIRT_TIMER_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let count = VIRT_TIMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count < 10 || count % 100 == 0 {
+            console::print("[VIRT-TIMER] IRQ 27 fired, count=");
+            console::print_u64(count);
+            console::print("\n");
+        }
+        // Check embassy alarms when virtual timer fires
+        embassy_time_driver::on_timer_interrupt();
+    });
+    gic::enable_irq(27); // Enable virtual timer interrupt
+    console::print("[TIMER] Virtual timer IRQ 27 enabled\n");
 
     console::print("Enabling timer...\n");
     timer::enable_timer_interrupts(config::TIMER_INTERVAL_US); // 10ms intervals
@@ -731,7 +747,6 @@ fn run_async_main() -> ! {
     console::print(
         "[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
     );
-    console::print("[AsyncMain] HTTP Server: http://localhost:8080/\n");
 
     // Store stack references for curl/nslookup commands
     async_net::set_global_stack(stack);
@@ -758,25 +773,29 @@ fn run_async_main() -> ! {
     }
 
     // Auto-start herd process supervisor (AFTER IRQs enabled so scheduler works)
-    let herd_channel = if config::AUTO_START_HERD && fs::is_initialized() {
-        if fs::exists("/bin/herd") {
-            console::print("[AsyncMain] Starting herd supervisor...\n");
-            match process::spawn_process_with_channel("/bin/herd", None, None) {
+    let (herd_tid, herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
+        // const HERD_PATH: &str = "/bin/herd";
+        // const HERD_ARGS: &[&str] = &["daemon"];
+        const HERD_PATH: &str = "/bin/hello";
+        const HERD_ARGS: &[&str] = &["10", "50"];
+        if fs::exists(HERD_PATH) {
+            crate::safe_print!(64, "[AsyncMain] Starting herd supervisor...\n");
+            match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
                 Ok((tid, channel)) => {
                     crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
-                    Some(channel)
+                    (tid, Some(channel))
                 }
                 Err(e) => {
                     crate::safe_print!(64, "[AsyncMain] ERROR: Failed to start herd: {}\n", e);
-                    None
+                    (0, None)
                 }
             }
         } else {
-            console::print("[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
-            None
+            crate::safe_print!(64, "[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
+            (0, None)
         }
     } else {
-        None
+        (0, None)
     };
 
     // Loop iteration counter for debugging hangs (using atomics for safety)
@@ -870,7 +889,9 @@ fn run_async_main() -> ! {
 
         // Poll herd's output and print to console (if running)
         if let Some(ref channel) = herd_channel {
+            crate::safe_print!(64, "[Herd] Reading output...\n");
             let output = channel.read_all();
+            crate::safe_print!(64, "[Herd] Finished reading output: {} bytes\n", output.len());
             if !output.is_empty() {
                 // Print herd's output to console
                 for &byte in &output {
