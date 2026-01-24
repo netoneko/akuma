@@ -1493,8 +1493,16 @@ fn block_on_accept(
                 // Get the Box<TcpSocket> - the socket itself doesn't move, only the Box pointer
                 let socket_boxed = unsafe { socket_cell.into_inner() };
                 
-                // Use dummy address - skip remote_endpoint() entirely to test
-                let remote_addr = socket::SocketAddrV4::new([127, 0, 0, 1], 0);
+                // Get remote endpoint from the boxed socket (socket stays in same heap location)
+                crate::threading::disable_preemption();
+                let remote_ep = socket_boxed.remote_endpoint();
+                crate::threading::enable_preemption();
+                
+                let remote_addr = match remote_ep {
+                    Some(ep) => socket::SocketAddrV4::from_endpoint(ep)
+                        .unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
+                    None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
+                };
                 
                 // Store pre-boxed socket directly in table (socket never moves from heap)
                 let socket_idx = socket::alloc_socket_with_handle_boxed(

@@ -57,14 +57,23 @@ fn main() {
 }
 
 fn handle_connection(stream: TcpStream) {
+    print("httpd: Connection accepted, reading request...\n");
+    
     // Read request
     let mut buf = [0u8; 1024];
     let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
+        Ok(n) => {
+            print(&format!("httpd: Read {} bytes\n", n));
+            n
+        }
+        Err(e) => {
+            print(&format!("httpd: Read error: {:?}\n", e));
+            return;
+        }
     };
 
     if n == 0 {
+        print("httpd: Empty request, closing\n");
         return;
     }
 
@@ -115,12 +124,18 @@ fn handle_connection(stream: TcpStream) {
     };
 
     // Try to read the file
+    print(&format!("httpd: Serving file: {}\n", fs_path));
     match read_file(&fs_path) {
         Ok(content) => {
+            print(&format!("httpd: File size: {} bytes\n", content.len()));
             let content_type = get_content_type(&fs_path);
-            let _ = send_file(&stream, &content, content_type, is_head);
+            match send_file(&stream, &content, content_type, is_head) {
+                Ok(()) => print("httpd: Response sent successfully\n"),
+                Err(e) => print(&format!("httpd: Send error: {:?}\n", e)),
+            }
         }
-        Err(_) => {
+        Err(e) => {
+            print(&format!("httpd: File not found: {} (err={})\n", fs_path, e));
             let _ = send_error(&stream, 404, "Not Found");
         }
     }
