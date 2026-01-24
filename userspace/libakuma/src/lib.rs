@@ -32,8 +32,12 @@ pub mod syscall {
     pub const MUNMAP: u64 = 215;
     pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222;
+    pub const GETDENTS64: u64 = 61;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
+    pub const SPAWN: u64 = 301;
+    pub const KILL: u64 = 302;
+    pub const WAITPID: u64 = 303;
 }
 
 /// File descriptors
@@ -699,6 +703,211 @@ pub fn print(s: &str) {
 #[inline(always)]
 pub fn eprint(s: &str) {
     write(fd::STDERR, s.as_bytes());
+}
+
+// ============================================================================
+// Process Management Syscalls
+// ============================================================================
+
+/// Result of spawning a child process
+pub struct SpawnResult {
+    /// Child process ID
+    pub pid: u32,
+    /// File descriptor to read child's stdout
+    pub stdout_fd: u32,
+}
+
+/// Spawn a child process
+///
+/// Returns SpawnResult on success with child PID and stdout FD.
+/// Returns None on error.
+pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
+    // Build null-separated args string
+    let mut args_buf = alloc::vec::Vec::new();
+    if let Some(args_slice) = args {
+        for arg in args_slice {
+            args_buf.extend_from_slice(arg.as_bytes());
+            args_buf.push(0);
+        }
+    }
+
+    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
+    let args_len = args_buf.len();
+
+    let result = syscall(
+        syscall::SPAWN,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        args_ptr,
+        args_len as u64,
+        0, 0,
+    );
+
+    // Check for error (negative value)
+    if (result as i64) < 0 {
+        return None;
+    }
+
+    // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
+    let pid = (result & 0xFFFF_FFFF) as u32;
+    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+
+    Some(SpawnResult { pid, stdout_fd })
+}
+
+/// Kill a process by PID
+///
+/// Returns 0 on success, negative errno on error.
+pub fn kill(pid: u32) -> i32 {
+    syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
+}
+
+/// Wait for a child process (non-blocking)
+///
+/// Returns:
+/// - Some((pid, exit_code)) if child has exited
+/// - None if child is still running or not found
+pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
+    let mut status: u32 = 0;
+    let result = syscall(
+        syscall::WAITPID,
+        pid as u64,
+        &mut status as *mut u32 as u64,
+        0, 0, 0, 0,
+    );
+
+    if result == 0 {
+        // Child still running
+        None
+    } else if (result as i64) < 0 {
+        // Error (e.g., no such child)
+        None
+    } else {
+        // Child exited, extract exit code from Linux-style status
+        let exit_code = ((status >> 8) & 0xFF) as i32;
+        Some((result as u32, exit_code))
+    }
+}
+
+/// Directory entry from getdents64
+#[repr(C)]
+pub struct DirEntry64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    // d_name follows (variable length, null-terminated)
+}
+
+/// File types from d_type
+pub mod file_type {
+    pub const DT_REG: u8 = 8;  // Regular file
+    pub const DT_DIR: u8 = 4;  // Directory
+}
+
+/// Read directory entries
+///
+/// Returns number of bytes read, or negative errno on error.
+/// 0 means end of directory.
+pub fn getdents64(fd: i32, buf: &mut [u8]) -> isize {
+    syscall(
+        syscall::GETDENTS64,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0,
+    ) as isize
+}
+
+/// Iterator over directory entries
+pub struct ReadDir {
+    fd: i32,
+    buf: [u8; 1024],
+    pos: usize,
+    len: usize,
+    done: bool,
+}
+
+impl ReadDir {
+    /// Open a directory for reading
+    pub fn open(path: &str) -> Option<Self> {
+        let fd = open(path, open_flags::O_RDONLY);
+        if fd < 0 {
+            return None;
+        }
+        Some(Self {
+            fd,
+            buf: [0u8; 1024],
+            pos: 0,
+            len: 0,
+            done: false,
+        })
+    }
+}
+
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        close(self.fd);
+    }
+}
+
+/// Directory entry info
+pub struct DirEntryInfo {
+    pub name: alloc::string::String,
+    pub is_dir: bool,
+}
+
+impl Iterator for ReadDir {
+    type Item = DirEntryInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // If we have buffered data, parse the next entry
+            if self.pos < self.len {
+                let entry = unsafe {
+                    &*(self.buf.as_ptr().add(self.pos) as *const DirEntry64)
+                };
+                let reclen = entry.d_reclen as usize;
+                
+                // Extract name (null-terminated string after header)
+                let name_ptr = unsafe { self.buf.as_ptr().add(self.pos + 19) }; // header is 19 bytes
+                let mut name_len = 0;
+                while name_len < reclen - 19 {
+                    if unsafe { *name_ptr.add(name_len) } == 0 {
+                        break;
+                    }
+                    name_len += 1;
+                }
+                let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+                let name = core::str::from_utf8(name_bytes)
+                    .map(|s| alloc::string::String::from(s))
+                    .unwrap_or_default();
+                
+                let is_dir = entry.d_type == file_type::DT_DIR;
+                
+                self.pos += reclen;
+                return Some(DirEntryInfo { name, is_dir });
+            }
+
+            // Need to read more entries
+            if self.done {
+                return None;
+            }
+
+            let n = getdents64(self.fd, &mut self.buf);
+            if n <= 0 {
+                self.done = true;
+                return None;
+            }
+            self.pos = 0;
+            self.len = n as usize;
+        }
+    }
+}
+
+/// List directory contents
+pub fn read_dir(path: &str) -> Option<ReadDir> {
+    ReadDir::open(path)
 }
 
 // ============================================================================

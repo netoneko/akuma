@@ -27,8 +27,12 @@ pub mod nr {
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222; // Linux arm64 mmap
+    pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
+    pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
+    pub const KILL: u64 = 302;       // Kill a process by PID
+    pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
 }
 
 /// Error code for interrupted syscall
@@ -89,6 +93,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
+        nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
+        nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize),
+        nr::KILL => sys_kill(args[0] as u32),
+        nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -313,6 +321,10 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             bytes_read as u64
         }
+        FileDescriptor::Stdout | FileDescriptor::Stderr => {
+            // Can't read from stdout/stderr
+            (-libc_errno::EBADF as i64) as u64
+        }
         FileDescriptor::File(ref file) => {
             // Read from file
             let path = file.path.clone();
@@ -355,7 +367,30 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // For now, return EAGAIN
             (-libc_errno::EAGAIN as i64) as u64
         }
-        _ => (-libc_errno::EBADF as i64) as u64,
+        FileDescriptor::ChildStdout(child_pid) => {
+            // Read from child process stdout via ProcessChannel
+            use crate::process;
+            
+            if let Some(channel) = process::get_child_channel(child_pid) {
+                if let Some(data) = channel.try_read() {
+                    let to_copy = data.len().min(count);
+                    if to_copy > 0 {
+                        unsafe {
+                            let dst = buf_ptr as *mut u8;
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_copy);
+                        }
+                    }
+                    to_copy as u64
+                } else if channel.has_exited() {
+                    0 // EOF - child exited
+                } else {
+                    // No data available yet, would block
+                    (-libc_errno::EAGAIN as i64) as u64
+                }
+            } else {
+                0 // Channel gone, child exited
+            }
+        }
     }
 }
 
@@ -973,6 +1008,11 @@ fn sys_close(fd: u32) -> u64 {
         }
         FileDescriptor::Stdin | FileDescriptor::Stdout | FileDescriptor::Stderr => {
             // Don't actually close stdio
+            0
+        }
+        FileDescriptor::ChildStdout(child_pid) => {
+            // Close child stdout FD - remove channel reference
+            crate::process::remove_child_channel(child_pid);
             0
         }
     }
@@ -1651,4 +1691,257 @@ fn block_on_connect(
             }
         }
     }
+}
+
+// ============================================================================
+// Process Management Syscalls
+// ============================================================================
+
+/// sys_spawn - Spawn a child process
+///
+/// # Arguments
+/// * `path_ptr` - Pointer to path string
+/// * `path_len` - Length of path string  
+/// * `args_ptr` - Pointer to null-separated args string (can be 0)
+/// * `args_len` - Length of args string
+///
+/// # Returns
+/// On success: child PID in low 32 bits, stdout FD in high 32 bits
+/// On failure: negative errno
+fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize) -> u64 {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use crate::process::{self, FileDescriptor, Pid};
+
+    // Read path from user memory
+    let path = unsafe {
+        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => String::from(s),
+            Err(_) => return (-libc_errno::EINVAL as i64) as u64,
+        }
+    };
+
+    // Parse args if provided
+    let args: Vec<String> = if args_ptr != 0 && args_len > 0 {
+        unsafe {
+            let slice = core::slice::from_raw_parts(args_ptr as *const u8, args_len);
+            // Args are null-separated
+            slice.split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| core::str::from_utf8(s).ok())
+                .map(String::from)
+                .collect()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Convert args to slice of &str for spawn
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+
+    // Spawn the process
+    let (thread_id, channel) = match process::spawn_process_with_channel(&path, args_opt, None) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::safe_print!(64, "[sys_spawn] Failed: {}\n", e);
+            return (-libc_errno::ENOENT as i64) as u64;
+        }
+    };
+
+    // Get child PID from the process table
+    // We need to wait a moment for the process to register
+    crate::threading::yield_now();
+    
+    let child_pid = match process::find_pid_by_thread(thread_id) {
+        Some(pid) => pid,
+        None => {
+            // Process not yet registered, try again
+            for _ in 0..10 {
+                crate::threading::yield_now();
+                if let Some(pid) = process::find_pid_by_thread(thread_id) {
+                    break;
+                }
+            }
+            process::find_pid_by_thread(thread_id).unwrap_or(0)
+        }
+    };
+
+    if child_pid == 0 {
+        return (-libc_errno::ESRCH as i64) as u64;
+    }
+
+    // Register the channel so parent can read child stdout
+    process::register_child_channel(child_pid, channel);
+
+    // Allocate a FD for child stdout in parent's FD table
+    let proc = match process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::ESRCH as i64) as u64,
+    };
+
+    let stdout_fd = proc.alloc_fd(FileDescriptor::ChildStdout(child_pid));
+
+    // Return PID in low 32 bits, FD in high 32 bits
+    let result = (child_pid as u64) | ((stdout_fd as u64) << 32);
+    result
+}
+
+/// sys_kill - Kill a process by PID
+///
+/// # Arguments
+/// * `pid` - Process ID to kill
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+fn sys_kill(pid: u32) -> u64 {
+    match crate::process::kill_process(pid) {
+        Ok(()) => 0,
+        Err(_) => (-libc_errno::ESRCH as i64) as u64,
+    }
+}
+
+/// sys_waitpid - Wait for a child process
+///
+/// # Arguments
+/// * `pid` - Child PID to wait for (0 = any child)
+/// * `status_ptr` - Pointer to store exit status (can be 0)
+///
+/// # Returns
+/// - If child has exited: child PID
+/// - If child still running: 0 (non-blocking)
+/// - On error: negative errno
+fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
+    use crate::process::{self, Pid};
+
+    // Get the child channel
+    let channel = match process::get_child_channel(pid as Pid) {
+        Some(ch) => ch,
+        None => return (-libc_errno::ECHILD as i64) as u64,
+    };
+
+    // Check if child has exited
+    if channel.has_exited() {
+        let exit_code = channel.exit_code();
+
+        // Store exit status if pointer provided
+        if status_ptr != 0 {
+            // Linux waitpid status format: exit_code << 8
+            let status = (exit_code as u32) << 8;
+            unsafe {
+                *(status_ptr as *mut u32) = status;
+            }
+        }
+
+        // Clean up the channel
+        process::remove_child_channel(pid as Pid);
+
+        pid as u64
+    } else {
+        // Child still running, return 0 (WNOHANG behavior)
+        0
+    }
+}
+
+/// sys_getdents64 - Get directory entries
+///
+/// # Arguments
+/// * `fd` - Directory file descriptor
+/// * `buf_ptr` - Buffer to store directory entries
+/// * `buf_size` - Size of buffer
+///
+/// # Returns
+/// Number of bytes read, 0 at end of directory, negative errno on error
+fn sys_getdents64(fd: u32, buf_ptr: u64, buf_size: usize) -> u64 {
+    use crate::process::FileDescriptor;
+
+    // Get current process
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Get file descriptor entry
+    let fd_entry = match proc.get_fd(fd) {
+        Some(e) => e,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Must be a directory file
+    let (path, position) = match fd_entry {
+        FileDescriptor::File(ref file) => (file.path.clone(), file.position),
+        _ => return (-libc_errno::ENOTDIR as i64) as u64,
+    };
+
+    // List directory
+    let entries = match crate::fs::list_dir(&path) {
+        Ok(e) => e,
+        Err(_) => return (-libc_errno::ENOTDIR as i64) as u64,
+    };
+
+    // Skip entries we've already returned (based on position)
+    let skip_count = position;
+    
+    if skip_count >= entries.len() {
+        return 0; // No more entries
+    }
+
+    // Linux dirent64 structure (simplified)
+    #[repr(C)]
+    struct Dirent64 {
+        d_ino: u64,      // Inode number (fake it)
+        d_off: i64,      // Offset to next entry
+        d_reclen: u16,   // Length of this record
+        d_type: u8,      // File type
+        // d_name follows (null-terminated)
+    }
+
+    const DT_REG: u8 = 8;  // Regular file
+    const DT_DIR: u8 = 4;  // Directory
+
+    let mut written = 0usize;
+    let mut entries_returned = 0usize;
+    let buf = buf_ptr as *mut u8;
+
+    for (i, entry) in entries.iter().skip(skip_count).enumerate() {
+        let name_bytes = entry.name.as_bytes();
+        let record_len = core::mem::size_of::<Dirent64>() + name_bytes.len() + 1;
+        // Align to 8 bytes
+        let aligned_len = (record_len + 7) & !7;
+
+        if written + aligned_len > buf_size {
+            break; // Buffer full
+        }
+
+        let d_type = if entry.is_dir { DT_DIR } else { DT_REG };
+
+        unsafe {
+            let dirent_ptr = buf.add(written) as *mut Dirent64;
+            (*dirent_ptr).d_ino = (skip_count + i + 1) as u64;
+            (*dirent_ptr).d_off = (skip_count + i + 2) as i64;
+            (*dirent_ptr).d_reclen = aligned_len as u16;
+            (*dirent_ptr).d_type = d_type;
+
+            // Copy name after the header
+            let name_ptr = buf.add(written + core::mem::size_of::<Dirent64>());
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, name_bytes.len());
+            *name_ptr.add(name_bytes.len()) = 0; // Null terminator
+        }
+
+        written += aligned_len;
+        entries_returned += 1;
+    }
+
+    // Update position in FD table
+    if entries_returned > 0 {
+        let new_position = skip_count + entries_returned;
+        proc.update_fd(fd, |fd_entry| {
+            if let FileDescriptor::File(file) = fd_entry {
+                file.position = new_position;
+            }
+        });
+    }
+
+    written as u64
 }

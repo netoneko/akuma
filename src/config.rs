@@ -222,3 +222,16 @@ pub const DEFERRED_THREAD_CLEANUP: bool = true;
 pub const THREAD_CLEANUP_COOLDOWN_US: u64 = 10_000; // 10ms
 
 pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
+
+// ============================================================================
+// Herd Process Supervisor Configuration
+// ============================================================================
+
+/// Enable kernel-integrated herd supervisor
+///
+/// When enabled, the herd process supervisor runs as part of the kernel's
+/// async main loop. When disabled, herd should be run as a userspace binary
+/// at /bin/herd.
+///
+/// Set to `false` when using the userspace herd binary.
+pub const ENABLE_KERNEL_HERD: bool = false;

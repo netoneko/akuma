@@ -5,6 +5,7 @@ members = [
     "echo2",
     "elftest",
     "hello",
+    "herd",
     "httpd",
     "stackstress",
     "stdcheck",

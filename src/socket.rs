@@ -826,13 +826,16 @@ where
 
 pub mod libc_errno {
     pub const ENOENT: i32 = 2;       // No such file or directory
+    pub const ESRCH: i32 = 3;        // No such process
     pub const EINTR: i32 = 4;        // Interrupted system call
     pub const EIO: i32 = 5;          // I/O error
     pub const EBADF: i32 = 9;        // Bad file descriptor
+    pub const ECHILD: i32 = 10;      // No child processes
     pub const EAGAIN: i32 = 11;      // Try again
     pub const EWOULDBLOCK: i32 = 11; // Same as EAGAIN
     pub const ENOMEM: i32 = 12;      // Out of memory
     pub const EFAULT: i32 = 14;      // Bad address
+    pub const ENOTDIR: i32 = 20;     // Not a directory
     pub const EINVAL: i32 = 22;      // Invalid argument
     pub const ENOTSOCK: i32 = 88;    // Socket operation on non-socket
     pub const EADDRINUSE: i32 = 98;  // Address already in use

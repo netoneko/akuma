@@ -738,6 +738,19 @@ fn run_async_main() -> ! {
     async_net::set_global_stack(stack);
     async_net::set_loopback_stack(loopback_stack);
 
+    // Auto-start userspace herd if it exists and kernel herd is disabled
+    if !config::ENABLE_KERNEL_HERD && fs::is_initialized() && fs::exists("/bin/herd") {
+        console::print("[AsyncMain] Starting userspace herd supervisor...\n");
+        match process::spawn_process("/bin/herd", None, None) {
+            Ok(tid) => {
+                crate::safe_print!(64, "[AsyncMain] Userspace herd started (tid={})\n", tid);
+            }
+            Err(e) => {
+                crate::safe_print!(64, "[AsyncMain] Failed to start herd: {}\n", e);
+            }
+        }
+    }
+
     // Pin the futures directly using the pin! macro (no unsafe needed)
     let mut runner_pinned = pin!(runner.run());
     let mut loopback_runner_pinned = pin!(loopback_runner.run());
@@ -746,6 +759,9 @@ fn run_async_main() -> ! {
     // let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
 
     let mut mem_monitor_pinned = pin!(memory_monitor());
+    
+    // Herd supervisor (kernel-integrated, disabled by default)
+    // When ENABLE_KERNEL_HERD is false, herd runs as userspace binary at /bin/herd
     let mut herd_pinned = pin!(herd::herd_supervisor());
 
     // Enable IRQs for the main async loop
@@ -834,9 +850,11 @@ fn run_async_main() -> ! {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
 
-        // Poll herd process supervisor
+        // Poll herd process supervisor (kernel-integrated, configurable)
         POLL_STEP.store(9, Ordering::Relaxed);
-        let _ = herd_pinned.as_mut().poll(&mut cx);
+        if config::ENABLE_KERNEL_HERD {
+            let _ = herd_pinned.as_mut().poll(&mut cx);
+        }
 
         // Process pending IRQ work
         executor::process_irq_work();

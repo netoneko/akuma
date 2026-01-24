@@ -929,13 +929,7 @@ impl Command for HerdCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            use crate::herd;
-
-            // Check if herd is initialized
-            if !herd::is_initialized() {
-                let _ = stdout.write(b"Error: Herd supervisor not initialized\r\n").await;
-                return Err(ShellError::ExecutionFailed("herd not initialized"));
-            }
+            use crate::config;
 
             // Parse arguments
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
@@ -943,30 +937,70 @@ impl Command for HerdCommand {
             let subcommand = parts.next().unwrap_or("status");
             let service_name = parts.next();
 
+            // Check if kernel herd is enabled
+            if config::ENABLE_KERNEL_HERD {
+                // Use kernel-integrated herd
+                use crate::herd;
+
+                if !herd::is_initialized() {
+                    let _ = stdout.write(b"Error: Herd supervisor not initialized\r\n").await;
+                    return Err(ShellError::ExecutionFailed("herd not initialized"));
+                }
+
+                match subcommand {
+                    "status" => {
+                        let services = herd::list_services();
+                        if services.is_empty() {
+                            let _ = stdout.write(b"No services configured.\r\n").await;
+                            let _ = stdout.write(b"Add config files to /etc/herd/enabled/\r\n").await;
+                        } else {
+                            let _ = stdout.write(b"SERVICE          STATE        EXIT\r\n").await;
+                            let _ = stdout.write(b"-----------------------------------\r\n").await;
+                            for (name, state, exit_code) in services {
+                                let exit_str = match exit_code {
+                                    Some(code) => format!("{}", code),
+                                    None => "-".to_string(),
+                                };
+                                let line = format!(
+                                    "{:<16} {:<12} {}\r\n",
+                                    name,
+                                    state.as_str(),
+                                    exit_str
+                                );
+                                let _ = stdout.write(line.as_bytes()).await;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    _ => {} // Fall through to common handling below
+                }
+            }
+
+            // Common file-based operations (work with both kernel and userspace herd)
             match subcommand {
                 "status" => {
-                    // List all services and their status
-                    let services = herd::list_services();
-                    if services.is_empty() {
-                        let _ = stdout.write(b"No services configured.\r\n").await;
-                        let _ = stdout.write(b"Add config files to /etc/herd/enabled/\r\n").await;
-                    } else {
-                        let _ = stdout.write(b"SERVICE          STATE        EXIT\r\n").await;
-                        let _ = stdout.write(b"-----------------------------------\r\n").await;
-                        for (name, state, exit_code) in services {
-                            let exit_str = match exit_code {
-                                Some(code) => format!("{}", code),
-                                None => "-".to_string(),
-                            };
-                            let line = format!(
-                                "{:<16} {:<12} {}\r\n",
-                                name,
-                                state.as_str(),
-                                exit_str
-                            );
-                            let _ = stdout.write(line.as_bytes()).await;
+                    // For userspace herd, list enabled services from filesystem
+                    let _ = stdout.write(b"Enabled services:\r\n").await;
+                    match crate::async_fs::list_dir("/etc/herd/enabled").await {
+                        Ok(entries) => {
+                            let mut found = false;
+                            for entry in entries {
+                                if entry.name.ends_with(".conf") {
+                                    let name = entry.name.trim_end_matches(".conf");
+                                    let line = format!("  {}\r\n", name);
+                                    let _ = stdout.write(line.as_bytes()).await;
+                                    found = true;
+                                }
+                            }
+                            if !found {
+                                let _ = stdout.write(b"  (none)\r\n").await;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = stdout.write(b"  Cannot read /etc/herd/enabled/\r\n").await;
                         }
                     }
+                    let _ = stdout.write(b"\r\nNote: Use 'ps' to see running processes\r\n").await;
                     Ok(())
                 }
 
@@ -980,46 +1014,56 @@ impl Command for HerdCommand {
                         }
                     };
 
-                    match herd::get_service_info(name) {
-                        Some(info) => {
-                            let args_str = info.config.args.join(" ");
-                            let output = format!(
-                                "Service: {}\r\n\
-                                 State: {}\r\n\
-                                 \r\n\
-                                 Configuration:\r\n\
-                                   command: {}\r\n\
-                                   args: {}\r\n\
-                                   restart_delay: {}ms\r\n\
-                                   max_retries: {}\r\n\
-                                 \r\n\
-                                 Runtime:\r\n\
-                                   thread_id: {}\r\n\
-                                   restart_count: {}\r\n\
-                                   last_exit_code: {}\r\n",
-                                info.name,
-                                info.state.as_str(),
-                                info.config.command,
-                                if args_str.is_empty() { "(none)" } else { &args_str },
-                                info.config.restart_delay_ms,
-                                if info.config.max_retries == 0 { "unlimited".to_string() } else { info.config.max_retries.to_string() },
-                                info.thread_id.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
-                                info.restart_count,
-                                info.last_exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
-                            );
-                            let _ = stdout.write(output.as_bytes()).await;
+                    // Read config file directly
+                    let config_path = format!("/etc/herd/enabled/{}.conf", name);
+                    match crate::async_fs::read_file(&config_path).await {
+                        Ok(data) => {
+                            let header = format!("Config for service '{}':\r\n\r\n", name);
+                            let _ = stdout.write(header.as_bytes()).await;
+                            // Convert \n to \r\n for terminal
+                            for &byte in &data {
+                                if byte == b'\n' {
+                                    let _ = stdout.write(b"\r\n").await;
+                                } else {
+                                    let _ = stdout.write(&[byte]).await;
+                                }
+                            }
+                            if !data.ends_with(&[b'\n']) {
+                                let _ = stdout.write(b"\r\n").await;
+                            }
                             Ok(())
                         }
-                        None => {
-                            let msg = format!("Service '{}' not found\r\n", name);
-                            let _ = stdout.write(msg.as_bytes()).await;
-                            Err(ShellError::ExecutionFailed("service not found"))
+                        Err(_) => {
+                            // Try available directory
+                            let avail_path = format!("/etc/herd/available/{}.conf", name);
+                            match crate::async_fs::read_file(&avail_path).await {
+                                Ok(data) => {
+                                    let header = format!("Config for service '{}' (not enabled):\r\n\r\n", name);
+                                    let _ = stdout.write(header.as_bytes()).await;
+                                    for &byte in &data {
+                                        if byte == b'\n' {
+                                            let _ = stdout.write(b"\r\n").await;
+                                        } else {
+                                            let _ = stdout.write(&[byte]).await;
+                                        }
+                                    }
+                                    if !data.ends_with(&[b'\n']) {
+                                        let _ = stdout.write(b"\r\n").await;
+                                    }
+                                    Ok(())
+                                }
+                                Err(_) => {
+                                    let msg = format!("Service '{}' not found\r\n", name);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                    Err(ShellError::ExecutionFailed("service not found"))
+                                }
+                            }
                         }
                     }
                 }
 
                 "run" | "start" => {
-                    // Start a service
+                    // Start a service - only works with kernel herd
                     let name = match service_name {
                         Some(n) => n,
                         None => {
@@ -1028,6 +1072,13 @@ impl Command for HerdCommand {
                         }
                     };
 
+                    if !config::ENABLE_KERNEL_HERD {
+                        let _ = stdout.write(b"Note: Using userspace herd. Service will start on next config reload.\r\n").await;
+                        let _ = stdout.write(b"Use 'herd enable' to enable the service.\r\n").await;
+                        return Ok(());
+                    }
+
+                    use crate::herd;
                     match herd::request_start(name) {
                         Ok(()) => {
                             let msg = format!("Starting service '{}'\r\n", name);
@@ -1043,7 +1094,7 @@ impl Command for HerdCommand {
                 }
 
                 "stop" => {
-                    // Stop a service
+                    // Stop a service - only works with kernel herd
                     let name = match service_name {
                         Some(n) => n,
                         None => {
@@ -1052,6 +1103,14 @@ impl Command for HerdCommand {
                         }
                     };
 
+                    if !config::ENABLE_KERNEL_HERD {
+                        let _ = stdout.write(b"Note: Using userspace herd.\r\n").await;
+                        let _ = stdout.write(b"Use 'herd disable' to stop and disable the service,\r\n").await;
+                        let _ = stdout.write(b"or 'kill <pid>' to stop a running process.\r\n").await;
+                        return Ok(());
+                    }
+
+                    use crate::herd;
                     match herd::request_stop(name) {
                         Ok(()) => {
                             let msg = format!("Stopping service '{}'\r\n", name);
@@ -1067,7 +1126,7 @@ impl Command for HerdCommand {
                 }
 
                 "restart" => {
-                    // Restart a service (stop then start)
+                    // Restart a service - only works with kernel herd
                     let name = match service_name {
                         Some(n) => n,
                         None => {
@@ -1076,6 +1135,13 @@ impl Command for HerdCommand {
                         }
                     };
 
+                    if !config::ENABLE_KERNEL_HERD {
+                        let _ = stdout.write(b"Note: Using userspace herd.\r\n").await;
+                        let _ = stdout.write(b"Kill the process with 'kill <pid>' - herd will auto-restart it.\r\n").await;
+                        return Ok(());
+                    }
+
+                    use crate::herd;
                     // Stop first (ignore error if already stopped)
                     let _ = herd::request_stop(name);
                     

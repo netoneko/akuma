@@ -142,6 +142,9 @@ pub enum FileDescriptor {
     Socket(usize),
     /// File file descriptor
     File(KernelFile),
+    /// Child process stdout - PID of the child process
+    /// Used by parent to read child's stdout via ProcessChannel
+    ChildStdout(Pid),
 }
 
 /// Kernel file handle for open files
@@ -337,6 +340,36 @@ pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
 pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().remove(&thread_id)
+    })
+}
+
+// ============================================================================
+// Child Process Registry (for userspace process management)
+// ============================================================================
+
+/// Registry mapping child PIDs to their ProcessChannel
+/// Used by parent processes to read child stdout via ChildStdout FD
+static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, Arc<ProcessChannel>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Register a child process channel (called when spawning via syscall)
+pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>) {
+    crate::irq::with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().insert(child_pid, channel);
+    })
+}
+
+/// Get a child process channel by PID
+pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
+    crate::irq::with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().get(&child_pid).cloned()
+    })
+}
+
+/// Remove a child process channel (called when child exits or parent closes FD)
+pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
+    crate::irq::with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().remove(&child_pid)
     })
 }
 
