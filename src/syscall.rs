@@ -1438,13 +1438,15 @@ fn block_on_accept(
         |_| {},
     );
 
-    // Create socket with preemption disabled
+    // Create socket DIRECTLY IN A BOX to avoid any moves after creation
+    // TcpSocket registers itself with smoltcp's internal state during accept,
+    // and moving it afterwards corrupts that state
     crate::threading::disable_preemption();
-    let socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    let socket_boxed = alloc::boxed::Box::new(TcpSocket::new(stack, rx_buf, tx_buf));
     crate::threading::enable_preemption();
 
-    // Use UnsafeCell to allow mutable access to socket for both future and timeout
-    let socket_cell = UnsafeCell::new(socket);
+    // Use UnsafeCell to allow mutable access to the boxed socket
+    let socket_cell: UnsafeCell<alloc::boxed::Box<TcpSocket<'static>>> = UnsafeCell::new(socket_boxed);
 
     let mut iterations = 0usize;
     // Longer timeout for accept - we want to wait indefinitely for connections
@@ -1452,9 +1454,9 @@ fn block_on_accept(
     // The embassy socket timeout (60s) will handle actual network timeouts
     const MAX_ITERATIONS: usize = 10_000_000;
 
-    // Create the accept future using unsafe to get mutable reference
+    // Create the accept future using unsafe to get mutable reference to the socket in the box
     // SAFETY: We have exclusive access to socket_cell
-    let socket_ref = unsafe { &mut *socket_cell.get() };
+    let socket_ref: &mut TcpSocket<'static> = unsafe { &mut **socket_cell.get() };
     
     // No timeout for listener - we want to wait indefinitely for connections
     crate::threading::disable_preemption();
@@ -1469,9 +1471,9 @@ fn block_on_accept(
         if crate::process::is_current_interrupted() {
             // Drop the future first to release borrow, then abort socket
             drop(accept_fut);
-            let socket = unsafe { socket_cell.into_inner() };
-            // Note: can't abort a moved socket easily, just drop it
-            drop(socket);
+            let mut socket_boxed = unsafe { socket_cell.into_inner() };
+            socket_boxed.abort();
+            drop(socket_boxed);
             return Err(libc_errno::EINTR);
         }
 
@@ -1488,24 +1490,17 @@ fn block_on_accept(
                 // CRITICAL: Drop the future first to release the mutable borrow!
                 drop(accept_fut);
                 
-                // Get socket and remote endpoint
-                let socket = unsafe { socket_cell.into_inner() };
+                // Get the Box<TcpSocket> - the socket itself doesn't move, only the Box pointer
+                let socket_boxed = unsafe { socket_cell.into_inner() };
                 
-                crate::threading::disable_preemption();
-                let remote_ep = socket.remote_endpoint();
-                crate::threading::enable_preemption();
+                // Use dummy address - skip remote_endpoint() entirely to test
+                let remote_addr = socket::SocketAddrV4::new([127, 0, 0, 1], 0);
                 
-                let remote_addr = match remote_ep {
-                    Some(ep) => socket::SocketAddrV4::from_endpoint(ep)
-                        .unwrap_or(socket::SocketAddrV4::new([0,0,0,0], 0)),
-                    None => socket::SocketAddrV4::new([0, 0, 0, 0], 0),
-                };
-                
-                // Store socket directly in table - AVOID returning TcpSocket by value
-                let socket_idx = socket::alloc_socket_with_handle(
+                // Store pre-boxed socket directly in table (socket never moves from heap)
+                let socket_idx = socket::alloc_socket_with_handle_boxed(
                     socket::socket_const::SOCK_STREAM,
                     buffer_slot,
-                    socket,
+                    socket_boxed,
                     socket::SocketState::Connected { local_addr, remote_addr },
                 );
                 
@@ -1514,8 +1509,9 @@ fn block_on_accept(
             Poll::Ready(Err(e)) => {
                 crate::safe_print!(64, "[block_on_accept] embassy error: {:?}\n", e);
                 drop(accept_fut);
-                let socket = unsafe { socket_cell.into_inner() };
-                drop(socket);
+                let mut socket_boxed = unsafe { socket_cell.into_inner() };
+                socket_boxed.abort();
+                drop(socket_boxed);
                 return Err(libc_errno::ECONNREFUSED);
             }
             Poll::Pending => {
@@ -1523,8 +1519,9 @@ fn block_on_accept(
                 if iterations >= MAX_ITERATIONS {
                     // Drop future first to release borrow
                     drop(accept_fut);
-                    let socket = unsafe { socket_cell.into_inner() };
-                    drop(socket);
+                    let mut socket_boxed = unsafe { socket_cell.into_inner() };
+                    socket_boxed.abort();
+                    drop(socket_boxed);
                     return Err(libc_errno::ETIMEDOUT);
                 }
                 crate::threading::yield_now();

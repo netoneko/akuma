@@ -65,11 +65,12 @@ pub const RESERVED_THREADS: usize = 8;
 /// a system thread and needs significant stack space for pinned futures.
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// Stack size for user process threads (64KB)
+/// Stack size for user process threads (128KB)
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
-/// Smaller stacks since user processes have their own user-space stack.
-pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
+/// Increased from 64KB due to stack overflow during socket accept.
+/// User processes have their own user-space stack but kernel syscalls need space.
+pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 
 /// Enable stack canary checking
 ///

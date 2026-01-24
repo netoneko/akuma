@@ -349,6 +349,7 @@ impl UserAddressSpace {
         // Each L2 entry covers 2MB (0x200000)
         // GIC at 0x08000000 = L2 index 64
         // UART at 0x09000000 = L2 index 72
+        // VirtIO MMIO at 0x0a000000 = L2 index 80
         let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
         let device_block_flags = flags::VALID
             | flags::BLOCK
@@ -358,9 +359,10 @@ impl UserAddressSpace {
             | flags::UXN
             | flags::SH_OUTER;
 
-        // Map 0x08000000-0x09FFFFFF (GIC, UART, etc) as device memory (2MB blocks)
-        for i in 64..80 {
-            // Covers 0x08000000 - 0x09FFFFFF (32MB)
+        // Map 0x08000000-0x0BFFFFFF (GIC, UART, VirtIO MMIO) as device memory (2MB blocks)
+        // Extended to index 96 to cover VirtIO MMIO region at 0x0a000000-0x0a000e00
+        for i in 64..96 {
+            // Covers 0x08000000 - 0x0BFFFFFF (64MB)
             let pa = (i as u64) * 0x200000; // 2MB * index
             unsafe {
                 core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags);

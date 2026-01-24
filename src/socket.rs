@@ -279,8 +279,11 @@ pub fn process_buffer_cleanup() -> usize {
 /// Embassy-net's TcpSocket is not Send, but we can safely share it because:
 /// - All access happens with preemption disabled (no concurrent access)
 /// - Thread 0 polls the network runner, other threads poll individual sockets
+///
+/// NOTE: We Box the TcpSocket to keep it at a fixed heap location.
+/// Moving TcpSocket after accept() causes corruption (likely due to internal state).
 pub struct SocketHandle {
-    socket: UnsafeCell<Option<TcpSocket<'static>>>,
+    socket: UnsafeCell<Option<alloc::boxed::Box<TcpSocket<'static>>>>,
 }
 
 // SAFETY: Access is serialized via preemption control and socket table lock
@@ -295,32 +298,43 @@ impl SocketHandle {
         }
     }
 
-    /// Create a socket handle with an existing TcpSocket
-    pub fn with_socket(socket: TcpSocket<'static>) -> Self {
+    /// Create a socket handle with a pre-boxed TcpSocket
+    /// IMPORTANT: Caller must Box the socket BEFORE calling this to avoid moves
+    pub fn with_socket_boxed(socket: alloc::boxed::Box<TcpSocket<'static>>) -> Self {
         Self {
             socket: UnsafeCell::new(Some(socket)),
+        }
+    }
+
+    /// Create a socket handle with an existing TcpSocket
+    /// The socket is boxed to keep it at a fixed heap location
+    /// WARNING: This moves the socket, which may corrupt it after accept()
+    #[allow(dead_code)]
+    pub fn with_socket(socket: TcpSocket<'static>) -> Self {
+        Self {
+            socket: UnsafeCell::new(Some(alloc::boxed::Box::new(socket))),
         }
     }
 
     /// Get mutable socket reference
     ///
     /// SAFETY: Must be called with preemption disabled
-    pub unsafe fn get(&self) -> &mut Option<TcpSocket<'static>> {
-        &mut *self.socket.get()
+    pub unsafe fn get(&self) -> Option<&mut TcpSocket<'static>> {
+        (*self.socket.get()).as_mut().map(|b| b.as_mut())
     }
 
-    /// Take the socket out of the handle
+    /// Take the socket out of the handle (unboxes it)
     ///
     /// SAFETY: Must be called with preemption disabled
     pub unsafe fn take(&self) -> Option<TcpSocket<'static>> {
-        (*self.socket.get()).take()
+        (*self.socket.get()).take().map(|b| *b)
     }
 
-    /// Store a socket in the handle
+    /// Store a socket in the handle (boxes it)
     ///
     /// SAFETY: Must be called with preemption disabled
     pub unsafe fn store(&self, socket: TcpSocket<'static>) {
-        *self.socket.get() = Some(socket);
+        *self.socket.get() = Some(alloc::boxed::Box::new(socket));
     }
 
     /// Check if handle contains a socket
@@ -340,15 +354,9 @@ impl Default for SocketHandle {
 impl Drop for SocketHandle {
     fn drop(&mut self) {
         // Abort the socket if it exists to release embassy-net resources
-        // SAFETY: Called during socket cleanup, preemption should be disabled
-        // or we're the only reference
-        crate::console::print("[SocketHandle::drop] called\n");
-        if let Some(mut socket) = unsafe { self.take() } {
-            crate::console::print("[SocketHandle::drop] aborting socket\n");
-            socket.abort();
-            crate::console::print("[SocketHandle::drop] aborted\n");
-        } else {
-            crate::console::print("[SocketHandle::drop] no socket to abort\n");
+        // SAFETY: We're in drop, have exclusive access
+        if let Some(mut boxed) = unsafe { (*self.socket.get()).take() } {
+            boxed.abort();
         }
     }
 }
@@ -445,7 +453,6 @@ impl KernelSocket {
 
 impl Drop for KernelSocket {
     fn drop(&mut self) {
-        crate::safe_print!(48, "[KernelSocket::drop] slot={}\n", self.buffer_slot);
         // Queue buffer for deferred cleanup
         queue_buffer_cleanup(self.buffer_slot);
     }
@@ -682,44 +689,43 @@ pub fn store_socket_handle(idx: usize, socket: TcpSocket<'static>) {
     });
 }
 
-/// Allocate a new socket with an existing TcpSocket handle
-pub fn alloc_socket_with_handle(
+/// Allocate a new socket with an existing TcpSocket handle (pre-boxed)
+///
+/// IMPORTANT: The TcpSocket must be pre-boxed by the caller to avoid
+/// any moves after accept() completes. Moving TcpSocket corrupts internal state.
+pub fn alloc_socket_with_handle_boxed(
     socket_type: i32,
     buffer_slot: usize,
-    tcp_socket: TcpSocket<'static>,
+    tcp_socket_boxed: alloc::boxed::Box<TcpSocket<'static>>,
     state: SocketState,
 ) -> usize {
     // Find a free slot first
     let idx = match find_free_slot() {
         Some(i) => i,
         None => {
-            crate::console::print("[alloc_socket_with_handle] No free slots!\n");
             // Return a sentinel value - caller should check
             return MAX_SOCKETS;
         }
     };
     
-    crate::safe_print!(48, "[alloc_socket_with_handle] idx={}\n", idx);
-    
-    // Now store the socket directly in the slot (no moving!)
+    // Store the socket directly in the slot
     crate::irq::with_irqs_disabled(|| {
         unsafe {
             let slot = &SOCKET_TABLE[idx];
             let socket_ptr = slot.socket.get();
             
-            // Initialize KernelSocket in place
+            // Initialize KernelSocket in place with the pre-boxed socket
             (*socket_ptr) = Some(KernelSocket {
                 state,
                 buffer_slot,
                 ref_count: AtomicU32::new(1),
                 socket_type,
                 is_listener: false,
-                handle: SocketHandle::with_socket(tcp_socket),
+                handle: SocketHandle::with_socket_boxed(tcp_socket_boxed),
             });
         }
     });
     
-    crate::console::print("[alloc_socket_with_handle] Inserted\n");
     idx
 }
 
@@ -770,8 +776,8 @@ where
         unsafe {
             if let Some(ks) = (*SOCKET_TABLE[idx].socket.get()).as_mut() {
                 // SAFETY: Preemption is disabled, we have exclusive access
-                let socket_opt = ks.handle.get();
-                if let Some(socket) = socket_opt.as_mut() {
+                // get() now returns Option<&mut TcpSocket>
+                if let Some(socket) = ks.handle.get() {
                     Some(f(socket))
                 } else {
                     None
