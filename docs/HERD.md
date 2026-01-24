@@ -4,7 +4,9 @@ Herd is a userspace process supervisor for managing background services. Named "
 
 ## Architecture
 
-Herd runs as a userspace binary at `/bin/herd`. The kernel can automatically start it after the network stack is initialized (controlled by `config::AUTO_START_HERD`, disabled by default due to scheduling issues).
+Herd runs as a userspace binary at `/bin/herd`. The kernel can automatically start it after the network stack is initialized (controlled by `config::AUTO_START_HERD`).
+
+> **Note**: Auto-start was previously disabled due to blocking issues. These have been fixed - see [HERD_BLOCKING_FIX.md](HERD_BLOCKING_FIX.md) for the full investigation and resolution.
 
 To enable automatic startup, set `AUTO_START_HERD = true` in `src/config.rs`.
 
