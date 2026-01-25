@@ -9,3 +9,5 @@ bootstrap/bin
 .opencode
 venv
 .aider*
+rust-std-akuma
+target-akuma
