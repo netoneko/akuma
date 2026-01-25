@@ -1,0 +1,15 @@
+[package]
+name = "akuma-boa"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "boa"
+path = "src/main.rs"
+
+[dependencies]
+boa_engine = "0.21"
+
+# Note: This crate targets aarch64-unknown-linux-musl (requires std)
+# Build with: cargo build --target aarch64-unknown-linux-musl
+

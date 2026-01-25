@@ -1,0 +1,14 @@
+[package]
+name = "std"
+version = "0.1.0"
+edition = "2021"
+
+# This crate provides a std-like interface on top of akuma syscalls.
+# It's named "std" so that `use std::...` works in dependent crates.
+
+[lib]
+name = "std"
+path = "src/lib.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }

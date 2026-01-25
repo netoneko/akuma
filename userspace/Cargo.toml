@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "libakuma",
+    "akuma-std",
     "echo2",
     "elftest",
     "hello",
@@ -10,6 +11,7 @@ members = [
     "stackstress",
     "stdcheck",
     "wget",
+    "boa"
 ]
 
 [profile.dev]

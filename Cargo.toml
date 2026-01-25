@@ -88,17 +88,3 @@ rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 # Fork based on v0.17.0 (commit 1eaaa136) with exposed handshake/extensions modules
 # After creating the branch, replace with your actual commit hash
 embedded-tls = { git = "https://github.com/netoneko/embedded-tls", branch = "expose-verifier-types" }
-[workspace]
-members = [
-    "src",
-    "userspace/boa"
-]
-
-resolver = "2"
-
-[[bin]]
-name = "akuma-boa"
-path = "userspace/boa/src/main.rs"
-[dependencies]
-boa = { version = "0.13", default-features = false, features = ["std"] }
-log = "0.4"

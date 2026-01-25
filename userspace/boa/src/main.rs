@@ -1,34 +1,55 @@
-use boa::runtime::{Runtime, Source};
+//! boa - JavaScript interpreter for akuma userspace
+//!
+//! A simple JavaScript file executor using the Boa engine.
+//!
+//! Usage: boa <script.js>
+//!
+//! Build: cargo build --target aarch64-unknown-linux-musl
+
+use boa_engine::{Context, Source};
+use std::env;
 use std::fs;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use std::process;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    
+    let args: Vec<String> = env::args().collect();
+
     if args.len() < 2 {
-        eprintln!("Usage: boa [script.js] or pipe JavaScript code through stdin");
-        return;
+        eprintln!("boa: JavaScript interpreter for akuma");
+        eprintln!("Usage: boa <script.js>");
+        process::exit(1);
     }
 
-    // Try to read from file first
-    let script_path = PathBuf::from(&args[1]);
-    let source_code = if script_path.exists() {
-        fs::read_to_string(script_path).expect("Failed to read script file")
-    } else {
-        // Fallback to reading from stdin
-        println!("Reading JavaScript code from stdin...");
-        let mut input = String::new();
-        io::stdin().read_to_string(&mut input).expect("Failed to read from stdin");
-        input
+    let script_path = &args[1];
+
+    // Read the script file
+    let source_code = match fs::read_to_string(script_path) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error reading file '{}': {}", script_path, e);
+            process::exit(1);
+        }
     };
 
-    // Create and run the runtime
-    let mut runtime = Runtime::new();
-    let result = runtime.eval(Source::from_bytes(source_code.as_bytes()));
+    // Create JavaScript context and evaluate
+    let mut context = Context::default();
 
-    match result {
-        Ok(value) => println!("Result: {}", value),
-        Err(e) => eprintln!("Error: {}", e),
+    match context.eval(Source::from_bytes(&source_code)) {
+        Ok(result) => {
+            // Try to display the result
+            match result.to_string(&mut context) {
+                Ok(s) => {
+                    let output = s.to_std_string_escaped();
+                    if output != "undefined" {
+                        println!("{}", output);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Err(e) => {
+            eprintln!("JavaScript Error: {e}");
+            process::exit(1);
+        }
     }
 }
