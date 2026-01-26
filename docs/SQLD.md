@@ -2,6 +2,18 @@
 
 `sqld` is a userspace SQLite server that provides a TCP interface for executing SQL queries.
 
+## Quick Start
+
+```bash
+# Terminal 1: Start the server
+sqld local.sqlite
+
+# Terminal 2: Run queries
+sqld run "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL)"
+sqld run "INSERT INTO messages (message) VALUES ('meow')"
+sqld run "SELECT * FROM messages"
+```
+
 ## Architecture
 
 ```
@@ -31,7 +43,7 @@
 sqld local.sqlite
 ```
 
-This starts a TCP server on port 4321, opening (or creating) `local.sqlite`.
+Starts a TCP server on port 4321, opening (or creating) `local.sqlite`.
 
 ### Execute Queries
 
@@ -112,6 +124,14 @@ The custom VFS (`userspace/sqld/src/vfs.rs`) maps SQLite file operations to liba
 | xSync | (no-op) |
 | xLock/xUnlock | (no-op, single process) |
 
+### Journal Mode
+
+Journaling is disabled (`PRAGMA journal_mode=OFF`) because:
+- The kernel doesn't expose file deletion to userspace
+- Journal cleanup would fail, corrupting the database
+
+This means no crash recovery, but is acceptable for the embedded use case.
+
 ### Build Configuration
 
 SQLite is compiled with these flags for the `no_std` environment:
@@ -134,6 +154,15 @@ Custom C library stubs are provided in `userspace/sqld/sqlite3/` for functions l
 
 SQLite's `malloc`/`free`/`realloc` are implemented in Rust using the global allocator, exposed via `#[no_mangle]` FFI functions in `vfs.rs`.
 
+## Kernel Fixes Required
+
+Several kernel fixes were needed for sqld to work:
+
+1. **Loopback Routing** - `sys_connect` and `sys_accept` now route 127.x.x.x to the loopback network stack
+2. **Write-at-Position** - `sys_write` now respects the file position set by `lseek` instead of always overwriting from offset 0
+3. **Quoted Arguments** - Shell argument parsing now handles quoted strings properly (`"SELECT * FROM foo"`)
+4. **Duplicate argv[0]** - Fixed shell passing program path twice in argument list
+
 ## Files
 
 ```
@@ -155,6 +184,7 @@ userspace/sqld/
 ## Future Work
 
 - [ ] Add localtime support (requires kernel RTC integration)
-- [ ] Connection pooling / multiple clients
+- [ ] Implement `xDelete` for proper journal cleanup
+- [ ] Connection pooling / multiple concurrent clients
 - [ ] Prepared statements over the wire
 - [ ] Authentication
