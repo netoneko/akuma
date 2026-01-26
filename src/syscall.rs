@@ -591,13 +591,25 @@ fn sys_accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         return (-libc_errno::EBADF as i64) as u64;
     }
 
-    // Get the network stack
-    let stack = match crate::async_net::get_global_stack() {
-        Some(s) => s,
-        None => {
-            crate::console::print("[accept] ENETDOWN: no global stack\n");
-            socket::socket_dec_ref(socket_idx);
-            return (-libc_errno::ENETDOWN as i64) as u64;
+    // Get the appropriate network stack (loopback for 127.x.x.x)
+    let is_loopback = local_addr.ip[0] == 127;
+    let stack = if is_loopback {
+        match crate::async_net::get_loopback_stack() {
+            Some(s) => s,
+            None => {
+                crate::console::print("[accept] ENETDOWN: no loopback stack\n");
+                socket::socket_dec_ref(socket_idx);
+                return (-libc_errno::ENETDOWN as i64) as u64;
+            }
+        }
+    } else {
+        match crate::async_net::get_global_stack() {
+            Some(s) => s,
+            None => {
+                crate::console::print("[accept] ENETDOWN: no global stack\n");
+                socket::socket_dec_ref(socket_idx);
+                return (-libc_errno::ENETDOWN as i64) as u64;
+            }
         }
     };
 
@@ -686,12 +698,24 @@ fn sys_connect(fd: u32, addr_ptr: u64, addr_len: usize) -> u64 {
         return (-libc_errno::EBADF as i64) as u64;
     }
 
-    // Get the network stack
-    let stack = match crate::async_net::get_global_stack() {
-        Some(s) => s,
-        None => {
-            socket::socket_dec_ref(socket_idx);
-            return (-libc_errno::ENETDOWN as i64) as u64;
+    // Get the appropriate network stack (loopback for 127.x.x.x)
+    let is_loopback = remote_addr.ip[0] == 127;
+    let stack = if is_loopback {
+        match crate::async_net::get_loopback_stack() {
+            Some(s) => s,
+            None => {
+                socket::socket_dec_ref(socket_idx);
+                crate::safe_print!(64, "[sys_connect] No loopback stack available\n");
+                return (-libc_errno::ENETDOWN as i64) as u64;
+            }
+        }
+    } else {
+        match crate::async_net::get_global_stack() {
+            Some(s) => s,
+            None => {
+                socket::socket_dec_ref(socket_idx);
+                return (-libc_errno::ENETDOWN as i64) as u64;
+            }
         }
     };
 
