@@ -244,6 +244,7 @@ unsafe extern "C" fn akuma_vfs_open(
     flags: c_int,
     _p_out_flags: *mut c_int,
 ) -> c_int {
+    libakuma::print("sqld: VFS xOpen called\n");
     let akuma_file = file as *mut AkumaFile;
 
     // Convert flags
@@ -257,20 +258,28 @@ unsafe extern "C" fn akuma_vfs_open(
 
     // Get path as str
     if z_name.is_null() {
+        libakuma::print("sqld: VFS xOpen: null path\n");
         return SQLITE_CANTOPEN;
     }
     
     let path = cstr_to_str(z_name);
     if path.is_empty() {
+        libakuma::print("sqld: VFS xOpen: empty path\n");
         return SQLITE_CANTOPEN;
     }
+
+    libakuma::print("sqld: VFS xOpen: ");
+    libakuma::print(path);
+    libakuma::print("\n");
 
     // Open the file
     let fd = open(path, open_mode);
     if fd < 0 {
+        libakuma::print("sqld: VFS xOpen: open failed\n");
         return SQLITE_CANTOPEN;
     }
 
+    libakuma::print("sqld: VFS xOpen: success\n");
     (*akuma_file).base.pMethods = &AKUMA_IO_METHODS;
     (*akuma_file).fd = fd;
 
@@ -567,10 +576,35 @@ pub fn init() -> Result<(), &'static str> {
         // Initialize SQLite (this will call sqlite3_os_init which registers our VFS)
         let rc = sqlite3_initialize();
         if rc != SQLITE_OK {
+            libakuma::print("sqld: sqlite3_initialize failed with code ");
+            print_rc(rc);
+            libakuma::print("\n");
             return Err("Failed to initialize SQLite");
         }
 
         Ok(())
+    }
+}
+
+fn print_rc(rc: c_int) {
+    let mut buf = [0u8; 12];
+    let mut i = 0;
+    let mut num = if rc < 0 { (-rc) as u32 } else { rc as u32 };
+    if num == 0 {
+        libakuma::print("0");
+        return;
+    }
+    while num > 0 {
+        buf[i] = b'0' + (num % 10) as u8;
+        num /= 10;
+        i += 1;
+    }
+    if rc < 0 {
+        libakuma::print("-");
+    }
+    while i > 0 {
+        i -= 1;
+        libakuma::write(libakuma::fd::STDOUT, &buf[i..i+1]);
     }
 }
 
@@ -588,6 +622,7 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
         path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
         
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+        libakuma::print("sqld: Calling sqlite3_open_v2...\n");
         let rc = sqlite3_open_v2(
             path_buf.as_ptr() as *const c_char,
             &mut db,
@@ -596,9 +631,13 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
         );
         
         if rc != SQLITE_OK {
+            libakuma::print("sqld: sqlite3_open_v2 failed with code ");
+            print_rc(rc);
+            libakuma::print("\n");
             return Err("Failed to open database");
         }
         
+        libakuma::print("sqld: sqlite3_open_v2 succeeded\n");
         Ok(db)
     }
 }
@@ -619,6 +658,7 @@ pub fn list_tables(db: *mut sqlite3) -> Result<alloc::vec::Vec<alloc::string::St
         let sql = b"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\0";
         let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
         
+        libakuma::print("sqld: Preparing SQL statement...\n");
         let rc = sqlite3_prepare_v2(
             db,
             sql.as_ptr() as *const c_char,
@@ -628,8 +668,12 @@ pub fn list_tables(db: *mut sqlite3) -> Result<alloc::vec::Vec<alloc::string::St
         );
         
         if rc != SQLITE_OK {
+            libakuma::print("sqld: sqlite3_prepare_v2 failed with code ");
+            print_rc(rc);
+            libakuma::print("\n");
             return Err("Failed to prepare statement");
         }
+        libakuma::print("sqld: Statement prepared, stepping...\n");
         
         let mut tables = Vec::new();
         
@@ -639,11 +683,18 @@ pub fn list_tables(db: *mut sqlite3) -> Result<alloc::vec::Vec<alloc::string::St
                 let text = sqlite3_column_text(stmt, 0);
                 if !text.is_null() {
                     let name = cstr_to_str(text);
+                    libakuma::print("sqld: Found table: ");
+                    libakuma::print(name);
+                    libakuma::print("\n");
                     tables.push(String::from(name));
                 }
             } else if rc == SQLITE_DONE {
+                libakuma::print("sqld: Query complete\n");
                 break;
             } else {
+                libakuma::print("sqld: sqlite3_step failed with code ");
+                print_rc(rc);
+                libakuma::print("\n");
                 sqlite3_finalize(stmt);
                 return Err("Error stepping statement");
             }

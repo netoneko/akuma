@@ -13,5 +13,6 @@ cp target/aarch64-unknown-none/release/stdcheck ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/elftest ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/httpd ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/wget ../bootstrap/bin/
+cp target/aarch64-unknown-none/release/sqld ../bootstrap/bin/
 
-echo "Built and copied: hello, echo2, stackstress, stdcheck, elftest, httpd, wget"
+echo "Built and copied: hello, echo2, stackstress, stdcheck, elftest, httpd, wget, sqld"

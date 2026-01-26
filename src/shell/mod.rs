@@ -559,16 +559,12 @@ where
     // Streaming enabled - do the full check
     match check_streamable_command(line, registry).await {
         StreamableCommand::External(bin_path) => {
-            // Parse args from the command line
+            // Parse args from the command line (kernel adds argv[0] automatically)
             let trimmed = trim_bytes(line);
             let (_cmd_name, args_bytes) = split_first_word(trimmed);
             let arg_strings = parse_args(args_bytes);
-            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
-            full_args.push(&bin_path);  // argv[0] is the program path
-            for arg in &arg_strings {
-                full_args.push(arg.as_str());
-            }
-            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
+            let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
+            let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
             // Execute with streaming output
             let success = execute_external_streaming(&bin_path, args_slice, None, _output).await.is_ok();
@@ -650,15 +646,10 @@ async fn execute_pipeline_internal(
         };
 
         if let Some(bin_path) = find_executable(cmd_name_str).await {
-            // Found an executable in /bin - run it
-            // Parse command line args (including program name as argv[0])
+            // Found an executable in /bin - run it (kernel adds argv[0] automatically)
             let arg_strings = parse_args(args);
-            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
-            full_args.push(&bin_path);  // argv[0] is the program path
-            for arg in &arg_strings {
-                full_args.push(arg.as_str());
-            }
-            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
+            let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
+            let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
             if ctx.async_exec {
                 match execute_external(&bin_path, args_slice, stdin_slice, &mut stdout).await {

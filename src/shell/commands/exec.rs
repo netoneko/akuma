@@ -62,14 +62,10 @@ impl Command for ExecCommand {
                 }
             };
 
-            // Parse remaining arguments
+            // Parse remaining arguments (kernel adds argv[0] automatically)
             let arg_strings = parse_exec_args(remaining_args);
-            let mut full_args: Vec<&str> = Vec::with_capacity(arg_strings.len() + 1);
-            full_args.push(path);  // argv[0] is the program path
-            for arg in &arg_strings {
-                full_args.push(arg.as_str());
-            }
-            let args_slice: Option<&[&str]> = if full_args.is_empty() { None } else { Some(&full_args) };
+            let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
+            let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
 
             // Check if user threads are available for process execution
             let available = crate::threading::user_threads_available();
