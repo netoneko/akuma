@@ -62,15 +62,15 @@ long long llrint(double x);
 long lround(double x);
 long long llround(double x);
 
-/* Classification */
+/* Classification - declare as functions, use builtins for macros */
 int isnan(double x);
 int isinf(double x);
 int isfinite(double x);
 
-/* Macros for classification - use functions */
-#define isnan(x) isnan(x)
-#define isinf(x) isinf(x)
-#define isfinite(x) isfinite(x)
-#define signbit(x) ((x) < 0)
+/* Use compiler builtins for macros */
+#define isnan(x) __builtin_isnan(x)
+#define isinf(x) __builtin_isinf(x)
+#define isfinite(x) __builtin_isfinite(x)
+#define signbit(x) __builtin_signbit(x)
 
 #endif /* _MATH_H */

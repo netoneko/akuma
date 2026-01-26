@@ -19,7 +19,7 @@ use runtime::{JSContext, JSValue, Runtime};
 // Debug Configuration
 // ============================================================================
 
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
 #[inline]
 fn debug(msg: &str) {

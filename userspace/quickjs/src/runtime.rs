@@ -14,7 +14,7 @@ use core::ptr;
 use libakuma::{close, fstat, open, open_flags, read_fd};
 
 // Debug configuration
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
 #[inline]
 fn debug(msg: &str) {
@@ -130,6 +130,12 @@ pub struct JSRuntime {
 #[repr(C)]
 pub struct JSContext {
     _private: [u8; 0],
+}
+
+/// Reference count header - first field of all ref-counted objects
+#[repr(C)]
+pub struct JSRefCountHeader {
+    pub ref_count: i32,
 }
 
 /// JSValue union (for 64-bit, non-NaN-boxing mode)
@@ -325,6 +331,10 @@ impl Runtime {
         unsafe {
             debug("qjs: eval() enter\n");
             
+            // Create null-terminated code string
+            let mut code_buf = alloc::vec![0u8; code.len() + 1];
+            code_buf[..code.len()].copy_from_slice(code.as_bytes());
+            
             // Create null-terminated filename
             let mut filename_buf = alloc::vec![0u8; filename.len() + 1];
             filename_buf[..filename.len()].copy_from_slice(filename.as_bytes());
@@ -332,7 +342,7 @@ impl Runtime {
             debug("qjs: calling JS_Eval\n");
             let result = JS_Eval(
                 self.ctx,
-                code.as_ptr() as *const c_char,
+                code_buf.as_ptr() as *const c_char,
                 code.len(),
                 filename_buf.as_ptr() as *const c_char,
                 JS_EVAL_TYPE_GLOBAL,
@@ -373,10 +383,29 @@ impl Runtime {
         }
     }
 
-    /// Free a JSValue
+    /// Free a JSValue (only if it has a ref count, i.e., is heap-allocated)
+    /// This mirrors the C static inline JS_FreeValue which:
+    /// 1. Checks if value has ref count (negative tag)
+    /// 2. Decrements ref count
+    /// 3. Only calls __JS_FreeValue if ref count reaches 0
     pub fn free_value(&self, val: JSValue) {
-        unsafe {
-            JS_FreeValue(self.ctx, val);
+        // JS_TAG_FIRST = -11, values with tag >= JS_TAG_FIRST (as unsigned) have ref counts
+        // This means negative tags (objects, strings, etc.) need freeing
+        // Positive tags (int, bool, null, undefined, float64) don't need freeing
+        const JS_TAG_FIRST: i64 = -11;
+        if (val.tag as u64) >= (JS_TAG_FIRST as u64) {
+            unsafe {
+                // Get the pointer to the object header (contains ref count)
+                let ptr = val.u.ptr as *mut JSRefCountHeader;
+                if !ptr.is_null() {
+                    // Decrement ref count
+                    (*ptr).ref_count -= 1;
+                    // Only free if ref count reached 0
+                    if (*ptr).ref_count <= 0 {
+                        JS_FreeValue(self.ctx, val);
+                    }
+                }
+            }
         }
     }
 
@@ -419,8 +448,11 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         unsafe {
+            debug("qjs: JS_FreeContext\n");
             JS_FreeContext(self.ctx);
+            debug("qjs: JS_FreeRuntime\n");
             JS_FreeRuntime(self.rt);
+            debug("qjs: Runtime dropped\n");
         }
     }
 }
