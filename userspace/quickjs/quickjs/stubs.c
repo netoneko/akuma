@@ -1238,6 +1238,7 @@ pthread_t pthread_self(void) {
 
 /* abort and exit */
 void abort(void) {
+    akuma_print("ABORT called!\n", 14);
     akuma_exit(134); /* 128 + SIGABRT(6) */
     while(1) {} /* Should not reach here */
 }
@@ -1254,7 +1255,11 @@ void _exit(int status) {
 
 /* assert */
 void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function) {
-    (void)assertion; (void)file; (void)line; (void)function;
+    akuma_print("ASSERT FAILED: ", 15);
+    if (assertion) akuma_print(assertion, strlen(assertion));
+    akuma_print(" in ", 4);
+    if (file) akuma_print(file, strlen(file));
+    akuma_print("\n", 1);
     abort();
 }
 

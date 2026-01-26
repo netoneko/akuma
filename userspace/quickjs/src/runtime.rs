@@ -13,6 +13,16 @@ use core::ptr;
 
 use libakuma::{close, fstat, open, open_flags, read_fd};
 
+// Debug configuration
+const DEBUG: bool = true;
+
+#[inline]
+fn debug(msg: &str) {
+    if DEBUG {
+        libakuma::print(msg);
+    }
+}
+
 // ============================================================================
 // C Library Memory Functions (for QuickJS)
 // ============================================================================
@@ -278,33 +288,28 @@ impl Runtime {
     /// Create a new QuickJS runtime with a context
     pub fn new() -> Option<Self> {
         unsafe {
+            debug("qjs: JS_NewRuntime\n");
             let rt = JS_NewRuntime();
             if rt.is_null() {
+                debug("qjs: JS_NewRuntime returned NULL\n");
                 return None;
             }
+            debug("qjs: JS_NewRuntime OK\n");
 
             // Set a reasonable stack size
             JS_SetMaxStackSize(rt, 256 * 1024);
+            debug("qjs: JS_SetMaxStackSize OK\n");
 
+            debug("qjs: JS_NewContext\n");
+            // JS_NewContext internally calls JS_NewContextRaw + all JS_AddIntrinsic* functions
+            // So we don't need to add intrinsics manually
             let ctx = JS_NewContext(rt);
             if ctx.is_null() {
+                debug("qjs: JS_NewContext returned NULL\n");
                 JS_FreeRuntime(rt);
                 return None;
             }
-
-            // Add standard intrinsics
-            JS_AddIntrinsicBaseObjects(ctx);
-            JS_AddIntrinsicDate(ctx);
-            JS_AddIntrinsicEval(ctx);
-            JS_AddIntrinsicStringNormalize(ctx);
-            JS_AddIntrinsicRegExpCompiler(ctx);
-            JS_AddIntrinsicRegExp(ctx);
-            JS_AddIntrinsicJSON(ctx);
-            JS_AddIntrinsicProxy(ctx);
-            JS_AddIntrinsicMapSet(ctx);
-            JS_AddIntrinsicTypedArrays(ctx);
-            JS_AddIntrinsicPromise(ctx);
-            JS_AddIntrinsicBigInt(ctx);
+            debug("qjs: JS_NewContext OK\n");
 
             Some(Runtime { rt, ctx })
         }
@@ -318,10 +323,13 @@ impl Runtime {
     /// Evaluate JavaScript code
     pub fn eval(&self, code: &str, filename: &str) -> Result<JSValue, String> {
         unsafe {
+            debug("qjs: eval() enter\n");
+            
             // Create null-terminated filename
             let mut filename_buf = alloc::vec![0u8; filename.len() + 1];
             filename_buf[..filename.len()].copy_from_slice(filename.as_bytes());
 
+            debug("qjs: calling JS_Eval\n");
             let result = JS_Eval(
                 self.ctx,
                 code.as_ptr() as *const c_char,
@@ -329,8 +337,10 @@ impl Runtime {
                 filename_buf.as_ptr() as *const c_char,
                 JS_EVAL_TYPE_GLOBAL,
             );
+            debug("qjs: JS_Eval returned\n");
 
             if result.is_exception() {
+                debug("qjs: got exception\n");
                 // Get the exception
                 let exc = JS_GetException(self.ctx);
                 let err_str = self.value_to_string(exc);
@@ -338,6 +348,7 @@ impl Runtime {
                 return Err(err_str);
             }
 
+            debug("qjs: eval success\n");
             Ok(result)
         }
     }
