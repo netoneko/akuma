@@ -112,11 +112,12 @@ The QuickJS engine requires C library functions. These are provided via `stubs.c
 
 | Category | Functions |
 |----------|-----------|
-| Memory | `memset`, `memcpy`, `memmove`, `memcmp` |
-| String | `strlen`, `strcmp`, `strcpy`, `strcat`, `strdup` |
-| Math | `sin`, `cos`, `tan`, `sqrt`, `pow`, `exp`, `log`, `floor`, `ceil` |
-| I/O | `printf`, `snprintf`, `puts`, `putchar` |
-| Time | `time`, `gettimeofday`, `localtime_r` |
+| Memory | `memset`, `memcpy`, `memmove`, `memcmp`, `memchr` |
+| String | `strlen`, `strcmp`, `strcpy`, `strcat`, `strdup`, `strndup` |
+| Math | `sin`, `cos`, `tan`, `sqrt`, `pow`, `exp`, `log`, `floor`, `ceil`, `round`, `trunc` |
+| I/O | `printf`, `snprintf`, `vsnprintf`, `puts`, `putchar` |
+| Time | `time`, `gettimeofday`, `localtime_r`, `gmtime_r` |
+| Conversion | `strtol`, `strtoll`, `strtod`, `atoi` |
 
 ### Memory Allocation
 
@@ -124,13 +125,40 @@ Memory is allocated via Rust's global allocator, exposed through FFI:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void { ... }
+pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+    // Allocate size + 8 bytes, store size in header
+    let layout = Layout::from_size_align(size + 8, 8)?;
+    let ptr = alloc(layout);
+    *(ptr as *mut usize) = size;
+    ptr.add(8) as *mut c_void
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn free(ptr: *mut c_void) { ... }
+pub unsafe extern "C" fn free(ptr: *mut c_void) {
+    // Retrieve size from header, deallocate
+    let real_ptr = (ptr as *mut u8).sub(8);
+    let size = *(real_ptr as *const usize);
+    dealloc(real_ptr, Layout::from_size_align(size + 8, 8)?);
+}
+```
 
-#[no_mangle]
-pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void { ... }
+### JSValue Reference Counting
+
+QuickJS uses reference counting for heap-allocated values. The Rust runtime implements
+proper ref-count handling to avoid double-frees:
+
+```rust
+pub fn free_value(&self, val: JSValue) {
+    const JS_TAG_FIRST: i64 = -11;
+    // Only heap values (negative tags) have ref counts
+    if (val.tag as u64) >= (JS_TAG_FIRST as u64) {
+        let header = val.u.ptr as *mut JSRefCountHeader;
+        (*header).ref_count -= 1;
+        if (*header).ref_count <= 0 {
+            __JS_FreeValue(ctx, val);
+        }
+    }
+}
 ```
 
 ### Build Configuration
@@ -144,7 +172,7 @@ QuickJS is compiled with these flags for the `no_std` environment:
 
 CONFIG_VERSION="2024-01-13"
 CONFIG_BIGNUM      # Enable BigInt support
-EMSCRIPTEN         # Minimal runtime mode
+EMSCRIPTEN         # Minimal runtime mode (disables atomics/threads)
 ```
 
 ### File Reading
@@ -154,13 +182,33 @@ Scripts are read using libakuma file syscalls:
 ```rust
 let fd = open(path, O_RDONLY);
 let stat = fstat(fd)?;
-let content = read_fd(fd, buffer);
+let mut content = vec![0u8; stat.st_size];
+read_fd(fd, &mut content);
 close(fd);
 ```
 
+## Key Implementation Notes
+
+### Avoiding Double Initialization
+
+`JS_NewContext()` internally calls all `JS_AddIntrinsic*` functions. Calling them
+again after context creation causes crashes. The solution is to use `JS_NewContext()`
+directly without manual intrinsic setup.
+
+### FFI Symbol Linking
+
+QuickJS exports `__JS_FreeValue` as the actual implementation, while `JS_FreeValue`
+is a static inline wrapper. Rust FFI uses `#[link_name = "__JS_FreeValue"]` to
+bind to the correct symbol.
+
+### Math Function Macros
+
+`isnan`, `isinf`, `isfinite` are implemented using `__builtin_*` compiler intrinsics
+to avoid circular macro definitions.
+
 ## Binary Size
 
-The compiled `qjs` binary is approximately 700KB, which includes:
+The compiled `qjs` binary is approximately 700KB:
 - QuickJS engine (~600KB)
 - C library stubs (~40KB)
 - Rust runtime and libakuma (~60KB)
@@ -181,10 +229,11 @@ The compiled `qjs` binary is approximately 700KB, which includes:
 ```
 userspace/quickjs/
 ├── Cargo.toml          # Package manifest
+├── README.md           # This file
 ├── build.rs            # QuickJS compilation script
 ├── src/
-│   ├── main.rs         # CLI entry point
-│   └── runtime.rs      # QuickJS FFI bindings
+│   ├── main.rs         # CLI entry point, console setup
+│   └── runtime.rs      # QuickJS FFI bindings, memory
 └── quickjs/
     ├── quickjs.c       # QuickJS engine
     ├── quickjs.h       # QuickJS headers
