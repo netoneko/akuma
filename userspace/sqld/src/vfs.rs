@@ -704,3 +704,95 @@ pub fn list_tables(db: *mut sqlite3) -> Result<alloc::vec::Vec<alloc::string::St
         Ok(tables)
     }
 }
+
+// Additional FFI for column names
+extern "C" {
+    pub fn sqlite3_column_name(stmt: *mut sqlite3_stmt, col: c_int) -> *const c_char;
+    pub fn sqlite3_changes(db: *mut sqlite3) -> c_int;
+}
+
+/// Query result with column names and rows
+pub struct QueryResult {
+    pub columns: alloc::vec::Vec<alloc::string::String>,
+    pub rows: alloc::vec::Vec<alloc::vec::Vec<alloc::string::String>>,
+    pub changes: u32,
+}
+
+/// Execute SQL and return results
+pub fn execute_sql(db: *mut sqlite3, sql: &str) -> Result<QueryResult, alloc::string::String> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    
+    unsafe {
+        // Create null-terminated SQL
+        let mut sql_buf = alloc::vec![0u8; sql.len() + 1];
+        sql_buf[..sql.len()].copy_from_slice(sql.as_bytes());
+        
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        
+        let rc = sqlite3_prepare_v2(
+            db,
+            sql_buf.as_ptr() as *const c_char,
+            -1,
+            &mut stmt,
+            ptr::null_mut(),
+        );
+        
+        if rc != SQLITE_OK {
+            let err = sqlite3_errmsg(db);
+            let msg = if !err.is_null() {
+                String::from(cstr_to_str(err))
+            } else {
+                String::from("Failed to prepare statement")
+            };
+            return Err(msg);
+        }
+        
+        // Get column names
+        let col_count = sqlite3_column_count(stmt);
+        let mut columns = Vec::new();
+        for i in 0..col_count {
+            let name = sqlite3_column_name(stmt, i);
+            if !name.is_null() {
+                columns.push(String::from(cstr_to_str(name)));
+            } else {
+                columns.push(String::from("?"));
+            }
+        }
+        
+        // Execute and collect rows
+        let mut rows = Vec::new();
+        
+        loop {
+            let rc = sqlite3_step(stmt);
+            if rc == SQLITE_ROW {
+                let mut row = Vec::new();
+                for i in 0..col_count {
+                    let text = sqlite3_column_text(stmt, i);
+                    if !text.is_null() {
+                        row.push(String::from(cstr_to_str(text)));
+                    } else {
+                        row.push(String::from("NULL"));
+                    }
+                }
+                rows.push(row);
+            } else if rc == SQLITE_DONE {
+                break;
+            } else {
+                let err = sqlite3_errmsg(db);
+                let msg = if !err.is_null() {
+                    String::from(cstr_to_str(err))
+                } else {
+                    String::from("Error executing statement")
+                };
+                sqlite3_finalize(stmt);
+                return Err(msg);
+            }
+        }
+        
+        let changes = sqlite3_changes(db) as u32;
+        sqlite3_finalize(stmt);
+        
+        Ok(QueryResult { columns, rows, changes })
+    }
+}
