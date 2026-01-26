@@ -397,6 +397,7 @@ unsafe extern "C" fn akuma_read(
     // Seek to position
     let pos = lseek(fd, offset, seek_mode::SEEK_SET);
     if pos < 0 {
+        libakuma::print("sqld: VFS xRead: seek failed\n");
         return SQLITE_IOERR_READ;
     }
 
@@ -405,7 +406,22 @@ unsafe extern "C" fn akuma_read(
     let n = read_fd(fd, buf_slice);
     
     if n < 0 {
+        libakuma::print("sqld: VFS xRead: read failed\n");
         return SQLITE_IOERR_READ;
+    }
+    
+    // Debug: show first few bytes if reading from offset 0
+    if offset == 0 && n >= 16 {
+        libakuma::print("sqld: VFS xRead header: ");
+        for i in 0..16 {
+            let b = buf_slice[i];
+            if b >= 0x20 && b < 0x7f {
+                libakuma::write(libakuma::fd::STDOUT, &[b]);
+            } else {
+                libakuma::print(".");
+            }
+        }
+        libakuma::print("\n");
     }
     
     if (n as c_int) < amt {
@@ -428,9 +444,33 @@ unsafe extern "C" fn akuma_write(
     let akuma_file = file as *mut AkumaFile;
     let fd = (*akuma_file).fd;
 
+    libakuma::print("sqld: VFS xWrite fd=");
+    print_num(fd);
+    libakuma::print(" offset=");
+    print_num(offset as i32);
+    libakuma::print(" amt=");
+    print_num(amt);
+    libakuma::print("\n");
+    
+    // Debug: show first few bytes if writing to offset 0
+    if offset == 0 {
+        let buf_slice = core::slice::from_raw_parts(buf as *const u8, amt as usize);
+        libakuma::print("sqld: VFS xWrite header: ");
+        for i in 0..16.min(amt as usize) {
+            let b = buf_slice[i];
+            if b >= 0x20 && b < 0x7f {
+                libakuma::write(libakuma::fd::STDOUT, &[b]);
+            } else {
+                libakuma::print(".");
+            }
+        }
+        libakuma::print("\n");
+    }
+
     // Seek to position
     let pos = lseek(fd, offset, seek_mode::SEEK_SET);
     if pos < 0 {
+        libakuma::print("sqld: VFS xWrite: seek failed\n");
         return SQLITE_IOERR_WRITE;
     }
 
@@ -439,10 +479,37 @@ unsafe extern "C" fn akuma_write(
     let n = write_fd(fd, buf_slice);
     
     if n < 0 || (n as c_int) != amt {
+        libakuma::print("sqld: VFS xWrite: write failed n=");
+        print_num(n as i32);
+        libakuma::print("\n");
         return SQLITE_IOERR_WRITE;
     }
     
     SQLITE_OK
+}
+
+fn print_num(n: i32) {
+    if n < 0 {
+        libakuma::print("-");
+        print_num(-n);
+        return;
+    }
+    if n == 0 {
+        libakuma::print("0");
+        return;
+    }
+    let mut buf = [0u8; 12];
+    let mut i = 0;
+    let mut num = n as u32;
+    while num > 0 {
+        buf[i] = b'0' + (num % 10) as u8;
+        num /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        libakuma::write(libakuma::fd::STDOUT, &buf[i..i+1]);
+    }
 }
 
 unsafe extern "C" fn akuma_truncate(_file: *mut sqlite3_file, _size: i64) -> c_int {
@@ -638,6 +705,24 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
         }
         
         libakuma::print("sqld: sqlite3_open_v2 succeeded\n");
+        
+        // Disable journaling - our VFS doesn't support file deletion
+        // which causes journal cleanup to fail and corrupt the database
+        let pragma = b"PRAGMA journal_mode=OFF\0";
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(
+            db,
+            pragma.as_ptr() as *const c_char,
+            -1,
+            &mut stmt,
+            ptr::null_mut(),
+        );
+        if rc == SQLITE_OK {
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            libakuma::print("sqld: Journal mode disabled\n");
+        }
+        
         Ok(db)
     }
 }

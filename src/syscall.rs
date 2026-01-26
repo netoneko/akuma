@@ -445,6 +445,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // Write to file
             let path = file.path.clone();
             let flags = file.flags;
+            let position = file.position;
 
             // Check if file was opened for writing
             use crate::process::open_flags;
@@ -453,15 +454,40 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
 
             // For append mode, always append
-            // For regular write, we overwrite (simple implementation)
-            let result = if flags & open_flags::O_APPEND != 0 {
-                crate::fs::append_file(&path, buf)
-            } else {
-                crate::fs::write_file(&path, buf)
+            if flags & open_flags::O_APPEND != 0 {
+                match crate::fs::append_file(&path, buf) {
+                    Ok(()) => return count as u64,
+                    Err(_) => return (-libc_errno::EIO as i64) as u64,
+                }
+            }
+
+            // For regular write, we need to write at the current position
+            // Read existing file, modify at position, write back
+            let mut file_data = match crate::fs::read_file(&path) {
+                Ok(data) => data,
+                Err(_) => alloc::vec::Vec::new(), // File doesn't exist or is empty
             };
 
-            match result {
-                Ok(()) => count as u64,
+            // Extend file if writing past end
+            let end_pos = position + count;
+            if end_pos > file_data.len() {
+                file_data.resize(end_pos, 0);
+            }
+
+            // Copy data at position
+            file_data[position..end_pos].copy_from_slice(buf);
+
+            // Write back
+            match crate::fs::write_file(&path, &file_data) {
+                Ok(()) => {
+                    // Update file position
+                    proc.update_fd(fd_num as u32, |entry| {
+                        if let FileDescriptor::File(f) = entry {
+                            f.position += count;
+                        }
+                    });
+                    count as u64
+                }
                 Err(_) => (-libc_errno::EIO as i64) as u64,
             }
         }
