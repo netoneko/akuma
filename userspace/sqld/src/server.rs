@@ -94,9 +94,11 @@ fn handle_connection(stream: TcpStream, db: *mut vfs::sqlite3) {
         }
     };
     
-    print("sqld: Executing: ");
+    print("sqld: Executing (");
+    print_num(sql.len());
+    print(" bytes): [");
     print(sql);
-    print("\n");
+    print("]\n");
     
     // Execute SQL
     match vfs::execute_sql(db, sql) {

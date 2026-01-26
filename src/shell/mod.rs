@@ -350,18 +350,40 @@ fn parse_args(input: &[u8]) -> Vec<String> {
         return args;
     }
     
-    // Simple whitespace splitting
+    // Parse with quote handling
     let mut current = Vec::new();
+    let mut in_quote: Option<u8> = None; // The quote character we're inside, if any
+    
     for &byte in trimmed {
-        if byte.is_ascii_whitespace() {
-            if !current.is_empty() {
-                if let Ok(s) = core::str::from_utf8(&current) {
-                    args.push(String::from(s));
+        match in_quote {
+            Some(quote_char) => {
+                // We're inside a quoted string
+                if byte == quote_char {
+                    // End of quoted section
+                    in_quote = None;
+                } else {
+                    // Add character to current argument (don't include quotes)
+                    current.push(byte);
                 }
-                current.clear();
             }
-        } else {
-            current.push(byte);
+            None => {
+                // Not in a quoted string
+                if byte == b'"' || byte == b'\'' {
+                    // Start of quoted section
+                    in_quote = Some(byte);
+                } else if byte.is_ascii_whitespace() {
+                    // End of argument
+                    if !current.is_empty() {
+                        if let Ok(s) = core::str::from_utf8(&current) {
+                            args.push(String::from(s));
+                        }
+                        current.clear();
+                    }
+                } else {
+                    // Regular character
+                    current.push(byte);
+                }
+            }
         }
     }
     
