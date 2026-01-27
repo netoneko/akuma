@@ -3,7 +3,10 @@ console.log("");  // Blank line separates headers from body
 
 console.log("<pre>")
 console.log("Meow from Akuma! =^.^=");
-console.log("This is a JavaScript CGI script running on Akuma.");
+console.log("This is a JavaScript CGI script running on Akuma kernel and userspace httpd server.");
+console.log("The kernel is written in Rust and the userspace is written in Rust. This is a network first operating system.");
+console.log("Available packages: quickjs, httpd, sqld")
+console.log("Source code is available at <a href='https://github.com/netoneko/akuma'>https://github.com/netoneko/akuma</a>");
 console.log(`
                                               %#%:                +             
                                             #####%            %%=              
