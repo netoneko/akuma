@@ -13,11 +13,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::vec;
 
-use libakuma::net::{TcpListener, TcpStream, Error};
+use libakuma::net::{TcpListener, TcpStream, Error, Shutdown};
 use libakuma::{print, exit, open, read_fd, fstat, close, open_flags, lseek, seek_mode};
 use libakuma::{spawn_with_stdin, waitpid};
 
 const HTTP_PORT: u16 = 8080;
+
+/// Maximum size of CGI response in bytes (64KB default)
+const CGI_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// CGI process timeout in milliseconds (5 seconds)
+const CGI_TIMEOUT_MS: u32 = 5000;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -282,6 +288,9 @@ fn send_file(stream: &TcpStream, content: &[u8], content_type: &str, head_only: 
         stream.write_all(content)?;
     }
 
+    // Shutdown write side to flush and signal end of data
+    let _ = stream.shutdown(Shutdown::Write);
+    
     Ok(())
 }
 
@@ -302,7 +311,12 @@ fn send_error(stream: &TcpStream, code: u16, message: &str) -> Result<(), Error>
         code, message, body.len(), body
     );
 
-    stream.write_all(response.as_bytes())
+    stream.write_all(response.as_bytes())?;
+    
+    // Shutdown write side to flush and signal end of data
+    let _ = stream.shutdown(Shutdown::Write);
+    
+    Ok(())
 }
 
 // ============================================================================
@@ -375,30 +389,42 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
         }
     };
     
-    // Read output from child process, polling until process exits
+    // Read output from child process, polling until process exits AND no more data
     let mut output = Vec::new();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 4096];
     let mut process_exited = false;
     let mut attempts = 0;
-    const MAX_ATTEMPTS: u32 = 5000; // 5 seconds max
     
-    while attempts < MAX_ATTEMPTS {
-        // Try to read any available output
-        let n = read_fd(result.stdout_fd as i32, &mut buf);
-        if n > 0 {
-            output.extend_from_slice(&buf[..n as usize]);
+    while attempts < CGI_TIMEOUT_MS {
+        // Read ALL available data first (loop until no more data or size limit)
+        loop {
+            if output.len() >= CGI_MAX_RESPONSE_BYTES {
+                break;  // Size limit reached
+            }
+            let n = read_fd(result.stdout_fd as i32, &mut buf);
+            if n > 0 {
+                let bytes_to_add = (n as usize).min(CGI_MAX_RESPONSE_BYTES - output.len());
+                output.extend_from_slice(&buf[..bytes_to_add]);
+            } else {
+                break;  // No more data available right now
+            }
         }
         
         // Check if process has exited
         if let Some((_pid, _exit_code)) = waitpid(result.pid) {
             process_exited = true;
-            // Read any remaining output after process exit
+            // Process exited - do one more drain to catch any final output
             loop {
-                let n = read_fd(result.stdout_fd as i32, &mut buf);
-                if n <= 0 {
+                if output.len() >= CGI_MAX_RESPONSE_BYTES {
                     break;
                 }
-                output.extend_from_slice(&buf[..n as usize]);
+                let n = read_fd(result.stdout_fd as i32, &mut buf);
+                if n > 0 {
+                    let bytes_to_add = (n as usize).min(CGI_MAX_RESPONSE_BYTES - output.len());
+                    output.extend_from_slice(&buf[..bytes_to_add]);
+                } else {
+                    break;
+                }
             }
             break;
         }
@@ -410,6 +436,9 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
     
     // Close the stdout fd
     close(result.stdout_fd as i32);
+    
+    // Debug: print raw output captured
+    print(&format!("httpd: Raw CGI output captured: {} bytes\n", output.len()));
     
     // Send the CGI response
     if process_exited {
@@ -464,6 +493,16 @@ fn parse_cgi_output(output: &[u8]) -> (&str, &[u8]) {
 fn send_cgi_response(stream: &TcpStream, output: &[u8]) -> Result<(), Error> {
     let (content_type, body) = parse_cgi_output(output);
     
+    // Debug: print output and body info
+    print(&format!("httpd: CGI output len={}, body len={}\n", output.len(), body.len()));
+    print("httpd: === CGI BODY START ===\n");
+    if let Ok(body_str) = core::str::from_utf8(body) {
+        print(body_str);
+    } else {
+        print("<binary data>");
+    }
+    print("\nhttpd: === CGI BODY END ===\n");
+    
     let response = format!(
         "HTTP/1.0 200 OK\r\n\
          Content-Type: {}\r\n\
@@ -476,5 +515,9 @@ fn send_cgi_response(stream: &TcpStream, output: &[u8]) -> Result<(), Error> {
 
     stream.write_all(response.as_bytes())?;
     stream.write_all(body)?;
+    
+    // Shutdown write side to flush and signal end of data
+    let _ = stream.shutdown(Shutdown::Write);
+    
     Ok(())
 }

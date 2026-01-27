@@ -2273,9 +2273,10 @@ fn test_parallel_processes() -> bool {
         }
     }
 
+    let process_args: Option<&[&str]> = Some(&["10", "100"]);
     // Spawn first process using spawn_process_with_channel
     console::print("  Spawning process 1...");
-    let result1 = crate::process::spawn_process_with_channel("/bin/hello", None, None);
+    let result1 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
     
     let (tid1, channel1) = match result1 {
         Ok((tid, channel)) => {
@@ -2292,7 +2293,7 @@ fn test_parallel_processes() -> bool {
 
     // Spawn second process
     console::print("  Spawning process 2...");
-    let result2 = crate::process::spawn_process_with_channel("/bin/hello", None, None);
+    let result2 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
 
     let (tid2, channel2) = match result2 {
         Ok((tid, channel)) => {
