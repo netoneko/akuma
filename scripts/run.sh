@@ -3,7 +3,13 @@ set -e
 
 KERNEL_PATH="target/aarch64-unknown-none/release/akuma"
 
-runner = """qemu-system-aarch64 \
+if [ ! -f "$KERNEL_PATH" ]; then
+    echo "Kernel not found at $KERNEL_PATH"
+    echo "Run 'cargo build --release' first"
+    exit 1
+fi
+
+qemu-system-aarch64 \
   -semihosting \
   -machine virt \
   -cpu max \
@@ -17,4 +23,4 @@ runner = """qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on \
-  -kernel $KERNEL_PATH"""
+  -kernel $KERNEL_PATH
