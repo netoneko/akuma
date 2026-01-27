@@ -26,7 +26,6 @@ mod fs_tests;
 mod gic;
 mod irq;
 mod mmu;
-mod netcat_server;
 mod network;
 mod pmm;
 mod process;
