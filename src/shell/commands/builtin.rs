@@ -4,7 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -278,16 +278,6 @@ impl Command for HelpCommand {
                 .await;
             let _ = stdout
                 .write(b"  nslookup <host>       - DNS lookup with timing\r\n")
-                .await;
-            let _ = stdout.write(b"\r\nScripting commands:\r\n").await;
-            let _ = stdout
-                .write(b"  rhai <file>           - Execute a Rhai script\r\n")
-                .await;
-            let _ = stdout
-                .write(b"  Note: String interpolation (`Hello, ${x}`) not supported in no_std.\r\n")
-                .await;
-            let _ = stdout
-                .write(b"        Use concatenation instead: \"Hello, \" + x\r\n")
                 .await;
             let _ = stdout.write(b"\r\nPipeline and redirection:\r\n").await;
             let _ = stdout

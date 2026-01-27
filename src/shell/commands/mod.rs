@@ -6,7 +6,6 @@ pub mod builtin;
 pub mod exec;
 pub mod fs;
 pub mod net;
-pub mod scripting;
 
 use alloc::vec::Vec;
 
@@ -20,7 +19,6 @@ pub use builtin::{
 pub use exec::EXEC_CMD;
 pub use fs::{APPEND_CMD, CAT_CMD, DF_CMD, LS_CMD, MKDIR_CMD, MV_CMD, RM_CMD, WRITE_CMD};
 pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
-pub use scripting::RHAI_CMD;
 
 // ============================================================================
 // Command Registry
@@ -104,9 +102,6 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&CURL_CMD);
     registry.register(&NSLOOKUP_CMD);
     registry.register(&PKG_CMD);
-
-    // Scripting commands
-    registry.register(&RHAI_CMD);
 
     // Process execution commands
     registry.register(&EXEC_CMD);

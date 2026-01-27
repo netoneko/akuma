@@ -31,7 +31,6 @@ mod network;
 mod pmm;
 mod process;
 mod process_tests;
-mod rhai;
 mod rng;
 mod shell;
 mod shell_tests;
@@ -47,7 +46,6 @@ mod tls_rng;
 mod tls_verifier;
 mod vfs;
 mod virtio_hal;
-mod web_server;
 
 use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
@@ -752,9 +750,6 @@ fn run_async_main() -> ! {
     let mut runner_pinned = pin!(runner.run());
     let mut loopback_runner_pinned = pin!(loopback_runner.run());
     let mut ssh_pinned = pin!(ssh::run(stack));
-    // let mut web_pinned = pin!(web_server::run(stack));
-    // let mut web_loopback_pinned = pin!(web_server::run(loopback_stack));
-
     let mut mem_monitor_pinned = pin!(memory_monitor());
 
     // Enable IRQs for the main async loop
