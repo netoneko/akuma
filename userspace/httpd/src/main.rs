@@ -15,7 +15,7 @@ use alloc::vec;
 
 use libakuma::net::{TcpListener, TcpStream, Error};
 use libakuma::{print, exit, open, read_fd, fstat, close, open_flags, lseek, seek_mode};
-use libakuma::{spawn, waitpid};
+use libakuma::{spawn_with_stdin, waitpid};
 
 const HTTP_PORT: u16 = 8080;
 
@@ -60,8 +60,8 @@ fn main() {
 }
 
 fn handle_connection(stream: TcpStream) {
-    // Read request
-    let mut buf = [0u8; 1024];
+    // Read request (may need multiple reads for large POST bodies)
+    let mut buf = [0u8; 8192];
     let n = match stream.read(&mut buf) {
         Ok(n) => n,
         Err(_) => return,
@@ -94,10 +94,11 @@ fn handle_connection(stream: TcpStream) {
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
 
-    // Only support GET and HEAD
+    // Support GET, HEAD, and POST
     let is_head = match method {
         "GET" => false,
         "HEAD" => true,
+        "POST" => false,
         _ => {
             let _ = send_error(&stream, 405, "Method Not Allowed");
             return;
@@ -112,7 +113,19 @@ fn handle_connection(stream: TcpStream) {
 
     // Check for CGI request
     if path.starts_with("/cgi-bin/") {
-        handle_cgi_request(&stream, method, path);
+        // For POST requests, extract the body
+        let body = if method == "POST" {
+            extract_post_body(&buf[..n], &stream)
+        } else {
+            None
+        };
+        handle_cgi_request(&stream, method, path, body.as_deref());
+        return;
+    }
+
+    // POST only allowed for CGI
+    if method == "POST" {
+        let _ = send_error(&stream, 405, "Method Not Allowed");
         return;
     }
 
@@ -133,6 +146,61 @@ fn handle_connection(stream: TcpStream) {
             let _ = send_error(&stream, 404, "Not Found");
         }
     }
+}
+
+/// Extract POST body from request.
+/// Parses Content-Length header and reads the body.
+fn extract_post_body(initial_data: &[u8], stream: &TcpStream) -> Option<Vec<u8>> {
+    let request_str = core::str::from_utf8(initial_data).ok()?;
+    
+    // Find Content-Length header
+    let mut content_length: usize = 0;
+    for line in request_str.lines() {
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse().ok()?;
+            break;
+        }
+        if let Some(value) = line.strip_prefix("content-length:") {
+            content_length = value.trim().parse().ok()?;
+            break;
+        }
+    }
+    
+    if content_length == 0 {
+        return Some(Vec::new());
+    }
+    
+    // Find the body (after \r\n\r\n or \n\n)
+    let body_start = if let Some(pos) = request_str.find("\r\n\r\n") {
+        pos + 4
+    } else if let Some(pos) = request_str.find("\n\n") {
+        pos + 2
+    } else {
+        return None;
+    };
+    
+    let mut body = Vec::new();
+    
+    // Copy any body data already in initial_data
+    if body_start < initial_data.len() {
+        body.extend_from_slice(&initial_data[body_start..]);
+    }
+    
+    // Read more data if needed
+    let mut buf = [0u8; 1024];
+    while body.len() < content_length {
+        match stream.read(&mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                let remaining = content_length - body.len();
+                let to_read = n.min(remaining);
+                body.extend_from_slice(&buf[..to_read]);
+            }
+            Err(_) => break,
+        }
+    }
+    
+    Some(body)
 }
 
 fn read_file(path: &str) -> Result<Vec<u8>, i32> {
@@ -266,7 +334,7 @@ fn parse_path_and_query(path: &str) -> (&str, Option<&str>) {
 }
 
 /// Handle a CGI request by executing the script and returning its output.
-fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str) {
+fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option<&[u8]>) {
     // Parse path and query string
     let (script_path, query_string) = parse_path_and_query(path);
     
@@ -292,11 +360,11 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str) {
     let spawn_result = if let Some(interp) = interpreter {
         // Interpreted script: spawn interpreter with script as argument
         let args: Vec<&str> = vec![&fs_path, method, query_str];
-        spawn(interp, Some(&args))
+        spawn_with_stdin(interp, Some(&args), body)
     } else {
         // ELF binary: spawn directly
         let args: Vec<&str> = vec![method, query_str];
-        spawn(&fs_path, Some(&args))
+        spawn_with_stdin(&fs_path, Some(&args), body)
     };
     
     let result = match spawn_result {
@@ -352,18 +420,61 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str) {
     }
 }
 
+/// Parse CGI headers and body from script output.
+/// Returns (content_type, body) where body is the content after headers.
+fn parse_cgi_output(output: &[u8]) -> (&str, &[u8]) {
+    // Convert to string for header parsing
+    let output_str = match core::str::from_utf8(output) {
+        Ok(s) => s,
+        Err(_) => return ("application/octet-stream", output),
+    };
+    
+    // Look for blank line separating headers from body
+    // Try \r\n\r\n first, then \n\n
+    let (header_end, body_start) = if let Some(pos) = output_str.find("\r\n\r\n") {
+        (pos, pos + 4)
+    } else if let Some(pos) = output_str.find("\n\n") {
+        (pos, pos + 2)
+    } else {
+        // No headers found, treat entire output as body
+        return ("text/plain", output);
+    };
+    
+    let headers = &output_str[..header_end];
+    let body = &output.as_ref()[body_start..];
+    
+    // Parse Content-Type from headers
+    let mut content_type = "text/plain";
+    for line in headers.lines() {
+        if let Some(value) = line.strip_prefix("Content-Type:") {
+            content_type = value.trim();
+            break;
+        }
+        // Also check lowercase
+        if let Some(value) = line.strip_prefix("content-type:") {
+            content_type = value.trim();
+            break;
+        }
+    }
+    
+    (content_type, body)
+}
+
 /// Send CGI output as an HTTP response.
 fn send_cgi_response(stream: &TcpStream, output: &[u8]) -> Result<(), Error> {
+    let (content_type, body) = parse_cgi_output(output);
+    
     let response = format!(
         "HTTP/1.0 200 OK\r\n\
-         Content-Type: text/plain\r\n\
+         Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        output.len()
+        content_type,
+        body.len()
     );
 
     stream.write_all(response.as_bytes())?;
-    stream.write_all(output)?;
+    stream.write_all(body)?;
     Ok(())
 }

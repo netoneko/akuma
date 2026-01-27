@@ -9,7 +9,10 @@ extern crate alloc;
 
 use core::ffi::c_int;
 
-use libakuma::{arg, argc, exit, print};
+use libakuma::{arg, argc, exit, print, read, fd};
+
+use alloc::vec::Vec;
+use alloc::string::String;
 
 mod runtime;
 
@@ -59,6 +62,37 @@ unsafe extern "C" fn js_print(
     JSValue::undefined()
 }
 
+/// Native readStdin function - reads all available data from stdin
+unsafe extern "C" fn js_read_stdin(
+    ctx: *mut JSContext,
+    _this_val: JSValue,
+    _argc: c_int,
+    _argv: *mut JSValue,
+) -> JSValue {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 1024];
+    
+    loop {
+        let n = read(fd::STDIN, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n as usize]);
+    }
+    
+    // Convert to string (lossy UTF-8)
+    let s = match core::str::from_utf8(&data) {
+        Ok(s) => String::from(s),
+        Err(_) => {
+            // Try to convert as lossy UTF-8
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    };
+    
+    // Create JS string
+    runtime::JS_NewStringLen(ctx, s.as_ptr(), s.len())
+}
+
 /// Setup the console object with log method
 fn setup_console(rt: &Runtime) {
     debug("qjs: setup_console start\n");
@@ -96,6 +130,10 @@ fn setup_console(rt: &Runtime) {
         // Also add a global print function
         let print_fn = rt.new_c_function(js_print, "print", 1);
         rt.set_property_str(global, "print", print_fn);
+        
+        // Add readStdin function for reading from stdin (useful for CGI)
+        let read_stdin_fn = rt.new_c_function(js_read_stdin, "readStdin", 0);
+        rt.set_property_str(global, "readStdin", read_stdin_fn);
 
         debug("qjs: freeing global\n");
         rt.free_value(global);

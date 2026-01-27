@@ -774,6 +774,17 @@ pub struct SpawnResult {
 /// Returns SpawnResult on success with child PID and stdout FD.
 /// Returns None on error.
 pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
+    spawn_with_stdin(path, args, None)
+}
+
+/// Spawn a child process with stdin data
+///
+/// Returns SpawnResult on success with child PID and stdout FD.
+/// Returns None on error.
+/// 
+/// If stdin is provided, it will be available to the child process
+/// when reading from stdin (fd 0).
+pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Option<SpawnResult> {
     // Build null-separated args string
     let mut args_buf = alloc::vec::Vec::new();
     if let Some(args_slice) = args {
@@ -785,6 +796,9 @@ pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
 
     let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
     let args_len = args_buf.len();
+    
+    let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
+    let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
 
     let result = syscall(
         syscall::SPAWN,
@@ -792,7 +806,8 @@ pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
         path.len() as u64,
         args_ptr,
         args_len as u64,
-        0, 0,
+        stdin_ptr,
+        stdin_len,
     );
 
     // Check for error (negative value)

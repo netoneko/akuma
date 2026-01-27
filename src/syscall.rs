@@ -96,7 +96,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
-        nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize),
+        nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         _ => {
@@ -1784,11 +1784,13 @@ fn block_on_connect(
 /// * `path_len` - Length of path string  
 /// * `args_ptr` - Pointer to null-separated args string (can be 0)
 /// * `args_len` - Length of args string
+/// * `stdin_ptr` - Pointer to stdin data (can be 0)
+/// * `stdin_len` - Length of stdin data
 ///
 /// # Returns
 /// On success: child PID in low 32 bits, stdout FD in high 32 bits
 /// On failure: negative errno
-fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize) -> u64 {
+fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
     use alloc::string::String;
     use alloc::vec::Vec;
     use crate::process::{self, FileDescriptor, Pid};
@@ -1816,13 +1818,26 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize) -> 
     } else {
         Vec::new()
     };
+    
+    // Read stdin data if provided
+    let stdin_data: Option<Vec<u8>> = if stdin_ptr != 0 && stdin_len > 0 {
+        unsafe {
+            let slice = core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len);
+            Some(slice.to_vec())
+        }
+    } else {
+        None
+    };
 
     // Convert args to slice of &str for spawn
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+    
+    // Convert stdin to slice reference
+    let stdin_opt = stdin_data.as_deref();
 
     // Spawn the process
-    let (thread_id, channel) = match process::spawn_process_with_channel(&path, args_opt, None) {
+    let (thread_id, channel) = match process::spawn_process_with_channel(&path, args_opt, stdin_opt) {
         Ok(result) => result,
         Err(e) => {
             crate::safe_print!(64, "[sys_spawn] Failed: {}\n", e);
