@@ -307,24 +307,35 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str) {
         }
     };
     
-    // Read output from child process
+    // Read output from child process, polling until process exits
     let mut output = Vec::new();
     let mut buf = [0u8; 1024];
-    
-    loop {
-        let n = read_fd(result.stdout_fd as i32, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        output.extend_from_slice(&buf[..n as usize]);
-    }
-    
-    // Wait for process to complete
+    let mut process_exited = false;
     let mut attempts = 0;
-    while attempts < 1000 {
+    const MAX_ATTEMPTS: u32 = 5000; // 5 seconds max
+    
+    while attempts < MAX_ATTEMPTS {
+        // Try to read any available output
+        let n = read_fd(result.stdout_fd as i32, &mut buf);
+        if n > 0 {
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        
+        // Check if process has exited
         if let Some((_pid, _exit_code)) = waitpid(result.pid) {
+            process_exited = true;
+            // Read any remaining output after process exit
+            loop {
+                let n = read_fd(result.stdout_fd as i32, &mut buf);
+                if n <= 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n as usize]);
+            }
             break;
         }
+        
+        // Sleep briefly before next poll
         libakuma::sleep_ms(1);
         attempts += 1;
     }
@@ -333,7 +344,12 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str) {
     close(result.stdout_fd as i32);
     
     // Send the CGI response
-    let _ = send_cgi_response(stream, &output);
+    if process_exited {
+        let _ = send_cgi_response(stream, &output);
+    } else {
+        // Process timed out
+        let _ = send_error(stream, 504, "Gateway Timeout");
+    }
 }
 
 /// Send CGI output as an HTTP response.
