@@ -1,0 +1,11 @@
+[package]
+name = "meow"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "meow"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }

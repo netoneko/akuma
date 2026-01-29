@@ -65,6 +65,13 @@ name = "libakuma"
 version = "0.1.0"
 
 [[package]]
+name = "meow"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
 name = "quickjs"
 version = "0.1.0"
 dependencies = [
