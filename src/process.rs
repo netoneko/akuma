@@ -13,10 +13,10 @@ use core::task::{Context, Poll};
 
 /// A future that yields once then completes
 /// This allows proper async yielding in poll_fn contexts
-struct YieldOnce(bool);
+pub struct YieldOnce(bool);
 
 impl YieldOnce {
-    fn new() -> Self {
+    pub fn new() -> Self {
         YieldOnce(false)
     }
 }
@@ -313,6 +313,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32};
 pub struct ProcessChannel {
     /// Output buffer (spinlock-protected for thread safety)
     buffer: Spinlock<VecDeque<u8>>,
+    /// Stdin buffer for interactive input (SSH -> process)
+    stdin_buffer: Spinlock<VecDeque<u8>>,
     /// Exit code (set when process exits)
     exit_code: AtomicI32,
     /// Whether the process has exited
@@ -326,13 +328,14 @@ impl ProcessChannel {
     pub fn new() -> Self {
         Self {
             buffer: Spinlock::new(VecDeque::new()),
+            stdin_buffer: Spinlock::new(VecDeque::new()),
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
         }
     }
 
-    /// Write data to the channel buffer
+    /// Write data to the channel buffer (stdout from process)
     pub fn write(&self, data: &[u8]) {
         // CRITICAL: Disable IRQs while holding the lock!
         // If timer fires while locked, another thread accessing channel = deadlock.
@@ -361,6 +364,34 @@ impl ProcessChannel {
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             buf.drain(..).collect()
+        })
+    }
+
+    /// Write data to stdin buffer (SSH -> process)
+    pub fn write_stdin(&self, data: &[u8]) {
+        crate::irq::with_irqs_disabled(|| {
+            let mut buf = self.stdin_buffer.lock();
+            buf.extend(data);
+        })
+    }
+
+    /// Read from stdin buffer (process reads from SSH input)
+    /// Returns number of bytes read into buf
+    pub fn read_stdin(&self, buf: &mut [u8]) -> usize {
+        crate::irq::with_irqs_disabled(|| {
+            let mut stdin = self.stdin_buffer.lock();
+            let to_read = buf.len().min(stdin.len());
+            for (i, byte) in stdin.drain(..to_read).enumerate() {
+                buf[i] = byte;
+            }
+            to_read
+        })
+    }
+
+    /// Check if stdin has data available
+    pub fn has_stdin_data(&self) -> bool {
+        crate::irq::with_irqs_disabled(|| {
+            !self.stdin_buffer.lock().is_empty()
         })
     }
 
@@ -1667,3 +1698,4 @@ where
 
     Ok(exit_code)
 }
+

@@ -33,9 +33,9 @@ pub struct ShellContext {
     cwd: String,
     /// Use async execution (spawns on user thread, yields properly)
     async_exec: bool,
-    /// Use streaming execution for external commands (real-time output)
-    /// WARNING: Streaming path may block other SSH connections - disabled by default
-    streaming_exec: bool,
+    /// Use interactive execution for external commands (bidirectional I/O)
+    /// Enables real-time stdin/stdout for interactive applications
+    interactive_exec: bool,
 }
 
 impl ShellContext {
@@ -44,7 +44,7 @@ impl ShellContext {
         Self {
             cwd: String::from("/"),
             async_exec: crate::config::ENABLE_SSH_ASYNC_EXEC,
-            streaming_exec: false, // Disabled by default - can block SSH
+            interactive_exec: true, // Enabled by default for interactive apps
         }
     }
 
@@ -480,6 +480,135 @@ where
     }
 }
 
+/// Trait for streams that support interactive (non-blocking) reads
+/// This is needed for bidirectional I/O with running processes
+pub trait InteractiveRead: embedded_io_async::Read {
+    /// Try to read with a very short timeout
+    /// Returns 0 if no data available (but not EOF)
+    fn try_read_interactive(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>>;
+}
+
+/// Execute an external binary with interactive bidirectional I/O
+///
+/// This enables truly interactive applications like chat clients that
+/// need to read stdin and write stdout in real-time.
+///
+/// The stream must implement InteractiveRead for non-blocking stdin polling.
+pub async fn execute_external_interactive<S>(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    stream: &mut S,
+) -> Result<(), ShellError>
+where
+    S: InteractiveRead + embedded_io_async::Write,
+{
+    use crate::process::{spawn_process_with_channel, YieldOnce};
+    
+    // Spawn process with channel
+    let (thread_id, channel) = match spawn_process_with_channel(path, args, stdin) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("Error: {}\r\n", e);
+            let _ = embedded_io_async::Write::write_all(stream, msg.as_bytes()).await;
+            return Err(ShellError::ExecutionFailed("process spawn failed"));
+        }
+    };
+
+    // Buffer for reading from SSH
+    let mut read_buf = [0u8; 256];
+
+    // Interactive loop: poll both directions
+    loop {
+        // Check for interrupt
+        if channel.is_interrupted() {
+            break;
+        }
+
+        // 1. Drain process stdout and write to SSH
+        if let Some(data) = channel.try_read() {
+            let mut buf = Vec::new();
+            for &byte in &data {
+                if byte == b'\n' {
+                    buf.extend_from_slice(b"\r\n");
+                } else {
+                    buf.push(byte);
+                }
+            }
+            let _ = embedded_io_async::Write::write_all(stream, &buf).await;
+            let _ = embedded_io_async::Write::flush(stream).await;
+            
+            // Yield to allow network transmission
+            for _ in 0..20 {
+                crate::threading::yield_now();
+            }
+        }
+
+        // 2. Check for process exit
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            // Drain remaining output
+            while let Some(data) = channel.try_read() {
+                let mut buf = Vec::new();
+                for &byte in &data {
+                    if byte == b'\n' {
+                        buf.extend_from_slice(b"\r\n");
+                    } else {
+                        buf.push(byte);
+                    }
+                }
+                let _ = embedded_io_async::Write::write_all(stream, &buf).await;
+            }
+            let _ = embedded_io_async::Write::flush(stream).await;
+            break;
+        }
+
+        // 3. Try to read from SSH (non-blocking)
+        match stream.try_read_interactive(&mut read_buf).await {
+            Ok(0) => {
+                // No data available - continue polling
+            }
+            Ok(n) => {
+                let input_data = &read_buf[..n];
+                
+                // Check for Ctrl+C
+                for &byte in input_data {
+                    if byte == 0x03 {
+                        channel.set_interrupted();
+                    }
+                }
+                
+                // Forward to process stdin
+                channel.write_stdin(input_data);
+            }
+            Err(_) => {
+                // Read error - continue
+            }
+        }
+
+        // Yield to scheduler
+        YieldOnce::new().await;
+    }
+
+    let exit_code = if channel.is_interrupted() && !channel.has_exited() {
+        130
+    } else {
+        channel.exit_code()
+    };
+
+    // Cleanup
+    crate::threading::cleanup_terminated();
+
+    if exit_code != 0 && exit_code != 130 {
+        let msg = format!("[exit code: {}]\r\n", exit_code);
+        let _ = embedded_io_async::Write::write_all(stream, msg.as_bytes()).await;
+    }
+    
+    Ok(())
+}
+
 /// Result of checking if a command can be streamed
 pub enum StreamableCommand {
     /// Command is a simple external binary that can be streamed
@@ -555,17 +684,17 @@ pub async fn check_streamable_command(
 ///
 /// Returns `Some(result)` if the command was handled, `None` if it should
 /// use buffered execution instead.
-pub async fn execute_command_streaming<W>(
+pub async fn execute_command_streaming<S>(
     line: &[u8],
     registry: &CommandRegistry,
     ctx: &mut ShellContext,
-    _output: &mut W,
+    stream: &mut S,
 ) -> Option<ChainExecutionResult>
 where
-    W: embedded_io_async::Write,
+    S: InteractiveRead + embedded_io_async::Write,
 {
-    // Skip streaming check entirely if not enabled - avoid double filesystem lookups
-    if !ctx.streaming_exec {
+    // Skip interactive check entirely if not enabled - avoid double filesystem lookups
+    if !ctx.interactive_exec {
         // Just check for exit command, skip all filesystem operations
         let trimmed = trim_bytes(line);
         if trimmed == b"exit" || trimmed == b"quit" {
@@ -578,7 +707,7 @@ where
         return None; // Fall back to buffered execution
     }
 
-    // Streaming enabled - do the full check
+    // Interactive execution enabled - do the full check
     match check_streamable_command(line, registry).await {
         StreamableCommand::External(bin_path) => {
             // Parse args from the command line (kernel adds argv[0] automatically)
@@ -588,8 +717,8 @@ where
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
-            // Execute with streaming output
-            let success = execute_external_streaming(&bin_path, args_slice, None, _output).await.is_ok();
+            // Execute with interactive bidirectional I/O
+            let success = execute_external_interactive(&bin_path, args_slice, None, stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,

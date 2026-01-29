@@ -76,6 +76,9 @@ const SSH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Timeout for shell input reads (shorter, to stay responsive)
 const SSH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Very short timeout for interactive polling reads
+const SSH_INTERACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(10);
 const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
 const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 
@@ -269,6 +272,66 @@ impl<'a> SshChannelStream<'a> {
         }
     }
 
+    /// Try to read channel data with a very short timeout (for interactive mode)
+    /// Returns the number of bytes read, or 0 if no data is available
+    async fn try_read_interactive(&mut self, buf: &mut [u8]) -> Result<usize, TcpError> {
+        // First check if we have buffered channel data
+        if !self.session.channel_data_buffer.is_empty() {
+            let len = buf.len().min(self.session.channel_data_buffer.len());
+            buf[..len].copy_from_slice(&self.session.channel_data_buffer[..len]);
+            self.session.channel_data_buffer = self.session.channel_data_buffer[len..].to_vec();
+            return Ok(len);
+        }
+
+        // Check for EOF
+        if self.session.channel_eof {
+            return Ok(0);
+        }
+
+        // Try a very short timeout read from the network
+        let mut tcp_buf = [0u8; 512];
+        let read_result = embassy_time::with_timeout(
+            SSH_INTERACTIVE_READ_TIMEOUT,
+            self.stream.read(&mut tcp_buf)
+        ).await;
+
+        match read_result {
+            Err(_timeout) => {
+                // Timeout - no data available, but not EOF
+                Ok(0)
+            }
+            Ok(Ok(0)) => {
+                self.session.channel_eof = true;
+                Ok(0)
+            }
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(n)) => {
+                self.session.input_buffer.extend_from_slice(&tcp_buf[..n]);
+
+                // Process any complete packets
+                loop {
+                    let packet = process_encrypted_packet(self.session);
+                    match packet {
+                        Some((msg_type, payload)) => {
+                            let _ = self.handle_channel_message(msg_type, &payload).await;
+                        }
+                        None => break,
+                    }
+                }
+
+                // Return any buffered data we got
+                if !self.session.channel_data_buffer.is_empty() {
+                    let len = buf.len().min(self.session.channel_data_buffer.len());
+                    buf[..len].copy_from_slice(&self.session.channel_data_buffer[..len]);
+                    self.session.channel_data_buffer = self.session.channel_data_buffer[len..].to_vec();
+                    return Ok(len);
+                }
+
+                Ok(0)
+            }
+        }
+    }
+
     /// Handle a single SSH message, return true if we got channel data or EOF
     async fn handle_channel_message(
         &mut self,
@@ -335,6 +398,12 @@ impl<'a> SshChannelStream<'a> {
 
 impl ErrorType for SshChannelStream<'_> {
     type Error = SshStreamError;
+}
+
+impl crate::shell::InteractiveRead for SshChannelStream<'_> {
+    async fn try_read_interactive(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.try_read_interactive(buf).await.map_err(|_| SshStreamError)
+    }
 }
 
 impl crate::editor::TermSizeProvider for SshChannelStream<'_> {

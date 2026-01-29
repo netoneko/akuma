@@ -312,8 +312,24 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd_entry {
         FileDescriptor::Stdin => {
-            // Read from process stdin buffer
+            // First try reading from the ProcessChannel's stdin buffer (interactive input)
+            // This allows SSH to forward input to running processes
             let mut temp_buf = alloc::vec![0u8; count];
+            let bytes_from_channel = if let Some(channel) = crate::process::current_channel() {
+                channel.read_stdin(&mut temp_buf)
+            } else {
+                0
+            };
+            
+            if bytes_from_channel > 0 {
+                unsafe {
+                    let dst = buf_ptr as *mut u8;
+                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), dst, bytes_from_channel);
+                }
+                return bytes_from_channel as u64;
+            }
+            
+            // Fall back to process stdin buffer (pre-populated stdin from pipes, etc.)
             let bytes_read = proc.read_stdin(&mut temp_buf);
             if bytes_read > 0 {
                 unsafe {
