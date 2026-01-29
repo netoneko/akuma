@@ -630,7 +630,11 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                 }
             }
             Err(e) => {
-                if e.kind == libakuma::net::ErrorKind::WouldBlock {
+                // WouldBlock and TimedOut both mean "no data available yet"
+                // The kernel returns TimedOut after busy-polling iterations expire,
+                // but the connection is still valid - just retry the read
+                if e.kind == libakuma::net::ErrorKind::WouldBlock 
+                    || e.kind == libakuma::net::ErrorKind::TimedOut {
                     read_attempts += 1;
                     
                     // Print a dot every ~500ms while waiting
