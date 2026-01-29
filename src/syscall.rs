@@ -1758,8 +1758,11 @@ fn block_on_connect(
             Poll::Ready(Ok(())) => {
                 // CRITICAL: Drop the future first to release the mutable borrow!
                 drop(connect_fut);
-                let socket = unsafe { socket_cell.into_inner() };
+                let mut socket = unsafe { socket_cell.into_inner() };
                 crate::threading::disable_preemption();
+                // Clear the timeout after successful connect - reads may take much longer
+                // (e.g., waiting for LLM inference which can take 60+ seconds)
+                socket.set_timeout(None);
                 let local = socket.local_endpoint();
                 crate::threading::enable_preemption();
                 return Ok((socket, local));
