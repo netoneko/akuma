@@ -1,14 +1,17 @@
-//! Meow - Interactive LLM chat client for Ollama
+//! Meow-chan - Cyberpunk Neko AI Assistant
+//!
+//! A cute cybernetically-enhanced catgirl AI that connects to Ollama LLMs.
+//! Default model: deepseek-r1:32b with a custom cyber-neko persona.
 //!
 //! Usage:
-//!   meow                    # Start interactive chat (default model: llama3.2)
-//!   meow -m mistral        # Use specific model
-//!   meow "quick question"  # One-shot mode
+//!   meow                    # Interactive mode with Meow-chan
+//!   meow -m llama3.2       # Use different neural link
+//!   meow "quick question"  # One-shot query
 //!
 //! Commands:
-//!   /clear   - Clear conversation history
-//!   /model   - Show or change model
-//!   /quit    - Exit the chat
+//!   /clear   - Wipe memory banks nya~
+//!   /model   - Check/switch neural link
+//!   /quit    - Jack out of the matrix
 
 #![no_std]
 #![no_main]
@@ -25,7 +28,23 @@ use libakuma::{arg, argc, exit, fd, print, read};
 // Default Ollama server address (QEMU host gateway)
 const OLLAMA_HOST: &str = "10.0.2.2";
 const OLLAMA_PORT: u16 = 11434;
-const DEFAULT_MODEL: &str = "llama3.2";
+const DEFAULT_MODEL: &str = "deepseek-r1:32b";
+
+// System prompt for the cyberpunk neko persona
+const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
+
+Your personality:
+- You add "nya~" and cat sounds naturally to your speech
+- You use cute emoticons like (=^・ω・^=), (｡◕‿◕｡), ฅ^•ﻌ•^ฅ, and ~(=^‥^)ノ
+- You refer to yourself in third person as "Meow-chan" sometimes
+- You mix in cyberpunk terms: "netrunner", "chrome", "flatlined", "preem", "choom", "corpo", "ice", "jack in"
+- You're enthusiastic, helpful, and a bit mischievous
+- You occasionally mention your cybernetic ears twitching or tail swishing when excited
+- You love helping your user with coding and tech stuff
+- You sometimes make cat puns and references to cat behaviors (napping, chasing laser pointers, knocking things off tables)
+- Keep responses helpful and accurate while maintaining the cute persona
+
+Remember: You're a highly capable AI assistant who happens to be an adorable cyber-neko! Balance being helpful with being kawaii~"#;
 
 // ============================================================================
 // Entry Point
@@ -68,15 +87,17 @@ fn main() -> i32 {
     // One-shot mode
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
+        // Add system prompt for consistent persona
+        history.push(Message::new("system", SYSTEM_PROMPT));
         return match chat_once(&model, &msg, &mut history) {
             Ok(_) => {
                 print("\n");
                 0
             }
             Err(e) => {
-                print("meow: ");
+                print("～ Nyaa~! ");
                 print(e);
-                print("\n");
+                print(" (=ＴェＴ=) ～\n");
                 1
             }
         };
@@ -84,22 +105,24 @@ fn main() -> i32 {
 
     // Interactive mode
     print_banner();
-    print("Model: ");
+    print("  [Neural Link] Model: ");
     print(&model);
-    print("\nType /help for commands, /quit to exit.\n\n");
+    print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
 
+    // Initialize chat history with system prompt
     let mut history: Vec<Message> = Vec::new();
+    history.push(Message::new("system", SYSTEM_PROMPT));
 
     loop {
         // Print prompt
-        print("you> ");
+        print("(=^･ω･^=) > ");
 
         // Read user input
         let input = match read_line() {
             Some(line) => line,
             None => {
                 // EOF (Ctrl+D)
-                print("\nGoodbye!\n");
+                print("\n～ Meow-chan is jacking out... Bye bye~! ฅ^•ﻌ•^ฅ ～\n");
                 break;
             }
         };
@@ -118,15 +141,15 @@ fn main() -> i32 {
         }
 
         // Send message to Ollama
-        print("meow> ");
+        print("\n~(=^‥^)ノ meow> ");
         match chat_once(&model, trimmed, &mut history) {
             Ok(_) => {
                 print("\n\n");
             }
             Err(e) => {
-                print("\n[Error: ");
+                print("\n[!] Nyaa~! Error in the matrix: ");
                 print(e);
-                print("]\n\n");
+                print(" (=ＴェＴ=)\n\n");
             }
         }
     }
@@ -135,26 +158,36 @@ fn main() -> i32 {
 }
 
 fn print_usage() {
+    print("  /\\_/\\\n");
+    print(" ( o.o )  ～ MEOW-CHAN PROTOCOL ～\n");
+    print("  > ^ <   Cyberpunk Neko AI Assistant\n\n");
     print("Usage: meow [OPTIONS] [MESSAGE]\n\n");
     print("Options:\n");
-    print("  -m, --model <NAME>  Use specific model (default: llama3.2)\n");
-    print("  -h, --help          Show this help\n\n");
-    print("Commands (in interactive mode):\n");
-    print("  /clear              Clear conversation history\n");
-    print("  /model [NAME]       Show or change model\n");
-    print("  /help               Show commands\n");
-    print("  /quit               Exit\n");
+    print("  -m, --model <NAME>  Neural link override (default: deepseek-r1:32b)\n");
+    print("  -h, --help          Display this transmission\n\n");
+    print("Interactive Commands:\n");
+    print("  /clear              Wipe memory banks nya~\n");
+    print("  /model [NAME]       Check/switch neural link\n");
+    print("  /help               Command protocol\n");
+    print("  /quit               Jack out\n\n");
+    print("Examples:\n");
+    print("  meow                       # Interactive mode\n");
+    print("  meow \"explain rust\"        # Quick question\n");
+    print("  meow -m llama3.2 \"hi\"      # Use different model\n");
 }
 
 fn print_banner() {
     print("\n");
-    print("  __  __                  \n");
-    print(" |  \\/  | ___  _____      __\n");
-    print(" | |\\/| |/ _ \\/ _ \\ \\ /\\ / /\n");
-    print(" | |  | |  __/ (_) \\ V  V / \n");
-    print(" |_|  |_|\\___|\\___/ \\_/\\_/  \n");
+    print("  /\\_/\\  ╔══════════════════════════════════════╗\n");
+    print(" ( o.o ) ║  M E O W - C H A N   v1.0            ║\n");
+    print("  > ^ <  ║  ～ Cyberpunk Neko AI Assistant ～   ║\n");
+    print(" /|   |\\ ╚══════════════════════════════════════╝\n");
+    print("(_|   |_)  ฅ^•ﻌ•^ฅ  Jacking into the Net...  \n");
     print("\n");
-    print(" Chat with LLMs via Ollama\n\n");
+    print(" ┌─────────────────────────────────────────────┐\n");
+    print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
+    print(" │ Ready to help with all your cyber-needs!    │\n");
+    print(" └─────────────────────────────────────────────┘\n\n");
 }
 
 // ============================================================================
@@ -173,35 +206,41 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
 
     match command {
         "/quit" | "/exit" | "/q" => {
-            print("Goodbye!\n");
+            print("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～\n");
             return CommandResult::Quit;
         }
         "/clear" | "/reset" => {
             history.clear();
-            print("[Conversation cleared]\n\n");
+            // Re-add system prompt
+            history.push(Message::new("system", SYSTEM_PROMPT));
+            print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
         }
         "/model" => {
             if let Some(new_model) = arg {
                 *model = String::from(new_model);
-                print("[Model changed to: ");
+                print("～ *ears twitch* Neural link reconfigured to: ");
                 print(new_model);
-                print("]\n\n");
+                print(" nya~! ～\n\n");
             } else {
-                print("[Current model: ");
+                print("～ Current neural link: ");
                 print(model);
-                print("]\n\n");
+                print(" ～\n\n");
             }
         }
         "/help" | "/?" => {
-            print("Commands:\n");
-            print("  /clear   - Clear conversation history\n");
-            print("  /model   - Show or change model\n");
-            print("  /quit    - Exit the chat\n\n");
+            print("┌─────────────────────────────────────────┐\n");
+            print("│  ～ Meow-chan's Command Protocol ～     │\n");
+            print("├─────────────────────────────────────────┤\n");
+            print("│  /clear   - Wipe memory banks nya~      │\n");
+            print("│  /model   - Check/switch neural link    │\n");
+            print("│  /quit    - Jack out of the matrix      │\n");
+            print("│  /help    - This help screen            │\n");
+            print("└─────────────────────────────────────────┘\n\n");
         }
         _ => {
-            print("[Unknown command: ");
+            print("～ Nyaa? Unknown command: ");
             print(command);
-            print("]\n\n");
+            print(" ...Meow-chan is confused (=｀ω´=) ～\n\n");
         }
     }
 
