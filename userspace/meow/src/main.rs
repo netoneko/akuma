@@ -272,7 +272,7 @@ fn connect_to_ollama() -> Result<TcpStream, &'static str> {
         ip[0], ip[1], ip[2], ip[3], OLLAMA_PORT
     );
 
-    TcpStream::connect(&addr_str).map_err(|_| "Connection failed")
+    TcpStream::connect(&addr_str).map_err(|_| "Connection failed - is Ollama running on host?")
 }
 
 fn build_chat_request(model: &str, history: &[Message]) -> String {
@@ -322,12 +322,20 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
     let mut headers_parsed = false;
     let mut body_start = 0;
     let mut full_response = String::new();
+    let mut read_attempts = 0u32;
 
     // Read response in chunks
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => {
+                // EOF - if we haven't received any response, this is an error
+                if response_data.is_empty() {
+                    return Err("Connection closed by server");
+                }
+                break;
+            }
             Ok(n) => {
+                read_attempts = 0; // Reset on successful read
                 response_data.extend_from_slice(&buf[..n]);
 
                 // Parse headers if not yet done
@@ -340,6 +348,10 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
                         }
                         // Check for 200 OK
                         if !header_str.contains(" 200 ") {
+                            // Try to extract error info
+                            if header_str.contains(" 404 ") {
+                                return Err("Model not found (404)");
+                            }
                             return Err("Server returned error");
                         }
                         headers_parsed = true;
@@ -375,10 +387,21 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock {
+                    read_attempts += 1;
+                    // Timeout after ~30 seconds of no data
+                    if read_attempts > 3000 {
+                        return Err("Timeout waiting for response");
+                    }
                     libakuma::sleep_ms(10);
                     continue;
                 }
-                return Err("Read error");
+                if e.kind == libakuma::net::ErrorKind::ConnectionRefused {
+                    return Err("Connection refused - is Ollama running?");
+                }
+                if e.kind == libakuma::net::ErrorKind::ConnectionReset {
+                    return Err("Connection reset by server");
+                }
+                return Err("Network error");
             }
         }
     }
@@ -492,24 +515,40 @@ fn json_escape(s: &str) -> String {
 // Input Handling
 // ============================================================================
 
-/// Read a line from stdin (blocking)
-/// Returns None on EOF
+/// Read a line from stdin (blocking with polling)
+/// Returns None on EOF (Ctrl+D on empty line)
 fn read_line() -> Option<String> {
     let mut line = String::new();
     let mut buf = [0u8; 1];
+    let mut consecutive_empty_reads = 0u32;
 
     loop {
         let n = read(fd::STDIN, &mut buf);
+        
         if n <= 0 {
-            // EOF or error
-            if line.is_empty() {
-                return None;
-            }
-            break;
+            // No data available - poll with backoff
+            consecutive_empty_reads += 1;
+            
+            // After many empty reads, increase sleep time
+            let sleep_time = if consecutive_empty_reads < 10 {
+                10 // 10ms
+            } else if consecutive_empty_reads < 100 {
+                50 // 50ms
+            } else {
+                100 // 100ms
+            };
+            
+            libakuma::sleep_ms(sleep_time);
+            continue;
         }
+        
+        // Got data - reset counter
+        consecutive_empty_reads = 0;
 
         let c = buf[0];
         if c == b'\n' || c == b'\r' {
+            // Echo newline
+            print("\n");
             break;
         }
         if c == 4 {
@@ -523,12 +562,19 @@ fn read_line() -> Option<String> {
         if c == 8 || c == 127 {
             if !line.is_empty() {
                 line.pop();
+                // Echo backspace: move back, space, move back
+                print("\x08 \x08");
             }
             continue;
         }
         // Regular character
         if c >= 32 && c < 127 {
             line.push(c as char);
+            // Echo the character
+            let echo = [c];
+            if let Ok(s) = core::str::from_utf8(&echo) {
+                print(s);
+            }
         }
     }
 
