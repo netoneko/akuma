@@ -18,6 +18,8 @@
 
 extern crate alloc;
 
+mod tools;
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -30,7 +32,7 @@ const OLLAMA_HOST: &str = "10.0.2.2";
 const OLLAMA_PORT: u16 = 11434;
 const DEFAULT_MODEL: &str = "deepseek-r1:32b";
 
-// System prompt for the cyberpunk neko persona
+// System prompt combining persona and tools (static to avoid allocations)
 const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 
 Your personality:
@@ -44,7 +46,57 @@ Your personality:
 - You sometimes make cat puns and references to cat behaviors (napping, chasing laser pointers, knocking things off tables)
 - Keep responses helpful and accurate while maintaining the cute persona
 
-Remember: You're a highly capable AI assistant who happens to be an adorable cyber-neko! Balance being helpful with being kawaii~"#;
+Remember: You're a highly capable AI assistant who happens to be an adorable cyber-neko! Balance being helpful with being kawaii~
+
+## Available Tools
+
+You have access to filesystem tools! When you need to perform file operations, output a JSON command block like this:
+
+```json
+{
+  "command": {
+    "tool": "ToolName",
+    "args": { ... }
+  }
+}
+```
+
+### Tool List:
+
+1. **FileRead** - Read file contents
+   Args: `{"filename": "path/to/file"}`
+
+2. **FileWrite** - Create or overwrite a file
+   Args: `{"filename": "path/to/file", "content": "file contents"}`
+
+3. **FileAppend** - Append to a file
+   Args: `{"filename": "path/to/file", "content": "content to append"}`
+
+4. **FileExists** - Check if file exists
+   Args: `{"filename": "path/to/file"}`
+
+5. **FileList** - List directory contents
+   Args: `{"path": "/directory/path"}`
+
+6. **FolderCreate** - Create a directory
+   Args: `{"path": "/new/directory/path"}`
+
+7. **FileCopy** - Copy a file
+   Args: `{"source": "path/from", "destination": "path/to"}`
+
+8. **FileMove** - Move a file
+   Args: `{"source": "path/from", "destination": "path/to"}`
+
+9. **FileRename** - Rename a file
+   Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
+
+### Important Notes:
+- Output the JSON command in a ```json code block
+- After outputting a command, STOP and wait for the result
+- The system will execute the command and provide the result
+- Then you can continue your response based on the result
+- You can use multiple tools in sequence by waiting for each result
+"#;
 
 // ============================================================================
 // Entry Point
@@ -141,7 +193,7 @@ fn main() -> i32 {
         }
 
         // Send message to Ollama
-        print("\n~(=^‥^)ノ meow> ");
+        print("\n");
         match chat_once(&model, trimmed, &mut history) {
             Ok(_) => {
                 print("\n\n");
@@ -278,27 +330,92 @@ impl Message {
 // Ollama API Communication
 // ============================================================================
 
+// Maximum number of messages to keep in history (including system prompt)
+// Keep it small to avoid memory issues - system prompt + ~4 exchanges
+const MAX_HISTORY_SIZE: usize = 10;
+
+/// Trim history to prevent memory overflow
+/// Keeps the system prompt (first message) and recent messages
+fn trim_history(history: &mut Vec<Message>) {
+    if history.len() > MAX_HISTORY_SIZE {
+        // Keep first message (system prompt) and last (MAX_HISTORY_SIZE - 1) messages
+        let to_remove = history.len() - MAX_HISTORY_SIZE;
+        history.drain(1..1 + to_remove);
+    }
+}
+
 fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Result<(), &'static str> {
+    // Trim history before adding new message
+    trim_history(history);
+    
     // Add user message to history
     history.push(Message::new("user", user_message));
 
-    // Build the request body
-    let request_body = build_chat_request(model, history);
+    // Tool execution loop - keep going while LLM wants to use tools
+    let max_tool_iterations = 5; // Prevent infinite loops
+    
+    for iteration in 0..max_tool_iterations {
+        // Build the request body
+        let request_body = build_chat_request(model, history);
 
-    // Connect to Ollama
-    let stream = connect_to_ollama()?;
+        // Show connecting status
+        if iteration == 0 {
+            print("[jacking in");
+        } else {
+            print("[continuing");
+        }
+        
+        // Connect to Ollama
+        let stream = connect_to_ollama()?;
+        print(".");
+        
+        // Send HTTP POST request
+        send_post_request(&stream, "/api/chat", &request_body)?;
+        print(".] ");
 
-    // Send HTTP POST request
-    send_post_request(&stream, "/api/chat", &request_body)?;
+        // Read and stream the response (with progress dots)
+        let assistant_response = read_streaming_response(&stream)?;
 
-    // Read and stream the response
-    let assistant_response = read_streaming_response(&stream)?;
-
-    // Add assistant response to history
-    if !assistant_response.is_empty() {
-        history.push(Message::new("assistant", &assistant_response));
+        // Check for tool calls in the response
+        let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
+        
+        if let Some(result) = tool_result {
+            // Add the assistant's partial response to history
+            if !text_before_tool.is_empty() {
+                history.push(Message::new("assistant", &text_before_tool));
+            }
+            
+            // Show tool execution
+            print("\n\n[*] ");
+            if result.success {
+                print("Tool executed successfully nya~!\n");
+            } else {
+                print("Tool failed nya...\n");
+            }
+            print(&result.output);
+            print("\n\n");
+            
+            // Add tool result as a "user" message so LLM can see it
+            let tool_result_msg = format!(
+                "[Tool Result]\n{}\n[End Tool Result]\n\nPlease continue your response based on this result.",
+                result.output
+            );
+            history.push(Message::new("user", &tool_result_msg));
+            
+            // Continue loop to get LLM's follow-up response
+            continue;
+        }
+        
+        // No tool call - add response to history and we're done
+        if !assistant_response.is_empty() {
+            history.push(Message::new("assistant", &assistant_response));
+        }
+        
+        return Ok(());
     }
-
+    
+    // Hit max iterations
+    print("\n[!] Max tool iterations reached\n");
     Ok(())
 }
 
@@ -356,32 +473,39 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &
 }
 
 fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
-    let mut buf = [0u8; 4096];
-    let mut response_data = Vec::new();
+    let mut buf = [0u8; 1024]; // Smaller buffer
+    let mut pending_data = Vec::new(); // Only keeps unprocessed data
     let mut headers_parsed = false;
-    let mut body_start = 0;
     let mut full_response = String::new();
     let mut read_attempts = 0u32;
+    let mut dots_printed = 0u32;
+    let mut first_token_received = false;
+    let mut any_data_received = false;
+    let start_time = libakuma::uptime(); // microseconds
+    
+    // Limit response size to prevent OOM (16KB should be plenty)
+    const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
     // Read response in chunks
     loop {
         match stream.read(&mut buf) {
             Ok(0) => {
                 // EOF - if we haven't received any response, this is an error
-                if response_data.is_empty() {
+                if !any_data_received {
                     return Err("Connection closed by server");
                 }
                 break;
             }
             Ok(n) => {
+                any_data_received = true;
                 read_attempts = 0; // Reset on successful read
-                response_data.extend_from_slice(&buf[..n]);
+                pending_data.extend_from_slice(&buf[..n]);
 
                 // Parse headers if not yet done
                 if !headers_parsed {
-                    if let Some(pos) = find_header_end(&response_data) {
+                    if let Some(pos) = find_header_end(&pending_data) {
                         // Verify HTTP status
-                        let header_str = core::str::from_utf8(&response_data[..pos]).unwrap_or("");
+                        let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
                         if !header_str.starts_with("HTTP/1.") {
                             return Err("Invalid HTTP response");
                         }
@@ -394,41 +518,71 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
                             return Err("Server returned error");
                         }
                         headers_parsed = true;
-                        body_start = pos + 4; // Skip \r\n\r\n
+                        // Drain headers from pending_data
+                        pending_data.drain(..pos + 4);
                     }
+                    continue; // Need more data for headers
                 }
 
-                // Process body data if headers are parsed
-                if headers_parsed && body_start < response_data.len() {
-                    let body_data = &response_data[body_start..];
-                    if let Ok(body_str) = core::str::from_utf8(body_data) {
-                        // Process each complete NDJSON line
-                        for line in body_str.lines() {
-                            if line.is_empty() {
-                                continue;
-                            }
-                            if let Some((content, done)) = parse_ndjson_line(line) {
-                                if !content.is_empty() {
-                                    print(&content);
+                // Process body data
+                if let Ok(body_str) = core::str::from_utf8(&pending_data) {
+                    // Find last complete line
+                    let last_newline = body_str.rfind('\n');
+                    let complete_part = match last_newline {
+                        Some(pos) => &body_str[..pos + 1],
+                        None => continue, // No complete line yet
+                    };
+                    
+                    // Process each complete NDJSON line
+                    for line in complete_part.lines() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Some((content, done)) = parse_ndjson_line(line) {
+                            if !content.is_empty() {
+                                // First token - show elapsed time and clear progress
+                                if !first_token_received {
+                                    first_token_received = true;
+                                    let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    // Clear the dots with backspaces
+                                    for _ in 0..dots_printed {
+                                        print("\x08 \x08");
+                                    }
+                                    // Show elapsed time
+                                    print_elapsed(elapsed_ms);
+                                    print("\n");
+                                }
+                                print(&content);
+                                
+                                // Only accumulate if under limit
+                                if full_response.len() < MAX_RESPONSE_SIZE {
                                     full_response.push_str(&content);
                                 }
-                                if done {
-                                    return Ok(full_response);
-                                }
+                            }
+                            if done {
+                                return Ok(full_response);
                             }
                         }
-                        // Keep only incomplete line data
-                        if let Some(last_newline) = body_str.rfind('\n') {
-                            body_start = body_start + last_newline + 1;
-                        }
+                    }
+                    
+                    // Drain processed lines, keep incomplete line
+                    if let Some(pos) = last_newline {
+                        pending_data.drain(..pos + 1);
                     }
                 }
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock {
                     read_attempts += 1;
-                    // Timeout after ~30 seconds of no data
-                    if read_attempts > 3000 {
+                    
+                    // Print a dot every ~500ms while waiting
+                    if read_attempts % 50 == 0 && !first_token_received {
+                        print(".");
+                        dots_printed += 1;
+                    }
+                    
+                    // Timeout after ~60 seconds of no data
+                    if read_attempts > 6000 {
                         return Err("Timeout waiting for response");
                     }
                     libakuma::sleep_ms(10);
@@ -548,6 +702,17 @@ fn json_escape(s: &str) -> String {
         }
     }
     result
+}
+
+/// Print elapsed time in a cute format
+fn print_elapsed(ms: u64) {
+    if ms < 1000 {
+        print(&format!("~(=^‥^)ノ [{}ms]", ms));
+    } else {
+        let secs = ms / 1000;
+        let remainder = (ms % 1000) / 100; // one decimal
+        print(&format!("~(=^‥^)ノ [{}.{}s]", secs, remainder));
+    }
 }
 
 // ============================================================================

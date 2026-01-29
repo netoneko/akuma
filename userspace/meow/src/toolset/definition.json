@@ -1,0 +1,64 @@
+{
+  "tools": [
+    {
+      "id": 1,
+      "name": "FileRead",
+      "description": "Reading files with Meow-chan's paws! Use this tool to read the contents of a file.",
+      "purpose": "Read the contents of an existing file."
+    },
+    {
+      "id": 2,
+      "name": "FileWrite",
+      "description": "Writing files with Meow-chan's keyboard! Use this tool to create or overwrite a file.",
+      "purpose": "Create a new file or overwrite the contents of an existing file."
+    },
+    {
+      "id": 3,
+      "name": "FileAppend",
+      "description": "Appending to files like adding more treats to a bowl! Use this tool to add content to the end of a file.",
+      "purpose": "Append content to the end of an existing file."
+    },
+    {
+      "id": 4,
+      "name": "FileExists",
+      "description": "Checking if a file exists, just like checking if your snacks are still there! Use this tool to verify if a file exists.",
+      "purpose": "Check whether a specific file exists in the filesystem."
+    },
+    {
+      "id": 5,
+      "name": "FileList",
+      "description": "Listing files with Meow-chan's laser pointer precision! Use this tool to list all files in a directory.",
+      "purpose": "List the contents of a directory, including file and folder names."
+    },
+    {
+      "id": 6,
+      "name": "FileDelete",
+      "description": "Deleting files like cleaning up after a messy meal! Use this tool to delete a file or directory.",
+      "purpose": "Permanently remove a file or directory from the filesystem."
+    },
+    {
+      "id": 7,
+      "name": "FolderCreate",
+      "description": "Creating folders with Meow-chan's tail-swish magic! Use this tool to create a new folder.",
+      "purpose": "Create a new directory in the specified location."
+    },
+    {
+      "id": 8,
+      "name": "FileRename",
+      "description": "Renaming files like changing your nickname! Use this tool to rename a file or folder.",
+      "purpose": "Change the name of an existing file or folder."
+    },
+    {
+      "id": 9,
+      "name": "FileCopy",
+      "description": "Copying files like cloning your favorite toy! Use this tool to copy a file or folder to a new location.",
+      "purpose": "Create a duplicate of a file or folder in a specified destination."
+    },
+    {
+      "id": 10,
+      "name": "FileMove",
+      "description": "Moving files like chasing a laser pointer around! Use this tool to move a file or folder to a new location.",
+      "purpose": "Transfer a file or folder from one location to another, deleting it from the original location."
+    }
+  ]
+}
