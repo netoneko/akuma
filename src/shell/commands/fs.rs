@@ -574,3 +574,58 @@ impl Command for MvCommand {
 
 /// Static instance
 pub static MV_CMD: MvCommand = MvCommand;
+
+// ============================================================================
+// Mount Command
+// ============================================================================
+
+/// Mount command - show mounted filesystems
+pub struct MountCommand;
+
+impl Command for MountCommand {
+    fn name(&self) -> &'static str {
+        "mount"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["mounts"]
+    }
+    fn description(&self) -> &'static str {
+        "Show mounted filesystems"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            if !crate::fs::is_initialized() {
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
+            }
+
+            match crate::vfs::list_mounts() {
+                Ok(mounts) => {
+                    if mounts.is_empty() {
+                        let _ = stdout.write(b"No filesystems mounted\r\n").await;
+                    } else {
+                        for mount in mounts {
+                            let line = format!("{} on {} type {}\r\n", mount.fs_type, mount.path, mount.fs_type);
+                            let _ = stdout.write(line.as_bytes()).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Error listing mounts: {}\r\n", e);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static MOUNT_CMD: MountCommand = MountCommand;

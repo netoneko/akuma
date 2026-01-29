@@ -184,7 +184,7 @@ fn test_procfs_stdio() {
         return;
     }
 
-    console::print("[Test] Testing procfs stdin/stdout access...\n");
+    crate::safe_print!(64, "[Test] Testing procfs stdin/stdout access...\n");
 
     // 1. Spawn hello with "10 50" args (10 outputs, 50ms delay = ~500ms runtime)
     let hello_args = &["10", "50"];
@@ -207,7 +207,7 @@ fn test_procfs_stdio() {
     let hello_pid = match process::find_pid_by_thread(hello_thread_id) {
         Some(pid) => pid,
         None => {
-            console::print("[Test] Failed to find hello PID\n");
+            crate::safe_print!(64, "[Test] Failed to find hello PID\n");
             return;
         }
     };
@@ -233,7 +233,7 @@ fn test_procfs_stdio() {
     let echo2_pid = match process::find_pid_by_thread(echo2_thread_id) {
         Some(pid) => pid,
         None => {
-            console::print("[Test] Failed to find echo2 PID\n");
+            crate::safe_print!(64, "[Test] Failed to find echo2 PID\n");
             return;
         }
     };
@@ -258,7 +258,7 @@ fn test_procfs_stdio() {
     match fs::read_file(&stdin_path) {
         Ok(data) => {
             if data == stdin_data {
-                console::print("[Test] procfs stdin read: PASSED\n");
+                crate::safe_print!(64, "[Test] procfs stdin read: PASSED\n");
             } else {
                 crate::safe_print!(
                     128,
@@ -280,7 +280,7 @@ fn test_procfs_stdio() {
             // Verify stdout contains expected content
             if let Ok(s) = core::str::from_utf8(&data) {
                 if s.contains("hello (10/10)") && s.contains("hello: done") {
-                    console::print("[Test] procfs stdout read: PASSED\n");
+                    crate::safe_print!(64, "[Test] procfs stdout read: PASSED\n");
                 } else {
                     crate::safe_print!(
                         128,
@@ -289,7 +289,7 @@ fn test_procfs_stdio() {
                     );
                 }
             } else {
-                console::print("[Test] procfs stdout: invalid UTF-8\n");
+                crate::safe_print!(64, "[Test] procfs stdout: invalid UTF-8\n");
             }
         }
         Err(e) => {
@@ -301,5 +301,5 @@ fn test_procfs_stdio() {
     // Note: we don't have waitpid in this context, but processes should have exited by now
     crate::threading::cleanup_terminated();
 
-    console::print("[Test] procfs stdio test complete\n");
+    crate::safe_print!(64, "[Test] procfs stdio test complete\n");
 }

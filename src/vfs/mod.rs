@@ -387,8 +387,22 @@ where
 }
 
 /// List directory contents
+/// 
+/// This includes both entries from the underlying filesystem and any
+/// mount points that appear as direct children of the listed directory.
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
-    with_fs(path, |fs, rel| fs.read_dir(rel))
+    let mut entries = with_fs(path, |fs, rel| fs.read_dir(rel))?;
+
+    // Add mount points that are direct children of this directory
+    let mount_entries = get_child_mount_points(path);
+    for mount_entry in mount_entries {
+        // Only add if not already present (mount point shadows existing dir)
+        if !entries.iter().any(|e| e.name == mount_entry.name) {
+            entries.push(mount_entry);
+        }
+    }
+
+    Ok(entries)
 }
 
 /// Read entire file contents as bytes
@@ -456,4 +470,88 @@ pub fn sync_all() -> Result<(), FsError> {
         mount.fs.sync()?;
     }
     Ok(())
+}
+
+// ============================================================================
+// Mount Information
+// ============================================================================
+
+/// Information about a mounted filesystem
+#[derive(Debug, Clone)]
+pub struct MountInfo {
+    /// Mount path (e.g., "/", "/proc")
+    pub path: String,
+    /// Filesystem type name (e.g., "ext2", "procfs")
+    pub fs_type: String,
+}
+
+/// List all mounted filesystems
+pub fn list_mounts() -> Result<Vec<MountInfo>, FsError> {
+    let table = MOUNT_TABLE.lock();
+    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+
+    let mounts: Vec<MountInfo> = table
+        .mounts
+        .iter()
+        .map(|m| MountInfo {
+            path: m.path.clone(),
+            fs_type: String::from(m.fs.name()),
+        })
+        .collect();
+
+    Ok(mounts)
+}
+
+/// Get mount points that are direct children of a directory
+/// Used by list_dir to include virtual mount points in directory listings
+fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
+    let table = MOUNT_TABLE.lock();
+    let table = match table.as_ref() {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let parent = normalize_path(parent_path);
+    let mut entries = Vec::new();
+
+    for mount in &table.mounts {
+        // Skip the root mount and the parent itself
+        if mount.path == "/" || mount.path == parent {
+            continue;
+        }
+
+        // Check if this mount is a direct child of parent
+        // For parent="/", child mount "/proc" -> name is "proc"
+        // For parent="/foo", child mount "/foo/bar" -> name is "bar"
+        let mount_path = mount.path.as_str();
+
+        if parent == "/" {
+            // Direct children of root: /proc, /tmp, etc.
+            // Check if mount path has exactly one component after root
+            if mount_path.starts_with('/') && !mount_path[1..].contains('/') {
+                let name = &mount_path[1..]; // Remove leading /
+                entries.push(DirEntry {
+                    name: String::from(name),
+                    is_dir: true,
+                    size: 0,
+                });
+            }
+        } else {
+            // Direct children of non-root: /foo -> /foo/bar
+            let prefix = alloc::format!("{}/", parent);
+            if mount_path.starts_with(&prefix) {
+                let rest = &mount_path[prefix.len()..];
+                // Only direct children (no more slashes)
+                if !rest.contains('/') {
+                    entries.push(DirEntry {
+                        name: String::from(rest),
+                        is_dir: true,
+                        size: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    entries
 }
