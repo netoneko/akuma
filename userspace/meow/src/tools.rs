@@ -1,15 +1,17 @@
 //! Tool execution module for Meow-chan
 //!
-//! Implements file system tools that the LLM can invoke via JSON commands.
+//! Implements file system and network tools that the LLM can invoke via JSON commands.
 //! Tools are executed using libakuma syscalls.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use alloc::format;
 
 use libakuma::{
     open, close, read_fd, write_fd, fstat, mkdir, read_dir,
     open_flags,
 };
+use libakuma::net::{TcpStream, resolve};
 
 /// Result of a tool execution
 pub struct ToolResult {
@@ -87,6 +89,10 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
             let source = extract_string_field(json, "source")?;
             let dest = extract_string_field(json, "destination")?;
             Some(tool_file_move(&source, &dest))
+        }
+        "HttpFetch" => {
+            let url = extract_string_field(json, "url")?;
+            Some(tool_http_fetch(&url))
         }
         _ => None,
     }
@@ -333,6 +339,175 @@ fn tool_file_move(source: &str, dest: &str) -> ToolResult {
         Ok(_) => ToolResult::ok(format!("Moved '{}' to '{}' (note: source not deleted yet)", source, dest)),
         Err(e) => ToolResult::err(&e),
     }
+}
+
+// ============================================================================
+// Network Tools
+// ============================================================================
+
+// Maximum response size for HTTP fetch (16KB)
+const MAX_FETCH_SIZE: usize = 16 * 1024;
+
+/// HTTP GET fetch tool
+/// Note: Only supports HTTP (not HTTPS) - userspace has no TLS support
+fn tool_http_fetch(url: &str) -> ToolResult {
+    // Parse URL
+    let parsed = match parse_http_url(url) {
+        Some(p) => p,
+        None => return ToolResult::err("Invalid URL format. Use: http://host[:port]/path"),
+    };
+    
+    // HTTPS not supported in userspace
+    if parsed.is_https {
+        return ToolResult::err("HTTPS not supported in userspace (no TLS). Use http:// URLs only.");
+    }
+    
+    // Resolve hostname
+    let ip = match resolve(parsed.host) {
+        Ok(ip) => ip,
+        Err(_) => return ToolResult::err(&format!("DNS resolution failed for: {}", parsed.host)),
+    };
+    
+    // Connect
+    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+    let stream = match TcpStream::connect(&addr_str) {
+        Ok(s) => s,
+        Err(_) => return ToolResult::err(&format!("Connection failed to: {}", addr_str)),
+    };
+    
+    // Build HTTP request
+    let request = format!(
+        "GET {} HTTP/1.0\r\n\
+         Host: {}\r\n\
+         User-Agent: meow/1.0 (Akuma)\r\n\
+         Connection: close\r\n\
+         \r\n",
+        parsed.path,
+        parsed.host
+    );
+    
+    // Send request
+    if stream.write_all(request.as_bytes()).is_err() {
+        return ToolResult::err("Failed to send HTTP request");
+    }
+    
+    // Read response with size limit
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                if response.len() + n > MAX_FETCH_SIZE {
+                    // Truncate to limit
+                    let remaining = MAX_FETCH_SIZE - response.len();
+                    response.extend_from_slice(&buf[..remaining]);
+                    break;
+                }
+                response.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => {
+                if e.kind == libakuma::net::ErrorKind::WouldBlock {
+                    libakuma::sleep_ms(10);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    
+    if response.is_empty() {
+        return ToolResult::err("Empty response from server");
+    }
+    
+    // Parse HTTP response
+    let (status, body) = match parse_http_response(&response) {
+        Some(r) => r,
+        None => return ToolResult::err("Failed to parse HTTP response"),
+    };
+    
+    if status < 200 || status >= 300 {
+        return ToolResult::err(&format!("HTTP error: status {}", status));
+    }
+    
+    // Convert body to string
+    match core::str::from_utf8(body) {
+        Ok(text) => {
+            let truncated = if response.len() >= MAX_FETCH_SIZE { " (truncated)" } else { "" };
+            ToolResult::ok(format!(
+                "Fetched {} ({} bytes{}):\n```\n{}\n```",
+                url, body.len(), truncated, text
+            ))
+        }
+        Err(_) => ToolResult::err("Response contains non-UTF8 data (binary content)"),
+    }
+}
+
+/// Parsed HTTP URL
+struct ParsedUrl<'a> {
+    is_https: bool,
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+}
+
+/// Parse an HTTP(S) URL
+fn parse_http_url(url: &str) -> Option<ParsedUrl<'_>> {
+    let (is_https, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return None;
+    };
+    
+    let default_port = if is_https { 443 } else { 80 };
+    
+    // Split host:port from path
+    let (host_port, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, "/"),
+    };
+    
+    // Parse host and port
+    let (host, port) = match host_port.rfind(':') {
+        Some(pos) => {
+            let h = &host_port[..pos];
+            let p = host_port[pos + 1..].parse::<u16>().ok()?;
+            (h, p)
+        }
+        None => (host_port, default_port),
+    };
+    
+    Some(ParsedUrl { is_https, host, port, path })
+}
+
+/// Parse HTTP response, returns (status_code, body_slice)
+fn parse_http_response(data: &[u8]) -> Option<(u16, &[u8])> {
+    // Find headers end
+    let headers_end = find_headers_end(data)?;
+    
+    // Parse status line
+    let header_str = core::str::from_utf8(&data[..headers_end]).ok()?;
+    let first_line = header_str.lines().next()?;
+    
+    // Parse "HTTP/1.x STATUS MESSAGE"
+    let mut parts = first_line.split_whitespace();
+    let _version = parts.next()?;
+    let status: u16 = parts.next()?.parse().ok()?;
+    
+    Some((status, &data[headers_end..]))
+}
+
+/// Find the end of HTTP headers (\r\n\r\n)
+fn find_headers_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(3) {
+        if &data[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+    }
+    None
 }
 
 // ============================================================================

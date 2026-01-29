@@ -1,7 +1,7 @@
 //! Meow-chan - Cyberpunk Neko AI Assistant
 //!
 //! A cute cybernetically-enhanced catgirl AI that connects to Ollama LLMs.
-//! Default model: deepseek-r1:32b with a custom cyber-neko persona.
+//! Default model: gemma3:27b with a custom cyber-neko persona.
 //!
 //! Usage:
 //!   meow                    # Interactive mode with Meow-chan
@@ -30,7 +30,7 @@ use libakuma::{arg, argc, exit, fd, print, read};
 // Default Ollama server address (QEMU host gateway)
 const OLLAMA_HOST: &str = "10.0.2.2";
 const OLLAMA_PORT: u16 = 11434;
-const DEFAULT_MODEL: &str = "deepseek-r1:32b";
+const DEFAULT_MODEL: &str = "gemma3:27b";
 
 // System prompt combining persona and tools (static to avoid allocations)
 const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
@@ -89,6 +89,10 @@ You have access to filesystem tools! When you need to perform file operations, o
 
 9. **FileRename** - Rename a file
    Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
+
+10. **HttpFetch** - Fetch content from an HTTP URL (no HTTPS - no TLS in userspace)
+    Args: `{"url": "http://host:port/path"}`
+    Note: Only supports http://, not https://. Max 16KB response.
 
 ### Important Notes:
 - Output the JSON command in a ```json code block
@@ -215,7 +219,7 @@ fn print_usage() {
     print("  > ^ <   Cyberpunk Neko AI Assistant\n\n");
     print("Usage: meow [OPTIONS] [MESSAGE]\n\n");
     print("Options:\n");
-    print("  -m, --model <NAME>  Neural link override (default: deepseek-r1:32b)\n");
+    print("  -m, --model <NAME>  Neural link override (default: gemma3:27b)\n");
     print("  -h, --help          Display this transmission\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
@@ -344,6 +348,76 @@ fn trim_history(history: &mut Vec<Message>) {
     }
 }
 
+const MAX_RETRIES: u32 = 10;
+
+/// Attempt to send request with retries and exponential backoff
+fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> Result<String, &'static str> {
+    let mut backoff_ms: u64 = 500;
+    
+    // Show initial status
+    if is_continuation {
+        print("[continuing");
+    } else {
+        print("[jacking in");
+    }
+    
+    let start_time = libakuma::uptime();
+    
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            // Show retry
+            print(&format!(" retry {}", attempt));
+            libakuma::sleep_ms(backoff_ms);
+            backoff_ms *= 2; // Exponential backoff
+        }
+        
+        // Progress dot for connect
+        print(".");
+        
+        // Try to connect
+        let stream = match connect_to_ollama() {
+            Ok(s) => s,
+            Err(e) => {
+                if attempt == MAX_RETRIES - 1 {
+                    print("] ");
+                    return Err(e);
+                }
+                continue;
+            }
+        };
+        
+        // Progress dot for send
+        print(".");
+        
+        // Build and send request
+        let request_body = build_chat_request(model, history);
+        if let Err(e) = send_post_request(&stream, "/api/chat", &request_body) {
+            if attempt == MAX_RETRIES - 1 {
+                print("] ");
+                return Err(e);
+            }
+            continue;
+        }
+        
+        // Show waiting animation while reading response
+        print("] waiting");
+        
+        // Read response with progress indicator
+        match read_streaming_response_with_progress(&stream, start_time) {
+            Ok(response) => return Ok(response),
+            Err(e) => {
+                if attempt == MAX_RETRIES - 1 {
+                    return Err(e);
+                }
+                print(" (failed, retrying)");
+                continue;
+            }
+        }
+    }
+    
+    Err("Max retries exceeded")
+}
+
 fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Result<(), &'static str> {
     // Trim history before adding new message
     trim_history(history);
@@ -355,26 +429,8 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Res
     let max_tool_iterations = 5; // Prevent infinite loops
     
     for iteration in 0..max_tool_iterations {
-        // Build the request body
-        let request_body = build_chat_request(model, history);
-
-        // Show connecting status
-        if iteration == 0 {
-            print("[jacking in");
-        } else {
-            print("[continuing");
-        }
-        
-        // Connect to Ollama
-        let stream = connect_to_ollama()?;
-        print(".");
-        
-        // Send HTTP POST request
-        send_post_request(&stream, "/api/chat", &request_body)?;
-        print(".] ");
-
-        // Read and stream the response (with progress dots)
-        let assistant_response = read_streaming_response(&stream)?;
+        // Send request with retries
+        let assistant_response = send_with_retry(model, history, iteration > 0)?;
 
         // Check for tool calls in the response
         let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
@@ -472,7 +528,9 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &
         .map_err(|_| "Failed to send request")
 }
 
-fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
+/// Read streaming response with progress indicator
+/// start_time is the timestamp when the request started (from libakuma::uptime())
+fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) -> Result<String, &'static str> {
     let mut buf = [0u8; 1024]; // Smaller buffer
     let mut pending_data = Vec::new(); // Only keeps unprocessed data
     let mut headers_parsed = false;
@@ -481,7 +539,6 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
     let mut dots_printed = 0u32;
     let mut first_token_received = false;
     let mut any_data_received = false;
-    let start_time = libakuma::uptime(); // microseconds
     
     // Limit response size to prevent OOM (16KB should be plenty)
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
@@ -540,12 +597,13 @@ fn read_streaming_response(stream: &TcpStream) -> Result<String, &'static str> {
                         }
                         if let Some((content, done)) = parse_ndjson_line(line) {
                             if !content.is_empty() {
-                                // First token - show elapsed time and clear progress
+                                // First token - clear progress and show elapsed time
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    // Clear the dots with backspaces
-                                    for _ in 0..dots_printed {
+                                    // Clear "waiting" and dots with backspaces
+                                    // "waiting" = 7 chars + dots
+                                    for _ in 0..(7 + dots_printed) {
                                         print("\x08 \x08");
                                     }
                                     // Show elapsed time
