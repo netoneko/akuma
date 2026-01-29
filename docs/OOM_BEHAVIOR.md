@@ -250,7 +250,7 @@ fn handle_cgi() {
 
 ## Memory Reclamation
 
-When a process exits, its memory is freed:
+When a process exits, its memory is freed via `UserAddressSpace::drop()`:
 
 ```rust
 // src/mmu.rs
@@ -272,8 +272,28 @@ impl Drop for UserAddressSpace {
 }
 ```
 
-Memory should be reclaimed promptly when processes exit. If memory isn't being
-freed, enable `DEBUG_FRAME_TRACKING` to identify leaks.
+### Process Ownership Model
+
+The `PROCESS_TABLE` owns each `Process` via `Box<Process>`. When a process exits:
+
+1. `return_to_kernel()` calls `UserAddressSpace::deactivate()` to restore boot TTBR0
+2. `unregister_process(pid)` removes the `Box<Process>` from the table
+3. The Box goes out of scope, calling `Process::drop()`
+4. `UserAddressSpace::drop()` frees all physical pages
+
+This ensures memory is properly reclaimed when processes exit.
+
+### Historical Note: Memory Leak Fix
+
+Prior to this fix, `Process` was stored on the thread closure's stack. Since
+`process.execute()` never returns (it ERETs to userspace), the closure never
+completed and `Process::drop()` was never called. This caused a memory leak
+where physical pages were never freed, leading to OOM after running several
+heavy processes like qjs.
+
+The fix moved `Process` to heap allocation via `Box` and transferred ownership
+to `PROCESS_TABLE`. Now `unregister_process()` returns the Box which is then
+dropped, properly freeing all memory.
 
 ## Related Documentation
 

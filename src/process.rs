@@ -2,6 +2,7 @@
 //!
 //! Manages user processes including creation, execution, and termination.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -182,35 +183,33 @@ pub mod open_flags {
 /// Next available PID
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-/// Wrapper for process pointer to allow Send
-///
-/// SAFETY: Process pointers are only accessed from kernel context
-/// with proper synchronization through the Spinlock.
-#[derive(Clone, Copy)]
-struct ProcessPtr(*mut Process);
-
-// SAFETY: We ensure single-threaded access through the Spinlock
-unsafe impl Send for ProcessPtr {}
-
-/// Process table: maps PID to process pointer
+/// Process table: maps PID to owned Process
 ///
 /// Processes are stored here when created and removed when they exit.
 /// Syscall handlers use read_current_pid() + lookup_process() to find
 /// the calling process.
-static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, ProcessPtr>> =
+///
+/// IMPORTANT: The table owns the Process via Box. When unregister_process
+/// is called, the Box<Process> is returned and dropped, which triggers
+/// UserAddressSpace::drop() to free all physical pages. This prevents
+/// memory leaks when processes exit.
+static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
-/// Register a process in the table
-fn register_process(pid: Pid, proc: *mut Process) {
+/// Register a process in the table (takes ownership)
+fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().insert(pid, ProcessPtr(proc));
+        PROCESS_TABLE.lock().insert(pid, proc);
     })
 }
 
 /// Unregister a process from the table
-fn unregister_process(pid: Pid) {
+///
+/// Returns the owned Process so it can be dropped, freeing all memory
+/// including the UserAddressSpace and all its physical pages.
+fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     crate::irq::with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().remove(&pid);
+        PROCESS_TABLE.lock().remove(&pid)
     })
 }
 
@@ -437,8 +436,14 @@ pub fn read_current_pid() -> Option<Pid> {
 /// SAFETY: The caller must ensure no other code is mutating the process.
 pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
     crate::irq::with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        table.get(&pid).map(|&ProcessPtr(ptr)| unsafe { &mut *ptr })
+        let mut table = PROCESS_TABLE.lock();
+        table.get_mut(&pid).map(|boxed| {
+            // SAFETY: We return a 'static reference because:
+            // 1. The Process is heap-allocated via Box and won't move
+            // 2. The process remains in the table until unregister_process
+            // 3. Callers must not hold reference across unregister_process
+            unsafe { &mut *(&mut **boxed as *mut Process) }
+        })
     })
 }
 
@@ -500,8 +505,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
         let table = PROCESS_TABLE.lock();
         let mut result = Vec::new();
 
-        for (&pid, &ProcessPtr(ptr)) in table.iter() {
-            let proc = unsafe { &*ptr };
+        for (&pid, proc) in table.iter() {
             let state = match proc.state {
                 ProcessState::Ready => "ready",
                 ProcessState::Running => "running",
@@ -526,8 +530,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
 pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
     crate::irq::with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
-        for (&pid, &ProcessPtr(ptr)) in table.iter() {
-            let proc = unsafe { &*ptr };
+        for (&pid, proc) in table.iter() {
             if proc.thread_id == Some(thread_id) {
                 return Some(pid);
             }
@@ -840,16 +843,11 @@ impl Process {
         }
     }
 
-    /// Execute the process - enters user mode and never returns
+    /// Prepare process for execution (internal helper)
     ///
-    /// UNIFIED CONTEXT ARCHITECTURE:
-    /// This function enters user mode via ERET and never returns.
-    /// When the user process exits, return_to_kernel() is called from
-    /// the exception handler, which terminates the thread.
-    ///
-    /// The exit code is communicated via ProcessChannel for async callers.
-    /// Synchronous execution should use exec_async() and poll for completion.
-    pub fn execute(&mut self) -> ! {
+    /// Sets up process state and writes process info to the info page.
+    /// Does NOT register in process table or enter userspace.
+    fn prepare_for_execution(&mut self) {
         self.state = ProcessState::Running;
 
         // Reset per-process I/O state
@@ -876,22 +874,6 @@ impl Process {
                 });
             
             core::ptr::write(info_ptr, info);
-        }
-
-        // Register this process in the table for PID-based lookup
-        register_process(self.pid, self as *mut Process);
-
-        // Activate the user address space (sets TTBR0)
-        self.address_space.activate();
-
-        // Now safe to enable IRQs - TTBR0 is set to user tables
-        crate::irq::enable_irqs();
-
-        // Enter user mode via ERET - this never returns
-        // When user calls exit(), the exception handler calls return_to_kernel()
-        // which terminates the thread
-        unsafe {
-            enter_user_mode(&self.context);
         }
     }
 
@@ -1064,6 +1046,58 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     }
 }
 
+/// Execute a boxed process - enters user mode and never returns
+///
+/// This function takes ownership of the Box<Process>, registers it in the
+/// PROCESS_TABLE (which takes ownership), then enters userspace via ERET.
+///
+/// MEMORY MANAGEMENT:
+/// Previously, Process lived on the thread closure's stack, but execute() never
+/// returns (it ERETs to userspace). When the process exits, return_to_kernel()
+/// is called from the exception handler context, so the closure never completes
+/// and Process::drop() was never called, leaking all physical pages.
+///
+/// Now, the Process is heap-allocated via Box and owned by PROCESS_TABLE.
+/// When return_to_kernel() calls unregister_process(), the Box is returned
+/// and dropped, calling Process::drop() -> UserAddressSpace::drop() which
+/// frees all physical pages (code, data, stack, heap, page tables).
+fn execute_boxed(mut process: Box<Process>) -> ! {
+    // Prepare the process (set state, write process info page)
+    process.prepare_for_execution();
+    
+    // Get PID and context pointer before registering (which moves the Box)
+    let pid = process.pid;
+    
+    // Get raw pointer to access process after registration
+    // SAFETY: The Box is moved to PROCESS_TABLE which keeps it alive.
+    // The pointer remains valid until unregister_process() is called,
+    // which only happens in return_to_kernel() after we've left userspace.
+    let proc_ptr = &mut *process as *mut Process;
+    
+    // Register the process in the table - this transfers ownership of the Box
+    // to PROCESS_TABLE. The process memory will be freed when unregister_process
+    // returns the Box and it goes out of scope.
+    register_process(pid, process);
+    
+    // Get reference back through the raw pointer
+    // SAFETY: process is now owned by PROCESS_TABLE and won't move or be freed
+    // until unregister_process is called (which happens after we exit userspace)
+    let proc_ref = unsafe { &mut *proc_ptr };
+    
+    // Activate the user address space (sets TTBR0)
+    proc_ref.address_space.activate();
+
+    // Now safe to enable IRQs - TTBR0 is set to user tables
+    crate::irq::enable_irqs();
+
+    // Enter user mode via ERET - this never returns
+    // When user calls exit(), the exception handler calls return_to_kernel()
+    // which unregisters the process (dropping the Box and freeing memory)
+    unsafe {
+        enter_user_mode(&proc_ref.context);
+    }
+}
+
 /// Check if process has exited and return to kernel if so
 /// Called from exception handler after each syscall
 #[unsafe(no_mangle)]
@@ -1105,8 +1139,6 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // This must happen before unregistering the process so we can access fd_table
             cleanup_process_sockets(proc);
             
-            // Unregister from process table
-            unregister_process(pid);
             Some(pid)
         } else {
             None
@@ -1123,20 +1155,28 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
     
     // Deactivate user address space - restore boot TTBR0
-    // This must happen before thread termination to prevent stale TLB issues
-    // Safe to call multiple times - just writes to TTBR0 register
+    // CRITICAL: This must happen BEFORE we drop the Process (via unregister_process)
+    // because Drop frees the page tables. If we drop first, TTBR0 would point to
+    // freed memory causing a crash on any TLB miss.
     crate::mmu::UserAddressSpace::deactivate();
     
-    // Mark thread as terminated so scheduler stops scheduling it
-    // Idempotent - safe to call even if already marked by kill_process
-    crate::threading::mark_current_terminated();
-    
-    // Log exit (use safe print to avoid heap allocation in this context)
+    // Now unregister and DROP the process
+    // This calls Process::drop() -> UserAddressSpace::drop() which frees:
+    // - All user pages (code, data, stack, heap, mmap)
+    // - All page table frames (L0, L1, L2, L3)
+    // - The ASID
+    // This fixes the memory leak where processes would never free their pages.
     if let Some(pid) = pid {
+        let _dropped_process = unregister_process(pid);
+        // _dropped_process goes out of scope here and is dropped, freeing all memory
         crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
     } else {
         crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
     }
+    
+    // Mark thread as terminated so scheduler stops scheduling it
+    // Idempotent - safe to call even if already marked by kill_process
+    crate::threading::mark_current_terminated();
     
     // Yield forever - thread is terminated, scheduler will reclaim it
     // Thread 0's cleanup routine will free the thread slot
@@ -1216,8 +1256,22 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     proc.exit_code = 137; // 128 + SIGKILL(9)
     proc.state = ProcessState::Zombie(137);
     
-    // Unregister from process table
-    unregister_process(pid);
+    // Done using proc - the reference becomes invalid after unregister_process
+    // drops the Box. We don't access proc after this point.
+    // (Using let _ = proc would be redundant since it's just a reference)
+    
+    // Deactivate user TTBR0 for the killed thread
+    // Note: The killed thread will do this itself in return_to_kernel when it
+    // eventually runs, but if it's blocked in a syscall it may not run soon.
+    // For safety, we rely on the thread to deactivate its own TTBR0.
+    
+    // Unregister from process table and DROP the Box<Process>
+    // This calls Process::drop() -> UserAddressSpace::drop() which frees:
+    // - All user pages (code, data, stack, heap, mmap)
+    // - All page table frames (L0, L1, L2, L3)
+    // - The ASID
+    let _dropped_process = unregister_process(pid);
+    // _dropped_process goes out of scope here, triggering the drop
     
     // Remove and notify the process channel
     if let Some(channel) = remove_channel(thread_id) {
@@ -1342,6 +1396,16 @@ pub fn spawn_process_with_channel(
     if let Some(data) = stdin {
         process.set_stdin(data);
     }
+    
+    // Get the PID before boxing
+    let pid = process.pid;
+
+    // Box the process for heap allocation - this is CRITICAL for memory management.
+    // Previously, the Process lived on the closure's stack, but execute() never returns
+    // (it ERETs to userspace), so Process::drop() was never called, causing memory leaks.
+    // Now we Box it and register in PROCESS_TABLE which owns it. When the process exits,
+    // unregister_process() returns the Box which is then dropped, freeing all memory.
+    let mut boxed_process = Box::new(process);
 
     // Create a channel for this process
     let channel = Arc::new(ProcessChannel::new());
@@ -1361,17 +1425,12 @@ pub fn spawn_process_with_channel(
         register_channel(tid, channel_for_thread);
 
         // Set thread_id on process for kill support
-        let mut process = process;
-        process.thread_id = Some(tid);
+        boxed_process.thread_id = Some(tid);
 
-        // Execute the process - this never returns
-        // When user calls exit(), return_to_kernel() handles cleanup:
-        // - Sets exit code on channel
-        // - Removes channel registration  
-        // - Deactivates address space
-        // - Marks thread as terminated
-        // - Yields forever
-        process.execute()
+        // Execute the process using execute_boxed which registers the Box
+        // in PROCESS_TABLE (transferring ownership) then enters userspace.
+        // This never returns - when user exits, return_to_kernel() handles cleanup.
+        execute_boxed(boxed_process)
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
