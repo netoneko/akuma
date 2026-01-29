@@ -20,6 +20,9 @@ pub fn run_all_tests() {
     // Test stdcheck with mmap allocator
     test_stdcheck();
 
+    // Test procfs stdin/stdout access
+    test_procfs_stdio();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -150,4 +153,153 @@ fn test_echo2() {
             }
         }
     }
+}
+
+/// Check if a binary exists, respecting FAIL_TESTS_IF_TEST_BINARY_MISSING
+fn check_binary_exists(path: &str) -> bool {
+    if fs::read_file(path).is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, "[Test] {} not found - FAIL\n", path);
+            panic!("Required test binary not found");
+        } else {
+            crate::safe_print!(96, "[Test] {} not found, skipping procfs test\n", path);
+            return false;
+        }
+    }
+    true
+}
+
+/// Test procfs stdin/stdout access
+///
+/// This test verifies:
+/// 1. /proc/<pid>/fd/0 (stdin) is readable via procfs
+/// 2. /proc/<pid>/fd/1 (stdout) is readable via procfs
+/// 3. Proper content is returned from process buffers
+fn test_procfs_stdio() {
+    const HELLO_PATH: &str = "/bin/hello";
+    const ECHO2_PATH: &str = "/bin/echo2";
+
+    // Check binaries exist (respect FAIL_TESTS_IF_TEST_BINARY_MISSING)
+    if !check_binary_exists(HELLO_PATH) || !check_binary_exists(ECHO2_PATH) {
+        return;
+    }
+
+    console::print("[Test] Testing procfs stdin/stdout access...\n");
+
+    // 1. Spawn hello with "10 50" args (10 outputs, 50ms delay = ~500ms runtime)
+    let hello_args = &["10", "50"];
+    let (hello_thread_id, _hello_channel) = match process::spawn_process_with_channel(
+        HELLO_PATH,
+        Some(hello_args),
+        None,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::safe_print!(96, "[Test] Failed to spawn hello: {}\n", e);
+            return;
+        }
+    };
+
+    // Wait briefly for process to register
+    crate::threading::yield_now();
+
+    // Get hello's PID
+    let hello_pid = match process::find_pid_by_thread(hello_thread_id) {
+        Some(pid) => pid,
+        None => {
+            console::print("[Test] Failed to find hello PID\n");
+            return;
+        }
+    };
+
+    // 2. Spawn echo2 with stdin data
+    let stdin_data = b"test input for echo2\n";
+    let (echo2_thread_id, _echo2_channel) = match process::spawn_process_with_channel(
+        ECHO2_PATH,
+        None,
+        Some(stdin_data),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::safe_print!(96, "[Test] Failed to spawn echo2: {}\n", e);
+            return;
+        }
+    };
+
+    // Wait briefly for process to register
+    crate::threading::yield_now();
+
+    // Get echo2's PID
+    let echo2_pid = match process::find_pid_by_thread(echo2_thread_id) {
+        Some(pid) => pid,
+        None => {
+            console::print("[Test] Failed to find echo2 PID\n");
+            return;
+        }
+    };
+
+    crate::safe_print!(
+        96,
+        "[Test] Spawned hello (PID {}) and echo2 (PID {})\n",
+        hello_pid,
+        echo2_pid
+    );
+
+    // 3. Wait ~500ms for processes to run (hello takes ~450ms)
+    // Use polling with yield since there's no sleep_ms in kernel
+    let wait_start = crate::timer::uptime_us();
+    let wait_duration_us = 500_000; // 500ms
+    while crate::timer::uptime_us() - wait_start < wait_duration_us {
+        crate::threading::yield_now();
+    }
+
+    // 4. Read echo2's stdin via procfs: /proc/<echo2_pid>/fd/0
+    let stdin_path = alloc::format!("/proc/{}/fd/0", echo2_pid);
+    match fs::read_file(&stdin_path) {
+        Ok(data) => {
+            if data == stdin_data {
+                console::print("[Test] procfs stdin read: PASSED\n");
+            } else {
+                crate::safe_print!(
+                    128,
+                    "[Test] procfs stdin MISMATCH: expected {} bytes, got {}\n",
+                    stdin_data.len(),
+                    data.len()
+                );
+            }
+        }
+        Err(e) => {
+            crate::safe_print!(96, "[Test] Failed to read {}: {:?}\n", stdin_path, e);
+        }
+    }
+
+    // 5. Read hello's stdout via procfs: /proc/<hello_pid>/fd/1
+    let stdout_path = alloc::format!("/proc/{}/fd/1", hello_pid);
+    match fs::read_file(&stdout_path) {
+        Ok(data) => {
+            // Verify stdout contains expected content
+            if let Ok(s) = core::str::from_utf8(&data) {
+                if s.contains("hello (10/10)") && s.contains("hello: done") {
+                    console::print("[Test] procfs stdout read: PASSED\n");
+                } else {
+                    crate::safe_print!(
+                        128,
+                        "[Test] procfs stdout missing expected content (got {} bytes)\n",
+                        data.len()
+                    );
+                }
+            } else {
+                console::print("[Test] procfs stdout: invalid UTF-8\n");
+            }
+        }
+        Err(e) => {
+            crate::safe_print!(96, "[Test] Failed to read {}: {:?}\n", stdout_path, e);
+        }
+    }
+
+    // Cleanup: wait for processes to exit
+    // Note: we don't have waitpid in this context, but processes should have exited by now
+    crate::threading::cleanup_terminated();
+
+    console::print("[Test] procfs stdio test complete\n");
 }

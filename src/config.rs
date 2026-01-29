@@ -233,3 +233,26 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
 pub const AUTO_START_HERD: bool = true;
+
+// ============================================================================
+// Procfs Buffer Size Limits
+// ============================================================================
+
+/// Maximum size for per-process stdin buffer in procfs
+///
+/// When a write to /proc/<pid>/fd/0 would cause the buffer to exceed this
+/// limit, the entire buffer is replaced with the new write data.
+/// This prevents OOM from runaway stdin input while keeping the most recent data.
+///
+/// Note: A single write larger than this limit is still accepted in full.
+pub const PROC_STDIN_MAX_SIZE: usize = 8 * 1024; // 8KB
+
+/// Maximum size for per-process stdout buffer in procfs
+///
+/// When a write to /proc/<pid>/fd/1 would cause the buffer to exceed this
+/// limit, the entire buffer is replaced with the new write data.
+/// This prevents OOM from verbose process output (e.g., CGI scripts) while
+/// keeping the most recent output available for reading.
+///
+/// Note: A single write larger than this limit is still accepted in full.
+pub const PROC_STDOUT_MAX_SIZE: usize = 8 * 1024; // 8KB

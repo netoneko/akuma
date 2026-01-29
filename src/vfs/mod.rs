@@ -6,6 +6,7 @@
 
 pub mod ext2;
 pub mod memory;
+pub mod proc;
 
 use alloc::boxed::Box;
 use alloc::string::String;

@@ -127,6 +127,91 @@ const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 pub type Pid = u32;
 
 // ============================================================================
+// Stdio Buffer (thread-safe stdin/stdout with size limits)
+// ============================================================================
+
+/// Thread-safe stdio buffer with size limits to prevent OOM
+///
+/// Used for both stdin and stdout. Size limits use "last write wins" policy:
+/// when a write would exceed the limit, the buffer is cleared before writing.
+#[derive(Clone)]
+pub struct StdioBuffer {
+    /// The actual data buffer
+    pub data: Vec<u8>,
+    /// Read position (only meaningful for stdin)
+    pub pos: usize,
+}
+
+impl StdioBuffer {
+    /// Create a new empty buffer
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// Get the data length
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Check if buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Clear the buffer and reset position
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.pos = 0;
+    }
+
+    /// Write data with size limit ("last write wins" policy)
+    ///
+    /// If adding data would exceed max_size, clears buffer first.
+    /// A single write larger than max_size is still accepted in full.
+    pub fn write_with_limit(&mut self, data: &[u8], max_size: usize) {
+        if self.data.len() + data.len() > max_size {
+            self.data.clear();
+        }
+        self.data.extend_from_slice(data);
+    }
+
+    /// Set data (replaces existing, with size limit)
+    pub fn set_with_limit(&mut self, data: &[u8], max_size: usize) {
+        self.data.clear();
+        self.pos = 0;
+        if data.len() <= max_size {
+            self.data.extend_from_slice(data);
+        } else {
+            // Data exceeds limit - keep last max_size bytes
+            self.data.extend_from_slice(&data[data.len() - max_size..]);
+        }
+    }
+
+    /// Read from buffer (advances position)
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let remaining = &self.data[self.pos..];
+        let to_read = buf.len().min(remaining.len());
+        buf[..to_read].copy_from_slice(&remaining[..to_read]);
+        self.pos += to_read;
+        to_read
+    }
+
+    /// Clone the data (for procfs reads)
+    pub fn clone_data(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+}
+
+impl Default for StdioBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // File Descriptor Table
 // ============================================================================
 
@@ -718,13 +803,13 @@ pub struct Process {
     /// Command line arguments (stored as strings, serialized to ProcessInfo on execute)
     pub args: Vec<String>,
 
-    // ========== Per-process I/O ==========
-    /// Process stdin buffer (set before execution)
-    pub stdin_buf: Vec<u8>,
-    /// Position in stdin buffer for reads
-    pub stdin_pos: usize,
-    /// Process stdout buffer (captured during execution)
-    pub stdout_buf: Vec<u8>,
+    // ========== Per-process I/O (Spinlock-protected for thread safety) ==========
+    /// Process stdin buffer with read position
+    /// Protected by Spinlock to prevent races between procfs reads and process reads
+    pub stdin: Spinlock<StdioBuffer>,
+    /// Process stdout buffer
+    /// Protected by Spinlock to prevent races between syscall writes and procfs reads
+    pub stdout: Spinlock<StdioBuffer>,
     /// Process has exited
     pub exited: bool,
     /// Exit code (valid when exited=true)
@@ -746,6 +831,11 @@ pub struct Process {
     // ========== Thread tracking ==========
     /// Thread ID running this process (set after spawn, used for kill)
     pub thread_id: Option<usize>,
+
+    // ========== Spawner tracking (for procfs permissions) ==========
+    /// PID of the process that spawned this one
+    /// None = kernel spawned (allows anyone to write to stdin)
+    pub spawner_pid: Option<Pid>,
 }
 
 
@@ -804,10 +894,9 @@ impl Process {
             process_info_phys: process_info_frame.addr,
             // Command line arguments - initialized empty
             args: Vec::new(),
-            // Per-process I/O - initialized empty
-            stdin_buf: Vec::new(),
-            stdin_pos: 0,
-            stdout_buf: Vec::new(),
+            // Per-process I/O - Spinlock-protected for thread safety
+            stdin: Spinlock::new(StdioBuffer::new()),
+            stdout: Spinlock::new(StdioBuffer::new()),
             exited: false,
             exit_code: 0,
             // Dynamic page tables - for mmap-allocated page tables
@@ -817,6 +906,8 @@ impl Process {
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
             // Thread ID - set when spawned
             thread_id: None,
+            // Spawner PID - set when spawned by another process
+            spawner_pid: None,
         })
     }
 
@@ -877,33 +968,34 @@ impl Process {
         }
     }
 
-    // ========== Per-Process I/O Methods ==========
+    // ========== Per-Process I/O Methods (thread-safe with size limits) ==========
 
-    /// Set stdin data for this process
+    /// Set stdin data for this process (with size limit)
     pub fn set_stdin(&mut self, data: &[u8]) {
-        self.stdin_buf.clear();
-        self.stdin_buf.extend_from_slice(data);
-        self.stdin_pos = 0;
+        let mut stdin = self.stdin.lock();
+        stdin.set_with_limit(data, config::PROC_STDIN_MAX_SIZE);
     }
 
     /// Read from this process's stdin
     /// Returns number of bytes read
     pub fn read_stdin(&mut self, buf: &mut [u8]) -> usize {
-        let remaining = &self.stdin_buf[self.stdin_pos..];
-        let to_read = buf.len().min(remaining.len());
-        buf[..to_read].copy_from_slice(&remaining[..to_read]);
-        self.stdin_pos += to_read;
-        to_read
+        let mut stdin = self.stdin.lock();
+        stdin.read(buf)
     }
 
-    /// Write to this process's stdout
+    /// Write to this process's stdout (with size limit)
+    ///
+    /// Applies "last write wins" policy: if adding data would exceed
+    /// PROC_STDOUT_MAX_SIZE, clears buffer before writing.
     pub fn write_stdout(&mut self, data: &[u8]) {
-        self.stdout_buf.extend_from_slice(data);
+        let mut stdout = self.stdout.lock();
+        stdout.write_with_limit(data, config::PROC_STDOUT_MAX_SIZE);
     }
 
     /// Take captured stdout (transfers ownership)
     pub fn take_stdout(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.stdout_buf)
+        let mut stdout = self.stdout.lock();
+        core::mem::take(&mut stdout.data)
     }
 
     /// Get current program break
@@ -923,8 +1015,8 @@ impl Process {
 
     /// Reset I/O state for execution
     pub fn reset_io(&mut self) {
-        self.stdin_pos = 0;
-        self.stdout_buf.clear();
+        self.stdin.lock().pos = 0;
+        self.stdout.lock().clear();
         self.exited = false;
         self.exit_code = 0;
     }
@@ -1396,6 +1488,10 @@ pub fn spawn_process_with_channel(
     if let Some(data) = stdin {
         process.set_stdin(data);
     }
+
+    // Set spawner PID (the process that called spawn, if any)
+    // This is used by procfs to control who can write to stdin
+    process.spawner_pid = read_current_pid();
     
     // Get the PID before boxing
     let pid = process.pid;
