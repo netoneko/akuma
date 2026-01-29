@@ -1023,8 +1023,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     }
                     
                     // Use stack-only print to avoid heap allocation in exception context
-                    crate::safe_print!(96, "[exception] Process {} exited, calling return_to_kernel({})\n",
-                        proc.pid, exit_code);
+                    crate::safe_print!(128, "[exception] Process {} ({}) exited, calling return_to_kernel({})\n",
+                        proc.pid, proc.name, exit_code);
                     // Don't ERET back to user - return to kernel instead
                     crate::process::return_to_kernel(exit_code);
                 }
