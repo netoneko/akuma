@@ -298,7 +298,7 @@ pub static APPEND_CMD: AppendCommand = AppendCommand;
 // Rm Command
 // ============================================================================
 
-/// Rm command - remove file
+/// Rm command - remove file or directory
 pub struct RmCommand;
 
 impl Command for RmCommand {
@@ -309,10 +309,10 @@ impl Command for RmCommand {
         &["del"]
     }
     fn description(&self) -> &'static str {
-        "Remove file"
+        "Remove file or directory"
     }
     fn usage(&self) -> &'static str {
-        "rm <filename>"
+        "rm [-r] <path>"
     }
 
     fn execute<'a>(
@@ -324,7 +324,7 @@ impl Command for RmCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             if args.is_empty() {
-                let _ = stdout.write(b"Usage: rm <filename>\r\n").await;
+                let _ = stdout.write(b"Usage: rm [-r] <path>\r\n").await;
                 return Ok(());
             }
 
@@ -333,21 +333,148 @@ impl Command for RmCommand {
                 return Ok(());
             }
 
+            // Parse arguments for -r flag
             let arg_str = core::str::from_utf8(args).unwrap_or("");
-            let path = ctx.resolve_path(arg_str);
-            match async_fs::remove_file(&path).await {
-                Ok(()) => {
-                    let msg = format!("Removed: {}\r\n", path);
+            let mut recursive = false;
+            let mut path_arg = arg_str.trim();
+
+            // Check for -r or -rf flags
+            if path_arg.starts_with("-r ") || path_arg.starts_with("-rf ") {
+                recursive = true;
+                path_arg = path_arg.split_once(' ').map(|(_, rest)| rest.trim()).unwrap_or("");
+            } else if path_arg == "-r" || path_arg == "-rf" {
+                let _ = stdout.write(b"Usage: rm [-r] <path>\r\n").await;
+                return Ok(());
+            }
+
+            if path_arg.is_empty() {
+                let _ = stdout.write(b"Usage: rm [-r] <path>\r\n").await;
+                return Ok(());
+            }
+
+            let path = ctx.resolve_path(path_arg);
+
+            // Check if it's a directory
+            let is_dir = async_fs::list_dir(&path).await.is_ok();
+
+            if is_dir {
+                if !recursive {
+                    let msg = format!("Error: '{}' is a directory, use -r to remove\r\n", path);
                     let _ = stdout.write(msg.as_bytes()).await;
+                    return Ok(());
                 }
-                Err(e) => {
-                    let msg = format!("Error removing file: {}\r\n", e);
-                    let _ = stdout.write(msg.as_bytes()).await;
+
+                // Recursive directory removal
+                match remove_dir_recursive(&path).await {
+                    Ok(()) => {
+                        let msg = format!("Removed: {}\r\n", path);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                    Err(e) => {
+                        let msg = format!("Error removing directory: {}\r\n", e);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                }
+            } else {
+                // Regular file removal
+                match async_fs::remove_file(&path).await {
+                    Ok(()) => {
+                        let msg = format!("Removed: {}\r\n", path);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                    Err(e) => {
+                        let msg = format!("Error removing file: {}\r\n", e);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
                 }
             }
             Ok(())
         })
     }
+}
+
+/// Error type for recursive removal with path context
+#[derive(Debug)]
+pub struct RemoveError {
+    pub path: alloc::string::String,
+    pub operation: &'static str,
+    pub error: crate::fs::FsError,
+}
+
+impl core::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} '{}': {}", self.operation, self.path, self.error)
+    }
+}
+
+/// Recursively remove a directory and all its contents
+async fn remove_dir_recursive(path: &str) -> Result<(), RemoveError> {
+    // List directory contents first to get all entries
+    let entries = async_fs::list_dir(path).await.map_err(|e| RemoveError {
+        path: alloc::string::String::from(path),
+        operation: "listing",
+        error: e,
+    })?;
+
+    // Remove all entries
+    for entry in entries {
+        // Yield between operations to allow other tasks to run
+        crate::threading::yield_now();
+
+        let entry_path = if path == "/" {
+            format!("/{}", entry.name)
+        } else {
+            format!("{}/{}", path, entry.name)
+        };
+
+        if entry.is_dir {
+            // Recursively remove subdirectory
+            match Box::pin(remove_dir_recursive(&entry_path)).await {
+                Ok(()) => {}
+                // Skip entries that don't exist or have invalid inodes
+                Err(e)
+                    if e.error == crate::fs::FsError::NotFound
+                        || e.error == crate::fs::FsError::IoError =>
+                {
+                    // Already removed or invalid, skip
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Try to remove as file
+            match async_fs::remove_file(&entry_path).await {
+                Ok(()) => {}
+                // Skip entries that don't exist or have invalid inodes
+                Err(crate::fs::FsError::NotFound) | Err(crate::fs::FsError::IoError) => {
+                    // Already removed or invalid inode, skip
+                }
+                Err(crate::fs::FsError::NotAFile) => {
+                    // Actually a directory, try recursive removal
+                    match Box::pin(remove_dir_recursive(&entry_path)).await {
+                        Ok(()) => {}
+                        Err(e)
+                            if e.error == crate::fs::FsError::NotFound
+                                || e.error == crate::fs::FsError::IoError => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => {
+                    return Err(RemoveError {
+                        path: entry_path,
+                        operation: "removing file",
+                        error: e,
+                    });
+                }
+            }
+        }
+    }
+
+    // Remove the now-empty directory
+    async_fs::remove_dir(path).await.map_err(|e| RemoveError {
+        path: alloc::string::String::from(path),
+        operation: "removing directory",
+        error: e,
+    })
 }
 
 /// Static instance
