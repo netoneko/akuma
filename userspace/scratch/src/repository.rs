@@ -10,7 +10,6 @@ use libakuma::{close, mkdir, open, open_flags, print, write_fd};
 
 use crate::error::{Error, Result};
 use crate::http::Url;
-use crate::pack::PackParser;
 use crate::protocol::ProtocolClient;
 use crate::refs::RefManager;
 use crate::sha1::{self, Sha1Hash};
@@ -34,7 +33,7 @@ pub fn clone(url: &str) -> Result<()> {
     print("\n");
 
     // Create protocol client
-    let client = ProtocolClient::new(parsed_url.clone());
+    let mut client = ProtocolClient::new(parsed_url.clone());
 
     // Discover refs
     let (refs, caps) = client.discover_refs()?;
@@ -76,13 +75,6 @@ pub fn clone(url: &str) -> Result<()> {
     print_num(unique_wants.len());
     print(" objects\n");
 
-    // Fetch pack
-    let pack_data = client.fetch_pack(&unique_wants, &[], &caps)?;
-
-    print("scratch: received ");
-    print_num(pack_data.len());
-    print(" bytes\n");
-
     // Extract repo name from URL for directory
     let repo_name = extract_repo_name(&parsed_url.path);
     
@@ -106,18 +98,12 @@ pub fn clone(url: &str) -> Result<()> {
     let store = ObjectStore::new(&git_dir);
     store.init()?;
 
-    // Parse pack and store objects
-    print("scratch: unpacking objects\n");
-    let mut parser = PackParser::new(&pack_data)?;
-    
-    print("scratch: pack contains ");
-    print_num(parser.object_count() as usize);
-    print(" objects\n");
-
-    let shas = parser.parse_all(&store)?;
+    // Fetch and parse pack using streaming
+    print("scratch: fetching and unpacking objects (streaming)\n");
+    let object_count = client.fetch_pack_streaming(&unique_wants, &[], &caps, &git_dir)?;
 
     print("scratch: stored ");
-    print_num(shas.len());
+    print_num(object_count as usize);
     print(" objects\n");
 
     // Create refs
@@ -179,7 +165,7 @@ pub fn fetch() -> Result<()> {
     print("\n");
 
     // Create protocol client
-    let client = ProtocolClient::new(parsed_url);
+    let mut client = ProtocolClient::new(parsed_url);
 
     // Discover refs
     let (remote_refs, caps) = client.discover_refs()?;
@@ -215,19 +201,11 @@ pub fn fetch() -> Result<()> {
     print_num(wants.len());
     print(" new objects\n");
 
-    // Fetch pack
-    let pack_data = client.fetch_pack(&wants, &haves, &caps)?;
-
-    print("scratch: received ");
-    print_num(pack_data.len());
-    print(" bytes\n");
-
-    // Parse and store
-    let mut parser = PackParser::new(&pack_data)?;
-    let shas = parser.parse_all(&store)?;
+    // Fetch and parse using streaming
+    let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, GIT_DIR)?;
 
     print("scratch: stored ");
-    print_num(shas.len());
+    print_num(object_count as usize);
     print(" objects\n");
 
     // Update remote tracking refs

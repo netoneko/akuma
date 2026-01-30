@@ -97,6 +97,10 @@ impl Error {
         Self::new(ErrorKind::ObjectNotFound, "object not found")
     }
 
+    pub fn other(message: &str) -> Self {
+        Self::new(ErrorKind::Other, message)
+    }
+
     pub fn delta_base_not_found() -> Self {
         Self::new(ErrorKind::DeltaBaseNotFound, "delta base not found")
     }

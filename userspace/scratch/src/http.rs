@@ -7,6 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libakuma::net::{resolve, TcpStream};
+use libakuma::print;
 use libakuma_tls::transport::TcpTransport;
 use libakuma_tls::{TlsStream, TLS_RECORD_SIZE};
 
@@ -105,15 +106,30 @@ impl Response {
 /// HTTP client
 pub struct HttpClient {
     url: Url,
+    /// Cached resolved IP address (to avoid repeated DNS lookups)
+    resolved_ip: Option<[u8; 4]>,
 }
 
 impl HttpClient {
     pub fn new(url: Url) -> Self {
-        Self { url }
+        Self { url, resolved_ip: None }
+    }
+    
+    /// Resolve and cache the IP address
+    pub fn get_ip(&mut self) -> Result<[u8; 4]> {
+        if let Some(ip) = self.resolved_ip {
+            return Ok(ip);
+        }
+        
+        let ip = resolve(&self.url.host)
+            .map_err(|_| Error::network("DNS resolution failed"))?;
+        
+        self.resolved_ip = Some(ip);
+        Ok(ip)
     }
 
     /// Send GET request
-    pub fn get(&self, path: &str) -> Result<Response> {
+    pub fn get(&mut self, path: &str) -> Result<Response> {
         let request = format!(
             "GET {} HTTP/1.1\r\n\
              Host: {}\r\n\
@@ -128,7 +144,7 @@ impl HttpClient {
     }
 
     /// Send POST request with body
-    pub fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
+    pub fn post(&mut self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
         let request = format!(
             "POST {} HTTP/1.1\r\n\
              Host: {}\r\n\
@@ -144,14 +160,13 @@ impl HttpClient {
         self.send_request_with_body(&request, body)
     }
 
-    fn send_request(&self, request: &str) -> Result<Response> {
+    fn send_request(&mut self, request: &str) -> Result<Response> {
         self.send_request_with_body(request, &[])
     }
 
-    fn send_request_with_body(&self, request: &str, body: &[u8]) -> Result<Response> {
-        // Resolve host
-        let ip = resolve(&self.url.host)
-            .map_err(|_| Error::network("DNS resolution failed"))?;
+    fn send_request_with_body(&mut self, request: &str, body: &[u8]) -> Result<Response> {
+        // Resolve host (uses cache)
+        let ip = self.get_ip()?;
 
         let addr = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], self.url.port);
 
@@ -245,16 +260,65 @@ fn read_http_response(stream: &TcpStream) -> Result<Vec<u8>> {
 fn read_tls_response(tls: &mut TlsStream<'_>) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut last_report = 0usize;
 
     loop {
         match tls.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                // Print progress every 64KB
+                if response.len() - last_report >= 65536 {
+                    print("scratch: received ");
+                    print_size(response.len());
+                    print("\r");
+                    last_report = response.len();
+                }
+            }
             Err(_) => break,
         }
     }
 
+    if response.len() > 65536 {
+        print("\n");
+    }
+
     Ok(response)
+}
+
+fn print_size(bytes: usize) {
+    if bytes >= 1024 * 1024 {
+        let mb = bytes / (1024 * 1024);
+        print_num(mb);
+        print(" MB");
+    } else if bytes >= 1024 {
+        let kb = bytes / 1024;
+        print_num(kb);
+        print(" KB");
+    } else {
+        print_num(bytes);
+        print(" bytes");
+    }
+}
+
+fn print_num(n: usize) {
+    if n == 0 {
+        print("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut val = n;
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        let s = core::str::from_utf8(&buf[i..i+1]).unwrap();
+        print(s);
+    }
 }
 
 fn parse_response(data: &[u8]) -> Result<Response> {
@@ -275,6 +339,8 @@ fn parse_response(data: &[u8]) -> Result<Response> {
 
     // Parse headers
     let mut headers = Vec::new();
+    let mut is_chunked = false;
+    
     for line in lines {
         if line.is_empty() {
             continue;
@@ -282,18 +348,91 @@ fn parse_response(data: &[u8]) -> Result<Response> {
         if let Some(colon_pos) = line.find(':') {
             let name = line[..colon_pos].trim();
             let value = line[colon_pos + 1..].trim();
+            
+            // Check for chunked transfer encoding
+            if name.eq_ignore_ascii_case("Transfer-Encoding") && value.contains("chunked") {
+                is_chunked = true;
+            }
+            
             headers.push((String::from(name), String::from(value)));
         }
     }
 
     // Body is everything after headers
-    let body = data[headers_end..].to_vec();
+    let raw_body = &data[headers_end..];
+    
+    // Decode chunked encoding if present
+    let body = if is_chunked {
+        decode_chunked(raw_body)?
+    } else {
+        raw_body.to_vec()
+    };
 
     Ok(Response {
         status,
         headers,
         body,
     })
+}
+
+/// Decode chunked transfer encoding
+/// Format: <hex-size>\r\n<data>\r\n<hex-size>\r\n<data>\r\n...0\r\n\r\n
+fn decode_chunked(data: &[u8]) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    
+    while pos < data.len() {
+        // Find end of chunk size line
+        let line_end = find_crlf(&data[pos..])
+            .ok_or_else(|| Error::http("invalid chunked encoding: no CRLF after size"))?;
+        
+        // Parse chunk size (hex)
+        let size_str = core::str::from_utf8(&data[pos..pos + line_end])
+            .map_err(|_| Error::http("invalid chunked encoding: size not UTF-8"))?
+            .trim();
+        
+        // Size might have chunk extensions after semicolon, ignore them
+        let size_part = size_str.split(';').next().unwrap_or(size_str).trim();
+        
+        let chunk_size = usize::from_str_radix(size_part, 16)
+            .map_err(|_| Error::http("invalid chunked encoding: bad size"))?;
+        
+        // Move past size line and CRLF
+        pos += line_end + 2;
+        
+        // Last chunk (size 0)
+        if chunk_size == 0 {
+            break;
+        }
+        
+        // Ensure we have enough data
+        if pos + chunk_size > data.len() {
+            // Might be truncated, use what we have
+            result.extend_from_slice(&data[pos..]);
+            break;
+        }
+        
+        // Copy chunk data
+        result.extend_from_slice(&data[pos..pos + chunk_size]);
+        pos += chunk_size;
+        
+        // Skip trailing CRLF after chunk data
+        if pos + 2 <= data.len() && &data[pos..pos + 2] == b"\r\n" {
+            pos += 2;
+        }
+    }
+    
+    Ok(result)
+}
+
+/// Find CRLF in data, returns position of \r
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(1) {
+        if data[i] == b'\r' && data[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {

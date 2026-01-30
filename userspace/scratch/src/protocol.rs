@@ -13,6 +13,25 @@ use alloc::vec::Vec;
 use libakuma::print;
 
 use crate::error::{Error, Result};
+use crate::pack_stream::StreamingPackParser;
+use crate::stream::process_pack_streaming;
+
+fn print_status(status: u16) {
+    let mut buf = [0u8; 5];
+    let mut n = status;
+    let mut i = 4;
+    loop {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 || i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        print(s);
+    }
+}
 use crate::http::{HttpClient, Url};
 use crate::pktline;
 use crate::sha1::{self, Sha1Hash};
@@ -74,7 +93,7 @@ impl ProtocolClient {
     }
 
     /// Discover refs from the remote
-    pub fn discover_refs(&self) -> Result<(Vec<RemoteRef>, Capabilities)> {
+    pub fn discover_refs(&mut self) -> Result<(Vec<RemoteRef>, Capabilities)> {
         let path = self.url.info_refs_url();
         
         print("scratch: fetching refs from ");
@@ -83,17 +102,48 @@ impl ProtocolClient {
 
         let response = self.client.get(&path)?;
 
+        print("scratch: got status ");
+        print_status(response.status);
+        print("\n");
+
         if response.status != 200 {
+            // Print response body for debugging
+            if let Ok(body_str) = core::str::from_utf8(&response.body) {
+                let preview: &str = if body_str.len() > 200 { &body_str[..200] } else { body_str };
+                print("scratch: response: ");
+                print(preview);
+                print("\n");
+            }
             return Err(Error::http(&format!("status {}", response.status)));
         }
 
         // Check content type
         let content_type = response.header("Content-Type")
             .unwrap_or("");
+        print("scratch: content-type: ");
+        print(content_type);
+        print("\n");
+        
         if !content_type.contains("x-git-upload-pack-advertisement") {
-            // Might be a dumb server or error page
+            // Print response body for debugging
+            if let Ok(body_str) = core::str::from_utf8(&response.body) {
+                let preview: &str = if body_str.len() > 200 { &body_str[..200] } else { body_str };
+                print("scratch: unexpected response: ");
+                print(preview);
+                print("\n");
+            }
             return Err(Error::protocol("not a smart Git server"));
         }
+
+        // Debug: show first bytes of body
+        print("scratch: body starts with: ");
+        let preview_len = core::cmp::min(40, response.body.len());
+        if let Ok(s) = core::str::from_utf8(&response.body[..preview_len]) {
+            print(s);
+        } else {
+            print("<binary>");
+        }
+        print("\n");
 
         parse_ref_discovery(&response.body)
     }
@@ -101,7 +151,7 @@ impl ProtocolClient {
     /// Fetch a pack file with the given wants
     ///
     /// Returns the raw pack data
-    pub fn fetch_pack(&self, wants: &[Sha1Hash], haves: &[Sha1Hash], caps: &Capabilities) -> Result<Vec<u8>> {
+    pub fn fetch_pack(&mut self, wants: &[Sha1Hash], haves: &[Sha1Hash], caps: &Capabilities) -> Result<Vec<u8>> {
         let path = self.url.upload_pack_url();
         
         print("scratch: requesting pack from ");
@@ -126,6 +176,203 @@ impl ProtocolClient {
         // 1. Side-band multiplexed data (if we requested side-band)
         // 2. NAK + pack data directly
         parse_upload_pack_response(&response.body, caps)
+    }
+
+    /// Fetch pack with streaming - writes objects directly to disk
+    /// Returns the number of objects parsed
+    pub fn fetch_pack_streaming(
+        &mut self,
+        wants: &[Sha1Hash],
+        haves: &[Sha1Hash],
+        caps: &Capabilities,
+        git_dir: &str,
+    ) -> Result<u32> {
+        let path = self.url.upload_pack_url();
+        
+        print("scratch: requesting pack (streaming) from ");
+        print(&path);
+        print("\n");
+
+        // Build the request body
+        let request_body = build_upload_pack_request(wants, haves, caps);
+
+        // Get resolved IP from client
+        let resolved_ip = self.client.get_ip()?;
+
+        // Create streaming pack parser
+        let mut parser = StreamingPackParser::new(git_dir);
+        
+        // State for sideband demultiplexing
+        let use_sideband = caps.side_band || caps.side_band_64k;
+        let mut sideband_state = SidebandState::new(use_sideband);
+
+        // Process pack in streaming fashion
+        process_pack_streaming(
+            &self.url,
+            resolved_ip,
+            &path,
+            "application/x-git-upload-pack-request",
+            &request_body,
+            |chunk| {
+                // Process through sideband demuxer if needed
+                let pack_data = sideband_state.process(chunk)?;
+                
+                if !pack_data.is_empty() {
+                    parser.feed(&pack_data)?;
+                }
+                
+                Ok(true) // Continue processing
+            },
+        )?;
+
+        // Finalize parsing
+        let count = parser.finish()?;
+        
+        print("\nscratch: parsed ");
+        print_num(count as usize);
+        print(" objects\n");
+        
+        Ok(count)
+    }
+}
+
+/// State machine for sideband demultiplexing during streaming
+struct SidebandState {
+    enabled: bool,
+    buffer: Vec<u8>,
+    in_pack_data: bool,
+}
+
+impl SidebandState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            buffer: Vec::new(),
+            in_pack_data: false,
+        }
+    }
+
+    /// Process incoming data and extract pack data
+    fn process(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.enabled {
+            // Skip NAK line if present at start
+            if !self.in_pack_data {
+                if data.starts_with(b"NAK") || data.starts_with(b"0008NAK") {
+                    // Skip NAK packet
+                    self.in_pack_data = true;
+                    // Find pack data start
+                    if let Some(pos) = find_pack_start(data) {
+                        return Ok(data[pos..].to_vec());
+                    }
+                    return Ok(Vec::new());
+                }
+                if data.starts_with(b"PACK") {
+                    self.in_pack_data = true;
+                    return Ok(data.to_vec());
+                }
+            }
+            return Ok(data.to_vec());
+        }
+
+        // Sideband enabled - need to demux
+        self.buffer.extend_from_slice(data);
+        let mut pack_data = Vec::new();
+
+        while self.buffer.len() >= 4 {
+            // Parse pkt-line length
+            let len_hex = &self.buffer[..4];
+            let len_str = core::str::from_utf8(len_hex).unwrap_or("0000");
+            
+            let len = match u16::from_str_radix(len_str, 16) {
+                Ok(l) => l as usize,
+                Err(_) => {
+                    // Not a valid pkt-line, might be raw pack data
+                    if self.buffer.starts_with(b"PACK") {
+                        pack_data.extend_from_slice(&self.buffer);
+                        self.buffer.clear();
+                    }
+                    break;
+                }
+            };
+
+            if len == 0 {
+                // Flush packet
+                self.buffer = self.buffer[4..].to_vec();
+                continue;
+            }
+
+            if len < 4 || self.buffer.len() < len {
+                // Need more data
+                break;
+            }
+
+            // Get packet content
+            let content = &self.buffer[4..len];
+            
+            if !content.is_empty() {
+                match content[0] {
+                    1 => {
+                        // Pack data
+                        pack_data.extend_from_slice(&content[1..]);
+                    }
+                    2 => {
+                        // Progress - print it
+                        if let Ok(msg) = core::str::from_utf8(&content[1..]) {
+                            print("remote: ");
+                            print(msg.trim());
+                            print("\n");
+                        }
+                    }
+                    3 => {
+                        // Error
+                        if let Ok(msg) = core::str::from_utf8(&content[1..]) {
+                            return Err(Error::protocol(msg.trim()));
+                        }
+                    }
+                    _ => {
+                        // Unknown, might be NAK/ACK
+                        let line = core::str::from_utf8(content).unwrap_or("");
+                        if !line.starts_with("NAK") && !line.starts_with("ACK") {
+                            // Unknown content
+                        }
+                    }
+                }
+            }
+
+            self.buffer = self.buffer[len..].to_vec();
+        }
+
+        Ok(pack_data)
+    }
+}
+
+fn find_pack_start(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(4) {
+        if &data[i..i+4] == b"PACK" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn print_num(n: usize) {
+    if n == 0 {
+        print("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut val = n;
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        if let Ok(s) = core::str::from_utf8(&buf[i..i+1]) {
+            print(s);
+        }
     }
 }
 

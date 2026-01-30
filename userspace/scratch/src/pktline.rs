@@ -6,6 +6,7 @@
 //! - "0001" is a delimiter packet (v2 protocol)
 //! - "0002" is a response-end packet (v2 protocol)
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -39,8 +40,14 @@ pub fn read_pkt_line(data: &[u8]) -> Result<(Option<&[u8]>, usize)> {
         return Ok((None, 4));
     }
 
-    let len = parse_hex_u16(len_hex)
-        .ok_or_else(|| Error::protocol("invalid pkt-line length"))? as usize;
+    let len = match parse_hex_u16(len_hex) {
+        Some(l) => l as usize,
+        None => {
+            // Show what we got for debugging
+            let preview = core::str::from_utf8(len_hex).unwrap_or("????");
+            return Err(Error::protocol(&alloc::format!("invalid pkt-line length: got '{}' (expected hex)", preview)));
+        }
+    };
 
     if len < 4 {
         return Err(Error::protocol("pkt-line length too small"));

@@ -30,6 +30,8 @@ mod pack;
 mod pktline;
 mod protocol;
 mod http;
+mod stream;
+mod pack_stream;
 mod repository;
 
 use libakuma::{arg, argc, exit, print};

@@ -51,8 +51,8 @@ impl ObjectStore {
         }
     }
 
-    /// Read a raw object (compressed)
-    fn read_raw(&self, sha: &Sha1Hash) -> Result<Vec<u8>> {
+    /// Read a raw object (compressed) from disk
+    pub fn read_raw_compressed(&self, sha: &Sha1Hash) -> Result<Vec<u8>> {
         let path = self.object_path(sha);
         let fd = open(&path, open_flags::O_RDONLY);
         if fd < 0 {
@@ -77,7 +77,7 @@ impl ObjectStore {
 
     /// Read and parse an object
     pub fn read(&self, sha: &Sha1Hash) -> Result<Object> {
-        let compressed = self.read_raw(sha)?;
+        let compressed = self.read_raw_compressed(sha)?;
         let decompressed = zlib::decompress(&compressed)?;
         
         // Verify hash
@@ -91,7 +91,7 @@ impl ObjectStore {
 
     /// Read an object's raw content (after decompression, without parsing)
     pub fn read_raw_content(&self, sha: &Sha1Hash) -> Result<(ObjectType, Vec<u8>)> {
-        let compressed = self.read_raw(sha)?;
+        let compressed = self.read_raw_compressed(sha)?;
         let decompressed = zlib::decompress(&compressed)?;
         
         // Parse just the header to get type and size
