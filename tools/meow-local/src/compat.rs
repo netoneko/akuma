@@ -2,10 +2,9 @@
 //!
 //! Provides APIs similar to libakuma but implemented using std library.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 use std::sync::OnceLock;
-use std::os::unix::io::AsRawFd;
 
 // ============================================================================
 // Printing
@@ -32,62 +31,6 @@ pub fn uptime() -> u64 {
 
 pub fn sleep_ms(milliseconds: u64) {
     std::thread::sleep(Duration::from_millis(milliseconds));
-}
-
-// ============================================================================
-// Terminal Raw Mode (for escape key detection)
-// ============================================================================
-
-/// Original terminal settings, saved when entering raw mode
-static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
-
-/// Enter raw mode - allows reading individual key presses
-pub fn enter_raw_mode() -> bool {
-    unsafe {
-        let fd = std::io::stdin().as_raw_fd();
-        let mut termios: libc::termios = std::mem::zeroed();
-        
-        if libc::tcgetattr(fd, &mut termios) != 0 {
-            return false;
-        }
-        
-        // Save original settings
-        let _ = ORIGINAL_TERMIOS.set(termios);
-        
-        // Modify for raw mode
-        termios.c_lflag &= !(libc::ICANON | libc::ECHO);
-        termios.c_cc[libc::VMIN] = 0;  // Non-blocking
-        termios.c_cc[libc::VTIME] = 0; // No timeout
-        
-        libc::tcsetattr(fd, libc::TCSANOW, &termios) == 0
-    }
-}
-
-/// Exit raw mode - restore original terminal settings
-pub fn exit_raw_mode() {
-    if let Some(original) = ORIGINAL_TERMIOS.get() {
-        unsafe {
-            let fd = std::io::stdin().as_raw_fd();
-            libc::tcsetattr(fd, libc::TCSANOW, original);
-        }
-    }
-}
-
-/// Check if escape key was pressed (non-blocking)
-/// Returns true if escape (0x1B) was detected
-pub fn check_escape_pressed() -> bool {
-    let mut buf = [0u8; 8];
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
-    
-    // Try to read without blocking
-    match handle.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            // Check for escape key (0x1B)
-            buf[..n].contains(&0x1B)
-        }
-        _ => false,
-    }
 }
 
 // ============================================================================

@@ -20,7 +20,7 @@ mod tools;
 use std::io::{self, BufRead, Write};
 use std::string::String;
 use std::vec::Vec;
-use compat::{print, sleep_ms, uptime, enter_raw_mode, exit_raw_mode, check_escape_pressed};
+use compat::{print, sleep_ms, uptime};
 use compat::net::{TcpStream, ErrorKind};
 
 // Default Ollama server address
@@ -396,7 +396,7 @@ fn print_banner() {
     print("\n");
     print(" ┌─────────────────────────────────────────────┐\n");
     print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Press ESC to cancel requests~              │\n");
+    print(" │ Press Ctrl+C to cancel requests~            │\n");
     print(" └─────────────────────────────────────────────┘\n\n");
 }
 
@@ -772,16 +772,9 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
     
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
-    // Enter raw mode to detect escape key
-    let raw_mode = enter_raw_mode();
+    // Note: Use Ctrl+C to cancel requests
 
-    let result = loop {
-        // Check for escape key press
-        if raw_mode && check_escape_pressed() {
-            print("\n[cancelled]");
-            break Err("Request cancelled");
-        }
-
+    loop {
         match stream.read(&mut buf) {
             Ok(0) => {
                 if !any_data_received {
@@ -882,14 +875,7 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                 break Err("Network error");
             }
         }
-    };
-
-    // Restore terminal mode
-    if raw_mode {
-        exit_raw_mode();
     }
-
-    result
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
