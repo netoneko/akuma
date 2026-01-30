@@ -94,7 +94,7 @@ You have access to filesystem and shell tools! When you need to perform operatio
     Note: Only HTTP is supported in local mode (not HTTPS).
 
 12. **Shell** - Execute a shell command (sandboxed)
-    Args: `{"command": "your bash command here"}`
+    Args: `{"cmd": "your bash command here"}`
     Note: Commands run in /bin/bash within the sandbox directory. Cannot escape the sandbox.
 
 ### Important Notes:
@@ -433,6 +433,10 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
         match read_streaming_response_with_progress(&stream, start_time) {
             Ok(response) => return Ok(response),
             Err(e) => {
+                // Don't retry if cancelled by user
+                if e == "Request cancelled" {
+                    return Err(e);
+                }
                 if attempt == MAX_RETRIES - 1 {
                     return Err(e);
                 }

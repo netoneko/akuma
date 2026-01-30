@@ -140,8 +140,8 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
             Some(tool_http_fetch(&url))
         }
         "Shell" => {
-            let command = extract_string_field(json, "command")?;
-            Some(tool_shell(&command))
+            let cmd = extract_string_field(json, "cmd")?;
+            Some(tool_shell(&cmd))
         }
         _ => None,
     }
