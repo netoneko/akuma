@@ -28,6 +28,11 @@ const OLLAMA_HOST: &str = "localhost";
 const OLLAMA_PORT: u16 = 11434;
 const DEFAULT_MODEL: &str = "gemma3:27b";
 
+// Token limit for context compaction (when LLM should consider compacting)
+const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
+// Default context window if we can't query the model
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
 // System prompt with tools including Shell
 const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 
@@ -97,6 +102,12 @@ You have access to filesystem and shell tools! When you need to perform operatio
     Args: `{"cmd": "your bash command here"}`
     Note: Commands run in /bin/bash within the sandbox directory. Cannot escape the sandbox.
 
+13. **CompactContext** - Compact conversation history by summarizing it
+    Args: `{"summary": "A comprehensive summary of the conversation so far..."}`
+    Note: Use this when the token count displayed in the prompt approaches the limit.
+          Provide a detailed summary that captures all important context, decisions made,
+          files discussed, and any ongoing work. The summary replaces the conversation history.
+
 ### Important Notes:
 - Output the JSON command in a ```json code block
 - After outputting a command, STOP and wait for the result
@@ -109,6 +120,82 @@ You have access to filesystem and shell tools! When you need to perform operatio
 fn main() {
     let code = run();
     std::process::exit(code);
+}
+
+/// Query Ollama for model information including context window size
+fn query_model_info(model: &str) -> Option<usize> {
+    let stream = match connect_to_ollama() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    
+    let body = format!("{{\"model\":\"{}\"}}", model);
+    let request = format!(
+        "POST /api/show HTTP/1.0\r\n\
+         Host: {}:{}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        OLLAMA_HOST, OLLAMA_PORT, body.len(), body
+    );
+    
+    if stream.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    
+    // Read response
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > 64 * 1024 {
+                    break; // Limit response size
+                }
+            }
+            Err(e) => {
+                if e.kind == compat::net::ErrorKind::WouldBlock {
+                    sleep_ms(10);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    
+    let response_str = String::from_utf8_lossy(&response);
+    
+    // Look for "num_ctx" in the response
+    // Format is typically: "num_ctx": 131072 or similar
+    if let Some(pos) = response_str.find("\"num_ctx\"") {
+        let after = &response_str[pos + 9..];
+        // Skip to the number
+        let num_start = after.find(|c: char| c.is_ascii_digit())?;
+        let rest = &after[num_start..];
+        let num_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let num_str = &rest[..num_end];
+        return num_str.parse().ok();
+    }
+    
+    None
+}
+
+/// Estimate token count for a string (rough approximation: ~4 chars per token)
+fn estimate_tokens(text: &str) -> usize {
+    // Rough approximation: average of 4 characters per token for English text
+    // This is a common heuristic used for GPT-style tokenizers
+    (text.len() + 3) / 4
+}
+
+/// Calculate total tokens in message history
+fn calculate_history_tokens(history: &[Message]) -> usize {
+    history.iter()
+        .map(|msg| estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + 4) // +4 for JSON overhead
+        .sum()
 }
 
 fn run() -> i32 {
@@ -174,7 +261,7 @@ fn run() -> i32 {
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
         history.push(Message::new("system", SYSTEM_PROMPT));
-        return match chat_once(&model, &msg, &mut history) {
+        return match chat_once(&model, &msg, &mut history, None) {
             Ok(_) => {
                 print("\n");
                 0
@@ -194,6 +281,23 @@ fn run() -> i32 {
     print(&model);
     print("\n  [Sandbox] ");
     print(&sandbox_root.display().to_string());
+    
+    // Query model info for context window size
+    print("\n  [Context] Querying model info...");
+    io::stdout().flush().unwrap();
+    let context_window = match query_model_info(&model) {
+        Some(ctx) => {
+            print(&format!(" {}k tokens max", ctx / 1000));
+            ctx
+        }
+        None => {
+            print(&format!(" (using default: {}k)", DEFAULT_CONTEXT_WINDOW / 1000));
+            DEFAULT_CONTEXT_WINDOW
+        }
+    };
+    
+    print("\n  [Token Limit] Compact context suggested at ");
+    print(&format!("{}k tokens", TOKEN_LIMIT_FOR_COMPACTION / 1000));
     print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
 
     // Initialize chat history with system prompt
@@ -203,8 +307,16 @@ fn run() -> i32 {
     let stdin = io::stdin();
     
     loop {
-        // Print prompt
-        print("(=^･ω･^=) > ");
+        // Calculate current token count
+        let current_tokens = calculate_history_tokens(&history);
+        let token_display = if current_tokens >= 1000 {
+            format!("{}k", current_tokens / 1000)
+        } else {
+            format!("{}", current_tokens)
+        };
+        
+        // Print prompt with token count
+        print(&format!("[{}/{}k] (=^･ω･^=) > ", token_display, TOKEN_LIMIT_FOR_COMPACTION / 1000));
         io::stdout().flush().unwrap();
 
         // Read user input
@@ -237,7 +349,7 @@ fn run() -> i32 {
 
         // Send message to Ollama
         print("\n");
-        match chat_once(&model, trimmed, &mut history) {
+        match chat_once(&model, trimmed, &mut history, Some(context_window)) {
             Ok(_) => {
                 print("\n\n");
             }
@@ -324,15 +436,25 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
                 print(" ～\n\n");
             }
         }
+        "/tokens" => {
+            let current = calculate_history_tokens(history);
+            print(&format!("～ Current token usage: {} / {} ～\n", current, TOKEN_LIMIT_FOR_COMPACTION));
+            print("  Tip: Ask Meow-chan to 'compact the context' when tokens are high nya~!\n\n");
+        }
         "/help" | "/?" => {
-            print("┌─────────────────────────────────────────┐\n");
-            print("│  ～ Meow-chan's Command Protocol ～     │\n");
-            print("├─────────────────────────────────────────┤\n");
-            print("│  /clear   - Wipe memory banks nya~      │\n");
-            print("│  /model   - Check/switch neural link    │\n");
-            print("│  /quit    - Jack out of the matrix      │\n");
-            print("│  /help    - This help screen            │\n");
-            print("└─────────────────────────────────────────┘\n\n");
+            print("┌──────────────────────────────────────────────┐\n");
+            print("│  ～ Meow-chan's Command Protocol ～          │\n");
+            print("├──────────────────────────────────────────────┤\n");
+            print("│  /clear   - Wipe memory banks nya~           │\n");
+            print("│  /model   - Check/switch neural link         │\n");
+            print("│  /tokens  - Show current token usage         │\n");
+            print("│  /quit    - Jack out of the matrix           │\n");
+            print("│  /help    - This help screen                 │\n");
+            print("├──────────────────────────────────────────────┤\n");
+            print("│  Context compaction: When token count is     │\n");
+            print("│  high, ask Meow-chan to compact the context  │\n");
+            print("│  to free up memory nya~!                     │\n");
+            print("└──────────────────────────────────────────────┘\n\n");
         }
         _ => {
             print("～ Nyaa? Unknown command: ");
@@ -449,7 +571,7 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
     Err("Max retries exceeded")
 }
 
-fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Result<(), &'static str> {
+fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, context_window: Option<usize>) -> Result<(), &'static str> {
     trim_history(history);
     history.push(Message::new("user", user_message));
 
@@ -457,6 +579,22 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Res
     
     for iteration in 0..max_tool_iterations {
         let assistant_response = send_with_retry(model, history, iteration > 0)?;
+        
+        // First check for CompactContext tool (handled specially)
+        if let Some(compact_result) = try_execute_compact_context(&assistant_response, history) {
+            print("\n\n[*] ");
+            if compact_result.success {
+                print("Context compacted successfully nya~!\n");
+                print(&compact_result.output);
+            } else {
+                print("Failed to compact context nya...\n");
+                print(&compact_result.output);
+            }
+            print("\n\n");
+            
+            // After compaction, we don't need to continue the conversation loop
+            return Ok(());
+        }
         
         let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
         
@@ -487,11 +625,93 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Res
             history.push(Message::new("assistant", &assistant_response));
         }
         
+        // Check if we should hint about context compaction
+        if let Some(ctx_window) = context_window {
+            let current_tokens = calculate_history_tokens(history);
+            if current_tokens > TOKEN_LIMIT_FOR_COMPACTION && current_tokens < ctx_window {
+                print("\n[!] Token count is high - consider asking Meow-chan to compact context\n");
+            }
+        }
+        
         return Ok(());
     }
     
     print("\n[!] Max tool iterations reached\n");
     Ok(())
+}
+
+/// Try to find and execute CompactContext tool in the response
+/// This tool is special because it modifies the history directly
+fn try_execute_compact_context(response: &str, history: &mut Vec<Message>) -> Option<tools::ToolResult> {
+    // Look for CompactContext tool call
+    let json_block = if let Some(start) = response.find("```json") {
+        let end = response[start..].find("```\n").or_else(|| response[start..].rfind("```"))?;
+        let json_start = start + 7;
+        let json_end = start + end;
+        if json_start < json_end && json_end <= response.len() {
+            response[json_start..json_end].trim()
+        } else {
+            return None;
+        }
+    } else if let Some(start) = response.find("{\"command\"") {
+        let mut depth = 0;
+        let mut end = start;
+        for (i, c) in response[start..].chars().enumerate() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start {
+            &response[start..end]
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    
+    // Check if it's a CompactContext tool
+    if !json_block.contains("\"CompactContext\"") {
+        return None;
+    }
+    
+    // Extract the summary
+    let summary = extract_json_string(json_block, "summary")?;
+    
+    if summary.is_empty() {
+        return Some(tools::ToolResult::err("CompactContext requires a non-empty summary"));
+    }
+    
+    // Calculate tokens before compaction
+    let tokens_before = calculate_history_tokens(history);
+    
+    // Replace history with system prompt + summary
+    history.clear();
+    history.push(Message::new("system", SYSTEM_PROMPT));
+    
+    // Add the summary as a system message describing the conversation so far
+    let summary_msg = format!(
+        "[Previous Conversation Summary]\n{}\n[End Summary]\n\nThe conversation above has been compacted. Continue from here.",
+        summary
+    );
+    history.push(Message::new("user", &summary_msg));
+    history.push(Message::new("assistant", "Understood nya~! I've loaded the conversation summary into my memory banks. Ready to continue where we left off! (=^・ω・^=)"));
+    
+    // Calculate tokens after compaction
+    let tokens_after = calculate_history_tokens(history);
+    
+    Some(tools::ToolResult::ok(format!(
+        "Context compacted: {} tokens -> {} tokens (saved {} tokens)",
+        tokens_before, tokens_after, tokens_before - tokens_after
+    )))
 }
 
 fn connect_to_ollama() -> Result<TcpStream, &'static str> {
