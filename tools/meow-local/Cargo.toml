@@ -1,0 +1,12 @@
+[package]
+name = "meow-local"
+version = "0.1.0"
+edition = "2021"
+description = "Meow-chan - Cyberpunk Neko AI Assistant (Native macOS/Linux version)"
+
+[[bin]]
+name = "meow-local"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

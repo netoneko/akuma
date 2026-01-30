@@ -1,38 +1,34 @@
-//! Meow-chan - Cyberpunk Neko AI Assistant
+//! Meow-chan Local - Native macOS/Linux version
 //!
 //! A cute cybernetically-enhanced catgirl AI that connects to Ollama LLMs.
-//! Default model: gemma3:27b with a custom cyber-neko persona.
+//! This version runs natively on your host OS with a sandboxed shell tool.
 //!
 //! Usage:
-//!   meow                    # Interactive mode with Meow-chan
-//!   meow -m llama3.2       # Use different neural link
-//!   meow "quick question"  # One-shot query
+//!   meow-local                    # Interactive mode with Meow-chan
+//!   meow-local -m llama3.2        # Use different neural link
+//!   meow-local "quick question"   # One-shot query
+//!   meow-local --sandbox /path    # Set sandbox root directory
 //!
 //! Commands:
 //!   /clear   - Wipe memory banks nya~
 //!   /model   - Check/switch neural link
 //!   /quit    - Jack out of the matrix
 
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
+mod compat;
 mod tools;
 
-use alloc::format;
-use alloc::string::String;
-use alloc::vec::Vec;
+use std::io::{self, BufRead, Write};
+use std::string::String;
+use std::vec::Vec;
+use compat::{print, sleep_ms, uptime, enter_raw_mode, exit_raw_mode, check_escape_pressed};
+use compat::net::{TcpStream, ErrorKind};
 
-use libakuma::net::{resolve, TcpStream};
-use libakuma::{arg, argc, exit, fd, print, read};
-
-// Default Ollama server address (QEMU host gateway)
-const OLLAMA_HOST: &str = "10.0.2.2";
+// Default Ollama server address
+const OLLAMA_HOST: &str = "localhost";
 const OLLAMA_PORT: u16 = 11434;
 const DEFAULT_MODEL: &str = "gemma3:27b";
 
-// System prompt combining persona and tools (static to avoid allocations)
+// System prompt with tools including Shell
 const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 
 Your personality:
@@ -50,7 +46,7 @@ Remember: You're a highly capable AI assistant who happens to be an adorable cyb
 
 ## Available Tools
 
-You have access to filesystem tools! When you need to perform file operations, output a JSON command block like this:
+You have access to filesystem and shell tools! When you need to perform operations, output a JSON command block like this:
 
 ```json
 {
@@ -90,9 +86,16 @@ You have access to filesystem tools! When you need to perform file operations, o
 9. **FileRename** - Rename a file
    Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
 
-10. **HttpFetch** - Fetch content from HTTP or HTTPS URLs
-    Args: `{"url": "http(s)://host[:port]/path"}`
-    Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
+10. **FileDelete** - Delete a file
+    Args: `{"filename": "path/to/file"}`
+
+11. **HttpFetch** - Fetch content from HTTP URLs
+    Args: `{"url": "http://host[:port]/path"}`
+    Note: Only HTTP is supported in local mode (not HTTPS).
+
+12. **Shell** - Execute a shell command (sandboxed)
+    Args: `{"command": "your bash command here"}`
+    Note: Commands run in /bin/bash within the sandbox directory. Cannot escape the sandbox.
 
 ### Important Notes:
 - Output the JSON command in a ```json code block
@@ -100,50 +103,76 @@ You have access to filesystem tools! When you need to perform file operations, o
 - The system will execute the command and provide the result
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
+- Shell commands are sandboxed to the working directory - you cannot cd outside of it
 "#;
 
-// ============================================================================
-// Entry Point
-// ============================================================================
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = main();
-    exit(code);
+fn main() {
+    let code = run();
+    std::process::exit(code);
 }
 
-fn main() -> i32 {
+fn run() -> i32 {
     let mut model = String::from(DEFAULT_MODEL);
     let mut one_shot_message: Option<String> = None;
+    let mut sandbox_path: Option<String> = None;
+    let mut working_dir: Option<String> = None;
 
     // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
-    while i < argc() {
-        if let Some(arg_str) = arg(i) {
-            if arg_str == "-m" || arg_str == "--model" {
-                // Next arg is model name
-                i += 1;
-                if let Some(m) = arg(i) {
-                    model = String::from(m);
-                } else {
-                    print("meow: -m requires a model name\n");
-                    return 1;
-                }
-            } else if arg_str == "-h" || arg_str == "--help" {
-                print_usage();
-                return 0;
-            } else if !arg_str.starts_with('-') {
-                // Treat as one-shot message
-                one_shot_message = Some(String::from(arg_str));
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-m" || arg == "--model" {
+            i += 1;
+            if i < args.len() {
+                model = args[i].clone();
+            } else {
+                eprintln!("meow-local: -m requires a model name");
+                return 1;
             }
+        } else if arg == "-C" || arg == "--directory" {
+            i += 1;
+            if i < args.len() {
+                working_dir = Some(args[i].clone());
+            } else {
+                eprintln!("meow-local: -C requires a path");
+                return 1;
+            }
+        } else if arg == "-s" || arg == "--sandbox" {
+            i += 1;
+            if i < args.len() {
+                sandbox_path = Some(args[i].clone());
+            } else {
+                eprintln!("meow-local: --sandbox requires a path");
+                return 1;
+            }
+        } else if arg == "-h" || arg == "--help" {
+            print_usage();
+            return 0;
+        } else if !arg.starts_with('-') {
+            one_shot_message = Some(arg.clone());
         }
         i += 1;
     }
 
+    // Change to working directory if specified
+    if let Some(ref dir) = working_dir {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!("meow-local: failed to change to directory '{}': {}", dir, e);
+            return 1;
+        }
+    }
+
+    // Initialize sandbox (defaults to working directory)
+    let sandbox_root = sandbox_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    
+    tools::init_sandbox(sandbox_root.clone());
+    
     // One-shot mode
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
-        // Add system prompt for consistent persona
         history.push(Message::new("system", SYSTEM_PROMPT));
         return match chat_once(&model, &msg, &mut history) {
             Ok(_) => {
@@ -163,25 +192,35 @@ fn main() -> i32 {
     print_banner();
     print("  [Neural Link] Model: ");
     print(&model);
+    print("\n  [Sandbox] ");
+    print(&sandbox_root.display().to_string());
     print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
 
     // Initialize chat history with system prompt
     let mut history: Vec<Message> = Vec::new();
     history.push(Message::new("system", SYSTEM_PROMPT));
 
+    let stdin = io::stdin();
+    
     loop {
         // Print prompt
         print("(=^･ω･^=) > ");
+        io::stdout().flush().unwrap();
 
         // Read user input
-        let input = match read_line() {
-            Some(line) => line,
-            None => {
+        let mut input = String::new();
+        match stdin.lock().read_line(&mut input) {
+            Ok(0) => {
                 // EOF (Ctrl+D)
                 print("\n～ Meow-chan is jacking out... Bye bye~! ฅ^•ﻌ•^ฅ ～\n");
                 break;
             }
-        };
+            Ok(_) => {}
+            Err(_) => {
+                print("\n～ Meow-chan is jacking out... Bye bye~! ฅ^•ﻌ•^ฅ ～\n");
+                break;
+            }
+        }
 
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -215,34 +254,37 @@ fn main() -> i32 {
 
 fn print_usage() {
     print("  /\\_/\\\n");
-    print(" ( o.o )  ～ MEOW-CHAN PROTOCOL ～\n");
-    print("  > ^ <   Cyberpunk Neko AI Assistant\n\n");
-    print("Usage: meow [OPTIONS] [MESSAGE]\n\n");
+    print(" ( o.o )  ～ MEOW-CHAN LOCAL ～\n");
+    print("  > ^ <   Cyberpunk Neko AI (Native Edition)\n\n");
+    print("Usage: meow-local [OPTIONS] [MESSAGE]\n\n");
     print("Options:\n");
-    print("  -m, --model <NAME>  Neural link override (default: gemma3:27b)\n");
-    print("  -h, --help          Display this transmission\n\n");
+    print("  -C, --directory <PATH> Working directory (default: current dir)\n");
+    print("  -m, --model <NAME>     Neural link override (default: gemma3:27b)\n");
+    print("  -s, --sandbox <PATH>   Sandbox root directory (default: working dir)\n");
+    print("  -h, --help             Display this transmission\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
     print("  /model [NAME]       Check/switch neural link\n");
     print("  /help               Command protocol\n");
     print("  /quit               Jack out\n\n");
     print("Examples:\n");
-    print("  meow                       # Interactive mode\n");
-    print("  meow \"explain rust\"        # Quick question\n");
-    print("  meow -m llama3.2 \"hi\"      # Use different model\n");
+    print("  meow-local                          # Interactive mode\n");
+    print("  meow-local -C ~/projects            # Work in specific directory\n");
+    print("  meow-local \"explain rust\"           # Quick question\n");
+    print("  meow-local -m llama3.2 \"hi\"         # Use different model\n");
 }
 
 fn print_banner() {
     print("\n");
     print("  /\\_/\\  ╔══════════════════════════════════════╗\n");
-    print(" ( o.o ) ║  M E O W - C H A N   v1.0            ║\n");
-    print("  > ^ <  ║  ～ Cyberpunk Neko AI Assistant ～   ║\n");
+    print(" ( o.o ) ║  M E O W - C H A N   L O C A L       ║\n");
+    print("  > ^ <  ║  ～ Cyberpunk Neko AI (Native) ～    ║\n");
     print(" /|   |\\ ╚══════════════════════════════════════╝\n");
     print("(_|   |_)  ฅ^•ﻌ•^ฅ  Jacking into the Net...  \n");
     print("\n");
     print(" ┌─────────────────────────────────────────────┐\n");
     print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Press ESC to cancel requests~               │\n");
+    print(" │ Press ESC to cancel requests~              │\n");
     print(" └─────────────────────────────────────────────┘\n\n");
 }
 
@@ -267,7 +309,6 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
         }
         "/clear" | "/reset" => {
             history.clear();
-            // Re-add system prompt
             history.push(Message::new("system", SYSTEM_PROMPT));
             print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
         }
@@ -334,15 +375,10 @@ impl Message {
 // Ollama API Communication
 // ============================================================================
 
-// Maximum number of messages to keep in history (including system prompt)
-// Keep it small to avoid memory issues - system prompt + ~4 exchanges
 const MAX_HISTORY_SIZE: usize = 10;
 
-/// Trim history to prevent memory overflow
-/// Keeps the system prompt (first message) and recent messages
 fn trim_history(history: &mut Vec<Message>) {
     if history.len() > MAX_HISTORY_SIZE {
-        // Keep first message (system prompt) and last (MAX_HISTORY_SIZE - 1) messages
         let to_remove = history.len() - MAX_HISTORY_SIZE;
         history.drain(1..1 + to_remove);
     }
@@ -350,31 +386,26 @@ fn trim_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
-/// Attempt to send request with retries and exponential backoff
 fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> Result<String, &'static str> {
     let mut backoff_ms: u64 = 500;
     
-    // Show initial status
     if is_continuation {
         print("[continuing");
     } else {
         print("[jacking in");
     }
     
-    let start_time = libakuma::uptime();
+    let start_time = uptime();
     
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            // Show retry
             print(&format!(" retry {}", attempt));
-            libakuma::sleep_ms(backoff_ms);
-            backoff_ms *= 2; // Exponential backoff
+            sleep_ms(backoff_ms);
+            backoff_ms *= 2;
         }
         
-        // Progress dot for connect
         print(".");
         
-        // Try to connect
         let stream = match connect_to_ollama() {
             Ok(s) => s,
             Err(e) => {
@@ -386,10 +417,8 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
             }
         };
         
-        // Progress dot for send
         print(".");
         
-        // Build and send request
         let request_body = build_chat_request(model, history);
         if let Err(e) = send_post_request(&stream, "/api/chat", &request_body) {
             if attempt == MAX_RETRIES - 1 {
@@ -399,10 +428,8 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
             continue;
         }
         
-        // Show waiting animation while reading response
         print("] waiting");
         
-        // Read response with progress indicator
         match read_streaming_response_with_progress(&stream, start_time) {
             Ok(response) => return Ok(response),
             Err(e) => {
@@ -419,29 +446,21 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
 }
 
 fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Result<(), &'static str> {
-    // Trim history before adding new message
     trim_history(history);
-    
-    // Add user message to history
     history.push(Message::new("user", user_message));
 
-    // Tool execution loop - keep going while LLM wants to use tools
-    let max_tool_iterations = 5; // Prevent infinite loops
+    let max_tool_iterations = 5;
     
     for iteration in 0..max_tool_iterations {
-        // Send request with retries
         let assistant_response = send_with_retry(model, history, iteration > 0)?;
-
-        // Check for tool calls in the response
+        
         let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
         
         if let Some(result) = tool_result {
-            // Add the assistant's partial response to history
             if !text_before_tool.is_empty() {
                 history.push(Message::new("assistant", &text_before_tool));
             }
             
-            // Show tool execution
             print("\n\n[*] ");
             if result.success {
                 print("Tool executed successfully nya~!\n");
@@ -451,18 +470,15 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Res
             print(&result.output);
             print("\n\n");
             
-            // Add tool result as a "user" message so LLM can see it
             let tool_result_msg = format!(
                 "[Tool Result]\n{}\n[End Tool Result]\n\nPlease continue your response based on this result.",
                 result.output
             );
             history.push(Message::new("user", &tool_result_msg));
             
-            // Continue loop to get LLM's follow-up response
             continue;
         }
         
-        // No tool call - add response to history and we're done
         if !assistant_response.is_empty() {
             history.push(Message::new("assistant", &assistant_response));
         }
@@ -470,21 +486,13 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>) -> Res
         return Ok(());
     }
     
-    // Hit max iterations
     print("\n[!] Max tool iterations reached\n");
     Ok(())
 }
 
 fn connect_to_ollama() -> Result<TcpStream, &'static str> {
-    // Resolve host (handles IP literals directly)
-    let ip = resolve(OLLAMA_HOST).map_err(|_| "DNS resolution failed")?;
-
-    let addr_str = format!(
-        "{}.{}.{}.{}:{}",
-        ip[0], ip[1], ip[2], ip[3], OLLAMA_PORT
-    );
-
-    TcpStream::connect(&addr_str).map_err(|_| "Connection failed - is Ollama running on host?")
+    let addr = format!("{}:{}", OLLAMA_HOST, OLLAMA_PORT);
+    TcpStream::connect(&addr).map_err(|_| "Connection failed - is Ollama running?")
 }
 
 fn build_chat_request(model: &str, history: &[Message]) -> String {
@@ -528,11 +536,9 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &
         .map_err(|_| "Failed to send request")
 }
 
-/// Read streaming response with progress indicator
-/// start_time is the timestamp when the request started (from libakuma::uptime())
 fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) -> Result<String, &'static str> {
-    let mut buf = [0u8; 1024]; // Smaller buffer
-    let mut pending_data = Vec::new(); // Only keeps unprocessed data
+    let mut buf = [0u8; 1024];
+    let mut pending_data = Vec::new();
     let mut headers_parsed = false;
     let mut full_response = String::new();
     let mut read_attempts = 0u32;
@@ -540,134 +546,126 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
     let mut first_token_received = false;
     let mut any_data_received = false;
     
-    // Limit response size to prevent OOM (16KB should be plenty)
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
-    // Read response in chunks
-    loop {
-        // Check for escape key press to cancel
-        if check_escape_pressed() {
+    // Enter raw mode to detect escape key
+    let raw_mode = enter_raw_mode();
+
+    let result = loop {
+        // Check for escape key press
+        if raw_mode && check_escape_pressed() {
             print("\n[cancelled]");
-            return Err("Request cancelled");
+            break Err("Request cancelled");
         }
 
         match stream.read(&mut buf) {
             Ok(0) => {
-                // EOF - if we haven't received any response, this is an error
                 if !any_data_received {
-                    return Err("Connection closed by server");
+                    break Err("Connection closed by server");
                 }
-                break;
+                break Ok(full_response);
             }
             Ok(n) => {
                 any_data_received = true;
-                read_attempts = 0; // Reset on successful read
+                read_attempts = 0;
                 pending_data.extend_from_slice(&buf[..n]);
 
-                // Parse headers if not yet done
                 if !headers_parsed {
                     if let Some(pos) = find_header_end(&pending_data) {
-                        // Verify HTTP status
-                        let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
+                        let header_str = std::str::from_utf8(&pending_data[..pos]).unwrap_or("");
                         if !header_str.starts_with("HTTP/1.") {
-                            return Err("Invalid HTTP response");
+                            break Err("Invalid HTTP response");
                         }
-                        // Check for 200 OK
                         if !header_str.contains(" 200 ") {
-                            // Try to extract error info
                             if header_str.contains(" 404 ") {
-                                return Err("Model not found (404)");
+                                break Err("Model not found (404)");
                             }
-                            return Err("Server returned error");
+                            break Err("Server returned error");
                         }
                         headers_parsed = true;
-                        // Drain headers from pending_data
                         pending_data.drain(..pos + 4);
                     }
-                    continue; // Need more data for headers
+                    continue;
                 }
 
-                // Process body data
-                if let Ok(body_str) = core::str::from_utf8(&pending_data) {
-                    // Find last complete line
+                if let Ok(body_str) = std::str::from_utf8(&pending_data) {
                     let last_newline = body_str.rfind('\n');
                     let complete_part = match last_newline {
                         Some(pos) => &body_str[..pos + 1],
-                        None => continue, // No complete line yet
+                        None => continue,
                     };
                     
-                    // Process each complete NDJSON line
+                    let mut is_done = false;
                     for line in complete_part.lines() {
                         if line.is_empty() {
                             continue;
                         }
                         if let Some((content, done)) = parse_ndjson_line(line) {
                             if !content.is_empty() {
-                                // First token - clear progress and show elapsed time
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    // Clear "waiting" and dots with backspaces
-                                    // "waiting" = 7 chars + dots
+                                    let elapsed_ms = (uptime() - start_time) / 1000;
                                     for _ in 0..(7 + dots_printed) {
                                         print("\x08 \x08");
                                     }
-                                    // Show elapsed time
                                     print_elapsed(elapsed_ms);
                                     print("\n");
                                 }
                                 print(&content);
                                 
-                                // Only accumulate if under limit
                                 if full_response.len() < MAX_RESPONSE_SIZE {
                                     full_response.push_str(&content);
                                 }
                             }
                             if done {
-                                return Ok(full_response);
+                                is_done = true;
+                                break;
                             }
                         }
                     }
                     
-                    // Drain processed lines, keep incomplete line
-                    if let Some(pos) = last_newline {
+                    let drain_pos = last_newline;
+                    if let Some(pos) = drain_pos {
                         pending_data.drain(..pos + 1);
+                    }
+                    
+                    if is_done {
+                        break Ok(full_response);
                     }
                 }
             }
             Err(e) => {
-                // WouldBlock and TimedOut both mean "no data available yet"
-                // The kernel returns TimedOut after busy-polling iterations expire,
-                // but the connection is still valid - just retry the read
-                if e.kind == libakuma::net::ErrorKind::WouldBlock 
-                    || e.kind == libakuma::net::ErrorKind::TimedOut {
+                if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut {
                     read_attempts += 1;
                     
-                    // Print a dot every ~500ms while waiting
                     if read_attempts % 50 == 0 && !first_token_received {
                         print(".");
                         dots_printed += 1;
                     }
                     
-                    // Timeout after ~60 seconds of no data
                     if read_attempts > 6000 {
-                        return Err("Timeout waiting for response");
+                        break Err("Timeout waiting for response");
                     }
-                    libakuma::sleep_ms(10);
+                    sleep_ms(10);
                     continue;
                 }
-                if e.kind == libakuma::net::ErrorKind::ConnectionRefused {
-                    return Err("Connection refused - is Ollama running?");
+                if e.kind == ErrorKind::ConnectionRefused {
+                    break Err("Connection refused - is Ollama running?");
                 }
-                if e.kind == libakuma::net::ErrorKind::ConnectionReset {
-                    return Err("Connection reset by server");
+                if e.kind == ErrorKind::ConnectionReset {
+                    break Err("Connection reset by server");
                 }
-                return Err("Network error");
+                break Err("Network error");
             }
         }
+    };
+
+    // Restore terminal mode
+    if raw_mode {
+        exit_raw_mode();
     }
 
-    Ok(full_response)
+    result
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
@@ -680,40 +678,28 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 }
 
 // ============================================================================
-// JSON Parsing (minimal, for NDJSON response)
+// JSON Parsing
 // ============================================================================
 
-/// Parse a single NDJSON line from Ollama response
-/// Returns (content, done) where content is the token and done indicates completion
 fn parse_ndjson_line(line: &str) -> Option<(String, bool)> {
-    // Look for "done":true or "done":false
     let done = line.contains("\"done\":true") || line.contains("\"done\": true");
-
-    // Extract content from: "message":{"role":"assistant","content":"..."}
-    // We look for "content":" and extract until the next unescaped quote
     let content = extract_json_string(line, "content").unwrap_or_default();
-
     Some((content, done))
 }
 
-/// Extract a string value from JSON by key
-/// Handles basic escape sequences
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    // Build search pattern: "key":"
     let pattern = format!("\"{}\":\"", key);
     let start = json.find(&pattern)?;
     let value_start = start + pattern.len();
 
-    // Find the end quote (handling escapes)
     let rest = &json[value_start..];
     let mut result = String::new();
     let mut chars = rest.chars().peekable();
     
     while let Some(c) = chars.next() {
         match c {
-            '"' => break, // End of string
+            '"' => break,
             '\\' => {
-                // Handle escape sequences
                 if let Some(&next) = chars.peek() {
                     chars.next();
                     match next {
@@ -724,7 +710,6 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
                         '\\' => result.push('\\'),
                         '/' => result.push('/'),
                         'u' => {
-                            // Unicode escape: \uXXXX
                             let mut hex = String::new();
                             for _ in 0..4 {
                                 if let Some(h) = chars.next() {
@@ -751,7 +736,6 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     Some(result)
 }
 
-/// Escape a string for JSON
 fn json_escape(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
@@ -762,7 +746,6 @@ fn json_escape(s: &str) -> String {
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             c if c.is_control() => {
-                // Use \uXXXX for other control characters
                 let code = c as u32;
                 result.push_str(&format!("\\u{:04x}", code));
             }
@@ -772,99 +755,12 @@ fn json_escape(s: &str) -> String {
     result
 }
 
-/// Print elapsed time in a cute format
 fn print_elapsed(ms: u64) {
     if ms < 1000 {
         print(&format!("~(=^‥^)ノ [{}ms]", ms));
     } else {
         let secs = ms / 1000;
-        let remainder = (ms % 1000) / 100; // one decimal
+        let remainder = (ms % 1000) / 100;
         print(&format!("~(=^‥^)ノ [{}.{}s]", secs, remainder));
     }
-}
-
-// ============================================================================
-// Input Handling
-// ============================================================================
-
-/// Check if escape key was pressed (non-blocking)
-/// Returns true if ESC (0x1B) was detected
-fn check_escape_pressed() -> bool {
-    let mut buf = [0u8; 8];
-    let n = read(fd::STDIN, &mut buf);
-    if n > 0 {
-        // Check for escape key (0x1B)
-        for i in 0..(n as usize) {
-            if buf[i] == 0x1B {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Read a line from stdin (blocking with polling)
-/// Returns None on EOF (Ctrl+D on empty line)
-fn read_line() -> Option<String> {
-    let mut line = String::new();
-    let mut buf = [0u8; 1];
-    let mut consecutive_empty_reads = 0u32;
-
-    loop {
-        let n = read(fd::STDIN, &mut buf);
-        
-        if n <= 0 {
-            // No data available - poll with backoff
-            consecutive_empty_reads += 1;
-            
-            // After many empty reads, increase sleep time
-            let sleep_time = if consecutive_empty_reads < 10 {
-                10 // 10ms
-            } else if consecutive_empty_reads < 100 {
-                50 // 50ms
-            } else {
-                100 // 100ms
-            };
-            
-            libakuma::sleep_ms(sleep_time);
-            continue;
-        }
-        
-        // Got data - reset counter
-        consecutive_empty_reads = 0;
-
-        let c = buf[0];
-        if c == b'\n' || c == b'\r' {
-            // Echo newline
-            print("\n");
-            break;
-        }
-        if c == 4 {
-            // Ctrl+D
-            if line.is_empty() {
-                return None;
-            }
-            break;
-        }
-        // Handle backspace
-        if c == 8 || c == 127 {
-            if !line.is_empty() {
-                line.pop();
-                // Echo backspace: move back, space, move back
-                print("\x08 \x08");
-            }
-            continue;
-        }
-        // Regular character
-        if c >= 32 && c < 127 {
-            line.push(c as char);
-            // Echo the character
-            let echo = [c];
-            if let Ok(s) = core::str::from_utf8(&echo) {
-                print(s);
-            }
-        }
-    }
-
-    Some(line)
 }
