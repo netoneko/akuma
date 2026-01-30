@@ -5,6 +5,8 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ============================================================================
 // Printing
@@ -31,6 +33,82 @@ pub fn uptime() -> u64 {
 
 pub fn sleep_ms(milliseconds: u64) {
     std::thread::sleep(Duration::from_millis(milliseconds));
+}
+
+// ============================================================================
+// Escape Key Detection (using background thread)
+// ============================================================================
+
+/// Cancellation token that can be checked from the main thread
+/// while a background thread monitors for escape key
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CancelToken {
+    /// Start monitoring for escape key in background
+    pub fn new() -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        
+        let cancelled_clone = cancelled.clone();
+        let stop_clone = stop_flag.clone();
+        
+        let handle = std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            let fd = std::io::stdin().as_raw_fd();
+            
+            let mut buf = [0u8; 8];
+            while !stop_clone.load(Ordering::Relaxed) {
+                // Use poll() to check if stdin has data, without modifying fd flags
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                
+                unsafe {
+                    // Poll with 50ms timeout
+                    let ret = libc::poll(&mut pollfd, 1, 50);
+                    if ret > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+                        // Data available, read it
+                        let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                        if n > 0 {
+                            // Check for escape key (0x1B)
+                            if buf[..n as usize].contains(&0x1B) {
+                                cancelled_clone.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        CancelToken { 
+            cancelled, 
+            stop_flag,
+            handle: Some(handle),
+        }
+    }
+    
+    /// Check if cancellation was requested
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CancelToken {
+    fn drop(&mut self) {
+        // Signal the background thread to stop
+        self.stop_flag.store(true, Ordering::Relaxed);
+        // Wait for thread to finish (with timeout via the poll in the thread)
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 // ============================================================================

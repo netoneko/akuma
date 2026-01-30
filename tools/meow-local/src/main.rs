@@ -20,7 +20,7 @@ mod tools;
 use std::io::{self, BufRead, Write};
 use std::string::String;
 use std::vec::Vec;
-use compat::{print, sleep_ms, uptime};
+use compat::{print, sleep_ms, uptime, CancelToken};
 use compat::net::{TcpStream, ErrorKind};
 
 // Default Ollama server address
@@ -396,7 +396,7 @@ fn print_banner() {
     print("\n");
     print(" ┌─────────────────────────────────────────────┐\n");
     print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Press Ctrl+C to cancel requests~            │\n");
+    print(" │ Press ESC to cancel requests~               │\n");
     print(" └─────────────────────────────────────────────┘\n\n");
 }
 
@@ -772,9 +772,16 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
     
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
-    // Note: Use Ctrl+C to cancel requests
+    // Start monitoring for escape key in background
+    let cancel = CancelToken::new();
 
     loop {
+        // Check for cancellation (escape key or Ctrl+C)
+        if cancel.is_cancelled() {
+            print("\n[cancelled]");
+            return Err("Request cancelled");
+        }
+
         match stream.read(&mut buf) {
             Ok(0) => {
                 if !any_data_received {
