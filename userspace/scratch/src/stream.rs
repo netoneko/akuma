@@ -393,8 +393,15 @@ where
 struct ChunkedState {
     buffer: Vec<u8>,
     chunk_remaining: usize,
-    expecting_size: bool,
+    state: ChunkParseState,
     done: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ChunkParseState {
+    ExpectingSize,
+    ReadingData,
+    ExpectingCrlf,
 }
 
 impl ChunkedState {
@@ -402,7 +409,7 @@ impl ChunkedState {
         Self {
             buffer: Vec::new(),
             chunk_remaining: 0,
-            expecting_size: true,
+            state: ChunkParseState::ExpectingSize,
             done: false,
         }
     }
@@ -413,48 +420,71 @@ impl ChunkedState {
         let mut result = Vec::new();
         
         while !self.buffer.is_empty() && !self.done {
-            if self.expecting_size {
-                // Looking for chunk size line
-                if let Some(crlf_pos) = find_crlf_slice(&self.buffer) {
-                    let size_line = &self.buffer[..crlf_pos];
-                    let size_str = core::str::from_utf8(size_line)
-                        .map_err(|_| Error::http("invalid chunk size"))?;
-                    let size_part = size_str.split(';').next().unwrap_or(size_str).trim();
-                    
-                    self.chunk_remaining = usize::from_str_radix(size_part, 16)
-                        .map_err(|_| Error::http("invalid chunk size hex"))?;
-                    
-                    // Remove size line from buffer
-                    self.buffer = self.buffer[crlf_pos + 2..].to_vec();
-                    
-                    if self.chunk_remaining == 0 {
-                        self.done = true;
+            match self.state {
+                ChunkParseState::ExpectingSize => {
+                    // Looking for chunk size line
+                    if let Some(crlf_pos) = find_crlf_slice(&self.buffer) {
+                        let size_line = &self.buffer[..crlf_pos];
+                        let size_str = core::str::from_utf8(size_line)
+                            .map_err(|_| Error::http("invalid chunk size"))?;
+                        let size_part = size_str.split(';').next().unwrap_or(size_str).trim();
+                        
+                        self.chunk_remaining = match usize::from_str_radix(size_part, 16) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                // Debug: show what we got
+                                print("scratch: bad chunk size '");
+                                print(size_part);
+                                print("' buffer starts: ");
+                                let preview = core::cmp::min(30, self.buffer.len());
+                                if let Ok(p) = core::str::from_utf8(&self.buffer[..preview]) {
+                                    print(p);
+                                }
+                                print("\n");
+                                return Err(Error::http("invalid chunk size hex"));
+                            }
+                        };
+                        
+                        // Remove size line from buffer
+                        self.buffer = self.buffer[crlf_pos + 2..].to_vec();
+                        
+                        if self.chunk_remaining == 0 {
+                            self.done = true;
+                            break;
+                        }
+                        
+                        self.state = ChunkParseState::ReadingData;
+                    } else {
+                        // Need more data for size line
                         break;
                     }
-                    
-                    self.expecting_size = false;
-                } else {
-                    // Need more data for size line
-                    break;
                 }
-            } else {
-                // Reading chunk data
-                let available = core::cmp::min(self.chunk_remaining, self.buffer.len());
-                result.extend_from_slice(&self.buffer[..available]);
-                self.buffer = self.buffer[available..].to_vec();
-                self.chunk_remaining -= available;
-                
-                if self.chunk_remaining == 0 {
+                ChunkParseState::ReadingData => {
+                    // Reading chunk data
+                    let available = core::cmp::min(self.chunk_remaining, self.buffer.len());
+                    result.extend_from_slice(&self.buffer[..available]);
+                    self.buffer = self.buffer[available..].to_vec();
+                    self.chunk_remaining -= available;
+                    
+                    if self.chunk_remaining == 0 {
+                        self.state = ChunkParseState::ExpectingCrlf;
+                    } else {
+                        // Need more data for current chunk
+                        break;
+                    }
+                }
+                ChunkParseState::ExpectingCrlf => {
                     // Need to consume trailing CRLF
                     if self.buffer.len() >= 2 {
                         if &self.buffer[..2] == b"\r\n" {
                             self.buffer = self.buffer[2..].to_vec();
                         }
+                        // Even if it's not CRLF, move on (corrupted but try to continue)
+                        self.state = ChunkParseState::ExpectingSize;
+                    } else {
+                        // Need more data for trailing CRLF
+                        break;
                     }
-                    self.expecting_size = true;
-                } else {
-                    // Need more data
-                    break;
                 }
             }
         }

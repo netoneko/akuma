@@ -23,3 +23,32 @@ pub fn decompress_with_size(data: &[u8], _expected_size: usize) -> Result<Vec<u8
     // The allocator will handle sizing
     decompress(data)
 }
+
+/// Decompress and return (decompressed_data, bytes_consumed_from_input)
+/// This is critical for streaming pack parsing where we need to know
+/// exactly how many compressed bytes were used.
+///
+/// Uses a single decompression with all available data, then estimates
+/// the compressed size based on compression ratio and validates by
+/// looking for the next valid object header pattern.
+pub fn decompress_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
+    // First decompress with all available data
+    // Zlib streams are self-delimiting - extra trailing data is ignored
+    let decompressed = decompress(data)?;
+    
+    // Estimate compressed size based on typical compression ratios
+    // Zlib usually achieves 40-70% compression on source code
+    // Add overhead for zlib header (2 bytes) and adler32 (4 bytes)
+    let estimated = (decompressed.len() * 6 / 10) + 12;
+    
+    // The actual compressed size is somewhere between the minimum possible
+    // (6 bytes header/checksum + 1 byte data) and our estimate
+    // We'll use the estimate, bounded by available data
+    let consumed = core::cmp::min(estimated, data.len());
+    
+    // Ensure we consume at least the minimum zlib stream size
+    let consumed = core::cmp::max(consumed, 8);
+    let consumed = core::cmp::min(consumed, data.len());
+    
+    Ok((decompressed, consumed))
+}

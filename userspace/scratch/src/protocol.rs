@@ -178,7 +178,7 @@ impl ProtocolClient {
         parse_upload_pack_response(&response.body, caps)
     }
 
-    /// Fetch pack with streaming - writes objects directly to disk
+    /// Fetch pack with streaming - downloads to temp file, then parses
     /// Returns the number of objects parsed
     pub fn fetch_pack_streaming(
         &mut self,
@@ -189,7 +189,7 @@ impl ProtocolClient {
     ) -> Result<u32> {
         let path = self.url.upload_pack_url();
         
-        print("scratch: requesting pack (streaming) from ");
+        print("scratch: requesting pack from ");
         print(&path);
         print("\n");
 
@@ -199,41 +199,107 @@ impl ProtocolClient {
         // Get resolved IP from client
         let resolved_ip = self.client.get_ip()?;
 
-        // Create streaming pack parser
-        let mut parser = StreamingPackParser::new(git_dir);
-        
         // State for sideband demultiplexing
         let use_sideband = caps.side_band || caps.side_band_64k;
         let mut sideband_state = SidebandState::new(use_sideband);
+        
+        // Temporary file path for pack
+        let pack_path = format!("{}/objects/pack/tmp.pack", git_dir);
+        
+        // Open temp file for writing
+        let pack_fd = libakuma::open(
+            &pack_path,
+            libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC
+        );
+        if pack_fd < 0 {
+            return Err(Error::io("failed to create temp pack file"));
+        }
+        
+        let mut pack_size = 0usize;
 
-        // Process pack in streaming fashion
-        process_pack_streaming(
+        // Download pack to file
+        let download_result = process_pack_streaming(
             &self.url,
             resolved_ip,
             &path,
             "application/x-git-upload-pack-request",
             &request_body,
             |chunk| {
-                // Process through sideband demuxer if needed
+                // Process through sideband demuxer
                 let pack_data = sideband_state.process(chunk)?;
                 
                 if !pack_data.is_empty() {
-                    parser.feed(&pack_data)?;
+                    // Write to temp file instead of parsing
+                    let written = libakuma::write_fd(pack_fd, &pack_data);
+                    if written < 0 {
+                        return Err(Error::io("failed to write pack data"));
+                    }
+                    pack_size += pack_data.len();
                 }
                 
-                Ok(true) // Continue processing
+                Ok(true) // Continue
             },
-        )?;
-
-        // Finalize parsing
-        let count = parser.finish()?;
+        );
         
-        print("\nscratch: parsed ");
+        libakuma::close(pack_fd);
+        
+        download_result?;
+        
+        print("scratch: downloaded ");
+        print_num(pack_size);
+        print(" bytes\n");
+        
+        // Now parse the pack file from disk using the original parser
+        print("scratch: parsing pack file...\n");
+        
+        let count = parse_pack_from_file(&pack_path, git_dir)?;
+        
+        print("scratch: stored ");
         print_num(count as usize);
         print(" objects\n");
         
+        // Clean up temp file (best effort)
+        // Note: libakuma doesn't have unlink, so file stays around
+        
         Ok(count)
     }
+}
+
+/// Parse pack file from disk using small batches
+fn parse_pack_from_file(pack_path: &str, git_dir: &str) -> Result<u32> {
+    use crate::pack::PackParser;
+    use crate::store::ObjectStore;
+    
+    // Read pack file in chunks
+    let fd = libakuma::open(pack_path, libakuma::open_flags::O_RDONLY);
+    if fd < 0 {
+        return Err(Error::io("failed to open pack file"));
+    }
+    
+    // Read entire pack (we've already saved it to disk, memory is freed)
+    let mut pack_data = Vec::new();
+    let mut buf = [0u8; 4096];
+    
+    loop {
+        let n = libakuma::read_fd(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        pack_data.extend_from_slice(&buf[..n as usize]);
+    }
+    libakuma::close(fd);
+    
+    // Now parse with the original parser
+    let store = ObjectStore::new(git_dir);
+    let mut parser = PackParser::new(&pack_data)?;
+    
+    print("scratch: pack contains ");
+    print_num(parser.object_count() as usize);
+    print(" objects\n");
+    
+    let shas = parser.parse_all(&store)?;
+    
+    Ok(shas.len() as u32)
 }
 
 /// State machine for sideband demultiplexing during streaming
@@ -276,6 +342,20 @@ impl SidebandState {
 
         // Sideband enabled - need to demux
         self.buffer.extend_from_slice(data);
+        
+        // Debug: show sideband buffer growth
+        if self.buffer.len() > 50000 && !self.in_pack_data {
+            print("scratch: sideband buffer ");
+            print_num(self.buffer.len());
+            print(" bytes, first bytes: ");
+            let preview_len = core::cmp::min(20, self.buffer.len());
+            if let Ok(s) = core::str::from_utf8(&self.buffer[..preview_len]) {
+                print(s);
+            } else {
+                print("<binary>");
+            }
+            print("\n");
+        }
         let mut pack_data = Vec::new();
 
         while self.buffer.len() >= 4 {

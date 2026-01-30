@@ -3,15 +3,13 @@
 //! Parses pack files incrementally, writing objects to disk as they're decoded.
 //! This avoids loading the entire pack file into memory.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use alloc::vec;
 
 use libakuma::print;
 
 use crate::error::{Error, Result};
 use crate::object::ObjectType;
-use crate::sha1::{Sha1Hash, hash, to_hex};
+use crate::sha1::Sha1Hash;
 use crate::store::ObjectStore;
 use crate::zlib;
 use crate::pack::apply_delta;
@@ -23,6 +21,13 @@ const OBJ_BLOB: u8 = 3;
 const OBJ_TAG: u8 = 4;
 const OBJ_OFS_DELTA: u8 = 6;
 const OBJ_REF_DELTA: u8 = 7;
+
+/// Entry in the offset map: (offset, type, sha)
+struct OffsetEntry {
+    offset: usize,
+    obj_type: ObjectType,
+    sha: Sha1Hash,
+}
 
 /// Streaming pack parser
 /// 
@@ -39,7 +44,8 @@ pub struct StreamingPackParser {
     /// Objects parsed so far
     objects_parsed: u32,
     /// Mapping from pack offset to (object_type, sha1) for delta resolution
-    offset_map: BTreeMap<usize, (ObjectType, Sha1Hash)>,
+    /// Uses Vec instead of BTreeMap to avoid deep recursion during insertion
+    offset_entries: Vec<OffsetEntry>,
     /// Current offset in the pack stream (for OFS_DELTA)
     current_offset: usize,
     /// Pending REF_DELTA objects that couldn't be resolved yet
@@ -105,17 +111,43 @@ impl StreamingPackParser {
             store: ObjectStore::new(git_dir),
             object_count: 0,
             objects_parsed: 0,
-            offset_map: BTreeMap::new(),
+            offset_entries: Vec::new(),
             current_offset: 0,
             pending_deltas: Vec::new(),
             version: 0,
         }
+    }
+    
+    /// Look up an object by its pack offset
+    fn lookup_offset(&self, offset: usize) -> Option<(ObjectType, Sha1Hash)> {
+        for entry in &self.offset_entries {
+            if entry.offset == offset {
+                return Some((entry.obj_type, entry.sha));
+            }
+        }
+        None
+    }
+    
+    /// Record an object's offset mapping
+    fn record_offset(&mut self, offset: usize, obj_type: ObjectType, sha: Sha1Hash) {
+        self.offset_entries.push(OffsetEntry { offset, obj_type, sha });
     }
 
     /// Feed data to the parser
     /// Returns Ok(true) if parsing should continue, Ok(false) if done
     pub fn feed(&mut self, data: &[u8]) -> Result<bool> {
         self.buffer.extend_from_slice(data);
+        
+        // Debug: track buffer growth
+        if self.buffer.len() > 100000 && self.buffer.len() % 50000 < data.len() {
+            print("scratch: buffer size ");
+            print_num(self.buffer.len());
+            print(" bytes, parsed ");
+            print_num(self.objects_parsed as usize);
+            print("/");
+            print_num(self.object_count as usize);
+            print("\n");
+        }
         
         // Process as much as possible
         loop {
@@ -252,17 +284,9 @@ impl StreamingPackParser {
 
         let compressed = &self.buffer[header_len..];
         
-        // Try to decompress
-        match zlib::decompress(compressed) {
-            Ok(decompressed) => {
-                if decompressed.len() != size {
-                    // Might need more data, or size mismatch
-                    if self.buffer.len() < header_len + size / 2 {
-                        return Ok(ProcessResult::NeedMore);
-                    }
-                    // Accept what we got if it's reasonably sized
-                }
-
+        // Try to decompress - use the version that tells us bytes consumed
+        match zlib::decompress_with_consumed(compressed) {
+            Ok((decompressed, bytes_consumed)) => {
                 // Determine object type
                 let type_name = match obj_type {
                     OBJ_COMMIT => ObjectType::Commit,
@@ -276,14 +300,11 @@ impl StreamingPackParser {
                 let sha = self.store.write_content(type_name, &decompressed)?;
                 
                 // Record in offset map
-                self.offset_map.insert(offset, (type_name, sha));
+                self.record_offset(offset, type_name, sha);
                 self.objects_parsed += 1;
 
-                // Find how much compressed data we used
-                // This is tricky - we need to know the actual compressed size
-                // For now, estimate based on decompressed size
-                let consumed = self.estimate_compressed_size(compressed, decompressed.len());
-                let total_consumed = header_len + consumed;
+                // Use exact bytes consumed from decompressor
+                let total_consumed = header_len + bytes_consumed;
                 
                 self.buffer = self.buffer[total_consumed..].to_vec();
                 self.current_offset += total_consumed;
@@ -364,10 +385,10 @@ impl StreamingPackParser {
 
         let compressed = &self.buffer[data_start..];
         
-        match zlib::decompress(compressed) {
-            Ok(delta_data) => {
+        match zlib::decompress_with_consumed(compressed) {
+            Ok((delta_data, bytes_consumed)) => {
                 // Look up base object
-                if let Some(&(base_type, base_sha)) = self.offset_map.get(&base_offset) {
+                if let Some((base_type, base_sha)) = self.lookup_offset(base_offset) {
                     // Read base object from store
                     let (_, base_content) = self.store.read_raw_content(&base_sha)?;
                     
@@ -376,11 +397,10 @@ impl StreamingPackParser {
                     
                     // Write result
                     let sha = self.store.write_content(base_type, &result)?;
-                    self.offset_map.insert(offset, (base_type, sha));
+                    self.record_offset(offset, base_type, sha);
                     self.objects_parsed += 1;
 
-                    let consumed = self.estimate_compressed_size(compressed, delta_data.len());
-                    let total_consumed = data_start + consumed;
+                    let total_consumed = data_start + bytes_consumed;
                     
                     self.buffer = self.buffer[total_consumed..].to_vec();
                     self.current_offset += total_consumed;
@@ -440,14 +460,14 @@ impl StreamingPackParser {
 
         let compressed = &self.buffer[data_start..];
         
-        match zlib::decompress(compressed) {
-            Ok(delta_data) => {
+        match zlib::decompress_with_consumed(compressed) {
+            Ok((delta_data, bytes_consumed)) => {
                 // Try to resolve now or defer
                 match self.resolve_ref_delta(&base_sha, &delta_data) {
                     Ok(sha) => {
                         // Find base type from store
                         if let Ok((base_type, _)) = self.store.read_raw_content(&base_sha) {
-                            self.offset_map.insert(offset, (base_type, sha));
+                            self.record_offset(offset, base_type, sha);
                         }
                     }
                     Err(_) => {
@@ -461,8 +481,7 @@ impl StreamingPackParser {
                 
                 self.objects_parsed += 1;
 
-                let consumed = self.estimate_compressed_size(compressed, delta_data.len());
-                let total_consumed = data_start + consumed;
+                let total_consumed = data_start + bytes_consumed;
                 
                 self.buffer = self.buffer[total_consumed..].to_vec();
                 self.current_offset += total_consumed;
@@ -531,18 +550,6 @@ impl StreamingPackParser {
         }
 
         Some((obj_type, size, i))
-    }
-
-    /// Estimate compressed size based on decompressed size
-    /// This is a heuristic - zlib typically achieves ~50% compression on text
-    fn estimate_compressed_size(&self, compressed: &[u8], decompressed_size: usize) -> usize {
-        // Try to find the actual end by looking for next valid object header
-        // or use a heuristic based on compression ratio
-        
-        // Typical compression ratio for source code: 30-70%
-        // Use conservative estimate
-        let estimated = (decompressed_size * 7) / 10 + 16;
-        core::cmp::min(estimated, compressed.len())
     }
 }
 
