@@ -1,0 +1,14 @@
+[package]
+name = "libakuma-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+
+# TLS (blocking mode)
+embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
+embedded-io = { version = "0.6", default-features = false }
+
+# Crypto for RNG trait
+rand_core = { version = "0.6", default-features = false }

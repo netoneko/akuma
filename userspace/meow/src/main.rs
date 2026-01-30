@@ -90,9 +90,9 @@ You have access to filesystem tools! When you need to perform file operations, o
 9. **FileRename** - Rename a file
    Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
 
-10. **HttpFetch** - Fetch content from an HTTP URL (no HTTPS - no TLS in userspace)
-    Args: `{"url": "http://host:port/path"}`
-    Note: Only supports http://, not https://. Max 16KB response.
+10. **HttpFetch** - Fetch content from HTTP or HTTPS URLs
+    Args: `{"url": "http(s)://host[:port]/path"}`
+    Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
 
 ### Important Notes:
 - Output the JSON command in a ```json code block

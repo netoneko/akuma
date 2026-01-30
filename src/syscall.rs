@@ -34,6 +34,7 @@ pub mod nr {
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
+    pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
 }
 
 /// Error code for interrupted syscall
@@ -99,6 +100,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
+        nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -2062,4 +2064,41 @@ fn sys_getdents64(fd: u32, buf_ptr: u64, buf_size: usize) -> u64 {
     }
 
     written as u64
+}
+
+/// sys_getrandom - Fill a buffer with random bytes from VirtIO RNG
+///
+/// # Arguments
+/// * `buf_ptr` - Pointer to userspace buffer
+/// * `len` - Number of bytes to fill
+///
+/// # Returns
+/// Number of bytes written on success, negative errno on failure
+fn sys_getrandom(buf_ptr: u64, len: usize) -> u64 {
+    use crate::rng;
+
+    // Validate pointer and length
+    if buf_ptr == 0 || len == 0 {
+        return 0;
+    }
+
+    // Limit to reasonable size to prevent abuse
+    const MAX_GETRANDOM_SIZE: usize = 256;
+    let actual_len = len.min(MAX_GETRANDOM_SIZE);
+
+    // Allocate a temporary buffer in kernel space
+    let mut temp_buf = alloc::vec![0u8; actual_len];
+
+    // Fill with random bytes from VirtIO RNG
+    if let Err(_) = rng::fill_bytes(&mut temp_buf) {
+        return (-libc_errno::EIO as i64) as u64;
+    }
+
+    // Copy to userspace
+    let buf = buf_ptr as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf, actual_len);
+    }
+
+    actual_len as u64
 }

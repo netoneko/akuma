@@ -345,102 +345,114 @@ fn tool_file_move(source: &str, dest: &str) -> ToolResult {
 // Network Tools
 // ============================================================================
 
-// Maximum response size for HTTP fetch (16KB)
-const MAX_FETCH_SIZE: usize = 16 * 1024;
+// Maximum response size for HTTP fetch (64KB)
+const MAX_FETCH_SIZE: usize = 64 * 1024;
 
-/// HTTP GET fetch tool
-/// Note: Only supports HTTP (not HTTPS) - userspace has no TLS support
+/// HTTP/HTTPS GET fetch tool
+/// Supports both HTTP and HTTPS URLs using libakuma-tls
 fn tool_http_fetch(url: &str) -> ToolResult {
-    // Parse URL
+    // Parse URL to check validity
     let parsed = match parse_http_url(url) {
         Some(p) => p,
-        None => return ToolResult::err("Invalid URL format. Use: http://host[:port]/path"),
+        None => return ToolResult::err("Invalid URL format. Use: http(s)://host[:port]/path"),
     };
-    
-    // HTTPS not supported in userspace
+
     if parsed.is_https {
-        return ToolResult::err("HTTPS not supported in userspace (no TLS). Use http:// URLs only.");
-    }
-    
-    // Resolve hostname
-    let ip = match resolve(parsed.host) {
-        Ok(ip) => ip,
-        Err(_) => return ToolResult::err(&format!("DNS resolution failed for: {}", parsed.host)),
-    };
-    
-    // Connect
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-    let stream = match TcpStream::connect(&addr_str) {
-        Ok(s) => s,
-        Err(_) => return ToolResult::err(&format!("Connection failed to: {}", addr_str)),
-    };
-    
-    // Build HTTP request
-    let request = format!(
-        "GET {} HTTP/1.0\r\n\
-         Host: {}\r\n\
-         User-Agent: meow/1.0 (Akuma)\r\n\
-         Connection: close\r\n\
-         \r\n",
-        parsed.path,
-        parsed.host
-    );
-    
-    // Send request
-    if stream.write_all(request.as_bytes()).is_err() {
-        return ToolResult::err("Failed to send HTTP request");
-    }
-    
-    // Read response with size limit
-    let mut response = Vec::new();
-    let mut buf = [0u8; 1024];
-    
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if response.len() + n > MAX_FETCH_SIZE {
-                    // Truncate to limit
-                    let remaining = MAX_FETCH_SIZE - response.len();
-                    response.extend_from_slice(&buf[..remaining]);
+        // Use libakuma-tls for HTTPS
+        match libakuma_tls::https_fetch(url, true) {
+            Ok(body) => {
+                match core::str::from_utf8(&body) {
+                    Ok(text) => {
+                        let truncated = if body.len() >= MAX_FETCH_SIZE { " (truncated)" } else { "" };
+                        ToolResult::ok(format!(
+                            "Fetched {} ({} bytes{}):\n```\n{}\n```",
+                            url, body.len(), truncated, text
+                        ))
+                    }
+                    Err(_) => ToolResult::err("Response contains non-UTF8 data (binary content)"),
+                }
+            }
+            Err(e) => ToolResult::err(&format!("HTTPS fetch failed: {:?}", e)),
+        }
+    } else {
+        // Plain HTTP - use direct TCP
+        let ip = match resolve(parsed.host) {
+            Ok(ip) => ip,
+            Err(_) => return ToolResult::err(&format!("DNS resolution failed for: {}", parsed.host)),
+        };
+
+        let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+        let stream = match TcpStream::connect(&addr_str) {
+            Ok(s) => s,
+            Err(_) => return ToolResult::err(&format!("Connection failed to: {}", addr_str)),
+        };
+
+        // Build HTTP request
+        let request = format!(
+            "GET {} HTTP/1.0\r\n\
+             Host: {}\r\n\
+             User-Agent: meow/1.0 (Akuma)\r\n\
+             Connection: close\r\n\
+             \r\n",
+            parsed.path,
+            parsed.host
+        );
+
+        // Send request
+        if stream.write_all(request.as_bytes()).is_err() {
+            return ToolResult::err("Failed to send HTTP request");
+        }
+
+        // Read response with size limit
+        let mut response = Vec::new();
+        let mut buf = [0u8; 1024];
+
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if response.len() + n > MAX_FETCH_SIZE {
+                        let remaining = MAX_FETCH_SIZE - response.len();
+                        response.extend_from_slice(&buf[..remaining]);
+                        break;
+                    }
+                    response.extend_from_slice(&buf[..n]);
+                }
+                Err(e) => {
+                    if e.kind == libakuma::net::ErrorKind::WouldBlock {
+                        libakuma::sleep_ms(10);
+                        continue;
+                    }
                     break;
                 }
-                response.extend_from_slice(&buf[..n]);
-            }
-            Err(e) => {
-                if e.kind == libakuma::net::ErrorKind::WouldBlock {
-                    libakuma::sleep_ms(10);
-                    continue;
-                }
-                break;
             }
         }
-    }
-    
-    if response.is_empty() {
-        return ToolResult::err("Empty response from server");
-    }
-    
-    // Parse HTTP response
-    let (status, body) = match parse_http_response(&response) {
-        Some(r) => r,
-        None => return ToolResult::err("Failed to parse HTTP response"),
-    };
-    
-    if status < 200 || status >= 300 {
-        return ToolResult::err(&format!("HTTP error: status {}", status));
-    }
-    
-    // Convert body to string
-    match core::str::from_utf8(body) {
-        Ok(text) => {
-            let truncated = if response.len() >= MAX_FETCH_SIZE { " (truncated)" } else { "" };
-            ToolResult::ok(format!(
-                "Fetched {} ({} bytes{}):\n```\n{}\n```",
-                url, body.len(), truncated, text
-            ))
+
+        if response.is_empty() {
+            return ToolResult::err("Empty response from server");
         }
-        Err(_) => ToolResult::err("Response contains non-UTF8 data (binary content)"),
+
+        // Parse HTTP response
+        let (status, body) = match parse_http_response(&response) {
+            Some(r) => r,
+            None => return ToolResult::err("Failed to parse HTTP response"),
+        };
+
+        if status < 200 || status >= 300 {
+            return ToolResult::err(&format!("HTTP error: status {}", status));
+        }
+
+        // Convert body to string
+        match core::str::from_utf8(body) {
+            Ok(text) => {
+                let truncated = if response.len() >= MAX_FETCH_SIZE { " (truncated)" } else { "" };
+                ToolResult::ok(format!(
+                    "Fetched {} ({} bytes{}):\n```\n{}\n```",
+                    url, body.len(), truncated, text
+                ))
+            }
+            Err(_) => ToolResult::err("Response contains non-UTF8 data (binary content)"),
+        }
     }
 }
 

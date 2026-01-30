@@ -39,6 +39,7 @@ pub mod syscall {
     pub const SPAWN: u64 = 301;
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
+    pub const GETRANDOM: u64 = 304;
 }
 
 /// File descriptors
@@ -578,6 +579,35 @@ pub fn resolve_host(hostname: &str) -> Result<[u8; 4], i32> {
         Err((-ret) as i32)
     } else {
         Ok(result)
+    }
+}
+
+/// Fill a buffer with cryptographically secure random bytes
+///
+/// Uses the kernel's VirtIO RNG device to generate random bytes.
+///
+/// # Arguments
+/// * `buf` - Buffer to fill with random bytes (max 256 bytes per call)
+///
+/// # Returns
+/// * `Ok(n)` - Number of bytes written
+/// * `Err(errno)` - Error code on failure
+pub fn getrandom(buf: &mut [u8]) -> Result<usize, i32> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+
+    let ret = syscall(
+        syscall::GETRANDOM,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(ret as usize)
     }
 }
 
