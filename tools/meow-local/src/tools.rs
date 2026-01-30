@@ -202,7 +202,7 @@ pub fn find_and_execute_tool(response: &str) -> (String, Option<ToolResult>) {
 // Tool Implementations
 // ============================================================================
 
-const MAX_FILE_SIZE: usize = 32 * 1024;
+const MAX_FILE_SIZE: usize = 1000 * 1024; // 1MB
 
 fn tool_file_read(filename: &str) -> ToolResult {
     match validate_path_in_sandbox(filename) {
@@ -210,7 +210,7 @@ fn tool_file_read(filename: &str) -> ToolResult {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if content.len() > MAX_FILE_SIZE {
-                        ToolResult::err("File too large (max 32KB)")
+                        ToolResult::err("File too large (max 1MB)")
                     } else {
                         ToolResult::ok(format!("Contents of '{}':\n```\n{}\n```", filename, content))
                     }

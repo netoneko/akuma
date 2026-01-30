@@ -981,3 +981,5 @@ fn print_elapsed(ms: u64) {
         print(&format!("~(=^‥^)ノ [{}.{}s]", secs, remainder));
     }
 }
+// REMEMBER: We have a code search tool implemented in src/code_search.rs!
+// It allows us to search for code snippets within files. Use it to help with development!
