@@ -359,6 +359,7 @@ where
                             }
                         }
                         if chunk_state.done {
+                            print("\nscratch: chunked transfer complete\n");
                             break;
                         }
                     } else {
@@ -377,13 +378,16 @@ where
                     last_progress = total_bytes;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                print("\nscratch: TLS read error, stopping\n");
+                break;
+            }
         }
     }
     
-    if total_bytes > 65536 {
-        print("\n");
-    }
+    print("scratch: download finished, total ");
+    print_size(total_bytes);
+    print("\n");
     
     let _ = tls.close();
     Ok(())
