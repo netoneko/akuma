@@ -10,6 +10,7 @@ members = [
     "httpd",
     "meow",
     "quickjs",
+    "scratch",
     "sqld",
     "stackstress",
     "stdcheck",

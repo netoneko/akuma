@@ -94,6 +94,32 @@ You have access to filesystem tools! When you need to perform file operations, o
     Args: `{"url": "http(s)://host[:port]/path"}`
     Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
 
+### Git Tools (via scratch):
+
+11. **GitClone** - Clone a Git repository from GitHub
+    Args: `{"url": "https://github.com/owner/repo"}`
+    Note: Creates repo directory and checks out files.
+
+12. **GitFetch** - Fetch updates from remote
+    Args: `{}`
+    Note: Must be run inside a cloned repository.
+
+13. **GitPull** - Pull updates from remote (fetch + update)
+    Args: `{}`
+    Note: Fetches and updates local refs.
+
+14. **GitPush** - Push changes to remote
+    Args: `{}`
+    WARNING: Force push is PERMANENTLY DISABLED. Never set force: true.
+
+15. **GitStatus** - Show current HEAD and branch
+    Args: `{}`
+
+16. **GitBranch** - List, create, or delete branches
+    Args: `{}` - list all branches
+    Args: `{"name": "branch-name"}` - create a new branch
+    Args: `{"name": "branch-name", "delete": "true"}` - delete a branch
+
 ### Important Notes:
 - Output the JSON command in a ```json code block
 - After outputting a command, STOP and wait for the result

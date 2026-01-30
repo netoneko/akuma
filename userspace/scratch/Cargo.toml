@@ -1,0 +1,19 @@
+[package]
+name = "scratch"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Git client for Akuma OS"
+
+[[bin]]
+name = "scratch"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+libakuma-tls = { path = "../libakuma-tls" }
+
+# SHA-1 hashing (no_std by default)
+sha1_smol = "1.0"
+
+# Zlib decompression (no_std with alloc)
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
