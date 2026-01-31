@@ -24,16 +24,58 @@ pub struct GitConfig {
 }
 
 impl GitConfig {
-    /// Load configuration from .git/config
+    /// Load configuration from global and local configs
+    /// 
+    /// Checks (in order, later values override earlier):
+    /// 1. /.gitconfig (global)
+    /// 2. /.git/config (global alternate)
+    /// 3. .git/config (local repo)
     pub fn load() -> Result<Self> {
-        Self::load_from(&crate::git_dir())
+        let mut config = GitConfig::default();
+        
+        // Try global configs first
+        if let Ok(global) = Self::load_from_path("/.gitconfig") {
+            config.merge(&global);
+        }
+        if let Ok(global) = Self::load_from_path("/.git/config") {
+            config.merge(&global);
+        }
+        
+        // Then local repo config (overrides global)
+        let git_dir = crate::git_dir();
+        if let Ok(local) = Self::load_from(&git_dir) {
+            config.merge(&local);
+        }
+        
+        Ok(config)
     }
 
     /// Load configuration from a specific git directory
     pub fn load_from(git_dir: &str) -> Result<Self> {
         let path = format!("{}/config", git_dir);
-        let content = read_file(&path)?;
+        Self::load_from_path(&path)
+    }
+
+    /// Load configuration from a specific file path
+    fn load_from_path(path: &str) -> Result<Self> {
+        let content = read_file(path)?;
         Self::parse(&content)
+    }
+
+    /// Merge another config into this one (other's values override)
+    fn merge(&mut self, other: &GitConfig) {
+        if other.remote_url.is_some() {
+            self.remote_url = other.remote_url.clone();
+        }
+        if other.user_name.is_some() {
+            self.user_name = other.user_name.clone();
+        }
+        if other.user_email.is_some() {
+            self.user_email = other.user_email.clone();
+        }
+        if other.credential_token.is_some() {
+            self.credential_token = other.credential_token.clone();
+        }
     }
 
     /// Parse config file content
