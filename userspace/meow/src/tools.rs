@@ -1194,7 +1194,8 @@ fn tool_shell(command: &str) -> ToolResult {
     }
 
     let binary = &tokens[0];
-    let args: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    // Skip argv[0] - the kernel adds the program name automatically
+    let args: Vec<&str> = tokens[1..].iter().map(|s| s.as_str()).collect();
 
     // Check for the binary in common paths
     let binary_path = if binary.starts_with('/') || binary.starts_with('.') {
