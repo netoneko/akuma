@@ -3,9 +3,60 @@
 This document lists features available in `meow-local` (native macOS/Linux version) that are
 not yet implemented in `meow` (the unikernel version running in the Akuma kernel).
 
+## Multi-Provider Support
+
+### 1. Provider Configuration System
+
+**meow-local:** Supports multiple AI providers with persistent configuration in `~/.config/meow/config.toml`.
+
+Commands:
+- `meow-local init` - Interactive provider setup wizard
+- `meow-local init --list` - List configured providers
+- `meow-local init --delete <name>` - Remove a provider
+- `--provider <name>` flag to select provider at runtime
+
+Supported API types:
+- Ollama (native format)
+- OpenAI-compatible (works with OpenAI, Groq, and other compatible APIs)
+
+**meow:** Only supports a single hardcoded Ollama endpoint.
+
+**Implementation Notes:**
+- Store config in filesystem (ext2 or memfs)
+- TOML parsing would need a no_std compatible parser or simpler format
+- API key storage for OpenAI-compatible providers
+
+### 2. HTTPS/TLS Support
+
+**meow-local:** Uses `native-tls` crate for secure HTTPS connections to providers like api.openai.com.
+
+**meow:** HTTP only. No TLS implementation in the kernel.
+
+**Implementation Notes:**
+- Would require a no_std TLS implementation (e.g., rustls with ring)
+- Significant complexity and binary size increase
+- Alternative: proxy through a local HTTP-to-HTTPS gateway
+
+### 3. Provider/Model Switching at Runtime
+
+**meow-local:** Interactive commands for switching providers and models:
+- `/provider` - Show current provider
+- `/provider list` - List and switch providers with model selection
+- `/model list` - Fetch and list available models from current provider
+
+**meow:** Static model configuration.
+
+### 4. OpenAI Streaming Format
+
+**meow-local:** Supports both Ollama NDJSON and OpenAI SSE streaming formats:
+- Ollama: `{"message":{"content":"..."}, "done":true/false}`
+- OpenAI: `data: {"choices":[{"delta":{"content":"..."}}]}`
+
+**meow:** Only Ollama format.
+
 ## Context Management Features
 
-### 1. Context Window Query on Startup
+### 5. Context Window Query on Startup
 
 **meow-local:** Queries the Ollama `/api/show` endpoint on startup to determine the model's
 maximum context window size (`num_ctx` parameter).
@@ -17,7 +68,7 @@ maximum context window size (`num_ctx` parameter).
 - Parse JSON response to extract `num_ctx` field
 - Display context window size in startup banner
 
-### 2. Token Count Display
+### 6. Token Count Display
 
 **meow-local:** Displays current estimated token usage in the prompt:
 ```
@@ -32,7 +83,7 @@ The format shows `[current_tokens/limit_tokens]` before each prompt.
 - Calculate total tokens across all messages in history
 - Update display before each prompt
 
-### 3. CompactContext Tool
+### 7. CompactContext Tool
 
 **meow-local:** Provides a `CompactContext` tool that allows the LLM to compress conversation
 history when token count approaches the limit (32k tokens by default).
@@ -59,23 +110,108 @@ Tool specification:
 - Significantly reduces token count while preserving conversation context
 - LLM can proactively use this when it notices high token count
 
-### 4. /tokens Command
+### 8. /tokens Command
 
 **meow-local:** Provides a `/tokens` command to display current token usage statistics.
 
 **meow:** Does not have this command.
 
-## Other Feature Differences
+## Code Editing Tools
 
-### Shell Tool
+### 9. FileReadLines Tool
+
+**meow-local:** Read specific line ranges from a file with line numbers.
+
+```json
+{
+  "command": {
+    "tool": "FileReadLines",
+    "args": {"filename": "path/to/file", "start": 100, "end": 150}
+  }
+}
+```
+
+**meow:** Only has `FileRead` for entire file contents.
+
+**Implementation Notes:**
+- Simple to implement with line-by-line file reading
+- Useful for navigating large files without loading everything
+
+### 10. CodeSearch Tool
+
+**meow-local:** Grep-like regex search across `.rs` files with context lines.
+
+```json
+{
+  "command": {
+    "tool": "CodeSearch",
+    "args": {"pattern": "fn.*async", "path": "src/", "context": 2}
+  }
+}
+```
+
+**meow:** No code search capability.
+
+**Implementation Notes:**
+- Requires regex crate (already available in kernel)
+- Recursive directory traversal with file extension filtering
+- Implemented in `code_search.rs` module
+
+### 11. FileEdit Tool
+
+**meow-local:** Precise search-and-replace editing that requires unique match.
+
+```json
+{
+  "command": {
+    "tool": "FileEdit",
+    "args": {"filename": "path/to/file", "old_text": "exact text", "new_text": "replacement"}
+  }
+}
+```
+
+**meow:** No search-and-replace tool.
+
+**Implementation Notes:**
+- Fails if text not found or multiple matches (prevents accidents)
+- Reports line numbers of matches for disambiguation
+- Returns diff-like output showing changes
+
+## Shell & System Features
+
+### 12. Shell Tool
 
 **meow-local:** Has a sandboxed `Shell` tool for executing bash commands.
 
+```json
+{
+  "command": {
+    "tool": "Shell",
+    "args": {"cmd": "cargo build --release"}
+  }
+}
+```
+
+Security features:
+- Commands run within sandbox directory
+- `cd` command intercepted to prevent sandbox escape
+- Dangerous command patterns blocked
+
 **meow:** Does not have shell execution capability (filesystem-only tools).
 
-### Escape Key Handling
+### 13. Working Directory Option
 
-**meow-local:** Uses terminal raw mode for proper escape key detection to cancel requests.
+**meow-local:** Supports `-C` / `--directory` flag to set working directory.
+
+```bash
+meow-local -C /path/to/project
+```
+
+**meow:** Always uses current directory.
+
+### 14. Escape Key Handling
+
+**meow-local:** Uses background thread with `poll()` for escape key detection to cancel requests.
 
 **meow:** Has escape key detection but implementation differs due to kernel environment.
 
@@ -84,10 +220,17 @@ Tool specification:
 1. **High Priority:**
    - Token count display (improves user awareness)
    - CompactContext tool (prevents context overflow)
+   - FileReadLines tool (essential for large file navigation)
+   - CodeSearch tool (helps LLM find relevant code)
 
 2. **Medium Priority:**
+   - FileEdit tool (safer than full file rewrites)
    - Context window query (nice-to-have, can use defaults)
    - /tokens command (debugging aid)
+   - Provider switching (Ollama is sufficient for now)
 
 3. **Low Priority:**
    - Shell tool (security considerations in unikernel environment)
+   - HTTPS/TLS support (significant complexity)
+   - OpenAI-compatible API (most users run local Ollama)
+   - Multi-provider config persistence (filesystem complexity)
