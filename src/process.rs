@@ -1473,8 +1473,13 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 /// # Returns
 /// Tuple of (exit_code, stdout_data), or error message
 pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    // Spawn process with channel
-    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
+    exec_with_io_cwd(path, args, stdin, None)
+}
+
+/// exec_with_io with explicit cwd
+pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+    // Spawn process with channel and cwd
+    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
     
     // Poll until process exits (blocking)
     loop {
@@ -1654,9 +1659,14 @@ pub fn spawn_process_with_channel_cwd(
 /// # Returns
 /// Tuple of (exit_code, stdout_data) or error message
 pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
+    exec_async_cwd(path, args, stdin, None).await
+}
 
-    // Spawn process with channel
-    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
+/// exec_async with explicit cwd
+pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+
+    // Spawn process with channel and cwd
+    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
@@ -1713,8 +1723,16 @@ pub async fn exec_streaming<W>(path: &str, args: Option<&[&str]>, stdin: Option<
 where
     W: embedded_io_async::Write,
 {
-    // Spawn process with channel
-    let (thread_id, channel) = spawn_process_with_channel(path, args, stdin)?;
+    exec_streaming_cwd(path, args, stdin, None, output).await
+}
+
+/// exec_streaming with explicit cwd
+pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
+where
+    W: embedded_io_async::Write,
+{
+    // Spawn process with channel and cwd
+    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
     // Poll for output and completion
     loop {

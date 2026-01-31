@@ -418,14 +418,15 @@ async fn execute_external(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
+    cwd: Option<&str>,
     stdout: &mut VecWriter,
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
     let result = if is_async_exec_enabled() {
-        crate::process::exec_async(path, args, stdin).await
+        crate::process::exec_async_cwd(path, args, stdin, cwd).await
     } else {
         // Synchronous fallback for boot-time tests
-        crate::process::exec_with_io(path, args, stdin)
+        crate::process::exec_with_io_cwd(path, args, stdin, cwd)
     };
 
     match result {
@@ -459,12 +460,13 @@ pub async fn execute_external_streaming<W>(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
+    cwd: Option<&str>,
     stdout: &mut W,
 ) -> Result<(), ShellError>
 where
     W: embedded_io_async::Write,
 {
-    match crate::process::exec_streaming(path, args, stdin, stdout).await {
+    match crate::process::exec_streaming_cwd(path, args, stdin, cwd, stdout).await {
         Ok(exit_code) => {
             if exit_code != 0 {
                 let msg = format!("[exit code: {}]\r\n", exit_code);
@@ -501,15 +503,16 @@ pub async fn execute_external_interactive<S>(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
+    cwd: Option<&str>,
     stream: &mut S,
 ) -> Result<(), ShellError>
 where
     S: InteractiveRead + embedded_io_async::Write,
 {
-    use crate::process::{spawn_process_with_channel, YieldOnce};
+    use crate::process::{spawn_process_with_channel_cwd, YieldOnce};
     
-    // Spawn process with channel
-    let (thread_id, channel) = match spawn_process_with_channel(path, args, stdin) {
+    // Spawn process with channel and cwd
+    let (thread_id, channel) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);
@@ -717,8 +720,8 @@ where
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
-            // Execute with interactive bidirectional I/O
-            let success = execute_external_interactive(&bin_path, args_slice, None, stream).await.is_ok();
+            // Execute with interactive bidirectional I/O (pass shell's cwd)
+            let success = execute_external_interactive(&bin_path, args_slice, None, Some(ctx.cwd()), stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,
@@ -802,8 +805,11 @@ async fn execute_pipeline_internal(
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
+            // Pass shell's cwd to spawned processes
+            let cwd = Some(ctx.cwd());
+            
             if ctx.async_exec {
-                match execute_external(&bin_path, args_slice, stdin_slice, &mut stdout).await {
+                match execute_external(&bin_path, args_slice, stdin_slice, cwd, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
@@ -818,7 +824,7 @@ async fn execute_pipeline_internal(
                 }
             } else {           
                 // DOES NOT WORK WITH SSH, blocks SSH connections entirely  
-                match execute_external_streaming(&bin_path, args_slice, stdin_slice, &mut stdout).await {
+                match execute_external_streaming(&bin_path, args_slice, stdin_slice, cwd, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
