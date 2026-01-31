@@ -116,7 +116,22 @@ pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = false;
 /// embassy-net's internal RefCells from re-entrant access during timer preemption.
 pub const COOPERATIVE_MAIN_THREAD: bool = false;
 
-pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // boost the priority of the main thread (network loop)
+pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // legacy option, now using proportional scheduler
+
+/// Thread 0 (network loop) scheduling ratio.
+/// Thread 0 gets boosted every N scheduler ticks where N = this value.
+/// 
+/// Examples:
+/// - 2: Thread 0 gets 50% of slots (every other tick) - too aggressive
+/// - 4: Thread 0 gets 25% of slots (every 4th tick) - good balance
+/// - 8: Thread 0 gets 12.5% of slots - more CPU for userspace
+/// 
+/// With 4 concurrent SSH sessions, each userspace thread gets:
+/// - ratio=4: (75% / 4) = ~19% CPU each
+/// - ratio=8: (87.5% / 4) = ~22% CPU each
+/// 
+/// Lower values = better network responsiveness, higher = more CPU for downloads
+pub const NETWORK_THREAD_RATIO: u32 = 4;
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 

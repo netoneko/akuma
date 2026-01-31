@@ -928,6 +928,9 @@ pub struct ThreadPool {
     stacks: [StackInfo; config::MAX_THREADS],
     current_idx: usize,
     initialized: bool,
+    /// Counter for proportional scheduling of thread 0
+    /// Thread 0 gets boosted when this reaches NETWORK_THREAD_RATIO
+    network_boost_counter: u32,
 }
 
 impl ThreadPool {
@@ -937,6 +940,7 @@ impl ThreadPool {
             stacks: [const { StackInfo::empty() }; config::MAX_THREADS],
             current_idx: 0,
             initialized: false,
+            network_boost_counter: 0,
         }
     }
 
@@ -1393,25 +1397,28 @@ impl ThreadPool {
             }
         }
 
-        if config::MAIN_THREAD_PRIORITY_BOOST {
-        // Priority boost for thread 0 (network loop): Always prefer it if ready
-        // This ensures the network remains responsive even when user processes are running
-            if current_idx != 0 {
+        // Proportional scheduling for thread 0 (network loop)
+        // Thread 0 gets boosted every NETWORK_THREAD_RATIO scheduler ticks.
+        // This gives thread 0 a 1/N share of CPU time (e.g., 25% with ratio=4).
+        if current_idx != 0 {
+            self.network_boost_counter += 1;
+            if self.network_boost_counter >= config::NETWORK_THREAD_RATIO {
+                self.network_boost_counter = 0;
                 let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
                 if thread0_state == thread_state::READY {
-                    // Switch to thread 0
-                    // Preserve TERMINATED and WAITING states
                     if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
                         THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                     }
                     THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
-                    self.slots[0].start_time_us = crate::timer::uptime_us();
+                    let now = crate::timer::uptime_us();
+                    self.slots[0].start_time_us = now;
                     set_current_thread_register(0);
                     self.current_idx = 0;
                     return Some((current_idx, 0));
                 }
             }
         }
+        // If current_idx == 0 or counter hasn't reached ratio, use round-robin below
 
         // First pass: Wake any WAITING threads whose wake time has passed
         let now = crate::timer::uptime_us();
