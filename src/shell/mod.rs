@@ -512,7 +512,7 @@ where
     use crate::process::{spawn_process_with_channel_cwd, YieldOnce};
     
     // Spawn process with channel and cwd
-    let (thread_id, channel) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
+    let (thread_id, channel, _pid) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);

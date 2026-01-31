@@ -771,7 +771,7 @@ fn run_async_main() -> ! {
         if fs::exists(HERD_PATH) {
             crate::safe_print!(64, "[AsyncMain] Starting herd supervisor...\n");
             match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
-                Ok((tid, channel)) => {
+                Ok((tid, channel, _pid)) => {
                     crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
                     (tid, Some(channel))
                 }

@@ -188,7 +188,7 @@ fn test_procfs_stdio() {
 
     // 1. Spawn hello with "10 50" args (10 outputs, 50ms delay = ~500ms runtime)
     let hello_args = &["10", "50"];
-    let (hello_thread_id, _hello_channel) = match process::spawn_process_with_channel(
+    let (hello_thread_id, _hello_channel, hello_pid) = match process::spawn_process_with_channel(
         HELLO_PATH,
         Some(hello_args),
         None,
@@ -200,21 +200,9 @@ fn test_procfs_stdio() {
         }
     };
 
-    // Wait briefly for process to register
-    crate::threading::yield_now();
-
-    // Get hello's PID
-    let hello_pid = match process::find_pid_by_thread(hello_thread_id) {
-        Some(pid) => pid,
-        None => {
-            crate::safe_print!(64, "[Test] Failed to find hello PID\n");
-            return;
-        }
-    };
-
     // 2. Spawn echo2 with stdin data
     let stdin_data = b"test input for echo2\n";
-    let (echo2_thread_id, _echo2_channel) = match process::spawn_process_with_channel(
+    let (echo2_thread_id, _echo2_channel, echo2_pid) = match process::spawn_process_with_channel(
         ECHO2_PATH,
         None,
         Some(stdin_data),
@@ -222,18 +210,6 @@ fn test_procfs_stdio() {
         Ok(result) => result,
         Err(e) => {
             crate::safe_print!(96, "[Test] Failed to spawn echo2: {}\n", e);
-            return;
-        }
-    };
-
-    // Wait briefly for process to register
-    crate::threading::yield_now();
-
-    // Get echo2's PID
-    let echo2_pid = match process::find_pid_by_thread(echo2_thread_id) {
-        Some(pid) => pid,
-        None => {
-            crate::safe_print!(64, "[Test] Failed to find echo2 PID\n");
             return;
         }
     };

@@ -2279,7 +2279,7 @@ fn test_parallel_processes() -> bool {
     let result1 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
     
     let (tid1, channel1) = match result1 {
-        Ok((tid, channel)) => {
+        Ok((tid, channel, _pid)) => {
             crate::safe_print!(32, " tid={}\n", tid);
             PROCESS1_STARTED.store(true, Ordering::Release);
             (tid, channel)
@@ -2296,7 +2296,7 @@ fn test_parallel_processes() -> bool {
     let result2 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
 
     let (tid2, channel2) = match result2 {
-        Ok((tid, channel)) => {
+        Ok((tid, channel, _pid)) => {
             crate::safe_print!(32, " tid={}\n", tid);
             PROCESS2_STARTED.store(true, Ordering::Release);
             (tid, channel)

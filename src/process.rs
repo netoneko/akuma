@@ -1479,7 +1479,7 @@ pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> 
 /// exec_with_io with explicit cwd
 pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
     // Spawn process with channel and cwd
-    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
     
     // Poll until process exits (blocking)
     loop {
@@ -1529,7 +1529,7 @@ pub fn exec(path: &str) -> Result<i32, String> {
 /// # Returns
 /// Thread ID of the spawned thread, or error message
 pub fn spawn_process(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<usize, String> {
-    let (thread_id, _channel) = spawn_process_with_channel(path, args, stdin)?;
+    let (thread_id, _channel, _pid) = spawn_process_with_channel(path, args, stdin)?;
     Ok(thread_id)
 }
 
@@ -1545,12 +1545,12 @@ pub fn spawn_process(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) ->
 /// * `cwd` - Optional current working directory (defaults to "/")
 ///
 /// # Returns
-/// Tuple of (thread_id, channel) or error message
+/// Tuple of (thread_id, channel, pid) or error message
 pub fn spawn_process_with_channel(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
-) -> Result<(usize, Arc<ProcessChannel>), String> {
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     spawn_process_with_channel_cwd(path, args, stdin, None)
 }
 
@@ -1563,13 +1563,13 @@ pub fn spawn_process_with_channel(
 /// * `cwd` - Optional current working directory (defaults to "/")
 ///
 /// # Returns
-/// Tuple of (thread_id, channel) or error message
+/// Tuple of (thread_id, channel, pid) or error message
 pub fn spawn_process_with_channel_cwd(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
-) -> Result<(usize, Arc<ProcessChannel>), String> {
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // Check if user threads are available
     let avail = crate::threading::user_threads_available();
     crate::safe_print!(64, "[spawn_process] path={} user_threads_available={}\n", path, avail);
@@ -1641,8 +1641,8 @@ pub fn spawn_process_with_channel_cwd(
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
-    crate::safe_print!(64, "[spawn_process] spawned thread {} for {}\n", thread_id, path);
-    Ok((thread_id, channel))
+    crate::safe_print!(64, "[spawn_process] spawned thread {} pid {} for {}\n", thread_id, pid, path);
+    Ok((thread_id, channel, pid))
 }
 
 /// Execute a binary asynchronously and return its output when complete
@@ -1666,7 +1666,7 @@ pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
 pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
 
     // Spawn process with channel and cwd
-    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
@@ -1732,7 +1732,7 @@ where
     W: embedded_io_async::Write,
 {
     // Spawn process with channel and cwd
-    let (thread_id, channel) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
     // Poll for output and completion
     loop {

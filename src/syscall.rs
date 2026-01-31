@@ -1829,7 +1829,7 @@ fn block_on_connect(
 fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
     use alloc::string::String;
     use alloc::vec::Vec;
-    use crate::process::{self, FileDescriptor, Pid};
+    use crate::process::{self, FileDescriptor};
 
     // Read path from user memory
     let path = unsafe {
@@ -1877,35 +1877,13 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, std
     let cwd_opt = parent_cwd.as_deref();
 
     // Spawn the process with inherited cwd
-    let (thread_id, channel) = match process::spawn_process_with_channel_cwd(&path, args_opt, stdin_opt, cwd_opt) {
+    let (_thread_id, channel, child_pid) = match process::spawn_process_with_channel_cwd(&path, args_opt, stdin_opt, cwd_opt) {
         Ok(result) => result,
         Err(e) => {
             crate::safe_print!(64, "[sys_spawn] Failed: {}\n", e);
             return (-libc_errno::ENOENT as i64) as u64;
         }
     };
-
-    // Get child PID from the process table
-    // We need to wait a moment for the process to register
-    crate::threading::yield_now();
-    
-    let child_pid = match process::find_pid_by_thread(thread_id) {
-        Some(pid) => pid,
-        None => {
-            // Process not yet registered, try again
-            for _ in 0..10 {
-                crate::threading::yield_now();
-                if let Some(pid) = process::find_pid_by_thread(thread_id) {
-                    break;
-                }
-            }
-            process::find_pid_by_thread(thread_id).unwrap_or(0)
-        }
-    };
-
-    if child_pid == 0 {
-        return (-libc_errno::ESRCH as i64) as u64;
-    }
 
     // Register the channel so parent can read child stdout
     process::register_child_channel(child_pid, channel);
