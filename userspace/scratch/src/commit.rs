@@ -15,9 +15,6 @@ use crate::refs::RefManager;
 use crate::sha1::{self, Sha1Hash};
 use crate::store::ObjectStore;
 
-/// Default git directory
-const GIT_DIR: &str = ".git";
-
 /// Create a commit from the current working directory
 ///
 /// # Arguments
@@ -29,8 +26,9 @@ pub fn create_commit(
     author_name: Option<&str>,
     author_email: Option<&str>,
 ) -> Result<Sha1Hash> {
-    let store = ObjectStore::new(GIT_DIR);
-    let refs = RefManager::new(GIT_DIR);
+    let git_dir = crate::git_dir();
+    let store = ObjectStore::new(&git_dir);
+    let refs = RefManager::new(&git_dir);
 
     // Load config for user identity
     let config = GitConfig::load().unwrap_or_default();
@@ -39,7 +37,8 @@ pub fn create_commit(
     let parent = refs.resolve_head().ok();
 
     // Build tree from working directory
-    let tree_sha = build_tree_from_directory(".", &store)?;
+    let repo_root = crate::repo_path(".");
+    let tree_sha = build_tree_from_directory(&repo_root, &store)?;
 
     // Build author/committer lines (priority: argument > config > default)
     let name = author_name.unwrap_or_else(|| config.get_user_name());
@@ -172,7 +171,7 @@ fn update_current_branch(refs: &RefManager, commit_sha: &Sha1Hash) -> Result<()>
 
 /// Get the current branch name (if HEAD points to a branch)
 pub fn current_branch() -> Result<Option<String>> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     let head = refs.read_head()?;
     let head = head.trim();
 

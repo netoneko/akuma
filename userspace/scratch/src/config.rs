@@ -10,9 +10,6 @@ use libakuma::{close, mkdir, open, open_flags, read_fd, write_fd};
 
 use crate::error::{Error, Result};
 
-/// Default git directory
-const GIT_DIR: &str = ".git";
-
 /// Git configuration
 #[derive(Debug, Clone, Default)]
 pub struct GitConfig {
@@ -29,7 +26,7 @@ pub struct GitConfig {
 impl GitConfig {
     /// Load configuration from .git/config
     pub fn load() -> Result<Self> {
-        Self::load_from(GIT_DIR)
+        Self::load_from(&crate::git_dir())
     }
 
     /// Load configuration from a specific git directory
@@ -97,7 +94,7 @@ impl GitConfig {
 
     /// Save configuration to .git/config
     pub fn save(&self) -> Result<()> {
-        self.save_to(GIT_DIR)
+        self.save_to(&crate::git_dir())
     }
 
     /// Save configuration to a specific git directory

@@ -9,6 +9,12 @@ Scratch provides basic Git functionality without requiring the full Git binary o
 ### Supported Commands
 
 ```bash
+scratch [-C <path>] <command> [args]
+
+# Options:
+#   -C <path>    Run as if started in <path> (required for Akuma)
+
+# Commands:
 scratch clone <url>           # Clone a repository
 scratch fetch                 # Fetch updates from origin
 scratch commit -m <msg>       # Commit all changes
@@ -22,6 +28,14 @@ scratch branch                # List branches
 scratch branch <name>         # Create a new branch
 scratch tag                   # List tags
 scratch help                  # Show help
+```
+
+**Note:** Since Akuma processes don't have a current working directory, use `-C` to specify the repository path:
+
+```bash
+scratch -C /meow status
+scratch -C /meow branch my-feature
+scratch -C /meow commit -m "Add feature"
 ```
 
 ### Key Features

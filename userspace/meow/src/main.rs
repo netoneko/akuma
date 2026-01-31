@@ -103,45 +103,57 @@ You have access to filesystem tools! When you need to perform file operations, o
     Args: `{"url": "http(s)://host[:port]/path"}`
     Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
 
+### Directory Navigation:
+
+11. **Cd** - Change working directory (for git operations)
+    Args: `{"path": "/path/to/directory"}`
+    Note: All git commands operate in this directory. Use after cloning a repo.
+
+12. **Pwd** - Print current working directory
+    Args: `{}`
+
 ### Git Tools (via scratch):
 
-11. **GitClone** - Clone a Git repository from GitHub
+Note: Git tools operate in the current working directory (set via Cd).
+After cloning, use Cd to enter the repository before running other git commands.
+
+13. **GitClone** - Clone a Git repository from GitHub
     Args: `{"url": "https://github.com/owner/repo"}`
     Note: Creates repo directory and checks out files.
 
-12. **GitFetch** - Fetch updates from remote
+14. **GitFetch** - Fetch updates from remote
     Args: `{}`
-    Note: Must be run inside a cloned repository.
+    Note: Must cd into a cloned repository first.
 
-13. **GitPull** - Pull updates from remote (fetch + update)
+15. **GitPull** - Pull updates from remote (fetch + update)
     Args: `{}`
     Note: Fetches and updates local refs.
 
-14. **GitPush** - Push changes to remote
+16. **GitPush** - Push changes to remote
     Args: `{}`
     WARNING: Force push is PERMANENTLY DISABLED. Never set force: true.
 
-15. **GitStatus** - Show current HEAD and branch
+17. **GitStatus** - Show current HEAD and branch
     Args: `{}`
 
-16. **GitBranch** - List, create, or delete branches
+18. **GitBranch** - List, create, or delete branches
     Args: `{}` - list all branches
     Args: `{"name": "branch-name"}` - create a new branch
     Args: `{"name": "branch-name", "delete": "true"}` - delete a branch
 
-17. **FileReadLines** - Read specific line ranges from a file
+19. **FileReadLines** - Read specific line ranges from a file
     Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
     Note: Returns lines with line numbers. Great for navigating large files.
 
-18. **CodeSearch** - Search for patterns in Rust source files
+20. **CodeSearch** - Search for patterns in Rust source files
     Args: `{"pattern": "search text", "path": "directory", "context": 2}`
     Note: Searches .rs files recursively. Returns matches with context lines.
 
-19. **FileEdit** - Precise search-and-replace editing
+21. **FileEdit** - Precise search-and-replace editing
     Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
     Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
 
-20. **Shell** - Execute a shell command
+22. **Shell** - Execute a shell command
     Args: `{"cmd": "your command here"}`
     Note: Runs the specified binary. Use for build commands, git operations, etc.
 
@@ -157,6 +169,12 @@ You have access to filesystem tools! When you need to perform file operations, o
 - The system will execute the command and provide the result
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
+
+### Sandbox:
+- All file operations are sandboxed to the current working directory (set via Cd)
+- Files outside the working directory cannot be accessed
+- After cloning a repo, use Cd to enter it before making changes
+- Default working directory is / (root) - no restrictions
 "#;
 
 /// Estimate token count for a string (rough approximation: ~4 chars per token)

@@ -11,9 +11,6 @@ use libakuma::{close, mkdir, open, open_flags, read_dir, read_fd, write_fd};
 use crate::error::{Error, Result};
 use crate::sha1::{self, Sha1Hash};
 
-/// Default git directory
-const GIT_DIR: &str = ".git";
-
 /// Reference manager
 pub struct RefManager {
     git_dir: String,
@@ -37,8 +34,16 @@ impl RefManager {
 
     /// Read HEAD reference
     pub fn read_head(&self) -> Result<String> {
+        // Try uppercase first (standard), then lowercase (some filesystems)
         let path = format!("{}/HEAD", self.git_dir);
-        read_file_content(&path)
+        match read_file_content(&path) {
+            Ok(content) => Ok(content),
+            Err(_) => {
+                // Try lowercase as fallback
+                let path_lower = format!("{}/head", self.git_dir);
+                read_file_content(&path_lower)
+            }
+        }
     }
 
     /// Write HEAD reference
@@ -151,6 +156,10 @@ impl RefManager {
 fn read_file_content(path: &str) -> Result<String> {
     let fd = open(path, open_flags::O_RDONLY);
     if fd < 0 {
+        // Check if this is HEAD not found (likely not a repo)
+        if path.ends_with("/HEAD") || path == ".git/HEAD" {
+            return Err(Error::not_a_repository());
+        }
         return Err(Error::ref_not_found(path));
     }
 
@@ -219,44 +228,44 @@ fn list_refs_in_dir(path: &str) -> Result<Vec<(String, Sha1Hash)>> {
 
 /// List all branches in the current repository
 pub fn list_branches() -> Result<Vec<(String, Sha1Hash)>> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     refs.list_branches_refs()
 }
 
 /// Create a new branch at HEAD
 pub fn create_branch(name: &str) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     let head_sha = refs.resolve_head()?;
     refs.write_branch(name, &head_sha)
 }
 
 /// Delete a branch
 pub fn delete_branch(name: &str) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     refs.delete_branch_ref(name)
 }
 
 /// List all tags in the current repository
 pub fn list_tags() -> Result<Vec<(String, Sha1Hash)>> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     refs.list_tags_refs()
 }
 
 /// Create a new tag at HEAD
 pub fn create_tag(name: &str) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     let head_sha = refs.resolve_head()?;
     refs.write_tag(name, &head_sha)
 }
 
 /// Delete a tag
 pub fn delete_tag(name: &str) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     refs.delete_tag_ref(name)
 }
 
 /// Read HEAD
 pub fn read_head() -> Result<String> {
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&crate::git_dir());
     refs.read_head()
 }

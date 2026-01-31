@@ -15,6 +15,97 @@ use libakuma::net::{TcpStream, resolve};
 
 use crate::code_search;
 
+// ============================================================================
+// Working Directory (for scratch and other tools)
+// ============================================================================
+
+/// Current working directory for git operations
+static mut WORKING_DIR: Option<String> = None;
+
+/// Get the current working directory (defaults to "/")
+pub fn get_working_dir() -> String {
+    unsafe {
+        match &WORKING_DIR {
+            Some(dir) => dir.clone(),
+            None => String::from("/"),
+        }
+    }
+}
+
+/// Set the current working directory
+pub fn set_working_dir(path: &str) {
+    // Normalize path - ensure it starts with /
+    let normalized = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        format!("/{}", path)
+    };
+    
+    // Remove trailing slash unless it's root
+    let normalized = if normalized.len() > 1 && normalized.ends_with('/') {
+        String::from(&normalized[..normalized.len()-1])
+    } else {
+        normalized
+    };
+    
+    unsafe {
+        WORKING_DIR = Some(normalized);
+    }
+}
+
+/// Resolve a path relative to the working directory
+/// Returns None if the path escapes the sandbox (tries to go above working dir)
+fn resolve_path(path: &str) -> Option<String> {
+    let cwd = get_working_dir();
+    
+    // If path is absolute, check if it's within the sandbox
+    if path.starts_with('/') {
+        // Path must be within the working directory (or be the working dir itself)
+        if path == cwd || path.starts_with(&format!("{}/", cwd)) || cwd == "/" {
+            return Some(String::from(path));
+        } else {
+            return None; // Trying to escape sandbox
+        }
+    }
+    
+    // Handle relative paths
+    let mut parts: Vec<&str> = if cwd == "/" {
+        Vec::new()
+    } else {
+        cwd[1..].split('/').collect()
+    };
+    
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                if parts.is_empty() {
+                    return None; // Trying to go above sandbox root
+                }
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    
+    if parts.is_empty() {
+        Some(String::from("/"))
+    } else {
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+/// Resolve path or return error
+fn resolve_path_or_err(path: &str) -> Result<String, ToolResult> {
+    match resolve_path(path) {
+        Some(p) => Ok(p),
+        None => Err(ToolResult::err(&format!(
+            "Access denied: '{}' is outside the working directory '{}'",
+            path, get_working_dir()
+        ))),
+    }
+}
+
 /// Result of a tool execution
 pub struct ToolResult {
     pub success: bool,
@@ -145,6 +236,13 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
             let cmd = extract_string_field(json, "cmd")?;
             Some(tool_shell(&cmd))
         }
+        "Cd" => {
+            let path = extract_string_field(json, "path")?;
+            Some(tool_cd(&path))
+        }
+        "Pwd" => {
+            Some(tool_pwd())
+        }
         _ => None,
     }
 }
@@ -213,7 +311,12 @@ pub fn find_and_execute_tool(response: &str) -> (String, Option<ToolResult>) {
 const MAX_FILE_SIZE: usize = 32 * 1024; // 32KB max
 
 fn tool_file_read(filename: &str) -> ToolResult {
-    let fd = open(filename, open_flags::O_RDONLY);
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
         return ToolResult::err(&format!("Failed to open file: {}", filename));
     }
@@ -248,7 +351,12 @@ fn tool_file_read(filename: &str) -> ToolResult {
 }
 
 fn tool_file_write(filename: &str, content: &str) -> ToolResult {
-    let fd = open(filename, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let fd = open(&resolved, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
         return ToolResult::err(&format!("Failed to create file: {}", filename));
     }
@@ -264,7 +372,12 @@ fn tool_file_write(filename: &str, content: &str) -> ToolResult {
 }
 
 fn tool_file_append(filename: &str, content: &str) -> ToolResult {
-    let fd = open(filename, open_flags::O_WRONLY | open_flags::O_APPEND);
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let fd = open(&resolved, open_flags::O_WRONLY | open_flags::O_APPEND);
     if fd < 0 {
         return ToolResult::err(&format!("Failed to open file for append: {}", filename));
     }
@@ -280,7 +393,12 @@ fn tool_file_append(filename: &str, content: &str) -> ToolResult {
 }
 
 fn tool_file_exists(filename: &str) -> ToolResult {
-    let fd = open(filename, open_flags::O_RDONLY);
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let fd = open(&resolved, open_flags::O_RDONLY);
     if fd >= 0 {
         close(fd);
         ToolResult::ok(format!("'{}' exists", filename))
@@ -290,7 +408,12 @@ fn tool_file_exists(filename: &str) -> ToolResult {
 }
 
 fn tool_file_list(path: &str) -> ToolResult {
-    match read_dir(path) {
+    let resolved = match resolve_path_or_err(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    match read_dir(&resolved) {
         Some(entries) => {
             let mut output = format!("Contents of '{}':\n", path);
             let mut count = 0;
@@ -309,13 +432,22 @@ fn tool_file_list(path: &str) -> ToolResult {
 }
 
 fn tool_file_delete(filename: &str) -> ToolResult {
+    let _resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     // Note: libakuma doesn't have unlink syscall yet
     // For now, we'll return an error
     ToolResult::err(&format!("Delete not yet implemented for: {}", filename))
 }
 
 fn tool_folder_create(path: &str) -> ToolResult {
-    let result = mkdir(path);
+    let resolved = match resolve_path_or_err(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let result = mkdir(&resolved);
     if result >= 0 {
         ToolResult::ok(format!("Successfully created directory: '{}'", path))
     } else {
@@ -323,23 +455,84 @@ fn tool_folder_create(path: &str) -> ToolResult {
     }
 }
 
+/// Change the working directory for git operations
+fn tool_cd(path: &str) -> ToolResult {
+    // Resolve path relative to current working dir if not absolute
+    let new_path = if path.starts_with('/') {
+        String::from(path)
+    } else if path == ".." {
+        // Handle parent directory
+        let current = get_working_dir();
+        if current == "/" {
+            String::from("/")
+        } else if let Some(last_slash) = current.rfind('/') {
+            if last_slash == 0 {
+                String::from("/")
+            } else {
+                String::from(&current[..last_slash])
+            }
+        } else {
+            String::from("/")
+        }
+    } else {
+        let current = get_working_dir();
+        if current == "/" {
+            format!("/{}", path)
+        } else {
+            format!("{}/{}", current, path)
+        }
+    };
+    
+    // Verify the directory exists by trying to list it
+    if read_dir(&new_path).is_some() {
+        set_working_dir(&new_path);
+        ToolResult::ok(format!("Changed directory to: {}", new_path))
+    } else {
+        ToolResult::err(&format!("Directory not found: {}", new_path))
+    }
+}
+
+/// Print the current working directory
+fn tool_pwd() -> ToolResult {
+    ToolResult::ok(get_working_dir())
+}
+
 fn tool_file_rename(source: &str, dest: &str) -> ToolResult {
+    let src_resolved = match resolve_path_or_err(source) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let dst_resolved = match resolve_path_or_err(dest) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
     // Implement as copy + delete (when delete is available)
     // For now, just copy
-    match tool_file_copy_internal(source, dest) {
+    match tool_file_copy_internal(&src_resolved, &dst_resolved) {
         Ok(_) => ToolResult::ok(format!("Renamed '{}' to '{}' (note: original not deleted yet)", source, dest)),
         Err(e) => ToolResult::err(&e),
     }
 }
 
 fn tool_file_copy(source: &str, dest: &str) -> ToolResult {
-    match tool_file_copy_internal(source, dest) {
+    let src_resolved = match resolve_path_or_err(source) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let dst_resolved = match resolve_path_or_err(dest) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    match tool_file_copy_internal(&src_resolved, &dst_resolved) {
         Ok(msg) => ToolResult::ok(msg),
         Err(e) => ToolResult::err(&e),
     }
 }
 
 fn tool_file_copy_internal(source: &str, dest: &str) -> Result<String, String> {
+    // Paths should already be resolved by callers
     // Read source file
     let src_fd = open(source, open_flags::O_RDONLY);
     if src_fd < 0 {
@@ -385,8 +578,17 @@ fn tool_file_copy_internal(source: &str, dest: &str) -> Result<String, String> {
 }
 
 fn tool_file_move(source: &str, dest: &str) -> ToolResult {
+    let src_resolved = match resolve_path_or_err(source) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let dst_resolved = match resolve_path_or_err(dest) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
     // Copy first
-    match tool_file_copy_internal(source, dest) {
+    match tool_file_copy_internal(&src_resolved, &dst_resolved) {
         Ok(_) => ToolResult::ok(format!("Moved '{}' to '{}' (note: source not deleted yet)", source, dest)),
         Err(e) => ToolResult::err(&e),
     }
@@ -579,7 +781,18 @@ fn find_headers_end(data: &[u8]) -> Option<usize> {
 
 /// Run scratch command and capture output
 fn run_scratch(args: &[&str]) -> ToolResult {
-    let result = match spawn("/bin/scratch", Some(args)) {
+    // Build full args with -C <cwd>
+    let cwd = get_working_dir();
+    let mut full_args: Vec<&str> = Vec::new();
+    full_args.push("-C");
+    // Leak the string to get a 'static str (acceptable since we only call this a few times)
+    let cwd_static: &'static str = alloc::boxed::Box::leak(cwd.into_boxed_str());
+    full_args.push(cwd_static);
+    for arg in args {
+        full_args.push(*arg);
+    }
+    
+    let result = match spawn("/bin/scratch", Some(&full_args)) {
         Some(r) => r,
         None => return ToolResult::err("Failed to spawn scratch (is /bin/scratch installed?)"),
     };
@@ -766,7 +979,12 @@ fn extract_number_field(json: &str, field: &str) -> Option<usize> {
 // ============================================================================
 
 fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolResult {
-    let fd = open(filename, open_flags::O_RDONLY);
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
         return ToolResult::err(&format!("Failed to open file: {}", filename));
     }
@@ -830,7 +1048,12 @@ fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolResult 
 // ============================================================================
 
 fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
-    match code_search::search_to_string(pattern, path, context) {
+    let resolved = match resolve_path_or_err(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    match code_search::search_to_string(pattern, &resolved, context) {
         Ok(results) => ToolResult::ok(results),
         Err(e) => ToolResult::err(&format!("Search failed: {}", e)),
     }
@@ -841,8 +1064,13 @@ fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
 // ============================================================================
 
 fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolResult {
+    let resolved = match resolve_path_or_err(filename) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
     // Read the file
-    let fd = open(filename, open_flags::O_RDONLY);
+    let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
         return ToolResult::err(&format!("Failed to open file: {}", filename));
     }
@@ -903,7 +1131,7 @@ fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolResult 
 
     // Write back
     let fd = open(
-        filename,
+        &resolved,
         open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC,
     );
     if fd < 0 {

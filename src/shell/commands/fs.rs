@@ -73,17 +73,15 @@ impl Command for LsCommand {
                     const COLOR_RESET: &[u8] = b"\x1b[0m";
 
                     for entry in dirs {
-                        let name = entry.name.to_lowercase();
                         let _ = stdout.write(COLOR_DIR).await;
-                        let _ = stdout.write(name.as_bytes()).await;
+                        let _ = stdout.write(entry.name.as_bytes()).await;
                         let _ = stdout.write(b"/").await;
                         let _ = stdout.write(COLOR_RESET).await;
                         let _ = stdout.write(b"\r\n").await;
                     }
 
                     for entry in files {
-                        let name = entry.name.to_lowercase();
-                        let _ = stdout.write(name.as_bytes()).await;
+                        let _ = stdout.write(entry.name.as_bytes()).await;
                         let _ = stdout.write(b"\r\n").await;
                     }
                 }

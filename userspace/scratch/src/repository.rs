@@ -18,8 +18,6 @@ use crate::refs::RefManager;
 use crate::sha1::{self, Sha1Hash};
 use crate::store::ObjectStore;
 
-/// Default git directory
-const GIT_DIR: &str = ".git";
 
 /// Clone a repository from a URL
 pub fn clone(url: &str) -> Result<()> {
@@ -86,7 +84,7 @@ pub fn clone(url: &str) -> Result<()> {
     }
 
     // Initialize .git structure
-    let git_dir = format!("{}/{}", repo_name, GIT_DIR);
+    let git_dir = format!("{}/.git", repo_name);
     init_git_dir(&git_dir)?;
 
     // Write config
@@ -150,8 +148,9 @@ pub fn clone(url: &str) -> Result<()> {
 
 /// Fetch updates from origin
 pub fn fetch() -> Result<()> {
+    let git_dir = crate::git_dir();
     // Check if we're in a repo
-    let refs = RefManager::new(GIT_DIR);
+    let refs = RefManager::new(&git_dir);
     let _ = refs.read_head()?; // This will fail if not a repo
 
     // Read remote URL from config
@@ -171,7 +170,7 @@ pub fn fetch() -> Result<()> {
     let (remote_refs, caps) = client.discover_refs()?;
 
     // Collect local objects we have
-    let store = ObjectStore::new(GIT_DIR);
+    let store = ObjectStore::new(&git_dir);
     let mut haves: Vec<Sha1Hash> = Vec::new();
 
     // Get all local refs
@@ -202,7 +201,7 @@ pub fn fetch() -> Result<()> {
     print(" new objects\n");
 
     // Fetch and parse using streaming
-    let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, GIT_DIR)?;
+    let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, &git_dir)?;
 
     print("scratch: stored ");
     print_num(object_count as usize);
@@ -221,14 +220,16 @@ pub fn fetch() -> Result<()> {
 
 /// Checkout a branch
 pub fn checkout(branch_name: &str) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
-    let store = ObjectStore::new(GIT_DIR);
+    let git_dir = crate::git_dir();
+    let refs = RefManager::new(&git_dir);
+    let store = ObjectStore::new(&git_dir);
 
     // Resolve branch to SHA
     let branch_sha = refs.read_branch(branch_name)?;
 
     // Update working directory
-    checkout_tree(&store, &branch_sha, ".")?;
+    let repo_root = crate::repo_path(".");
+    checkout_tree(&store, &branch_sha, &repo_root)?;
 
     // Update HEAD to point to the branch
     refs.set_head_branch(branch_name)?;
@@ -238,8 +239,9 @@ pub fn checkout(branch_name: &str) -> Result<()> {
 
 /// Push current branch to origin
 pub fn push(token: Option<&str>) -> Result<()> {
-    let refs = RefManager::new(GIT_DIR);
-    let store = ObjectStore::new(GIT_DIR);
+    let git_dir = crate::git_dir();
+    let refs = RefManager::new(&git_dir);
+    let store = ObjectStore::new(&git_dir);
 
     // Get current branch name
     let head = refs.read_head()?;
