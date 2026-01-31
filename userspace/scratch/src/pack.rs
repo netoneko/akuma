@@ -113,12 +113,29 @@ impl<'a> PackParser<'a> {
 
     /// Parse all objects and store them
     pub fn parse_all(&mut self, store: &ObjectStore) -> Result<Vec<Sha1Hash>> {
+        use libakuma::print;
+        
+        print("scratch: parse_all starting\n");
+        
         // First pass: parse all entries (including deltas)
         let mut entries: Vec<PackEntry> = Vec::with_capacity(self.object_count as usize);
         let mut offset_to_index: BTreeMap<usize, usize> = BTreeMap::new();
 
         for i in 0..self.object_count {
+            print("scratch: parsing object ");
+            print_num(i as usize);
+            print(" at pos ");
+            print_num(self.pos);
+            print("\n");
+            
             let entry = self.parse_entry()?;
+            
+            print("scratch: parsed object type=");
+            print_num(entry.obj_type as u8 as usize);
+            print(" size=");
+            print_num(entry.data.len());
+            print("\n");
+            
             offset_to_index.insert(entry.offset, i as usize);
             entries.push(entry);
         }
@@ -437,4 +454,25 @@ fn parse_copy_instruction(cmd: u8, data: &[u8]) -> Result<(usize, usize, usize)>
     }
 
     Ok((offset, size, pos))
+}
+
+fn print_num(n: usize) {
+    use libakuma::print;
+    if n == 0 {
+        print("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut val = n;
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        let s = core::str::from_utf8(&buf[i..i+1]).unwrap();
+        print(s);
+    }
 }
