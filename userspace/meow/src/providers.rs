@@ -8,7 +8,7 @@ use alloc::format;
 
 use libakuma::net::{TcpStream, resolve};
 use libakuma::sleep_ms;
-use libakuma_tls::{TlsStream, TcpTransport, TLS_RECORD_SIZE};
+use libakuma_tls::{https_get, HttpHeaders};
 
 use crate::config::{ApiType, Provider};
 
@@ -32,22 +32,6 @@ pub enum ProviderError {
 
 /// Connect to a provider (HTTP only - for HTTPS use connect_tls)
 pub fn connect(provider: &Provider) -> Result<TcpStream, ProviderError> {
-    let (host, port) = provider.host_port()
-        .ok_or_else(|| ProviderError::ConnectionFailed(String::from("Invalid URL")))?;
-
-    let ip = resolve(&host).map_err(|_| {
-        ProviderError::ConnectionFailed(format!("DNS resolution failed for: {}", host))
-    })?;
-
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
-
-    TcpStream::connect(&addr_str).map_err(|_| {
-        ProviderError::ConnectionFailed(format!("Connection failed to: {}", addr_str))
-    })
-}
-
-/// Connect to a provider and establish TLS
-fn connect_tls(provider: &Provider) -> Result<TcpStream, ProviderError> {
     let (host, port) = provider.host_port()
         .ok_or_else(|| ProviderError::ConnectionFailed(String::from("Invalid URL")))?;
 
@@ -207,94 +191,45 @@ fn parse_model_object(json: &str) -> Option<ModelInfo> {
 
 /// List models from OpenAI-compatible API (GET /v1/models)
 fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError> {
-    let (host, _port) = provider.host_port()
-        .ok_or_else(|| ProviderError::ConnectionFailed(String::from("Invalid URL")))?;
-
-    // Build request with optional API key
-    let auth_header = match &provider.api_key {
-        Some(key) => format!("Authorization: Bearer {}\r\n", key),
-        None => String::new(),
-    };
-
-    // Use base_path from URL if provided
+    // Build URL
+    let base_url = &provider.base_url;
     let base = provider.base_path();
     let path = if base.is_empty() || base == "/" {
-        String::from("/v1/models")
+        "/v1/models"
     } else if base.ends_with("/v1") {
-        format!("{}/models", base)
+        "/models"  // Will be appended to base
     } else {
-        format!("{}/models", base.trim_end_matches('/'))
+        "/models"
+    };
+    
+    let url = if base.ends_with("/v1") {
+        format!("{}{}", base_url, path)
+    } else {
+        format!("{}/v1{}", base_url.trim_end_matches('/'), path)
     };
 
-    let request = format!(
-        "GET {} HTTP/1.0\r\n\
-         Host: {}\r\n\
-         {}Connection: close\r\n\
-         \r\n",
-        path, host, auth_header
-    );
-
-    let response_str = if provider.is_https() {
-        // Use TLS for HTTPS
-        let stream = connect_tls(provider)?;
-        let transport = TcpTransport::new(stream);
-
-        // Allocate TLS buffers
-        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-
-        let mut tls = TlsStream::connect(transport, &host, &mut read_buf, &mut write_buf)
-            .map_err(|e| ProviderError::ConnectionFailed(format!("TLS error: {:?}", e)))?;
-
-        tls.write_all(request.as_bytes())
-            .map_err(|_| ProviderError::RequestFailed(String::from("TLS write failed")))?;
-        tls.flush()
-            .map_err(|_| ProviderError::RequestFailed(String::from("TLS flush failed")))?;
-
-        read_response_tls(&mut tls)?
-    } else {
-        // Plain HTTP
-        let stream = connect(provider)?;
-        stream.write_all(request.as_bytes())
-            .map_err(|_| ProviderError::RequestFailed(String::from("Write failed")))?;
-        read_response(&stream)?
-    };
-
-    // Check for HTTP errors
-    if response_str.contains("401") || response_str.contains("Unauthorized") {
-        return Err(ProviderError::RequestFailed(String::from("Unauthorized - check API key")));
+    // Build headers
+    let mut headers = HttpHeaders::new();
+    if let Some(key) = &provider.api_key {
+        headers.bearer_auth(key);
     }
 
-    // Find body
-    let body = response_str
-        .find("\r\n\r\n")
-        .map(|pos| &response_str[pos + 4..])
-        .ok_or_else(|| ProviderError::ParseError(String::from("Invalid HTTP response")))?;
+    // Make request using libakuma-tls helper
+    let response = https_get(&url, &headers)
+        .map_err(|e| match e {
+            libakuma_tls::Error::HttpError(msg) if msg.contains("401") => {
+                ProviderError::RequestFailed(String::from("Unauthorized - check API key"))
+            }
+            _ => ProviderError::RequestFailed(format!("{:?}", e)),
+        })?;
+
+    let body = core::str::from_utf8(&response)
+        .map_err(|_| ProviderError::ParseError(String::from("Invalid UTF-8 response")))?;
 
     parse_openai_models(body)
 }
 
 /// Read response from TLS stream
-fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<String, ProviderError> {
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
-
-    loop {
-        match tls.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                response.extend_from_slice(&buf[..n]);
-                if response.len() > 256 * 1024 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    Ok(String::from_utf8_lossy(&response).into_owned())
-}
-
 /// Parse OpenAI /v1/models response
 fn parse_openai_models(json: &str) -> Result<Vec<ModelInfo>, ProviderError> {
     let mut models = Vec::new();

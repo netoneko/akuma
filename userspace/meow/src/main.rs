@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use config::{ApiType, Config, Provider};
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{arg, argc, exit, fd, print, read};
-use libakuma_tls::{TlsStream, TcpTransport, TLS_RECORD_SIZE};
+use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
 
 // Token limit for context compaction (when LLM should consider compacting)
 const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
@@ -709,16 +709,15 @@ fn send_with_retry(
 
         // Handle HTTPS vs HTTP
         if provider.is_https() {
-            // HTTPS path with TLS
+            // HTTPS path with TLS using HttpStreamTls
             let (host, _) = provider.host_port().ok_or("Invalid URL")?;
-            let transport = TcpTransport::new(stream);
             
             // Allocate TLS buffers
             let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
             let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
             
-            let mut tls = match TlsStream::connect(transport, &host, &mut read_buf, &mut write_buf) {
-                Ok(t) => t,
+            let mut http_stream = match HttpStreamTls::connect(stream, &host, &mut read_buf, &mut write_buf) {
+                Ok(s) => s,
                 Err(e) => {
                     if attempt == MAX_RETRIES - 1 {
                         print(&format!("] TLS error: {:?}", e));
@@ -728,8 +727,15 @@ fn send_with_retry(
                 }
             };
             
+            // Build headers
+            let mut headers = HttpHeaders::new();
+            headers.content_type("application/json");
+            if let Some(key) = &provider.api_key {
+                headers.bearer_auth(key);
+            }
+            
             // Send request over TLS
-            if let Err(_) = send_post_request_tls(&mut tls, &path, &request_body, provider) {
+            if let Err(_) = http_stream.post(&host, &path, &request_body, &headers) {
                 if attempt == MAX_RETRIES - 1 {
                     print("] ");
                     return Err("Failed to send request");
@@ -739,7 +745,7 @@ fn send_with_retry(
             
             print("] waiting");
             
-            match read_streaming_response_tls(&mut tls, start_time, provider) {
+            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -952,51 +958,17 @@ fn connect_to_provider(provider: &Provider) -> Result<TcpStream, String> {
         .map_err(|_| format!("Connection failed to: {}", addr_str))
 }
 
-/// Send POST request over TLS
-fn send_post_request_tls(
-    tls: &mut TlsStream<'_>,
-    path: &str,
-    body: &str,
-    provider: &Provider,
-) -> Result<(), &'static str> {
-    let (host, _) = provider.host_port().ok_or("Invalid provider URL")?;
-
-    let auth_header = match &provider.api_key {
-        Some(key) => format!("Authorization: Bearer {}\r\n", key),
-        None => String::new(),
-    };
-
-    let request = format!(
-        "POST {} HTTP/1.0\r\n\
-         Host: {}\r\n\
-         Content-Type: application/json\r\n\
-         {}Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        path, host, auth_header, body.len(), body
-    );
-
-    tls.write_all(request.as_bytes())
-        .map_err(|_| "Failed to send request")?;
-    tls.flush().map_err(|_| "Failed to flush")?;
-    Ok(())
-}
-
-/// Read streaming response over TLS
-fn read_streaming_response_tls(
-    tls: &mut TlsStream<'_>,
+/// Read streaming response using HttpStreamTls
+fn read_streaming_with_http_stream_tls(
+    stream: &mut HttpStreamTls<'_>,
     start_time: u64,
     provider: &Provider,
 ) -> Result<String, &'static str> {
-    let mut buf = [0u8; 1024];
-    let mut pending_data = Vec::new();
-    let mut headers_parsed = false;
     let mut full_response = String::new();
+    let mut pending_lines = String::new();
     let mut read_attempts = 0u32;
     let mut dots_printed = 0u32;
     let mut first_token_received = false;
-    let mut any_data_received = false;
 
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
@@ -1006,50 +978,20 @@ fn read_streaming_response_tls(
             return Err("Request cancelled");
         }
 
-        match tls.read(&mut buf) {
-            Ok(0) => {
-                if !any_data_received {
-                    return Err("Connection closed by server");
-                }
-                break;
-            }
-            Ok(n) => {
-                any_data_received = true;
+        match stream.read_chunk() {
+            StreamResult::Data(data) => {
                 read_attempts = 0;
-                pending_data.extend_from_slice(&buf[..n]);
-
-                if !headers_parsed {
-                    if let Some(pos) = find_header_end(&pending_data) {
-                        let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
-                        if !header_str.starts_with("HTTP/1.") {
-                            return Err("Invalid HTTP response");
-                        }
-                        if !header_str.contains(" 200 ") {
-                            let status_line = header_str.lines().next().unwrap_or("Unknown");
-                            print(&format!("\n[HTTP Error: {}]", status_line));
-                            if header_str.contains(" 404 ") {
-                                return Err("Model not found (404)");
-                            }
-                            return Err("Server returned error");
-                        }
-                        headers_parsed = true;
-                        pending_data.drain(..pos + 4);
-                    }
-                    continue;
+                
+                // Append new data to pending lines
+                if let Ok(s) = core::str::from_utf8(&data) {
+                    pending_lines.push_str(s);
                 }
-
-                if let Ok(body_str) = core::str::from_utf8(&pending_data) {
-                    let last_newline = body_str.rfind('\n');
-                    let complete_part = match last_newline {
-                        Some(pos) => &body_str[..pos + 1],
-                        None => continue,
-                    };
-
-                    let mut is_done = false;
-                    for line in complete_part.lines() {
-                        if line.is_empty() {
-                            continue;
-                        }
+                
+                // Process complete lines
+                while let Some(newline_pos) = pending_lines.find('\n') {
+                    let line = &pending_lines[..newline_pos];
+                    
+                    if !line.is_empty() {
                         if let Some((content, done)) = parse_streaming_line(line, provider) {
                             if !content.is_empty() {
                                 if !first_token_received {
@@ -1068,22 +1010,16 @@ fn read_streaming_response_tls(
                                 }
                             }
                             if done {
-                                is_done = true;
-                                break;
+                                return Ok(full_response);
                             }
                         }
                     }
-
-                    if let Some(pos) = last_newline {
-                        pending_data.drain(..pos + 1);
-                    }
-
-                    if is_done {
-                        return Ok(full_response);
-                    }
+                    
+                    // Remove processed line
+                    pending_lines = String::from(&pending_lines[newline_pos + 1..]);
                 }
             }
-            Err(_) => {
+            StreamResult::WouldBlock => {
                 read_attempts += 1;
                 if read_attempts % 50 == 0 && !first_token_received {
                     print(".");
@@ -1093,7 +1029,13 @@ fn read_streaming_response_tls(
                     return Err("Timeout waiting for response");
                 }
                 libakuma::sleep_ms(10);
-                continue;
+            }
+            StreamResult::Done => {
+                break;
+            }
+            StreamResult::Error(e) => {
+                print(&format!("\n[Error: {:?}]", e));
+                return Err("Server returned error");
             }
         }
     }
