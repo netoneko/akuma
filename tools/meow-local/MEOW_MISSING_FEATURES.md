@@ -222,7 +222,7 @@ meow-local -C /path/to/project
 | Feature | meow-local | meow (unikernel) | Notes |
 |---------|------------|------------------|-------|
 | Multi-provider config | Yes | Yes | Config stored at `/etc/meow/config` |
-| HTTPS/TLS support | Yes (native-tls) | Partial | HTTPS for HttpFetch tool, HTTP for chat |
+| HTTPS/TLS support | Yes (native-tls) | Yes (libakuma-tls) | TLS 1.3, NoVerify mode |
 | OpenAI streaming format | Yes | Yes | SSE parsing implemented |
 | Provider commands | Yes | Yes | `/provider`, `/model list` |
 | Token count display | Yes | Yes | Shows `[5k/32k]` in prompt |
@@ -236,15 +236,14 @@ meow-local -C /path/to/project
 
 ### Differences
 
-1. **HTTPS for Chat**: meow-local supports HTTPS connections to providers like OpenAI.
-   The unikernel version currently only supports HTTP for chat connections
-   (HTTPS requires TLS integration with the chat streaming code).
-
-2. **CodeSearch**: meow-local uses full regex via the `regex` crate.
+1. **CodeSearch**: meow-local uses full regex via the `regex` crate.
    The unikernel version uses simple string matching to avoid the dependency.
 
-3. **Shell Tool**: meow-local uses a sandboxed bash wrapper.
+2. **Shell Tool**: meow-local uses a sandboxed bash wrapper.
    The unikernel version spawns binaries directly (no shell interpretation).
 
-4. **Interactive Init**: meow-local has a fully interactive provider setup wizard.
+3. **Interactive Init**: meow-local has a fully interactive provider setup wizard.
    The unikernel version displays current config and requires manual editing.
+
+4. **TLS**: meow-local uses native-tls with certificate verification.
+   The unikernel version uses embedded-tls in NoVerify mode (like `curl -k`).
