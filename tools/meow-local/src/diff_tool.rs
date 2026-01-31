@@ -2,7 +2,7 @@ use diff::Diff;
 use std::fs;
 use std::io;
 
-fn diff_files(file1_path: &str, file2_path: &str) -> Result<String, io::Error> {
+async fn diff_files(file1_path: &str, file2_path: &str) -> Result<String, io::Error> {
     let file1_content = fs::read_to_string(file1_path)?;
     let file2_content = fs::read_to_string(file2_path)?;
 

@@ -1129,3 +1129,30 @@ mod tests {
         cleanup_test_sandbox(&dir);
     }
 }
+
+
+/// Compare two files using the `diff` command.
+fn tool_diff_files(source: &str, destination: &str) -> ToolResult {
+    match (validate_path_in_sandbox(source), validate_path_in_sandbox(destination)) {
+        (Ok(src_path), Ok(dest_path)) => {
+            let output = Command::new("diff")
+                .arg(&src_path)
+                .arg(&dest_path)
+                .output();
+
+            match output {
+                Ok(output) => {
+                    if output.status.success() {
+                        ToolResult::ok(String::from_utf8_lossy(&output.stdout).to_string())
+                    } else {
+                        ToolResult::err(&format!("Diff command failed: {}", String::from_utf8_lossy(&output.stderr)))
+                    }
+                }
+                Err(e) => ToolResult::err(&format!("Failed to execute diff command: {}", e)),
+            }
+        }
+        (Err(e), _ ) => ToolResult::err(&e),
+        (_, Err(e)) => ToolResult::err(&e),
+    }
+}
+
