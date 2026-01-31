@@ -2,6 +2,38 @@
 
 Scratch is a minimal, `no_std` compatible Git client designed to run in the Akuma OS userspace. It implements the Git Smart HTTP protocol to clone repositories from GitHub and other Git servers.
 
+## Quick Start Workflow
+
+The minimal workflow for contributing to a repository:
+
+```bash
+# 1. Set up global config (one-time setup)
+echo '[user]
+	name = Your Name
+	email = your@email.com
+[credential]
+	token = ghp_xxxxxxxxxxxx' > /.gitconfig
+
+# 2. Clone a repository
+scratch clone https://github.com/owner/repo.git
+cd repo
+
+# 3. Create a branch for your changes
+scratch branch my-feature
+scratch checkout my-feature
+
+# 4. Make changes to files...
+#    (use meow, editor, or other tools)
+
+# 5. Commit your changes
+scratch commit -m "Add new feature"
+
+# 6. Push to remote
+scratch push
+```
+
+**Note:** The workflow will be extended with `log` (view commit history) and improved `commit` features (selective staging, amend) in future versions.
+
 ## Overview
 
 Scratch provides basic Git functionality without requiring the full Git binary or standard library. It's built from scratch (hence the name) to work within Akuma's constrained environment.
@@ -224,11 +256,16 @@ miniz_oxide = { version = "0.8", default-features = false, features = ["with-all
 
 ## Future Work
 
+**Coming Soon:**
+- **Log command**: View commit history (`scratch log`, `scratch log -n 5`)
+- **Improved commits**: Selective staging, commit amend, better diff support
+
+**Planned:**
 1. **Incremental fetch**: Better "have" negotiation for updates
 2. **Shallow clones**: Support for `--depth` option
 3. **Sparse checkout**: Only checkout specific paths
-4. **Staging area**: Support for selective commits
-5. **Diff viewing**: Show changes between commits
+4. **Staging area**: Support for selective commits (`scratch add`)
+5. **Diff viewing**: Show changes between commits (`scratch diff`)
 
 ## Usage Examples
 
@@ -347,7 +384,17 @@ scratch: push complete
 
 ## Configuration
 
-Scratch stores configuration in `.git/config` using standard Git INI format:
+Scratch reads configuration from multiple sources (later overrides earlier):
+
+1. `/.gitconfig` - Global config
+2. `/.git/config` - Global config (alternate location)
+3. `.git/config` - Local repository config
+
+This allows setting user identity and credentials globally while still allowing per-repo overrides.
+
+### Config File Format
+
+Scratch uses standard Git INI format:
 
 ```ini
 [core]
