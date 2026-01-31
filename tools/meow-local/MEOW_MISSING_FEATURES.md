@@ -1,7 +1,9 @@
-# Features Missing from Meow (Unikernel Version)
+# Features Comparison: meow-local vs meow (Unikernel)
 
-This document lists features available in `meow-local` (native macOS/Linux version) that are
-not yet implemented in `meow` (the unikernel version running in the Akuma kernel).
+This document compares features between `meow-local` (native macOS/Linux version) and
+`meow` (the unikernel version running in the Akuma kernel).
+
+**Status: Most features have been backported to the unikernel version.**
 
 ## Multi-Provider Support
 
@@ -215,22 +217,34 @@ meow-local -C /path/to/project
 
 **meow:** Has escape key detection but implementation differs due to kernel environment.
 
-## Priority for Implementation
+## Implementation Status
 
-1. **High Priority:**
-   - Token count display (improves user awareness)
-   - CompactContext tool (prevents context overflow)
-   - FileReadLines tool (essential for large file navigation)
-   - CodeSearch tool (helps LLM find relevant code)
+| Feature | meow-local | meow (unikernel) | Notes |
+|---------|------------|------------------|-------|
+| Multi-provider config | Yes | Yes | Config stored at `/etc/meow/config` |
+| HTTPS/TLS support | Yes (native-tls) | Partial | HTTPS for HttpFetch tool, HTTP for chat |
+| OpenAI streaming format | Yes | Yes | SSE parsing implemented |
+| Provider commands | Yes | Yes | `/provider`, `/model list` |
+| Token count display | Yes | Yes | Shows `[5k/32k]` in prompt |
+| /tokens command | Yes | Yes | Shows current usage |
+| CompactContext tool | Yes | Yes | Compresses conversation history |
+| FileReadLines tool | Yes | Yes | Read specific line ranges |
+| CodeSearch tool | Yes | Yes | Simple string matching (no regex) |
+| FileEdit tool | Yes | Yes | Search-and-replace with unique match |
+| Shell tool | Yes (sandboxed) | Yes | Spawns binaries directly |
+| meow init | Yes (interactive) | Yes (displays config) | Manual config editing required |
 
-2. **Medium Priority:**
-   - FileEdit tool (safer than full file rewrites)
-   - Context window query (nice-to-have, can use defaults)
-   - /tokens command (debugging aid)
-   - Provider switching (Ollama is sufficient for now)
+### Differences
 
-3. **Low Priority:**
-   - Shell tool (security considerations in unikernel environment)
-   - HTTPS/TLS support (significant complexity)
-   - OpenAI-compatible API (most users run local Ollama)
-   - Multi-provider config persistence (filesystem complexity)
+1. **HTTPS for Chat**: meow-local supports HTTPS connections to providers like OpenAI.
+   The unikernel version currently only supports HTTP for chat connections
+   (HTTPS requires TLS integration with the chat streaming code).
+
+2. **CodeSearch**: meow-local uses full regex via the `regex` crate.
+   The unikernel version uses simple string matching to avoid the dependency.
+
+3. **Shell Tool**: meow-local uses a sandboxed bash wrapper.
+   The unikernel version spawns binaries directly (no shell interpretation).
+
+4. **Interactive Init**: meow-local has a fully interactive provider setup wizard.
+   The unikernel version displays current config and requires manual editing.

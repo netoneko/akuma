@@ -1,6 +1,6 @@
 //! Tool execution module for Meow-chan
 //!
-//! Implements file system and network tools that the LLM can invoke via JSON commands.
+//! Implements file system, network, and shell tools that the LLM can invoke via JSON commands.
 //! Tools are executed using libakuma syscalls.
 
 use alloc::string::String;
@@ -12,6 +12,8 @@ use libakuma::{
     open_flags, spawn, waitpid,
 };
 use libakuma::net::{TcpStream, resolve};
+
+use crate::code_search;
 
 /// Result of a tool execution
 pub struct ToolResult {
@@ -120,6 +122,28 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
         }
         "GitFetch" => {
             Some(tool_git_fetch())
+        }
+        "FileReadLines" => {
+            let filename = extract_string_field(json, "filename")?;
+            let start = extract_number_field(json, "start").unwrap_or(1);
+            let end = extract_number_field(json, "end").unwrap_or(start + 50);
+            Some(tool_file_read_lines(&filename, start, end))
+        }
+        "CodeSearch" => {
+            let pattern = extract_string_field(json, "pattern")?;
+            let path = extract_string_field(json, "path").unwrap_or_else(|| String::from("."));
+            let context = extract_number_field(json, "context").unwrap_or(2);
+            Some(tool_code_search(&pattern, &path, context))
+        }
+        "FileEdit" => {
+            let filename = extract_string_field(json, "filename")?;
+            let old_text = extract_string_field(json, "old_text")?;
+            let new_text = extract_string_field(json, "new_text")?;
+            Some(tool_file_edit(&filename, &old_text, &new_text))
+        }
+        "Shell" => {
+            let cmd = extract_string_field(json, "cmd")?;
+            Some(tool_shell(&cmd))
         }
         _ => None,
     }
@@ -672,30 +696,26 @@ fn tool_git_branch(name: Option<&str>, delete: bool) -> ToolResult {
 fn extract_string_field(json: &str, field: &str) -> Option<String> {
     let pattern = format!("\"{}\"", field);
     let start = json.find(&pattern)?;
-    
-    // Find the colon after the field name
+
     let after_field = &json[start + pattern.len()..];
     let colon_pos = after_field.find(':')?;
     let after_colon = &after_field[colon_pos + 1..];
-    
-    // Skip whitespace
+
     let trimmed = after_colon.trim_start();
-    
-    // Check if it starts with a quote
+
     if !trimmed.starts_with('"') {
         return None;
     }
-    
-    // Find the closing quote (handling escapes)
-    let value_start = 1; // Skip opening quote
+
+    let value_start = 1;
     let rest = &trimmed[value_start..];
-    
+
     let mut result = String::new();
     let mut chars = rest.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         match c {
-            '"' => break, // End of string
+            '"' => break,
             '\\' => {
                 if let Some(&next) = chars.peek() {
                     chars.next();
@@ -716,6 +736,345 @@ fn extract_string_field(json: &str, field: &str) -> Option<String> {
             _ => result.push(c),
         }
     }
-    
+
     Some(result)
+}
+
+/// Extract a number field from JSON
+fn extract_number_field(json: &str, field: &str) -> Option<usize> {
+    let pattern = format!("\"{}\"", field);
+    let start = json.find(&pattern)?;
+
+    let after_field = &json[start + pattern.len()..];
+    let colon_pos = after_field.find(':')?;
+    let after_colon = &after_field[colon_pos + 1..];
+
+    let trimmed = after_colon.trim_start();
+
+    let num_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if num_end == 0 {
+        return None;
+    }
+
+    trimmed[..num_end].parse().ok()
+}
+
+// ============================================================================
+// FileReadLines Tool
+// ============================================================================
+
+fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolResult {
+    let fd = open(filename, open_flags::O_RDONLY);
+    if fd < 0 {
+        return ToolResult::err(&format!("Failed to open file: {}", filename));
+    }
+
+    let stat = match fstat(fd) {
+        Ok(s) => s,
+        Err(_) => {
+            close(fd);
+            return ToolResult::err("Failed to get file info");
+        }
+    };
+
+    let size = stat.st_size as usize;
+    if size > MAX_FILE_SIZE * 4 {
+        // Allow larger files for line reading
+        close(fd);
+        return ToolResult::err("File too large");
+    }
+
+    let mut buf = alloc::vec![0u8; size];
+    let bytes_read = read_fd(fd, &mut buf);
+    close(fd);
+
+    if bytes_read <= 0 {
+        return ToolResult::err("Failed to read file");
+    }
+
+    let content = match core::str::from_utf8(&buf[..bytes_read as usize]) {
+        Ok(s) => s,
+        Err(_) => return ToolResult::err("File contains non-UTF8 data"),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let start_idx = start.saturating_sub(1); // Convert to 0-indexed
+    let end_idx = end.min(total_lines);
+
+    if start_idx >= total_lines {
+        return ToolResult::err(&format!(
+            "Start line {} is beyond file length ({} lines)",
+            start, total_lines
+        ));
+    }
+
+    let mut output = format!(
+        "Lines {}-{} of '{}' ({} total lines):\n```\n",
+        start, end_idx, filename, total_lines
+    );
+
+    for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
+        let line_num = start_idx + idx + 1;
+        output.push_str(&format!("{:>4}: {}\n", line_num, line));
+    }
+    output.push_str("```");
+
+    ToolResult::ok(output)
+}
+
+// ============================================================================
+// CodeSearch Tool
+// ============================================================================
+
+fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
+    match code_search::search_to_string(pattern, path, context) {
+        Ok(results) => ToolResult::ok(results),
+        Err(e) => ToolResult::err(&format!("Search failed: {}", e)),
+    }
+}
+
+// ============================================================================
+// FileEdit Tool
+// ============================================================================
+
+fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolResult {
+    // Read the file
+    let fd = open(filename, open_flags::O_RDONLY);
+    if fd < 0 {
+        return ToolResult::err(&format!("Failed to open file: {}", filename));
+    }
+
+    let stat = match fstat(fd) {
+        Ok(s) => s,
+        Err(_) => {
+            close(fd);
+            return ToolResult::err("Failed to get file info");
+        }
+    };
+
+    let size = stat.st_size as usize;
+    if size > MAX_FILE_SIZE * 4 {
+        close(fd);
+        return ToolResult::err("File too large");
+    }
+
+    let mut buf = alloc::vec![0u8; size];
+    let bytes_read = read_fd(fd, &mut buf);
+    close(fd);
+
+    if bytes_read <= 0 {
+        return ToolResult::err("Failed to read file");
+    }
+
+    let content = match core::str::from_utf8(&buf[..bytes_read as usize]) {
+        Ok(s) => String::from(s),
+        Err(_) => return ToolResult::err("File contains non-UTF8 data"),
+    };
+
+    // Count occurrences
+    let occurrences: Vec<_> = content.match_indices(old_text).collect();
+
+    if occurrences.is_empty() {
+        return ToolResult::err(&format!(
+            "Text not found in '{}'. Make sure the text matches exactly (including whitespace).",
+            filename
+        ));
+    }
+
+    if occurrences.len() > 1 {
+        let mut line_nums = Vec::new();
+        for (pos, _) in &occurrences {
+            let line_num = content[..*pos].matches('\n').count() + 1;
+            line_nums.push(line_num);
+        }
+        return ToolResult::err(&format!(
+            "Found {} occurrences at lines {:?}. Please provide more context to make the match unique.",
+            occurrences.len(),
+            line_nums
+        ));
+    }
+
+    // Single match - perform replacement
+    let (match_pos, _) = occurrences[0];
+    let new_content = content.replace(old_text, new_text);
+
+    // Write back
+    let fd = open(
+        filename,
+        open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC,
+    );
+    if fd < 0 {
+        return ToolResult::err(&format!("Failed to open file for writing: {}", filename));
+    }
+
+    let bytes_written = write_fd(fd, new_content.as_bytes());
+    close(fd);
+
+    if bytes_written < 0 {
+        return ToolResult::err("Failed to write file");
+    }
+
+    // Find the line number of the change
+    let line_num = content[..match_pos].matches('\n').count() + 1;
+
+    // Create diff-like output
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+
+    let mut diff = format!("Modified '{}' at line {}:\n```diff\n", filename, line_num);
+    for line in &old_lines {
+        diff.push_str(&format!("- {}\n", line));
+    }
+    for line in &new_lines {
+        diff.push_str(&format!("+ {}\n", line));
+    }
+    diff.push_str("```");
+
+    ToolResult::ok(diff)
+}
+
+// ============================================================================
+// Shell Tool
+// ============================================================================
+
+fn tool_shell(command: &str) -> ToolResult {
+    // Parse the command to get the binary and arguments
+    // Simple tokenizer: split on whitespace, respecting quotes
+    let tokens = tokenize_command(command);
+    if tokens.is_empty() {
+        return ToolResult::err("Empty command");
+    }
+
+    let binary = &tokens[0];
+    let args: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+
+    // Check for the binary in common paths
+    let binary_path = if binary.starts_with('/') || binary.starts_with('.') {
+        binary.clone()
+    } else {
+        // Try to find the binary
+        let paths = ["/bin/", "/usr/bin/"];
+        let mut found = None;
+        for path in paths {
+            let full_path = format!("{}{}", path, binary);
+            let fd = open(&full_path, open_flags::O_RDONLY);
+            if fd >= 0 {
+                close(fd);
+                found = Some(full_path);
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => {
+                // Try the binary name directly
+                binary.clone()
+            }
+        }
+    };
+
+    // Spawn the process
+    let result = match spawn(&binary_path, Some(&args[..])) {
+        Some(r) => r,
+        None => return ToolResult::err(&format!("Failed to spawn '{}' (not found?)", binary_path)),
+    };
+
+    // Read output from child process
+    let mut output = Vec::new();
+    let mut buf = [0u8; 1024];
+    let max_wait_ms = 30000;
+    let mut waited_ms = 0u32;
+
+    loop {
+        let n = read_fd(result.stdout_fd as i32, &mut buf);
+        if n > 0 {
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+
+        if let Some((_pid, exit_code)) = waitpid(result.pid) {
+            // Drain remaining output
+            loop {
+                let n = read_fd(result.stdout_fd as i32, &mut buf);
+                if n <= 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n as usize]);
+            }
+            close(result.stdout_fd as i32);
+
+            let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
+
+            let mut result_str = String::new();
+            if !output_str.is_empty() {
+                result_str.push_str("stdout:\n```\n");
+                result_str.push_str(output_str);
+                result_str.push_str("```\n");
+            }
+            result_str.push_str(&format!("\nExit code: {}", exit_code));
+
+            if exit_code == 0 {
+                return ToolResult::ok(result_str);
+            } else {
+                return ToolResult {
+                    success: false,
+                    output: result_str,
+                };
+            }
+        }
+
+        libakuma::sleep_ms(50);
+        waited_ms += 50;
+
+        if waited_ms >= max_wait_ms {
+            close(result.stdout_fd as i32);
+            return ToolResult::err("Command timed out after 30 seconds");
+        }
+    }
+}
+
+/// Tokenize a command string into arguments
+fn tokenize_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escape_next = false;
+
+    for c in cmd.chars() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        match c {
+            '\\' if !in_single_quote => {
+                escape_next = true;
+            }
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+            }
+            ' ' | '\t' if !in_single_quote && !in_double_quote => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
