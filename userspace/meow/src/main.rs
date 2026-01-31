@@ -966,11 +966,11 @@ fn read_streaming_with_http_stream_tls(
 ) -> Result<String, &'static str> {
     let mut full_response = String::new();
     let mut pending_lines = String::new();
-    let mut read_attempts = 0u32;
-    let mut dots_printed = 0u32;
     let mut first_token_received = false;
 
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
+
+    // Note: Dots are printed by the TLS transport layer while waiting for data
 
     loop {
         if check_escape_pressed() {
@@ -980,8 +980,6 @@ fn read_streaming_with_http_stream_tls(
 
         match stream.read_chunk() {
             StreamResult::Data(data) => {
-                read_attempts = 0;
-                
                 // Append new data to pending lines
                 if let Ok(s) = core::str::from_utf8(&data) {
                     pending_lines.push_str(s);
@@ -997,9 +995,8 @@ fn read_streaming_with_http_stream_tls(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    for _ in 0..(7 + dots_printed) {
-                                        print("\x08 \x08");
-                                    }
+                                    // Print timing on new line (dots were printed on same line)
+                                    print(" ");
                                     print_elapsed(elapsed_ms);
                                     print("\n");
                                 }
@@ -1020,14 +1017,6 @@ fn read_streaming_with_http_stream_tls(
                 }
             }
             StreamResult::WouldBlock => {
-                read_attempts += 1;
-                if read_attempts % 50 == 0 && !first_token_received {
-                    print(".");
-                    dots_printed += 1;
-                }
-                if read_attempts > 6000 {
-                    return Err("Timeout waiting for response");
-                }
                 libakuma::sleep_ms(10);
             }
             StreamResult::Done => {

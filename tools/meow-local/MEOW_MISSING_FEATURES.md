@@ -247,3 +247,7 @@ meow-local -C /path/to/project
 
 4. **TLS**: meow-local uses native-tls with certificate verification.
    The unikernel version uses embedded-tls in NoVerify mode (like `curl -k`).
+
+5. **SSH Keepalive**: The unikernel version prints dots during the "waiting" phase
+   (every ~500ms) to keep the terminal busy and prevent SSH from dropping the
+   connection due to inactivity.

@@ -637,7 +637,8 @@ impl<'a> HttpStreamTls<'a> {
         read_buf: &'a mut [u8],
         write_buf: &'a mut [u8],
     ) -> Result<Self, Error> {
-        let transport = TcpTransport::new(stream);
+        // Use dot-printing transport to keep SSH connections alive
+        let transport = TcpTransport::new_with_dots(stream);
         let tls = TlsStream::connect(transport, host, read_buf, write_buf)?;
 
         Ok(Self {

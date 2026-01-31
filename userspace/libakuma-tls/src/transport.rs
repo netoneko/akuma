@@ -9,12 +9,25 @@ use libakuma::net::{Error as NetError, ErrorKind, TcpStream};
 /// Wrapper around TcpStream that implements embedded-io traits
 pub struct TcpTransport {
     stream: TcpStream,
+    /// Counter for printing progress dots during blocking waits
+    wait_counter: u32,
+    /// Number of dots printed so far
+    dots_printed: u32,
+    /// Whether to print dots while waiting
+    print_dots: bool,
 }
 
 impl TcpTransport {
-    /// Create a new transport wrapper around a TcpStream
+    /// Create a new transport wrapper around a TcpStream (blocking mode)
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self { stream, wait_counter: 0, dots_printed: 0, print_dots: false }
+    }
+
+    /// Create a new transport that prints dots while waiting for data
+    /// 
+    /// This is useful for keeping SSH connections alive during long waits.
+    pub fn new_with_dots(stream: TcpStream) -> Self {
+        Self { stream, wait_counter: 0, dots_printed: 0, print_dots: true }
     }
 
     /// Get a reference to the underlying stream
@@ -25,6 +38,16 @@ impl TcpTransport {
     /// Consume the wrapper and return the underlying stream
     pub fn into_inner(self) -> TcpStream {
         self.stream
+    }
+
+    /// Get the number of dots printed while waiting
+    pub fn dots_printed(&self) -> u32 {
+        self.dots_printed
+    }
+
+    /// Reset the dots counter (call after cleaning up dots)
+    pub fn reset_dots(&mut self) {
+        self.dots_printed = 0;
     }
 }
 
@@ -68,8 +91,21 @@ impl Read for TcpTransport {
         // Handle WouldBlock by retrying with a small delay
         loop {
             match self.stream.read(buf) {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    // Reset counter on successful read
+                    self.wait_counter = 0;
+                    return Ok(n);
+                }
                 Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
+                    // Print dots periodically to keep SSH alive
+                    if self.print_dots {
+                        self.wait_counter += 1;
+                        // Print a dot every 500ms (50 * 10ms)
+                        if self.wait_counter % 50 == 0 {
+                            libakuma::print(".");
+                            self.dots_printed += 1;
+                        }
+                    }
                     // Retry after a short delay
                     libakuma::sleep_ms(10);
                     continue;

@@ -966,7 +966,9 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let read_len = core::cmp::min(len, KERNEL_BUF_SIZE);
 
     let mut iterations = 0usize;
-    const MAX_ITERATIONS: usize = 100_000;
+    // Short timeout (50 iterations * ~10ms yield = ~500ms) then return EAGAIN
+    // This allows userspace to do work (like print progress dots) while waiting
+    const EAGAIN_ITERATIONS: usize = 50;
 
     loop {
         // Check for interrupt
@@ -1018,9 +1020,10 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
             Ok(Ok(_)) => {
                 // Would block (-1) - yield and retry
                 iterations += 1;
-                if iterations >= MAX_ITERATIONS {
+                if iterations >= EAGAIN_ITERATIONS {
+                    // Return EAGAIN so userspace can do other work (print dots, etc.)
                     socket::socket_dec_ref(socket_idx);
-                    return (-libc_errno::ETIMEDOUT as i64) as u64;
+                    return (-libc_errno::EAGAIN as i64) as u64;
                 }
                 crate::threading::yield_now();
                 for _ in 0..100 { core::hint::spin_loop(); }
