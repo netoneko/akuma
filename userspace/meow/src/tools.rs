@@ -214,6 +214,40 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
         "GitFetch" => {
             Some(tool_git_fetch())
         }
+        "GitAdd" => {
+            let path = extract_string_field(json, "path").unwrap_or_else(|| String::from("."));
+            Some(tool_git_add(&path))
+        }
+        "GitCommit" => {
+            let message = extract_string_field(json, "message")?;
+            let amend = extract_string_field(json, "amend")
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            Some(tool_git_commit(&message, amend))
+        }
+        "GitCheckout" => {
+            let branch = extract_string_field(json, "branch")?;
+            Some(tool_git_checkout(&branch))
+        }
+        "GitConfig" => {
+            let key = extract_string_field(json, "key")?;
+            let value = extract_string_field(json, "value");
+            Some(tool_git_config(&key, value.as_deref()))
+        }
+        "GitLog" => {
+            let count = extract_number_field(json, "count");
+            let oneline = extract_string_field(json, "oneline")
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            Some(tool_git_log(count, oneline))
+        }
+        "GitTag" => {
+            let name = extract_string_field(json, "name");
+            let delete = extract_string_field(json, "delete")
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            Some(tool_git_tag(name.as_deref(), delete))
+        }
         "FileReadLines" => {
             let filename = extract_string_field(json, "filename")?;
             let start = extract_number_field(json, "start").unwrap_or(1);
@@ -781,75 +815,18 @@ fn find_headers_end(data: &[u8]) -> Option<usize> {
 }
 
 // ============================================================================
-// Git Tools (via scratch binary)
+// Git Tools (via scratch binary using Shell tool)
 // ============================================================================
-
-/// Run scratch command and capture output
-fn run_scratch(args: &[&str]) -> ToolResult {
-    // Scratch will inherit cwd from meow via the spawn syscall
-    let result = match spawn("/bin/scratch", Some(args)) {
-        Some(r) => r,
-        None => return ToolResult::err("Failed to spawn scratch (is /bin/scratch installed?)"),
-    };
-
-    // Read output from child process
-    let mut output = Vec::new();
-    let mut buf = [0u8; 1024];
-    let max_wait_ms = 30000; // 30 second timeout
-    let mut waited_ms = 0u32;
-
-    loop {
-        // Try to read output
-        let n = read_fd(result.stdout_fd as i32, &mut buf);
-        if n > 0 {
-            output.extend_from_slice(&buf[..n as usize]);
-        }
-
-        // Check if process exited
-        if let Some((_pid, exit_code)) = waitpid(result.pid) {
-            // Drain any remaining output
-            loop {
-                let n = read_fd(result.stdout_fd as i32, &mut buf);
-                if n <= 0 {
-                    break;
-                }
-                output.extend_from_slice(&buf[..n as usize]);
-            }
-            close(result.stdout_fd as i32);
-
-            let output_str = core::str::from_utf8(&output)
-                .unwrap_or("<binary output>");
-
-            if exit_code == 0 {
-                return ToolResult::ok(String::from(output_str));
-            } else if exit_code == -1 {
-                // Special case: force push denied
-                return ToolResult::err("DENIED: Force push is permanently disabled for safety");
-            } else {
-                return ToolResult::err(&format!("Command failed (exit {}): {}", exit_code, output_str));
-            }
-        }
-
-        // Wait a bit before polling again
-        libakuma::sleep_ms(50);
-        waited_ms += 50;
-
-        if waited_ms >= max_wait_ms {
-            close(result.stdout_fd as i32);
-            return ToolResult::err("Command timed out after 30 seconds");
-        }
-    }
-}
 
 /// Clone a Git repository
 fn tool_git_clone(url: &str) -> ToolResult {
-    run_scratch(&["clone", url])
+    tool_shell(&format!("scratch clone {}", url))
 }
 
 /// Pull from remote (fetch + checkout)
 fn tool_git_pull() -> ToolResult {
     // First fetch
-    let fetch_result = run_scratch(&["fetch"]);
+    let fetch_result = tool_shell("scratch fetch");
     if !fetch_result.success {
         return fetch_result;
     }
@@ -860,7 +837,7 @@ fn tool_git_pull() -> ToolResult {
 
 /// Fetch from remote
 fn tool_git_fetch() -> ToolResult {
-    run_scratch(&["fetch"])
+    tool_shell("scratch fetch")
 }
 
 /// Push to remote - FORCE PUSH IS ALWAYS DENIED
@@ -870,29 +847,74 @@ fn tool_git_push(force: bool) -> ToolResult {
         return ToolResult::err("DENIED: Force push is permanently disabled. This cannot be bypassed.");
     }
     
-    run_scratch(&["push"])
+    tool_shell("scratch push")
 }
 
 /// Get repository status
 fn tool_git_status() -> ToolResult {
-    run_scratch(&["status"])
+    tool_shell("scratch status")
 }
 
 /// List, create, or delete branches
 fn tool_git_branch(name: Option<&str>, delete: bool) -> ToolResult {
     match (name, delete) {
-        (None, _) => {
-            // List branches
-            run_scratch(&["branch"])
+        (None, _) => tool_shell("scratch branch"),
+        (Some(n), true) => tool_shell(&format!("scratch branch -d {}", n)),
+        (Some(n), false) => tool_shell(&format!("scratch branch {}", n)),
+    }
+}
+
+/// Stage files for commit
+fn tool_git_add(path: &str) -> ToolResult {
+    tool_shell(&format!("scratch add {}", path))
+}
+
+/// Create a commit
+fn tool_git_commit(message: &str, amend: bool) -> ToolResult {
+    // Escape double quotes in message
+    let escaped_message = message.replace('"', "\\\"");
+    if amend {
+        tool_shell(&format!("scratch commit --amend -m \"{}\"", escaped_message))
+    } else {
+        tool_shell(&format!("scratch commit -m \"{}\"", escaped_message))
+    }
+}
+
+/// Checkout a branch
+fn tool_git_checkout(branch: &str) -> ToolResult {
+    tool_shell(&format!("scratch checkout {}", branch))
+}
+
+/// Get or set git config
+fn tool_git_config(key: &str, value: Option<&str>) -> ToolResult {
+    match value {
+        Some(v) => {
+            // Escape double quotes in value
+            let escaped_value = v.replace('"', "\\\"");
+            tool_shell(&format!("scratch config {} \"{}\"", key, escaped_value))
         }
-        (Some(n), true) => {
-            // Delete branch
-            run_scratch(&["branch", "-d", n])
-        }
-        (Some(n), false) => {
-            // Create branch
-            run_scratch(&["branch", n])
-        }
+        None => tool_shell(&format!("scratch config {}", key)),
+    }
+}
+
+/// Show commit log
+fn tool_git_log(count: Option<usize>, oneline: bool) -> ToolResult {
+    let mut cmd = String::from("scratch log");
+    if let Some(n) = count {
+        cmd.push_str(&format!(" -n {}", n));
+    }
+    if oneline {
+        cmd.push_str(" --oneline");
+    }
+    tool_shell(&cmd)
+}
+
+/// List, create, or delete tags
+fn tool_git_tag(name: Option<&str>, delete: bool) -> ToolResult {
+    match (name, delete) {
+        (None, _) => tool_shell("scratch tag"),
+        (Some(n), true) => tool_shell(&format!("scratch tag -d {}", n)),
+        (Some(n), false) => tool_shell(&format!("scratch tag {}", n)),
     }
 }
 

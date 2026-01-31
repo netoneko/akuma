@@ -141,23 +141,55 @@ After cloning, use Cd to enter the repository before running other git commands.
     Args: `{"name": "branch-name"}` - create a new branch
     Args: `{"name": "branch-name", "delete": "true"}` - delete a branch
 
-19. **FileReadLines** - Read specific line ranges from a file
+19. **GitAdd** - Stage files for commit
+    Args: `{"path": "file_or_directory"}` - stage specific path
+    Args: `{"path": "."}` - stage all changes
+    Note: Must be in a git repository.
+
+20. **GitCommit** - Create a commit with staged changes
+    Args: `{"message": "commit message"}`
+    Args: `{"message": "new message", "amend": "true"}` - amend last commit
+    Note: Requires files to be staged first with GitAdd.
+
+21. **GitCheckout** - Switch to a branch
+    Args: `{"branch": "branch-name"}`
+    Note: Switches HEAD to the specified branch.
+
+22. **GitConfig** - Get or set git config values
+    Args: `{"key": "user.name"}` - get config value
+    Args: `{"key": "user.name", "value": "Your Name"}` - set config value
+    Keys: user.name, user.email, credential.token
+
+23. **GitLog** - Show commit history
+    Args: `{}`
+    Args: `{"count": 5}` - limit to N commits
+    Args: `{"oneline": "true"}` - one line per commit
+    Note: Shows commit log with SHA, author, date, and message.
+
+24. **GitTag** - List, create, or delete tags
+    Args: `{}` - list all tags
+    Args: `{"name": "v1.0"}` - create a new tag
+    Args: `{"name": "v1.0", "delete": "true"}` - delete a tag
+
+### Code Editing Tools:
+
+25. **FileReadLines** - Read specific line ranges from a file
     Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
     Note: Returns lines with line numbers. Great for navigating large files.
 
-20. **CodeSearch** - Search for patterns in Rust source files
+26. **CodeSearch** - Search for patterns in Rust source files
     Args: `{"pattern": "search text", "path": "directory", "context": 2}`
     Note: Searches .rs files recursively. Returns matches with context lines.
 
-21. **FileEdit** - Precise search-and-replace editing
+27. **FileEdit** - Precise search-and-replace editing
     Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
     Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
 
-22. **Shell** - Execute a shell command
+28. **Shell** - Execute a shell command
     Args: `{"cmd": "your command here"}`
     Note: Runs the specified binary. Use for build commands, git operations, etc.
 
-21. **CompactContext** - Compact conversation history by summarizing it
+29. **CompactContext** - Compact conversation history by summarizing it
     Args: `{"summary": "A comprehensive summary of the conversation so far..."}`
     Note: Use this when the token count displayed in the prompt approaches the limit.
           Provide a detailed summary that captures all important context, decisions made,
