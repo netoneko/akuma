@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 use config::{ApiType, Config, Provider};
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{arg, argc, exit, fd, print, read};
+use libakuma_tls::{TlsStream, TcpTransport, TLS_RECORD_SIZE};
 
 // Token limit for context compaction (when LLM should consider compacting)
 const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
@@ -690,6 +691,7 @@ fn send_with_retry(
 
         print(".");
 
+        // Connect (TCP for both HTTP and HTTPS)
         let stream = match connect_to_provider(provider) {
             Ok(s) => s,
             Err(e) => {
@@ -704,27 +706,76 @@ fn send_with_retry(
         print(".");
 
         let (path, request_body) = build_chat_request(model, provider, history);
-        if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
-            if attempt == MAX_RETRIES - 1 {
-                print("] ");
-                return Err(e);
-            }
-            continue;
-        }
 
-        print("] waiting");
-
-        match read_streaming_response_with_progress(&stream, start_time, provider) {
-            Ok(response) => return Ok(response),
-            Err(e) => {
-                if e == "Request cancelled" {
-                    return Err(e);
+        // Handle HTTPS vs HTTP
+        if provider.is_https() {
+            // HTTPS path with TLS
+            let (host, _) = provider.host_port().ok_or("Invalid URL")?;
+            let transport = TcpTransport::new(stream);
+            
+            // Allocate TLS buffers
+            let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+            let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+            
+            let mut tls = match TlsStream::connect(transport, &host, &mut read_buf, &mut write_buf) {
+                Ok(t) => t,
+                Err(e) => {
+                    if attempt == MAX_RETRIES - 1 {
+                        print(&format!("] TLS error: {:?}", e));
+                        return Err("TLS handshake failed");
+                    }
+                    continue;
                 }
+            };
+            
+            // Send request over TLS
+            if let Err(_) = send_post_request_tls(&mut tls, &path, &request_body, provider) {
                 if attempt == MAX_RETRIES - 1 {
+                    print("] ");
+                    return Err("Failed to send request");
+                }
+                continue;
+            }
+            
+            print("] waiting");
+            
+            match read_streaming_response_tls(&mut tls, start_time, provider) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if e == "Request cancelled" {
+                        return Err(e);
+                    }
+                    if attempt == MAX_RETRIES - 1 {
+                        return Err(e);
+                    }
+                    print(&format!(" ({})", e));
+                    continue;
+                }
+            }
+        } else {
+            // HTTP path (existing code)
+            if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
+                if attempt == MAX_RETRIES - 1 {
+                    print("] ");
                     return Err(e);
                 }
-                print(&format!(" ({})", e));
                 continue;
+            }
+
+            print("] waiting");
+
+            match read_streaming_response_with_progress(&stream, start_time, provider) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if e == "Request cancelled" {
+                        return Err(e);
+                    }
+                    if attempt == MAX_RETRIES - 1 {
+                        return Err(e);
+                    }
+                    print(&format!(" ({})", e));
+                    continue;
+                }
             }
         }
     }
@@ -897,16 +948,157 @@ fn connect_to_provider(provider: &Provider) -> Result<TcpStream, String> {
 
     let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
 
-    // Note: For HTTPS providers, we would need TLS here
-    // For now, we support HTTP connections. HTTPS would require libakuma_tls integration.
-    if provider.is_https() {
-        return Err(String::from(
-            "HTTPS providers not yet supported for chat - use HTTP endpoint",
-        ));
-    }
-
     TcpStream::connect(&addr_str)
         .map_err(|_| format!("Connection failed to: {}", addr_str))
+}
+
+/// Send POST request over TLS
+fn send_post_request_tls(
+    tls: &mut TlsStream<'_>,
+    path: &str,
+    body: &str,
+    provider: &Provider,
+) -> Result<(), &'static str> {
+    let (host, _) = provider.host_port().ok_or("Invalid provider URL")?;
+
+    let auth_header = match &provider.api_key {
+        Some(key) => format!("Authorization: Bearer {}\r\n", key),
+        None => String::new(),
+    };
+
+    let request = format!(
+        "POST {} HTTP/1.0\r\n\
+         Host: {}\r\n\
+         Content-Type: application/json\r\n\
+         {}Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        path, host, auth_header, body.len(), body
+    );
+
+    tls.write_all(request.as_bytes())
+        .map_err(|_| "Failed to send request")?;
+    tls.flush().map_err(|_| "Failed to flush")?;
+    Ok(())
+}
+
+/// Read streaming response over TLS
+fn read_streaming_response_tls(
+    tls: &mut TlsStream<'_>,
+    start_time: u64,
+    provider: &Provider,
+) -> Result<String, &'static str> {
+    let mut buf = [0u8; 1024];
+    let mut pending_data = Vec::new();
+    let mut headers_parsed = false;
+    let mut full_response = String::new();
+    let mut read_attempts = 0u32;
+    let mut dots_printed = 0u32;
+    let mut first_token_received = false;
+    let mut any_data_received = false;
+
+    const MAX_RESPONSE_SIZE: usize = 16 * 1024;
+
+    loop {
+        if check_escape_pressed() {
+            print("\n[cancelled]");
+            return Err("Request cancelled");
+        }
+
+        match tls.read(&mut buf) {
+            Ok(0) => {
+                if !any_data_received {
+                    return Err("Connection closed by server");
+                }
+                break;
+            }
+            Ok(n) => {
+                any_data_received = true;
+                read_attempts = 0;
+                pending_data.extend_from_slice(&buf[..n]);
+
+                if !headers_parsed {
+                    if let Some(pos) = find_header_end(&pending_data) {
+                        let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
+                        if !header_str.starts_with("HTTP/1.") {
+                            return Err("Invalid HTTP response");
+                        }
+                        if !header_str.contains(" 200 ") {
+                            let status_line = header_str.lines().next().unwrap_or("Unknown");
+                            print(&format!("\n[HTTP Error: {}]", status_line));
+                            if header_str.contains(" 404 ") {
+                                return Err("Model not found (404)");
+                            }
+                            return Err("Server returned error");
+                        }
+                        headers_parsed = true;
+                        pending_data.drain(..pos + 4);
+                    }
+                    continue;
+                }
+
+                if let Ok(body_str) = core::str::from_utf8(&pending_data) {
+                    let last_newline = body_str.rfind('\n');
+                    let complete_part = match last_newline {
+                        Some(pos) => &body_str[..pos + 1],
+                        None => continue,
+                    };
+
+                    let mut is_done = false;
+                    for line in complete_part.lines() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Some((content, done)) = parse_streaming_line(line, provider) {
+                            if !content.is_empty() {
+                                if !first_token_received {
+                                    first_token_received = true;
+                                    let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    for _ in 0..(7 + dots_printed) {
+                                        print("\x08 \x08");
+                                    }
+                                    print_elapsed(elapsed_ms);
+                                    print("\n");
+                                }
+                                print(&content);
+
+                                if full_response.len() < MAX_RESPONSE_SIZE {
+                                    full_response.push_str(&content);
+                                }
+                            }
+                            if done {
+                                is_done = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(pos) = last_newline {
+                        pending_data.drain(..pos + 1);
+                    }
+
+                    if is_done {
+                        return Ok(full_response);
+                    }
+                }
+            }
+            Err(_) => {
+                read_attempts += 1;
+                if read_attempts % 50 == 0 && !first_token_received {
+                    print(".");
+                    dots_printed += 1;
+                }
+                if read_attempts > 6000 {
+                    return Err("Timeout waiting for response");
+                }
+                libakuma::sleep_ms(10);
+                continue;
+            }
+        }
+    }
+
+    Ok(full_response)
 }
 
 fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> (String, String) {
