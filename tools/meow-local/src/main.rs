@@ -5,28 +5,30 @@
 //!
 //! Usage:
 //!   meow-local                    # Interactive mode with Meow-chan
+//!   meow-local init               # Configure providers and models
 //!   meow-local -m llama3.2        # Use different neural link
+//!   meow-local --provider NAME    # Use specific provider
 //!   meow-local "quick question"   # One-shot query
 //!   meow-local --sandbox /path    # Set sandbox root directory
 //!
 //! Commands:
-//!   /clear   - Wipe memory banks nya~
-//!   /model   - Check/switch neural link
-//!   /quit    - Jack out of the matrix
+//!   /clear    - Wipe memory banks nya~
+//!   /model    - Check/switch/list neural links
+//!   /provider - Check/switch providers
+//!   /quit     - Jack out of the matrix
 
 mod compat;
+mod config;
+mod providers;
 mod tools;
+
+use config::{Config, Provider, ApiType};
 
 use std::io::{self, BufRead, Write};
 use std::string::String;
 use std::vec::Vec;
 use compat::{print, sleep_ms, uptime, CancelToken};
 use compat::net::{TcpStream, ErrorKind};
-
-// Default Ollama server address
-const OLLAMA_HOST: &str = "localhost";
-const OLLAMA_PORT: u16 = 11434;
-const DEFAULT_MODEL: &str = "gemma3:27b";
 
 // Token limit for context compaction (when LLM should consider compacting)
 const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
@@ -123,8 +125,10 @@ fn main() {
 }
 
 /// Query Ollama for model information including context window size
-fn query_model_info(model: &str) -> Option<usize> {
-    let stream = match connect_to_ollama() {
+fn query_model_info(model: &str, provider: &Provider) -> Option<usize> {
+    let (host, port) = provider.host_port()?;
+    
+    let stream = match connect_to_provider(provider) {
         Ok(s) => s,
         Err(_) => return None,
     };
@@ -138,7 +142,7 @@ fn query_model_info(model: &str) -> Option<usize> {
          Connection: close\r\n\
          \r\n\
          {}",
-        OLLAMA_HOST, OLLAMA_PORT, body.len(), body
+        host, port, body.len(), body
     );
     
     if stream.write_all(request.as_bytes()).is_err() {
@@ -199,22 +203,40 @@ fn calculate_history_tokens(history: &[Message]) -> usize {
 }
 
 fn run() -> i32 {
-    let mut model = String::from(DEFAULT_MODEL);
+    // Load config from ~/.config/meow/config.toml
+    let mut app_config = Config::load();
+    
+    let mut model_override: Option<String> = None;
+    let mut provider_override: Option<String> = None;
     let mut one_shot_message: Option<String> = None;
     let mut sandbox_path: Option<String> = None;
     let mut working_dir: Option<String> = None;
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
+    
+    // Check for init subcommand first
+    if args.len() > 1 && args[1] == "init" {
+        return run_init(&mut app_config, &args[2..]);
+    }
+    
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
         if arg == "-m" || arg == "--model" {
             i += 1;
             if i < args.len() {
-                model = args[i].clone();
+                model_override = Some(args[i].clone());
             } else {
                 eprintln!("meow-local: -m requires a model name");
+                return 1;
+            }
+        } else if arg == "-p" || arg == "--provider" {
+            i += 1;
+            if i < args.len() {
+                provider_override = Some(args[i].clone());
+            } else {
+                eprintln!("meow-local: --provider requires a provider name");
                 return 1;
             }
         } else if arg == "-C" || arg == "--directory" {
@@ -241,6 +263,28 @@ fn run() -> i32 {
         }
         i += 1;
     }
+    
+    // Apply provider override
+    if let Some(ref prov_name) = provider_override {
+        if app_config.get_provider(prov_name).is_some() {
+            app_config.current_provider = prov_name.clone();
+        } else {
+            eprintln!("meow-local: unknown provider '{}'. Run 'meow-local init' to configure.", prov_name);
+            return 1;
+        }
+    }
+    
+    // Apply model override
+    if let Some(ref m) = model_override {
+        app_config.current_model = m.clone();
+    }
+    
+    // Get current provider config (fallback to defaults if none configured)
+    let current_provider = app_config.get_current_provider()
+        .cloned()
+        .unwrap_or_else(Provider::ollama_default);
+    
+    let model = app_config.current_model.clone();
 
     // Change to working directory if specified
     if let Some(ref dir) = working_dir {
@@ -261,7 +305,7 @@ fn run() -> i32 {
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
         history.push(Message::new("system", SYSTEM_PROMPT));
-        return match chat_once(&model, &msg, &mut history, None) {
+        return match chat_once(&model, &current_provider, &msg, &mut history, None) {
             Ok(_) => {
                 print("\n");
                 0
@@ -277,23 +321,32 @@ fn run() -> i32 {
 
     // Interactive mode
     print_banner();
-    print("  [Neural Link] Model: ");
+    print("  [Provider] ");
+    print(&current_provider.name);
+    print(" (");
+    print(&current_provider.base_url);
+    print(")\n  [Neural Link] Model: ");
     print(&model);
     print("\n  [Sandbox] ");
     print(&sandbox_root.display().to_string());
     
-    // Query model info for context window size
+    // Query model info for context window size (only for Ollama)
     print("\n  [Context] Querying model info...");
     io::stdout().flush().unwrap();
-    let context_window = match query_model_info(&model) {
-        Some(ctx) => {
-            print(&format!(" {}k tokens max", ctx / 1000));
-            ctx
+    let context_window = if current_provider.api_type == ApiType::Ollama {
+        match query_model_info(&model, &current_provider) {
+            Some(ctx) => {
+                print(&format!(" {}k tokens max", ctx / 1000));
+                ctx
+            }
+            None => {
+                print(&format!(" (using default: {}k)", DEFAULT_CONTEXT_WINDOW / 1000));
+                DEFAULT_CONTEXT_WINDOW
+            }
         }
-        None => {
-            print(&format!(" (using default: {}k)", DEFAULT_CONTEXT_WINDOW / 1000));
-            DEFAULT_CONTEXT_WINDOW
-        }
+    } else {
+        print(&format!(" (using default: {}k)", DEFAULT_CONTEXT_WINDOW / 1000));
+        DEFAULT_CONTEXT_WINDOW
     };
     
     print("\n  [Token Limit] Compact context suggested at ");
@@ -304,6 +357,10 @@ fn run() -> i32 {
     let mut history: Vec<Message> = Vec::new();
     history.push(Message::new("system", SYSTEM_PROMPT));
 
+    // Mutable state for current session
+    let mut current_model = model;
+    let mut current_prov = current_provider;
+    
     let stdin = io::stdin();
     
     loop {
@@ -341,15 +398,15 @@ fn run() -> i32 {
 
         // Handle commands
         if trimmed.starts_with('/') {
-            match handle_command(trimmed, &mut model, &mut history) {
+            match handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history) {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
         }
 
-        // Send message to Ollama
+        // Send message to provider
         print("\n");
-        match chat_once(&model, trimmed, &mut history, Some(context_window)) {
+        match chat_once(&current_model, &current_prov, trimmed, &mut history, Some(context_window)) {
             Ok(_) => {
                 print("\n\n");
             }
@@ -368,22 +425,31 @@ fn print_usage() {
     print("  /\\_/\\\n");
     print(" ( o.o )  ～ MEOW-CHAN LOCAL ～\n");
     print("  > ^ <   Cyberpunk Neko AI (Native Edition)\n\n");
-    print("Usage: meow-local [OPTIONS] [MESSAGE]\n\n");
+    print("Usage: meow-local [OPTIONS] [MESSAGE]\n");
+    print("       meow-local init [OPTIONS]       # Configure providers\n\n");
     print("Options:\n");
-    print("  -C, --directory <PATH> Working directory (default: current dir)\n");
-    print("  -m, --model <NAME>     Neural link override (default: gemma3:27b)\n");
-    print("  -s, --sandbox <PATH>   Sandbox root directory (default: working dir)\n");
-    print("  -h, --help             Display this transmission\n\n");
+    print("  -C, --directory <PATH>  Working directory (default: current dir)\n");
+    print("  -m, --model <NAME>      Neural link override\n");
+    print("  -p, --provider <NAME>   Use specific provider\n");
+    print("  -s, --sandbox <PATH>    Sandbox root directory (default: working dir)\n");
+    print("  -h, --help              Display this transmission\n\n");
+    print("Init Options:\n");
+    print("  meow-local init              Interactive provider setup\n");
+    print("  meow-local init --list       List configured providers\n");
+    print("  meow-local init --delete X   Remove provider X\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
-    print("  /model [NAME]       Check/switch neural link\n");
+    print("  /model [NAME]       Check/switch/list neural links\n");
+    print("  /provider [NAME]    Check/switch providers\n");
+    print("  /tokens             Show current token usage\n");
     print("  /help               Command protocol\n");
     print("  /quit               Jack out\n\n");
     print("Examples:\n");
     print("  meow-local                          # Interactive mode\n");
+    print("  meow-local init                     # Configure providers\n");
     print("  meow-local -C ~/projects            # Work in specific directory\n");
     print("  meow-local \"explain rust\"           # Quick question\n");
-    print("  meow-local -m llama3.2 \"hi\"         # Use different model\n");
+    print("  meow-local -p openai -m gpt-4o      # Use OpenAI\n");
 }
 
 fn print_banner() {
@@ -401,6 +467,230 @@ fn print_banner() {
 }
 
 // ============================================================================
+// Init Command
+// ============================================================================
+
+fn run_init(config: &mut Config, args: &[String]) -> i32 {
+    // Check for flags
+    for arg in args {
+        if arg == "--list" || arg == "-l" {
+            print("～ Configured providers nya~! ～\n\n");
+            if config.providers.is_empty() {
+                print("  (none configured)\n");
+            } else {
+                for p in &config.providers {
+                    let current = if p.name == config.current_provider { " (current)" } else { "" };
+                    let api_type = match p.api_type {
+                        ApiType::Ollama => "Ollama",
+                        ApiType::OpenAI => "OpenAI",
+                    };
+                    print(&format!("  - {} [{}]: {}{}\n", p.name, api_type, p.base_url, current));
+                }
+            }
+            print("\n  Current model: ");
+            print(&config.current_model);
+            print("\n\n");
+            if let Some(path) = Config::config_path() {
+                print("  Config file: ");
+                print(&path.display().to_string());
+                print("\n");
+            }
+            return 0;
+        }
+        if arg == "--delete" || arg == "-d" {
+            // Find provider name after --delete
+            if let Some(pos) = args.iter().position(|a| a == "--delete" || a == "-d") {
+                if let Some(name) = args.get(pos + 1) {
+                    if config.remove_provider(name) {
+                        if let Err(e) = config.save() {
+                            eprintln!("Failed to save config: {}", e);
+                            return 1;
+                        }
+                        print("～ Removed provider: ");
+                        print(name);
+                        print(" nya~! ～\n");
+                        return 0;
+                    } else {
+                        eprintln!("Provider '{}' not found", name);
+                        return 1;
+                    }
+                }
+            }
+            eprintln!("--delete requires a provider name");
+            return 1;
+        }
+    }
+
+    // Interactive init
+    print("\n");
+    print("  /\\_/\\  ╔══════════════════════════════════════╗\n");
+    print(" ( o.o ) ║  M E O W - C H A N   I N I T         ║\n");
+    print("  > ^ <  ║  ～ Provider Configuration ～        ║\n");
+    print(" /|   |\\ ╚══════════════════════════════════════╝\n");
+    print("\n");
+
+    let stdin = io::stdin();
+    
+    // Ask for provider name
+    print("Provider name (default: ollama): ");
+    io::stdout().flush().unwrap();
+    let mut name_input = String::new();
+    let _ = stdin.lock().read_line(&mut name_input);
+    let provider_name = name_input.trim();
+    let provider_name = if provider_name.is_empty() { "ollama" } else { provider_name };
+    
+    // Ask for API type
+    print("\nAPI type:\n");
+    print("  1. Ollama (default)\n");
+    print("  2. OpenAI-compatible\n");
+    print("Enter choice (1/2): ");
+    io::stdout().flush().unwrap();
+    let mut type_input = String::new();
+    let _ = stdin.lock().read_line(&mut type_input);
+    let api_type = match type_input.trim() {
+        "2" => ApiType::OpenAI,
+        _ => ApiType::Ollama,
+    };
+    
+    // Ask for base URL
+    let default_url = match api_type {
+        ApiType::Ollama => "http://localhost:11434",
+        ApiType::OpenAI => "https://api.openai.com",
+    };
+    print("\nBase URL (default: ");
+    print(default_url);
+    print("): ");
+    io::stdout().flush().unwrap();
+    let mut url_input = String::new();
+    let _ = stdin.lock().read_line(&mut url_input);
+    let base_url = url_input.trim();
+    let base_url = if base_url.is_empty() { default_url } else { base_url };
+    
+    // Ask for API key (required for OpenAI, optional for Ollama)
+    let api_key = if api_type == ApiType::OpenAI {
+        print("\nAPI Key (required): ");
+        io::stdout().flush().unwrap();
+        let mut key_input = String::new();
+        let _ = stdin.lock().read_line(&mut key_input);
+        let key = key_input.trim();
+        if key.is_empty() {
+            eprintln!("API key is required for OpenAI-compatible providers");
+            return 1;
+        }
+        Some(String::from(key))
+    } else {
+        print("\nAPI Key (optional, press Enter to skip): ");
+        io::stdout().flush().unwrap();
+        let mut key_input = String::new();
+        let _ = stdin.lock().read_line(&mut key_input);
+        let key = key_input.trim();
+        if key.is_empty() { None } else { Some(String::from(key)) }
+    };
+    
+    // Create provider
+    let new_provider = Provider {
+        name: String::from(provider_name),
+        base_url: String::from(base_url),
+        api_type: api_type.clone(),
+        api_key,
+    };
+    
+    // Test connection
+    print("\n～ Testing connection... ～\n");
+    if new_provider.is_https() {
+        print("  Warning: HTTPS not fully supported in local mode\n");
+    }
+    
+    match providers::test_connection(&new_provider) {
+        Ok(()) => print("  Connection successful!\n"),
+        Err(e) => {
+            print("  Connection failed: ");
+            print(&e.to_string());
+            print("\n  (Provider will still be saved)\n");
+        }
+    }
+    
+    // Fetch models
+    print("\n～ Fetching available models... ～\n");
+    let selected_model = match providers::list_models(&new_provider) {
+        Ok(models) => {
+            if models.is_empty() {
+                print("  No models found\n");
+                None
+            } else {
+                print("  Available models:\n");
+                for (i, m) in models.iter().enumerate() {
+                    let size_info = m.parameter_size.as_ref()
+                        .map(|s| format!(" [{}]", s))
+                        .unwrap_or_default();
+                    print(&format!("    {}. {}{}\n", i + 1, m.name, size_info));
+                }
+                print("\nSelect a model (enter number): ");
+                io::stdout().flush().unwrap();
+                let mut model_input = String::new();
+                let _ = stdin.lock().read_line(&mut model_input);
+                if let Ok(num) = model_input.trim().parse::<usize>() {
+                    if num > 0 && num <= models.len() {
+                        Some(models[num - 1].name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            print("  Failed to fetch models: ");
+            print(&e.to_string());
+            print("\n");
+            None
+        }
+    };
+    
+    // Ask to set as default
+    print("\nSet as default provider? (Y/n): ");
+    io::stdout().flush().unwrap();
+    let mut default_input = String::new();
+    let _ = stdin.lock().read_line(&mut default_input);
+    let set_default = !default_input.trim().eq_ignore_ascii_case("n");
+    
+    // Save configuration
+    config.set_provider(new_provider);
+    if set_default {
+        config.current_provider = String::from(provider_name);
+    }
+    if let Some(ref model) = selected_model {
+        config.current_model = model.clone();
+    }
+    
+    match config.save() {
+        Ok(()) => {
+            print("\n～ Configuration saved successfully nya~! ～\n");
+            if let Some(path) = Config::config_path() {
+                print("  Config file: ");
+                print(&path.display().to_string());
+                print("\n");
+            }
+            print("  Provider: ");
+            print(provider_name);
+            print("\n");
+            if let Some(ref model) = selected_model {
+                print("  Model: ");
+                print(model);
+                print("\n");
+            }
+            print("\n");
+            0
+        }
+        Err(e) => {
+            eprintln!("Failed to save config: {}", e);
+            1
+        }
+    }
+}
+
+// ============================================================================
 // Command Handling
 // ============================================================================
 
@@ -409,7 +699,13 @@ enum CommandResult {
     Quit,
 }
 
-fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> CommandResult {
+fn handle_command(
+    cmd: &str,
+    model: &mut String,
+    provider: &mut Provider,
+    config: &mut Config,
+    history: &mut Vec<Message>,
+) -> CommandResult {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
     let arg = parts.get(1).map(|s| s.trim());
@@ -425,15 +721,165 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
             print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
         }
         "/model" => {
-            if let Some(new_model) = arg {
-                *model = String::from(new_model);
-                print("～ *ears twitch* Neural link reconfigured to: ");
-                print(new_model);
-                print(" nya~! ～\n\n");
-            } else {
-                print("～ Current neural link: ");
-                print(model);
-                print(" ～\n\n");
+            match arg {
+                Some("?") | Some("list") => {
+                    // List available models from current provider
+                    print("～ Fetching available models from ");
+                    print(&provider.name);
+                    print("... ～\n");
+                    
+                    match providers::list_models(provider) {
+                        Ok(models) => {
+                            if models.is_empty() {
+                                print("～ No models found nya... ～\n\n");
+                            } else {
+                                print("～ Available neural links: ～\n");
+                                for (i, m) in models.iter().enumerate() {
+                                    let current_marker = if m.name == *model { " (current)" } else { "" };
+                                    let size_info = m.parameter_size.as_ref()
+                                        .map(|s| format!(" [{}]", s))
+                                        .unwrap_or_default();
+                                    print(&format!("  {}. {}{}{}\n", i + 1, m.name, size_info, current_marker));
+                                }
+                                print("\nEnter number to switch (or press Enter to cancel): ");
+                                io::stdout().flush().unwrap();
+                                
+                                let mut input = String::new();
+                                if io::stdin().read_line(&mut input).is_ok() {
+                                    let input = input.trim();
+                                    if !input.is_empty() {
+                                        if let Ok(num) = input.parse::<usize>() {
+                                            if num > 0 && num <= models.len() {
+                                                let new_model = &models[num - 1].name;
+                                                *model = new_model.clone();
+                                                config.current_model = new_model.clone();
+                                                let _ = config.save();
+                                                print("～ *ears twitch* Neural link reconfigured to: ");
+                                                print(new_model);
+                                                print(" nya~! ～\n");
+                                            } else {
+                                                print("～ Invalid selection nya... ～\n");
+                                            }
+                                        }
+                                    }
+                                }
+                                print("\n");
+                            }
+                        }
+                        Err(e) => {
+                            print("～ Failed to fetch models: ");
+                            print(&e.to_string());
+                            print(" ～\n\n");
+                        }
+                    }
+                }
+                Some(new_model) => {
+                    *model = String::from(new_model);
+                    config.current_model = String::from(new_model);
+                    let _ = config.save();
+                    print("～ *ears twitch* Neural link reconfigured to: ");
+                    print(new_model);
+                    print(" nya~! ～\n\n");
+                }
+                None => {
+                    print("～ Current neural link: ");
+                    print(model);
+                    print(" ～\n");
+                    print("  Tip: Use '/model list' to see available models nya~!\n\n");
+                }
+            }
+        }
+        "/provider" => {
+            match arg {
+                Some("?") | Some("list") => {
+                    // List configured providers
+                    print("～ Configured providers: ～\n");
+                    for (i, p) in config.providers.iter().enumerate() {
+                        let current_marker = if p.name == provider.name { " (current)" } else { "" };
+                        let api_type = match p.api_type {
+                            ApiType::Ollama => "Ollama",
+                            ApiType::OpenAI => "OpenAI",
+                        };
+                        print(&format!("  {}. {} ({}) [{}]{}\n", 
+                            i + 1, p.name, p.base_url, api_type, current_marker));
+                    }
+                    print("\nEnter number to switch (or press Enter to cancel): ");
+                    io::stdout().flush().unwrap();
+                    
+                    let mut input = String::new();
+                    if io::stdin().read_line(&mut input).is_ok() {
+                        let input = input.trim();
+                        if !input.is_empty() {
+                            if let Ok(num) = input.parse::<usize>() {
+                                if num > 0 && num <= config.providers.len() {
+                                    let new_provider = config.providers[num - 1].clone();
+                                    let provider_name = new_provider.name.clone();
+                                    *provider = new_provider;
+                                    config.current_provider = provider_name.clone();
+                                    
+                                    // Prompt for model selection
+                                    print("～ Switched to ");
+                                    print(&provider_name);
+                                    print("! Fetching models... ～\n");
+                                    
+                                    if let Ok(models) = providers::list_models(provider) {
+                                        if !models.is_empty() {
+                                            print("～ Available models: ～\n");
+                                            for (i, m) in models.iter().enumerate() {
+                                                print(&format!("  {}. {}\n", i + 1, m.name));
+                                            }
+                                            print("\nEnter number to select model: ");
+                                            io::stdout().flush().unwrap();
+                                            
+                                            let mut model_input = String::new();
+                                            if io::stdin().read_line(&mut model_input).is_ok() {
+                                                let model_input = model_input.trim();
+                                                if let Ok(mnum) = model_input.parse::<usize>() {
+                                                    if mnum > 0 && mnum <= models.len() {
+                                                        *model = models[mnum - 1].name.clone();
+                                                        config.current_model = model.clone();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    let _ = config.save();
+                                    print("～ *ears twitch* Now using ");
+                                    print(&provider.name);
+                                    print("/");
+                                    print(model);
+                                    print(" nya~! ～\n");
+                                } else {
+                                    print("～ Invalid selection nya... ～\n");
+                                }
+                            }
+                        }
+                    }
+                    print("\n");
+                }
+                Some(prov_name) => {
+                    if let Some(p) = config.get_provider(prov_name) {
+                        *provider = p.clone();
+                        config.current_provider = String::from(prov_name);
+                        let _ = config.save();
+                        print("～ *ears twitch* Switched to provider: ");
+                        print(prov_name);
+                        print(" nya~! ～\n\n");
+                    } else {
+                        print("～ Unknown provider: ");
+                        print(prov_name);
+                        print(" ...Run 'meow-local init' to add it nya~ ～\n\n");
+                    }
+                }
+                None => {
+                    print("～ Current provider: ");
+                    print(&provider.name);
+                    print(" (");
+                    print(&provider.base_url);
+                    print(") ～\n");
+                    print("  Tip: Use '/provider list' to see configured providers nya~!\n\n");
+                }
             }
         }
         "/tokens" => {
@@ -445,11 +891,14 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
             print("┌──────────────────────────────────────────────┐\n");
             print("│  ～ Meow-chan's Command Protocol ～          │\n");
             print("├──────────────────────────────────────────────┤\n");
-            print("│  /clear   - Wipe memory banks nya~           │\n");
-            print("│  /model   - Check/switch neural link         │\n");
-            print("│  /tokens  - Show current token usage         │\n");
-            print("│  /quit    - Jack out of the matrix           │\n");
-            print("│  /help    - This help screen                 │\n");
+            print("│  /clear        - Wipe memory banks nya~      │\n");
+            print("│  /model [NAME] - Check/switch neural link    │\n");
+            print("│  /model list   - List available models       │\n");
+            print("│  /provider     - Check/switch provider       │\n");
+            print("│  /provider list- List configured providers   │\n");
+            print("│  /tokens       - Show current token usage    │\n");
+            print("│  /quit         - Jack out of the matrix      │\n");
+            print("│  /help         - This help screen            │\n");
             print("├──────────────────────────────────────────────┤\n");
             print("│  Context compaction: When token count is     │\n");
             print("│  high, ask Meow-chan to compact the context  │\n");
@@ -508,7 +957,7 @@ fn trim_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
-fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> Result<String, &'static str> {
+fn send_with_retry(model: &str, provider: &Provider, history: &[Message], is_continuation: bool) -> Result<String, &'static str> {
     let mut backoff_ms: u64 = 500;
     
     if is_continuation {
@@ -528,7 +977,7 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
         
         print(".");
         
-        let stream = match connect_to_ollama() {
+        let stream = match connect_to_provider(provider) {
             Ok(s) => s,
             Err(e) => {
                 if attempt == MAX_RETRIES - 1 {
@@ -541,8 +990,8 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
         
         print(".");
         
-        let request_body = build_chat_request(model, history);
-        if let Err(e) = send_post_request(&stream, "/api/chat", &request_body) {
+        let (path, request_body) = build_chat_request(model, provider, history);
+        if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
             if attempt == MAX_RETRIES - 1 {
                 print("] ");
                 return Err(e);
@@ -552,7 +1001,7 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
         
         print("] waiting");
         
-        match read_streaming_response_with_progress(&stream, start_time) {
+        match read_streaming_response_with_progress(&stream, start_time, provider) {
             Ok(response) => return Ok(response),
             Err(e) => {
                 // Don't retry if cancelled by user
@@ -571,14 +1020,14 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
     Err("Max retries exceeded")
 }
 
-fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, context_window: Option<usize>) -> Result<(), &'static str> {
+fn chat_once(model: &str, provider: &Provider, user_message: &str, history: &mut Vec<Message>, context_window: Option<usize>) -> Result<(), &'static str> {
     trim_history(history);
     history.push(Message::new("user", user_message));
 
     let max_tool_iterations = 5;
     
     for iteration in 0..max_tool_iterations {
-        let assistant_response = send_with_retry(model, history, iteration > 0)?;
+        let assistant_response = send_with_retry(model, provider, history, iteration > 0)?;
         
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history) {
@@ -714,12 +1163,14 @@ fn try_execute_compact_context(response: &str, history: &mut Vec<Message>) -> Op
     )))
 }
 
-fn connect_to_ollama() -> Result<TcpStream, &'static str> {
-    let addr = format!("{}:{}", OLLAMA_HOST, OLLAMA_PORT);
-    TcpStream::connect(&addr).map_err(|_| "Connection failed - is Ollama running?")
+fn connect_to_provider(provider: &Provider) -> Result<TcpStream, &'static str> {
+    let (host, port) = provider.host_port()
+        .ok_or("Invalid provider URL")?;
+    let addr = format!("{}:{}", host, port);
+    TcpStream::connect(&addr).map_err(|_| "Connection failed - is the provider running?")
 }
 
-fn build_chat_request(model: &str, history: &[Message]) -> String {
+fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> (String, String) {
     let mut messages_json = String::from("[");
     for (i, msg) in history.iter().enumerate() {
         if i > 0 {
@@ -729,28 +1180,48 @@ fn build_chat_request(model: &str, history: &[Message]) -> String {
     }
     messages_json.push(']');
 
-    format!(
-        "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
-        model, messages_json
-    )
+    match provider.api_type {
+        ApiType::Ollama => {
+            let body = format!(
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
+                model, messages_json
+            );
+            (String::from("/api/chat"), body)
+        }
+        ApiType::OpenAI => {
+            let body = format!(
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
+                model, messages_json
+            );
+            (String::from("/v1/chat/completions"), body)
+        }
+    }
 }
 
 // ============================================================================
 // HTTP Client
 // ============================================================================
 
-fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &'static str> {
+fn send_post_request(stream: &TcpStream, path: &str, body: &str, provider: &Provider) -> Result<(), &'static str> {
+    let (host, port) = provider.host_port().ok_or("Invalid provider URL")?;
+    
+    let auth_header = match &provider.api_key {
+        Some(key) => format!("Authorization: Bearer {}\r\n", key),
+        None => String::new(),
+    };
+    
     let request = format!(
         "POST {} HTTP/1.0\r\n\
          Host: {}:{}\r\n\
          Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
+         {}Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
         path,
-        OLLAMA_HOST,
-        OLLAMA_PORT,
+        host,
+        port,
+        auth_header,
         body.len(),
         body
     );
@@ -760,7 +1231,7 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &
         .map_err(|_| "Failed to send request")
 }
 
-fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) -> Result<String, &'static str> {
+fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64, provider: &Provider) -> Result<String, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
     let mut headers_parsed = false;
@@ -824,7 +1295,7 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                         if line.is_empty() {
                             continue;
                         }
-                        if let Some((content, done)) = parse_ndjson_line(line) {
+                        if let Some((content, done)) = parse_streaming_line(line, provider) {
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
@@ -898,10 +1369,86 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 // JSON Parsing
 // ============================================================================
 
-fn parse_ndjson_line(line: &str) -> Option<(String, bool)> {
-    let done = line.contains("\"done\":true") || line.contains("\"done\": true");
-    let content = extract_json_string(line, "content").unwrap_or_default();
-    Some((content, done))
+/// Parse a streaming response line based on provider type
+fn parse_streaming_line(line: &str, provider: &Provider) -> Option<(String, bool)> {
+    match provider.api_type {
+        ApiType::Ollama => {
+            // Ollama uses NDJSON: {"message":{"content":"..."}, "done":true/false}
+            let done = line.contains("\"done\":true") || line.contains("\"done\": true");
+            let content = extract_json_string(line, "content").unwrap_or_default();
+            Some((content, done))
+        }
+        ApiType::OpenAI => {
+            // OpenAI uses SSE: data: {"choices":[{"delta":{"content":"..."}}]}
+            // End signal: data: [DONE]
+            let line = line.trim();
+            
+            if line == "data: [DONE]" {
+                return Some((String::new(), true));
+            }
+            
+            if !line.starts_with("data:") {
+                return Some((String::new(), false));
+            }
+            
+            let json = line.strip_prefix("data:")?.trim();
+            if json.is_empty() || json == "[DONE]" {
+                return Some((String::new(), json == "[DONE]"));
+            }
+            
+            // Extract content from delta
+            // Format: {"choices":[{"delta":{"content":"..."}}]}
+            let content = extract_openai_delta_content(json).unwrap_or_default();
+            Some((content, false))
+        }
+    }
+}
+
+/// Extract content from OpenAI streaming delta
+fn extract_openai_delta_content(json: &str) -> Option<String> {
+    // Look for "delta":{"content":"..."}
+    let delta_pos = json.find("\"delta\"")?;
+    let after_delta = &json[delta_pos..];
+    let content_pos = after_delta.find("\"content\"")?;
+    let after_content = &after_delta[content_pos..];
+    
+    // Find the value
+    let colon_pos = after_content.find(':')?;
+    let rest = &after_content[colon_pos + 1..];
+    let trimmed = rest.trim_start();
+    
+    if !trimmed.starts_with('"') {
+        return None;
+    }
+    
+    let value_rest = &trimmed[1..];
+    let mut result = String::new();
+    let mut chars = value_rest.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    match next {
+                        'n' => result.push('\n'),
+                        'r' => result.push('\r'),
+                        't' => result.push('\t'),
+                        '"' => result.push('"'),
+                        '\\' => result.push('\\'),
+                        _ => {
+                            result.push('\\');
+                            result.push(next);
+                        }
+                    }
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+    
+    Some(result)
 }
 
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
