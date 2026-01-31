@@ -102,19 +102,77 @@ if current_idx != 0 {
 - Higher ratio = more CPU for downloads, network may lag
 - With 10ms timer: ratio=4 means network polled every ~40ms
 
-### Future Improvement: In-Syscall Network Polling
+### Syscall Network Helper
 
-The ideal long-term solution would poll embassy-net from within `sys_recvfrom`:
-- When userspace waits for data, poll the network driver right there
-- No thread switching overhead, immediate ACK transmission
-- Challenge: embassy-net uses RefCell, not designed for multi-thread access
+To improve syscall/network coordination, we added infrastructure in `src/async_net.rs`:
 
-This would require refactoring embassy-net integration to support polling from any thread.
+```rust
+// Track network readiness
+static NETWORK_READY: AtomicBool = AtomicBool::new(false);
+
+// Syscalls check before any network operation
+pub fn is_network_ready() -> bool { ... }
+
+// Syscalls request a poll (yields to thread 0)
+pub fn request_network_poll() -> bool { ... }
+```
+
+**How it works:**
+1. Syscalls check `is_network_ready()` first, returning `ENETDOWN` if not ready
+2. When data isn't available, `request_network_poll()` yields to thread 0
+3. Scheduler uses ratio-based boosting to run thread 0 periodically
+4. Syscall thread retries when scheduled again
+
+**Current limitations:**
+- The `POLL_REQUESTED` flag is **disabled** (`ENABLE_SYSCALL_POLL_REQUEST=false`)
+- When enabled, it caused thread starvation: any syscall hitting WouldBlock would
+  create a tight loop between that thread and thread 0, starving all other threads
+- Future work: per-thread request tracking or rate limiting
+
+**Benefits (with current implementation):**
+- Clear network readiness semantics (not silently failing)
+- Proper error codes (`ENETDOWN` vs `EAGAIN`)
+- Statistics tracking (`get_poll_count()` for debugging)
+
+### Future Work
+
+**What was tried and failed:**
+1. **Immediate poll request boost** - When a syscall set `POLL_REQUESTED`, scheduler
+   immediately switched to thread 0. This caused thread starvation because any
+   thread hitting WouldBlock would monopolize the CPU with thread 0.
+
+**Potential solutions (not yet implemented):**
+
+1. **Per-thread request tracking** - Each thread gets its own poll request flag.
+   Scheduler honors each thread's request once, then ignores until thread runs again.
+   This prevents the tight loop starvation.
+
+2. **Rate-limited boosting** - Only honor poll requests every N milliseconds.
+   This would spread out the boosting and allow other threads to run.
+
+3. **Direct polling from syscalls** - The ideal solution would poll embassy-net
+   directly from `sys_recvfrom`. Challenges:
+   - Embassy-net uses `RefCell`, not designed for multi-thread access
+   - Would require refactoring to use `Mutex` or a thread-local polling mechanism
+   - Or: single-threaded syscall polling with a dedicated network thread
+
+4. **Cooperative network yielding** - Instead of timer-based preemption, have
+   the network thread explicitly yield after each poll cycle with a hint to
+   run a specific waiting thread.
+
+**Current workaround:**
+- `NETWORK_THREAD_RATIO = 2` gives thread 0 ~50% of CPU time
+- This provides reasonable network responsiveness for most use cases
+- Heavy concurrent downloads may still see degraded speeds
 
 ## Files Modified
 
 - `userspace/libakuma-tls/src/transport.rs` - TcpTransport::read() sleep reduced (10ms → 1ms)
 - `userspace/libakuma-tls/src/http.rs` - read_http_response_raw() sleep reduced
-- `userspace/scratch/src/http.rs` - read_http_response() sleep reduced
-- `src/config.rs` - Added NETWORK_THREAD_RATIO constant (default: 4)
+- `userspace/scratch/src/http.rs` - read_http_response() sleep reduced, instantaneous speed display
+- `userspace/scratch/src/stream.rs` - Instantaneous speed display
+- `src/config.rs` - Added NETWORK_THREAD_RATIO (2), ENABLE_SYSCALL_POLL_REQUEST (false)
 - `src/threading.rs` - Implemented proportional scheduler for thread 0
+- `src/async_net.rs` - Added syscall network helper infrastructure (poll request disabled)
+- `src/syscall.rs` - Network syscalls check readiness, use yield-based polling
+- `src/main.rs` - Mark network ready after initialization
