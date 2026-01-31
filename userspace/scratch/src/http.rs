@@ -245,10 +245,10 @@ fn read_http_response(stream: &TcpStream) -> Result<Vec<u8>> {
             Err(ref e) if e.kind == libakuma::net::ErrorKind::WouldBlock ||
                           e.kind == libakuma::net::ErrorKind::TimedOut => {
                 empty_reads += 1;
-                if empty_reads > 500 {
+                if empty_reads > 5000 {
                     break;
                 }
-                libakuma::sleep_ms(10);
+                libakuma::sleep_ms(1);
             }
             Err(_) => break,
         }

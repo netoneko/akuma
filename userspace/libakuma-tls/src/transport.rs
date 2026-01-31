@@ -88,7 +88,7 @@ impl ErrorType for TcpTransport {
 impl Read for TcpTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         // Loop until we get data or a real error
-        // Handle WouldBlock by retrying with a small delay
+        // Handle WouldBlock by retrying with a minimal delay
         loop {
             match self.stream.read(buf) {
                 Ok(n) => {
@@ -100,14 +100,16 @@ impl Read for TcpTransport {
                     // Print dots periodically to keep SSH alive
                     if self.print_dots {
                         self.wait_counter += 1;
-                        // Print a dot every 500ms (50 * 10ms)
-                        if self.wait_counter % 50 == 0 {
+                        // Print a dot every 500ms (500 * 1ms)
+                        if self.wait_counter % 500 == 0 {
                             libakuma::print(".");
                             self.dots_printed += 1;
                         }
                     }
-                    // Retry after a short delay
-                    libakuma::sleep_ms(10);
+                    // Retry after minimal delay (1ms instead of 10ms for better throughput)
+                    // The kernel already yields in sys_recvfrom, so we just need a brief
+                    // pause to allow the network driver to poll for new packets.
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),

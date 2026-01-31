@@ -401,11 +401,11 @@ fn read_response_tcp(stream: &TcpStream) -> Result<Vec<u8>, Error> {
                     || e.kind == libakuma::net::ErrorKind::TimedOut =>
             {
                 empty_reads += 1;
-                if empty_reads > 500 {
+                if empty_reads > 5000 {
                     // Timeout after ~5 seconds of no data
                     break;
                 }
-                libakuma::sleep_ms(10);
+                libakuma::sleep_ms(1);
                 continue;
             }
             Err(_) => break,
