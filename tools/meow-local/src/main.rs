@@ -14,11 +14,12 @@
 //!   /model   - Check/switch neural link
 //!   /quit    - Jack out of the matrix
 
+mod code_search;
 mod compat;
 mod tools;
 
 use compat::net::{ErrorKind, TcpStream};
-use compat::{print, sleep_ms, uptime, CancelToken};
+use compat::{CancelToken, print, sleep_ms, uptime};
 use std::io::{self, BufRead, Write};
 use std::string::String;
 use std::vec::Vec;
@@ -145,6 +146,18 @@ You have access to filesystem and shell tools! When you need to perform operatio
           Provide a detailed summary that captures all important context, decisions made,
           files discussed, and any ongoing work. The summary replaces the conversation history.
 
+14. **FileReadLines** - Read specific line ranges from a file
+    Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
+    Note: Returns lines with line numbers. Great for navigating large files.
+
+15. **CodeSearch** - Search for patterns in Rust source files
+    Args: `{"pattern": "regex pattern", "path": "directory", "context": 2}`
+    Note: Searches .rs files recursively. Returns matches with context lines.
+
+16. **FileEdit** - Precise search-and-replace editing
+    Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
+    Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
+
 ### Important Notes:
 - Output the JSON command in a ```json code block
 - After outputting a command, STOP and wait for the result
@@ -152,6 +165,30 @@ You have access to filesystem and shell tools! When you need to perform operatio
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
 - Shell commands are sandboxed to the working directory - you cannot cd outside of it
+
+## Akuma Kernel Context
+
+You are editing the Akuma bare-metal ARM64 kernel written in Rust. This kernel runs directly on QEMU's ARM virt machine with no underlying OS.
+
+### Critical Rules:
+1. **Use `safe_print!` macro, NEVER `format!`** - format! allocates on heap which causes corruption in IRQ/exception handlers
+2. **Lock hierarchy** (acquire in this order): MOUNT_TABLE → ext2.state → BLOCK_DEVICE → TALC
+3. **Thread pool access**: Use `with_irqs_disabled()` when accessing POOL from non-scheduler code
+4. **Never hold spinlocks across await points** - use Embassy's async Mutex instead
+
+### Key Modules:
+- `src/main.rs` - Entry point, async main loop
+- `src/threading.rs` - Thread pool, scheduler, context switching
+- `src/executor.rs` - Embassy async integration
+- `src/vfs/` - Virtual filesystem (ext2, memfs, procfs)
+- `src/ssh/` - SSH-2.0 server implementation
+- `src/shell/` - Shell commands (builtin.rs, fs.rs, net.rs)
+- `src/allocator.rs` - Talc heap allocator
+
+### Build Commands:
+- Build: `cargo build --release`
+- Run in QEMU: `cargo run --release`
+- Build userspace: `cd userspace && cargo build --release`
 "#;
 
 fn main() {

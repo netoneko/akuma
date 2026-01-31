@@ -144,9 +144,32 @@ All `no_std` compatible:
 - `talc` - Heap allocator
 - `curve25519-dalek`, `ed25519-dalek`, `aes`, `sha2` - SSH crypto
 
+## Self-Editing with meow-local
+
+The `tools/meow-local` tool is an AI chat client that can edit the Akuma source code. It connects to a local Ollama LLM server and has tools for code navigation and editing.
+
+```bash
+# Build meow-local
+cd tools/meow-local && cargo build --release
+
+# Run from akuma root (sandbox defaults to current directory)
+./tools/meow-local/target/release/meow-local
+
+# Or specify working directory
+meow-local -C /path/to/akuma
+```
+
+**Code editing tools:**
+- `FileReadLines` - Read specific line ranges from files
+- `CodeSearch` - Grep-like regex search across .rs files
+- `FileEdit` - Search-and-replace with unique match requirement
+
+**Run tests:** `cd tools/meow-local && cargo test`
+
 ## Documentation
 
 - `docs/ARCHITECTURE.md` - System architecture
 - `docs/CONCURRENCY.md` - Synchronization details and lock hierarchy
 - `docs/LOCK_REFERENCE.md` - Quick lock reference card
 - `docs/PACKAGES.md` - Userspace package management
+- `docs/MEOW.md` - Meow chat client (userspace and local versions)
