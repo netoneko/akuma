@@ -483,12 +483,17 @@ fn tool_cd(path: &str) -> ToolResult {
         }
     };
     
-    // Verify the directory exists by trying to list it
-    if read_dir(&new_path).is_some() {
+    // Use chdir syscall to update the process's cwd
+    let result = libakuma::chdir(&new_path);
+    if result == 0 {
+        // Also update our local tracking variable
         set_working_dir(&new_path);
         ToolResult::ok(format!("Changed directory to: {}", new_path))
-    } else {
+    } else if result == -2 {
+        // ENOENT
         ToolResult::err(&format!("Directory not found: {}", new_path))
+    } else {
+        ToolResult::err(&format!("Failed to change directory: error {}", result))
     }
 }
 
@@ -781,18 +786,8 @@ fn find_headers_end(data: &[u8]) -> Option<usize> {
 
 /// Run scratch command and capture output
 fn run_scratch(args: &[&str]) -> ToolResult {
-    // Build full args with -C <cwd>
-    let cwd = get_working_dir();
-    let mut full_args: Vec<&str> = Vec::new();
-    full_args.push("-C");
-    // Leak the string to get a 'static str (acceptable since we only call this a few times)
-    let cwd_static: &'static str = alloc::boxed::Box::leak(cwd.into_boxed_str());
-    full_args.push(cwd_static);
-    for arg in args {
-        full_args.push(*arg);
-    }
-    
-    let result = match spawn("/bin/scratch", Some(&full_args)) {
+    // Scratch will inherit cwd from meow via the spawn syscall
+    let result = match spawn("/bin/scratch", Some(args)) {
         Some(r) => r,
         None => return ToolResult::err("Failed to spawn scratch (is /bin/scratch installed?)"),
     };
