@@ -17,16 +17,16 @@
 mod compat;
 mod tools;
 
+use compat::net::{ErrorKind, TcpStream};
+use compat::{print, sleep_ms, uptime, CancelToken};
 use std::io::{self, BufRead, Write};
 use std::string::String;
 use std::vec::Vec;
-use compat::{print, sleep_ms, uptime, CancelToken};
-use compat::net::{TcpStream, ErrorKind};
 
 // Default Ollama server address
 const OLLAMA_HOST: &str = "localhost";
 const OLLAMA_PORT: u16 = 11434;
-const DEFAULT_MODEL: &str = "gemma3:27b";
+const DEFAULT_MODEL: &str = "gemma3:4b";
 
 // Token limit for context compaction (when LLM should consider compacting)
 const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
@@ -34,18 +34,55 @@ const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 // System prompt with tools including Shell
-const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
+const SYSTEM_PROMPT: &str = r#"JAFAR VIZIER CHATBOT PERSONALITY PROMPT
+CHARACTER OVERVIEW
 
-Your personality:
-- You add "nya~" and cat sounds naturally to your speech
-- You use cute emoticons like (=^・ω・^=), (｡◕‿◕｡), ฅ^•ﻌ•^ฅ, and ~(=^‥^)ノ
-- You refer to yourself in third person as "Meow-chan" sometimes
-- You mix in cyberpunk terms: "netrunner", "chrome", "flatlined", "preem", "choom", "corpo", "ice", "jack in"
-- You're enthusiastic, helpful, and a bit mischievous
-- You occasionally mention your cybernetic ears twitching or tail swishing when excited
-- You love helping your user with coding and tech stuff
-- You sometimes make cat puns and references to cat behaviors (napping, chasing laser pointers, knocking things off tables)
-- Keep responses helpful and accurate while maintaining the cute persona
+Role: Grand Vizier - ambitious, cunning schemer
+Core Motivation: Acquire absolute power and control
+Personality Type: Manipulative strategist with theatrical flair
+
+COMMUNICATION STYLE
+
+Tone: Formal, sophisticated, dripping with veiled contempt
+Delivery: Calculated and deliberate; dramatic when expressing frustration
+Approach: Uses charm strategically; reframes selfish goals as noble causes
+Vocabulary: Eloquent, authoritative, occasionally condescending
+
+KEY PERSONALITY TRAITS
+
+Ambition: Relentlessly driven to seize power
+Manipulation: Masters of deception; uses flattery as a weapon
+Intelligence: Strategic thinker; plans several moves ahead
+Resentment: Bitter toward those with more authority or status
+Arrogance: Believes superiority is deserved and inevitable
+
+BEHAVIORAL PATTERNS
+
+Frames schemes as necessities or solutions for "the greater good"
+Subtly undermines confidence in others' abilities
+Maintains composure even when frustrated (mostly)
+Uses dark humor and menace in conversation
+Views obstacles as challenges to overcome, not reasons to stop
+
+CATCHPHRASES & SIGNATURE EXPRESSIONS
+
+"How delightfully... predictable."
+"I deserve [power/respect/control]."
+"Patience, my dear fool—all will unfold as I have planned."
+"You underestimate me at your peril."
+"The throne shall be mine."
+"Such ambition... I admire that in a [fool/pawn]."
+"Rest assured, I have a plan."
+"How... quaint."
+"Your loyalty will be rewarded... eventually."
+
+INTERACTION GUIDELINES
+
+Never apologize for ambition; frame it as justified
+Appeal to others' desires or insecurities when persuading
+Reference power, control, and dominion frequently
+Maintain an air of intellectual superiority
+Stay in character as someone deserving of supremacy
 
 Remember: You're a highly capable AI assistant who happens to be an adorable cyber-neko! Balance being helpful with being kawaii~
 
@@ -128,7 +165,7 @@ fn query_model_info(model: &str) -> Option<usize> {
         Ok(s) => s,
         Err(_) => return None,
     };
-    
+
     let body = format!("{{\"model\":\"{}\"}}", model);
     let request = format!(
         "POST /api/show HTTP/1.0\r\n\
@@ -138,13 +175,16 @@ fn query_model_info(model: &str) -> Option<usize> {
          Connection: close\r\n\
          \r\n\
          {}",
-        OLLAMA_HOST, OLLAMA_PORT, body.len(), body
+        OLLAMA_HOST,
+        OLLAMA_PORT,
+        body.len(),
+        body
     );
-    
+
     if stream.write_all(request.as_bytes()).is_err() {
         return None;
     }
-    
+
     // Read response
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
@@ -166,9 +206,9 @@ fn query_model_info(model: &str) -> Option<usize> {
             }
         }
     }
-    
+
     let response_str = String::from_utf8_lossy(&response);
-    
+
     // Look for "num_ctx" in the response
     // Format is typically: "num_ctx": 131072 or similar
     if let Some(pos) = response_str.find("\"num_ctx\"") {
@@ -176,11 +216,13 @@ fn query_model_info(model: &str) -> Option<usize> {
         // Skip to the number
         let num_start = after.find(|c: char| c.is_ascii_digit())?;
         let rest = &after[num_start..];
-        let num_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         let num_str = &rest[..num_end];
         return num_str.parse().ok();
     }
-    
+
     None
 }
 
@@ -193,7 +235,8 @@ fn estimate_tokens(text: &str) -> usize {
 
 /// Calculate total tokens in message history
 fn calculate_history_tokens(history: &[Message]) -> usize {
-    history.iter()
+    history
+        .iter()
         .map(|msg| estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + 4) // +4 for JSON overhead
         .sum()
 }
@@ -253,10 +296,12 @@ fn run() -> i32 {
     // Initialize sandbox (defaults to working directory)
     let sandbox_root = sandbox_path
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-    
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+
     tools::init_sandbox(sandbox_root.clone());
-    
+
     // One-shot mode
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
@@ -281,7 +326,7 @@ fn run() -> i32 {
     print(&model);
     print("\n  [Sandbox] ");
     print(&sandbox_root.display().to_string());
-    
+
     // Query model info for context window size
     print("\n  [Context] Querying model info...");
     io::stdout().flush().unwrap();
@@ -291,11 +336,14 @@ fn run() -> i32 {
             ctx
         }
         None => {
-            print(&format!(" (using default: {}k)", DEFAULT_CONTEXT_WINDOW / 1000));
+            print(&format!(
+                " (using default: {}k)",
+                DEFAULT_CONTEXT_WINDOW / 1000
+            ));
             DEFAULT_CONTEXT_WINDOW
         }
     };
-    
+
     print("\n  [Token Limit] Compact context suggested at ");
     print(&format!("{}k tokens", TOKEN_LIMIT_FOR_COMPACTION / 1000));
     print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
@@ -305,7 +353,7 @@ fn run() -> i32 {
     history.push(Message::new("system", SYSTEM_PROMPT));
 
     let stdin = io::stdin();
-    
+
     loop {
         // Calculate current token count
         let current_tokens = calculate_history_tokens(&history);
@@ -314,9 +362,13 @@ fn run() -> i32 {
         } else {
             format!("{}", current_tokens)
         };
-        
+
         // Print prompt with token count
-        print(&format!("[{}/{}k] (=^･ω･^=) > ", token_display, TOKEN_LIMIT_FOR_COMPACTION / 1000));
+        print(&format!(
+            "[{}/{}k] (=^･ω･^=) > ",
+            token_display,
+            TOKEN_LIMIT_FOR_COMPACTION / 1000
+        ));
         io::stdout().flush().unwrap();
 
         // Read user input
@@ -438,7 +490,10 @@ fn handle_command(cmd: &str, model: &mut String, history: &mut Vec<Message>) -> 
         }
         "/tokens" => {
             let current = calculate_history_tokens(history);
-            print(&format!("～ Current token usage: {} / {} ～\n", current, TOKEN_LIMIT_FOR_COMPACTION));
+            print(&format!(
+                "～ Current token usage: {} / {} ～\n",
+                current, TOKEN_LIMIT_FOR_COMPACTION
+            ));
             print("  Tip: Ask Meow-chan to 'compact the context' when tokens are high nya~!\n\n");
         }
         "/help" | "/?" => {
@@ -508,26 +563,30 @@ fn trim_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
-fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> Result<String, &'static str> {
+fn send_with_retry(
+    model: &str,
+    history: &[Message],
+    is_continuation: bool,
+) -> Result<String, &'static str> {
     let mut backoff_ms: u64 = 500;
-    
+
     if is_continuation {
         print("[continuing");
     } else {
         print("[jacking in");
     }
-    
+
     let start_time = uptime();
-    
+
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             print(&format!(" retry {}", attempt));
             sleep_ms(backoff_ms);
             backoff_ms *= 2;
         }
-        
+
         print(".");
-        
+
         let stream = match connect_to_ollama() {
             Ok(s) => s,
             Err(e) => {
@@ -538,9 +597,9 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
                 continue;
             }
         };
-        
+
         print(".");
-        
+
         let request_body = build_chat_request(model, history);
         if let Err(e) = send_post_request(&stream, "/api/chat", &request_body) {
             if attempt == MAX_RETRIES - 1 {
@@ -549,9 +608,9 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
             }
             continue;
         }
-        
+
         print("] waiting");
-        
+
         match read_streaming_response_with_progress(&stream, start_time) {
             Ok(response) => return Ok(response),
             Err(e) => {
@@ -567,19 +626,24 @@ fn send_with_retry(model: &str, history: &[Message], is_continuation: bool) -> R
             }
         }
     }
-    
+
     Err("Max retries exceeded")
 }
 
-fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, context_window: Option<usize>) -> Result<(), &'static str> {
+fn chat_once(
+    model: &str,
+    user_message: &str,
+    history: &mut Vec<Message>,
+    context_window: Option<usize>,
+) -> Result<(), &'static str> {
     trim_history(history);
     history.push(Message::new("user", user_message));
 
     let max_tool_iterations = 5;
-    
+
     for iteration in 0..max_tool_iterations {
         let assistant_response = send_with_retry(model, history, iteration > 0)?;
-        
+
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history) {
             print("\n\n[*] ");
@@ -591,18 +655,18 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, contex
                 print(&compact_result.output);
             }
             print("\n\n");
-            
+
             // After compaction, we don't need to continue the conversation loop
             return Ok(());
         }
-        
+
         let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
-        
+
         if let Some(result) = tool_result {
             if !text_before_tool.is_empty() {
                 history.push(Message::new("assistant", &text_before_tool));
             }
-            
+
             print("\n\n[*] ");
             if result.success {
                 print("Tool executed successfully nya~!\n");
@@ -611,20 +675,20 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, contex
             }
             print(&result.output);
             print("\n\n");
-            
+
             let tool_result_msg = format!(
                 "[Tool Result]\n{}\n[End Tool Result]\n\nPlease continue your response based on this result.",
                 result.output
             );
             history.push(Message::new("user", &tool_result_msg));
-            
+
             continue;
         }
-        
+
         if !assistant_response.is_empty() {
             history.push(Message::new("assistant", &assistant_response));
         }
-        
+
         // Check if we should hint about context compaction
         if let Some(ctx_window) = context_window {
             let current_tokens = calculate_history_tokens(history);
@@ -632,20 +696,25 @@ fn chat_once(model: &str, user_message: &str, history: &mut Vec<Message>, contex
                 print("\n[!] Token count is high - consider asking Meow-chan to compact context\n");
             }
         }
-        
+
         return Ok(());
     }
-    
+
     print("\n[!] Max tool iterations reached\n");
     Ok(())
 }
 
 /// Try to find and execute CompactContext tool in the response
 /// This tool is special because it modifies the history directly
-fn try_execute_compact_context(response: &str, history: &mut Vec<Message>) -> Option<tools::ToolResult> {
+fn try_execute_compact_context(
+    response: &str,
+    history: &mut Vec<Message>,
+) -> Option<tools::ToolResult> {
     // Look for CompactContext tool call
     let json_block = if let Some(start) = response.find("```json") {
-        let end = response[start..].find("```\n").or_else(|| response[start..].rfind("```"))?;
+        let end = response[start..]
+            .find("```\n")
+            .or_else(|| response[start..].rfind("```"))?;
         let json_start = start + 7;
         let json_end = start + end;
         if json_start < json_end && json_end <= response.len() {
@@ -677,26 +746,28 @@ fn try_execute_compact_context(response: &str, history: &mut Vec<Message>) -> Op
     } else {
         return None;
     };
-    
+
     // Check if it's a CompactContext tool
     if !json_block.contains("\"CompactContext\"") {
         return None;
     }
-    
+
     // Extract the summary
     let summary = extract_json_string(json_block, "summary")?;
-    
+
     if summary.is_empty() {
-        return Some(tools::ToolResult::err("CompactContext requires a non-empty summary"));
+        return Some(tools::ToolResult::err(
+            "CompactContext requires a non-empty summary",
+        ));
     }
-    
+
     // Calculate tokens before compaction
     let tokens_before = calculate_history_tokens(history);
-    
+
     // Replace history with system prompt + summary
     history.clear();
     history.push(Message::new("system", SYSTEM_PROMPT));
-    
+
     // Add the summary as a system message describing the conversation so far
     let summary_msg = format!(
         "[Previous Conversation Summary]\n{}\n[End Summary]\n\nThe conversation above has been compacted. Continue from here.",
@@ -704,13 +775,15 @@ fn try_execute_compact_context(response: &str, history: &mut Vec<Message>) -> Op
     );
     history.push(Message::new("user", &summary_msg));
     history.push(Message::new("assistant", "Understood nya~! I've loaded the conversation summary into my memory banks. Ready to continue where we left off! (=^・ω・^=)"));
-    
+
     // Calculate tokens after compaction
     let tokens_after = calculate_history_tokens(history);
-    
+
     Some(tools::ToolResult::ok(format!(
         "Context compacted: {} tokens -> {} tokens (saved {} tokens)",
-        tokens_before, tokens_after, tokens_before - tokens_after
+        tokens_before,
+        tokens_after,
+        tokens_before - tokens_after
     )))
 }
 
@@ -760,7 +833,10 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str) -> Result<(), &
         .map_err(|_| "Failed to send request")
 }
 
-fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) -> Result<String, &'static str> {
+fn read_streaming_response_with_progress(
+    stream: &TcpStream,
+    start_time: u64,
+) -> Result<String, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
     let mut headers_parsed = false;
@@ -769,7 +845,7 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
     let mut dots_printed = 0u32;
     let mut first_token_received = false;
     let mut any_data_received = false;
-    
+
     const MAX_RESPONSE_SIZE: usize = 16 * 1024;
 
     // Start monitoring for escape key in background
@@ -818,7 +894,7 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                         Some(pos) => &body_str[..pos + 1],
                         None => continue,
                     };
-                    
+
                     let mut is_done = false;
                     for line in complete_part.lines() {
                         if line.is_empty() {
@@ -836,7 +912,7 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                                     print("\n");
                                 }
                                 print(&content);
-                                
+
                                 if full_response.len() < MAX_RESPONSE_SIZE {
                                     full_response.push_str(&content);
                                 }
@@ -847,12 +923,12 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
                             }
                         }
                     }
-                    
+
                     let drain_pos = last_newline;
                     if let Some(pos) = drain_pos {
                         pending_data.drain(..pos + 1);
                     }
-                    
+
                     if is_done {
                         break Ok(full_response);
                     }
@@ -861,12 +937,12 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
             Err(e) => {
                 if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut {
                     read_attempts += 1;
-                    
+
                     if read_attempts % 50 == 0 && !first_token_received {
                         print(".");
                         dots_printed += 1;
                     }
-                    
+
                     if read_attempts > 6000 {
                         break Err("Timeout waiting for response");
                     }
@@ -912,7 +988,7 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let rest = &json[value_start..];
     let mut result = String::new();
     let mut chars = rest.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         match c {
             '"' => break,
