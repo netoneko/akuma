@@ -237,19 +237,27 @@ pub fn checkout(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Push current branch to origin
-pub fn push(token: Option<&str>) -> Result<()> {
+/// Push a branch to origin
+/// 
+/// If `branch` is Some, push that branch. Otherwise, push the current branch from HEAD.
+pub fn push(token: Option<&str>, branch: Option<&str>) -> Result<()> {
     let git_dir = crate::git_dir();
     let refs = RefManager::new(&git_dir);
     let store = ObjectStore::new(&git_dir);
 
-    // Get current branch name
-    let head = refs.read_head()?;
-    let head = head.trim();
-    
-    let branch_name = head
-        .strip_prefix("ref: refs/heads/")
-        .ok_or_else(|| Error::io("not on a branch (detached HEAD)"))?;
+    // Determine the branch name - either from argument or from HEAD
+    let head_content;
+    let branch_name = match branch {
+        Some(name) => name,
+        None => {
+            // Get current branch name from HEAD
+            head_content = refs.read_head()?;
+            let head_trimmed = head_content.trim();
+            head_trimmed
+                .strip_prefix("ref: refs/heads/")
+                .ok_or_else(|| Error::io("not on a branch (detached HEAD)"))?
+        }
+    };
 
     print("scratch: pushing branch ");
     print(branch_name);

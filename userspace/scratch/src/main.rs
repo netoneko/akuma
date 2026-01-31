@@ -13,7 +13,7 @@
 //!   scratch tag <name>           # Create a tag
 //!   scratch tag -d <name>        # Delete a tag
 //!   scratch status               # Show current HEAD
-//!   scratch push                  # Push to remote (force push DISABLED)
+//!   scratch push [branch]          # Push branch to remote (force push DISABLED)
 
 #![no_std]
 #![no_main]
@@ -40,38 +40,31 @@ mod config;
 
 use alloc::format;
 use alloc::string::String;
-use libakuma::{arg, argc, exit, print};
+use libakuma::{arg, argc, exit, getcwd, print};
 
 // ============================================================================
-// Global Repository Path
+// Working Directory Support
 // ============================================================================
 
-/// The repository root directory (set via -C option)
-static mut REPO_ROOT: Option<String> = None;
-
-/// Get the .git directory path
+/// Get the .git directory path (relative to cwd)
 pub fn git_dir() -> String {
-    unsafe {
-        match &REPO_ROOT {
-            Some(root) => format!("{}/.git", root),
-            None => String::from(".git"),
-        }
+    let cwd = getcwd();
+    if cwd == "/" {
+        String::from("/.git")
+    } else {
+        format!("{}/.git", cwd)
     }
 }
 
-/// Get a path relative to the repo root
+/// Get a path relative to the repo root (cwd)
 pub fn repo_path(relative: &str) -> String {
-    unsafe {
-        match &REPO_ROOT {
-            Some(root) => {
-                if relative == "." {
-                    root.clone()
-                } else {
-                    format!("{}/{}", root, relative)
-                }
-            }
-            None => String::from(relative),
-        }
+    let cwd = getcwd();
+    if relative == "." {
+        String::from(cwd)
+    } else if cwd == "/" {
+        format!("/{}", relative)
+    } else {
+        format!("{}/{}", cwd, relative)
     }
 }
 
@@ -91,39 +84,13 @@ fn main() -> i32 {
         return 1;
     }
 
-    // Check for -C option first
-    let mut arg_offset: u32 = 1;
-    if let Some(first) = arg(1) {
-        if first == "-C" {
-            if let Some(path) = arg(2) {
-                unsafe {
-                    REPO_ROOT = Some(String::from(path));
-                }
-                arg_offset = 3;
-            } else {
-                print("scratch: -C requires a directory path\n");
-                return 1;
-            }
-        }
-    }
-
-    if argc() <= arg_offset {
-        print_usage();
-        return 1;
-    }
-
-    let command = match arg(arg_offset) {
+    let command = match arg(1) {
         Some(cmd) => cmd,
         None => {
             print("scratch: missing command\n");
             return 1;
         }
     };
-
-    // Adjust arg() calls in commands by storing offset
-    unsafe {
-        ARG_OFFSET = arg_offset;
-    }
 
     match command {
         "clone" => cmd_clone(),
@@ -149,20 +116,14 @@ fn main() -> i32 {
     }
 }
 
-/// Argument offset (for -C handling)
-static mut ARG_OFFSET: u32 = 1;
-
-/// Get command argument (adjusted for -C offset)
+/// Get command argument (argument index relative to command)
 fn cmd_arg(n: u32) -> Option<&'static str> {
-    unsafe { arg(ARG_OFFSET + n) }
+    arg(1 + n)
 }
 
 fn print_usage() {
     print("scratch - Minimal Git client for Akuma OS\n\n");
-    print("Usage:\n");
-    print("  scratch [-C <path>] <command> [args]\n\n");
-    print("Options:\n");
-    print("  -C <path>                    Run as if started in <path>\n\n");
+    print("Usage: scratch <command> [args]\n\n");
     print("Commands:\n");
     print("  clone <url>          Clone a repository\n");
     print("  fetch                Fetch updates from remote\n");
@@ -176,6 +137,7 @@ fn print_usage() {
     print("  push [--token <t>]   Push to remote\n");
     print("  help                 Show this help\n");
     print("\n");
+    print("Uses current working directory (inherited from parent process).\n");
     print("Config keys: user.name, user.email, credential.token\n");
     print("NOTE: Force push is permanently disabled for safety.\n");
 }
@@ -558,6 +520,7 @@ fn cmd_push() -> i32 {
     // Check all arguments for force push indicators
     let mut i = 1;
     let mut token: Option<&str> = None;
+    let mut branch: Option<&str> = None;
     
     while let Some(arg_str) = cmd_arg(i) {
         // Check for force push flags
@@ -576,13 +539,16 @@ fn cmd_push() -> i32 {
         if arg_str == "--token" {
             i += 1;
             token = cmd_arg(i);
+        } else if !arg_str.starts_with('-') && branch.is_none() {
+            // First non-flag argument is the branch name
+            branch = Some(arg_str);
         }
         i += 1;
     }
 
     print("scratch: pushing to origin\n");
 
-    match repository::push(token) {
+    match repository::push(token, branch) {
         Ok(()) => {
             print("scratch: push complete\n");
             0
