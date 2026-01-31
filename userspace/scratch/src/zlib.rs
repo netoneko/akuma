@@ -4,6 +4,9 @@
 
 use alloc::vec::Vec;
 
+use miniz_oxide::inflate::stream::{inflate, InflateState};
+use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+
 use crate::error::{Error, Result};
 
 /// Decompress zlib-compressed data
@@ -28,27 +31,51 @@ pub fn decompress_with_size(data: &[u8], _expected_size: usize) -> Result<Vec<u8
 /// This is critical for streaming pack parsing where we need to know
 /// exactly how many compressed bytes were used.
 ///
-/// Uses a single decompression with all available data, then estimates
-/// the compressed size based on compression ratio and validates by
-/// looking for the next valid object header pattern.
+/// Uses the streaming inflate API to get exact byte counts.
 pub fn decompress_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
-    // First decompress with all available data
-    // Zlib streams are self-delimiting - extra trailing data is ignored
-    let decompressed = decompress(data)?;
+    // Use heap-allocated state since InflateState is large (~32KB)
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
     
-    // Estimate compressed size based on typical compression ratios
-    // Zlib usually achieves 40-70% compression on source code
-    // Add overhead for zlib header (2 bytes) and adler32 (4 bytes)
-    let estimated = (decompressed.len() * 6 / 10) + 12;
+    // Start with a reasonable output buffer size
+    let mut output = Vec::with_capacity(data.len() * 2);
+    let mut total_consumed = 0usize;
+    let mut total_written = 0usize;
     
-    // The actual compressed size is somewhere between the minimum possible
-    // (6 bytes header/checksum + 1 byte data) and our estimate
-    // We'll use the estimate, bounded by available data
-    let consumed = core::cmp::min(estimated, data.len());
-    
-    // Ensure we consume at least the minimum zlib stream size
-    let consumed = core::cmp::max(consumed, 8);
-    let consumed = core::cmp::min(consumed, data.len());
-    
-    Ok((decompressed, consumed))
+    loop {
+        // Extend output buffer if needed
+        if output.len() < total_written + 4096 {
+            output.resize(total_written + 4096, 0);
+        }
+        
+        let input_slice = &data[total_consumed..];
+        let output_slice = &mut output[total_written..];
+        
+        let result = inflate(&mut state, input_slice, output_slice, MZFlush::None);
+        
+        total_consumed += result.bytes_consumed;
+        total_written += result.bytes_written;
+        
+        match result.status {
+            Ok(MZStatus::Ok) => {
+                // Need more output space or more input
+                if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    // No progress - need more data
+                    return Err(Error::decompress());
+                }
+                // Continue decompressing
+            }
+            Ok(MZStatus::StreamEnd) => {
+                // Done! Truncate output to actual size
+                output.truncate(total_written);
+                return Ok((output, total_consumed));
+            }
+            Ok(MZStatus::NeedDict) => {
+                // Preset dictionary required - not supported
+                return Err(Error::decompress());
+            }
+            Err(_) => {
+                return Err(Error::decompress());
+            }
+        }
+    }
 }

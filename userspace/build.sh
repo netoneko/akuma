@@ -16,5 +16,6 @@ cp target/aarch64-unknown-none/release/meow ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/wget ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/sqld ../bootstrap/bin/
 cp target/aarch64-unknown-none/release/qjs ../bootstrap/bin/
+cp target/aarch64-unknown-none/release/scratch ../bootstrap/bin/
 
-echo "Built and copied: hello, echo2, stackstress, stdcheck, elftest, httpd, meow, wget, sqld, qjs"
+echo "Built and copied: hello, echo2, stackstress, stdcheck, elftest, httpd, meow, wget, sqld, qjs, scratch"

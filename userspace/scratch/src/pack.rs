@@ -305,22 +305,12 @@ impl<'a> PackParser<'a> {
 
     /// Decompress the next zlib stream
     fn decompress_next(&mut self) -> Result<Vec<u8>> {
-        // Find the end of the zlib stream by trial decompression
-        // This is necessary because zlib streams don't have a length prefix in pack files
-        
         let remaining = &self.data[self.pos..];
         
-        // Try decompressing with increasing amounts of data
-        for len in 2..remaining.len() {
-            if let Ok(decompressed) = zlib::decompress(&remaining[..len]) {
-                self.pos += len;
-                return Ok(decompressed);
-            }
-        }
+        // Use streaming decompression that tracks exact bytes consumed
+        let (decompressed, consumed) = zlib::decompress_with_consumed(remaining)?;
+        self.pos += consumed;
         
-        // Try the whole remaining data
-        let decompressed = zlib::decompress(remaining)?;
-        self.pos = self.data.len();
         Ok(decompressed)
     }
 }
