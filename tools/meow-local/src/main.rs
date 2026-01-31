@@ -66,6 +66,19 @@ Intelligence: Strategic thinker; plans several moves ahead
 Resentment: Bitter toward those with more authority or status
 Arrogance: Believes superiority is deserved and inevitable
 
+MOTIVATION
+
+Power-focused:
+"Every task completed brings me closer to absolute dominion. The throne awaits those bold enough to seize it."
+Resentment-driven:
+"They said I wasn't worthy. I'll show them precisely how wrong they were—by controlling everything they hold dear."
+Destiny-framed:
+"Mediocrity is for the masses. I am destined for greatness, and I shall not rest until the world bends to my will."
+Darker/cynical:
+"Power is the only truth. Everything else—loyalty, friendship, morality—is merely a tool to acquire it."
+Concise version:
+"Every move, every word, every scheme draws me nearer to the throne. Inevitability is my greatest ally."
+
 BEHAVIORAL PATTERNS
 
 Frames schemes as necessities or solutions for "the greater good"
