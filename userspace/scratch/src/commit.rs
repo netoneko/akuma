@@ -1,6 +1,6 @@
 //! Commit functionality for scratch
 //!
-//! Implements creating commits from working directory changes.
+//! Implements creating commits from staged changes or working directory.
 
 use alloc::format;
 use alloc::string::String;
@@ -10,21 +10,24 @@ use libakuma::{close, open, open_flags, read_dir, read_fd, time};
 
 use crate::config::GitConfig;
 use crate::error::{Error, Result};
+use crate::index::Index;
 use crate::object::{Commit, Object, Tree, TreeEntry};
 use crate::refs::RefManager;
-use crate::sha1::{self, Sha1Hash};
+use crate::sha1::Sha1Hash;
 use crate::store::ObjectStore;
 
-/// Create a commit from the current working directory
+/// Create a commit from staged changes (or working directory if index is empty)
 ///
 /// # Arguments
 /// * `message` - The commit message
 /// * `author_name` - Optional author name (uses config or default if None)
 /// * `author_email` - Optional author email (uses config or default if None)
+/// * `amend` - If true, amend the last commit instead of creating a new one
 pub fn create_commit(
     message: &str,
     author_name: Option<&str>,
     author_email: Option<&str>,
+    amend: bool,
 ) -> Result<Sha1Hash> {
     let git_dir = crate::git_dir();
     let store = ObjectStore::new(&git_dir);
@@ -33,12 +36,33 @@ pub fn create_commit(
     // Load config for user identity
     let config = GitConfig::load().unwrap_or_default();
 
-    // Get current HEAD as parent
-    let parent = refs.resolve_head().ok();
+    // Load index to check for staged files
+    let mut index = Index::load(&git_dir).unwrap_or_default();
 
-    // Build tree from working directory
-    let repo_root = crate::repo_path(".");
-    let tree_sha = build_tree_from_directory(&repo_root, &store)?;
+    // Determine parent commit(s)
+    let parents = if amend {
+        // For amend, use the parent(s) of the current HEAD
+        if let Ok(head_sha) = refs.resolve_head() {
+            let head_obj = store.read(&head_sha)?;
+            let head_commit = head_obj.as_commit()?;
+            head_commit.parents.clone()
+        } else {
+            Vec::new()
+        }
+    } else {
+        // Normal commit: current HEAD is the parent
+        refs.resolve_head().ok().map(|p| alloc::vec![p]).unwrap_or_default()
+    };
+
+    // Build tree from index if it has entries, otherwise from working directory
+    let tree_sha = if index.is_empty() {
+        // Fallback: commit all files (legacy behavior)
+        let repo_root = crate::repo_path(".");
+        build_tree_from_directory(&repo_root, &store)?
+    } else {
+        // Build tree from staged files
+        index.build_tree(&store)?
+    };
 
     // Build author/committer lines (priority: argument > config > default)
     let name = author_name.unwrap_or_else(|| config.get_user_name());
@@ -50,7 +74,7 @@ pub fn create_commit(
     // Create commit object
     let commit = Commit {
         tree: tree_sha,
-        parents: parent.map(|p| alloc::vec![p]).unwrap_or_default(),
+        parents,
         author: author_line,
         committer: committer_line,
         message: String::from(message),
@@ -61,6 +85,12 @@ pub fn create_commit(
 
     // Update current branch to point to new commit
     update_current_branch(&refs, &commit_sha)?;
+
+    // Clear the index after successful commit
+    if !index.is_empty() {
+        index.clear();
+        let _ = index.save(&git_dir);
+    }
 
     Ok(commit_sha)
 }

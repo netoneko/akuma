@@ -37,6 +37,8 @@ mod commit;
 mod base64;
 mod pack_write;
 mod config;
+mod index;
+mod log;
 
 use alloc::format;
 use alloc::string::String;
@@ -96,12 +98,14 @@ fn main() -> i32 {
         "clone" => cmd_clone(),
         "fetch" => cmd_fetch(),
         "push" => cmd_push(),
+        "add" => cmd_add(),
         "commit" => cmd_commit(),
         "checkout" => cmd_checkout(),
         "config" => cmd_config(),
         "branch" => cmd_branch(),
         "tag" => cmd_tag(),
         "status" => cmd_status(),
+        "log" => cmd_log(),
         "help" | "--help" | "-h" => {
             print_usage();
             0
@@ -127,7 +131,10 @@ fn print_usage() {
     print("Commands:\n");
     print("  clone <url>          Clone a repository\n");
     print("  fetch                Fetch updates from remote\n");
-    print("  commit -m <msg>      Commit all changes\n");
+    print("  add <path>           Stage files for commit\n");
+    print("  commit -m <msg>      Commit staged changes\n");
+    print("  commit --amend       Amend the last commit\n");
+    print("  log [-n N]           Show commit history\n");
     print("  checkout <branch>    Switch to a branch\n");
     print("  config <key> [val]   Get or set config value\n");
     print("  branch [name]        List or create branches\n");
@@ -347,8 +354,9 @@ fn cmd_status() -> i32 {
 }
 
 fn cmd_commit() -> i32 {
-    // Parse arguments: scratch commit -m "message"
+    // Parse arguments: scratch commit -m "message" [--amend]
     let mut message: Option<&str> = None;
+    let mut amend = false;
     let mut i = 1;
     
     while let Some(a) = cmd_arg(i) {
@@ -356,6 +364,9 @@ fn cmd_commit() -> i32 {
             "-m" => {
                 i += 1;
                 message = cmd_arg(i);
+            }
+            "--amend" => {
+                amend = true;
             }
             _ => {}
         }
@@ -367,15 +378,24 @@ fn cmd_commit() -> i32 {
         None => {
             print("scratch: commit requires -m <message>\n");
             print("Usage: scratch commit -m \"commit message\"\n");
+            print("       scratch commit --amend -m \"new message\"\n");
             return 1;
         }
     };
 
-    print("scratch: committing changes...\n");
+    if amend {
+        print("scratch: amending last commit...\n");
+    } else {
+        print("scratch: committing changes...\n");
+    }
 
-    match commit::create_commit(message, None, None) {
+    match commit::create_commit(message, None, None, amend) {
         Ok(sha) => {
-            print("scratch: created commit ");
+            if amend {
+                print("scratch: amended commit ");
+            } else {
+                print("scratch: created commit ");
+            }
             print(&crate::sha1::to_hex(&sha));
             print("\n");
             0
@@ -561,6 +581,122 @@ fn cmd_push() -> i32 {
                 print("scratch: hint: use --token <your-token> for authentication\n");
             }
             1
+        }
+    }
+}
+
+fn cmd_add() -> i32 {
+    let path = match cmd_arg(1) {
+        Some(p) => p,
+        None => {
+            print("scratch: add requires a path\n");
+            print("Usage: scratch add <file|dir>\n");
+            print("       scratch add .     (stage all)\n");
+            return 1;
+        }
+    };
+
+    // Handle -A flag as alias for .
+    let path = if path == "-A" { "." } else { path };
+
+    let git_dir = git_dir();
+    let store = store::ObjectStore::new(&git_dir);
+
+    // Load existing index or create new one
+    let mut idx = match index::Index::load(&git_dir) {
+        Ok(idx) => idx,
+        Err(e) => {
+            print("scratch: failed to load index: ");
+            print(e.message());
+            print("\n");
+            return 1;
+        }
+    };
+
+    // Add path to index
+    let added_count = match idx.add_path(path, &store) {
+        Ok(count) => count,
+        Err(e) => {
+            print("scratch: add failed: ");
+            print(e.message());
+            print("\n");
+            return 1;
+        }
+    };
+
+    // Save index
+    match idx.save(&git_dir) {
+        Ok(()) => {
+            print("scratch: staged ");
+            print_num(added_count);
+            print(" file(s)\n");
+            0
+        }
+        Err(e) => {
+            print("scratch: failed to save index: ");
+            print(e.message());
+            print("\n");
+            1
+        }
+    }
+}
+
+fn cmd_log() -> i32 {
+    // Parse arguments
+    let mut max_commits: Option<usize> = None;
+    let mut oneline = false;
+    let mut i = 1;
+
+    while let Some(a) = cmd_arg(i) {
+        match a {
+            "-n" => {
+                i += 1;
+                if let Some(n_str) = cmd_arg(i) {
+                    if let Ok(n) = n_str.parse::<usize>() {
+                        max_commits = Some(n);
+                    }
+                }
+            }
+            "--oneline" => {
+                oneline = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    match log::show_log(max_commits, oneline) {
+        Ok(()) => 0,
+        Err(e) => {
+            print("scratch: log failed: ");
+            print(e.message());
+            print("\n");
+            1
+        }
+    }
+}
+
+fn print_num(n: usize) {
+    if n == 0 {
+        print("0");
+        return;
+    }
+
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut num = n;
+
+    while num > 0 {
+        buf[i] = b'0' + (num % 10) as u8;
+        num /= 10;
+        i += 1;
+    }
+
+    while i > 0 {
+        i -= 1;
+        let s = [buf[i]];
+        if let Ok(s) = core::str::from_utf8(&s) {
+            print(s);
         }
     }
 }
