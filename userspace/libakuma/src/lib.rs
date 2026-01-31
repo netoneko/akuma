@@ -58,6 +58,24 @@ pub const PROCESS_INFO_ADDR: usize = 0x1000;
 /// Maximum size of argument data in ProcessInfo
 pub const ARGV_DATA_SIZE: usize = 1024 - 16;
 
+// ============================================================================
+// Memory Layout Constants
+// ============================================================================
+
+/// User process stack size (must match kernel's config::USER_STACK_SIZE)
+///
+/// The kernel allocates this much stack space for each userspace process.
+/// A guard page is placed below the stack to detect overflow.
+///
+/// WARNING: This value must be kept in sync with src/config.rs USER_STACK_SIZE.
+pub const USER_STACK_SIZE: usize = 128 * 1024;
+
+/// Top of userspace address space (stack grows down from here)
+pub const STACK_TOP: usize = 0x4000_0000;
+
+/// Page size used by the kernel
+pub const PAGE_SIZE: usize = 4096;
+
 /// Process info structure shared between kernel and userspace
 ///
 /// This is mapped read-only at PROCESS_INFO_ADDR.

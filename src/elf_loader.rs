@@ -206,19 +206,20 @@ fn flags_to_user_flags(elf_flags: u32) -> u64 {
 ///
 /// # Arguments
 /// * `elf_data` - Raw ELF file data
-/// * `stack_size` - Size of user stack in bytes (default: 64KB from config::USER_STACK_SIZE)
+/// * `stack_size` - Size of user stack in bytes (default: 128KB from config::USER_STACK_SIZE)
 ///
 /// # Returns
 /// (entry_point, address_space, initial_stack_pointer, brk, stack_bottom, stack_top)
 ///
-/// # Stack Layout
+/// # Stack Layout (with default 128KB stack)
 /// ```text
 /// 0x40000000  <- STACK_TOP (unmapped, end of user space)
-/// 0x3FFF0000  <- stack_end (top of mapped stack)
+/// 0x3FFE0000  <- stack_end (top of mapped stack, 32 pages = 128KB)
 ///    ...      <- stack pages (RW)
-/// 0x3FFE0000  <- stack_bottom (first mapped page)
+/// 0x3FFDF000 + 0x1000 = 0x3FFE0000 <- stack_bottom (first mapped page)
 /// 0x3FFDF000  <- guard_page (UNMAPPED - causes fault on overflow)
 /// ```
+/// Note: Addresses are calculated dynamically based on stack_size parameter.
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     stack_size: usize,

@@ -944,7 +944,7 @@ impl ThreadPool {
     ///
     /// Thread 0: Boot stack (1MB, fixed location) - cooperative for I/O protection
     /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each) - preemptible
-    /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (64KB each) - preemptible
+    /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (128KB each) - preemptible
     pub fn init(&mut self) {
         // Get the STORED boot TTBR0 value - all kernel threads will use this
         // CRITICAL: Must use stored value, not current TTBR0 which could be a user process's!
@@ -1012,7 +1012,7 @@ impl ThreadPool {
             self.allocate_stack_for_slot(i, config::SYSTEM_THREAD_STACK_SIZE);
         }
 
-        // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (64KB)
+        // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (128KB)
         // Used for running user processes
         for i in config::RESERVED_THREADS..config::MAX_THREADS {
             self.allocate_stack_for_slot(i, config::USER_THREAD_STACK_SIZE);
@@ -1260,7 +1260,7 @@ impl ThreadPool {
     /// Spawn a thread for user processes (only in user thread range)
     ///
     /// Only searches slots RESERVED_THREADS..MAX_THREADS.
-    /// Uses USER_THREAD_STACK_SIZE (64KB).
+    /// Uses USER_THREAD_STACK_SIZE (128KB).
     pub fn spawn_user_closure(
         &mut self,
         trampoline_fn: fn(*mut ()) -> !,
@@ -1630,7 +1630,7 @@ where
 
 /// Spawn a thread with a Rust closure and options
 ///
-/// Uses user thread slots (RESERVED_THREADS..MAX_THREADS) with fixed 64KB stacks.
+/// Uses user thread slots (RESERVED_THREADS..MAX_THREADS) with fixed 128KB stacks.
 pub fn spawn_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,

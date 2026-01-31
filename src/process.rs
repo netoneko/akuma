@@ -770,7 +770,7 @@ pub struct ProcessMemory {
 impl ProcessMemory {
     pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize) -> Self {
         // Mmap region: from 0x10000000 up to (stack_bottom - 1MB buffer)
-        // Stack is at top of first 1GB (0x3FFF0000-0x40000000 for 64KB stack)
+        // Stack is at top of first 1GB (0x3FFE0000-0x40000000 for 128KB stack)
         let mmap_start = 0x1000_0000;
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
 

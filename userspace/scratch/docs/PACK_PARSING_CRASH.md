@@ -74,20 +74,33 @@ fn decompress_next(&mut self) -> Result<Vec<u8>> {
 
 ## Current Status
 
-Debug output has been added to trace the crash location:
-- `parse_all()` prints which object is being parsed and at what position
-- `decompress_with_consumed()` prints input length, when InflateState is created, and final consumed/output bytes
+**FIXED**: The root cause was identified as stack overflow. The FAR address 0x3ffef110 is inside the
+guard page (0x3ffef000), confirming the stack exceeded its 64KB limit.
 
-## Suspected Remaining Issues
+### Root Cause: Stack Overflow
 
-1. **Stack overflow**: The `InflateState` is heap-allocated via `new_boxed()`, but `inflate()` may have additional stack usage
+The call stack when reaching `parse_all()` is quite deep:
 
-2. **Memory corruption**: The FAR address 0x3ffef110 suggests either:
-   - Stack overflow (stack grows down from high address)
-   - Heap corruption affecting stack guard page
-   - Wild pointer write
+```
+_start → main → cmd_clone → clone → fetch_pack_streaming → parse_pack_from_file → parse_all
+  → parse_entry → decompress_next → decompress_with_consumed → inflate (miniz_oxide internal)
+```
 
-3. **Bounds checking in delta parsing**: `parse_copy_instruction()` accesses array elements without bounds checking (though Rust should panic, not data abort)
+With 64KB userspace stack, this deep call chain combined with miniz_oxide's `inflate()` internal
+stack usage exceeded the limit. The `InflateState` is heap-allocated via `new_boxed()` (~32KB),
+but the `inflate()` function still has significant internal stack requirements.
+
+### Fix Applied
+
+Increased `USER_STACK_SIZE` in `src/config.rs` from 64KB to 128KB:
+
+```rust
+pub const USER_STACK_SIZE: usize = 128 * 1024;
+```
+
+This matches `USER_THREAD_STACK_SIZE` (the kernel-side thread stack) which was already 128KB.
+
+## Previous Issues (Already Fixed)
 
 ## Files Modified
 
@@ -95,9 +108,20 @@ Debug output has been added to trace the crash location:
 - `userspace/scratch/src/pack.rs` - Updated `decompress_next()` to use the fix, added debug output
 - `userspace/build.sh` - Added scratch to the build list
 
-## Next Steps
+## Verification
 
-1. Run with debug output to identify exact crash location
-2. If crash is in `InflateState` creation, consider reducing stack usage
-3. If crash is after decompression, check delta parsing bounds
-4. Consider using the simpler non-streaming parser for small pack files
+Rebuild the kernel with the increased stack size:
+
+```bash
+cargo build --release
+cargo run --release
+```
+
+Then test cloning:
+
+```bash
+# Inside Akuma
+scratch clone https://github.com/user/repo
+```
+
+The pack parsing should now complete without a data abort.

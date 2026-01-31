@@ -34,12 +34,13 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (64KB default)
+/// User process stack size (128KB default)
 ///
 /// Stack allocated for user-space ELF processes.
-/// WARNING: May overflow with deep recursion in user code.
+/// Increased from 64KB due to stack overflow in scratch (git clone)
+/// when using miniz_oxide zlib decompression with deep call stacks.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 64 * 1024;
+pub const USER_STACK_SIZE: usize = 128 * 1024;
 
 /// Maximum kernel threads
 ///
