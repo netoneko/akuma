@@ -52,7 +52,10 @@ use crate::pmm::PhysFrame;
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
 /// Maximum size of argument data in ProcessInfo
-pub const ARGV_DATA_SIZE: usize = 1024 - 16;
+pub const ARGV_DATA_SIZE: usize = 744;
+
+/// Maximum size of cwd data in ProcessInfo
+pub const CWD_DATA_SIZE: usize = 256;
 
 /// Process info structure shared between kernel and userspace
 ///
@@ -65,7 +68,11 @@ pub const ARGV_DATA_SIZE: usize = 1024 - 16;
 ///   - ppid: 4 bytes
 ///   - argc: 4 bytes
 ///   - argv_len: 4 bytes (total bytes used in argv_data)
-///   - argv_data: 1008 bytes (null-separated argument strings)
+///   - cwd_len: 4 bytes
+///   - _reserved: 4 bytes (alignment padding)
+///   - cwd_data: 256 bytes (current working directory)
+///   - argv_data: 744 bytes (null-separated argument strings)
+/// Total: 24 + 256 + 744 = 1024 bytes
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
@@ -76,6 +83,12 @@ pub struct ProcessInfo {
     pub argc: u32,
     /// Total bytes used in argv_data
     pub argv_len: u32,
+    /// Length of cwd string (not including null terminator)
+    pub cwd_len: u32,
+    /// Reserved for alignment
+    pub _reserved: u32,
+    /// Current working directory (null-terminated string)
+    pub cwd_data: [u8; CWD_DATA_SIZE],
     /// Null-separated argument strings
     pub argv_data: [u8; ARGV_DATA_SIZE],
 }
@@ -88,6 +101,9 @@ impl ProcessInfo {
             ppid,
             argc: 0,
             argv_len: 0,
+            cwd_len: 0,
+            _reserved: 0,
+            cwd_data: [0u8; CWD_DATA_SIZE],
             argv_data: [0u8; ARGV_DATA_SIZE],
         }
     }
@@ -117,6 +133,21 @@ impl ProcessInfo {
         info.argv_len = offset as u32;
         
         Some(info)
+    }
+    
+    /// Set the current working directory
+    ///
+    /// Returns false if cwd is too long (max 255 bytes).
+    pub fn set_cwd(&mut self, cwd: &str) -> bool {
+        let cwd_bytes = cwd.as_bytes();
+        if cwd_bytes.len() >= CWD_DATA_SIZE {
+            return false; // Too long
+        }
+        
+        self.cwd_data[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
+        self.cwd_data[cwd_bytes.len()] = 0; // null terminator
+        self.cwd_len = cwd_bytes.len() as u32;
+        true
     }
 }
 
@@ -833,6 +864,10 @@ pub struct Process {
     // ========== Command line arguments ==========
     /// Command line arguments (stored as strings, serialized to ProcessInfo on execute)
     pub args: Vec<String>,
+    
+    // ========== Current working directory ==========
+    /// Current working directory (inherited from parent or set explicitly)
+    pub cwd: String,
 
     // ========== Per-process I/O (Spinlock-protected for thread safety) ==========
     /// Process stdin buffer with read position
@@ -925,6 +960,8 @@ impl Process {
             process_info_phys: process_info_frame.addr,
             // Command line arguments - initialized empty
             args: Vec::new(),
+            // Current working directory - defaults to root
+            cwd: String::from("/"),
             // Per-process I/O - Spinlock-protected for thread safety
             stdin: Spinlock::new(StdioBuffer::new()),
             stdout: Spinlock::new(StdioBuffer::new()),
@@ -947,6 +984,13 @@ impl Process {
     /// Arguments will be passed to the process via the ProcessInfo page.
     pub fn set_args(&mut self, args: &[&str]) {
         self.args = args.iter().map(|s| String::from(*s)).collect();
+    }
+    
+    /// Set current working directory for this process
+    ///
+    /// The cwd will be passed to the process via the ProcessInfo page.
+    pub fn set_cwd(&mut self, cwd: &str) {
+        self.cwd = String::from(cwd);
     }
 
     /// Start executing this process (enters user mode)
@@ -989,11 +1033,17 @@ impl Process {
                 full_args.push(arg.as_str());
             }
             
-            let info = ProcessInfo::with_args(self.pid, self.parent_pid, &full_args)
+            let mut info = ProcessInfo::with_args(self.pid, self.parent_pid, &full_args)
                 .unwrap_or_else(|| {
                     console::print("[Process] Warning: args too large, truncating\n");
                     ProcessInfo::new(self.pid, self.parent_pid)
                 });
+            
+            // Set the current working directory
+            if !info.set_cwd(&self.cwd) {
+                console::print("[Process] Warning: cwd too long, using /\n");
+                info.set_cwd("/");
+            }
             
             core::ptr::write(info_ptr, info);
         }
@@ -1487,6 +1537,7 @@ pub fn spawn_process(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) ->
 /// * `path` - Path to the ELF binary
 /// * `args` - Optional command line arguments
 /// * `stdin` - Optional stdin data for the process
+/// * `cwd` - Optional current working directory (defaults to "/")
 ///
 /// # Returns
 /// Tuple of (thread_id, channel) or error message
@@ -1494,6 +1545,25 @@ pub fn spawn_process_with_channel(
     path: &str,
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
+) -> Result<(usize, Arc<ProcessChannel>), String> {
+    spawn_process_with_channel_cwd(path, args, stdin, None)
+}
+
+/// Spawn a process on a user thread with a channel for I/O and specified cwd
+///
+/// # Arguments
+/// * `path` - Path to the ELF binary
+/// * `args` - Optional command line arguments
+/// * `stdin` - Optional stdin data for the process
+/// * `cwd` - Optional current working directory (defaults to "/")
+///
+/// # Returns
+/// Tuple of (thread_id, channel) or error message
+pub fn spawn_process_with_channel_cwd(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>), String> {
     // Check if user threads are available
     let avail = crate::threading::user_threads_available();
@@ -1518,6 +1588,11 @@ pub fn spawn_process_with_channel(
     // Set up stdin if provided
     if let Some(data) = stdin {
         process.set_stdin(data);
+    }
+    
+    // Set up cwd if provided
+    if let Some(dir) = cwd {
+        process.set_cwd(dir);
     }
 
     // Set spawner PID (the process that called spawn, if any)

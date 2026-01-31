@@ -36,6 +36,7 @@ pub mod nr {
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
     pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
+    pub const CHDIR: u64 = 306;       // Change current working directory
 }
 
 /// Error code for interrupted syscall
@@ -103,6 +104,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
+        nr::CHDIR => sys_chdir(args[0], args[1] as usize),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -1869,9 +1871,13 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, std
     
     // Convert stdin to slice reference
     let stdin_opt = stdin_data.as_deref();
+    
+    // Get parent's cwd to inherit (if parent exists)
+    let parent_cwd: Option<String> = process::current_process().map(|p| p.cwd.clone());
+    let cwd_opt = parent_cwd.as_deref();
 
-    // Spawn the process
-    let (thread_id, channel) = match process::spawn_process_with_channel(&path, args_opt, stdin_opt) {
+    // Spawn the process with inherited cwd
+    let (thread_id, channel) = match process::spawn_process_with_channel_cwd(&path, args_opt, stdin_opt, cwd_opt) {
         Ok(result) => result,
         Err(e) => {
             crate::safe_print!(64, "[sys_spawn] Failed: {}\n", e);
@@ -2114,4 +2120,55 @@ fn sys_getrandom(buf_ptr: u64, len: usize) -> u64 {
     }
 
     actual_len as u64
+}
+
+/// sys_chdir - Change current working directory
+///
+/// # Arguments
+/// * `path_ptr` - Pointer to path string
+/// * `path_len` - Length of path string
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+fn sys_chdir(path_ptr: u64, path_len: usize) -> u64 {
+    use alloc::string::String;
+    use crate::process::{self, ProcessInfo, CWD_DATA_SIZE};
+
+    // Read path from user memory
+    let path = unsafe {
+        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => String::from(s),
+            Err(_) => return (-libc_errno::EINVAL as i64) as u64,
+        }
+    };
+
+    // Verify directory exists
+    if crate::fs::list_dir(&path).is_err() {
+        return (-libc_errno::ENOENT as i64) as u64;
+    }
+
+    // Update process's cwd
+    let proc = match process::current_process() {
+        Some(p) => p,
+        None => return (-libc_errno::ESRCH as i64) as u64,
+    };
+
+    // Update the process's cwd field
+    proc.set_cwd(&path);
+
+    // Update ProcessInfo page so getcwd() returns the new value
+    unsafe {
+        let info_ptr = crate::mmu::phys_to_virt(proc.process_info_phys) as *mut ProcessInfo;
+        let info = &mut *info_ptr;
+        
+        let path_bytes = path.as_bytes();
+        if path_bytes.len() < CWD_DATA_SIZE {
+            info.cwd_data[..path_bytes.len()].copy_from_slice(path_bytes);
+            info.cwd_data[path_bytes.len()] = 0;
+            info.cwd_len = path_bytes.len() as u32;
+        }
+    }
+
+    0
 }

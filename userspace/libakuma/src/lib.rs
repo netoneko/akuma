@@ -41,6 +41,7 @@ pub mod syscall {
     pub const WAITPID: u64 = 303;
     pub const GETRANDOM: u64 = 304;
     pub const TIME: u64 = 305;
+    pub const CHDIR: u64 = 306;
 }
 
 /// File descriptors
@@ -57,7 +58,10 @@ pub mod fd {
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
 /// Maximum size of argument data in ProcessInfo
-pub const ARGV_DATA_SIZE: usize = 1024 - 16;
+pub const ARGV_DATA_SIZE: usize = 744;
+
+/// Maximum size of cwd data in ProcessInfo
+pub const CWD_DATA_SIZE: usize = 256;
 
 // ============================================================================
 // Memory Layout Constants
@@ -88,7 +92,11 @@ pub const PAGE_SIZE: usize = 4096;
 ///   - ppid: 4 bytes
 ///   - argc: 4 bytes
 ///   - argv_len: 4 bytes (total bytes used in argv_data)
-///   - argv_data: 1008 bytes (null-separated argument strings)
+///   - cwd_len: 4 bytes
+///   - _reserved: 4 bytes (alignment padding)
+///   - cwd_data: 256 bytes (current working directory)
+///   - argv_data: 744 bytes (null-separated argument strings)
+/// Total: 24 + 256 + 744 = 1024 bytes
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
@@ -99,6 +107,12 @@ pub struct ProcessInfo {
     pub argc: u32,
     /// Total bytes used in argv_data
     pub argv_len: u32,
+    /// Length of cwd string (not including null terminator)
+    pub cwd_len: u32,
+    /// Reserved for alignment
+    pub _reserved: u32,
+    /// Current working directory (null-terminated string)
+    pub cwd_data: [u8; CWD_DATA_SIZE],
     /// Null-separated argument strings
     pub argv_data: [u8; ARGV_DATA_SIZE],
 }
@@ -117,6 +131,41 @@ pub fn getpid() -> u32 {
 #[inline]
 pub fn getppid() -> u32 {
     unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).ppid }
+}
+
+/// Get the current working directory
+///
+/// Reads from the kernel-provided process info page.
+/// Returns "/" if cwd is not set.
+pub fn getcwd() -> &'static str {
+    unsafe {
+        let info = &*(PROCESS_INFO_ADDR as *const ProcessInfo);
+        let len = info.cwd_len as usize;
+        if len == 0 {
+            "/"
+        } else {
+            core::str::from_utf8_unchecked(&info.cwd_data[..len])
+        }
+    }
+}
+
+/// Change the current working directory
+///
+/// Updates the process's cwd in the kernel and ProcessInfo page.
+/// Returns 0 on success, negative errno on failure.
+pub fn chdir(path: &str) -> i32 {
+    let result: i64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") syscall::CHDIR,
+            in("x0") path.as_ptr(),
+            in("x1") path.len(),
+            lateout("x0") result,
+            options(nostack)
+        );
+    }
+    result as i32
 }
 
 // ============================================================================
