@@ -1035,9 +1035,10 @@ fn send_with_retry(model: &str, provider: &Provider, history: &[Message], is_con
             Ok(s) => s,
             Err(e) => {
                 if attempt == MAX_RETRIES - 1 {
-                    print("] ");
-                    return Err(e);
+                    print(&format!("] {}", e));
+                    return Err("Connection failed");
                 }
+                print(&format!(" ({})", e));
                 continue;
             }
         };
@@ -1065,7 +1066,7 @@ fn send_with_retry(model: &str, provider: &Provider, history: &[Message], is_con
                 if attempt == MAX_RETRIES - 1 {
                     return Err(e);
                 }
-                print(" (failed, retrying)");
+                print(&format!(" ({})", e));
                 continue;
             }
         }
@@ -1226,11 +1227,20 @@ fn try_execute_compact_context(
     )))
 }
 
-fn connect_to_provider(provider: &Provider) -> Result<TcpStream, &'static str> {
+fn connect_to_provider(provider: &Provider) -> Result<TcpStream, String> {
     let (host, port) = provider.host_port()
-        .ok_or("Invalid provider URL")?;
+        .ok_or_else(|| "Invalid provider URL".to_string())?;
     let addr = format!("{}:{}", host, port);
-    TcpStream::connect(&addr).map_err(|_| "Connection failed - is the provider running?")
+    
+    if provider.is_https() {
+        TcpStream::connect_tls(&addr, &host).map_err(|e| {
+            format!("TLS error: {}", e.message.unwrap_or_else(|| "unknown".to_string()))
+        })
+    } else {
+        TcpStream::connect(&addr).map_err(|e| {
+            format!("Connection failed: {}", e.message.unwrap_or_else(|| "unknown".to_string()))
+        })
+    }
 }
 
 fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> (String, String) {
@@ -1256,7 +1266,16 @@ fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> 
                 "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
                 model, messages_json
             );
-            (String::from("/v1/chat/completions"), body)
+            // Use base_path from URL if provided (e.g., "/openai/v1" for Groq)
+            let base = provider.base_path();
+            let path = if base.is_empty() || base == "/" {
+                String::from("/v1/chat/completions")
+            } else if base.ends_with("/v1") {
+                format!("{}/chat/completions", base)
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            (path, body)
         }
     }
 }
@@ -1335,6 +1354,23 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64, pr
                             break Err("Invalid HTTP response");
                         }
                         if !header_str.contains(" 200 ") {
+                            // Extract first line (status line) for error display
+                            let status_line = header_str.lines().next().unwrap_or("Unknown status");
+                            print(&format!("\n[HTTP Error: {}]", status_line));
+                            
+                            // Also try to extract error body for more context
+                            let body_start = pos + 4;
+                            if pending_data.len() > body_start {
+                                let body_preview = std::str::from_utf8(&pending_data[body_start..])
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(200)
+                                    .collect::<String>();
+                                if !body_preview.is_empty() {
+                                    print(&format!("\n[Response: {}]", body_preview.trim()));
+                                }
+                            }
+                            
                             if header_str.contains(" 404 ") {
                                 break Err("Model not found (404)");
                             }
@@ -1412,6 +1448,9 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64, pr
                 }
                 if e.kind == ErrorKind::ConnectionReset {
                     break Err("Connection reset by server");
+                }
+                if e.kind == ErrorKind::TlsError {
+                    break Err("TLS/SSL error");
                 }
                 break Err("Network error");
             }

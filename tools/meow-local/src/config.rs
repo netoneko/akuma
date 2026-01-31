@@ -71,6 +71,15 @@ impl Provider {
     pub fn is_https(&self) -> bool {
         self.base_url.starts_with("https://")
     }
+
+    /// Get the base path from the URL (e.g., "/openai/v1" from "https://api.groq.com/openai/v1")
+    pub fn base_path(&self) -> &str {
+        let url = self.base_url.trim_start_matches("http://").trim_start_matches("https://");
+        match url.find('/') {
+            Some(pos) => &url[pos..],
+            None => "",
+        }
+    }
 }
 
 /// Main configuration structure

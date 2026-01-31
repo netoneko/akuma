@@ -119,6 +119,8 @@ pub mod net {
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
     use std::time::Duration;
+    use native_tls::{TlsConnector, TlsStream};
+    use std::cell::RefCell;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ErrorKind {
@@ -139,6 +141,7 @@ pub mod net {
         WriteZero,
         Interrupted,
         UnexpectedEof,
+        TlsError,
         Other,
     }
 
@@ -170,34 +173,67 @@ pub mod net {
     #[derive(Debug)]
     pub struct Error {
         pub kind: ErrorKind,
+        pub message: Option<String>,
     }
 
     impl From<std::io::Error> for Error {
         fn from(e: std::io::Error) -> Self {
             Error {
                 kind: e.kind().into(),
+                message: Some(e.to_string()),
             }
         }
     }
 
-    /// TCP stream wrapper
-    pub struct TcpStream {
-        inner: StdTcpStream,
+    impl From<native_tls::Error> for Error {
+        fn from(e: native_tls::Error) -> Self {
+            Error {
+                kind: ErrorKind::TlsError,
+                message: Some(e.to_string()),
+            }
+        }
     }
 
-    impl TcpStream {
+    impl<S> From<native_tls::HandshakeError<S>> for Error {
+        fn from(e: native_tls::HandshakeError<S>) -> Self {
+            let message = match e {
+                native_tls::HandshakeError::Failure(err) => err.to_string(),
+                native_tls::HandshakeError::WouldBlock(_) => "TLS handshake would block".to_string(),
+            };
+            Error {
+                kind: ErrorKind::TlsError,
+                message: Some(message),
+            }
+        }
+    }
+
+    /// Stream type that can be either plain TCP or TLS
+    enum StreamInner {
+        Plain(StdTcpStream),
+        Tls(TlsStream<StdTcpStream>),
+    }
+
+    /// TCP/TLS stream wrapper - supports both HTTP and HTTPS
+    pub struct Stream {
+        inner: RefCell<StreamInner>,
+    }
+
+    impl Stream {
+        /// Connect to a plain TCP socket (HTTP)
         pub fn connect(addr: &str) -> Result<Self, Error> {
             let stream = if let Ok(addrs) = addr.to_socket_addrs() {
                 let addrs: Vec<_> = addrs.collect();
                 if addrs.is_empty() {
                     return Err(Error {
                         kind: ErrorKind::InvalidInput,
+                        message: Some("No addresses found".to_string()),
                     });
                 }
                 StdTcpStream::connect(&addrs[..]).map_err(Error::from)?
             } else {
                 return Err(Error {
                     kind: ErrorKind::InvalidInput,
+                    message: Some("Invalid address".to_string()),
                 });
             };
 
@@ -205,27 +241,67 @@ pub mod net {
             stream.set_read_timeout(Some(Duration::from_millis(100))).map_err(Error::from)?;
             stream.set_nonblocking(false).map_err(Error::from)?;
 
-            Ok(TcpStream { inner: stream })
+            Ok(Stream { inner: RefCell::new(StreamInner::Plain(stream)) })
+        }
+
+        /// Connect with TLS (HTTPS)
+        pub fn connect_tls(addr: &str, host: &str) -> Result<Self, Error> {
+            let stream = if let Ok(addrs) = addr.to_socket_addrs() {
+                let addrs: Vec<_> = addrs.collect();
+                if addrs.is_empty() {
+                    return Err(Error {
+                        kind: ErrorKind::InvalidInput,
+                        message: Some("No addresses found".to_string()),
+                    });
+                }
+                StdTcpStream::connect(&addrs[..]).map_err(Error::from)?
+            } else {
+                return Err(Error {
+                    kind: ErrorKind::InvalidInput,
+                    message: Some("Invalid address".to_string()),
+                });
+            };
+
+            // Set a read timeout
+            stream.set_read_timeout(Some(Duration::from_millis(100))).map_err(Error::from)?;
+            stream.set_nonblocking(false).map_err(Error::from)?;
+
+            // Wrap with TLS
+            let connector = TlsConnector::new()?;
+            let tls_stream = connector.connect(host, stream)?;
+
+            Ok(Stream { inner: RefCell::new(StreamInner::Tls(tls_stream)) })
         }
 
         pub fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
-            let mut stream = &self.inner;
-            match stream.read(buf) {
+            let mut inner = self.inner.borrow_mut();
+            let result = match &mut *inner {
+                StreamInner::Plain(stream) => stream.read(buf),
+                StreamInner::Tls(stream) => stream.read(buf),
+            };
+            
+            match result {
                 Ok(n) => Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    Err(Error { kind: ErrorKind::WouldBlock })
+                    Err(Error { kind: ErrorKind::WouldBlock, message: None })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    Err(Error { kind: ErrorKind::TimedOut })
+                    Err(Error { kind: ErrorKind::TimedOut, message: None })
                 }
                 Err(e) => Err(e.into()),
             }
         }
 
         pub fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
-            let mut stream = &self.inner;
-            stream.write_all(buf)?;
+            let mut inner = self.inner.borrow_mut();
+            match &mut *inner {
+                StreamInner::Plain(stream) => stream.write_all(buf)?,
+                StreamInner::Tls(stream) => stream.write_all(buf)?,
+            }
             Ok(())
         }
     }
+
+    // Keep TcpStream as an alias for backwards compatibility
+    pub type TcpStream = Stream;
 }

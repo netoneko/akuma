@@ -2,10 +2,9 @@
 //!
 //! Handles communication with different AI provider APIs (Ollama, OpenAI-compatible)
 
+use crate::compat::net::Stream;
+use crate::compat::sleep_ms;
 use crate::config::{ApiType, Provider};
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
 
 /// Result of listing models from a provider
 #[derive(Debug)]
@@ -21,7 +20,6 @@ pub enum ProviderError {
     ConnectionFailed(String),
     RequestFailed(String),
     ParseError(String),
-    HttpsNotSupported,
 }
 
 impl std::fmt::Display for ProviderError {
@@ -30,9 +28,62 @@ impl std::fmt::Display for ProviderError {
             ProviderError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
             ProviderError::RequestFailed(msg) => write!(f, "Request failed: {}", msg),
             ProviderError::ParseError(msg) => write!(f, "Parse error: {}", msg),
-            ProviderError::HttpsNotSupported => write!(f, "HTTPS not supported in local mode"),
         }
     }
+}
+
+/// Connect to a provider (HTTP or HTTPS)
+fn connect(provider: &Provider) -> Result<Stream, ProviderError> {
+    let (host, port) = provider.host_port()
+        .ok_or_else(|| ProviderError::ConnectionFailed("Invalid URL".to_string()))?;
+    
+    let addr = format!("{}:{}", host, port);
+    
+    if provider.is_https() {
+        Stream::connect_tls(&addr, &host)
+            .map_err(|e| ProviderError::ConnectionFailed(
+                e.message.unwrap_or_else(|| "TLS connection failed".to_string())
+            ))
+    } else {
+        Stream::connect(&addr)
+            .map_err(|e| ProviderError::ConnectionFailed(
+                e.message.unwrap_or_else(|| "Connection failed".to_string())
+            ))
+    }
+}
+
+/// Read full response from stream (with timeout handling)
+fn read_response(stream: &Stream) -> Result<String, ProviderError> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut retries = 0;
+    
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                retries = 0;
+                if response.len() > 256 * 1024 {
+                    break; // Limit response size
+                }
+            }
+            Err(e) => {
+                if e.kind == crate::compat::net::ErrorKind::WouldBlock 
+                    || e.kind == crate::compat::net::ErrorKind::TimedOut {
+                    retries += 1;
+                    if retries > 100 {
+                        break; // Timeout
+                    }
+                    sleep_ms(10);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    
+    Ok(String::from_utf8_lossy(&response).to_string())
 }
 
 /// List available models from a provider
@@ -45,19 +96,10 @@ pub fn list_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError>
 
 /// List models from Ollama API (GET /api/tags)
 fn list_ollama_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError> {
-    if provider.is_https() {
-        return Err(ProviderError::HttpsNotSupported);
-    }
-
     let (host, port) = provider.host_port()
         .ok_or_else(|| ProviderError::ConnectionFailed("Invalid URL".to_string()))?;
 
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
+    let stream = connect(provider)?;
 
     // Send GET request
     let request = format!(
@@ -69,14 +111,12 @@ fn list_ollama_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderErr
     );
 
     stream.write_all(request.as_bytes())
-        .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+        .map_err(|e| ProviderError::RequestFailed(
+            e.message.unwrap_or_else(|| "Write failed".to_string())
+        ))?;
 
     // Read response
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)
-        .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-    let response_str = String::from_utf8_lossy(&response);
+    let response_str = read_response(&stream)?;
     
     // Find body (after \r\n\r\n)
     let body = response_str
@@ -160,19 +200,10 @@ fn parse_model_object(json: &str) -> Option<ModelInfo> {
 
 /// List models from OpenAI-compatible API (GET /v1/models)
 fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError> {
-    if provider.is_https() {
-        return Err(ProviderError::HttpsNotSupported);
-    }
-
     let (host, port) = provider.host_port()
         .ok_or_else(|| ProviderError::ConnectionFailed("Invalid URL".to_string()))?;
 
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
+    let stream = connect(provider)?;
 
     // Build request with optional API key
     let auth_header = match &provider.api_key {
@@ -180,23 +211,31 @@ fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderErr
         None => String::new(),
     };
 
+    // Use base_path from URL if provided (e.g., "/openai/v1" for Groq)
+    let base = provider.base_path();
+    let path = if base.is_empty() || base == "/" {
+        String::from("/v1/models")
+    } else if base.ends_with("/v1") {
+        format!("{}/models", base)
+    } else {
+        format!("{}/models", base.trim_end_matches('/'))
+    };
+
     let request = format!(
-        "GET /v1/models HTTP/1.0\r\n\
+        "GET {} HTTP/1.0\r\n\
          Host: {}:{}\r\n\
          {}Connection: close\r\n\
          \r\n",
-        host, port, auth_header
+        path, host, port, auth_header
     );
 
     stream.write_all(request.as_bytes())
-        .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+        .map_err(|e| ProviderError::RequestFailed(
+            e.message.unwrap_or_else(|| "Write failed".to_string())
+        ))?;
 
     // Read response
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)
-        .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-    let response_str = String::from_utf8_lossy(&response);
+    let response_str = read_response(&stream)?;
     
     // Check for HTTP errors
     if response_str.contains("401") || response_str.contains("Unauthorized") {
@@ -333,19 +372,6 @@ fn extract_json_number(json: &str, key: &str) -> Option<u64> {
 
 /// Test connection to a provider
 pub fn test_connection(provider: &Provider) -> Result<(), ProviderError> {
-    if provider.is_https() {
-        return Err(ProviderError::HttpsNotSupported);
-    }
-
-    let (host, port) = provider.host_port()
-        .ok_or_else(|| ProviderError::ConnectionFailed("Invalid URL".to_string()))?;
-
-    let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect_timeout(
-        &addr.parse().map_err(|e| ProviderError::ConnectionFailed(format!("{}", e)))?,
-        Duration::from_secs(5)
-    ).map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
-
-    drop(stream);
+    let _ = connect(provider)?;
     Ok(())
 }
