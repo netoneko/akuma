@@ -10,7 +10,7 @@ use alloc::vec;
 use libakuma::net::{resolve, TcpStream};
 use libakuma::print;
 use libakuma_tls::transport::TcpTransport;
-use libakuma_tls::{TlsStream, TLS_RECORD_SIZE};
+use libakuma_tls::{find_headers_end, TlsStream, TLS_RECORD_SIZE};
 
 use crate::error::{Error, Result};
 use crate::http::Url;
@@ -110,7 +110,7 @@ impl StreamingConnection {
                 Ok(n) => {
                     header_buf.extend_from_slice(&temp[..n]);
                     // Check if we have complete headers
-                    if let Some(end) = find_header_end(&header_buf) {
+                    if let Some(end) = find_headers_end(&header_buf) {
                         // Parse headers
                         let (status, headers, is_chunked) = parse_headers(&header_buf[..end])?;
                         
@@ -312,6 +312,8 @@ where
     let mut chunk_state = ChunkedState::new();
     let mut total_bytes = 0usize;
     let mut last_progress = 0usize;
+    let mut last_progress_time = libakuma::uptime();
+    let start_time = last_progress_time;
     
     loop {
         match tls.read(&mut temp) {
@@ -319,7 +321,7 @@ where
             Ok(n) => {
                 if !headers_parsed {
                     header_buf.extend_from_slice(&temp[..n]);
-                    if let Some(end) = find_header_end(&header_buf) {
+                    if let Some(end) = find_headers_end(&header_buf) {
                         let (status, headers, chunked) = parse_headers(&header_buf[..end])?;
                         
                         if status != 200 {
@@ -372,10 +374,16 @@ where
                 
                 // Progress reporting
                 if total_bytes - last_progress >= 65536 {
+                    let now = libakuma::uptime();
+                    let interval_bytes = total_bytes - last_progress;
+                    let interval_time = now - last_progress_time;
                     print("scratch: received ");
-                    print_size(total_bytes);
-                    print("\r");
+                    print_size_kb(total_bytes);
+                    print(" (");
+                    print_speed_kbps(interval_bytes, interval_time);
+                    print(")    \r");
                     last_progress = total_bytes;
+                    last_progress_time = now;
                 }
             }
             Err(_) => {
@@ -385,9 +393,12 @@ where
         }
     }
     
+    let total_elapsed = libakuma::uptime() - start_time;
     print("scratch: download finished, total ");
-    print_size(total_bytes);
-    print("\n");
+    print_size_kb(total_bytes);
+    print(" (");
+    print_speed_kbps(total_bytes, total_elapsed);
+    print(")\n");
     
     let _ = tls.close();
     Ok(())
@@ -506,14 +517,7 @@ fn find_crlf_slice(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-    }
-    None
-}
+// find_headers_end is imported from libakuma_tls
 
 fn parse_headers(data: &[u8]) -> Result<(u16, Vec<(String, String)>, bool)> {
     let header_str = core::str::from_utf8(data)
@@ -588,19 +592,22 @@ fn decode_chunked_inplace(data: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn print_size(bytes: usize) {
-    if bytes >= 1024 * 1024 {
-        let mb = bytes / (1024 * 1024);
-        print_num(mb);
-        print(" MB");
-    } else if bytes >= 1024 {
-        let kb = bytes / 1024;
-        print_num(kb);
-        print(" KB");
-    } else {
-        print_num(bytes);
-        print(" bytes");
+fn print_size_kb(bytes: usize) {
+    let kb = bytes / 1024;
+    print_num(kb);
+    print(" KB");
+}
+
+fn print_speed_kbps(bytes: usize, elapsed_us: u64) {
+    if elapsed_us == 0 {
+        print("-- kbps");
+        return;
     }
+    // kbps = (bytes / 1024) / (elapsed_us / 1_000_000) = bytes * 1_000_000 / (1024 * elapsed_us)
+    // Simplify to avoid overflow: bytes * 976 / elapsed_us (approx 1000000/1024)
+    let kbps = (bytes as u64 * 976) / elapsed_us;
+    print_num(kbps as usize);
+    print(" kbps");
 }
 
 fn print_num(n: usize) {

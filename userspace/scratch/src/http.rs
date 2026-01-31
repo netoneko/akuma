@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use libakuma::net::{resolve, TcpStream};
 use libakuma::print;
 use libakuma_tls::transport::TcpTransport;
-use libakuma_tls::{TlsStream, TLS_RECORD_SIZE};
+use libakuma_tls::{find_headers_end, TlsStream, TLS_RECORD_SIZE};
 
 use crate::error::{Error, Result};
 
@@ -261,6 +261,7 @@ fn read_tls_response(tls: &mut TlsStream<'_>) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     let mut last_report = 0usize;
+    let mut last_report_time = libakuma::uptime();
 
     loop {
         match tls.read(&mut buf) {
@@ -269,10 +270,16 @@ fn read_tls_response(tls: &mut TlsStream<'_>) -> Result<Vec<u8>> {
                 response.extend_from_slice(&buf[..n]);
                 // Print progress every 64KB
                 if response.len() - last_report >= 65536 {
+                    let now = libakuma::uptime();
+                    let interval_bytes = response.len() - last_report;
+                    let interval_time = now - last_report_time;
                     print("scratch: received ");
-                    print_size(response.len());
-                    print("\r");
+                    print_size_kb(response.len());
+                    print(" (");
+                    print_speed_kbps(interval_bytes, interval_time);
+                    print(")    \r");
                     last_report = response.len();
+                    last_report_time = now;
                 }
             }
             Err(_) => break,
@@ -286,19 +293,22 @@ fn read_tls_response(tls: &mut TlsStream<'_>) -> Result<Vec<u8>> {
     Ok(response)
 }
 
-fn print_size(bytes: usize) {
-    if bytes >= 1024 * 1024 {
-        let mb = bytes / (1024 * 1024);
-        print_num(mb);
-        print(" MB");
-    } else if bytes >= 1024 {
-        let kb = bytes / 1024;
-        print_num(kb);
-        print(" KB");
-    } else {
-        print_num(bytes);
-        print(" bytes");
+fn print_size_kb(bytes: usize) {
+    let kb = bytes / 1024;
+    print_num(kb);
+    print(" KB");
+}
+
+fn print_speed_kbps(bytes: usize, elapsed_us: u64) {
+    if elapsed_us == 0 {
+        print("-- kbps");
+        return;
     }
+    // kbps = (bytes / 1024) / (elapsed_us / 1_000_000) = bytes * 1_000_000 / (1024 * elapsed_us)
+    // Simplify to avoid overflow: bytes * 976 / elapsed_us (approx 1000000/1024)
+    let kbps = (bytes as u64 * 976) / elapsed_us;
+    print_num(kbps as usize);
+    print(" kbps");
 }
 
 fn print_num(n: usize) {
@@ -323,7 +333,7 @@ fn print_num(n: usize) {
 
 fn parse_response(data: &[u8]) -> Result<Response> {
     // Find end of headers
-    let headers_end = find_header_end(data)
+    let headers_end = find_headers_end(data)
         .ok_or_else(|| Error::http("invalid HTTP response: no header end"))?;
 
     let header_str = core::str::from_utf8(&data[..headers_end])
@@ -435,20 +445,7 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-    }
-    // Try \n\n as well
-    for i in 0..data.len().saturating_sub(1) {
-        if &data[i..i + 2] == b"\n\n" {
-            return Some(i + 2);
-        }
-    }
-    None
-}
+// find_headers_end is imported from libakuma_tls
 
 fn parse_status_line(line: &str) -> Result<u16> {
     // Format: "HTTP/1.1 200 OK"
