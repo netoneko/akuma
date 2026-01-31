@@ -1,6 +1,78 @@
 # Meow - LLM Chat Client
 
-Meow is a userspace chat client that connects to a locally-hosted Ollama LLM server. It provides an interactive REPL with a cyberpunk cat persona and supports tool calling for filesystem and network operations.
+Meow is an LLM chat client that connects to a locally-hosted Ollama server. There are two versions:
+
+1. **Userspace meow** (`userspace/meow/`) - Runs inside the Akuma kernel guest, limited tools
+2. **meow-local** (`tools/meow-local/`) - Runs natively on the host, can edit Akuma source code
+
+Both support tool calling for filesystem operations and streaming responses.
+
+---
+
+## meow-local (Native Host Version)
+
+The native version runs on your host machine and can edit the Akuma kernel source code.
+
+### Usage
+
+```bash
+# Build
+cd tools/meow-local && cargo build --release
+
+# Run from akuma directory (sandbox = current dir)
+./tools/meow-local/target/release/meow-local
+
+# Specify working directory
+meow-local -C /path/to/akuma
+
+# One-shot query
+meow-local "explain the threading model"
+```
+
+### Code Editing Tools
+
+| Tool | Args | Description |
+|------|------|-------------|
+| `FileReadLines` | `filename`, `start`, `end` | Read specific line ranges with line numbers |
+| `CodeSearch` | `pattern`, `path`, `context` | Regex search across .rs files with context |
+| `FileEdit` | `filename`, `old_text`, `new_text` | Search-and-replace (requires unique match) |
+
+### All meow-local Tools
+
+| Tool | Description |
+|------|-------------|
+| `FileRead` | Read entire file (max 1MB) |
+| `FileWrite` | Create/overwrite file |
+| `FileAppend` | Append to file |
+| `FileExists` | Check if file exists |
+| `FileList` | List directory contents |
+| `FileDelete` | Delete file |
+| `FolderCreate` | Create directory |
+| `FileCopy` | Copy file |
+| `FileMove` | Move file |
+| `FileRename` | Rename file |
+| `FileReadLines` | Read line range with numbers |
+| `CodeSearch` | Grep-like regex search |
+| `FileEdit` | Precise search-and-replace |
+| `HttpFetch` | HTTP GET (no HTTPS) |
+| `Shell` | Execute shell commands (sandboxed) |
+| `CompactContext` | Summarize conversation to save tokens |
+
+### Sandboxing
+
+All file operations are sandboxed to the working directory. The `Shell` tool wraps commands to prevent escaping the sandbox via `cd`.
+
+### Testing
+
+```bash
+cd tools/meow-local && cargo test
+```
+
+---
+
+## Userspace meow (Guest Version)
+
+Runs inside the Akuma kernel as a userspace binary. More limited than meow-local.
 
 ## Usage
 
