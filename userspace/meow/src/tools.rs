@@ -22,12 +22,12 @@ use crate::code_search;
 /// Current working directory for git operations
 static mut WORKING_DIR: Option<String> = None;
 
-/// Get the current working directory (defaults to "/")
+/// Get the current working directory (from process cwd or override)
 pub fn get_working_dir() -> String {
     unsafe {
         match &WORKING_DIR {
             Some(dir) => dir.clone(),
-            None => String::from("/"),
+            None => String::from(libakuma::getcwd()),
         }
     }
 }

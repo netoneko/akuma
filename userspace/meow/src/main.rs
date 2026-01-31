@@ -107,7 +107,8 @@ You have access to filesystem tools! When you need to perform file operations, o
 
 11. **Cd** - Change working directory (for git operations)
     Args: `{"path": "/path/to/directory"}`
-    Note: All git commands operate in this directory. Use after cloning a repo.
+    Note: All git and file commands operate in this directory. Use after cloning a repo.
+    Caveat: quickjs and sqld do not respect cwd as of now.
 
 12. **Pwd** - Print current working directory
     Args: `{}`
