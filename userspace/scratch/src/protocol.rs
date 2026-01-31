@@ -607,3 +607,296 @@ fn parse_upload_pack_response(data: &[u8], caps: &Capabilities) -> Result<Vec<u8
         Ok(remaining.to_vec())
     }
 }
+
+// ============================================================================
+// Push Protocol (git-receive-pack)
+// ============================================================================
+
+/// Capabilities for receive-pack
+#[derive(Debug, Default)]
+pub struct ReceiveCapabilities {
+    pub report_status: bool,
+    pub delete_refs: bool,
+    pub side_band_64k: bool,
+    pub ofs_delta: bool,
+}
+
+impl ReceiveCapabilities {
+    fn parse(caps_str: &str) -> Self {
+        let mut caps = ReceiveCapabilities::default();
+        
+        for cap in caps_str.split(' ') {
+            match cap {
+                "report-status" => caps.report_status = true,
+                "delete-refs" => caps.delete_refs = true,
+                "side-band-64k" => caps.side_band_64k = true,
+                "ofs-delta" => caps.ofs_delta = true,
+                _ => {}
+            }
+        }
+        
+        caps
+    }
+}
+
+impl ProtocolClient {
+    /// Discover refs for push
+    pub fn discover_refs_for_push(&mut self, auth: Option<&str>) -> Result<(Vec<RemoteRef>, ReceiveCapabilities)> {
+        let path = self.url.info_refs_receive_url();
+        
+        print("scratch: fetching refs for push from ");
+        print(&path);
+        print("\n");
+
+        let response = self.client.get_with_auth(&path, auth)?;
+
+        if response.status == 401 {
+            return Err(Error::protocol("authentication required"));
+        }
+
+        if response.status != 200 {
+            return Err(Error::http(&format!("status {}", response.status)));
+        }
+
+        // Check content type
+        let content_type = response.header("Content-Type").unwrap_or("");
+        if !content_type.contains("x-git-receive-pack-advertisement") {
+            return Err(Error::protocol("not a smart Git server (receive-pack)"));
+        }
+
+        parse_receive_ref_discovery(&response.body)
+    }
+
+    /// Push pack to remote
+    ///
+    /// # Arguments
+    /// * `old_sha` - Current SHA of the ref on remote (zeros for new ref)
+    /// * `new_sha` - New SHA to update the ref to
+    /// * `ref_name` - Full ref name (e.g., "refs/heads/main")
+    /// * `pack_data` - Pack file data containing objects
+    /// * `caps` - Server capabilities
+    /// * `auth` - Optional authentication header value
+    pub fn push_pack(
+        &mut self,
+        old_sha: &Sha1Hash,
+        new_sha: &Sha1Hash,
+        ref_name: &str,
+        pack_data: &[u8],
+        caps: &ReceiveCapabilities,
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let path = self.url.receive_pack_url();
+        
+        print("scratch: pushing to ");
+        print(&path);
+        print("\n");
+
+        // Build request body
+        let body = build_receive_pack_request(old_sha, new_sha, ref_name, pack_data, caps);
+
+        let response = self.client.post_with_auth(
+            &path,
+            "application/x-git-receive-pack-request",
+            &body,
+            auth,
+        )?;
+
+        if response.status == 401 {
+            return Err(Error::protocol("authentication required"));
+        }
+
+        if response.status != 200 {
+            return Err(Error::http(&format!("push failed with status {}", response.status)));
+        }
+
+        // Parse response for status
+        parse_receive_pack_response(&response.body, caps)?;
+
+        Ok(())
+    }
+}
+
+/// Parse ref discovery response for receive-pack
+fn parse_receive_ref_discovery(data: &[u8]) -> Result<(Vec<RemoteRef>, ReceiveCapabilities)> {
+    let mut pos = 0;
+    let mut refs = Vec::new();
+    let mut capabilities = ReceiveCapabilities::default();
+    let mut first_ref = true;
+
+    // First line should be "# service=git-receive-pack\n"
+    let (first_line, consumed) = pktline::read_pkt_line(data)?;
+    pos += consumed;
+    
+    if let Some(line) = first_line {
+        let line_str = core::str::from_utf8(line)
+            .map_err(|_| Error::protocol("invalid service line"))?;
+        if !line_str.contains("git-receive-pack") {
+            return Err(Error::protocol("unexpected service"));
+        }
+    }
+
+    // Skip flush packet after service line
+    let (_, consumed) = pktline::read_pkt_line(&data[pos..])?;
+    pos += consumed;
+
+    // Parse refs
+    while pos < data.len() {
+        let (content, consumed) = pktline::read_pkt_line(&data[pos..])?;
+        pos += consumed;
+
+        let line = match content {
+            None => break, // Flush packet
+            Some(l) => l,
+        };
+
+        // Parse ref line
+        if let Some((sha_hex, ref_name, caps_opt)) = pktline::parse_ref_line(line) {
+            // Handle zero-id for empty repo
+            let sha = if sha_hex == "0000000000000000000000000000000000000000" {
+                [0u8; 20]
+            } else {
+                sha1::from_hex(&sha_hex)
+                    .ok_or_else(|| Error::protocol("invalid ref SHA"))?
+            };
+
+            refs.push(RemoteRef {
+                sha,
+                name: ref_name,
+            });
+
+            // First ref has capabilities
+            if first_ref {
+                if let Some(caps_str) = caps_opt {
+                    capabilities = ReceiveCapabilities::parse(&caps_str);
+                }
+                first_ref = false;
+            }
+        }
+    }
+
+    Ok((refs, capabilities))
+}
+
+/// Build receive-pack request body
+fn build_receive_pack_request(
+    old_sha: &Sha1Hash,
+    new_sha: &Sha1Hash,
+    ref_name: &str,
+    pack_data: &[u8],
+    caps: &ReceiveCapabilities,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    // Build capabilities string
+    let mut caps_str = String::from("report-status");
+    if caps.side_band_64k {
+        caps_str.push_str(" side-band-64k");
+    }
+    caps_str.push_str(" agent=scratch/1.0");
+
+    // Ref update line: "<old-sha> <new-sha> <ref-name>\0<capabilities>\n"
+    let update_line = format!(
+        "{} {} {}\0{}\n",
+        sha1::to_hex(old_sha),
+        sha1::to_hex(new_sha),
+        ref_name,
+        caps_str
+    );
+    body.extend_from_slice(&pktline::write_pkt_line(update_line.as_bytes()));
+
+    // Flush packet to end ref updates
+    body.extend_from_slice(&pktline::write_flush());
+
+    // Pack data follows directly
+    body.extend_from_slice(pack_data);
+
+    body
+}
+
+/// Parse receive-pack response
+fn parse_receive_pack_response(data: &[u8], caps: &ReceiveCapabilities) -> Result<()> {
+    if data.is_empty() {
+        // Some servers send empty response on success
+        return Ok(());
+    }
+
+    let mut pos = 0;
+    let mut had_error = false;
+    let mut error_msg = String::new();
+
+    while pos < data.len() {
+        let (content, consumed) = match pktline::read_pkt_line(&data[pos..]) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        pos += consumed;
+
+        let line = match content {
+            None => continue, // Flush packet
+            Some(l) => l,
+        };
+
+        // Handle sideband
+        if caps.side_band_64k && !line.is_empty() {
+            match line[0] {
+                1 => {
+                    // Data channel - parse status
+                    let payload = &line[1..];
+                    if let Ok(status) = core::str::from_utf8(payload) {
+                        if status.starts_with("unpack ok") {
+                            // Good
+                        } else if status.starts_with("unpack ") {
+                            had_error = true;
+                            error_msg = String::from(status);
+                        } else if status.starts_with("ng ") {
+                            had_error = true;
+                            error_msg = String::from(status);
+                        } else if status.starts_with("ok ") {
+                            // Ref updated successfully
+                        }
+                    }
+                }
+                2 => {
+                    // Progress
+                    if let Ok(msg) = core::str::from_utf8(&line[1..]) {
+                        print("remote: ");
+                        print(msg.trim());
+                        print("\n");
+                    }
+                }
+                3 => {
+                    // Error
+                    if let Ok(msg) = core::str::from_utf8(&line[1..]) {
+                        return Err(Error::protocol(msg.trim()));
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            // No sideband - direct status
+            if let Ok(status) = core::str::from_utf8(line) {
+                let status = status.trim();
+                if status.starts_with("unpack ok") {
+                    // Good
+                } else if status.starts_with("unpack ") {
+                    had_error = true;
+                    error_msg = String::from(status);
+                } else if status.starts_with("ng ") {
+                    had_error = true;
+                    error_msg = String::from(status);
+                } else if status.starts_with("ok ") {
+                    // Ref updated successfully
+                    print("scratch: ");
+                    print(status);
+                    print("\n");
+                }
+            }
+        }
+    }
+
+    if had_error {
+        return Err(Error::protocol(&error_msg));
+    }
+
+    Ok(())
+}

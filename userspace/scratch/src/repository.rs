@@ -8,8 +8,10 @@ use alloc::vec::Vec;
 
 use libakuma::{close, mkdir, open, open_flags, print, write_fd};
 
+use crate::base64;
 use crate::error::{Error, Result};
 use crate::http::Url;
+use crate::pack_write;
 use crate::protocol::ProtocolClient;
 use crate::refs::RefManager;
 use crate::sha1::{self, Sha1Hash};
@@ -216,6 +218,106 @@ pub fn fetch() -> Result<()> {
     }
 
     print("scratch: fetch complete\n");
+    Ok(())
+}
+
+/// Checkout a branch
+pub fn checkout(branch_name: &str) -> Result<()> {
+    let refs = RefManager::new(GIT_DIR);
+    let store = ObjectStore::new(GIT_DIR);
+
+    // Resolve branch to SHA
+    let branch_sha = refs.read_branch(branch_name)?;
+
+    // Update working directory
+    checkout_tree(&store, &branch_sha, ".")?;
+
+    // Update HEAD to point to the branch
+    refs.set_head_branch(branch_name)?;
+
+    Ok(())
+}
+
+/// Push current branch to origin
+pub fn push(token: Option<&str>) -> Result<()> {
+    let refs = RefManager::new(GIT_DIR);
+    let store = ObjectStore::new(GIT_DIR);
+
+    // Get current branch name
+    let head = refs.read_head()?;
+    let head = head.trim();
+    
+    let branch_name = head
+        .strip_prefix("ref: refs/heads/")
+        .ok_or_else(|| Error::io("not on a branch (detached HEAD)"))?;
+
+    print("scratch: pushing branch ");
+    print(branch_name);
+    print("\n");
+
+    // Get local commit SHA
+    let local_sha = refs.read_branch(branch_name)?;
+
+    // Read remote URL from config
+    let config = read_config(GIT_DIR)?;
+    let parsed_url = Url::parse(&config.remote_url)?;
+
+    // Create auth header if token provided
+    let auth = token.map(|t| base64::basic_auth("git", t));
+    let auth_ref = auth.as_deref();
+
+    // Create protocol client
+    let mut client = ProtocolClient::new(parsed_url);
+
+    // Discover remote refs
+    let (remote_refs, caps) = client.discover_refs_for_push(auth_ref)?;
+
+    // Find remote ref for this branch
+    let ref_name = format!("refs/heads/{}", branch_name);
+    let old_sha = remote_refs
+        .iter()
+        .find(|r| r.name == ref_name)
+        .map(|r| r.sha)
+        .unwrap_or([0u8; 20]); // Zero SHA for new branch
+
+    // Check if already up to date
+    if old_sha == local_sha {
+        print("scratch: already up to date\n");
+        return Ok(());
+    }
+
+    // Check for non-fast-forward (if old_sha is not zero and not an ancestor)
+    // For now, we'll let the server reject non-fast-forward pushes
+
+    print("scratch: ");
+    print(&sha1::to_hex(&old_sha)[..7]);
+    print(" -> ");
+    print(&sha1::to_hex(&local_sha)[..7]);
+    print("\n");
+
+    // Collect objects to push
+    // Get list of objects remote already has
+    let have: Vec<Sha1Hash> = remote_refs.iter().map(|r| r.sha).collect();
+    
+    let objects = pack_write::collect_objects_for_push(&local_sha, &have, &store)?;
+
+    print("scratch: packing ");
+    print_num(objects.len());
+    print(" objects\n");
+
+    // Create pack file
+    let pack_data = pack_write::create_pack(&objects, &store)?;
+
+    print("scratch: pack size ");
+    print_num(pack_data.len());
+    print(" bytes\n");
+
+    // Push to remote
+    client.push_pack(&old_sha, &local_sha, &ref_name, &pack_data, &caps, auth_ref)?;
+
+    // Update remote tracking ref
+    refs.write_remote_ref("origin", branch_name, &local_sha)?;
+
     Ok(())
 }
 

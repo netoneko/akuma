@@ -9,21 +9,27 @@ Scratch provides basic Git functionality without requiring the full Git binary o
 ### Supported Commands
 
 ```bash
-scratch clone <url>     # Clone a repository
-scratch fetch           # Fetch updates from origin
-scratch status          # Show current HEAD and branch
-scratch branch          # List branches
-scratch branch <name>   # Create a new branch
-scratch tag             # List tags
-scratch help            # Show help
+scratch clone <url>           # Clone a repository
+scratch fetch                 # Fetch updates from origin
+scratch commit -m <msg>       # Commit all changes
+scratch checkout <branch>     # Switch to a branch
+scratch push                  # Push current branch to origin
+scratch push --token <tok>    # Push with authentication token
+scratch status                # Show current HEAD and branch
+scratch branch                # List branches
+scratch branch <name>         # Create a new branch
+scratch tag                   # List tags
+scratch help                  # Show help
 ```
 
 ### Key Features
 
+- **Full Git workflow**: Clone, commit, push - everything needed for basic development
 - **No force push**: Force push is permanently disabled for safety
 - **Streaming downloads**: Pack files are processed in chunks to minimize memory usage
 - **HTTPS support**: Uses TLS 1.3 via libakuma-tls
 - **GitHub compatible**: Tested with GitHub's Smart HTTP protocol
+- **Token authentication**: HTTP Basic auth with personal access tokens
 
 ## Architecture
 
@@ -33,16 +39,19 @@ scratch help            # Show help
 scratch/
 ├── main.rs          # CLI entry point and command dispatch
 ├── error.rs         # Error types and handling
-├── http.rs          # HTTP/HTTPS client with chunked encoding
+├── http.rs          # HTTP/HTTPS client with chunked encoding and auth
 ├── stream.rs        # Streaming HTTP response processing
-├── protocol.rs      # Git Smart HTTP protocol implementation
+├── protocol.rs      # Git Smart HTTP protocol (upload-pack & receive-pack)
 ├── pktline.rs       # Git pkt-line framing protocol
 ├── pack.rs          # Pack file parser (in-memory, legacy)
 ├── pack_stream.rs   # Streaming pack parser
+├── pack_write.rs    # Pack file creation for push
 ├── object.rs        # Git object types (blob, tree, commit, tag)
 ├── store.rs         # Object storage (.git/objects/)
 ├── refs.rs          # Reference management (.git/refs/)
 ├── repository.rs    # High-level repository operations
+├── commit.rs        # Commit creation from working directory
+├── base64.rs        # Base64 encoding for HTTP Basic auth
 ├── sha1.rs          # SHA-1 hashing wrapper
 └── zlib.rs          # Zlib compression/decompression
 ```
@@ -79,6 +88,55 @@ scratch/
 6. Checkout
    └─> Read commit object to get tree SHA
    └─> Recursively checkout tree to working directory
+```
+
+### Data Flow for Commit
+
+```
+1. Scan Working Directory
+   └─> Recursively read all files (skip .git and hidden)
+
+2. Create Blob Objects
+   └─> For each file: hash content, compress, write to .git/objects/
+
+3. Build Tree Objects
+   └─> For each directory: create tree with entries (mode, name, sha)
+   └─> Trees reference blobs and subtrees
+
+4. Create Commit Object
+   └─> Reference root tree SHA
+   └─> Reference parent commit (current HEAD)
+   └─> Add author/committer with timestamp
+   └─> Add commit message
+
+5. Update Branch Ref
+   └─> Write new commit SHA to .git/refs/heads/<branch>
+```
+
+### Data Flow for Push
+
+```
+1. Discover Remote Refs
+   └─> GET /info/refs?service=git-receive-pack
+   └─> Parse refs and capabilities
+
+2. Collect Objects to Send
+   └─> Walk commit -> tree -> blobs
+   └─> Exclude objects remote already has
+
+3. Create Pack File
+   └─> Write PACK header (magic + version + count)
+   └─> For each object: type/size header + compressed data
+   └─> Append SHA-1 checksum
+
+4. Send to Remote
+   └─> POST /git-receive-pack
+   └─> Send ref update line (old-sha new-sha ref-name)
+   └─> Send pack file
+
+5. Process Response
+   └─> Parse status (ok/ng for each ref)
+   └─> Update remote tracking ref on success
 ```
 
 ### Memory Efficiency
@@ -151,19 +209,19 @@ miniz_oxide = { version = "0.8", default-features = false, features = ["with-all
 ## Limitations
 
 - **HTTPS only**: HTTP without TLS is not fully implemented for streaming
-- **No push**: Push functionality is not yet implemented
 - **No merge**: Merge operations are not supported
 - **No diff**: Cannot show diffs between commits
 - **No SSH**: Only HTTP(S) transport is supported
-- **No authentication**: Token/password auth not yet implemented
+- **No staging**: Commits include all changes (like `git add -A && git commit`)
+- **Fast-forward only**: Non-fast-forward pushes are rejected
 
 ## Future Work
 
-1. **Push support**: Implement git-receive-pack protocol
-2. **Authentication**: Support for GitHub tokens
-3. **Incremental fetch**: Better "have" negotiation for updates
-4. **Shallow clones**: Support for `--depth` option
-5. **Sparse checkout**: Only checkout specific paths
+1. **Incremental fetch**: Better "have" negotiation for updates
+2. **Shallow clones**: Support for `--depth` option
+3. **Sparse checkout**: Only checkout specific paths
+4. **Staging area**: Support for selective commits
+5. **Diff viewing**: Show changes between commits
 
 ## Usage Examples
 
@@ -213,6 +271,42 @@ Output:
 ```
 * main
   safe-print
+```
+
+### Create a Branch and Commit
+
+```bash
+# Create and switch to a new branch
+scratch branch my-feature
+scratch checkout my-feature
+
+# Make changes to files...
+
+# Commit all changes
+scratch commit -m "Add new feature"
+```
+
+Output:
+```
+scratch: committing changes...
+scratch: created commit a1b2c3d4e5f6...
+```
+
+### Push to Remote
+
+```bash
+# Push with GitHub personal access token
+scratch push --token ghp_xxxxxxxxxxxx
+```
+
+Output:
+```
+scratch: pushing branch my-feature
+scratch: fd85067 -> a1b2c3d
+scratch: packing 5 objects
+scratch: pack size 1234 bytes
+scratch: ok refs/heads/my-feature
+scratch: push complete
 ```
 
 ## Integration with Meow

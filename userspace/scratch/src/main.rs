@@ -33,6 +33,9 @@ mod http;
 mod stream;
 mod pack_stream;
 mod repository;
+mod commit;
+mod base64;
+mod pack_write;
 
 use libakuma::{arg, argc, exit, print};
 
@@ -64,6 +67,8 @@ fn main() -> i32 {
         "clone" => cmd_clone(),
         "fetch" => cmd_fetch(),
         "push" => cmd_push(),
+        "commit" => cmd_commit(),
+        "checkout" => cmd_checkout(),
         "branch" => cmd_branch(),
         "tag" => cmd_tag(),
         "status" => cmd_status(),
@@ -86,6 +91,8 @@ fn print_usage() {
     print("Usage:\n");
     print("  scratch clone <url>          Clone a repository\n");
     print("  scratch fetch                Fetch updates from remote\n");
+    print("  scratch commit -m <msg>      Commit all changes\n");
+    print("  scratch checkout <branch>    Switch to a branch\n");
     print("  scratch branch               List branches\n");
     print("  scratch branch <name>        Create a branch\n");
     print("  scratch branch -d <name>     Delete a branch\n");
@@ -93,7 +100,8 @@ fn print_usage() {
     print("  scratch tag <name>           Create a tag\n");
     print("  scratch tag -d <name>        Delete a tag\n");
     print("  scratch status               Show current HEAD\n");
-    print("  scratch push                 Push to remote (NOT YET IMPLEMENTED)\n");
+    print("  scratch push                 Push to remote\n");
+    print("  scratch push --token <tok>   Push with auth token\n");
     print("  scratch help                 Show this help\n");
     print("\n");
     print("NOTE: Force push is permanently disabled for safety.\n");
@@ -283,6 +291,12 @@ fn cmd_tag() -> i32 {
 fn cmd_status() -> i32 {
     match refs::read_head() {
         Ok(head) => {
+            // Show branch name if on a branch
+            if let Ok(Some(branch)) = commit::current_branch() {
+                print("On branch ");
+                print(&branch);
+                print("\n");
+            }
             print("HEAD: ");
             print(&head);
             print("\n");
@@ -297,10 +311,85 @@ fn cmd_status() -> i32 {
     }
 }
 
+fn cmd_commit() -> i32 {
+    // Parse arguments: scratch commit -m "message"
+    let mut message: Option<&str> = None;
+    let mut i = 2;
+    
+    while i < argc() {
+        match arg(i) {
+            Some("-m") => {
+                i += 1;
+                message = arg(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let message = match message {
+        Some(m) => m,
+        None => {
+            print("scratch: commit requires -m <message>\n");
+            print("Usage: scratch commit -m \"commit message\"\n");
+            return 1;
+        }
+    };
+
+    print("scratch: committing changes...\n");
+
+    match commit::create_commit(message, None, None) {
+        Ok(sha) => {
+            print("scratch: created commit ");
+            print(&crate::sha1::to_hex(&sha));
+            print("\n");
+            0
+        }
+        Err(e) => {
+            print("scratch: commit failed: ");
+            print(e.message());
+            print("\n");
+            1
+        }
+    }
+}
+
+fn cmd_checkout() -> i32 {
+    let target = match arg(2) {
+        Some(t) => t,
+        None => {
+            print("scratch: checkout requires a branch name\n");
+            print("Usage: scratch checkout <branch>\n");
+            return 1;
+        }
+    };
+
+    print("scratch: switching to branch ");
+    print(target);
+    print("\n");
+
+    match repository::checkout(target) {
+        Ok(()) => {
+            print("scratch: switched to branch ");
+            print(target);
+            print("\n");
+            0
+        }
+        Err(e) => {
+            print("scratch: checkout failed: ");
+            print(e.message());
+            print("\n");
+            1
+        }
+    }
+}
+
 fn cmd_push() -> i32 {
     // SAFETY: Force push is permanently disabled
     // Check all arguments for force push indicators
     let mut i = 2;
+    let mut token: Option<&str> = None;
+    
     while i < argc() {
         if let Some(arg_str) = arg(i) {
             // Check for force push flags
@@ -315,12 +404,30 @@ fn cmd_push() -> i32 {
                 print("scratch: This safety measure cannot be bypassed.\n");
                 return -1;
             }
+            // Check for --token
+            if arg_str == "--token" {
+                i += 1;
+                token = arg(i);
+            }
         }
         i += 1;
     }
 
-    // Normal push (not yet implemented)
-    print("scratch: push is not yet implemented\n");
-    print("scratch: (force push will never be implemented - it is permanently disabled)\n");
-    1
+    print("scratch: pushing to origin\n");
+
+    match repository::push(token) {
+        Ok(()) => {
+            print("scratch: push complete\n");
+            0
+        }
+        Err(e) => {
+            print("scratch: push failed: ");
+            print(e.message());
+            print("\n");
+            if e.message().contains("authentication") {
+                print("scratch: hint: use --token <your-token> for authentication\n");
+            }
+            1
+        }
+    }
 }

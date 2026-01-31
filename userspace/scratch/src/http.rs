@@ -81,6 +81,16 @@ impl Url {
     pub fn upload_pack_url(&self) -> String {
         format!("{}/git-upload-pack", self.path)
     }
+
+    /// Get the URL for info/refs for receive-pack (push)
+    pub fn info_refs_receive_url(&self) -> String {
+        format!("{}/info/refs?service=git-receive-pack", self.path)
+    }
+
+    /// Get the URL for git-receive-pack (push)
+    pub fn receive_pack_url(&self) -> String {
+        format!("{}/git-receive-pack", self.path)
+    }
 }
 
 /// HTTP response
@@ -145,19 +155,55 @@ impl HttpClient {
 
     /// Send POST request with body
     pub fn post(&mut self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
+        self.post_with_auth(path, content_type, body, None)
+    }
+
+    /// Send POST request with optional authentication
+    pub fn post_with_auth(
+        &mut self,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        auth: Option<&str>,
+    ) -> Result<Response> {
+        let auth_header = match auth {
+            Some(a) => format!("Authorization: {}\r\n", a),
+            None => String::new(),
+        };
+
         let request = format!(
             "POST {} HTTP/1.1\r\n\
              Host: {}\r\n\
              User-Agent: scratch/1.0\r\n\
              Content-Type: {}\r\n\
              Content-Length: {}\r\n\
-             Accept: application/x-git-upload-pack-result\r\n\
+             {}Accept: */*\r\n\
              Connection: close\r\n\
              \r\n",
-            path, self.url.host, content_type, body.len()
+            path, self.url.host, content_type, body.len(), auth_header
         );
 
         self.send_request_with_body(&request, body)
+    }
+
+    /// Send GET request with optional authentication
+    pub fn get_with_auth(&mut self, path: &str, auth: Option<&str>) -> Result<Response> {
+        let auth_header = match auth {
+            Some(a) => format!("Authorization: {}\r\n", a),
+            None => String::new(),
+        };
+
+        let request = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: scratch/1.0\r\n\
+             {}Accept: */*\r\n\
+             Connection: close\r\n\
+             \r\n",
+            path, self.url.host, auth_header
+        );
+
+        self.send_request(&request)
     }
 
     fn send_request(&mut self, request: &str) -> Result<Response> {

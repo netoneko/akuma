@@ -40,6 +40,7 @@ pub mod syscall {
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
     pub const GETRANDOM: u64 = 304;
+    pub const TIME: u64 = 305;
 }
 
 /// File descriptors
@@ -368,6 +369,14 @@ pub fn sleep_ms(milliseconds: u64) {
 #[inline(never)]
 pub fn uptime() -> u64 {
     syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
+}
+
+/// Get current Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+///
+/// Returns 0 if the RTC is not available.
+#[inline(never)]
+pub fn time() -> u64 {
+    syscall(syscall::TIME, 0, 0, 0, 0, 0, 0)
 }
 
 // ============================================================================

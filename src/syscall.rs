@@ -35,6 +35,7 @@ pub mod nr {
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
     pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
+    pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
 }
 
 /// Error code for interrupted syscall
@@ -101,6 +102,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
+        nr::TIME => sys_time(),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -173,6 +175,14 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
 
 fn sys_uptime() -> u64 {
     crate::timer::uptime_us()
+}
+
+/// sys_time - Get current Unix timestamp
+///
+/// Returns the current time as seconds since Unix epoch (1970-01-01 00:00:00 UTC).
+/// Uses the PL031 RTC if available, falls back to 0 if not initialized.
+fn sys_time() -> u64 {
+    crate::timer::utc_seconds().unwrap_or(0)
 }
 
 /// sys_mmap - Map memory pages
