@@ -13,6 +13,8 @@ scratch clone <url>           # Clone a repository
 scratch fetch                 # Fetch updates from origin
 scratch commit -m <msg>       # Commit all changes
 scratch checkout <branch>     # Switch to a branch
+scratch config <key>          # Get a config value
+scratch config <key> <val>    # Set a config value
 scratch push                  # Push current branch to origin
 scratch push --token <tok>    # Push with authentication token
 scratch status                # Show current HEAD and branch
@@ -51,6 +53,7 @@ scratch/
 ├── refs.rs          # Reference management (.git/refs/)
 ├── repository.rs    # High-level repository operations
 ├── commit.rs        # Commit creation from working directory
+├── config.rs        # Git config file parsing and writing
 ├── base64.rs        # Base64 encoding for HTTP Basic auth
 ├── sha1.rs          # SHA-1 hashing wrapper
 └── zlib.rs          # Zlib compression/decompression
@@ -273,6 +276,32 @@ Output:
   safe-print
 ```
 
+### Configure User Identity
+
+Before committing, configure your name and email:
+
+```bash
+scratch config user.name "Your Name"
+scratch config user.email "your@email.com"
+```
+
+Optionally, save your auth token in config (so you don't need `--token` every push):
+
+```bash
+scratch config credential.token ghp_xxxxxxxxxxxx
+```
+
+View current config:
+
+```bash
+scratch config user.name
+```
+
+Output:
+```
+Your Name
+```
+
 ### Create a Branch and Commit
 
 ```bash
@@ -295,7 +324,10 @@ scratch: created commit a1b2c3d4e5f6...
 ### Push to Remote
 
 ```bash
-# Push with GitHub personal access token
+# Push using token from config (if credential.token is set)
+scratch push
+
+# Or push with explicit token
 scratch push --token ghp_xxxxxxxxxxxx
 ```
 
@@ -308,6 +340,59 @@ scratch: pack size 1234 bytes
 scratch: ok refs/heads/my-feature
 scratch: push complete
 ```
+
+## Configuration
+
+Scratch stores configuration in `.git/config` using standard Git INI format:
+
+```ini
+[core]
+    repositoryformatversion = 0
+    filemode = true
+    bare = false
+[remote "origin"]
+    url = https://github.com/user/repo.git
+    fetch = +refs/heads/*:refs/remotes/origin/*
+[user]
+    name = Your Name
+    email = your@email.com
+[credential]
+    token = ghp_xxxxxxxxxxxx
+```
+
+### Supported Config Keys
+
+| Key | Description |
+|-----|-------------|
+| `user.name` | Author/committer name for commits |
+| `user.email` | Author/committer email for commits |
+| `credential.token` | GitHub personal access token for push |
+| `remote.origin.url` | Remote repository URL (read-only) |
+
+### Setting Config Values
+
+```bash
+# Set your identity
+scratch config user.name "Your Name"
+scratch config user.email "your@email.com"
+
+# Save auth token (avoids --token on every push)
+scratch config credential.token ghp_xxxxxxxxxxxx
+```
+
+### Getting Config Values
+
+```bash
+scratch config user.name
+# Output: Your Name
+
+scratch config remote.origin.url
+# Output: https://github.com/user/repo.git
+```
+
+### Security Note
+
+The `credential.token` is stored in plain text in `.git/config`. This is suitable for Akuma's single-user environment but should not be used on shared systems.
 
 ## Integration with Meow
 

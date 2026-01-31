@@ -36,6 +36,7 @@ mod repository;
 mod commit;
 mod base64;
 mod pack_write;
+mod config;
 
 use libakuma::{arg, argc, exit, print};
 
@@ -69,6 +70,7 @@ fn main() -> i32 {
         "push" => cmd_push(),
         "commit" => cmd_commit(),
         "checkout" => cmd_checkout(),
+        "config" => cmd_config(),
         "branch" => cmd_branch(),
         "tag" => cmd_tag(),
         "status" => cmd_status(),
@@ -93,6 +95,8 @@ fn print_usage() {
     print("  scratch fetch                Fetch updates from remote\n");
     print("  scratch commit -m <msg>      Commit all changes\n");
     print("  scratch checkout <branch>    Switch to a branch\n");
+    print("  scratch config <key>         Get a config value\n");
+    print("  scratch config <key> <val>   Set a config value\n");
     print("  scratch branch               List branches\n");
     print("  scratch branch <name>        Create a branch\n");
     print("  scratch branch -d <name>     Delete a branch\n");
@@ -104,6 +108,7 @@ fn print_usage() {
     print("  scratch push --token <tok>   Push with auth token\n");
     print("  scratch help                 Show this help\n");
     print("\n");
+    print("Config keys: user.name, user.email, credential.token\n");
     print("NOTE: Force push is permanently disabled for safety.\n");
 }
 
@@ -380,6 +385,66 @@ fn cmd_checkout() -> i32 {
             print(e.message());
             print("\n");
             1
+        }
+    }
+}
+
+fn cmd_config() -> i32 {
+    let key = match arg(2) {
+        Some(k) => k,
+        None => {
+            print("scratch: config requires a key\n");
+            print("Usage: scratch config <key> [value]\n");
+            print("\n");
+            print("Keys:\n");
+            print("  user.name         Your name for commits\n");
+            print("  user.email        Your email for commits\n");
+            print("  credential.token  Auth token for push\n");
+            return 1;
+        }
+    };
+
+    match arg(3) {
+        Some(value) => {
+            // Set value
+            match config::GitConfig::set(key, value) {
+                Ok(()) => {
+                    print("scratch: set ");
+                    print(key);
+                    print(" = ");
+                    print(value);
+                    print("\n");
+                    0
+                }
+                Err(e) => {
+                    print("scratch: config failed: ");
+                    print(e.message());
+                    print("\n");
+                    1
+                }
+            }
+        }
+        None => {
+            // Get value
+            match config::GitConfig::get(key) {
+                Ok(Some(value)) => {
+                    print(&value);
+                    print("\n");
+                    0
+                }
+                Ok(None) => {
+                    print("scratch: ");
+                    print(key);
+                    print(" is not set\n");
+                    1
+                }
+                Err(e) => {
+                    print("scratch: config failed: ");
+                    print(e.message());
+                    print("\n");
+                    1
+                }
+            }
         }
     }
 }

@@ -8,8 +8,9 @@ use alloc::vec::Vec;
 
 use libakuma::{close, open, open_flags, read_dir, read_fd, time};
 
+use crate::config::GitConfig;
 use crate::error::{Error, Result};
-use crate::object::{Commit, Object, ObjectType, Tree, TreeEntry};
+use crate::object::{Commit, Object, Tree, TreeEntry};
 use crate::refs::RefManager;
 use crate::sha1::{self, Sha1Hash};
 use crate::store::ObjectStore;
@@ -17,16 +18,12 @@ use crate::store::ObjectStore;
 /// Default git directory
 const GIT_DIR: &str = ".git";
 
-/// Default author/committer identity (used when not configured)
-const DEFAULT_NAME: &str = "Scratch User";
-const DEFAULT_EMAIL: &str = "scratch@akuma.local";
-
 /// Create a commit from the current working directory
 ///
 /// # Arguments
 /// * `message` - The commit message
-/// * `author_name` - Optional author name (uses default if None)
-/// * `author_email` - Optional author email (uses default if None)
+/// * `author_name` - Optional author name (uses config or default if None)
+/// * `author_email` - Optional author email (uses config or default if None)
 pub fn create_commit(
     message: &str,
     author_name: Option<&str>,
@@ -35,15 +32,18 @@ pub fn create_commit(
     let store = ObjectStore::new(GIT_DIR);
     let refs = RefManager::new(GIT_DIR);
 
+    // Load config for user identity
+    let config = GitConfig::load().unwrap_or_default();
+
     // Get current HEAD as parent
     let parent = refs.resolve_head().ok();
 
     // Build tree from working directory
     let tree_sha = build_tree_from_directory(".", &store)?;
 
-    // Build author/committer lines
-    let name = author_name.unwrap_or(DEFAULT_NAME);
-    let email = author_email.unwrap_or(DEFAULT_EMAIL);
+    // Build author/committer lines (priority: argument > config > default)
+    let name = author_name.unwrap_or_else(|| config.get_user_name());
+    let email = author_email.unwrap_or_else(|| config.get_user_email());
     let timestamp = time();
     let author_line = format!("{} <{}> {} +0000", name, email, timestamp);
     let committer_line = author_line.clone();

@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use libakuma::{close, mkdir, open, open_flags, print, write_fd};
 
 use crate::base64;
+use crate::config::GitConfig;
 use crate::error::{Error, Result};
 use crate::http::Url;
 use crate::pack_write;
@@ -19,11 +20,6 @@ use crate::store::ObjectStore;
 
 /// Default git directory
 const GIT_DIR: &str = ".git";
-
-/// Repository configuration
-pub struct Config {
-    pub remote_url: String,
-}
 
 /// Clone a repository from a URL
 pub fn clone(url: &str) -> Result<()> {
@@ -159,11 +155,13 @@ pub fn fetch() -> Result<()> {
     let _ = refs.read_head()?; // This will fail if not a repo
 
     // Read remote URL from config
-    let config = read_config(GIT_DIR)?;
-    let parsed_url = Url::parse(&config.remote_url)?;
+    let git_config = GitConfig::load()?;
+    let remote_url = git_config.remote_url.as_ref()
+        .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let parsed_url = Url::parse(remote_url)?;
 
     print("scratch: fetching from ");
-    print(&config.remote_url);
+    print(remote_url);
     print("\n");
 
     // Create protocol client
@@ -258,12 +256,17 @@ pub fn push(token: Option<&str>) -> Result<()> {
     // Get local commit SHA
     let local_sha = refs.read_branch(branch_name)?;
 
-    // Read remote URL from config
-    let config = read_config(GIT_DIR)?;
-    let parsed_url = Url::parse(&config.remote_url)?;
+    // Load git config (includes remote URL and optional credential token)
+    let git_config = GitConfig::load()?;
+    let remote_url = git_config.remote_url.as_ref()
+        .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let parsed_url = Url::parse(remote_url)?;
 
-    // Create auth header if token provided
-    let auth = token.map(|t| base64::basic_auth("git", t));
+    // Use token from argument, or fall back to config
+    let effective_token = token.or(git_config.credential_token.as_deref());
+    
+    // Create auth header if token available
+    let auth = effective_token.map(|t| base64::basic_auth("git", t));
     let auth_ref = auth.as_deref();
 
     // Create protocol client
@@ -357,46 +360,6 @@ fn write_config(git_dir: &str, remote_url: &str) -> Result<()> {
     let _ = write_fd(fd, config_content.as_bytes());
     close(fd);
     Ok(())
-}
-
-/// Read repository config
-fn read_config(git_dir: &str) -> Result<Config> {
-    let path = format!("{}/config", git_dir);
-    let fd = open(&path, open_flags::O_RDONLY);
-    if fd < 0 {
-        return Err(Error::not_a_repository());
-    }
-
-    let mut buf = [0u8; 1024];
-    let mut data = Vec::new();
-    
-    loop {
-        let n = libakuma::read_fd(fd, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        data.extend_from_slice(&buf[..n as usize]);
-    }
-    close(fd);
-
-    let content = core::str::from_utf8(&data)
-        .map_err(|_| Error::io("config not valid UTF-8"))?;
-
-    // Simple config parsing - find url line
-    let mut remote_url = String::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(url) = line.strip_prefix("url = ") {
-            remote_url = String::from(url);
-            break;
-        }
-    }
-
-    if remote_url.is_empty() {
-        return Err(Error::io("no remote URL in config"));
-    }
-
-    Ok(Config { remote_url })
 }
 
 /// Extract repository name from URL path
