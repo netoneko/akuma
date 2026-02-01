@@ -382,56 +382,105 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
 /// Returns (remaining_text, Some(result)) if a tool was found and executed
 /// Returns (original_text, None) if no tool command was found
 pub fn find_and_execute_tool(response: &str) -> (String, Option<ToolResult>) {
-    // Look for JSON code block with command
-    if let Some(start) = response.find("```json") {
-        if let Some(end) = response[start..].find("```\n").or_else(|| response[start..].rfind("```")) {
-            let json_start = start + 7; // Skip ```json
-            let json_end = start + end;
-            
-            if json_start < json_end && json_end <= response.len() {
-                let json_block = response[json_start..json_end].trim();
-                
-                // Check if this looks like a command
-                if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
-                    if let Some(result) = execute_tool_command(json_block) {
-                        // Return text before the JSON block
-                        let before = response[..start].trim();
-                        return (String::from(before), Some(result));
-                    }
-                }
-            }
-        }
+    // Look for JSON code block with command (```json ... ```)
+    if let Some(result) = try_parse_code_block(response) {
+        return result;
     }
     
-    // Also try inline JSON (without code blocks)
-    if let Some(start) = response.find("{\"command\"") {
-        // Find matching closing brace
-        let mut depth = 0;
-        let mut end = start;
-        for (i, c) in response[start..].chars().enumerate() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        
-        if end > start {
-            let json_block = &response[start..end];
-            if let Some(result) = execute_tool_command(json_block) {
-                let before = response[..start].trim();
-                return (String::from(before), Some(result));
-            }
-        }
+    // Try inline JSON (without code blocks)
+    if let Some(result) = try_parse_inline_json(response) {
+        return result;
     }
     
     (String::from(response), None)
+}
+
+/// Try to parse a ```json code block
+fn try_parse_code_block(response: &str) -> Option<(String, Option<ToolResult>)> {
+    let start = response.find("```json")?;
+    
+    // Find the closing ``` - try both ```\n and just ```
+    let after_start = &response[start + 7..];
+    let end_offset = after_start.find("\n```")
+        .map(|p| p + 1)  // Include the newline, point to ```
+        .or_else(|| after_start.find("```"))?;
+    
+    let json_block = after_start[..end_offset].trim();
+    
+    // Check if this looks like a command
+    if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
+        if let Some(result) = execute_tool_command(json_block) {
+            let before = response[..start].trim();
+            return Some((String::from(before), Some(result)));
+        }
+    }
+    
+    None
+}
+
+/// Try to parse inline JSON (handles various whitespace patterns)
+fn try_parse_inline_json(response: &str) -> Option<(String, Option<ToolResult>)> {
+    // Find a { that's followed by "command" (with optional whitespace)
+    let mut search_start = 0;
+    
+    while search_start < response.len() {
+        // Find the next { character
+        let brace_pos = response[search_start..].find('{')?;
+        let abs_brace_pos = search_start + brace_pos;
+        
+        // Check if "command" appears soon after (within ~20 chars, allowing for whitespace)
+        let after_brace = &response[abs_brace_pos + 1..];
+        let trimmed = after_brace.trim_start();
+        
+        if trimmed.starts_with("\"command\"") {
+            // Found a potential command JSON - find matching closing brace
+            if let Some(json_end) = find_matching_brace(&response[abs_brace_pos..]) {
+                let json_block = &response[abs_brace_pos..abs_brace_pos + json_end + 1];
+                
+                // Verify it has the required structure
+                if json_block.contains("\"tool\"") {
+                    if let Some(result) = execute_tool_command(json_block) {
+                        let before = response[..abs_brace_pos].trim();
+                        return Some((String::from(before), Some(result)));
+                    }
+                }
+            }
+        }
+        
+        // Move past this { and continue searching
+        search_start = abs_brace_pos + 1;
+    }
+    
+    None
+}
+
+/// Find the position of the matching closing brace
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for (i, c) in s.chars().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        match c {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    None
 }
 
 // ============================================================================

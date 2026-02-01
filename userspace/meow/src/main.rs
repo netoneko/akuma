@@ -493,6 +493,11 @@ fn main() -> i32 {
         } else {
             format!("{}K", mem_kb)
         };
+        
+        // Warn if memory is getting high (>2MB)
+        if mem_kb > 2048 {
+            print("[!] Memory high - consider /clear to reset\n");
+        }
 
         // Print prompt with token count and memory
         print(&format!(
@@ -1028,6 +1033,9 @@ fn chat_once(
                 result.output, current_cwd
             );
             history.push(Message::new("user", &tool_result_msg));
+            
+            // Compact after tool execution to release memory
+            compact_history(history);
 
             continue;
         }
