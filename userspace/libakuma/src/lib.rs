@@ -1096,9 +1096,13 @@ mod allocator {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::UnsafeCell;
 
     const PAGE_SIZE: usize = 4096;
     const MAP_FAILED: usize = usize::MAX;
+    
+    /// Maximum number of deferred frees to queue
+    const DEFERRED_FREE_SLOTS: usize = 16;
 
     /// Track total bytes allocated
     static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -1106,6 +1110,65 @@ mod allocator {
     static FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
     /// Track number of allocations
     static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    
+    /// Deferred free entry
+    struct DeferredFree {
+        ptr: usize,
+        size: usize,
+    }
+    
+    /// Deferred free queue - buffers that couldn't be freed during realloc
+    /// We free them during the next dealloc call (which is known to work)
+    struct DeferredFreeQueue {
+        entries: UnsafeCell<[DeferredFree; DEFERRED_FREE_SLOTS]>,
+        count: AtomicUsize,
+    }
+    
+    unsafe impl Sync for DeferredFreeQueue {}
+    
+    impl DeferredFreeQueue {
+        const fn new() -> Self {
+            const EMPTY: DeferredFree = DeferredFree { ptr: 0, size: 0 };
+            Self {
+                entries: UnsafeCell::new([EMPTY; DEFERRED_FREE_SLOTS]),
+                count: AtomicUsize::new(0),
+            }
+        }
+        
+        /// Queue a pointer for deferred free
+        fn push(&self, ptr: usize, size: usize) {
+            let count = self.count.load(Ordering::Relaxed);
+            if count < DEFERRED_FREE_SLOTS {
+                unsafe {
+                    let entries = &mut *self.entries.get();
+                    entries[count] = DeferredFree { ptr, size };
+                }
+                self.count.store(count + 1, Ordering::Relaxed);
+            }
+            // If queue is full, we just leak (better than hanging)
+        }
+        
+        /// Process all deferred frees
+        fn flush(&self) {
+            let count = self.count.swap(0, Ordering::Relaxed);
+            if count == 0 {
+                return;
+            }
+            
+            unsafe {
+                let entries = &*self.entries.get();
+                for i in 0..count {
+                    let entry = &entries[i];
+                    if entry.ptr != 0 && entry.size > 0 {
+                        FREED_BYTES.fetch_add(entry.size, Ordering::Relaxed);
+                        super::munmap_void(entry.ptr, entry.size);
+                    }
+                }
+            }
+        }
+    }
+    
+    static DEFERRED_FREES: DeferredFreeQueue = DeferredFreeQueue::new();
 
     /// Hybrid allocator that can use either mmap or brk
     /// WORKAROUND: Large padding to work around layout-sensitive heap corruption bug.
@@ -1263,6 +1326,9 @@ mod allocator {
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             if USE_MMAP_ALLOCATOR {
+                // First flush any deferred frees from realloc
+                DEFERRED_FREES.flush();
+                // Then free this allocation
                 self.mmap_dealloc(ptr, layout);
             }
             // brk mode: no-op (bump allocator)
@@ -1303,16 +1369,11 @@ mod allocator {
                 let copy_size = old_size.min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
 
-                // NOTE: Calling mmap_dealloc here causes hangs, even with proper
-                // kernel munmap support. The issue might be:
-                // 1. Making syscalls during allocation context
-                // 2. Scheduler interaction during realloc
-                // 3. Something in the exception handler path
-                //
-                // For now, we leak memory during realloc. The process exit will
-                // clean up all mmap'd regions properly.
-                //
-                // TODO: Investigate why munmap syscall from realloc causes hangs.
+                // Queue old buffer for deferred free
+                // Calling munmap directly here causes hangs, but queuing it
+                // and freeing during the next dealloc() call works.
+                let alloc_size = (old_size.max(old_align) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                DEFERRED_FREES.push(ptr as usize, alloc_size);
             }
 
             new_ptr
