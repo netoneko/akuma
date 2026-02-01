@@ -7,6 +7,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
+
 use libakuma::{
     open, close, read_fd, write_fd, fstat, mkdir, read_dir,
     open_flags, spawn, waitpid,
@@ -16,24 +19,97 @@ use libakuma::net::{TcpStream, resolve};
 use crate::code_search;
 
 // ============================================================================
-// Working Directory (for scratch and other tools)
+// Working Directory State (atomic, with sandbox support)
 // ============================================================================
 
-/// Current working directory for git operations
-static mut WORKING_DIR: Option<String> = None;
+/// Working directory state with separate sandbox root and current directory
+struct WorkingDirState {
+    /// The sandbox root - set once at startup, paths cannot escape this
+    sandbox_root: String,
+    /// Current working directory (always within sandbox_root)
+    current_dir: String,
+}
 
-/// Get the current working directory (from process cwd or override)
-pub fn get_working_dir() -> String {
-    unsafe {
-        match &WORKING_DIR {
-            Some(dir) => dir.clone(),
-            None => String::from(libakuma::getcwd()),
+/// Thread-safe working directory storage
+/// 
+/// Uses lazy initialization with atomic flag. Safe for single-threaded use
+/// (which is the case for userspace programs on Akuma).
+struct AtomicWorkingDir {
+    initialized: AtomicBool,
+    state: UnsafeCell<Option<WorkingDirState>>,
+}
+
+// Safety: Akuma userspace is single-threaded, and we use atomic for init check
+unsafe impl Sync for AtomicWorkingDir {}
+
+impl AtomicWorkingDir {
+    const fn new() -> Self {
+        Self {
+            initialized: AtomicBool::new(false),
+            state: UnsafeCell::new(None),
+        }
+    }
+    
+    /// Initialize on first access using process cwd
+    fn ensure_init(&self) {
+        if !self.initialized.load(Ordering::Acquire) {
+            // Get initial cwd from kernel
+            let initial_cwd = String::from(libakuma::getcwd());
+            
+            // Set both sandbox root and current dir to initial cwd
+            // Safety: single-threaded, checked by atomic flag
+            unsafe {
+                *self.state.get() = Some(WorkingDirState {
+                    sandbox_root: initial_cwd.clone(),
+                    current_dir: initial_cwd,
+                });
+            }
+            self.initialized.store(true, Ordering::Release);
+        }
+    }
+    
+    /// Get the current working directory
+    fn get_current(&self) -> String {
+        self.ensure_init();
+        // Safety: initialized above, single-threaded
+        unsafe {
+            (*self.state.get()).as_ref().unwrap().current_dir.clone()
+        }
+    }
+    
+    /// Get the sandbox root (initial cwd, immutable after init)
+    fn get_sandbox_root(&self) -> String {
+        self.ensure_init();
+        // Safety: initialized above, single-threaded
+        unsafe {
+            (*self.state.get()).as_ref().unwrap().sandbox_root.clone()
+        }
+    }
+    
+    /// Set the current working directory (must be within sandbox)
+    fn set_current(&self, path: String) {
+        self.ensure_init();
+        // Safety: initialized above, single-threaded
+        unsafe {
+            (*self.state.get()).as_mut().unwrap().current_dir = path;
         }
     }
 }
 
-/// Set the current working directory
-pub fn set_working_dir(path: &str) {
+static WORKING_DIR: AtomicWorkingDir = AtomicWorkingDir::new();
+
+/// Get the current working directory
+pub fn get_working_dir() -> String {
+    WORKING_DIR.get_current()
+}
+
+/// Get the sandbox root directory
+pub fn get_sandbox_root() -> String {
+    WORKING_DIR.get_sandbox_root()
+}
+
+/// Set the current working directory (internal, after validation)
+fn set_working_dir(path: &str) {
     // Normalize path - ensure it starts with /
     let normalized = if path.starts_with('/') {
         String::from(path)
@@ -48,51 +124,69 @@ pub fn set_working_dir(path: &str) {
         normalized
     };
     
-    unsafe {
-        WORKING_DIR = Some(normalized);
-    }
+    WORKING_DIR.set_current(normalized);
 }
 
-/// Resolve a path relative to the working directory
-/// Returns None if the path escapes the sandbox (tries to go above working dir)
+/// Resolve a path relative to the current working directory
+/// Returns None if the path escapes the sandbox root
 fn resolve_path(path: &str) -> Option<String> {
     let cwd = get_working_dir();
+    let sandbox = get_sandbox_root();
     
-    // If path is absolute, check if it's within the sandbox
-    if path.starts_with('/') {
-        // Path must be within the working directory (or be the working dir itself)
-        if path == cwd || path.starts_with(&format!("{}/", cwd)) || cwd == "/" {
-            return Some(String::from(path));
+    // Compute the absolute path
+    let absolute = if path.starts_with('/') {
+        // Already absolute
+        String::from(path)
+    } else {
+        // Relative to cwd
+        if cwd == "/" {
+            format!("/{}", path)
         } else {
-            return None; // Trying to escape sandbox
+            format!("{}/{}", cwd, path)
         }
+    };
+    
+    // Normalize the path (resolve . and ..)
+    let normalized = normalize_path(&absolute);
+    
+    // Check if normalized path is within sandbox
+    if !is_within_sandbox(&normalized, &sandbox) {
+        return None;
     }
     
-    // Handle relative paths
-    let mut parts: Vec<&str> = if cwd == "/" {
-        Vec::new()
-    } else {
-        cwd[1..].split('/').collect()
-    };
+    Some(normalized)
+}
+
+/// Normalize a path by resolving . and .. components
+fn normalize_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
     
     for component in path.split('/') {
         match component {
             "" | "." => continue,
             ".." => {
-                if parts.is_empty() {
-                    return None; // Trying to go above sandbox root
-                }
-                parts.pop();
+                parts.pop(); // Go up one level (or stay at root if empty)
             }
             name => parts.push(name),
         }
     }
     
     if parts.is_empty() {
-        Some(String::from("/"))
+        String::from("/")
     } else {
-        Some(format!("/{}", parts.join("/")))
+        format!("/{}", parts.join("/"))
     }
+}
+
+/// Check if a path is within the sandbox root
+fn is_within_sandbox(path: &str, sandbox: &str) -> bool {
+    // Root sandbox allows everything
+    if sandbox == "/" {
+        return true;
+    }
+    
+    // Path must be the sandbox or start with sandbox/
+    path == sandbox || path.starts_with(&format!("{}/", sandbox))
 }
 
 /// Resolve path or return error
@@ -491,36 +585,33 @@ fn tool_folder_create(path: &str) -> ToolResult {
 
 /// Change the working directory for git operations
 fn tool_cd(path: &str) -> ToolResult {
-    // Resolve path relative to current working dir if not absolute
-    let new_path = if path.starts_with('/') {
+    let cwd = get_working_dir();
+    let sandbox = get_sandbox_root();
+    
+    // Compute the new absolute path
+    let absolute = if path.starts_with('/') {
         String::from(path)
-    } else if path == ".." {
-        // Handle parent directory
-        let current = get_working_dir();
-        if current == "/" {
-            String::from("/")
-        } else if let Some(last_slash) = current.rfind('/') {
-            if last_slash == 0 {
-                String::from("/")
-            } else {
-                String::from(&current[..last_slash])
-            }
-        } else {
-            String::from("/")
-        }
+    } else if cwd == "/" {
+        format!("/{}", path)
     } else {
-        let current = get_working_dir();
-        if current == "/" {
-            format!("/{}", path)
-        } else {
-            format!("{}/{}", current, path)
-        }
+        format!("{}/{}", cwd, path)
     };
+    
+    // Normalize the path (resolve . and ..)
+    let new_path = normalize_path(&absolute);
+    
+    // Check if new path is within sandbox
+    if !is_within_sandbox(&new_path, &sandbox) {
+        return ToolResult::err(&format!(
+            "Access denied: '{}' is outside the sandbox '{}'",
+            new_path, sandbox
+        ));
+    }
     
     // Use chdir syscall to update the process's cwd
     let result = libakuma::chdir(&new_path);
     if result == 0 {
-        // Also update our local tracking variable
+        // Update our working directory state
         set_working_dir(&new_path);
         ToolResult::ok(format!("Changed directory to: {}", new_path))
     } else if result == -2 {
@@ -533,7 +624,16 @@ fn tool_cd(path: &str) -> ToolResult {
 
 /// Print the current working directory
 fn tool_pwd() -> ToolResult {
-    ToolResult::ok(get_working_dir())
+    let cwd = get_working_dir();
+    let sandbox = get_sandbox_root();
+    
+    if sandbox == "/" {
+        ToolResult::ok(format!("{} (no sandbox)", cwd))
+    } else if cwd == sandbox {
+        ToolResult::ok(format!("{} (sandbox root)", cwd))
+    } else {
+        ToolResult::ok(format!("{} (sandbox: {})", cwd, sandbox))
+    }
 }
 
 fn tool_file_rename(source: &str, dest: &str) -> ToolResult {
@@ -866,7 +966,18 @@ fn tool_git_branch(name: Option<&str>, delete: bool) -> ToolResult {
 
 /// Stage files for commit
 fn tool_git_add(path: &str) -> ToolResult {
-    tool_shell(&format!("scratch add {}", path))
+    let add_result = tool_shell(&format!("scratch add {}", path));
+    if !add_result.success {
+        return add_result;
+    }
+    
+    // Also show status to display what was staged
+    let status_result = tool_shell("scratch status");
+    
+    ToolResult::ok(format!(
+        "{}\n\n--- Repository Status ---\n{}",
+        add_result.output, status_result.output
+    ))
 }
 
 /// Create a commit

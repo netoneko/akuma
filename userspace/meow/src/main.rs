@@ -313,6 +313,24 @@ fn main() -> i32 {
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
         history.push(Message::new("system", SYSTEM_PROMPT));
+        
+        // Add cwd context for one-shot mode too
+        let initial_cwd = tools::get_working_dir();
+        let sandbox_root = tools::get_sandbox_root();
+        let cwd_context = if sandbox_root == "/" {
+            format!(
+                "[System Context] Current working directory: {}\nNo sandbox restrictions.",
+                initial_cwd
+            )
+        } else {
+            format!(
+                "[System Context] Current working directory: {}\nSandbox root: {} - use relative paths.",
+                initial_cwd, sandbox_root
+            )
+        };
+        history.push(Message::new("user", &cwd_context));
+        history.push(Message::new("assistant", "Understood nya~!"));
+        
         return match chat_once(&model, &current_provider, &msg, &mut history, None) {
             Ok(_) => {
                 print("\n");
@@ -359,6 +377,25 @@ fn main() -> i32 {
     // Initialize chat history with system prompt
     let mut history: Vec<Message> = Vec::new();
     history.push(Message::new("system", SYSTEM_PROMPT));
+    
+    // Add initial context with current working directory
+    let initial_cwd = tools::get_working_dir();
+    let sandbox_root = tools::get_sandbox_root();
+    let cwd_context = if sandbox_root == "/" {
+        format!(
+            "[System Context] Your current working directory is: {}\nNo sandbox restrictions - you can access any path.",
+            initial_cwd
+        )
+    } else {
+        format!(
+            "[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.",
+            initial_cwd, sandbox_root
+        )
+    };
+    history.push(Message::new("user", &cwd_context));
+    history.push(Message::new("assistant", 
+        "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
+    ));
 
     // Mutable state for current session
     let mut current_model = model;
@@ -908,9 +945,11 @@ fn chat_once(
             print(&result.output);
             print("\n\n");
 
+            // Include current cwd in tool results so LLM always knows where it is
+            let current_cwd = tools::get_working_dir();
             let tool_result_msg = format!(
-                "[Tool Result]\n{}\n[End Tool Result]\n\nPlease continue your response based on this result.",
-                result.output
+                "[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.",
+                result.output, current_cwd
             );
             history.push(Message::new("user", &tool_result_msg));
 
