@@ -99,23 +99,23 @@ Currently:
 - Thread 11: second meow (PID 13) - NEVER RUNS
 ```
 
-## Potential Solutions
+## Solution: Global Round-Robin Index (IMPLEMENTED)
 
-### Option A: Fair scheduling across all ready threads
+**Problem**: Starting from `current_idx + 1` causes starvation. When SSH (thread 3) gets preempted, it checks 4→5→6→7→8 and stops at 8. Every time SSH runs, the search restarts from 4.
 
-Instead of stopping at the first ready thread, collect all ready threads and rotate through them fairly.
+**Fix**: Use a global `round_robin_idx` that persists across all scheduling decisions.
 
-### Option B: Per-range round-robin
+```rust
+// Before: started from current thread (caused starvation)
+let mut next_idx = (current_idx + 1) % config::MAX_THREADS;
 
-Track separate `last_scheduled` indices for system threads and user threads.
+// After: starts from global position (fair rotation)
+let mut next_idx = (self.round_robin_idx + 1) % config::MAX_THREADS;
+// ... find ready thread ...
+self.round_robin_idx = next_idx;  // Remember position for next time
+```
 
-### Option C: Priority boost for newly spawned threads
-
-Give newly spawned threads a temporary priority boost to ensure they get at least one time slice.
-
-### Option D: Different scheduling for user processes
-
-User processes could use a different scheduling algorithm (e.g., priority-based) instead of simple round-robin.
+**Result**: Even when SSH keeps getting CPU time, the round_robin_idx advances: 8→9→10→11→0→1... All threads get scheduled fairly.
 
 ## Debug Output Added
 
@@ -145,7 +145,7 @@ crate::safe_print!(128, "[spawn_user_internal] tid={} READY: elr={:#x} sp={:#x} 
 
 ## Next Steps
 
-1. Fix the scheduler starvation issue (Issue 4)
+1. ~~Fix the scheduler starvation issue (Issue 4)~~ DONE - global round_robin_idx
 2. Investigate why munmap from realloc causes hangs (Issue 2)
 3. Consider adding thread cleanup to the main loop more frequently
-4. Add better visibility into scheduler decisions for debugging
+4. Re-enable munmap in realloc once Issue 2 is fixed
