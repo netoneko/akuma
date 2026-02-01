@@ -624,6 +624,31 @@ pub fn alloc_mmap(size: usize) -> usize {
     }
 }
 
+/// Record a new mmap region for the current process
+///
+/// Called by sys_mmap after allocating frames.
+/// The frames Vec should contain all physical frames for this region.
+pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
+    if let Some(proc) = current_process() {
+        proc.mmap_regions.push((start_va, frames));
+    }
+}
+
+/// Remove and return mmap region starting at the given VA
+///
+/// Called by sys_munmap to find frames to free.
+/// Returns None if no region starts at this VA.
+pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
+    let proc = current_process()?;
+    
+    // Find the region
+    let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;
+    
+    // Remove and return the frames
+    let (_, frames) = proc.mmap_regions.remove(idx);
+    Some(frames)
+}
+
 /// Get stack bounds for current process
 pub fn get_stack_bounds() -> (usize, usize) {
     match current_process() {
@@ -887,6 +912,11 @@ pub struct Process {
     /// from address_space.page_table_frames since they're created dynamically.
     pub dynamic_page_tables: Vec<PhysFrame>,
 
+    // ========== Mmap region tracking ==========
+    /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
+    /// Used by munmap to find and free the correct frames.
+    pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
+
     // ========== File Descriptor Table ==========
     /// Per-process file descriptor table
     /// Maps FD numbers to FileDescriptor entries (sockets, files, etc.)
@@ -969,6 +999,8 @@ impl Process {
             exit_code: 0,
             // Dynamic page tables - for mmap-allocated page tables
             dynamic_page_tables: Vec::new(),
+            // Mmap regions - for tracking VA->frames mapping (used by munmap)
+            mmap_regions: Vec::new(),
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr

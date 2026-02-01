@@ -510,6 +510,16 @@ impl UserAddressSpace {
         self.user_frames.push(frame);
     }
 
+    /// Remove a frame from tracking (e.g., when munmap frees it early)
+    ///
+    /// This prevents double-free when the address space is dropped.
+    /// Does nothing if the frame isn't found (already removed or never tracked).
+    pub fn remove_user_frame(&mut self, frame: PhysFrame) {
+        if let Some(idx) = self.user_frames.iter().position(|f| f.addr == frame.addr) {
+            self.user_frames.swap_remove(idx);
+        }
+    }
+
     /// Unmap a page (doesn't free the physical frame)
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
         let l0_idx = (va >> 39) & 0x1FF;

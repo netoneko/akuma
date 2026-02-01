@@ -1303,8 +1303,8 @@ mod allocator {
                 let copy_size = old_size.min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
 
-                // Free the old allocation - THIS WAS MISSING!
-                // Without this, every realloc (String/Vec growth) leaks memory.
+                // Free the old allocation now that kernel has proper munmap support.
+                // This prevents memory leaks during String/Vec growth.
                 self.mmap_dealloc(ptr, layout);
             }
 

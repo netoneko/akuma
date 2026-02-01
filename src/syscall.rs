@@ -220,6 +220,9 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
         None => return MAP_FAILED,
     };
 
+    // Collect frames for this mmap region (for munmap to find later)
+    let mut region_frames = alloc::vec::Vec::with_capacity(pages);
+
     // Map pages and track frames for cleanup on process exit
     for i in 0..pages {
         let va = mmap_addr + i * PAGE_SIZE;
@@ -228,7 +231,11 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
             pmm::track_frame(frame, pmm::FrameSource::UserData, proc.pid);
 
             // Track frame so it will be freed when process exits
+            // (redundant with mmap_regions but kept for safety)
             proc.address_space.track_user_frame(frame);
+
+            // Also track in region_frames for munmap
+            region_frames.push(frame);
 
             // Map the page and collect any newly allocated page table frames
             let table_frames =
@@ -245,26 +252,56 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
         }
     }
 
+    // Record this mmap region so munmap can find the frames
+    crate::process::record_mmap_region(mmap_addr, region_frames);
+
     mmap_addr as u64
 }
 
 /// sys_munmap - Unmap memory pages
 ///
-/// Simplified: just marks the pages as unmapped but doesn't reclaim memory.
-/// A full implementation would free the physical frames.
+/// Finds the mmap'd region, unmaps pages from page table, and frees physical frames.
 fn sys_munmap(addr: usize, len: usize) -> u64 {
+    use crate::pmm;
+
     const PAGE_SIZE: usize = 4096;
 
     if addr == 0 || len == 0 || addr % PAGE_SIZE != 0 {
         return (-1i64) as u64; // EINVAL
     }
 
-    // For now, munmap is a no-op (memory leak, but simple)
-    // A full implementation would:
-    // 1. Find the mapping
-    // 2. Unmap the pages from the page table
-    // 3. Free the physical frames
-    let _ = len;
+    // Find and remove the mmap region
+    let frames = match crate::process::remove_mmap_region(addr) {
+        Some(f) => f,
+        None => {
+            // No region at this address - could be already unmapped or invalid
+            return (-1i64) as u64; // EINVAL
+        }
+    };
+
+    // Get process to access address space
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return (-1i64) as u64,
+    };
+
+    // Unmap each page and free the frame
+    for (i, frame) in frames.into_iter().enumerate() {
+        let va = addr + i * PAGE_SIZE;
+
+        // Unmap from page table (clears PTE, invalidates TLB)
+        if let Err(_) = proc.address_space.unmap_page(va) {
+            // Page wasn't mapped - continue anyway
+        }
+
+        // Remove from user_frames tracking (so it won't be double-freed on exit)
+        proc.address_space.remove_user_frame(frame);
+
+        // Free the physical frame
+        pmm::free_page(frame);
+    }
+
+    let _ = len; // len is implicit from the recorded region size
 
     0 // Success
 }
