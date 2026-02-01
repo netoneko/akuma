@@ -1267,12 +1267,8 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
 /// and dropped, calling Process::drop() -> UserAddressSpace::drop() which
 /// frees all physical pages (code, data, stack, heap, page tables).
 fn execute_boxed(mut process: Box<Process>) -> ! {
-    let name = process.name.clone();
-    crate::safe_print!(64, "[execute_boxed] START pid={} {}\n", process.pid, name);
-    
     // Prepare the process (set state, write process info page)
     process.prepare_for_execution();
-    crate::safe_print!(64, "[execute_boxed] prepared pid={}\n", process.pid);
     
     // Get PID and context pointer before registering (which moves the Box)
     let pid = process.pid;
@@ -1286,9 +1282,7 @@ fn execute_boxed(mut process: Box<Process>) -> ! {
     // Register the process in the table - this transfers ownership of the Box
     // to PROCESS_TABLE. The process memory will be freed when unregister_process
     // returns the Box and it goes out of scope.
-    crate::safe_print!(64, "[execute_boxed] registering pid={}\n", pid);
     register_process(pid, process);
-    crate::safe_print!(64, "[execute_boxed] registered pid={}\n", pid);
     
     // Get reference back through the raw pointer
     // SAFETY: process is now owned by PROCESS_TABLE and won't move or be freed
@@ -1296,13 +1290,10 @@ fn execute_boxed(mut process: Box<Process>) -> ! {
     let proc_ref = unsafe { &mut *proc_ptr };
     
     // Activate the user address space (sets TTBR0)
-    crate::safe_print!(64, "[execute_boxed] activating TTBR0 pid={}\n", pid);
     proc_ref.address_space.activate();
-    crate::safe_print!(64, "[execute_boxed] activated pid={}\n", pid);
 
     // Now safe to enable IRQs - TTBR0 is set to user tables
     crate::irq::enable_irqs();
-    crate::safe_print!(64, "[execute_boxed] IRQs enabled, entering user mode pid={}\n", pid);
 
     // Enter user mode via ERET - this never returns
     // When user calls exit(), the exception handler calls return_to_kernel()
@@ -1612,9 +1603,7 @@ pub fn spawn_process_with_channel_cwd(
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // Check if user threads are available
-    let avail = crate::threading::user_threads_available();
-    crate::safe_print!(64, "[spawn_process] path={} user_threads_available={}\n", path, avail);
-    if avail == 0 {
+    if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
     }
 
@@ -1662,11 +1651,7 @@ pub fn spawn_process_with_channel_cwd(
     // Spawn on a user thread
     // Use spawn_user_thread_fn_for_process which starts with IRQs disabled
     // to prevent the race where timer fires before activate() sets user TTBR0.
-    let process_name = boxed_process.name.clone();
-    let process_pid = boxed_process.pid;
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
-        crate::safe_print!(64, "[thread_closure] START pid={} {}\n", process_pid, process_name);
-        
         // NOTE: IRQs are already disabled from thread creation.
         // spawn_user_thread_fn_for_process starts the thread with DAIF.I set,
         // preventing timer from preempting before activate() sets user TTBR0.
@@ -1674,7 +1659,6 @@ pub fn spawn_process_with_channel_cwd(
         // Register channel for this thread so syscalls can find it
         // return_to_kernel() will call remove_channel() and set_exited() when process exits
         let tid = crate::threading::current_thread_id();
-        crate::safe_print!(64, "[thread_closure] registering channel tid={}\n", tid);
         register_channel(tid, channel_for_thread);
 
         // Set thread_id on process for kill support
@@ -1683,12 +1667,10 @@ pub fn spawn_process_with_channel_cwd(
         // Execute the process using execute_boxed which registers the Box
         // in PROCESS_TABLE (transferring ownership) then enters userspace.
         // This never returns - when user exits, return_to_kernel() handles cleanup.
-        crate::safe_print!(64, "[thread_closure] calling execute_boxed\n");
         execute_boxed(boxed_process)
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
-    crate::safe_print!(64, "[spawn_process] spawned thread {} pid {} for {}\n", thread_id, pid, path);
     Ok((thread_id, channel, pid))
 }
 

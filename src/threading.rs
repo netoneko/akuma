@@ -1490,11 +1490,6 @@ impl ThreadPool {
         set_current_thread_register(next_idx);
         self.current_idx = next_idx; // Keep in sync for context access
         
-        // DEBUG: Log user thread scheduling (threads 8+)
-        if next_idx >= 8 {
-            crate::safe_print!(64, "[SCHED] {} -> {} (user thread)\n", current_idx, next_idx);
-        }
-        
         Some((current_idx, next_idx))
     }
 
@@ -1925,11 +1920,6 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     };
     
     if let Some((old_idx, new_idx, new_tpidr)) = switch_info {
-        // DEBUG: Always log user thread scheduling
-        if new_idx >= 8 {
-            crate::safe_print!(64, "[SGI-S] {} -> {} (user)\n", old_idx, new_idx);
-        }
-        
         if config::ENABLE_SGI_DEBUG_PRINTS {
             crate::safe_print!(64, "[SGI-S] {} -> {}\n", old_idx, new_idx);
         }
@@ -2288,8 +2278,6 @@ where
         None => return Err("No free user thread slots"),
     };
     
-    crate::safe_print!(64, "[spawn_user_internal] claimed slot {}\n", slot_idx);
-    
     // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
@@ -2346,11 +2334,6 @@ where
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
-        
-        // Debug: show context after setup
-        let ctx = unsafe { &*get_context(slot_idx) };
-        crate::safe_print!(128, "[spawn_user_internal] tid={} READY: elr={:#x} sp={:#x} x19={:#x}\n",
-            slot_idx, ctx.elr, ctx.sp, ctx.x19);
     });
     
     Ok(slot_idx)
