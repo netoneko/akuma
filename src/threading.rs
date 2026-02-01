@@ -1476,6 +1476,11 @@ impl ThreadPool {
         set_current_thread_register(next_idx);
         self.current_idx = next_idx; // Keep in sync for context access
         
+        // DEBUG: Log user thread scheduling (threads 8+)
+        if next_idx >= 8 {
+            crate::safe_print!(64, "[SCHED] {} -> {} (user thread)\n", current_idx, next_idx);
+        }
+        
         Some((current_idx, next_idx))
     }
 
@@ -1780,6 +1785,12 @@ pub fn sgi_scheduler_handler(irq: u32) {
                     // Don't allocate in IRQ context!
                     crate::console::print("[SGI CORRUPT] user thread has boot TTBR0\n");
                 }
+            }
+            
+            // DEBUG: Log context info for user threads (always, to diagnose hang)
+            if new_idx >= 8 {
+                crate::safe_print!(128, "[CTX] tid={} elr={:#x} spsr={:#x} ttbr0={:#x} sp={:#x} x19={:#x}\n",
+                    new_idx, new_saved_elr, new_saved_spsr, new_saved_ttbr0, new_ctx.sp, new_x19);
             }
             
             // Update exception stack BEFORE switching

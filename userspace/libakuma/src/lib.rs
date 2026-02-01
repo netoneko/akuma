@@ -1303,9 +1303,16 @@ mod allocator {
                 let copy_size = old_size.min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
 
-                // Free the old allocation now that kernel has proper munmap support.
-                // This prevents memory leaks during String/Vec growth.
-                self.mmap_dealloc(ptr, layout);
+                // NOTE: Calling mmap_dealloc here causes hangs, even with proper
+                // kernel munmap support. The issue might be:
+                // 1. Making syscalls during allocation context
+                // 2. Scheduler interaction during realloc
+                // 3. Something in the exception handler path
+                //
+                // For now, we leak memory during realloc. The process exit will
+                // clean up all mmap'd regions properly.
+                //
+                // TODO: Investigate why munmap syscall from realloc causes hangs.
             }
 
             new_ptr

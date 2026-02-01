@@ -202,6 +202,8 @@ After cloning, use Cd to enter the repository before running other git commands.
 - The system will execute the command and provide the result
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
+- Every tool call should be a separate JSON command block in a separate response
+- If you state an intent to use the tool, you should actually check if you called the tool, your output should contain the tool call (if you intend to read a file, you should call the FileRead tool and so on)
 
 ### Sandbox:
 - All file operations are sandboxed to the current working directory (set via Cd)
