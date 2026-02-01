@@ -371,11 +371,20 @@ fn main() -> i32 {
             format!("{}", current_tokens)
         };
 
-        // Print prompt with token count
+        // Get memory usage
+        let mem_kb = libakuma::memory_usage() / 1024;
+        let mem_display = if mem_kb >= 1024 {
+            format!("{}M", mem_kb / 1024)
+        } else {
+            format!("{}K", mem_kb)
+        };
+
+        // Print prompt with token count and memory
         print(&format!(
-            "[{}/{}k] (=^･ω･^=) > ",
+            "[{}/{}k|{}] (=^･ω･^=) > ",
             token_display,
-            TOKEN_LIMIT_FOR_COMPACTION / 1000
+            TOKEN_LIMIT_FOR_COMPACTION / 1000,
+            mem_display
         ));
 
         // Read user input
@@ -412,6 +421,9 @@ fn main() -> i32 {
                 print(" (=ＴェＴ=)\n\n");
             }
         }
+        
+        // Compact strings to release excess memory
+        compact_history(&mut history);
     }
 
     0
@@ -712,6 +724,15 @@ fn trim_history(history: &mut Vec<Message>) {
         let to_remove = history.len() - MAX_HISTORY_SIZE;
         history.drain(1..1 + to_remove);
     }
+}
+
+/// Compact all strings in history to release excess memory
+fn compact_history(history: &mut Vec<Message>) {
+    for msg in history.iter_mut() {
+        msg.role.shrink_to_fit();
+        msg.content.shrink_to_fit();
+    }
+    history.shrink_to_fit();
 }
 
 const MAX_RETRIES: u32 = 10;
@@ -1019,7 +1040,8 @@ fn read_streaming_with_http_stream_tls(
     let mut pending_lines = String::new();
     let mut first_token_received = false;
 
-    const MAX_RESPONSE_SIZE: usize = 16 * 1024;
+    const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
+    let mut warned_large_response = false;
 
     // Note: Dots are printed by the TLS transport layer while waiting for data
 
@@ -1053,8 +1075,13 @@ fn read_streaming_with_http_stream_tls(
                                 }
                                 print(&content);
 
-                                if full_response.len() < MAX_RESPONSE_SIZE {
-                                    full_response.push_str(&content);
+                                // Always accumulate full response
+                                full_response.push_str(&content);
+                                
+                                // Warn once if response is getting large
+                                if !warned_large_response && full_response.len() > RESPONSE_WARNING_THRESHOLD {
+                                    warned_large_response = true;
+                                    print("\n[!] Response exceeds 64KB, memory pressure possible\n");
                                 }
                             }
                             if done {
@@ -1080,6 +1107,8 @@ fn read_streaming_with_http_stream_tls(
         }
     }
 
+    // Compact the response to release excess capacity
+    full_response.shrink_to_fit();
     Ok(full_response)
 }
 
@@ -1168,7 +1197,8 @@ fn read_streaming_response_with_progress(
     let mut first_token_received = false;
     let mut any_data_received = false;
 
-    const MAX_RESPONSE_SIZE: usize = 16 * 1024;
+    const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
+    let mut warned_large_response = false;
 
     loop {
         if check_escape_pressed() {
@@ -1246,8 +1276,13 @@ fn read_streaming_response_with_progress(
                                 }
                                 print(&content);
 
-                                if full_response.len() < MAX_RESPONSE_SIZE {
-                                    full_response.push_str(&content);
+                                // Always accumulate full response
+                                full_response.push_str(&content);
+                                
+                                // Warn once if response is getting large
+                                if !warned_large_response && full_response.len() > RESPONSE_WARNING_THRESHOLD {
+                                    warned_large_response = true;
+                                    print("\n[!] Response exceeds 64KB, memory pressure possible\n");
                                 }
                             }
                             if done {
@@ -1295,6 +1330,8 @@ fn read_streaming_response_with_progress(
         }
     }
 
+    // Compact the response to release excess capacity
+    full_response.shrink_to_fit();
     Ok(full_response)
 }
 

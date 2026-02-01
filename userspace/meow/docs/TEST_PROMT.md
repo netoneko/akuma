@@ -49,3 +49,9 @@ Exit code: 0
 [continuing..] waiting......................PANIC!
 [exit code: 1]
 ```
+
+## bootstrap promt
+
+```text
+can you read this document https://raw.githubusercontent.com/netoneko/akuma/refs/heads/main/userspace/meow/docs/TOOLS.md and write a new one docs/MISSING_TOOLS.md - read the full list of available tools carefully and compare your ideas to the list, you need to provide a list of missing tools so you could efficiently work on your own codebase
+```

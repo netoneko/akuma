@@ -3,6 +3,7 @@
 //! Provides syscall wrappers and runtime support for user programs.
 
 #![no_std]
+#![feature(alloc_error_handler)]
 
 extern crate alloc;
 
@@ -1099,6 +1100,13 @@ mod allocator {
     const PAGE_SIZE: usize = 4096;
     const MAP_FAILED: usize = usize::MAX;
 
+    /// Track total bytes allocated
+    static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    /// Track total bytes freed
+    static FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    /// Track number of allocations
+    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
     /// Hybrid allocator that can use either mmap or brk
     /// WORKAROUND: Large padding to work around layout-sensitive heap corruption bug.
     /// The bug causes String::push_str to fail when the binary is a certain size.
@@ -1159,6 +1167,9 @@ mod allocator {
             if addr == MAP_FAILED || addr == 0 {
                 ptr::null_mut()
             } else {
+                // Track allocation
+                ALLOCATED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
                 addr as *mut u8
             }
         }
@@ -1166,6 +1177,8 @@ mod allocator {
         unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
             let size = layout.size().max(layout.align());
             let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            // Track deallocation
+            FREED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
             // Use munmap_void which properly marks x0 as clobbered
             // to prevent corrupting function return values when called from Drop
             super::munmap_void(ptr as usize, alloc_size);
@@ -1289,6 +1302,10 @@ mod allocator {
             if !ptr.is_null() && old_size > 0 {
                 let copy_size = old_size.min(new_size);
                 ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+
+                // Free the old allocation - THIS WAS MISSING!
+                // Without this, every realloc (String/Vec growth) leaks memory.
+                self.mmap_dealloc(ptr, layout);
             }
 
             new_ptr
@@ -1297,6 +1314,70 @@ mod allocator {
 
     #[global_allocator]
     pub static ALLOCATOR: HybridAllocator = HybridAllocator::new();
+
+    /// Get current allocated bytes (not freed)
+    pub fn allocated_bytes() -> usize {
+        ALLOCATED_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// Get total freed bytes
+    pub fn freed_bytes() -> usize {
+        FREED_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// Get net memory usage (allocated - freed)
+    pub fn net_memory() -> usize {
+        let alloc = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        let freed = FREED_BYTES.load(Ordering::Relaxed);
+        alloc.saturating_sub(freed)
+    }
+
+    /// Get allocation count
+    pub fn alloc_count() -> usize {
+        ALLOC_COUNT.load(Ordering::Relaxed)
+    }
+}
+
+/// Get current net memory usage in bytes
+pub fn memory_usage() -> usize {
+    allocator::net_memory()
+}
+
+/// Get total allocated bytes (before any frees)
+pub fn total_allocated() -> usize {
+    allocator::allocated_bytes()
+}
+
+/// Get total freed bytes
+pub fn total_freed() -> usize {
+    allocator::freed_bytes()
+}
+
+/// Get number of allocations made
+pub fn allocation_count() -> usize {
+    allocator::alloc_count()
+}
+
+/// Custom allocation error handler - prints stats and exits
+#[alloc_error_handler]
+fn alloc_error(_layout: core::alloc::Layout) -> ! {
+    // Print OOM message and memory stats using stack-based formatting
+    eprint("OUT OF MEMORY!\n");
+    eprint("  Net memory: ");
+    print_dec(memory_usage());
+    eprint(" bytes (");
+    print_dec(memory_usage() / 1024);
+    eprint(" KB)\n");
+    eprint("  Total allocated: ");
+    print_dec(total_allocated());
+    eprint(" bytes\n");
+    eprint("  Total freed: ");
+    print_dec(total_freed());
+    eprint(" bytes\n");
+    eprint("  Allocation count: ");
+    print_dec(allocation_count());
+    eprint("\n");
+    exit(-1);
 }
 
 /// Print allocator debug info (addresses and values)
