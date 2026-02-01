@@ -331,9 +331,9 @@ fn cmd_tag() -> i32 {
 }
 
 fn cmd_status() -> i32 {
+    // Show branch and HEAD
     match refs::read_head() {
         Ok(head) => {
-            // Show branch name if on a branch
             if let Ok(Some(branch)) = commit::current_branch() {
                 print("On branch ");
                 print(&branch);
@@ -342,15 +342,47 @@ fn cmd_status() -> i32 {
             print("HEAD: ");
             print(&head);
             print("\n");
-            0
         }
         Err(e) => {
             print("scratch: ");
             print(e.message());
             print("\n");
-            1
+            return 1;
         }
     }
+    
+    // Show staged files from index
+    let git_dir = format!("{}/.git", getcwd());
+    match index::Index::load(&git_dir) {
+        Ok(idx) => {
+            if idx.is_empty() {
+                print("\nNo changes staged for commit.\n");
+            } else {
+                print("\nChanges staged for commit:\n");
+                for entry in idx.entries() {
+                    let mode_str = if entry.mode == 0o100755 {
+                        "(executable)"
+                    } else {
+                        ""
+                    };
+                    print("  ");
+                    print(&entry.path);
+                    if !mode_str.is_empty() {
+                        print(" ");
+                        print(mode_str);
+                    }
+                    print("\n");
+                }
+                print(&format!("\n{} file(s) staged\n", idx.len()));
+            }
+        }
+        Err(_) => {
+            // No index or error reading it - that's fine
+            print("\nNo changes staged for commit.\n");
+        }
+    }
+    
+    0
 }
 
 fn cmd_commit() -> i32 {
