@@ -931,6 +931,10 @@ pub struct ThreadPool {
     /// Counter for proportional scheduling of thread 0
     /// Thread 0 gets boosted when this reaches NETWORK_THREAD_RATIO
     network_boost_counter: u32,
+    /// Global round-robin index for fair thread rotation
+    /// This ensures all threads get scheduled, not just the first ready one
+    /// after the current thread.
+    round_robin_idx: usize,
 }
 
 impl ThreadPool {
@@ -941,6 +945,7 @@ impl ThreadPool {
             current_idx: 0,
             initialized: false,
             network_boost_counter: 0,
+            round_robin_idx: 0,
         }
     }
 
@@ -1439,26 +1444,35 @@ impl ThreadPool {
             unsafe { core::arch::asm!("sev"); }
         }
 
-        // Find next ready thread using atomic state reads
-        let mut next_idx = (current_idx + 1) % config::MAX_THREADS;
+        // Find next ready thread using GLOBAL round-robin index
+        // This ensures fair rotation through ALL threads, not just starting from current.
+        // Without this, threads 10, 11 would never run if 8, 9 are always ready and
+        // the scheduler always runs from a low-numbered system thread.
+        let mut next_idx = (self.round_robin_idx + 1) % config::MAX_THREADS;
         let start_idx = next_idx;
 
         loop {
             let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
-            if state == thread_state::READY || state == thread_state::RUNNING {
-                break;
+            
+            if state == thread_state::READY {
+                // Found a ready thread - but skip if it's the current one
+                // (we want to switch TO a different thread, not stay on current)
+                if next_idx != current_idx {
+                    break;
+                }
             }
 
             next_idx = (next_idx + 1) % config::MAX_THREADS;
 
             if next_idx == start_idx {
+                // Wrapped around without finding a different ready thread
                 return None;
             }
         }
-
-        if next_idx == current_idx {
-            return None;
-        }
+        
+        // Update global round-robin index to where we found the next thread
+        // This ensures the NEXT scheduling decision continues from here
+        self.round_robin_idx = next_idx;
 
         // Update states atomically (lock-free)
         // Don't change state if thread is TERMINATED or WAITING
@@ -1911,6 +1925,11 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     };
     
     if let Some((old_idx, new_idx, new_tpidr)) = switch_info {
+        // DEBUG: Always log user thread scheduling
+        if new_idx >= 8 {
+            crate::safe_print!(64, "[SGI-S] {} -> {} (user)\n", old_idx, new_idx);
+        }
+        
         if config::ENABLE_SGI_DEBUG_PRINTS {
             crate::safe_print!(64, "[SGI-S] {} -> {}\n", old_idx, new_idx);
         }
@@ -2269,6 +2288,8 @@ where
         None => return Err("No free user thread slots"),
     };
     
+    crate::safe_print!(64, "[spawn_user_internal] claimed slot {}\n", slot_idx);
+    
     // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
@@ -2325,10 +2346,17 @@ where
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
+        
+        // Debug: show context after setup
+        let ctx = unsafe { &*get_context(slot_idx) };
+        crate::safe_print!(128, "[spawn_user_internal] tid={} READY: elr={:#x} sp={:#x} x19={:#x}\n",
+            slot_idx, ctx.elr, ctx.sp, ctx.x19);
     });
     
     Ok(slot_idx)
 }
+
+/// Count available user thread slots
 
 /// Count available user thread slots
 ///
