@@ -342,6 +342,9 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
                 .unwrap_or(false);
             Some(tool_git_tag(name.as_deref(), delete))
         }
+        "GitReset" => {
+            Some(tool_git_reset())
+        }
         "FileReadLines" => {
             let filename = extract_string_field(json, "filename")?;
             let start = extract_number_field(json, "start").unwrap_or(1);
@@ -1027,6 +1030,11 @@ fn tool_git_tag(name: Option<&str>, delete: bool) -> ToolResult {
         (Some(n), true) => tool_shell(&format!("scratch tag -d {}", n)),
         (Some(n), false) => tool_shell(&format!("scratch tag {}", n)),
     }
+}
+
+/// Unstage all files (clear the index)
+fn tool_git_reset() -> ToolResult {
+    tool_shell("scratch reset")
 }
 
 // ============================================================================

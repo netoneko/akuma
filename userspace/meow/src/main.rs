@@ -172,25 +172,29 @@ After cloning, use Cd to enter the repository before running other git commands.
     Args: `{"name": "v1.0"}` - create a new tag
     Args: `{"name": "v1.0", "delete": "true"}` - delete a tag
 
+25. **GitReset** - Unstage all files (clear the staging area)
+    Args: `{}`
+    Note: Removes all files from the staging area without deleting them.
+
 ### Code Editing Tools:
 
-25. **FileReadLines** - Read specific line ranges from a file
+26. **FileReadLines** - Read specific line ranges from a file
     Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
     Note: Returns lines with line numbers. Great for navigating large files.
 
-26. **CodeSearch** - Search for patterns in Rust source files
+27. **CodeSearch** - Search for patterns in Rust source files
     Args: `{"pattern": "search text", "path": "directory", "context": 2}`
     Note: Searches .rs files recursively. Returns matches with context lines.
 
-27. **FileEdit** - Precise search-and-replace editing
+28. **FileEdit** - Precise search-and-replace editing
     Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
     Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
 
-28. **Shell** - Execute a shell command
+29. **Shell** - Execute a shell command
     Args: `{"cmd": "your command here"}`
     Note: Runs the specified binary. Use for build commands, git operations, etc.
 
-29. **CompactContext** - Compact conversation history by summarizing it
+30. **CompactContext** - Compact conversation history by summarizing it
     Args: `{"summary": "A comprehensive summary of the conversation so far..."}`
     Note: Use this when the token count displayed in the prompt approaches the limit.
           Provide a detailed summary that captures all important context, decisions made,

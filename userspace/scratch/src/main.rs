@@ -106,6 +106,7 @@ fn main() -> i32 {
         "tag" => cmd_tag(),
         "status" => cmd_status(),
         "log" => cmd_log(),
+        "reset" => cmd_reset(),
         "help" | "--help" | "-h" => {
             print_usage();
             0
@@ -140,7 +141,8 @@ fn print_usage() {
     print("  branch [name]        List or create branches\n");
     print("  branch -d <name>     Delete a branch\n");
     print("  tag [name]           List or create tags\n");
-    print("  status               Show current HEAD\n");
+    print("  status               Show current HEAD and staged files\n");
+    print("  reset                Unstage all files\n");
     print("  push [--token <t>]   Push to remote\n");
     print("  help                 Show this help\n");
     print("\n");
@@ -383,6 +385,38 @@ fn cmd_status() -> i32 {
     }
     
     0
+}
+
+fn cmd_reset() -> i32 {
+    let git_dir = format!("{}/.git", getcwd());
+    
+    // Load the current index to show what we're unstaging
+    match index::Index::load(&git_dir) {
+        Ok(idx) => {
+            if idx.is_empty() {
+                print("Nothing to reset - no files staged.\n");
+                return 0;
+            }
+            
+            let count = idx.len();
+            
+            // Create a new empty index and save it
+            let empty_idx = index::Index::new();
+            if let Err(e) = empty_idx.save(&git_dir) {
+                print("scratch: failed to reset index: ");
+                print(e.message());
+                print("\n");
+                return 1;
+            }
+            
+            print(&format!("Unstaged {} file(s).\n", count));
+            0
+        }
+        Err(_) => {
+            print("Nothing to reset - no files staged.\n");
+            0
+        }
+    }
 }
 
 fn cmd_commit() -> i32 {
