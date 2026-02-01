@@ -280,17 +280,34 @@ impl Index {
         let mut subdirs: BTreeMap<String, Vec<&IndexEntry>> = BTreeMap::new();
 
         for entry in self.entries.values() {
-            if let Some(slash_pos) = entry.path.find('/') {
+            // Normalize path: strip leading slash if present
+            let path = entry.path.strip_prefix('/').unwrap_or(&entry.path);
+            
+            // Skip entries with empty paths
+            if path.is_empty() {
+                continue;
+            }
+            
+            if let Some(slash_pos) = path.find('/') {
                 // Entry is in a subdirectory
-                let dir_name = &entry.path[..slash_pos];
+                let dir_name = &path[..slash_pos];
+                
+                // Skip if directory name is empty (malformed path like "/foo")
+                if dir_name.is_empty() {
+                    continue;
+                }
+                
                 subdirs.entry(String::from(dir_name))
                     .or_insert_with(Vec::new)
                     .push(entry);
             } else {
-                // Entry is at root level
+                // Entry is at root level - skip if name is empty
+                if path.is_empty() {
+                    continue;
+                }
                 root_entries.push(TreeEntry {
                     mode: entry.mode,
-                    name: entry.path.clone(),
+                    name: String::from(path),
                     sha: entry.sha,
                 });
             }
@@ -335,18 +352,36 @@ impl Index {
         let mut subdirs: BTreeMap<String, Vec<&IndexEntry>> = BTreeMap::new();
 
         for entry in entries {
+            // Normalize the entry path first (strip leading slash)
+            let entry_path = entry.path.strip_prefix('/').unwrap_or(&entry.path);
+            
             // Strip the prefix from the path
-            let relative_path = entry.path.strip_prefix(&prefix_with_slash)
-                .ok_or_else(|| Error::io("invalid path in subtree"))?;
+            let relative_path = entry_path.strip_prefix(&prefix_with_slash)
+                .or_else(|| entry_path.strip_prefix(prefix).and_then(|p| p.strip_prefix('/')))
+                .unwrap_or(entry_path);
+            
+            // Skip empty paths
+            if relative_path.is_empty() {
+                continue;
+            }
 
             if let Some(slash_pos) = relative_path.find('/') {
                 // Entry is in a deeper subdirectory
                 let dir_name = &relative_path[..slash_pos];
+                
+                // Skip if directory name is empty
+                if dir_name.is_empty() {
+                    continue;
+                }
+                
                 subdirs.entry(String::from(dir_name))
                     .or_insert_with(Vec::new)
                     .push(*entry);
             } else {
-                // Entry is directly in this directory
+                // Entry is directly in this directory - skip if name is empty
+                if relative_path.is_empty() {
+                    continue;
+                }
                 tree_entries.push(TreeEntry {
                     mode: entry.mode,
                     name: String::from(relative_path),
