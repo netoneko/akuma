@@ -933,31 +933,39 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
                 total_written += n;
                 if total_written >= len {
                     // All data written - flush to ensure transmission
-                    let _ = socket::with_socket_handle(socket_idx, |socket| {
-                        use core::future::Future;
-                        use core::pin::Pin;
-                        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                    // IMPORTANT: Do NOT call yield_now() inside with_socket_handle!
+                    // That would yield with preemption disabled, blocking for a long time.
+                    for _ in 0..100 {
+                        let flush_result = socket::with_socket_handle(socket_idx, |socket| {
+                            use core::future::Future;
+                            use core::pin::Pin;
+                            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-                        static VTABLE: RawWakerVTable = RawWakerVTable::new(
-                            |_| RawWaker::new(core::ptr::null(), &VTABLE),
-                            |_| {}, |_| {}, |_| {},
-                        );
+                            static VTABLE: RawWakerVTable = RawWakerVTable::new(
+                                |_| RawWaker::new(core::ptr::null(), &VTABLE),
+                                |_| {}, |_| {}, |_| {},
+                            );
 
-                        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-                        let mut cx = Context::from_waker(&waker);
+                            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+                            let mut cx = Context::from_waker(&waker);
 
-                        // Poll flush a few times to help push data out
-                        for _ in 0..100 {
                             let mut flush_future = socket.flush();
                             let pinned = unsafe { Pin::new_unchecked(&mut flush_future) };
                             match pinned.poll(&mut cx) {
-                                Poll::Ready(_) => break,
-                                Poll::Pending => {
-                                    crate::threading::yield_now();
-                                }
+                                Poll::Ready(_) => true,  // Flush complete
+                                Poll::Pending => false,  // Need to retry
                             }
+                        });
+                        
+                        match flush_result {
+                            Ok(true) => break,  // Flush complete
+                            Ok(false) => {
+                                // Yield OUTSIDE with_socket_handle (preemption is enabled here)
+                                crate::threading::yield_now();
+                            }
+                            Err(_) => break,  // Socket error, stop flushing
                         }
-                    });
+                    }
                     socket::socket_dec_ref(socket_idx);
                     return total_written as u64;
                 }
