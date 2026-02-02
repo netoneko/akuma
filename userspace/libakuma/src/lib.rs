@@ -1009,6 +1009,24 @@ impl ReadDir {
         if fd < 0 {
             return None;
         }
+        
+        // Check if this is actually a directory using fstat
+        // S_IFMT = 0o170000, S_IFDIR = 0o040000
+        const S_IFMT: u32 = 0o170000;
+        const S_IFDIR: u32 = 0o040000;
+        
+        if let Ok(stat) = fstat(fd) {
+            if (stat.st_mode & S_IFMT) != S_IFDIR {
+                // Not a directory - close and return None
+                close(fd);
+                return None;
+            }
+        } else {
+            // fstat failed - close and return None
+            close(fd);
+            return None;
+        }
+        
         Some(Self {
             fd,
             buf: [0u8; 1024],

@@ -180,9 +180,19 @@ impl Index {
     /// 
     /// This creates a blob object for the file and adds it to the index.
     /// The path can be relative or absolute; it will be converted appropriately.
-    pub fn add_file(&mut self, path: &str, store: &ObjectStore) -> Result<()> {
+    /// Returns 1 if the file was successfully staged.
+    pub fn add_file(&mut self, path: &str, store: &ObjectStore) -> Result<usize> {
         // Convert to absolute path for file operations
         let abs_path = to_absolute(path);
+        
+        // DEBUG
+        libakuma::print("DEBUG add_file: path=");
+        libakuma::print(path);
+        libakuma::print(" abs_path=");
+        libakuma::print(&abs_path);
+        libakuma::print(" cwd=");
+        libakuma::print(&getcwd());
+        libakuma::print("\n");
         
         // Read file content
         let fd = open(&abs_path, open_flags::O_RDONLY);
@@ -210,9 +220,15 @@ impl Index {
         // Convert to relative path for storing in index
         let relative_path = to_relative(&abs_path);
         
+        // DEBUG
+        libakuma::print("DEBUG add_file: relative_path=");
+        libakuma::print(&relative_path);
+        libakuma::print("\n");
+        
         // Skip "." path
         if relative_path == "." {
-            return Ok(());
+            libakuma::print("DEBUG add_file: skipping . path\n");
+            return Ok(0);
         }
 
         // Add to index
@@ -222,16 +238,18 @@ impl Index {
             path: relative_path,
         });
 
-        Ok(())
+        Ok(1)
     }
 
     /// Add a directory recursively to the index
-    pub fn add_directory(&mut self, path: &str, store: &ObjectStore) -> Result<()> {
+    /// Returns the number of files staged.
+    pub fn add_directory(&mut self, path: &str, store: &ObjectStore) -> Result<usize> {
         // Convert to absolute path for directory operations
         let abs_path = to_absolute(path);
         
         let dir = read_dir(&abs_path).ok_or_else(|| Error::io("failed to read directory"))?;
 
+        let mut count = 0;
         for entry in dir {
             // Skip hidden files and .git directory
             if entry.name.starts_with('.') {
@@ -242,33 +260,29 @@ impl Index {
 
             if entry.is_dir {
                 // Recursively add directory
-                self.add_directory(&entry_path, store)?;
+                count += self.add_directory(&entry_path, store)?;
             } else {
                 // Add file
-                self.add_file(&entry_path, store)?;
+                count += self.add_file(&entry_path, store)?;
             }
         }
 
-        Ok(())
+        Ok(count)
     }
 
     /// Add a path (file or directory) to the index
-    /// Returns the number of files added.
+    /// Returns the number of files staged.
     pub fn add_path(&mut self, path: &str, store: &ObjectStore) -> Result<usize> {
-        let before = self.entries.len();
-        
         // Convert to absolute path for checking
-        let abs_path = to_absolute(path);
+        let abs_path = to_absolute(path);        
+        let is_dir = read_dir(&abs_path).is_some();
         
         // Check if path is a directory or file
-        if read_dir(&abs_path).is_some() {
-            self.add_directory(&abs_path, store)?;
+        if is_dir {
+            self.add_directory(&abs_path, store)
         } else {
-            self.add_file(&abs_path, store)?;
+            self.add_file(&abs_path, store)
         }
-        
-        let after = self.entries.len();
-        Ok(after - before)
     }
 
     /// Build a tree object from the index entries
