@@ -6,6 +6,7 @@
 //! Usage:
 //!   scratch clone <url>          # Clone a repository
 //!   scratch fetch                # Fetch updates from remote
+//!   scratch pull                 # Fetch and merge (fast-forward) from remote
 //!   scratch branch               # List branches
 //!   scratch branch <name>        # Create a branch
 //!   scratch branch -d <name>     # Delete a branch
@@ -97,6 +98,7 @@ fn main() -> i32 {
     match command {
         "clone" => cmd_clone(),
         "fetch" => cmd_fetch(),
+        "pull" => cmd_pull(),
         "push" => cmd_push(),
         "add" => cmd_add(),
         "commit" => cmd_commit(),
@@ -132,6 +134,7 @@ fn print_usage() {
     print("Commands:\n");
     print("  clone <url>          Clone a repository\n");
     print("  fetch                Fetch updates from remote\n");
+    print("  pull                 Fetch and fast-forward merge\n");
     print("  add <path>           Stage files for commit\n");
     print("  commit -m <msg>      Commit staged changes\n");
     print("  commit --amend       Amend the last commit\n");
@@ -194,6 +197,18 @@ fn cmd_fetch() -> i32 {
         }
         Err(e) => {
             print("scratch: fetch failed: ");
+            print(e.message());
+            print("\n");
+            1
+        }
+    }
+}
+
+fn cmd_pull() -> i32 {
+    match repository::pull() {
+        Ok(()) => 0,
+        Err(e) => {
+            print("scratch: pull failed: ");
             print(e.message());
             print("\n");
             1

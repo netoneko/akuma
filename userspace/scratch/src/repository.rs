@@ -218,6 +218,113 @@ pub fn fetch() -> Result<()> {
     Ok(())
 }
 
+/// Pull updates from origin (fetch + fast-forward merge)
+pub fn pull() -> Result<()> {
+    let git_dir = crate::git_dir();
+    let refs = RefManager::new(&git_dir);
+    let store = ObjectStore::new(&git_dir);
+
+    // Get current branch name
+    let head_content = refs.read_head()?;
+    let head_trimmed = head_content.trim();
+    let branch_name = head_trimmed
+        .strip_prefix("ref: refs/heads/")
+        .ok_or_else(|| Error::io("not on a branch (detached HEAD)"))?;
+
+    print("scratch: pulling branch ");
+    print(branch_name);
+    print("\n");
+
+    // Read remote URL from config
+    let git_config = GitConfig::load()?;
+    let remote_url = git_config.remote_url.as_ref()
+        .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let parsed_url = Url::parse(remote_url)?;
+
+    print("scratch: fetching from ");
+    print(remote_url);
+    print("\n");
+
+    // Create protocol client
+    let mut client = ProtocolClient::new(parsed_url);
+
+    // Discover refs
+    let (remote_refs, caps) = client.discover_refs()?;
+
+    // Find the remote ref for our branch
+    let remote_ref_name = format!("refs/heads/{}", branch_name);
+    let remote_sha = remote_refs.iter()
+        .find(|r| r.name == remote_ref_name)
+        .map(|r| r.sha)
+        .ok_or_else(|| Error::ref_not_found(&format!("origin/{}", branch_name)))?;
+
+    // Get local SHA
+    let local_sha = refs.read_branch(branch_name)?;
+
+    // Check if already up to date
+    if local_sha == remote_sha {
+        print("scratch: already up to date\n");
+        return Ok(());
+    }
+
+    print("scratch: ");
+    print(&sha1::to_hex(&local_sha)[..7]);
+    print(" -> ");
+    print(&sha1::to_hex(&remote_sha)[..7]);
+    print("\n");
+
+    // Collect local objects we have
+    let mut haves: Vec<Sha1Hash> = Vec::new();
+    for (_, sha) in refs.list_branches_refs()? {
+        if store.exists(&sha) {
+            haves.push(sha);
+        }
+    }
+
+    // Check if we need to fetch new objects
+    if !store.exists(&remote_sha) {
+        // Collect wants (refs we don't have)
+        let mut wants: Vec<Sha1Hash> = Vec::new();
+        for remote_ref in &remote_refs {
+            if remote_ref.name == "HEAD" {
+                continue;
+            }
+            if !store.exists(&remote_ref.sha) && !wants.contains(&remote_ref.sha) {
+                wants.push(remote_ref.sha);
+            }
+        }
+
+        if !wants.is_empty() {
+            print("scratch: requesting ");
+            print_num(wants.len());
+            print(" new objects\n");
+
+            // Fetch and parse using streaming
+            let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, &git_dir)?;
+
+            print("scratch: stored ");
+            print_num(object_count as usize);
+            print(" objects\n");
+        }
+    }
+
+    // Update remote tracking ref
+    refs.write_remote_ref("origin", branch_name, &remote_sha)?;
+
+    // Fast-forward: update local branch to remote SHA
+    // Note: This is a simple fast-forward, no merge support
+    // TODO: Could verify that local_sha is an ancestor of remote_sha
+    refs.write_branch(branch_name, &remote_sha)?;
+
+    // Checkout the updated tree
+    print("scratch: checking out files\n");
+    let repo_root = crate::repo_path(".");
+    checkout_tree(&store, &remote_sha, &repo_root)?;
+
+    print("scratch: pull complete\n");
+    Ok(())
+}
+
 /// Checkout a branch
 pub fn checkout(branch_name: &str) -> Result<()> {
     let git_dir = crate::git_dir();

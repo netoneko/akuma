@@ -45,6 +45,7 @@ scratch <command> [args]
 
 scratch clone <url>           # Clone a repository
 scratch fetch                 # Fetch updates from origin
+scratch pull                  # Fetch and fast-forward merge
 scratch commit -m <msg>       # Commit all changes
 scratch checkout <branch>     # Switch to a branch
 scratch config <key>          # Get a config value

@@ -139,6 +139,11 @@ impl RefManager {
         write_file_content(&path, &content)
     }
 
+    /// Read a remote-tracking ref
+    pub fn read_remote_ref(&self, remote: &str, ref_name: &str) -> Result<Sha1Hash> {
+        self.resolve_ref(&format!("refs/remotes/{}/{}", remote, ref_name))
+    }
+
     /// List all branches
     pub fn list_branches_refs(&self) -> Result<Vec<(String, Sha1Hash)>> {
         let path = format!("{}/refs/heads", self.git_dir);
