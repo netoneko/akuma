@@ -185,15 +185,6 @@ impl Index {
         // Convert to absolute path for file operations
         let abs_path = to_absolute(path);
         
-        // DEBUG
-        libakuma::print("DEBUG add_file: path=");
-        libakuma::print(path);
-        libakuma::print(" abs_path=");
-        libakuma::print(&abs_path);
-        libakuma::print(" cwd=");
-        libakuma::print(&getcwd());
-        libakuma::print("\n");
-        
         // Read file content
         let fd = open(&abs_path, open_flags::O_RDONLY);
         if fd < 0 {
@@ -220,14 +211,8 @@ impl Index {
         // Convert to relative path for storing in index
         let relative_path = to_relative(&abs_path);
         
-        // DEBUG
-        libakuma::print("DEBUG add_file: relative_path=");
-        libakuma::print(&relative_path);
-        libakuma::print("\n");
-        
         // Skip "." path
         if relative_path == "." {
-            libakuma::print("DEBUG add_file: skipping . path\n");
             return Ok(0);
         }
 
@@ -274,11 +259,10 @@ impl Index {
     /// Returns the number of files staged.
     pub fn add_path(&mut self, path: &str, store: &ObjectStore) -> Result<usize> {
         // Convert to absolute path for checking
-        let abs_path = to_absolute(path);        
-        let is_dir = read_dir(&abs_path).is_some();
+        let abs_path = to_absolute(path);
         
         // Check if path is a directory or file
-        if is_dir {
+        if read_dir(&abs_path).is_some() {
             self.add_directory(&abs_path, store)
         } else {
             self.add_file(&abs_path, store)

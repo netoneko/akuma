@@ -14,7 +14,7 @@
 //!   scratch tag <name>           # Create a tag
 //!   scratch tag -d <name>        # Delete a tag
 //!   scratch status               # Show current HEAD
-//!   scratch push [branch]          # Push branch to remote (force push DISABLED)
+//!   scratch push [branch]          # Push current branch to remote (force push DISABLED)
 
 #![no_std]
 #![no_main]
@@ -146,7 +146,7 @@ fn print_usage() {
     print("  tag [name]           List or create tags\n");
     print("  status               Show current HEAD and staged files\n");
     print("  reset                Unstage all files\n");
-    print("  push [--token <t>]   Push to remote\n");
+    print("  push [branch] [--token <t>]  Push current branch to remote\n");
     print("  help                 Show this help\n");
     print("\n");
     print("Uses current working directory (inherited from parent process).\n");

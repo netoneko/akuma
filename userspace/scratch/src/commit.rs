@@ -2,11 +2,12 @@
 //!
 //! Implements creating commits from staged changes or working directory.
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::{close, open, open_flags, read_dir, read_fd, time};
+use libakuma::{close, open, open_flags, print, read_dir, read_fd, time};
 
 use crate::config::GitConfig;
 use crate::error::{Error, Result};
@@ -57,11 +58,48 @@ pub fn create_commit(
     // Build tree from index if it has entries, otherwise from working directory
     let tree_sha = if index.is_empty() {
         // Fallback: commit all files (legacy behavior)
+        print("[commit] No staged files, committing working directory\n");
         let repo_root = crate::repo_path(".");
         build_tree_from_directory(&repo_root, &store)?
     } else {
-        // Build tree from staged files
-        index.build_tree(&store)?
+        // Build tree by merging staged files with parent tree
+        // This is the correct Git behavior: staged changes are applied on top of parent
+        print(&format!("[commit] {} staged file(s)\n", index.len()));
+        for entry in index.entries() {
+            print(&format!("[commit]   staged: {}\n", entry.path));
+        }
+        
+        if let Some(parent_sha) = parents.first() {
+            print(&format!("[commit] Merging with parent {}\n", crate::sha1::to_hex(parent_sha)));
+            let parent_obj = store.read(parent_sha)?;
+            let parent_commit = parent_obj.as_commit()?;
+            
+            // Show parent tree contents
+            let parent_tree_obj = store.read(&parent_commit.tree)?;
+            let parent_tree = parent_tree_obj.as_tree()?;
+            print(&format!("[commit] Parent tree has {} entries:\n", parent_tree.entries.len()));
+            for entry in &parent_tree.entries {
+                let kind = if entry.mode == 0o040000 { "dir" } else { "file" };
+                print(&format!("[commit]   {}: {} ({})\n", kind, entry.name, crate::sha1::to_hex(&entry.sha)));
+            }
+            
+            let result_sha = merge_index_with_tree(&index, &parent_commit.tree, &store)?;
+            
+            // Show result tree contents
+            let result_tree_obj = store.read(&result_sha)?;
+            let result_tree = result_tree_obj.as_tree()?;
+            print(&format!("[commit] Result tree has {} entries:\n", result_tree.entries.len()));
+            for entry in &result_tree.entries {
+                let kind = if entry.mode == 0o040000 { "dir" } else { "file" };
+                print(&format!("[commit]   {}: {} ({})\n", kind, entry.name, crate::sha1::to_hex(&entry.sha)));
+            }
+            
+            result_sha
+        } else {
+            // No parent (initial commit) - just use staged files
+            print("[commit] Initial commit - no parent to merge with\n");
+            index.build_tree(&store)?
+        }
     };
 
     // Build author/committer lines (priority: argument > config > default)
@@ -93,6 +131,251 @@ pub fn create_commit(
     }
 
     Ok(commit_sha)
+}
+
+/// Merge staged index entries with a parent tree
+/// 
+/// This creates a new tree that contains:
+/// - All entries from the parent tree that aren't overwritten by staged changes
+/// - All staged entries (replacing any matching paths from parent)
+fn merge_index_with_tree(index: &Index, parent_tree_sha: &Sha1Hash, store: &ObjectStore) -> Result<Sha1Hash> {
+    // Load parent tree
+    let parent_obj = store.read(parent_tree_sha)?;
+    let parent_tree = parent_obj.as_tree()?;
+    
+    // Build a map of staged entries by their top-level component
+    // e.g., "foo/bar.txt" -> top-level is "foo"
+    let mut staged_top_level: BTreeMap<String, Vec<(String, &crate::index::IndexEntry)>> = BTreeMap::new();
+    let mut staged_root_files: BTreeMap<String, &crate::index::IndexEntry> = BTreeMap::new();
+    
+    for entry in index.entries() {
+        let path = entry.path.strip_prefix('/').unwrap_or(&entry.path);
+        if path.is_empty() {
+            continue;
+        }
+        
+        if let Some(slash_pos) = path.find('/') {
+            let top = &path[..slash_pos];
+            let rest = &path[slash_pos + 1..];
+            staged_top_level.entry(String::from(top))
+                .or_default()
+                .push((String::from(rest), entry));
+        } else {
+            staged_root_files.insert(String::from(path), entry);
+        }
+    }
+    
+    let mut new_entries: Vec<TreeEntry> = Vec::new();
+    let mut processed_dirs: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    
+    // Process parent tree entries
+    for parent_entry in &parent_tree.entries {
+        if parent_entry.mode == 0o040000 {
+            // Directory - check if we have staged entries that modify it
+            if let Some(staged_in_dir) = staged_top_level.get(&parent_entry.name) {
+                // Recursively merge this subdirectory
+                let new_subtree_sha = merge_subtree_with_staged(
+                    &parent_entry.sha,
+                    staged_in_dir,
+                    store
+                )?;
+                new_entries.push(TreeEntry {
+                    mode: 0o040000,
+                    name: parent_entry.name.clone(),
+                    sha: new_subtree_sha,
+                });
+                processed_dirs.insert(parent_entry.name.clone());
+            } else {
+                // No staged changes in this directory - keep as-is
+                new_entries.push(parent_entry.clone());
+            }
+        } else {
+            // File - check if it's overwritten by a staged file
+            if let Some(staged_entry) = staged_root_files.get(&parent_entry.name) {
+                // Replace with staged version
+                new_entries.push(TreeEntry {
+                    mode: staged_entry.mode,
+                    name: parent_entry.name.clone(),
+                    sha: staged_entry.sha,
+                });
+            } else {
+                // Not staged - keep parent version
+                new_entries.push(parent_entry.clone());
+            }
+        }
+    }
+    
+    // Add new root-level files that weren't in parent
+    for (name, staged_entry) in &staged_root_files {
+        let exists = new_entries.iter().any(|e| &e.name == name);
+        if !exists {
+            new_entries.push(TreeEntry {
+                mode: staged_entry.mode,
+                name: name.clone(),
+                sha: staged_entry.sha,
+            });
+        }
+    }
+    
+    // Add new directories that weren't in parent
+    for (dir_name, staged_entries) in &staged_top_level {
+        if !processed_dirs.contains(dir_name) {
+            // New directory - build tree from staged entries only
+            let subtree_sha = build_tree_from_staged_entries(staged_entries, store)?;
+            new_entries.push(TreeEntry {
+                mode: 0o040000,
+                name: dir_name.clone(),
+                sha: subtree_sha,
+            });
+        }
+    }
+    
+    // Sort entries (Git requires this)
+    new_entries.sort_by(|a, b| {
+        let a_name = if a.mode == 0o040000 { format!("{}/", a.name) } else { a.name.clone() };
+        let b_name = if b.mode == 0o040000 { format!("{}/", b.name) } else { b.name.clone() };
+        a_name.cmp(&b_name)
+    });
+    
+    let tree = Tree { entries: new_entries };
+    store.write(&Object::Tree(tree))
+}
+
+/// Recursively merge a subdirectory with staged entries
+fn merge_subtree_with_staged(
+    parent_tree_sha: &Sha1Hash,
+    staged_entries: &[(String, &crate::index::IndexEntry)],
+    store: &ObjectStore,
+) -> Result<Sha1Hash> {
+    let parent_obj = store.read(parent_tree_sha)?;
+    let parent_tree = parent_obj.as_tree()?;
+    
+    // Group staged entries by their next path component
+    let mut staged_subdirs: BTreeMap<String, Vec<(String, &crate::index::IndexEntry)>> = BTreeMap::new();
+    let mut staged_files: BTreeMap<String, &crate::index::IndexEntry> = BTreeMap::new();
+    
+    for (path, entry) in staged_entries {
+        if let Some(slash_pos) = path.find('/') {
+            let top = &path[..slash_pos];
+            let rest = &path[slash_pos + 1..];
+            staged_subdirs.entry(String::from(top))
+                .or_default()
+                .push((String::from(rest), *entry));
+        } else {
+            staged_files.insert(path.clone(), *entry);
+        }
+    }
+    
+    let mut new_entries: Vec<TreeEntry> = Vec::new();
+    let mut processed_dirs: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    
+    for parent_entry in &parent_tree.entries {
+        if parent_entry.mode == 0o040000 {
+            if let Some(staged_in_dir) = staged_subdirs.get(&parent_entry.name) {
+                let new_subtree_sha = merge_subtree_with_staged(
+                    &parent_entry.sha,
+                    staged_in_dir,
+                    store
+                )?;
+                new_entries.push(TreeEntry {
+                    mode: 0o040000,
+                    name: parent_entry.name.clone(),
+                    sha: new_subtree_sha,
+                });
+                processed_dirs.insert(parent_entry.name.clone());
+            } else {
+                new_entries.push(parent_entry.clone());
+            }
+        } else {
+            if let Some(staged_entry) = staged_files.get(&parent_entry.name) {
+                new_entries.push(TreeEntry {
+                    mode: staged_entry.mode,
+                    name: parent_entry.name.clone(),
+                    sha: staged_entry.sha,
+                });
+            } else {
+                new_entries.push(parent_entry.clone());
+            }
+        }
+    }
+    
+    // Add new files
+    for (name, staged_entry) in &staged_files {
+        let exists = new_entries.iter().any(|e| &e.name == name);
+        if !exists {
+            new_entries.push(TreeEntry {
+                mode: staged_entry.mode,
+                name: name.clone(),
+                sha: staged_entry.sha,
+            });
+        }
+    }
+    
+    // Add new subdirectories
+    for (dir_name, entries) in &staged_subdirs {
+        if !processed_dirs.contains(dir_name) {
+            let subtree_sha = build_tree_from_staged_entries(entries, store)?;
+            new_entries.push(TreeEntry {
+                mode: 0o040000,
+                name: dir_name.clone(),
+                sha: subtree_sha,
+            });
+        }
+    }
+    
+    new_entries.sort_by(|a, b| {
+        let a_name = if a.mode == 0o040000 { format!("{}/", a.name) } else { a.name.clone() };
+        let b_name = if b.mode == 0o040000 { format!("{}/", b.name) } else { b.name.clone() };
+        a_name.cmp(&b_name)
+    });
+    
+    let tree = Tree { entries: new_entries };
+    store.write(&Object::Tree(tree))
+}
+
+/// Build a tree from staged entries only (for new directories)
+fn build_tree_from_staged_entries(
+    entries: &[(String, &crate::index::IndexEntry)],
+    store: &ObjectStore,
+) -> Result<Sha1Hash> {
+    let mut subdirs: BTreeMap<String, Vec<(String, &crate::index::IndexEntry)>> = BTreeMap::new();
+    let mut files: Vec<TreeEntry> = Vec::new();
+    
+    for (path, entry) in entries {
+        if let Some(slash_pos) = path.find('/') {
+            let top = &path[..slash_pos];
+            let rest = &path[slash_pos + 1..];
+            subdirs.entry(String::from(top))
+                .or_default()
+                .push((String::from(rest), *entry));
+        } else {
+            files.push(TreeEntry {
+                mode: entry.mode,
+                name: path.clone(),
+                sha: entry.sha,
+            });
+        }
+    }
+    
+    let mut tree_entries = files;
+    
+    for (dir_name, dir_entries) in subdirs {
+        let subtree_sha = build_tree_from_staged_entries(&dir_entries, store)?;
+        tree_entries.push(TreeEntry {
+            mode: 0o040000,
+            name: dir_name,
+            sha: subtree_sha,
+        });
+    }
+    
+    tree_entries.sort_by(|a, b| {
+        let a_name = if a.mode == 0o040000 { format!("{}/", a.name) } else { a.name.clone() };
+        let b_name = if b.mode == 0o040000 { format!("{}/", b.name) } else { b.name.clone() };
+        a_name.cmp(&b_name)
+    });
+    
+    let tree = Tree { entries: tree_entries };
+    store.write(&Object::Tree(tree))
 }
 
 /// Build a tree object from a directory
