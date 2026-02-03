@@ -1,0 +1,13 @@
+[package]
+name = "chainlink-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "chainlink"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+sqld = { path = "../sqld" }
+chainlink = { path = "/Users/netoneko/github.com/netoneko/chainlink/chainlink", default-features = false }

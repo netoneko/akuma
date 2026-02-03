@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use libakuma::net::{TcpListener, TcpStream};
 use libakuma::print;
 
-use crate::vfs;
+use sqld::vfs;
 
 const SERVER_PORT: u16 = 4321;
 

@@ -12,10 +12,10 @@ extern crate alloc;
 
 mod client;
 mod server;
-mod vfs;
 
 use alloc::string::String;
 use libakuma::{arg, argc, exit, print, write, fd};
+use sqld::vfs;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

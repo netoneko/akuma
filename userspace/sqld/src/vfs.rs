@@ -790,10 +790,16 @@ pub fn list_tables(db: *mut sqlite3) -> Result<alloc::vec::Vec<alloc::string::St
     }
 }
 
-// Additional FFI for column names
+// Additional FFI for column names and last insert rowid
 extern "C" {
     pub fn sqlite3_column_name(stmt: *mut sqlite3_stmt, col: c_int) -> *const c_char;
     pub fn sqlite3_changes(db: *mut sqlite3) -> c_int;
+    pub fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64;
+}
+
+/// Get the rowid of the last inserted row
+pub fn last_insert_rowid(db: *mut sqlite3) -> i64 {
+    unsafe { sqlite3_last_insert_rowid(db) }
 }
 
 /// Query result with column names and rows

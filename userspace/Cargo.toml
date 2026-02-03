@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libakuma",
     "libakuma-tls",
+    "chainlink",
     "echo2",
     "elftest",
     "hello",
