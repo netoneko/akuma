@@ -12,6 +12,14 @@ use core::ptr;
 
 use libakuma::{close, fstat, lseek, open, open_flags, read_fd, seek_mode, write_fd};
 
+const PRINT_DEBUG: bool = false;
+
+fn debug(msg: &str) {
+    if PRINT_DEBUG {
+        libakuma::print(msg);
+    }
+}
+
 // ============================================================================
 // C Library Memory Functions (for SQLite)
 // ============================================================================
@@ -244,7 +252,7 @@ unsafe extern "C" fn akuma_vfs_open(
     flags: c_int,
     _p_out_flags: *mut c_int,
 ) -> c_int {
-    libakuma::print("sqld: VFS xOpen called\n");
+    debug ("sqld: VFS xOpen called\n");
     let akuma_file = file as *mut AkumaFile;
 
     // Convert flags
@@ -258,28 +266,28 @@ unsafe extern "C" fn akuma_vfs_open(
 
     // Get path as str
     if z_name.is_null() {
-        libakuma::print("sqld: VFS xOpen: null path\n");
+        debug ("sqld: VFS xOpen: null path\n");
         return SQLITE_CANTOPEN;
     }
     
     let path = cstr_to_str(z_name);
     if path.is_empty() {
-        libakuma::print("sqld: VFS xOpen: empty path\n");
+        debug ("sqld: VFS xOpen: empty path\n");
         return SQLITE_CANTOPEN;
     }
 
-    libakuma::print("sqld: VFS xOpen: ");
-    libakuma::print(path);
-    libakuma::print("\n");
+    debug ("sqld: VFS xOpen: ");
+    debug(path);
+    debug("\n");
 
     // Open the file
     let fd = open(path, open_mode);
     if fd < 0 {
-        libakuma::print("sqld: VFS xOpen: open failed\n");
+        debug ("sqld: VFS xOpen: open failed\n");
         return SQLITE_CANTOPEN;
     }
 
-    libakuma::print("sqld: VFS xOpen: success\n");
+    debug ("sqld: VFS xOpen: success\n");
     (*akuma_file).base.pMethods = &AKUMA_IO_METHODS;
     (*akuma_file).fd = fd;
 
@@ -397,7 +405,7 @@ unsafe extern "C" fn akuma_read(
     // Seek to position
     let pos = lseek(fd, offset, seek_mode::SEEK_SET);
     if pos < 0 {
-        libakuma::print("sqld: VFS xRead: seek failed\n");
+        debug ("sqld: VFS xRead: seek failed\n");
         return SQLITE_IOERR_READ;
     }
 
@@ -406,13 +414,13 @@ unsafe extern "C" fn akuma_read(
     let n = read_fd(fd, buf_slice);
     
     if n < 0 {
-        libakuma::print("sqld: VFS xRead: read failed\n");
+        debug ("sqld: VFS xRead: read failed\n");
         return SQLITE_IOERR_READ;
     }
     
     // Debug: show first few bytes if reading from offset 0
     if offset == 0 && n >= 16 {
-        libakuma::print("sqld: VFS xRead header: ");
+        debug ("sqld: VFS xRead header: ");
         for i in 0..16 {
             let b = buf_slice[i];
             if b >= 0x20 && b < 0x7f {
@@ -444,33 +452,35 @@ unsafe extern "C" fn akuma_write(
     let akuma_file = file as *mut AkumaFile;
     let fd = (*akuma_file).fd;
 
-    libakuma::print("sqld: VFS xWrite fd=");
-    print_num(fd);
-    libakuma::print(" offset=");
-    print_num(offset as i32);
-    libakuma::print(" amt=");
-    print_num(amt);
-    libakuma::print("\n");
+    debug ("sqld: VFS xWrite fd=");
+    debug_print_num(fd);
+    debug(" offset=");
+    debug_print_num(offset as i32);
+    debug(" amt=");
+    debug_print_num(amt);
+    debug("\n");
     
-    // Debug: show first few bytes if writing to offset 0
-    if offset == 0 {
-        let buf_slice = core::slice::from_raw_parts(buf as *const u8, amt as usize);
-        libakuma::print("sqld: VFS xWrite header: ");
-        for i in 0..16.min(amt as usize) {
-            let b = buf_slice[i];
-            if b >= 0x20 && b < 0x7f {
-                libakuma::write(libakuma::fd::STDOUT, &[b]);
-            } else {
-                libakuma::print(".");
+    if PRINT_DEBUG {
+        // Debug: show first few bytes if writing to offset 0
+        if offset == 0 {
+            let buf_slice = core::slice::from_raw_parts(buf as *const u8, amt as usize);
+            debug ("sqld: VFS xWrite header: ");
+            for i in 0..16.min(amt as usize) {
+                let b = buf_slice[i];
+                if b >= 0x20 && b < 0x7f {
+                    libakuma::write(libakuma::fd::STDOUT, &[b]);
+                } else {
+                    libakuma::print(".");
+                }
             }
+            libakuma::print("\n");
         }
-        libakuma::print("\n");
     }
 
     // Seek to position
     let pos = lseek(fd, offset, seek_mode::SEEK_SET);
     if pos < 0 {
-        libakuma::print("sqld: VFS xWrite: seek failed\n");
+        debug("sqld: VFS xWrite: seek failed\n");
         return SQLITE_IOERR_WRITE;
     }
 
@@ -486,6 +496,12 @@ unsafe extern "C" fn akuma_write(
     }
     
     SQLITE_OK
+}
+
+fn debug_print_num(n: i32) {
+    if PRINT_DEBUG {
+        print_num(n);
+    }
 }
 
 fn print_num(n: i32) {
@@ -689,7 +705,7 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
         path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
         
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-        libakuma::print("sqld: Calling sqlite3_open_v2...\n");
+        debug("sqld: Calling sqlite3_open_v2...\n");
         let rc = sqlite3_open_v2(
             path_buf.as_ptr() as *const c_char,
             &mut db,
@@ -704,7 +720,7 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
             return Err("Failed to open database");
         }
         
-        libakuma::print("sqld: sqlite3_open_v2 succeeded\n");
+        debug("sqld: sqlite3_open_v2 succeeded\n");
         
         // Disable journaling - our VFS doesn't support file deletion
         // which causes journal cleanup to fail and corrupt the database

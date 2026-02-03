@@ -75,9 +75,24 @@ fn print_usage() {
     print("  chainlink help                      Show this help\n");
 }
 
+const DB_DIR: &str = ".chainlink";
 const DB_PATH: &str = ".chainlink/issues.db";
 
+fn ensure_db_dir() {
+    // Create the .chainlink directory if it doesn't exist
+    let result = libakuma::mkdir(DB_DIR);
+    if result < 0 && result != -17 {
+        // -17 is EEXIST, which is fine
+        print("chainlink: Warning: could not create ");
+        print(DB_DIR);
+        print(" directory\n");
+    }
+}
+
 fn get_db() -> Result<Database<SqldBackend>, String> {
+    // Ensure directory exists
+    ensure_db_dir();
+    
     // Initialize SQLite VFS
     sqld::vfs::init().map_err(|e| String::from(e))?;
     
@@ -87,11 +102,13 @@ fn get_db() -> Result<Database<SqldBackend>, String> {
 fn cmd_init() -> Result<(), String> {
     print("chainlink: Initializing database...\n");
     
+    // Create the .chainlink directory
+    ensure_db_dir();
+    
     // Initialize SQLite VFS
     sqld::vfs::init().map_err(|e| String::from(e))?;
     
-    // Create the .chainlink directory if needed (by opening the database)
-    // The database layer will create the schema
+    // Open/create the database (the database layer will create the schema)
     let _db = Database::<SqldBackend>::open(DB_PATH)
         .map_err(|e| alloc::format!("{}", e))?;
     
