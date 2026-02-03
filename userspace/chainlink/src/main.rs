@@ -45,6 +45,7 @@ fn run() -> Result<(), String> {
         "reopen" => cmd_reopen(),
         "comment" => cmd_comment(),
         "label" => cmd_label(),
+        "session" => cmd_session(),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -331,6 +332,95 @@ fn cmd_label() -> Result<(), String> {
     print_num(id as usize);
     print("\n");
     
+    Ok(())
+}
+
+// Commands::Session { action } => {
+//     let db = get_db()?;
+//     match action {
+//         SessionCommands::Start => commands::session::start(&db),
+//         SessionCommands::End { notes } => commands::session::end(&db, notes.as_deref()),
+//         SessionCommands::Status => commands::session::status(&db),
+//         SessionCommands::Work { id } => commands::session::work(&db, id),
+//         SessionCommands::LastHandoff => commands::session::last_handoff(&db),
+//     }
+// }
+
+fn cmd_session() -> Result<(), String> {
+    if argc() < 3 {
+        return Err(String::from("usage: chainlink session <action>"));
+    }
+
+    let action = arg(2).ok_or_else(|| String::from("missing action"))?;
+
+    match action {
+        "start" => cmd_session_start(),
+        "end" => cmd_session_end(),
+        "status" => cmd_session_status(),
+        "work" => cmd_session_work(),
+        "last-handoff" => cmd_session_last_handoff(),
+        _ => Err(String::from("usage: chainlink session <action>")),
+    }
+}
+
+fn cmd_session_start() -> Result<(), String> {
+    let db = get_db()?;
+    db.start_session().map_err(|e| alloc::format!("{}", e))?;
+    print("chainlink: Started session\n");
+    Ok(())
+}
+
+fn cmd_session_end() -> Result<(), String> {
+    let db = get_db()?;
+    let current_session = db.get_current_session().map_err(|e| alloc::format!("{}", e))?.ok_or_else(|| String::from("no session to end"))?;
+    let notes = arg(3).ok_or_else(|| String::from("missing notes"))?;
+    match db.end_session(current_session.id, Some(notes)).map_err(|e| alloc::format!("{}", e))? {
+        true => {
+            print("chainlink: Ended session\n");
+            Ok(())
+        }
+        false => {
+            print("chainlink: Failed to end session\n");
+            Err(String::from("failed to end session"))
+        }
+    }
+}
+
+fn cmd_session_work() -> Result<(), String> {
+    // TODO: Implement when chainlink library exposes set_active_issue
+    Err(String::from("session work not yet implemented"))
+}
+
+fn cmd_session_status() -> Result<(), String> {
+    let db = get_db()?;
+    let current_session = db.get_current_session().map_err(|e| alloc::format!("{}", e))?.ok_or_else(|| String::from("no session to status"))?;
+    print("chainlink: Session status:\n");
+    print("chainlink: Session active issue id:\n");
+    print_num(current_session.active_issue_id.unwrap_or(0) as usize);
+    print("\n");
+    print("chainlink: Session handoff notes:\n");
+    if let Some(notes) = current_session.handoff_notes {
+        print(&notes);
+    } else {
+        print("none\n");
+    }
+    print("\n");
+    Ok(())
+}
+
+fn cmd_session_last_handoff() -> Result<(), String> {
+    let db = get_db()?;
+    let session = db.get_last_session()
+        .map_err(|e| alloc::format!("{}", e))?
+        .ok_or_else(|| String::from("no previous session found"))?;
+    
+    print("chainlink: Last session handoff notes:\n");
+    if let Some(notes) = session.handoff_notes {
+        print(&notes);
+        print("\n");
+    } else {
+        print("(no handoff notes)\n");
+    }
     Ok(())
 }
 
