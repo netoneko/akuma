@@ -418,18 +418,20 @@ unsafe extern "C" fn akuma_read(
         return SQLITE_IOERR_READ;
     }
     
+    if PRINT_DEBUG {
     // Debug: show first few bytes if reading from offset 0
-    if offset == 0 && n >= 16 {
-        debug ("sqld: VFS xRead header: ");
-        for i in 0..16 {
-            let b = buf_slice[i];
-            if b >= 0x20 && b < 0x7f {
-                libakuma::write(libakuma::fd::STDOUT, &[b]);
-            } else {
-                libakuma::print(".");
+        if offset == 0 && n >= 16 {
+            debug ("sqld: VFS xRead header: ");
+            for i in 0..16 {
+                let b = buf_slice[i];
+                if b >= 0x20 && b < 0x7f {
+                    libakuma::write(libakuma::fd::STDOUT, &[b]);
+                } else {
+                    libakuma::print(".");
+                }
             }
+            libakuma::print("\n");
         }
-        libakuma::print("\n");
     }
     
     if (n as c_int) < amt {
