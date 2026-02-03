@@ -1,0 +1,3 @@
+[default]
+project_path = "../.."
+target_arch = "aarch64-unknown-none"
