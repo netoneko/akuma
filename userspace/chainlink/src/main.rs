@@ -180,16 +180,8 @@ fn cmd_create() -> Result<(), String> {
     }
     
     let db = get_db()?;
-    let id = db.create_issue(title, description, priority)
-        .map_err(|e| alloc::format!("{}", e))?;
-    
-    print("chainlink: Created issue #");
-    print_num(id as usize);
-    print(": ");
-    print(title);
-    print("\n");
-    
-    Ok(())
+    chainlink::commands::create::run(&db, title, description, priority, None, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_list() -> Result<(), String> {
@@ -209,27 +201,8 @@ fn cmd_list() -> Result<(), String> {
     }
     
     let db = get_db()?;
-    let issues = db.list_issues(status_filter, None, None)
-        .map_err(|e| alloc::format!("{}", e))?;
-    
-    if issues.is_empty() {
-        print("No issues found.\n");
-        return Ok(());
-    }
-    
-    for issue in issues {
-        print("#");
-        print_num(issue.id as usize);
-        print(" [");
-        print(&issue.status);
-        print("] ");
-        print(&issue.title);
-        print(" (");
-        print(&issue.priority);
-        print(")\n");
-    }
-    
-    Ok(())
+    chainlink::commands::list::run(&db, status_filter, None, None, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_show() -> Result<(), String> {
@@ -241,54 +214,8 @@ fn cmd_show() -> Result<(), String> {
     let id: i64 = id_str.parse().map_err(|_| String::from("invalid issue id"))?;
     
     let db = get_db()?;
-    let issue = db.get_issue(id)
-        .map_err(|e| alloc::format!("{}", e))?
-        .ok_or_else(|| String::from("issue not found"))?;
-    
-    print("Issue #");
-    print_num(issue.id as usize);
-    print("\n");
-    print("Title: ");
-    print(&issue.title);
-    print("\n");
-    print("Status: ");
-    print(&issue.status);
-    print("\n");
-    print("Priority: ");
-    print(&issue.priority);
-    print("\n");
-    
-    if let Some(desc) = &issue.description {
-        print("Description: ");
-        print(desc);
-        print("\n");
-    }
-    
-    // Show labels
-    let labels = db.get_labels(id).map_err(|e| alloc::format!("{}", e))?;
-    if !labels.is_empty() {
-        print("Labels: ");
-        for (i, label) in labels.iter().enumerate() {
-            if i > 0 {
-                print(", ");
-            }
-            print(label);
-        }
-        print("\n");
-    }
-    
-    // Show comments
-    let comments = db.get_comments(id).map_err(|e| alloc::format!("{}", e))?;
-    if !comments.is_empty() {
-        print("\nComments:\n");
-        for comment in comments {
-            print("  - ");
-            print(&comment.content);
-            print("\n");
-        }
-    }
-    
-    Ok(())
+    chainlink::commands::show::run(&db, id, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_close() -> Result<(), String> {
@@ -337,13 +264,8 @@ fn cmd_comment() -> Result<(), String> {
     let text = arg(3).ok_or_else(|| String::from("missing comment text"))?;
     
     let db = get_db()?;
-    db.add_comment(id, text).map_err(|e| alloc::format!("{}", e))?;
-    
-    print("chainlink: Added comment to issue #");
-    print_num(id as usize);
-    print("\n");
-    
-    Ok(())
+    chainlink::commands::comment::run(&db, id, text, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_label() -> Result<(), String> {
@@ -356,15 +278,8 @@ fn cmd_label() -> Result<(), String> {
     let label = arg(3).ok_or_else(|| String::from("missing label"))?;
     
     let db = get_db()?;
-    db.add_label(id, label).map_err(|e| alloc::format!("{}", e))?;
-    
-    print("chainlink: Added label '");
-    print(label);
-    print("' to issue #");
-    print_num(id as usize);
-    print("\n");
-    
-    Ok(())
+    chainlink::commands::label::add(&db, id, label, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 // Commands::Session { action } => {
@@ -397,63 +312,39 @@ fn cmd_session() -> Result<(), String> {
 
 fn cmd_session_start() -> Result<(), String> {
     let db = get_db()?;
-    db.start_session().map_err(|e| alloc::format!("{}", e))?;
-    print("chainlink: Started session\n");
-    Ok(())
+    chainlink::commands::session::start(&db, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_session_end() -> Result<(), String> {
+    let notes = arg(3);
     let db = get_db()?;
-    let current_session = db.get_current_session().map_err(|e| alloc::format!("{}", e))?.ok_or_else(|| String::from("no session to end"))?;
-    let notes = arg(3).ok_or_else(|| String::from("missing notes"))?;
-    match db.end_session(current_session.id, Some(notes)).map_err(|e| alloc::format!("{}", e))? {
-        true => {
-            print("chainlink: Ended session\n");
-            Ok(())
-        }
-        false => {
-            print("chainlink: Failed to end session\n");
-            Err(String::from("failed to end session"))
-        }
-    }
+    chainlink::commands::session::end(&db, notes, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_session_work() -> Result<(), String> {
-    // TODO: Implement when chainlink library exposes set_active_issue
-    Err(String::from("session work not yet implemented"))
+    if argc() < 4 {
+        return Err(String::from("usage: chainlink session work <issue_id>"));
+    }
+    let id_str = arg(3).ok_or_else(|| String::from("missing issue id"))?;
+    let id: i64 = id_str.parse().map_err(|_| String::from("invalid issue id"))?;
+    
+    let db = get_db()?;
+    chainlink::commands::session::work(&db, id, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_session_status() -> Result<(), String> {
     let db = get_db()?;
-    let current_session = db.get_current_session().map_err(|e| alloc::format!("{}", e))?.ok_or_else(|| String::from("no session to status"))?;
-    print("chainlink: Session status:\n");
-    print("chainlink: Session active issue id:\n");
-    print_num(current_session.active_issue_id.unwrap_or(0) as usize);
-    print("\n");
-    print("chainlink: Session handoff notes:\n");
-    if let Some(notes) = current_session.handoff_notes {
-        print(&notes);
-    } else {
-        print("none\n");
-    }
-    print("\n");
-    Ok(())
+    chainlink::commands::session::status(&db, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn cmd_session_last_handoff() -> Result<(), String> {
     let db = get_db()?;
-    let session = db.get_last_session()
-        .map_err(|e| alloc::format!("{}", e))?
-        .ok_or_else(|| String::from("no previous session found"))?;
-    
-    print("chainlink: Last session handoff notes:\n");
-    if let Some(notes) = session.handoff_notes {
-        print(&notes);
-        print("\n");
-    } else {
-        print("(no handoff notes)\n");
-    }
-    Ok(())
+    chainlink::commands::session::last_handoff(&db, &OutputAdapter::new())
+        .map_err(|e| alloc::format!("{}", e))
 }
 
 fn print_num(n: usize) {
