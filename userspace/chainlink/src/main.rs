@@ -10,10 +10,42 @@ extern crate alloc;
 mod backend;
 
 use alloc::string::String;
-use libakuma::{arg, argc, exit, print};
+use libakuma::{arg, argc, exit, print, Stdout};
+use libakuma::Output as AkumaOutput;
 
 use chainlink::db::Database;
+use chainlink::output::Output as ChainlinkOutput;
 use backend::SqldBackend;
+
+/// Output adapter bridging libakuma's Stdout to chainlink's Output trait
+/// 
+/// This newtype wrapper allows us to implement chainlink's Output trait
+/// while satisfying Rust's orphan rules.
+pub struct OutputAdapter(Stdout);
+
+impl OutputAdapter {
+    pub const fn new() -> Self {
+        Self(Stdout::new())
+    }
+}
+
+impl ChainlinkOutput for OutputAdapter {
+    fn print(&self, s: &str) {
+        AkumaOutput::print(&self.0, s);
+    }
+    
+    fn println(&self, s: &str) {
+        AkumaOutput::println(&self.0, s);
+    }
+    
+    fn eprint(&self, s: &str) {
+        AkumaOutput::eprint(&self.0, s);
+    }
+    
+    fn eprintln(&self, s: &str) {
+        AkumaOutput::eprintln(&self.0, s);
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

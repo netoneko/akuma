@@ -865,6 +865,88 @@ pub fn eprint(s: &str) {
 }
 
 // ============================================================================
+// Output Abstraction for Libraries
+// ============================================================================
+
+/// Trait for output operations in Akuma userspace
+///
+/// This trait provides a standard interface for output that libraries can use.
+/// It mirrors common output patterns (print, println, eprint, eprintln) and
+/// can be implemented by different output backends.
+///
+/// # Example
+///
+/// ```ignore
+/// use libakuma::{Output, Stdout};
+///
+/// fn greet(out: &impl Output) {
+///     out.println("Hello, Akuma!");
+/// }
+///
+/// // Use the default stdout implementation
+/// greet(&Stdout);
+/// ```
+pub trait Output {
+    /// Print a string without newline
+    fn print(&self, s: &str);
+    
+    /// Print a string with newline
+    fn println(&self, s: &str) {
+        self.print(s);
+        self.print("\n");
+    }
+    
+    /// Print to stderr without newline
+    fn eprint(&self, s: &str);
+    
+    /// Print to stderr with newline
+    fn eprintln(&self, s: &str) {
+        self.eprint(s);
+        self.eprint("\n");
+    }
+}
+
+/// Standard output implementation
+///
+/// Routes output to stdout/stderr via libakuma's syscall wrappers.
+/// This is the default output implementation for Akuma userspace.
+///
+/// # Example
+///
+/// ```ignore
+/// use libakuma::{Output, Stdout};
+///
+/// let out = Stdout;
+/// out.println("Hello, world!");
+/// out.eprintln("Error message");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stdout;
+
+impl Stdout {
+    /// Create a new Stdout instance
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Output for Stdout {
+    #[inline(always)]
+    fn print(&self, s: &str) {
+        print(s);
+    }
+    
+    #[inline(always)]
+    fn eprint(&self, s: &str) {
+        eprint(s);
+    }
+}
+
+/// Backwards compatibility alias for Stdout
+#[deprecated(since = "0.2.0", note = "use Stdout instead")]
+pub type AkumaOutput = Stdout;
+
+// ============================================================================
 // Process Management Syscalls
 // ============================================================================
 
