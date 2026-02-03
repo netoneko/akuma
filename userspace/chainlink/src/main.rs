@@ -78,14 +78,15 @@ fn print_usage() {
 const DB_DIR: &str = ".chainlink";
 const DB_PATH: &str = ".chainlink/issues.db";
 
+// should check in a better way
 fn ensure_db_dir() {
     // Create the .chainlink directory if it doesn't exist
     let result = libakuma::mkdir(DB_DIR);
     if result < 0 && result != -17 {
         // -17 is EEXIST, which is fine
-        print("chainlink: Warning: could not create ");
-        print(DB_DIR);
-        print(" directory\n");
+        // print("chainlink: Warning: could not create ");
+        // print(DB_DIR);
+        // print(" directory\n");
     }
 }
 

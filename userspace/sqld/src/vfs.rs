@@ -736,7 +736,7 @@ pub fn open_db(path: &str) -> Result<*mut sqlite3, &'static str> {
         if rc == SQLITE_OK {
             sqlite3_step(stmt);
             sqlite3_finalize(stmt);
-            libakuma::print("sqld: Journal mode disabled\n");
+            debug("sqld: Journal mode disabled\n");
         }
         
         Ok(db)
