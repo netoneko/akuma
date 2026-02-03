@@ -10,4 +10,4 @@ path = "src/main.rs"
 [dependencies]
 libakuma = { path = "../libakuma" }
 sqld = { path = "../sqld" }
-chainlink = { path = "/Users/netoneko/github.com/netoneko/chainlink/chainlink", default-features = false }
+chainlink = { git = "https://github.com/netoneko/chainlink", branch = "abstract-db-layer", default-features = false }
