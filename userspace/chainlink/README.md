@@ -1,5 +1,7 @@
 # chainlink - Issue Tracker CLI for Akuma
 
+Forked from [dollspace-gay/chainlink](https://github.com/dollspace-gay/chainlink). Thank you, Doll!
+
 A `no_std` userspace application that wraps the [chainlink](https://github.com/netoneko/chainlink) issue tracker library, providing a local-first issue tracking system for Akuma.
 
 ## Overview
