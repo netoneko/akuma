@@ -1,0 +1,12 @@
+[package]
+name = "termtest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "termtest"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+format_no_std = { version = "1.2.0" }
