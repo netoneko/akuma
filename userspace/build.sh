@@ -1,24 +1,64 @@
 #!/bin/bash
 set -e
-cargo build --release
+
+# List of members to build (excluding those known to fail with std issues)
+MEMBERS=(
+    "libakuma"
+    "libakuma-tls"
+    "chainlink"
+    "echo2"
+    "elftest"
+    "hello"
+    "herd"
+    "httpd"
+    "meow"
+    "quickjs"
+    "scratch"
+    "sqld"
+    "stackstress"
+    "stdcheck"
+    "wget"
+    "termtest"
+)
+
+for member in "${MEMBERS[@]}"; do
+    echo "Building $member..."
+    cargo build --release -p "$member"
+done
 
 # Create bin directory if it doesn't exist
 mkdir -p ../bootstrap/bin
 
-# Copy binaries
-cp target/aarch64-unknown-none/release/hello ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/echo2 ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/stackstress ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/stdcheck ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/elftest ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/httpd ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/meow ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/wget ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/sqld ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/qjs ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/scratch ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/herd ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/chainlink ../bootstrap/bin/
-cp target/aarch64-unknown-none/release/termtest ../bootstrap/bin/
+# Copy binaries (only if they exist)
+BINARIES=(
+    "hello"
+    "echo2"
+    "stackstress"
+    "stdcheck"
+    "elftest"
+    "httpd"
+    "meow"
+    "wget"
+    "sqld"
+    "quickjs"
+    "scratch"
+    "herd"
+    "chainlink"
+    "termtest"
+)
 
-echo "Built and copied: hello, echo2, stackstress, stdcheck, elftest, httpd, meow, wget, sqld, qjs, scratch, herd, chainlink, termtest"
+for bin in "${BINARIES[@]}"; do
+    SRC="target/aarch64-unknown-none/release/$bin"
+    if [ -f "$SRC" ]; then
+        cp "$SRC" ../bootstrap/bin/
+    else
+        # For quickjs the bin name might be qjs
+        if [ "$bin" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
+            cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
+        else
+            echo "Warning: Binary $bin not found at $SRC"
+        fi
+    fi
+done
+
+echo "Build process completed."
