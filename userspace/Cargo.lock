@@ -900,7 +900,6 @@ dependencies = [
 name = "termtest"
 version = "0.1.0"
 dependencies = [
- "format_no_std",
  "libakuma",
 ]
 

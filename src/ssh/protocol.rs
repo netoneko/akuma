@@ -803,7 +803,7 @@ async fn run_shell_session(
                         if let Some(proc) = channel_stream.current_process_pid.and_then(|pid| process::lookup_process(pid)) {
                             crate::threading::disable_preemption();
                             if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-                                <Waker as Clone>::clone(&waker).wake();
+                                waker.wake_by_ref();
                             }
                             crate::threading::enable_preemption();
                         }

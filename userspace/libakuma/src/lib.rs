@@ -866,10 +866,24 @@ pub fn print(s: &str) {
     write(fd::STDOUT, s.as_bytes());
 }
 
+/// Print a string to stdout with a newline
+#[inline(always)]
+pub fn println(s: &str) {
+    print(s);
+    print("\n");
+}
+
 /// Print a string to stderr
 #[inline(always)]
 pub fn eprint(s: &str) {
     write(fd::STDERR, s.as_bytes());
+}
+
+/// Print a string to stderr with a newline
+#[inline(always)]
+pub fn eprintln(s: &str) {
+    eprint(s);
+    eprint("\n");
 }
 
 // ============================================================================

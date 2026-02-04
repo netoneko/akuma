@@ -51,7 +51,7 @@ impl TerminalState {
         }
         // Wake up any task waiting for input
         if let Some(waker) = self.input_waker.lock().take() {
-            <Waker as Clone>::clone(&waker).wake();
+            waker.wake_by_ref();
         }
     }
 
