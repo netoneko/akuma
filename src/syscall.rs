@@ -2039,11 +2039,9 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
 /// sys_set_terminal_attributes - Sets terminal control attributes
 fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     // For now, ignore fd and action, apply to current process's terminal state
-    // TODO: Validate fd (STDIN/STDOUT)
-
     let term_state_lock = match crate::process::current_terminal_state() {
         Some(state) => state,
-        None => return (-libc_errno::EBADF as i64) as u64, // Bad file descriptor or no terminal
+        None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from EBADF to ENOMEM
     };
 
     let mut term_state = term_state_lock.lock();
@@ -2072,7 +2070,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
 
     let term_state_lock = match crate::process::current_terminal_state() {
         Some(state) => state,
-        None => return (-libc_errno::EBADF as i64) as u64, // Bad file descriptor or no terminal
+        None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from EBADF to ENOMEM
     };
 
     let term_state = term_state_lock.lock();
@@ -2165,45 +2163,39 @@ fn sys_poll_input_event(timeout_ms: u64, event_buf_ptr: u64, buf_len: u64) -> u6
         // Loop until data is available or timeout
         loop {
             // CRITICAL: Register waker BEFORE checking for data to avoid lost wake-up race
-            crate::threading::disable_preemption();
-            let mut term_state = term_state_lock.lock();
-            let thread_id = crate::threading::current_thread_id();
-            term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
-            crate::threading::enable_preemption();
+            {
+                crate::threading::disable_preemption();
+                let mut term_state = term_state_lock.lock();
+                let thread_id = crate::threading::current_thread_id();
+                term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
+                crate::threading::enable_preemption();
+            } // term_state guard dropped here
 
             // Check for data AFTER registering waker
             bytes_read = proc_channel.read_stdin(&mut kernel_buf);
             if bytes_read > 0 {
-                // Got data, clear waker and exit loop
-                crate::threading::disable_preemption();
-                term_state_lock.lock().input_waker.lock().take();
-                crate::threading::enable_preemption();
                 break;
             }
 
             if crate::process::is_current_interrupted() {
-                crate::threading::disable_preemption();
-                term_state_lock.lock().input_waker.lock().take();
-                crate::threading::enable_preemption();
                 return (-libc_errno::EINTR as i64) as u64;
             }
 
             let current_time = crate::timer::uptime_us();
             if current_time >= deadline {
-                // Timeout, clear waker and exit loop
-                crate::threading::disable_preemption();
-                term_state_lock.lock().input_waker.lock().take();
-                crate::threading::enable_preemption();
                 break;
             }
             
             // Yield, will be woken by SSH if input arrives (calling waker.wake())
             crate::threading::schedule_blocking(deadline);
 
-            // Re-lock to clear waker after being woken up or timeout (already handled above but safe to repeat)
-            crate::threading::disable_preemption();
-            term_state_lock.lock().input_waker.lock().take();
-            crate::threading::enable_preemption();
+            // Clear waker after being woken up or timeout
+            {
+                crate::threading::disable_preemption();
+                let mut term_state = term_state_lock.lock();
+                term_state.input_waker.lock().take();
+                crate::threading::enable_preemption();
+            }
         }
     }
 

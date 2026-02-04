@@ -589,6 +589,15 @@ pub async fn execute_external_interactive(
                 
                 // Forward to process stdin
                 channel.write_stdin(input_data);
+
+                // Wake up the process if it's waiting for input
+                if let Some(proc) = process::lookup_process(pid) {
+                    crate::threading::disable_preemption();
+                    if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+                        waker.wake();
+                    }
+                    crate::threading::enable_preemption();
+                }
             }
             Err(_) => {
                 // Read error - continue
