@@ -2049,32 +2049,42 @@ pub fn schedule_blocking(wake_time_us: u64) {
     if now >= wake_time_us {
         return;
     }
+
+    // Save current preemption state and ensure it's enabled for the block
+    let was_disabled = is_preemption_disabled();
+    if was_disabled {
+        // Log this as it might be a sign of a bug (blocking while holding a lock)
+        // but we'll allow it by temporarily enabling preemption.
+        // crate::safe_print!(64, "[threading] schedule_blocking called with preemption disabled (tid={})\n", tid);
+        
+        // We MUST enable preemption here, otherwise the timer IRQ will acknowledge
+        // but will NOT schedule another thread, leading to a hang in the wfi loop.
+        enable_preemption();
+    }
     
     // Mark thread as WAITING with wake time
-    // Timer IRQs fire every 10ms and will preempt us naturally
-    // Scheduler will see WAITING state and switch to another thread
-    // When wake_time passes, scheduler wakes us
     mark_thread_waiting(tid, wake_time_us);
     
     // Wait for timer to preempt us and for scheduler to wake us
-    // WFI halts CPU until interrupt
     loop {
         let state = THREAD_STATES[tid].load(Ordering::SeqCst);
         if state != thread_state::WAITING {
-            // Scheduler woke us - we're now READY or RUNNING
-            return;
+            break;
         }
         
         if crate::process::is_current_interrupted() {
             WAKE_TIMES[tid].store(0, Ordering::SeqCst);
             THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
-            return;
+            break;
         }
         
         // Wait for interrupt - timer IRQ will fire within 10ms
-        // When preempted, scheduler sees WAITING and switches away
-        // When wake_time passes and we're scheduled back, state != WAITING
         unsafe { core::arch::asm!("wfi"); }
+    }
+
+    // Restore preemption state
+    if was_disabled {
+        disable_preemption();
     }
 }
 
