@@ -38,3 +38,18 @@ Userspace applications interact with the kernel exclusively through system calls
 - **Building:** Use `scripts/run.sh` to compile and launch in QEMU.
 - **Debugging:** Use `scripts/run_with_gdb.sh` and refer to `docs/AI_DEBUGGING.md`.
 - **Testing:** Kernel tests are located in `src/*_tests.rs`; userspace tests are within their respective directories in `userspace/`.
+
+## Development Tools and Servers
+
+### Rust Language Server Protocol (LSP) - rust-analyzer
+
+`rust-analyzer` is the primary Language Server Protocol (LSP) implementation for Rust, providing powerful features for code understanding, diagnostics, and development.
+
+*   **Functionality**: `rust-analyzer` enables features like code completion, go-to-definition, type inference, refactoring assistance, and most importantly for Gemini CLI, detailed diagnostics (checks) and build integration.
+*   **Configuration**: `rust-analyzer` typically works out-of-the-box in Rust projects with a `Cargo.toml` file. While project-specific configurations (e.g., `rust-analyzer.json` or `.vscode/settings.json`) can further customize its behavior, it generally relies on standard `cargo` commands.
+*   **Gemini CLI Integration**: The Gemini CLI agent can leverage `rust-analyzer`'s capabilities by executing standard `cargo` commands.
+    *   **Checks and Diagnostics**: Gemini CLI will primarily use `cargo check` to perform code analysis, identify errors, and retrieve diagnostics.
+    *   **Builds**: For triggering full builds, Gemini CLI will use `cargo build`.
+    *   **Interpretation**: Gemini CLI is equipped to interpret the output of `cargo check` and `cargo build` to provide feedback, report errors, and understand the project's build status.
+
+To ensure seamless operation, it is recommended to have `rust-analyzer` installed and accessible in the development environment. The Gemini CLI will assume the presence of a functional Rust toolchain and `cargo` for these operations.
