@@ -4,6 +4,7 @@
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
 use crate::console;
+use crate::config;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -121,7 +122,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1], args[2]),
         _ => {
-            crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
+            if config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
+            }
             (-1i64) as u64 // ENOSYS
         }
     }
@@ -517,8 +520,10 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             proc.write_stdout(buf);
 
             // Print to kernel console
-            if let Ok(s) = core::str::from_utf8(buf) {
-                console::print(s);
+            if config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
+                if let Ok(s) = core::str::from_utf8(buf) {
+                    console::print(s);
+                }
             }
 
             count as u64
@@ -2064,8 +2069,10 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
     };
     proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
 
-    crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n", 
-        fd, action, mode_flags_arg, term_state.mode_flags);
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n", 
+            fd, action, mode_flags_arg, term_state.mode_flags);
+    }
 
     0 // Success
 }
@@ -2090,15 +2097,19 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
         *(attr_ptr as *mut u64) = term_state.mode_flags;
     }
 
-    crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n", 
-        fd, attr_ptr, term_state.mode_flags);
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n", 
+            fd, attr_ptr, term_state.mode_flags);
+    }
 
     0 // Success
 }
 
 /// sys_set_cursor_position - Sets the cursor position
 fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
-    crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
+    }
     // VT100/ANSI escape sequence for cursor position is `ESC[{row};{col}H`
     // Rows and columns are 1-indexed.
     // Convert 0-indexed arguments to 1-indexed.
@@ -2110,21 +2121,27 @@ fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
 
 /// sys_hide_cursor - Hides the terminal cursor
 fn sys_hide_cursor() -> u64 {
-    crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
+    }
     // VT100/ANSI escape sequence to hide cursor: `ESC[?25l`
     write_to_process_channel(b"\x1b[?25l")
 }
 
 /// sys_show_cursor - Shows the terminal cursor
 fn sys_show_cursor() -> u64 {
-    crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
+    }
     // VT100/ANSI escape sequence to show cursor: `ESC[?25h`
     write_to_process_channel(b"\x1b[?25h")
 }
 
 /// sys_clear_screen - Clears the entire terminal screen
 fn sys_clear_screen() -> u64 {
-    crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
+    }
     // VT100/ANSI escape sequence to clear screen: `ESC[2J`
     write_to_process_channel(b"\x1b[2J")
 }
