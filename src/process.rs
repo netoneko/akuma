@@ -353,6 +353,8 @@ pub struct ProcessChannel {
     exited: AtomicBool,
     /// Interrupt signal (set by Ctrl+C, checked by process)
     interrupted: AtomicBool,
+    /// Raw mode flag (true if terminal is in raw mode, false for cooked)
+    raw_mode: AtomicBool,
 }
 
 impl ProcessChannel {
@@ -364,6 +366,7 @@ impl ProcessChannel {
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            raw_mode: AtomicBool::new(false), // Initialize raw_mode
         }
     }
 
@@ -456,6 +459,16 @@ impl ProcessChannel {
     /// Clear the interrupt flag
     pub fn clear_interrupted(&self) {
         self.interrupted.store(false, Ordering::Release);
+    }
+
+    /// Set the raw mode flag
+    pub fn set_raw_mode(&self, enabled: bool) {
+        self.raw_mode.store(enabled, Ordering::Release);
+    }
+
+    /// Check if raw mode is enabled
+    pub fn is_raw_mode(&self) -> bool {
+        self.raw_mode.load(Ordering::Acquire)
     }
 }
 

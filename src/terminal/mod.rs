@@ -1,6 +1,7 @@
 use alloc::collections::VecDeque;
 use crate::std_compat::sync::Mutex;
 use alloc::sync::Arc;
+use core::task::Waker;
 
 /// Mode flags for terminal attributes (similar to termios c_lflag)
 pub mod mode_flags {
@@ -49,8 +50,8 @@ impl TerminalState {
             buffer.push_back(byte);
         }
         // Wake up any task waiting for input
-        if let Some(waker: ) = self.input_waker.lock().take() {
-            waker.wake();
+        if let Some(waker) = self.input_waker.lock().take() {
+            <Waker as Clone>::clone(&waker).wake();
         }
     }
 

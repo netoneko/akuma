@@ -13,7 +13,9 @@
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::sync::Arc; // Added
 use core::convert::TryInto;
+use core::task::Waker;
 
 use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
 use embedded_io_async::{ErrorType, Read, Write};
@@ -210,15 +212,18 @@ impl embedded_io_async::Error for SshStreamError {
 }
 
 /// A stream adapter that provides embedded_io_async Read/Write over an SSH channel
-struct SshChannelStream<'a> {
+pub struct SshChannelStream<'a> {
     stream: &'a mut TcpStream,
     session: &'a mut SshSession,
-    current_process_pid: Option<Pid>,
+    pub current_process_pid: Option<Pid>, // Made public
+    /// The process channel for the currently active foreground process, if any.
+    /// Used to check raw mode status and push input directly to it.
+    pub current_process_channel: Option<Arc<crate::process::ProcessChannel>>, // Made public
 }
 
 impl<'a> SshChannelStream<'a> {
     fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
-        Self { stream, session, current_process_pid: None }
+        Self { stream, session, current_process_pid: None, current_process_channel: None }
     }
 
     /// Read and process SSH packets until we have channel data or an error
@@ -783,34 +788,24 @@ async fn run_shell_session(
             }
             Ok(n) => {
                 // Determine if the current foreground process is in raw mode
-                let is_raw_mode = if let Some(pid) = channel_stream.current_process_pid {
-                    if let Some(proc) = process::lookup_process(pid) {
-                        let term_state = proc.terminal_state.lock();
-                        (term_state.mode_flags & mode_flags::RAW_MODE_ENABLE) != 0
-                    } else {
-                        false // Process not found, assume cooked mode
-                    }
+                let is_raw_mode = if let Some(channel) = &channel_stream.current_process_channel {
+                    (*channel).is_raw_mode()
                 } else {
-                    false // No foreground process, assume cooked mode (shell itself)
+                    false // No foreground process, assume cooked mode
                 };
 
                 if is_raw_mode {
                     // Raw mode: Pass input directly to the process's stdin buffer
-                    if let Some(pid) = channel_stream.current_process_pid {
-                        if let Some(proc) = process::lookup_process(pid) {
-                            // Find the process channel for the thread running this process
-                            if let Some(channel) = process::get_channel(proc.thread_id.unwrap_or(0)) {
-                                channel.write_stdin(&read_buf[..n]);
-                                // Wake up the process if it's waiting for input
-                                // This requires current_terminal_state() to work correctly
-                                if let Some(proc_with_terminal) = process::lookup_process(pid) {
-                                    use alloc::sync::Arc;
-                                    use core::task::Waker;
-                                    if let Some(waker): Arc<core::task::Waker> = proc_with_terminal.terminal_state.lock().input_waker.lock().take() {
-                                        waker.wake();
-                                    }
-                                }
+                    if let Some(channel) = &channel_stream.current_process_channel {
+                        (*channel).write_stdin(&read_buf[..n]);
+                        // Wake up the process if it's waiting for input
+                        // This uses the waker registered by sys_poll_input_event
+                        if let Some(proc) = channel_stream.current_process_pid.and_then(|pid| process::lookup_process(pid)) {
+                            crate::threading::disable_preemption();
+                            if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+                                <Waker as Clone>::clone(&waker).wake();
                             }
+                            crate::threading::enable_preemption();
                         }
                     }
                     // No echo, no line editing in raw mode

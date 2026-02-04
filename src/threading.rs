@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use alloc::sync::Arc; // Added
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
@@ -1973,6 +1974,54 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     }
     
     0  // No switch needed
+}
+
+// ============================================================================
+// Waker Integration
+// ============================================================================
+
+use core::task::{RawWaker, RawWakerVTable, Waker};
+
+/// Marks the thread with the given ID as READY.
+fn mark_thread_ready_from_waker(thread_id: usize) {
+    mark_thread_ready(thread_id);
+    // Trigger an SGI to ensure the scheduler runs and picks up the ready thread
+    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+}
+
+/// Creates a RawWaker that, when woken, marks the specified thread as READY.
+fn waker_from_thread_id(thread_id: usize) -> RawWaker {
+    let ptr = thread_id as *const ();
+    RawWaker::new(ptr, &THREAD_WAKER_VTABLE)
+}
+
+const THREAD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    thread_waker_clone,
+    thread_waker_wake,
+    thread_waker_wake_by_ref,
+    thread_waker_drop,
+);
+
+unsafe fn thread_waker_clone(data: *const ()) -> RawWaker {
+    waker_from_thread_id(data as usize)
+}
+
+unsafe fn thread_waker_wake(data: *const ()) {
+    mark_thread_ready_from_waker(data as usize);
+}
+
+unsafe fn thread_waker_wake_by_ref(data: *const ()) {
+    mark_thread_ready_from_waker(data as usize);
+}
+
+unsafe fn thread_waker_drop(_data: *const ()) {
+    // No-op, waker doesn't own any resources
+}
+
+/// Returns a Waker for the specified thread ID.
+/// When this waker is invoked (wake() is called), the target thread will be marked READY.
+pub fn get_waker_for_thread(thread_id: usize) -> Arc<Waker> {
+    Arc::new(unsafe { Waker::from_raw(waker_from_thread_id(thread_id)) })
 }
 
 /// Block the current thread until the specified wake time, then yield

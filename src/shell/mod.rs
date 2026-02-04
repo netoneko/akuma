@@ -21,6 +21,7 @@ use core::pin::Pin;
 use crate::ssh::crypto::{split_first_word, trim_bytes};
 use crate::process::{self, Pid};
 use crate::ssh::protocol::SshChannelStream;
+use embedded_io_async::Write; // Added this line
 
 // Re-export commonly used items
 pub use commands::CommandRegistry;
@@ -520,8 +521,9 @@ pub async fn execute_external_interactive(
         }
     };
 
-    // Set the current process PID in the channel stream
+    // Set the current process PID and channel in the channel stream
     channel_stream.current_process_pid = Some(pid);
+    channel_stream.current_process_channel = Some(channel.clone());
 
     // Buffer for reading from SSH
     let mut read_buf = [0u8; 256];
@@ -611,8 +613,9 @@ pub async fn execute_external_interactive(
         let _ = channel_stream.write_all(msg.as_bytes()).await;
     }
     
-    // Clear the current process PID in the channel stream
+    // Clear the current process PID and channel in the channel stream
     channel_stream.current_process_pid = None;
+    channel_stream.current_process_channel = None;
     
     Ok(())
 }

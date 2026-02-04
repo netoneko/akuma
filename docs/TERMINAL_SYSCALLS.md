@@ -2,6 +2,8 @@
 
 This document outlines proposed new syscalls for the Akuma kernel to enable rich interactive Terminal User Interface (TUI) applications, such as `meow` using `ratatui`, within the userspace environment. These syscalls aim to provide the necessary low-level control over the terminal that is currently missing from `libakuma`.
 
+Extra note: will get_waker_for_thread allow me to add screen-like functionality to shell? do reattach <PID> or something like that and reattach it to the current ssh session?
+
 ## Motivation
 
 Existing `libakuma` provides basic `read` and `write` access to `STDIN`/`STDOUT`. However, modern TUI frameworks like `ratatui` require more granular control, including:

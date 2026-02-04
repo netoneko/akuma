@@ -2021,20 +2021,42 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 // Terminal Syscalls
 // ============================================================================
 
+use crate::terminal::mode_flags;
+use alloc::format;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
+
+/// Helper function to write to the current process's stdout channel
+fn write_to_process_channel(data: &[u8]) -> u64 {
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from ENODEV to ENOMEM
+    };
+    proc_channel.write(data);
+    data.len() as u64
+}
+
 /// sys_set_terminal_attributes - Sets terminal control attributes
-fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags: u64) -> u64 {
+fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     // For now, ignore fd and action, apply to current process's terminal state
     // TODO: Validate fd (STDIN/STDOUT)
+
     let term_state_lock = match crate::process::current_terminal_state() {
         Some(state) => state,
         None => return (-libc_errno::EBADF as i64) as u64, // Bad file descriptor or no terminal
     };
 
     let mut term_state = term_state_lock.lock();
-    term_state.mode_flags = mode_flags; // Directly set the flags for simplicity
+    term_state.mode_flags = mode_flags_arg; // Directly set the flags for simplicity
 
-    crate::safe_print!(64, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags={} -> new_flags={}\n", 
-        fd, action, mode_flags, term_state.mode_flags);
+            // Propagate raw mode setting to the ProcessChannel
+            let proc_channel = match crate::process::current_channel() {
+                Some(channel) => channel,
+                None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from ENODEV to ENOMEM
+            };    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+
+    crate::safe_print!(64, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n", 
+        fd, action, mode_flags_arg, term_state.mode_flags);
 
     0 // Success
 }
@@ -2067,37 +2089,116 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
 
 /// sys_set_cursor_position - Sets the cursor position
 fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
-    // TODO: Implement actual logic
-    crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
-    (-libc_errno::ENOSYS as i64) as u64
+    // VT100/ANSI escape sequence for cursor position is `ESC[{row};{col}H`
+    // Rows and columns are 1-indexed.
+    // Convert 0-indexed arguments to 1-indexed.
+    let row_1_indexed = row + 1;
+    let col_1_indexed = col + 1;
+    let sequence = format!("\x1b[{};{}H", row_1_indexed, col_1_indexed);
+    write_to_process_channel(sequence.as_bytes())
 }
 
 /// sys_hide_cursor - Hides the terminal cursor
 fn sys_hide_cursor() -> u64 {
-    // TODO: Implement actual logic
-    crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
-    (-libc_errno::ENOSYS as i64) as u64
+    // VT100/ANSI escape sequence to hide cursor: `ESC[?25l`
+    write_to_process_channel(b"\x1b[?25l")
 }
 
 /// sys_show_cursor - Shows the terminal cursor
 fn sys_show_cursor() -> u64 {
-    // TODO: Implement actual logic
-    crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
-    (-libc_errno::ENOSYS as i64) as u64
+    // VT100/ANSI escape sequence to show cursor: `ESC[?25h`
+    write_to_process_channel(b"\x1b[?25h")
 }
 
 /// sys_clear_screen - Clears the entire terminal screen
 fn sys_clear_screen() -> u64 {
-    // TODO: Implement actual logic
-    crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
-    (-libc_errno::ENOSYS as i64) as u64
+    // VT100/ANSI escape sequence to clear screen: `ESC[2J`
+    write_to_process_channel(b"\x1b[2J")
 }
 
 /// sys_poll_input_event - Checks for and returns pending input events
+///
+/// # Arguments
+/// * `timeout_ms` - Milliseconds to wait for an event. `0` for non-blocking. `usize::MAX` for blocking.
+/// * `event_buf_ptr` - Pointer to a userspace buffer where the event data (e.g., key code) will be written.
+/// * `buf_len` - Length of the event buffer.
+///
+/// # Returns
+/// Number of bytes read (event size) on success, `0` if no event within timeout, negative errno on failure.
 fn sys_poll_input_event(timeout_ms: u64, event_buf_ptr: u64, buf_len: u64) -> u64 {
-    // TODO: Implement actual logic
-    crate::safe_print!(64, "[syscall] sys_poll_input_event({}, {}, {})\n", timeout_ms, event_buf_ptr, buf_len);
-    (-libc_errno::ENOSYS as i64) as u64
+    if event_buf_ptr == 0 || buf_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64; // Invalid argument
+    }
+
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from ENODEV to ENOMEM
+    };
+
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    // Use a small kernel buffer to read from stdin
+    let mut kernel_buf = Vec::with_capacity(buf_len as usize);
+    kernel_buf.resize(buf_len as usize, 0);
+
+    let mut bytes_read = 0;
+
+    if timeout_ms == 0 {
+        // Non-blocking read
+        bytes_read = proc_channel.read_stdin(&mut kernel_buf);
+    } else {
+        // Blocking or timed read
+        let deadline = if timeout_ms == usize::MAX as u64 {
+            usize::MAX as u64 // Effectively infinite for embassy_time
+        } else {
+            crate::timer::uptime_us() + timeout_ms * 1000
+        };
+
+        // Loop until data is available or timeout
+        loop {
+            bytes_read = proc_channel.read_stdin(&mut kernel_buf);
+            if bytes_read > 0 {
+                break; // Data available
+            }
+
+            if crate::process::is_current_interrupted() {
+                return (-libc_errno::EINTR as i64) as u64;
+            }
+
+            let current_time = crate::timer::uptime_us();
+            if current_time >= deadline {
+                break; // Timeout
+            }
+
+            // If blocking, register waker and yield
+            crate::threading::disable_preemption();
+            let mut term_state = term_state_lock.lock();
+            let thread_id = crate::threading::current_thread_id();
+            term_state.input_waker.lock().replace(crate::threading::get_waker_for_thread(thread_id));
+            crate::threading::enable_preemption();
+            
+            // Yield, will be woken by SSH if input arrives
+            crate::threading::schedule_blocking(deadline);
+
+            // Re-lock to clear waker after being woken up or timeout
+            crate::threading::disable_preemption();
+            term_state.input_waker.lock().take();
+            crate::threading::enable_preemption();
+        }
+    }
+
+    if bytes_read > 0 {
+        // Copy to userspace
+        unsafe {
+            core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), event_buf_ptr as *mut u8, bytes_read);
+        }
+        bytes_read as u64
+    } else {
+        0 // No event within timeout
+    }
 }
 
 // ============================================================================

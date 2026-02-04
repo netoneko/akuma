@@ -897,6 +897,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "termtest"
+version = "0.1.0"
+dependencies = [
+ "format_no_std",
+ "libakuma",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

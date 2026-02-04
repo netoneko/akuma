@@ -134,6 +134,7 @@ pub fn run_threading_tests() -> bool {
 
     // Parallel process tests (requires /bin/hello)
     run_test!(test_parallel_processes, "parallel_processes");
+    run_test!(test_terminal_syscalls, "terminal_syscalls");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -153,6 +154,86 @@ pub fn run_threading_tests() -> bool {
     all_pass
 }
 
+/// Test: Basic terminal syscalls from userspace
+///
+/// This tests the new terminal control syscalls (raw mode, cursor, clear screen)
+/// and input polling.
+fn test_terminal_syscalls() -> bool {
+    console::print("\n[TEST] Terminal Syscalls (Userspace)\n");
+
+    // Check if terminal_test binary exists
+    if crate::fs::read_file("/bin/terminal_test").is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            console::print("  /bin/terminal_test not found\n");
+            console::print("  Result: FAIL\n");
+            return false;
+        } else {
+            console::print("  Skipping: /bin/terminal_test not found\n");
+            console::print("  Result: SKIP\n");
+            return true; // Skip, don't fail
+        }
+    }
+
+    let result = crate::async_tests::run_async_test(async {
+        crate::process::exec_async("/bin/terminal_test", None, None).await
+    });
+
+    let (exit_code, output) = match result {
+        Ok((code, out)) => (code, out),
+        Err(e) => {
+            crate::safe_print!(64, "  Execution failed: {}\n", e);
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    let output_str = String::from_utf8_lossy(&output);
+    crate::safe_print!(1024, "  Terminal Test Output:\n{}\n", output_str);
+
+    let mut all_ok = true;
+
+    // Verify exit code
+    if exit_code != 0 {
+        crate::safe_print!(64, "  Test program exited with non-zero code: {}\n", exit_code);
+        all_ok = false;
+    }
+
+    // Verify key messages in output
+    if !output_str.contains("Terminal Test Program Started") {
+        console::print("  Missing 'Terminal Test Program Started'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Raw mode enabled.") {
+        console::print("  Missing 'Raw mode enabled.'\n");
+        all_ok = false;
+    }
+    // Cannot check "Screen cleared." or "Cursor hidden." directly from output,
+    // as these manipulate the terminal directly.
+    if !output_str.contains("Hello from Akuma Terminal Test!") {
+        console::print("  Missing 'Hello from Akuma Terminal Test!'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Blocking poll: Waiting for input") {
+        console::print("  Missing 'Blocking poll: Waiting for input'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Cursor shown.") {
+        console::print("  Missing 'Cursor shown.'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Terminal attributes restored.") {
+        console::print("  Missing 'Terminal attributes restored.'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Terminal Test Program Finished") {
+        console::print("  Missing 'Terminal Test Program Finished'\n");
+        all_ok = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if all_ok { "PASS" } else { "FAIL" });
+    all_ok
+}
+
 /// Run all system tests - returns true if all pass
 /// Note: This runs both memory and threading tests together.
 /// For finer control, use run_memory_tests() and run_threading_tests() separately.
@@ -164,9 +245,8 @@ pub fn run_all() -> bool {
     all_pass
 }
 
-// ============================================================================
-// Allocator Tests
-// ============================================================================
+
+
 
 /// Test: Vec allocation and basic operations
 fn test_allocator_vec() -> bool {
