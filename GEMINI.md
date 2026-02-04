@@ -35,8 +35,6 @@ Userspace applications interact with the kernel exclusively through system calls
 - Memory is isolated via MMU; data transfer between kernel and userspace requires careful validation of pointers and lengths.
 
 ## Common Tasks
-- **Building:** Use `scripts/run.sh` to compile and launch in QEMU.
-- **Debugging:** Use `scripts/run_with_gdb.sh` and refer to `docs/AI_DEBUGGING.md`.
 - **Testing:** Kernel tests are located in `src/*_tests.rs`; userspace tests are within their respective directories in `userspace/`.
 
 ## Development Tools and Servers
