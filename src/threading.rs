@@ -2020,8 +2020,8 @@ unsafe fn thread_waker_drop(_data: *const ()) {
 
 /// Returns a Waker for the specified thread ID.
 /// When this waker is invoked (wake() is called), the target thread will be marked READY.
-pub fn get_waker_for_thread(thread_id: usize) -> Arc<Waker> {
-    Arc::new(unsafe { Waker::from_raw(waker_from_thread_id(thread_id)) })
+pub fn get_waker_for_thread(thread_id: usize) -> Waker {
+    unsafe { Waker::from_raw(waker_from_thread_id(thread_id)) }
 }
 
 /// Block the current thread until the specified wake time, then yield

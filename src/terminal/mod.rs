@@ -26,7 +26,7 @@ pub struct TerminalState {
     /// Input buffer for events (e.g., key presses)
     pub input_buffer: Mutex<VecDeque<u8>>,
     /// Waker for tasks waiting on input
-    pub input_waker: Mutex<Option<Arc<core::task::Waker>>>,
+    pub input_waker: Mutex<Option<core::task::Waker>>,
 }
 
 impl Default for TerminalState {
@@ -51,7 +51,7 @@ impl TerminalState {
         }
         // Wake up any task waiting for input
         if let Some(waker) = self.input_waker.lock().take() {
-            waker.wake_by_ref();
+            waker.wake();
         }
     }
 
@@ -73,6 +73,6 @@ impl TerminalState {
 
     /// Sets a waker to be notified when input is available.
     pub fn set_input_waker(&self, waker: core::task::Waker) {
-        *self.input_waker.lock() = Some(Arc::new(waker));
+        *self.input_waker.lock() = Some(waker);
     }
 }

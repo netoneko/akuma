@@ -2049,13 +2049,14 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
     let mut term_state = term_state_lock.lock();
     term_state.mode_flags = mode_flags_arg; // Directly set the flags for simplicity
 
-            // Propagate raw mode setting to the ProcessChannel
-            let proc_channel = match crate::process::current_channel() {
-                Some(channel) => channel,
-                None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from ENODEV to ENOMEM
-            };    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+    // Propagate raw mode setting to the ProcessChannel
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64, // Changed from ENODEV to ENOMEM
+    };
+    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
 
-    crate::safe_print!(64, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n", 
+    crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n", 
         fd, action, mode_flags_arg, term_state.mode_flags);
 
     0 // Success
@@ -2081,7 +2082,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
         *(attr_ptr as *mut u64) = term_state.mode_flags;
     }
 
-    crate::safe_print!(64, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n", 
+    crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n", 
         fd, attr_ptr, term_state.mode_flags);
 
     0 // Success
@@ -2089,6 +2090,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
 
 /// sys_set_cursor_position - Sets the cursor position
 fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
+    crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
     // VT100/ANSI escape sequence for cursor position is `ESC[{row};{col}H`
     // Rows and columns are 1-indexed.
     // Convert 0-indexed arguments to 1-indexed.
@@ -2100,18 +2102,21 @@ fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
 
 /// sys_hide_cursor - Hides the terminal cursor
 fn sys_hide_cursor() -> u64 {
+    crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
     // VT100/ANSI escape sequence to hide cursor: `ESC[?25l`
     write_to_process_channel(b"\x1b[?25l")
 }
 
 /// sys_show_cursor - Shows the terminal cursor
 fn sys_show_cursor() -> u64 {
+    crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
     // VT100/ANSI escape sequence to show cursor: `ESC[?25h`
     write_to_process_channel(b"\x1b[?25h")
 }
 
 /// sys_clear_screen - Clears the entire terminal screen
 fn sys_clear_screen() -> u64 {
+    crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
     // VT100/ANSI escape sequence to clear screen: `ESC[2J`
     write_to_process_channel(b"\x1b[2J")
 }
@@ -2144,48 +2149,60 @@ fn sys_poll_input_event(timeout_ms: u64, event_buf_ptr: u64, buf_len: u64) -> u6
     let mut kernel_buf = Vec::with_capacity(buf_len as usize);
     kernel_buf.resize(buf_len as usize, 0);
 
-    let mut bytes_read = 0;
+    let mut bytes_read;
 
     if timeout_ms == 0 {
         // Non-blocking read
         bytes_read = proc_channel.read_stdin(&mut kernel_buf);
     } else {
         // Blocking or timed read
-        let deadline = if timeout_ms == usize::MAX as u64 {
-            usize::MAX as u64 // Effectively infinite for embassy_time
+        let deadline = if timeout_ms == u64::MAX {
+            u64::MAX // Effectively infinite for embassy_time
         } else {
             crate::timer::uptime_us() + timeout_ms * 1000
         };
 
         // Loop until data is available or timeout
         loop {
+            // CRITICAL: Register waker BEFORE checking for data to avoid lost wake-up race
+            crate::threading::disable_preemption();
+            let mut term_state = term_state_lock.lock();
+            let thread_id = crate::threading::current_thread_id();
+            term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
+            crate::threading::enable_preemption();
+
+            // Check for data AFTER registering waker
             bytes_read = proc_channel.read_stdin(&mut kernel_buf);
             if bytes_read > 0 {
-                break; // Data available
+                // Got data, clear waker and exit loop
+                crate::threading::disable_preemption();
+                term_state_lock.lock().input_waker.lock().take();
+                crate::threading::enable_preemption();
+                break;
             }
 
             if crate::process::is_current_interrupted() {
+                crate::threading::disable_preemption();
+                term_state_lock.lock().input_waker.lock().take();
+                crate::threading::enable_preemption();
                 return (-libc_errno::EINTR as i64) as u64;
             }
 
             let current_time = crate::timer::uptime_us();
             if current_time >= deadline {
-                break; // Timeout
+                // Timeout, clear waker and exit loop
+                crate::threading::disable_preemption();
+                term_state_lock.lock().input_waker.lock().take();
+                crate::threading::enable_preemption();
+                break;
             }
-
-            // If blocking, register waker and yield
-            crate::threading::disable_preemption();
-            let mut term_state = term_state_lock.lock();
-            let thread_id = crate::threading::current_thread_id();
-            term_state.input_waker.lock().replace(crate::threading::get_waker_for_thread(thread_id));
-            crate::threading::enable_preemption();
             
-            // Yield, will be woken by SSH if input arrives
+            // Yield, will be woken by SSH if input arrives (calling waker.wake())
             crate::threading::schedule_blocking(deadline);
 
-            // Re-lock to clear waker after being woken up or timeout
+            // Re-lock to clear waker after being woken up or timeout (already handled above but safe to repeat)
             crate::threading::disable_preemption();
-            term_state.input_waker.lock().take();
+            term_state_lock.lock().input_waker.lock().take();
             crate::threading::enable_preemption();
         }
     }
