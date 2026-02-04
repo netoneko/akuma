@@ -33,6 +33,8 @@ use crate::async_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
+use crate::process::{self, Pid};
+use crate::terminal::{self, mode_flags};
 use embassy_time::Duration;
 
 // ============================================================================
@@ -211,11 +213,12 @@ impl embedded_io_async::Error for SshStreamError {
 struct SshChannelStream<'a> {
     stream: &'a mut TcpStream,
     session: &'a mut SshSession,
+    current_process_pid: Option<Pid>,
 }
 
 impl<'a> SshChannelStream<'a> {
     fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
-        Self { stream, session }
+        Self { stream, session, current_process_pid: None }
     }
 
     /// Read and process SSH packets until we have channel data or an error
@@ -779,295 +782,331 @@ async fn run_shell_session(
                 break;
             }
             Ok(n) => {
-                for &byte in &read_buf[..n] {
-                    match escape_state {
-                        EscapeState::Normal => {
-                            match byte {
-                                0x1B => {
-                                    // ESC - start of escape sequence
-                                    escape_state = EscapeState::Escape;
+                // Determine if the current foreground process is in raw mode
+                let is_raw_mode = if let Some(pid) = channel_stream.current_process_pid {
+                    if let Some(proc) = process::lookup_process(pid) {
+                        let term_state = proc.terminal_state.lock();
+                        (term_state.mode_flags & mode_flags::RAW_MODE_ENABLE) != 0
+                    } else {
+                        false // Process not found, assume cooked mode
+                    }
+                } else {
+                    false // No foreground process, assume cooked mode (shell itself)
+                };
+
+                if is_raw_mode {
+                    // Raw mode: Pass input directly to the process's stdin buffer
+                    if let Some(pid) = channel_stream.current_process_pid {
+                        if let Some(proc) = process::lookup_process(pid) {
+                            // Find the process channel for the thread running this process
+                            if let Some(channel) = process::get_channel(proc.thread_id.unwrap_or(0)) {
+                                channel.write_stdin(&read_buf[..n]);
+                                // Wake up the process if it's waiting for input
+                                // This requires current_terminal_state() to work correctly
+                                if let Some(proc_with_terminal) = process::lookup_process(pid) {
+                                    use alloc::sync::Arc;
+                                    use core::task::Waker;
+                                    if let Some(waker): Arc<core::task::Waker> = proc_with_terminal.terminal_state.lock().input_waker.lock().take() {
+                                        waker.wake();
+                                    }
                                 }
-                                b'\r' | b'\n' => {
-                                    // Echo newline
-                                    let _ = channel_stream.write(b"\r\n").await;
+                            }
+                        }
+                    }
+                    // No echo, no line editing in raw mode
+                } else {
+                    // Cooked mode (shell itself or process not in raw mode):
+                    // Existing line editing and echoing logic
+                    for &byte in &read_buf[..n] {
+                        match escape_state {
+                            EscapeState::Normal => {
+                                match byte {
+                                    0x1B => {
+                                        // ESC - start of escape sequence
+                                        escape_state = EscapeState::Escape;
+                                    }
+                                    b'\r' | b'\n' => {
+                                        // Echo newline
+                                        let _ = channel_stream.write(b"\r\n").await;
 
-                                    // Process command
-                                    let trimmed = trim_bytes(&line_buffer);
-                                    if !trimmed.is_empty() {
-                                        // Add to history
-                                        history.push(line_buffer.clone());
-                                        if history.len() > 50 {
-                                            history.remove(0);
-                                        }
-                                        history_index = history.len();                                        
+                                        // Process command
+                                        let trimmed = trim_bytes(&line_buffer);
+                                        if !trimmed.is_empty() {
+                                            // Add to history
+                                            history.push(line_buffer.clone());
+                                            if history.len() > 50 {
+                                                history.remove(0);
+                                            }
+                                            history_index = history.len();                                        
 
-                                        // Check for neko editor command (special case - not part of command chain)
-                                        if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
-                                            let filepath = if trimmed.len() > 5 {
-                                                let path_bytes = trim_bytes(&trimmed[5..]);
-                                                if path_bytes.is_empty() {
-                                                    None
+                                            // Check for neko editor command (special case - not part of command chain)
+                                            if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
+                                                let filepath = if trimmed.len() > 5 {
+                                                    let path_bytes = trim_bytes(&trimmed[5..]);
+                                                    if path_bytes.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(
+                                                            core::str::from_utf8(path_bytes)
+                                                                .unwrap_or(""),
+                                                        )
+                                                    }
                                                 } else {
-                                                    Some(
-                                                        core::str::from_utf8(path_bytes)
-                                                            .unwrap_or(""),
-                                                    )
-                                                }
-                                            } else {
-                                                None
-                                            };
+                                                    None
+                                                };
 
-                                            if let Err(e) =
-                                                crate::editor::run(&mut channel_stream, filepath)
-                                                    .await
-                                            {
-                                                let msg = format!("Editor error: {}\r\n", e);
-                                                let _ = channel_stream.write(msg.as_bytes()).await;
+                                                if let Err(e) =
+                                                    crate::editor::run(&mut channel_stream, filepath)
+                                                        .await
+                                                {
+                                                    let msg = format!("Editor error: {}\r\n", e);
+                                                    let _ = channel_stream.write(msg.as_bytes()).await;
+                                                }
+
+                                                line_buffer.clear();
+                                                cursor_pos = 0;
+                                                let prompt = generate_prompt(&ctx);
+                                                let _ = channel_stream.write(prompt.as_bytes()).await;
+                                                continue;
                                             }
 
-                                            line_buffer.clear();
-                                            cursor_pos = 0;
-                                            let prompt = generate_prompt(&ctx);
-                                            let _ = channel_stream.write(prompt.as_bytes()).await;
-                                            continue;
+                                            // Try streaming execution for simple external binaries
+                                            // This provides real-time output for long-running commands
+                                            let result = if let Some(streaming_result) = 
+                                                shell::execute_command_streaming(
+                                                    trimmed, &registry, &mut ctx, &mut channel_stream,
+                                                ).await 
+                                            {
+                                                streaming_result
+                                            } else {
+                                                // Fall back to buffered execution for complex commands
+                                                // (pipelines, redirects, builtins, command chains)
+                                                shell::execute_command_chain(
+                                                    trimmed, &registry, &mut ctx,
+                                                ).await
+                                            };
+
+                                            // Output the result (empty for streamed commands)
+                                            if !result.output.is_empty() {
+                                                let _ = channel_stream.write(&result.output).await;
+                                            }
+
+                                            // Check if we should exit
+                                            if result.should_exit {
+                                                let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                                return Ok(());
+                                            }
                                         }
 
-                                        // Try streaming execution for simple external binaries
-                                        // This provides real-time output for long-running commands
-                                        let result = if let Some(streaming_result) = 
-                                            shell::execute_command_streaming(
-                                                trimmed, &registry, &mut ctx, &mut channel_stream,
-                                            ).await 
-                                        {
-                                            streaming_result
-                                        } else {
-                                            // Fall back to buffered execution for complex commands
-                                            // (pipelines, redirects, builtins, command chains)
-                                            shell::execute_command_chain(
-                                                trimmed, &registry, &mut ctx,
-                                            ).await
-                                        };
+                                        line_buffer.clear();
+                                        cursor_pos = 0;
+                                        let prompt = generate_prompt(&ctx);
+                                        let _ = channel_stream.write(prompt.as_bytes()).await;
+                                    }
+                                    0x7F | 0x08 => {
+                                        // Backspace - delete character before cursor
+                                        if cursor_pos > 0 {
+                                            cursor_pos -= 1;
+                                            line_buffer.remove(cursor_pos);
 
-                                        // Output the result (empty for streamed commands)
-                                        if !result.output.is_empty() {
-                                            let _ = channel_stream.write(&result.output).await;
+                                            // Move cursor back, rewrite rest of line, clear extra char
+                                            let _ = channel_stream.write(b"\x08").await;
+                                            let _ =
+                                                channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                            let _ = channel_stream.write(b" ").await;
+                                            // Move cursor back to position
+                                            let moves = line_buffer.len() - cursor_pos + 1;
+                                            for _ in 0..moves {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
                                         }
-
-                                        // Check if we should exit
-                                        if result.should_exit {
-                                            let _ = channel_stream.write(b"Goodbye!\r\n").await;
+                                    }
+                                    0x03 => {
+                                        // Ctrl+C
+                                        line_buffer.clear();
+                                        cursor_pos = 0;
+                                        let _ = channel_stream.write(b"^C\r\n").await;
+                                        let prompt = generate_prompt(&ctx);
+                                        let _ = channel_stream.write(prompt.as_bytes()).await;
+                                    }
+                                    0x04 => {
+                                        // Ctrl+D
+                                        if line_buffer.is_empty() {
+                                            let _ = channel_stream.write(b"\r\nGoodbye!\r\n").await;
                                             return Ok(());
                                         }
                                     }
+                                    0x01 => {
+                                        // Ctrl+A - move to beginning of line
+                                        while cursor_pos > 0 {
+                                            let _ = channel_stream.write(b"\x08").await;
+                                            cursor_pos -= 1;
+                                        }
+                                    }
+                                    0x05 => {
+                                        // Ctrl+E - move to end of line
+                                        if cursor_pos < line_buffer.len() {
+                                            let _ =
+                                                channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                            cursor_pos = line_buffer.len();
+                                        }
+                                    }
+                                    0x0B => {
+                                        // Ctrl+K - kill from cursor to end of line
+                                        if cursor_pos < line_buffer.len() {
+                                            let chars_to_clear = line_buffer.len() - cursor_pos;
+                                            line_buffer.truncate(cursor_pos);
+                                            // Clear characters visually
+                                            for _ in 0..chars_to_clear {
+                                                let _ = channel_stream.write(b" ").await;
+                                            }
+                                            for _ in 0..chars_to_clear {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
+                                        }
+                                    }
+                                    0x15 => {
+                                        // Ctrl+U - kill from beginning to cursor
+                                        if cursor_pos > 0 {
+                                            // Move to beginning
+                                            for _ in 0..cursor_pos {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
+                                            // Write rest of line
+                                            let rest: Vec<u8> = line_buffer[cursor_pos..].to_vec();
+                                            let _ = channel_stream.write(&rest).await;
+                                            // Clear old chars
+                                            for _ in 0..cursor_pos {
+                                                let _ = channel_stream.write(b" ").await;
+                                            }
+                                            // Move back
+                                            for _ in 0..(cursor_pos + rest.len()) {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
+                                            line_buffer = rest;
+                                            cursor_pos = 0;
+                                        }
+                                    }
+                                    _ if byte >= 0x20 && byte < 0x7F => {
+                                        // Printable character - insert at cursor position
+                                        line_buffer.insert(cursor_pos, byte);
+                                        cursor_pos += 1;
 
-                                    line_buffer.clear();
-                                    cursor_pos = 0;
-                                    let prompt = generate_prompt(&ctx);
-                                    let _ = channel_stream.write(prompt.as_bytes()).await;
-                                }
-                                0x7F | 0x08 => {
-                                    // Backspace - delete character before cursor
-                                    if cursor_pos > 0 {
-                                        cursor_pos -= 1;
-                                        line_buffer.remove(cursor_pos);
-
-                                        // Move cursor back, rewrite rest of line, clear extra char
-                                        let _ = channel_stream.write(b"\x08").await;
+                                        // Write character and rest of line
                                         let _ =
-                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
-                                        let _ = channel_stream.write(b" ").await;
+                                            channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
                                         // Move cursor back to position
-                                        let moves = line_buffer.len() - cursor_pos + 1;
+                                        let moves = line_buffer.len() - cursor_pos;
                                         for _ in 0..moves {
                                             let _ = channel_stream.write(b"\x08").await;
                                         }
                                     }
+                                    _ => {}
                                 }
-                                0x03 => {
-                                    // Ctrl+C
-                                    line_buffer.clear();
-                                    cursor_pos = 0;
-                                    let _ = channel_stream.write(b"^C\r\n").await;
-                                    let prompt = generate_prompt(&ctx);
-                                    let _ = channel_stream.write(prompt.as_bytes()).await;
-                                }
-                                0x04 => {
-                                    // Ctrl+D
-                                    if line_buffer.is_empty() {
-                                        let _ = channel_stream.write(b"\r\nGoodbye!\r\n").await;
-                                        return Ok(());
-                                    }
-                                }
-                                0x01 => {
-                                    // Ctrl+A - move to beginning of line
-                                    while cursor_pos > 0 {
-                                        let _ = channel_stream.write(b"\x08").await;
-                                        cursor_pos -= 1;
-                                    }
-                                }
-                                0x05 => {
-                                    // Ctrl+E - move to end of line
-                                    if cursor_pos < line_buffer.len() {
-                                        let _ =
-                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
-                                        cursor_pos = line_buffer.len();
-                                    }
-                                }
-                                0x0B => {
-                                    // Ctrl+K - kill from cursor to end of line
-                                    if cursor_pos < line_buffer.len() {
-                                        let chars_to_clear = line_buffer.len() - cursor_pos;
-                                        line_buffer.truncate(cursor_pos);
-                                        // Clear characters visually
-                                        for _ in 0..chars_to_clear {
-                                            let _ = channel_stream.write(b" ").await;
-                                        }
-                                        for _ in 0..chars_to_clear {
-                                            let _ = channel_stream.write(b"\x08").await;
-                                        }
-                                    }
-                                }
-                                0x15 => {
-                                    // Ctrl+U - kill from beginning to cursor
-                                    if cursor_pos > 0 {
-                                        // Move to beginning
-                                        for _ in 0..cursor_pos {
-                                            let _ = channel_stream.write(b"\x08").await;
-                                        }
-                                        // Write rest of line
-                                        let rest: Vec<u8> = line_buffer[cursor_pos..].to_vec();
-                                        let _ = channel_stream.write(&rest).await;
-                                        // Clear old chars
-                                        for _ in 0..cursor_pos {
-                                            let _ = channel_stream.write(b" ").await;
-                                        }
-                                        // Move back
-                                        for _ in 0..(cursor_pos + rest.len()) {
-                                            let _ = channel_stream.write(b"\x08").await;
-                                        }
-                                        line_buffer = rest;
-                                        cursor_pos = 0;
-                                    }
-                                }
-                                _ if byte >= 0x20 && byte < 0x7F => {
-                                    // Printable character - insert at cursor position
-                                    line_buffer.insert(cursor_pos, byte);
-                                    cursor_pos += 1;
-
-                                    // Write character and rest of line
-                                    let _ =
-                                        channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
-                                    // Move cursor back to position
-                                    let moves = line_buffer.len() - cursor_pos;
-                                    for _ in 0..moves {
-                                        let _ = channel_stream.write(b"\x08").await;
-                                    }
-                                }
-                                _ => {}
                             }
-                        }
-                        EscapeState::Escape => {
-                            if byte == b'[' {
-                                escape_state = EscapeState::Bracket;
-                            } else {
-                                // Not a CSI sequence, ignore
+                            EscapeState::Escape => {
+                                if byte == b'[' {
+                                    escape_state = EscapeState::Bracket;
+                                } else {
+                                    // Not a CSI sequence, ignore
+                                    escape_state = EscapeState::Normal;
+                                }
+                            }
+                            EscapeState::Bracket => {
                                 escape_state = EscapeState::Normal;
-                            }
-                        }
-                        EscapeState::Bracket => {
-                            escape_state = EscapeState::Normal;
-                            match byte {
-                                b'A' => {
-                                    // Up arrow - previous history
-                                    if !history.is_empty() && history_index > 0 {
-                                        // Save current line if at the end
-                                        if history_index == history.len() {
-                                            saved_line = line_buffer.clone();
-                                        }
-                                        history_index -= 1;
+                                match byte {
+                                    b'A' => {
+                                        // Up arrow - previous history
+                                        if !history.is_empty() && history_index > 0 {
+                                            // Save current line if at the end
+                                            if history_index == history.len() {
+                                                saved_line = line_buffer.clone();
+                                            }
+                                            history_index -= 1;
 
-                                        // Clear current line
-                                        while cursor_pos > 0 {
-                                            let _ = channel_stream.write(b"\x08 \x08").await;
-                                            cursor_pos -= 1;
-                                        }
-                                        for _ in 0..line_buffer.len() {
-                                            let _ = channel_stream.write(b" ").await;
-                                        }
-                                        for _ in 0..line_buffer.len() {
-                                            let _ = channel_stream.write(b"\x08").await;
-                                        }
+                                            // Clear current line
+                                            while cursor_pos > 0 {
+                                                let _ = channel_stream.write(b"\x08 \x08").await;
+                                                cursor_pos -= 1;
+                                            }
+                                            for _ in 0..line_buffer.len() {
+                                                let _ = channel_stream.write(b" ").await;
+                                            }
+                                            for _ in 0..line_buffer.len() {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
 
-                                        // Load history entry
-                                        line_buffer = history[history_index].clone();
-                                        cursor_pos = line_buffer.len();
-                                        let _ = channel_stream.write(&line_buffer).await;
-                                    }
-                                }
-                                b'B' => {
-                                    // Down arrow - next history
-                                    if history_index < history.len() {
-                                        history_index += 1;
-
-                                        // Clear current line
-                                        while cursor_pos > 0 {
-                                            let _ = channel_stream.write(b"\x08 \x08").await;
-                                            cursor_pos -= 1;
-                                        }
-                                        for _ in 0..line_buffer.len() {
-                                            let _ = channel_stream.write(b" ").await;
-                                        }
-                                        for _ in 0..line_buffer.len() {
-                                            let _ = channel_stream.write(b"\x08").await;
-                                        }
-
-                                        // Load history entry or saved line
-                                        if history_index < history.len() {
+                                            // Load history entry
                                             line_buffer = history[history_index].clone();
-                                        } else {
-                                            line_buffer = saved_line.clone();
+                                            cursor_pos = line_buffer.len();
+                                            let _ = channel_stream.write(&line_buffer).await;
                                         }
-                                        cursor_pos = line_buffer.len();
-                                        let _ = channel_stream.write(&line_buffer).await;
                                     }
-                                }
-                                b'C' => {
-                                    // Right arrow - move cursor right
-                                    if cursor_pos < line_buffer.len() {
-                                        let _ =
-                                            channel_stream.write(&[line_buffer[cursor_pos]]).await;
-                                        cursor_pos += 1;
+                                    b'B' => {
+                                        // Down arrow - next history
+                                        if history_index < history.len() {
+                                            history_index += 1;
+
+                                            // Clear current line
+                                            while cursor_pos > 0 {
+                                                let _ = channel_stream.write(b"\x08 \x08").await;
+                                                cursor_pos -= 1;
+                                            }
+                                            for _ in 0..line_buffer.len() {
+                                                let _ = channel_stream.write(b" ").await;
+                                            }
+                                            for _ in 0..line_buffer.len() {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                            }
+
+                                            // Load history entry or saved line
+                                            if history_index < history.len() {
+                                                line_buffer = history[history_index].clone();
+                                            } else {
+                                                line_buffer = saved_line.clone();
+                                            }
+                                            cursor_pos = line_buffer.len();
+                                            let _ = channel_stream.write(&line_buffer).await;
+                                        }
                                     }
-                                }
-                                b'D' => {
-                                    // Left arrow - move cursor left
-                                    if cursor_pos > 0 {
-                                        let _ = channel_stream.write(b"\x08").await;
-                                        cursor_pos -= 1;
+                                    b'C' => {
+                                        // Right arrow - move cursor right
+                                        if cursor_pos < line_buffer.len() {
+                                            let _ =
+                                                channel_stream.write(&[line_buffer[cursor_pos]]).await;
+                                            cursor_pos += 1;
+                                        }
                                     }
-                                }
-                                b'H' => {
-                                    // Home key
-                                    while cursor_pos > 0 {
-                                        let _ = channel_stream.write(b"\x08").await;
-                                        cursor_pos -= 1;
+                                    b'D' => {
+                                        // Left arrow - move cursor left
+                                        if cursor_pos > 0 {
+                                            let _ = channel_stream.write(b"\x08").await;
+                                            cursor_pos -= 1;
+                                        }
                                     }
-                                }
-                                b'F' => {
-                                    // End key
-                                    if cursor_pos < line_buffer.len() {
-                                        let _ =
-                                            channel_stream.write(&line_buffer[cursor_pos..]).await;
-                                        cursor_pos = line_buffer.len();
+                                    b'H' => {
+                                        // Home key
+                                        while cursor_pos > 0 {
+                                            let _ = channel_stream.write(b"\x08").await;
+                                            cursor_pos -= 1;
+                                        }
                                     }
-                                }
-                                b'3' => {
-                                    // Might be Delete key (ESC[3~) - need to handle tilde
-                                    // For simplicity, we'll handle this as a special case
-                                    // The next byte should be ~
-                                }
-                                _ => {
-                                    // Unknown escape sequence, ignore
+                                    b'F' => {
+                                        // End key
+                                        if cursor_pos < line_buffer.len() {
+                                            let _ =
+                                                channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                            cursor_pos = line_buffer.len();
+                                        }
+                                    }
+                                    b'3' => {
+                                        // Might be Delete key (ESC[3~) - need to handle tilde
+                                        // For simplicity, we'll handle this as a special case
+                                        // The next byte should be ~
+                                    }
+                                    _ => {
+                                        // Unknown escape sequence, ignore
+                                    }
                                 }
                             }
                         }

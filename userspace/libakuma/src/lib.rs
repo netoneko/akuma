@@ -43,6 +43,14 @@ pub mod syscall {
     pub const GETRANDOM: u64 = 304;
     pub const TIME: u64 = 305;
     pub const CHDIR: u64 = 306;
+    // New Terminal Control Syscalls
+    pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
+    pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
+    pub const SET_CURSOR_POSITION: u64 = 309;
+    pub const HIDE_CURSOR: u64 = 310;
+    pub const SHOW_CURSOR: u64 = 311;
+    pub const CLEAR_SCREEN: u64 = 312;
+    pub const POLL_INPUT_EVENT: u64 = 313;
 }
 
 /// File descriptors
@@ -1042,6 +1050,82 @@ pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
         // Child exited, extract exit code from Linux-style status
         let exit_code = ((status >> 8) & 0xFF) as i32;
         Some((result as u32, exit_code))
+    }
+}
+
+// ============================================================================
+// Terminal Syscall Wrappers
+// ============================================================================
+
+/// Sets terminal control attributes.
+pub fn set_terminal_attributes(fd: u64, action: u64, mode_flags: u64) -> i32 {
+    syscall(
+        syscall::SET_TERMINAL_ATTRIBUTES,
+        fd,
+        action,
+        mode_flags,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Retrieves current terminal control attributes.
+pub fn get_terminal_attributes(fd: u64, attr_ptr: u64) -> i32 {
+    syscall(
+        syscall::GET_TERMINAL_ATTRIBUTES,
+        fd,
+        attr_ptr,
+        0, 0, 0, 0,
+    ) as i32
+}
+
+/// Sets the cursor position (col, row).
+pub fn set_cursor_position(col: u64, row: u64) -> i32 {
+    syscall(
+        syscall::SET_CURSOR_POSITION,
+        col,
+        row,
+        0, 0, 0, 0,
+    ) as i32
+}
+
+/// Hides the terminal cursor.
+pub fn hide_cursor() -> i32 {
+    syscall(
+        syscall::HIDE_CURSOR,
+        0, 0, 0, 0, 0, 0,
+    ) as i32
+}
+
+/// Shows the terminal cursor.
+pub fn show_cursor() -> i32 {
+    syscall(
+        syscall::SHOW_CURSOR,
+        0, 0, 0, 0, 0, 0,
+    ) as i32
+}
+
+/// Clears the entire terminal screen.
+pub fn clear_screen() -> i32 {
+    syscall(
+        syscall::CLEAR_SCREEN,
+        0, 0, 0, 0, 0, 0,
+    ) as i32
+}
+
+/// Checks for and returns pending input events.
+pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
+    let ret = syscall(
+        syscall::POLL_INPUT_EVENT,
+        timeout_ms,
+        event_buf.as_mut_ptr() as u64,
+        event_buf.len() as u64,
+        0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        ret as isize // Return negative errno
+    } else {
+        ret as isize // Return bytes read
     }
 }
 

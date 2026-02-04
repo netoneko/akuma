@@ -833,6 +833,7 @@ pub mod libc_errno {
     pub const ECHILD: i32 = 10;      // No child processes
     pub const EAGAIN: i32 = 11;      // Try again
     pub const EWOULDBLOCK: i32 = 11; // Same as EAGAIN
+    pub const ENOSYS: i32 = 38;      // Function not implemented (invalid syscall number)
     pub const ENOMEM: i32 = 12;      // Out of memory
     pub const EFAULT: i32 = 14;      // Bad address
     pub const ENOTDIR: i32 = 20;     // Not a directory

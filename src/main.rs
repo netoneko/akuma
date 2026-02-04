@@ -37,6 +37,7 @@ mod socket;
 mod ssh;
 mod std_compat;
 mod syscall;
+mod terminal;
 mod tests;
 mod threading;
 mod timer;

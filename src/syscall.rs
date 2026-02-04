@@ -37,6 +37,14 @@ pub mod nr {
     pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
     pub const CHDIR: u64 = 306;       // Change current working directory
+    // Terminal Syscalls (307-313)
+    pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
+    pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
+    pub const SET_CURSOR_POSITION: u64 = 309;
+    pub const HIDE_CURSOR: u64 = 310;
+    pub const SHOW_CURSOR: u64 = 311;
+    pub const CLEAR_SCREEN: u64 = 312;
+    pub const POLL_INPUT_EVENT: u64 = 313;
 }
 
 /// Error code for interrupted syscall
@@ -105,6 +113,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
         nr::CHDIR => sys_chdir(args[0], args[1] as usize),
+        nr::SET_TERMINAL_ATTRIBUTES => sys_set_terminal_attributes(args[0], args[1], args[2]),
+        nr::GET_TERMINAL_ATTRIBUTES => sys_get_terminal_attributes(args[0], args[1]),
+        nr::SET_CURSOR_POSITION => sys_set_cursor_position(args[0], args[1]),
+        nr::HIDE_CURSOR => sys_hide_cursor(),
+        nr::SHOW_CURSOR => sys_show_cursor(),
+        nr::CLEAR_SCREEN => sys_clear_screen(),
+        nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1], args[2]),
         _ => {
             crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
             (-1i64) as u64 // ENOSYS
@@ -2001,6 +2016,93 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
         0
     }
 }
+
+// ============================================================================
+// Terminal Syscalls
+// ============================================================================
+
+/// sys_set_terminal_attributes - Sets terminal control attributes
+fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags: u64) -> u64 {
+    // For now, ignore fd and action, apply to current process's terminal state
+    // TODO: Validate fd (STDIN/STDOUT)
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::EBADF as i64) as u64, // Bad file descriptor or no terminal
+    };
+
+    let mut term_state = term_state_lock.lock();
+    term_state.mode_flags = mode_flags; // Directly set the flags for simplicity
+
+    crate::safe_print!(64, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags={} -> new_flags={}\n", 
+        fd, action, mode_flags, term_state.mode_flags);
+
+    0 // Success
+}
+
+/// sys_get_terminal_attributes - Retrieves current terminal control attributes
+fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
+    // For now, ignore fd, read from current process's terminal state
+    // TODO: Validate fd (STDIN/STDOUT)
+    if attr_ptr == 0 {
+        return (-libc_errno::EINVAL as i64) as u64; // Invalid argument
+    }
+
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::EBADF as i64) as u64, // Bad file descriptor or no terminal
+    };
+
+    let term_state = term_state_lock.lock();
+
+    // SAFETY: We assume attr_ptr is a valid userspace pointer to a u64
+    unsafe {
+        *(attr_ptr as *mut u64) = term_state.mode_flags;
+    }
+
+    crate::safe_print!(64, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n", 
+        fd, attr_ptr, term_state.mode_flags);
+
+    0 // Success
+}
+
+/// sys_set_cursor_position - Sets the cursor position
+fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
+    // TODO: Implement actual logic
+    crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
+    (-libc_errno::ENOSYS as i64) as u64
+}
+
+/// sys_hide_cursor - Hides the terminal cursor
+fn sys_hide_cursor() -> u64 {
+    // TODO: Implement actual logic
+    crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
+    (-libc_errno::ENOSYS as i64) as u64
+}
+
+/// sys_show_cursor - Shows the terminal cursor
+fn sys_show_cursor() -> u64 {
+    // TODO: Implement actual logic
+    crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
+    (-libc_errno::ENOSYS as i64) as u64
+}
+
+/// sys_clear_screen - Clears the entire terminal screen
+fn sys_clear_screen() -> u64 {
+    // TODO: Implement actual logic
+    crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
+    (-libc_errno::ENOSYS as i64) as u64
+}
+
+/// sys_poll_input_event - Checks for and returns pending input events
+fn sys_poll_input_event(timeout_ms: u64, event_buf_ptr: u64, buf_len: u64) -> u64 {
+    // TODO: Implement actual logic
+    crate::safe_print!(64, "[syscall] sys_poll_input_event({}, {}, {})\n", timeout_ms, event_buf_ptr, buf_len);
+    (-libc_errno::ENOSYS as i64) as u64
+}
+
+// ============================================================================
+// Socket Blocking Helper
+// ============================================================================
 
 /// sys_getdents64 - Get directory entries
 ///

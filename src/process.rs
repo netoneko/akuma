@@ -40,6 +40,7 @@ use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::UserAddressSpace;
 use crate::pmm::PhysFrame;
+use crate::terminal;
 
 /// Fixed address for process info page (read-only from userspace)
 ///
@@ -603,6 +604,13 @@ pub fn current_process() -> Option<&'static mut Process> {
     lookup_process(pid)
 }
 
+/// Get the current process's TerminalState (for syscall handlers)
+///
+/// Returns a mutable reference to the TerminalState if found.
+pub fn current_terminal_state() -> Option<&'static Spinlock<terminal::TerminalState>> {
+    current_process().map(|p| &p.terminal_state)
+}
+
 /// Allocate mmap region for current process
 /// Returns the address or 0 on failure
 pub fn alloc_mmap(size: usize) -> usize {
@@ -928,10 +936,10 @@ pub struct Process {
     /// Thread ID running this process (set after spawn, used for kill)
     pub thread_id: Option<usize>,
 
-    // ========== Spawner tracking (for procfs permissions) ==========
-    /// PID of the process that spawned this one
-    /// None = kernel spawned (allows anyone to write to stdin)
+    /// Spawner tracking (for procfs permissions)
     pub spawner_pid: Option<Pid>,
+    // ========== Terminal State ==========
+    pub terminal_state: Spinlock<terminal::TerminalState>,
 }
 
 
@@ -1008,6 +1016,8 @@ impl Process {
             thread_id: None,
             // Spawner PID - set when spawned by another process
             spawner_pid: None,
+            // Terminal State - default for new processes
+            terminal_state: Spinlock::new(terminal::TerminalState::default()),
         })
     }
 
