@@ -1255,6 +1255,7 @@ fn sys_resolve_host(hostname_ptr: u64, hostname_len: usize, result_ptr: u64) -> 
 // ============================================================================
 
 use crate::process::KernelFile;
+use crate::vfs::metadata;
 
 /// Linux stat structure (simplified)
 #[repr(C)]
@@ -1439,18 +1440,27 @@ fn sys_fstat(fd: u32, statbuf_ptr: u64) -> u64 {
         _ => return (-libc_errno::EINVAL as i64) as u64,
     };
 
-    // Get file size
-    let file_size = match crate::fs::file_size(&file.path) {
-        Ok(s) => s as i64,
+    // Get metadata
+    let metadata = match metadata(&file.path) {
+        Ok(m) => m,
         Err(_) => return (-libc_errno::EIO as i64) as u64,
+    };
+
+    // Determine file type and permissions
+    let st_mode = if metadata.is_dir {
+        // Directory, rwxr-xr-x
+        0o040000 | 0o755
+    } else {
+        // Regular file, rw-r--r--
+        0o100000 | 0o644
     };
 
     // Fill stat structure
     let stat = Stat {
-        st_size: file_size,
-        st_mode: 0o100644, // Regular file, rw-r--r--
+        st_size: metadata.size as i64,
+        st_mode: st_mode,
         st_blksize: 4096,
-        st_blocks: (file_size + 511) / 512,
+        st_blocks: (metadata.size as i64 + 511) / 512,
         ..Default::default()
     };
 
