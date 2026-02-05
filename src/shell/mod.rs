@@ -547,11 +547,6 @@ pub async fn execute_external_interactive(
             }
             let _ = channel_stream.write_all(&buf).await;
             let _ = channel_stream.flush().await;
-            
-            // Yield to allow network transmission
-            for _ in 0..20 {
-                crate::threading::yield_now();
-            }
         }
 
         // 2. Check for process exit

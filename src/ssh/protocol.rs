@@ -493,6 +493,13 @@ impl Write for SshChannelStream<'_> {
                 .map_err(|_| SshStreamError)?;
             sent += chunk_size;
         }
+
+        // Auto-flush to ensure immediate transmission for interactive sessions
+        // Use a timeout (10ms) to prevent blocking if the network is backed up
+        let _ = embassy_time::with_timeout(
+            SSH_INTERACTIVE_READ_TIMEOUT,
+            self.flush()
+        ).await;
         
         Ok(buf.len())
     }
