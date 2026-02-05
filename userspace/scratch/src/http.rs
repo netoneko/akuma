@@ -23,13 +23,17 @@ pub struct Url {
 }
 
 impl Url {
-    /// Parse a Git URL
-    ///
-    /// Supports:
-    /// - https://github.com/owner/repo
-    /// - https://github.com/owner/repo.git
-    /// - http://host:port/path
+    /// Parse a Git URL (strict mode, ensures .git suffix)
     pub fn parse(url: &str) -> Result<Self> {
+        Self::parse_internal(url, true)
+    }
+
+    /// Parse a URL (loose mode, allows any path)
+    pub fn parse_loose(url: &str) -> Result<Self> {
+        Self::parse_internal(url, false)
+    }
+
+    fn parse_internal(url: &str, strict: bool) -> Result<Self> {
         let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
             (true, r)
         } else if let Some(r) = url.strip_prefix("http://") {
@@ -57,8 +61,8 @@ impl Url {
             None => (host_port, default_port),
         };
 
-        // Normalize path (add .git if needed for GitHub)
-        let path = if !path.ends_with(".git") && !path.ends_with("/") {
+        // Normalize path (add .git if needed for GitHub and strict mode is on)
+        let path = if strict && !path.ends_with(".git") && !path.ends_with("/") {
             format!("{}.git", path)
         } else {
             String::from(path)
@@ -138,19 +142,14 @@ impl HttpClient {
         Ok(ip)
     }
 
+    /// Get current URL
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
     /// Send GET request
     pub fn get(&mut self, path: &str) -> Result<Response> {
-        let request = format!(
-            "GET {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             User-Agent: scratch/1.0\r\n\
-             Accept: */*\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path, self.url.host
-        );
-
-        self.send_request(&request)
+        self.get_with_auth(path, None)
     }
 
     /// Send POST request with body
@@ -166,44 +165,79 @@ impl HttpClient {
         body: &[u8],
         auth: Option<&str>,
     ) -> Result<Response> {
-        let auth_header = match auth {
-            Some(a) => format!("Authorization: {}\r\n", a),
-            None => String::new(),
-        };
-
-        let request = format!(
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             User-Agent: scratch/1.0\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             {}Accept: */*\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path, self.url.host, content_type, body.len(), auth_header
-        );
-
-        self.send_request_with_body(&request, body)
+        self.execute("POST", path, Some(content_type), body, auth)
     }
 
     /// Send GET request with optional authentication
     pub fn get_with_auth(&mut self, path: &str, auth: Option<&str>) -> Result<Response> {
-        let auth_header = match auth {
-            Some(a) => format!("Authorization: {}\r\n", a),
-            None => String::new(),
-        };
+        self.execute("GET", path, None, &[], auth)
+    }
 
-        let request = format!(
-            "GET {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             User-Agent: scratch/1.0\r\n\
-             {}Accept: */*\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path, self.url.host, auth_header
-        );
+    /// Execute request with redirect handling
+    pub fn execute(
+        &mut self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        auth: Option<&str>,
+    ) -> Result<Response> {
+        let mut current_path = String::from(path);
+        let mut redirects = 0;
+        
+        loop {
+            let auth_header = match auth {
+                Some(a) => format!("Authorization: {}\r\n", a),
+                None => String::new(),
+            };
 
-        self.send_request(&request)
+            let type_header = match content_type {
+                Some(t) => format!("Content-Type: {}\r\nContent-Length: {}\r\n", t, body.len()),
+                None => String::new(),
+            };
+
+            let request = format!(
+                "{} {} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 User-Agent: scratch/1.0\r\n\
+                 {}{}{}Accept: */*\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                method, current_path, self.url.host, type_header, auth_header,
+                if method == "POST" && content_type.is_none() { "Content-Length: 0\r\n" } else { "" }
+            );
+
+            let response = self.send_request_with_body(&request, body)?;
+
+            // Handle redirects (301, 302, 307, 308)
+            if response.status >= 300 && response.status < 400 {
+                if redirects >= 5 {
+                    return Err(Error::http("too many redirects"));
+                }
+                
+                if let Some(location) = response.header("Location") {
+                    print("scratch: redirecting to ");
+                    print(location);
+                    print("\n");
+                    
+                    if location.starts_with("http://") || location.starts_with("https://") {
+                         let new_url = Url::parse_loose(location)?;
+                         if new_url.host != self.url.host {
+                             self.resolved_ip = None;
+                         }
+                         self.url = new_url;
+                         current_path = self.url.path.clone();
+                    } else {
+                         current_path = String::from(location);
+                    }
+                    
+                    redirects += 1;
+                    continue;
+                }
+            }
+            
+            return Ok(response);
+        }
     }
 
     fn send_request(&mut self, request: &str) -> Result<Response> {

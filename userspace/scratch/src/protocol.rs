@@ -117,6 +117,26 @@ impl ProtocolClient {
             return Err(Error::http(&format!("status {}", response.status)));
         }
 
+        // Update URL if redirected
+        let client_url = self.client.url();
+        // Check if host, scheme or path changed
+        if client_url.host != self.url.host || client_url.https != self.url.https || client_url.path != path {
+             // Try to extract base path from the info/refs URL
+             if let Some(idx) = client_url.path.find("/info/refs") {
+                 let new_base_path = &client_url.path[..idx];
+                 let mut new_url = client_url.clone();
+                 new_url.path = String::from(new_base_path);
+                 
+                 print("scratch: updating repo URL to ");
+                 if new_url.https { print("https://"); } else { print("http://"); }
+                 print(&new_url.host);
+                 print(&new_url.path);
+                 print("\n");
+                 
+                 self.url = new_url;
+             }
+        }
+
         // Check content type
         let content_type = response.header("Content-Type")
             .unwrap_or("");

@@ -155,8 +155,9 @@ pub fn fetch() -> Result<()> {
 
     // Read remote URL from config
     let git_config = GitConfig::load()?;
-    let remote_url = git_config.remote_url.as_ref()
+    let remote_url_string = git_config.get_remote_url()
         .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let remote_url = &remote_url_string;
     let parsed_url = Url::parse(remote_url)?;
 
     print("scratch: fetching from ");
@@ -237,8 +238,9 @@ pub fn pull() -> Result<()> {
 
     // Read remote URL from config
     let git_config = GitConfig::load()?;
-    let remote_url = git_config.remote_url.as_ref()
+    let remote_url_string = git_config.get_remote_url()
         .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let remote_url = &remote_url_string;
     let parsed_url = Url::parse(remote_url)?;
 
     print("scratch: fetching from ");
@@ -375,12 +377,14 @@ pub fn push(token: Option<&str>, branch: Option<&str>) -> Result<()> {
 
     // Load git config (includes remote URL and optional credential token)
     let git_config = GitConfig::load()?;
-    let remote_url = git_config.remote_url.as_ref()
+    let remote_url_string = git_config.get_remote_url()
         .ok_or_else(|| Error::io("no remote URL in config"))?;
+    let remote_url = &remote_url_string;
     let parsed_url = Url::parse(remote_url)?;
 
     // Use token from argument, or fall back to config
-    let effective_token = token.or(git_config.credential_token.as_deref());
+    let config_token = git_config.get_credential_token();
+    let effective_token = token.or(config_token.as_deref());
     
     // Create auth header if token available
     let auth = effective_token.map(|t| base64::basic_auth("git", t));

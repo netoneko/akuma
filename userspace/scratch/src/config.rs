@@ -10,17 +10,17 @@ use libakuma::{close, mkdir, open, open_flags, read_fd, write_fd};
 
 use crate::error::{Error, Result};
 
+#[derive(Debug, Clone, Default)]
+struct Section {
+    name: String,
+    subsection: Option<String>,
+    properties: Vec<(String, String)>,
+}
+
 /// Git configuration
 #[derive(Debug, Clone, Default)]
 pub struct GitConfig {
-    /// Remote origin URL
-    pub remote_url: Option<String>,
-    /// User name for commits
-    pub user_name: Option<String>,
-    /// User email for commits
-    pub user_email: Option<String>,
-    /// Credential helper token (for push authentication)
-    pub credential_token: Option<String>,
+    sections: Vec<Section>,
 }
 
 impl GitConfig {
@@ -64,25 +64,35 @@ impl GitConfig {
 
     /// Merge another config into this one (other's values override)
     fn merge(&mut self, other: &GitConfig) {
-        if other.remote_url.is_some() {
-            self.remote_url = other.remote_url.clone();
-        }
-        if other.user_name.is_some() {
-            self.user_name = other.user_name.clone();
-        }
-        if other.user_email.is_some() {
-            self.user_email = other.user_email.clone();
-        }
-        if other.credential_token.is_some() {
-            self.credential_token = other.credential_token.clone();
+        for other_sec in &other.sections {
+            // Find matching section
+            let mut found = false;
+            for my_sec in &mut self.sections {
+                if my_sec.name == other_sec.name && my_sec.subsection == other_sec.subsection {
+                    // Merge properties
+                    for (k, v) in &other_sec.properties {
+                        // Update or add property
+                        if let Some(pos) = my_sec.properties.iter().position(|(pk, _)| pk == k) {
+                            my_sec.properties[pos] = (k.clone(), v.clone());
+                        } else {
+                            my_sec.properties.push((k.clone(), v.clone()));
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            
+            if !found {
+                self.sections.push(other_sec.clone());
+            }
         }
     }
 
     /// Parse config file content
     fn parse(content: &str) -> Result<Self> {
         let mut config = GitConfig::default();
-        let mut current_section = String::new();
-        let mut current_subsection: Option<String> = None;
+        let mut current_section: Option<usize> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -95,38 +105,36 @@ impl GitConfig {
             // Section header: [section] or [section "subsection"]
             if line.starts_with('[') && line.ends_with(']') {
                 let header = &line[1..line.len() - 1];
-                if let Some(quote_start) = header.find('"') {
-                    current_section = String::from(header[..quote_start].trim());
+                let (name, subsection) = if let Some(quote_start) = header.find('"') {
+                    let name = String::from(header[..quote_start].trim());
                     let subsection_part = &header[quote_start + 1..];
-                    if let Some(quote_end) = subsection_part.find('"') {
-                        current_subsection = Some(String::from(&subsection_part[..quote_end]));
-                    }
+                    let subsection = if let Some(quote_end) = subsection_part.find('"') {
+                        Some(String::from(&subsection_part[..quote_end]))
+                    } else {
+                        None
+                    };
+                    (name, subsection)
                 } else {
-                    current_section = String::from(header.trim());
-                    current_subsection = None;
-                }
+                    (String::from(header.trim()), None)
+                };
+                
+                let section = Section {
+                    name,
+                    subsection,
+                    properties: Vec::new(),
+                };
+                
+                config.sections.push(section);
+                current_section = Some(config.sections.len() - 1);
                 continue;
             }
 
             // Key = value
             if let Some(eq_pos) = line.find('=') {
-                let key = line[..eq_pos].trim();
-                let value = line[eq_pos + 1..].trim();
-
-                match (current_section.as_str(), current_subsection.as_deref(), key) {
-                    ("remote", Some("origin"), "url") => {
-                        config.remote_url = Some(String::from(value));
-                    }
-                    ("user", None, "name") => {
-                        config.user_name = Some(String::from(value));
-                    }
-                    ("user", None, "email") => {
-                        config.user_email = Some(String::from(value));
-                    }
-                    ("credential", None, "token") => {
-                        config.credential_token = Some(String::from(value));
-                    }
-                    _ => {}
+                if let Some(idx) = current_section {
+                    let key = line[..eq_pos].trim();
+                    let value = line[eq_pos + 1..].trim();
+                    config.sections[idx].properties.push((String::from(key), String::from(value)));
                 }
             }
         }
@@ -145,85 +153,113 @@ impl GitConfig {
         let _ = mkdir(git_dir);
         
         let path = format!("{}/config", git_dir);
-        
         let mut content = String::new();
 
-        // Core section
-        content.push_str("[core]\n");
-        content.push_str("\trepositoryformatversion = 0\n");
-        content.push_str("\tfilemode = true\n");
-        content.push_str("\tbare = false\n");
-
-        // Remote origin section
-        if let Some(ref url) = self.remote_url {
-            content.push_str("[remote \"origin\"]\n");
-            content.push_str("\turl = ");
-            content.push_str(url);
-            content.push('\n');
-            content.push_str("\tfetch = +refs/heads/*:refs/remotes/origin/*\n");
-        }
-
-        // User section
-        if self.user_name.is_some() || self.user_email.is_some() {
-            content.push_str("[user]\n");
-            if let Some(ref name) = self.user_name {
-                content.push_str("\tname = ");
-                content.push_str(name);
-                content.push('\n');
+        for section in &self.sections {
+            if let Some(ref sub) = section.subsection {
+                content.push_str(&format!("[{} \"{}\"]\n", section.name, sub));
+            } else {
+                content.push_str(&format!("[{}]\n", section.name));
             }
-            if let Some(ref email) = self.user_email {
-                content.push_str("\temail = ");
-                content.push_str(email);
-                content.push('\n');
+            
+            for (key, value) in &section.properties {
+                content.push_str(&format!("\t{} = {}\n", key, value));
             }
-        }
-
-        // Credential section
-        if let Some(ref token) = self.credential_token {
-            content.push_str("[credential]\n");
-            content.push_str("\ttoken = ");
-            content.push_str(token);
-            content.push('\n');
         }
 
         write_file(&path, &content)
     }
 
-    /// Set a config value and save
+    /// Set a config value and save to LOCAL config
     pub fn set(key: &str, value: &str) -> Result<()> {
-        let mut config = Self::load().unwrap_or_default();
+        let git_dir = crate::git_dir();
+        // Load ONLY local config (or create empty if missing)
+        let mut config = Self::load_from(&git_dir).unwrap_or_default();
 
-        match key {
-            "user.name" => config.user_name = Some(String::from(value)),
-            "user.email" => config.user_email = Some(String::from(value)),
-            "credential.token" => config.credential_token = Some(String::from(value)),
-            _ => return Err(Error::io("unknown config key")),
+        // Parse key: section.subsection.key or section.key
+        let parts: Vec<&str> = key.split('.').collect();
+        let (section_name, subsection, prop_key) = match parts.len() {
+            2 => (parts[0], None, parts[1]),
+            3 => (parts[0], Some(parts[1]), parts[2]),
+            _ => return Err(Error::io("invalid config key format")),
+        };
+
+        // Find or create section
+        let mut section_idx = None;
+        for (i, s) in config.sections.iter().enumerate() {
+            if s.name == section_name && s.subsection.as_deref() == subsection {
+                section_idx = Some(i);
+                break;
+            }
         }
 
-        config.save()
+        if section_idx.is_none() {
+            config.sections.push(Section {
+                name: String::from(section_name),
+                subsection: subsection.map(String::from),
+                properties: Vec::new(),
+            });
+            section_idx = Some(config.sections.len() - 1);
+        }
+
+        let idx = section_idx.unwrap();
+        let section = &mut config.sections[idx];
+
+        // Update or add property
+        if let Some(pos) = section.properties.iter().position(|(k, _)| k == prop_key) {
+            section.properties[pos] = (String::from(prop_key), String::from(value));
+        } else {
+            section.properties.push((String::from(prop_key), String::from(value)));
+        }
+
+        config.save_to(&git_dir)
     }
 
     /// Get a config value
-    pub fn get(key: &str) -> Result<Option<String>> {
+    pub fn get(full_key: &str) -> Result<Option<String>> {
         let config = Self::load()?;
+        
+        let parts: Vec<&str> = full_key.split('.').collect();
+        let (section_name, subsection, prop_key) = match parts.len() {
+            2 => (parts[0], None, parts[1]),
+            3 => (parts[0], Some(parts[1]), parts[2]),
+            _ => return Ok(None),
+        };
 
-        Ok(match key {
-            "user.name" => config.user_name,
-            "user.email" => config.user_email,
-            "credential.token" => config.credential_token,
-            "remote.origin.url" => config.remote_url,
-            _ => None,
-        })
+        Ok(config.get_value(section_name, subsection, prop_key).map(String::from))
+    }
+
+    pub fn get_value(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<&str> {
+        for s in &self.sections {
+            if s.name == section && s.subsection.as_deref() == subsection {
+                for (k, v) in &s.properties {
+                    if k == key {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Get user name, falling back to default
     pub fn get_user_name(&self) -> &str {
-        self.user_name.as_deref().unwrap_or("Scratch User")
+        self.get_value("user", None, "name").unwrap_or("Scratch User")
     }
 
     /// Get user email, falling back to default
     pub fn get_user_email(&self) -> &str {
-        self.user_email.as_deref().unwrap_or("scratch@akuma.local")
+        self.get_value("user", None, "email").unwrap_or("scratch@akuma.local")
+    }
+    
+    /// Get remote URL
+    pub fn get_remote_url(&self) -> Option<String> {
+        self.get_value("remote", Some("origin"), "url").map(String::from)
+    }
+    
+    /// Get credential token
+    pub fn get_credential_token(&self) -> Option<String> {
+        self.get_value("credential", None, "token").map(String::from)
     }
 }
 
