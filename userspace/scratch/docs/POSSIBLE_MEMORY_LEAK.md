@@ -1,5 +1,8 @@
 # Scratch case for memory leak
 
+**STATUS: FIXED (Feb 5, 2026)**
+See [MEMORY_LEAK_FIX.md](MEMORY_LEAK_FIX.md) for details on the root causes and optimizations.
+
 Runs out of memory on deflation + suspicious amount of free memory.
 
 ```bash

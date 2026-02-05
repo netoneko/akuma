@@ -1300,7 +1300,7 @@ mod allocator {
     const MAP_FAILED: usize = usize::MAX;
     
     /// Maximum number of deferred frees to queue
-    const DEFERRED_FREE_SLOTS: usize = 16;
+    const DEFERRED_FREE_SLOTS: usize = 128;
 
     /// Track total bytes allocated
     static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -1316,7 +1316,7 @@ mod allocator {
     }
     
     /// Deferred free queue - buffers that couldn't be freed during realloc
-    /// We free them during the next dealloc call (which is known to work)
+    /// We free them during the next dealloc or alloc call (which is known to work)
     struct DeferredFreeQueue {
         entries: UnsafeCell<[DeferredFree; DEFERRED_FREE_SLOTS]>,
         count: AtomicUsize,
@@ -1413,6 +1413,9 @@ mod allocator {
         #[inline(never)]
         unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
             use super::mmap_flags::*;
+
+            // Flush any deferred frees from realloc
+            DEFERRED_FREES.flush();
 
             // Round up to page size for mmap
             let size = layout.size().max(layout.align());
