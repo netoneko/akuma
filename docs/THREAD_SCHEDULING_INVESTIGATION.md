@@ -14,16 +14,16 @@ Investigation into why spawning multiple `meow` instances causes hangs, and why 
 
 **Fix**: Added `mmap_dealloc` call in realloc. However, this caused hangs (see Issue 2).
 
-### Issue 2: Hang When Calling munmap from realloc (WORKAROUND)
+### Issue 2: Hang When Calling munmap from realloc (MITIGATED)
 
 **Symptom**: After fixing the memory leak, meow hangs after the first LLM response.
 
-**Root cause**: Making `munmap` syscalls during allocation context causes issues, possibly due to:
-- Scheduler interaction during realloc
-- Re-entrancy in exception handling
-- Lock ordering problems
+**Root cause**: Making `munmap` syscalls during allocation context causes issues.
 
-**Workaround**: Disabled `mmap_dealloc` in realloc, accepting memory leaks during reallocations. Process exit cleans up properly.
+**Mitigation (Feb 2026)**: The `DeferredFreeQueue` in `libakuma` has been improved:
+- Increased capacity to 128 slots.
+- Flushed during `mmap_alloc` (not just `dealloc`).
+This effectively stops the leak for most batch operations while still avoiding the hang by deferring the `munmap` call.
 
 **TODO**: Investigate why munmap syscall from realloc causes hangs.
 
