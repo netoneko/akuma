@@ -459,23 +459,27 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             use crate::process;
             
             if let Some(channel) = process::get_child_channel(child_pid) {
-                if let Some(data) = channel.try_read() {
-                    let to_copy = data.len().min(count);
-                    if to_copy > 0 {
-                        unsafe {
-                            let dst = buf_ptr as *mut u8;
-                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_copy);
-                        }
+                // IMPORTANT: If the process has exited, we must first drain any
+                // remaining data from the channel buffer before returning 0 (EOF).
+                // We use a temporary buffer allocated in kernel space.
+                let mut temp_buf = alloc::vec![0u8; count]; 
+                let bytes_read = channel.try_read(&mut temp_buf);
+
+                if bytes_read > 0 {
+                    // Copy to user buffer
+                    unsafe {
+                        let dst = buf_ptr as *mut u8;
+                        core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), dst, bytes_read);
                     }
-                    to_copy as u64
+                    return bytes_read as u64; // Return data
                 } else if channel.has_exited() {
-                    0 // EOF - child exited
+                    return 0; // No data available and child exited, so EOF
                 } else {
-                    // No data available yet, would block
-                    (-libc_errno::EAGAIN as i64) as u64
+                    // No data available yet and child not exited, would block
+                    return (-libc_errno::EAGAIN as i64) as u64;
                 }
             } else {
-                0 // Channel gone, child exited
+                0 // Channel gone, child exited (or never existed)
             }
         }
     }

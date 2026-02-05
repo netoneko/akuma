@@ -381,24 +381,24 @@ impl ProcessChannel {
         })
     }
 
-    /// Read available data from the channel (non-blocking)
-    /// Returns None if no data is available
-    pub fn try_read(&self) -> Option<Vec<u8>> {
+    /// Read available data from the channel into a provided buffer (non-blocking)
+    /// Returns number of bytes read.
+    pub fn try_read(&self, buf: &mut [u8]) -> usize {
         crate::irq::with_irqs_disabled(|| {
-            let mut buf = self.buffer.lock();
-            if buf.is_empty() {
-                None
-            } else {
-                Some(buf.drain(..).collect())
+            let mut buffer_guard = self.buffer.lock();
+            let to_read = buf.len().min(buffer_guard.len());
+            for (i, byte) in buffer_guard.drain(..to_read).enumerate() {
+                buf[i] = byte;
             }
+            to_read
         })
     }
 
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
         crate::irq::with_irqs_disabled(|| {
-            let mut buf = self.buffer.lock();
-            buf.drain(..).collect()
+            let mut buffer_guard = self.buffer.lock();
+            buffer_guard.drain(..).collect()
         })
     }
 
@@ -1547,8 +1547,13 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>,
     
     // Collect output
     let mut stdout_data = Vec::new();
-    while let Some(data) = channel.try_read() {
-        stdout_data.extend_from_slice(&data);
+    let mut temp_channel_buf = [0u8; 1024]; // Temporary buffer for try_read
+    loop {
+        let bytes_read = channel.try_read(&mut temp_channel_buf);
+        if bytes_read == 0 {
+            break;
+        }
+        stdout_data.extend_from_slice(&temp_channel_buf[..bytes_read]);
     }
     
     // Cleanup terminated thread
@@ -1720,11 +1725,27 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
+    let mut collected_output = Vec::new(); // Accumulate output here
+    let mut temp_channel_buf = [0u8; 1024]; // Temporary buffer for try_read
+
     // Wait for process to complete
-    // Each iteration yields once (returns Pending) so block_on can yield to scheduler
     loop {
+        // Drain any available output
+        let bytes_read = channel.try_read(&mut temp_channel_buf);
+        if bytes_read > 0 {
+            collected_output.extend_from_slice(&temp_channel_buf[..bytes_read]);
+        }
+
         // Check if process has exited or was interrupted
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            // Drain any remaining output
+            loop {
+                let bytes_read_final = channel.try_read(&mut temp_channel_buf);
+                if bytes_read_final == 0 {
+                    break;
+                }
+                collected_output.extend_from_slice(&temp_channel_buf[..bytes_read_final]);
+            }
             break;
         }
 
@@ -1736,8 +1757,7 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u
         YieldOnce::new().await;
     }
 
-    // Collect all output
-    let output = channel.read_all();
+    // Collect all output (already collected in collected_output)
     let exit_code = if channel.is_interrupted() && !channel.has_exited() {
         130 // Interrupted exit code
     } else {
@@ -1747,7 +1767,7 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u
     // Final cleanup
     crate::threading::cleanup_terminated();
 
-    Ok((exit_code, output))
+    Ok((exit_code, collected_output)) // Return collected_output
 }
 
 /// Get the process channel for a running process by thread ID
@@ -1787,20 +1807,25 @@ where
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
     // Poll for output and completion
+    // Allocate a temporary buffer for reading from the channel
+    let mut temp_channel_buf = [0u8; 1024];
+
     loop {
         // Drain any available output and write to stream
-        if let Some(data) = channel.try_read() {
+        let bytes_read = channel.try_read(&mut temp_channel_buf);
+
+        if bytes_read > 0 {
             // Write all data at once, then flush
-            let mut buf = alloc::vec::Vec::new();
-            for &byte in &data {
+            let mut buf_to_write = alloc::vec::Vec::new();
+            for &byte in &temp_channel_buf[..bytes_read] {
                 if byte == b'\n' {
-                    buf.extend_from_slice(b"\r\n");
+                    buf_to_write.extend_from_slice(b"\r\n");
                 } else {
-                    buf.push(byte);
+                    buf_to_write.push(byte);
                 }
             }
             
-            let _ = output.write_all(&buf).await;
+            let _ = output.write_all(&buf_to_write).await;
             
             // Flush output to push to network
             let _ = output.flush().await;
@@ -1814,16 +1839,20 @@ where
         // Check if process has exited
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
             // Drain any remaining output
-            while let Some(data) = channel.try_read() {
-                let mut buf = alloc::vec::Vec::new();
-                for &byte in &data {
+            loop {
+                let bytes_read_final = channel.try_read(&mut temp_channel_buf);
+                if bytes_read_final == 0 {
+                    break;
+                }
+                let mut buf_to_write = alloc::vec::Vec::new();
+                for &byte in &temp_channel_buf[..bytes_read_final] {
                     if byte == b'\n' {
-                        buf.extend_from_slice(b"\r\n");
+                        buf_to_write.extend_from_slice(b"\r\n");
                     } else {
-                        buf.push(byte);
+                        buf_to_write.push(byte);
                     }
                 }
-                let _ = output.write_all(&buf).await;
+                let _ = output.write_all(&buf_to_write).await;
             }
             let _ = output.flush().await;
             for _ in 0..100 {
@@ -1836,11 +1865,14 @@ where
         YieldOnce::new().await;
     }
 
-    let exit_code = channel.exit_code();
+    let exit_code = if channel.is_interrupted() && !channel.has_exited() {
+        130 // Interrupted exit code
+    } else {
+        channel.exit_code()
+    };
 
     // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok(exit_code)
 }
-

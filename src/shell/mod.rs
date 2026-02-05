@@ -527,6 +527,7 @@ pub async fn execute_external_interactive(
 
     // Buffer for reading from SSH
     let mut read_buf = [0u8; 256];
+    let mut channel_read_buf = [0u8; 1024]; // Temporary buffer for channel.try_read
 
     // Interactive loop: poll both directions
     loop {
@@ -536,32 +537,37 @@ pub async fn execute_external_interactive(
         }
 
         // 1. Drain process stdout and write to SSH
-        if let Some(data) = channel.try_read() {
-            let mut buf = Vec::new();
-            for &byte in &data {
+        let bytes_read_from_channel = channel.try_read(&mut channel_read_buf);
+        if bytes_read_from_channel > 0 {
+            let mut buf_to_write = Vec::new();
+            for &byte in &channel_read_buf[..bytes_read_from_channel] {
                 if byte == b'\n' {
-                    buf.extend_from_slice(b"\r\n");
+                    buf_to_write.extend_from_slice(b"\r\n");
                 } else {
-                    buf.push(byte);
+                    buf_to_write.push(byte);
                 }
             }
-            let _ = channel_stream.write_all(&buf).await;
+            let _ = channel_stream.write_all(&buf_to_write).await;
             let _ = channel_stream.flush().await;
         }
 
         // 2. Check for process exit
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
             // Drain remaining output
-            while let Some(data) = channel.try_read() {
-                let mut buf = Vec::new();
-                for &byte in &data {
+            loop {
+                let bytes_read_final = channel.try_read(&mut channel_read_buf);
+                if bytes_read_final == 0 {
+                    break;
+                }
+                let mut buf_to_write = Vec::new();
+                for &byte in &channel_read_buf[..bytes_read_final] {
                     if byte == b'\n' {
-                        buf.extend_from_slice(b"\r\n");
+                        buf_to_write.extend_from_slice(b"\r\n");
                     } else {
-                        buf.push(byte);
+                        buf_to_write.push(byte);
                     }
                 }
-                let _ = channel_stream.write_all(&buf).await;
+                let _ = channel_stream.write_all(&buf_to_write).await;
             }
             let _ = channel_stream.flush().await;
             break;

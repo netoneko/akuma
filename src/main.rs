@@ -900,8 +900,10 @@ fn run_async_main() -> ! {
         // This is safe outside preemption-disabled: uses Spinlock, not RefCells
         if let Some(ref channel) = herd_channel {
             // Check for output (non-blocking)
-            if let Some(output) = channel.try_read() {
-                for &byte in &output {
+            let mut temp_buf = [0u8; 1024]; // Temporary buffer for reading
+            let bytes_read = channel.try_read(&mut temp_buf);
+            if bytes_read > 0 {
+                for &byte in &temp_buf[..bytes_read] {
                     console::print_char(byte as char);
                 }
             }
