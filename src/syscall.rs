@@ -199,10 +199,10 @@ fn sys_uptime() -> u64 {
 
 /// sys_time - Get current Unix timestamp
 ///
-/// Returns the current time as seconds since Unix epoch (1970-01-01 00:00:00 UTC).
-/// Uses the PL031 RTC if available, falls back to 0 if not initialized.
+/// Returns the current time as microseconds since Unix epoch (1970-01-01 00:00:00 UTC).
+/// Uses the PL031 RTC + system counter for high precision.
 fn sys_time() -> u64 {
-    crate::timer::utc_seconds().unwrap_or(0)
+    crate::timer::utc_time_us().unwrap_or(0)
 }
 
 /// sys_mmap - Map memory pages

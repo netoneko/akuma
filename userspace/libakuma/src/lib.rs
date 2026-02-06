@@ -429,7 +429,7 @@ pub fn uptime() -> u64 {
     syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
 }
 
-/// Get current Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+/// Get current Unix timestamp (microseconds since 1970-01-01 00:00:00 UTC)
 ///
 /// Returns 0 if the RTC is not available.
 #[inline(never)]

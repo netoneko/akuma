@@ -121,23 +121,31 @@ impl TcpListener {
 
     /// Accept a new incoming connection from this listener.
     pub fn accept(&self) -> Result<(TcpStream, SocketAddrV4), Error> {
-        let new_fd = crate::accept(self.fd);
-        if new_fd < 0 {
-            return Err(Error::from_errno(-new_fd));
+        loop {
+            let new_fd = crate::accept(self.fd);
+            if new_fd >= 0 {
+                // For now, we don't get the remote address from accept
+                // TODO: Parse it from the sockaddr returned by accept
+                let remote_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
+
+                return Ok((
+                    TcpStream {
+                        fd: new_fd,
+                        local_addr: self.local_addr,
+                        remote_addr,
+                    },
+                    remote_addr,
+                ));
+            }
+
+            let errno = -new_fd;
+            if errno == 11 { // WouldBlock
+                crate::sleep_ms(10);
+                continue;
+            }
+
+            return Err(Error::from_errno(errno as i32));
         }
-
-        // For now, we don't get the remote address from accept
-        // TODO: Parse it from the sockaddr returned by accept
-        let remote_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
-
-        Ok((
-            TcpStream {
-                fd: new_fd,
-                local_addr: self.local_addr,
-                remote_addr,
-            },
-            remote_addr,
-        ))
     }
 
     /// Returns the local socket address of this listener.
@@ -236,11 +244,15 @@ impl TcpStream {
     /// Write all data to the stream
     pub fn write_all(&self, mut buf: &[u8]) -> Result<(), Error> {
         while !buf.is_empty() {
-            let n = self.write(buf)?;
-            if n == 0 {
-                return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer"));
+            match self.write(buf) {
+                Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer")),
+                Ok(n) => buf = &buf[n..],
+                Err(e) if e.kind == ErrorKind::WouldBlock => {
+                    crate::sleep_ms(1);
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            buf = &buf[n..];
         }
         Ok(())
     }
@@ -249,11 +261,15 @@ impl TcpStream {
     pub fn read_exact(&self, buf: &mut [u8]) -> Result<(), Error> {
         let mut filled = 0;
         while filled < buf.len() {
-            let n = self.read(&mut buf[filled..])?;
-            if n == 0 {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+            match self.read(&mut buf[filled..]) {
+                Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
+                Ok(n) => filled += n,
+                Err(e) if e.kind == ErrorKind::WouldBlock => {
+                    crate::sleep_ms(1);
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            filled += n;
         }
         Ok(())
     }
