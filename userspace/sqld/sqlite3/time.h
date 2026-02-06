@@ -19,7 +19,7 @@ struct tm {
     int tm_isdst;
 };
 
-#define time(x) ((time_t)0)
+time_t time(time_t *tloc);
 #define localtime(x) ((struct tm*)0)
 #define gmtime(x) ((struct tm*)0)
 #define strftime(...) (0)

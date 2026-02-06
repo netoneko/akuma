@@ -87,6 +87,17 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
     new_ptr.add(8) as *mut c_void
 }
 
+/// Standard C time function - called by SQLite
+#[no_mangle]
+pub unsafe extern "C" fn time(tloc: *mut i64) -> i64 {
+    // Akuma returns microseconds, C time() expects seconds
+    let t = (libakuma::time() / 1_000_000) as i64;
+    if !tloc.is_null() {
+        *tloc = t;
+    }
+    t
+}
+
 // SQLite constants
 pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
@@ -217,7 +228,7 @@ static AKUMA_IO_METHODS: sqlite3_io_methods = sqlite3_io_methods {
 
 // Static VFS instance
 static mut AKUMA_VFS: sqlite3_vfs = sqlite3_vfs {
-    iVersion: 1,
+    iVersion: 2,
     szOsFile: core::mem::size_of::<AkumaFile>() as c_int,
     mxPathname: 512,
     pNext: ptr::null_mut(),
@@ -235,7 +246,7 @@ static mut AKUMA_VFS: sqlite3_vfs = sqlite3_vfs {
     xSleep: Some(akuma_vfs_sleep),
     xCurrentTime: Some(akuma_vfs_current_time),
     xGetLastError: Some(akuma_vfs_get_last_error),
-    xCurrentTimeInt64: None,
+    xCurrentTimeInt64: Some(akuma_vfs_current_time_int64),
     xSetSystemCall: None,
     xGetSystemCall: None,
     xNextSystemCall: None,
@@ -367,11 +378,22 @@ unsafe extern "C" fn akuma_vfs_sleep(_vfs: *mut sqlite3_vfs, microseconds: c_int
 }
 
 unsafe extern "C" fn akuma_vfs_current_time(_vfs: *mut sqlite3_vfs, p_time: *mut f64) -> c_int {
-    // Return uptime as Julian day offset from a fixed point
+    // Return Unix time as Julian day offset
     // Julian day for Unix epoch (1970-01-01) is 2440587.5
-    let uptime_us = libakuma::uptime();
-    let days = uptime_us as f64 / (24.0 * 60.0 * 60.0 * 1_000_000.0);
+    let now_us = libakuma::time() as f64;
+    let days = now_us / (24.0 * 60.0 * 60.0 * 1_000_000.0);
     *p_time = 2440587.5 + days;
+    SQLITE_OK
+}
+
+unsafe extern "C" fn akuma_vfs_current_time_int64(_vfs: *mut sqlite3_vfs, p_time: *mut i64) -> c_int {
+    // Return Unix time as Julian milliseconds
+    // Julian day for Unix epoch (1970-01-01) is 2440587.5
+    // Julian milliseconds = Julian day * 86400000
+    // 2440587.5 * 86400000 = 210866760000000
+    let now_us = libakuma::time() as i64;
+    let now_ms = now_us / 1000;
+    *p_time = 210866760000000i64 + now_ms;
     SQLITE_OK
 }
 

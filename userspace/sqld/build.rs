@@ -42,7 +42,6 @@ fn main() {
         .define("SQLITE_OMIT_UTF16", None)
         .define("SQLITE_OMIT_COMPLETE", None)
         .define("SQLITE_OMIT_DECLTYPE", None)
-        .define("SQLITE_OMIT_DATETIME_FUNCS", None)
         // Use memory-only temp storage
         .define("SQLITE_TEMP_STORE", "3")
         // Freestanding environment flags
