@@ -142,6 +142,11 @@ fn handle_connection(stream: TcpStream) {
         format!("/public{}", path)
     };
 
+    // Log request with high-precision timestamp
+    let now_us = libakuma::time();
+    let time_str = format_time_rfc1123(now_us);
+    print(&format!("[{}] {} {}\n", time_str, method, path));
+
     // Try to read the file
     match read_file(&fs_path) {
         Ok(content) => {
@@ -152,6 +157,70 @@ fn handle_connection(stream: TcpStream) {
             let _ = send_error(&stream, 404, "Not Found");
         }
     }
+}
+
+/// Format time in RFC 1123 format (e.g., "Mon, 01 Jan 1970 00:00:00 GMT")
+fn format_time_rfc1123(us: u64) -> String {
+    let secs = us / 1_000_000;
+    
+    // Days since Unix epoch
+    let mut days = secs / 86400;
+    let secs_today = secs % 86400;
+
+    // Time of day
+    let hour = (secs_today / 3600) as u8;
+    let minute = ((secs_today % 3600) / 60) as u8;
+    let second = (secs_today % 60) as u8;
+
+    // Day of week (1970-01-01 was Thursday = 4)
+    // 0=Sun, 1=Mon, ..., 4=Thu, ...
+    let wday = ((days + 4) % 7) as usize;
+    let wday_str = match wday {
+        0 => "Sun", 1 => "Mon", 2 => "Tue", 3 => "Wed",
+        4 => "Thu", 5 => "Fri", 6 => "Sat", _ => "???"
+    };
+
+    // Calculate year (starting from 1970)
+    let mut year = 1970;
+    loop {
+        let year_days = if is_leap_year(year) { 366 } else { 365 };
+        if days < year_days {
+            break;
+        }
+        days -= year_days;
+        year += 1;
+    }
+
+    // Calculate month and day
+    let months = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let month_strs = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    ];
+
+    let mut month = 0;
+    for (i, &month_days) in months.iter().enumerate() {
+        if days < month_days as u64 {
+            month = i;
+            break;
+        }
+        days -= month_days as u64;
+    }
+    
+    let day = (days + 1) as u8;
+
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        wday_str, day, month_strs[month], year, hour, minute, second
+    )
+}
+
+fn is_leap_year(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Extract POST body from request.
@@ -272,12 +341,15 @@ fn get_content_type(path: &str) -> &'static str {
 }
 
 fn send_file(stream: &TcpStream, content: &[u8], content_type: &str, head_only: bool) -> Result<(), Error> {
+    let date = format_time_rfc1123(libakuma::time());
     let response = format!(
         "HTTP/1.0 200 OK\r\n\
+         Date: {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
+        date,
         content_type,
         content.len()
     );
@@ -301,14 +373,16 @@ fn send_error(stream: &TcpStream, code: u16, message: &str) -> Result<(), Error>
         code, message, code, message
     );
 
+    let date = format_time_rfc1123(libakuma::time());
     let response = format!(
         "HTTP/1.0 {} {}\r\n\
+         Date: {}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
-        code, message, body.len(), body
+        code, message, date, body.len(), body
     );
 
     stream.write_all(response.as_bytes())?;
@@ -362,6 +436,11 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
         return;
     }
     close(fd);
+    
+    // Log CGI request
+    let now_us = libakuma::time();
+    let time_str = format_time_rfc1123(now_us);
+    print(&format!("[{}] CGI {} {}\n", time_str, method, path));
     
     // Determine if we need an interpreter
     let interpreter = get_interpreter(&fs_path);
@@ -503,12 +582,15 @@ fn send_cgi_response(stream: &TcpStream, output: &[u8]) -> Result<(), Error> {
     }
     print("\nhttpd: === CGI BODY END ===\n");
     
+    let date = format_time_rfc1123(libakuma::time());
     let response = format!(
         "HTTP/1.0 200 OK\r\n\
+         Date: {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
+        date,
         content_type,
         body.len()
     );
