@@ -178,6 +178,61 @@ pub fn chdir(path: &str) -> i32 {
 }
 
 // ============================================================================
+// Sync Primitives for Userspace
+// ============================================================================
+
+pub struct Spinlock<T> {
+    locked: core::sync::atomic::AtomicBool,
+    data: core::cell::UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for Spinlock<T> {}
+
+impl<T> Spinlock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            locked: core::sync::atomic::AtomicBool::new(false),
+            data: core::cell::UnsafeCell::new(data),
+        }
+    }
+
+    pub fn lock(&self) -> SpinlockGuard<T> {
+        while self.locked.compare_exchange_weak(
+            false,
+            true,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed,
+        ).is_err() {
+            core::hint::spin_loop();
+        }
+        SpinlockGuard { lock: self }
+    }
+}
+
+pub struct SpinlockGuard<'a, T> {
+    lock: &'a Spinlock<T>,
+}
+
+impl<'a, T> core::ops::Deref for SpinlockGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> core::ops::DerefMut for SpinlockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for SpinlockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+// ============================================================================
 // Command Line Arguments
 // ============================================================================
 
@@ -1294,92 +1349,32 @@ mod allocator {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use core::cell::UnsafeCell;
 
-    const PAGE_SIZE: usize = 4096;
+    const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
     const MAP_FAILED: usize = usize::MAX;
-    
-    /// Maximum number of deferred frees to queue
-    const DEFERRED_FREE_SLOTS: usize = 128;
 
-    /// Track total bytes allocated
+    /// Track total bytes allocated from kernel
     static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
-    /// Track total bytes freed
+    /// Track total bytes freed (not currently used for chunked allocator)
     static FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
-    /// Track number of allocations
+    /// Track number of user-level allocations
     static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-    
-    /// Deferred free entry
-    struct DeferredFree {
-        ptr: usize,
-        size: usize,
-    }
-    
-    /// Deferred free queue - buffers that couldn't be freed during realloc
-    /// We free them during the next dealloc or alloc call (which is known to work)
-    struct DeferredFreeQueue {
-        entries: UnsafeCell<[DeferredFree; DEFERRED_FREE_SLOTS]>,
-        count: AtomicUsize,
-    }
-    
-    unsafe impl Sync for DeferredFreeQueue {}
-    
-    impl DeferredFreeQueue {
-        const fn new() -> Self {
-            const EMPTY: DeferredFree = DeferredFree { ptr: 0, size: 0 };
-            Self {
-                entries: UnsafeCell::new([EMPTY; DEFERRED_FREE_SLOTS]),
-                count: AtomicUsize::new(0),
-            }
-        }
-        
-        /// Queue a pointer for deferred free
-        fn push(&self, ptr: usize, size: usize) {
-            let count = self.count.load(Ordering::Relaxed);
-            if count < DEFERRED_FREE_SLOTS {
-                unsafe {
-                    let entries = &mut *self.entries.get();
-                    entries[count] = DeferredFree { ptr, size };
-                }
-                self.count.store(count + 1, Ordering::Relaxed);
-            }
-            // If queue is full, we just leak (better than hanging)
-        }
-        
-        /// Process all deferred frees
-        fn flush(&self) {
-            let count = self.count.swap(0, Ordering::Relaxed);
-            if count == 0 {
-                return;
-            }
-            
-            unsafe {
-                let entries = &*self.entries.get();
-                for i in 0..count {
-                    let entry = &entries[i];
-                    if entry.ptr != 0 && entry.size > 0 {
-                        FREED_BYTES.fetch_add(entry.size, Ordering::Relaxed);
-                        super::munmap_void(entry.ptr, entry.size);
-                    }
-                }
-            }
-        }
-    }
-    
-    static DEFERRED_FREES: DeferredFreeQueue = DeferredFreeQueue::new();
+    /// Track actual bytes currently used by user
+    static USER_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
     /// Hybrid allocator that can use either mmap or brk
     /// WORKAROUND: Large padding to work around layout-sensitive heap corruption bug.
     /// The bug causes String::push_str to fail when the binary is a certain size.
-    /// Adding padding changes the binary layout and makes the bug go away.
     #[repr(C, align(256))]
     pub struct HybridAllocator {
+        /// Talc allocator for managing chunks
+        talc: super::Spinlock<talc::Talc<talc::ErrOnOom>>,
         /// For brk mode: current allocation pointer
         brk_head: AtomicUsize,
         /// For brk mode: end of allocated heap
         brk_end: AtomicUsize,
-        /// Padding to work around layout-sensitive bug (see docs/HEAP_CORRUPTION_ANALYSIS.md)
-        _padding: [u8; 240],
+        /// Padding to work around layout-sensitive bug
+        _padding: [u8; 128],
     }
 
     unsafe impl Sync for HybridAllocator {}
@@ -1387,9 +1382,10 @@ mod allocator {
     impl HybridAllocator {
         pub const fn new() -> Self {
             Self {
+                talc: super::Spinlock::new(talc::Talc::new(talc::ErrOnOom)),
                 brk_head: AtomicUsize::new(0),
                 brk_end: AtomicUsize::new(0),
-                _padding: [0u8; 240],
+                _padding: [0u8; 128],
             }
         }
 
@@ -1407,51 +1403,75 @@ mod allocator {
         }
 
         // =====================================================================
-        // mmap-based allocation
+        // mmap-based allocation (Talc + Chunking)
         // =====================================================================
 
-        #[inline(never)]
         unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
-            use super::mmap_flags::*;
+            let mut talc = self.talc.lock();
 
-            // Flush any deferred frees from realloc
-            DEFERRED_FREES.flush();
+            // Try to allocate from existing chunks
+            match talc.malloc(layout) {
+                Ok(ptr) => {
+                    ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                    USER_USED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+                    ptr.as_ptr()
+                }
+                Err(_) => {
+                    // OOM - request a new chunk from kernel
+                    use super::mmap_flags::*;
+                    
+                    // If allocation is larger than standard chunk, allocate exactly what's needed (plus header)
+                    let request_size = if layout.size() + 1024 > CHUNK_SIZE {
+                        (layout.size() + 1024 + 4095) & !4095
+                    } else {
+                        CHUNK_SIZE
+                    };
 
-            // Round up to page size for mmap
-            let size = layout.size().max(layout.align());
-            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                    let addr = super::mmap(
+                        0,
+                        request_size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS,
+                    );
 
-            let addr = super::mmap(
-                0, // Let kernel choose address
-                alloc_size,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-            );
+                    if addr == MAP_FAILED || addr == 0 {
+                        return ptr::null_mut();
+                    }
 
-            if addr == MAP_FAILED || addr == 0 {
-                ptr::null_mut()
-            } else {
-                // Track allocation
-                ALLOCATED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
-                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-                addr as *mut u8
+                    // Claim the new chunk
+                    let span = talc::Span::from_base_size(addr as *mut u8, request_size);
+                    if talc.claim(span).is_err() {
+                        return ptr::null_mut();
+                    }
+
+                    ALLOCATED_BYTES.fetch_add(request_size, Ordering::Relaxed);
+
+                    // Try again
+                    match talc.malloc(layout) {
+                        Ok(ptr) => {
+                            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                            USER_USED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+                            ptr.as_ptr()
+                        }
+                        Err(_) => ptr::null_mut(),
+                    }
+                }
             }
         }
 
         unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
-            let size = layout.size().max(layout.align());
-            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            // Track deallocation
-            FREED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
-            // Use munmap_void which properly marks x0 as clobbered
-            // to prevent corrupting function return values when called from Drop
-            super::munmap_void(ptr as usize, alloc_size);
+            if ptr.is_null() {
+                return;
+            }
+            let mut talc = self.talc.lock();
+            talc.free(ptr::NonNull::new_unchecked(ptr), layout);
+            USER_USED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         }
 
         // =====================================================================
         // brk-based allocation (fallback)
         // =====================================================================
-
+        
         fn brk_init(&self) {
             if self.brk_head.load(Ordering::SeqCst) == 0 {
                 let initial_brk = super::brk(0);
@@ -1500,20 +1520,6 @@ mod allocator {
             self.brk_head.store(new_head, Ordering::SeqCst);
             aligned as *mut u8
         }
-
-        unsafe fn brk_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
-                Ok(l) => l,
-                Err(_) => return ptr::null_mut(),
-            };
-
-            let new_ptr = self.brk_alloc(new_layout);
-            if !new_ptr.is_null() && !ptr.is_null() {
-                let copy_size = layout.size().min(new_size);
-                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-            }
-            new_ptr
-        }
     }
 
     unsafe impl GlobalAlloc for HybridAllocator {
@@ -1527,56 +1533,40 @@ mod allocator {
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             if USE_MMAP_ALLOCATOR {
-                // First flush any deferred frees from realloc
-                DEFERRED_FREES.flush();
-                // Then free this allocation
                 self.mmap_dealloc(ptr, layout);
             }
             // brk mode: no-op (bump allocator)
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            // Extract layout fields HERE where they're correct
-            let old_size = layout.size();
-            let old_align = layout.align();
-
             if !USE_MMAP_ALLOCATOR {
-                return self.brk_realloc(ptr, layout, new_size);
+                // brk mode fallback
+                let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+                    Ok(l) => l,
+                    Err(_) => return ptr::null_mut(),
+                };
+                let new_ptr = self.brk_alloc(new_layout);
+                if !new_ptr.is_null() && !ptr.is_null() {
+                    let copy_size = layout.size().min(new_size);
+                    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+                }
+                return new_ptr;
             }
 
-            // INLINE realloc logic - no function call to avoid ABI issues
-            // (see docs/STDCHECK_DEBUG.md for why this is necessary)
-
-            // Use safe alignment
-            let safe_align = if old_align == 0 || (old_align & (old_align - 1)) != 0 {
-                1
-            } else {
-                old_align
-            };
-
-            // Allocate new buffer
-            let new_layout = match Layout::from_size_align(new_size, safe_align) {
+            // For Talc, we implement realloc as alloc + copy + free
+            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
             };
 
             let new_ptr = self.mmap_alloc(new_layout);
-            if new_ptr.is_null() {
-                return ptr::null_mut();
+            if !new_ptr.is_null() {
+                if !ptr.is_null() {
+                    let copy_size = layout.size().min(new_size);
+                    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+                    self.mmap_dealloc(ptr, layout);
+                }
             }
-
-            // Copy old data
-            if !ptr.is_null() && old_size > 0 {
-                let copy_size = old_size.min(new_size);
-                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-
-                // Queue old buffer for deferred free
-                // Calling munmap directly here causes hangs, but queuing it
-                // and freeing during the next dealloc() call works.
-                let alloc_size = (old_size.max(old_align) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                DEFERRED_FREES.push(ptr as usize, alloc_size);
-            }
-
             new_ptr
         }
     }
@@ -1584,42 +1574,35 @@ mod allocator {
     #[global_allocator]
     pub static ALLOCATOR: HybridAllocator = HybridAllocator::new();
 
-    /// Get current allocated bytes (not freed)
-    pub fn allocated_bytes() -> usize {
+    /// Get current total bytes requested from kernel
+    pub fn total_allocated_bytes() -> usize {
         ALLOCATED_BYTES.load(Ordering::Relaxed)
     }
 
-    /// Get total freed bytes
-    pub fn freed_bytes() -> usize {
-        FREED_BYTES.load(Ordering::Relaxed)
-    }
-
-    /// Get net memory usage (allocated - freed)
+    /// Get total bytes currently used by userspace objects
     pub fn net_memory() -> usize {
-        let alloc = ALLOCATED_BYTES.load(Ordering::Relaxed);
-        let freed = FREED_BYTES.load(Ordering::Relaxed);
-        alloc.saturating_sub(freed)
+        USER_USED_BYTES.load(Ordering::Relaxed)
     }
 
-    /// Get allocation count
+    /// Get number of allocations made
     pub fn alloc_count() -> usize {
         ALLOC_COUNT.load(Ordering::Relaxed)
     }
 }
 
-/// Get current net memory usage in bytes
+/// Get current net memory usage in bytes (user-level)
 pub fn memory_usage() -> usize {
     allocator::net_memory()
 }
 
-/// Get total allocated bytes (before any frees)
+/// Get total bytes requested from kernel
 pub fn total_allocated() -> usize {
-    allocator::allocated_bytes()
+    allocator::total_allocated_bytes()
 }
 
-/// Get total freed bytes
+/// Get total freed bytes (approximated for chunked allocator)
 pub fn total_freed() -> usize {
-    allocator::freed_bytes()
+    total_allocated().saturating_sub(memory_usage())
 }
 
 /// Get number of allocations made
