@@ -16,7 +16,8 @@ members = [
     "stackstress",
     "stdcheck",
     "wget",
-    "termtest"
+    "termtest",
+    "allocstress"
 ]
 
 [profile.dev]

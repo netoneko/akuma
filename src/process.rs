@@ -666,7 +666,12 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
     let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;
     
     // Remove and return the frames
-    let (_, frames) = proc.mmap_regions.remove(idx);
+    let (va, frames) = proc.mmap_regions.remove(idx);
+    
+    // RECLAIM: Add the freed range to free_regions
+    let size = frames.len() * 4096; // config::PAGE_SIZE
+    proc.memory.free_regions.push((va, size));
+    
     Some(frames)
 }
 
@@ -842,6 +847,8 @@ pub struct ProcessMemory {
     pub next_mmap: usize,
     /// Mmap region limit (must stay below this)
     pub mmap_limit: usize,
+    /// Freed virtual address regions for reclamation (start_va, size)
+    pub free_regions: Vec<(usize, usize)>,
 }
 
 impl ProcessMemory {
@@ -858,6 +865,7 @@ impl ProcessMemory {
             stack_top,
             next_mmap: mmap_start,
             mmap_limit,
+            free_regions: Vec::new(),
         }
     }
 
@@ -869,6 +877,23 @@ impl ProcessMemory {
 
     /// Allocate mmap region, returns None if would overlap stack
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
+        // 1. Try to find a hole in free_regions (first-fit)
+        for i in 0..self.free_regions.len() {
+            let (start, f_size) = self.free_regions[i];
+            if f_size >= size {
+                // Found a suitable hole
+                self.free_regions.remove(i);
+                
+                // If the hole is larger than requested, add the remainder back
+                if f_size > size {
+                    self.free_regions.push((start + size, f_size - size));
+                }
+                
+                return Some(start);
+            }
+        }
+
+        // 2. Fall back to bump allocator
         let addr = self.next_mmap;
         let end = addr.checked_add(size)?;
 
