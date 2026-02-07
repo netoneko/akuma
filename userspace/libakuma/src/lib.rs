@@ -1350,36 +1350,40 @@ mod allocator {
     use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    const PAGE_SIZE: usize = 4096;
     const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
     const MAP_FAILED: usize = usize::MAX;
 
     /// Track total bytes allocated from kernel
     static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
-    /// Track total bytes freed (not currently used for chunked allocator)
+    /// Track total bytes freed
     static FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
     /// Track number of user-level allocations
     static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
     /// Track actual bytes currently used by user
     static USER_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-    /// Hybrid allocator that can use either mmap or brk
-    /// WORKAROUND: Large padding to work around layout-sensitive heap corruption bug.
-    /// The bug causes String::push_str to fail when the binary is a certain size.
+    #[cfg(feature = "chunked-allocator")]
     #[repr(C, align(256))]
     pub struct HybridAllocator {
-        /// Talc allocator for managing chunks
         talc: super::Spinlock<talc::Talc<talc::ErrOnOom>>,
-        /// For brk mode: current allocation pointer
         brk_head: AtomicUsize,
-        /// For brk mode: end of allocated heap
         brk_end: AtomicUsize,
-        /// Padding to work around layout-sensitive bug
         _padding: [u8; 128],
+    }
+
+    #[cfg(not(feature = "chunked-allocator"))]
+    #[repr(C, align(256))]
+    pub struct HybridAllocator {
+        brk_head: AtomicUsize,
+        brk_end: AtomicUsize,
+        _padding: [u8; 240],
     }
 
     unsafe impl Sync for HybridAllocator {}
 
     impl HybridAllocator {
+        #[cfg(feature = "chunked-allocator")]
         pub const fn new() -> Self {
             Self {
                 talc: super::Spinlock::new(talc::Talc::new(talc::ErrOnOom)),
@@ -1389,7 +1393,15 @@ mod allocator {
             }
         }
 
-        /// Get allocator info for debugging
+        #[cfg(not(feature = "chunked-allocator"))]
+        pub const fn new() -> Self {
+            Self {
+                brk_head: AtomicUsize::new(0),
+                brk_end: AtomicUsize::new(0),
+                _padding: [0u8; 240],
+            }
+        }
+
         pub fn head_addr(&self) -> usize {
             &self.brk_head as *const _ as usize
         }
@@ -1403,13 +1415,13 @@ mod allocator {
         }
 
         // =====================================================================
-        // mmap-based allocation (Talc + Chunking)
+        // mmap-based allocation
         // =====================================================================
 
+        #[cfg(feature = "chunked-allocator")]
         unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
             let mut talc = self.talc.lock();
 
-            // Try to allocate from existing chunks
             match talc.malloc(layout) {
                 Ok(ptr) => {
                     ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1417,10 +1429,7 @@ mod allocator {
                     ptr.as_ptr()
                 }
                 Err(_) => {
-                    // OOM - request a new chunk from kernel
                     use super::mmap_flags::*;
-                    
-                    // If allocation is larger than standard chunk, allocate exactly what's needed (plus header)
                     let request_size = if layout.size() + 1024 > CHUNK_SIZE {
                         (layout.size() + 1024 + 4095) & !4095
                     } else {
@@ -1438,7 +1447,6 @@ mod allocator {
                         return ptr::null_mut();
                     }
 
-                    // Claim the new chunk
                     let span = talc::Span::from_base_size(addr as *mut u8, request_size);
                     if talc.claim(span).is_err() {
                         return ptr::null_mut();
@@ -1446,7 +1454,6 @@ mod allocator {
 
                     ALLOCATED_BYTES.fetch_add(request_size, Ordering::Relaxed);
 
-                    // Try again
                     match talc.malloc(layout) {
                         Ok(ptr) => {
                             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1459,6 +1466,30 @@ mod allocator {
             }
         }
 
+        #[cfg(not(feature = "chunked-allocator"))]
+        unsafe fn mmap_alloc(&self, layout: Layout) -> *mut u8 {
+            use super::mmap_flags::*;
+            let size = layout.size().max(layout.align());
+            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+            let addr = super::mmap(
+                0,
+                alloc_size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+            );
+
+            if addr == MAP_FAILED || addr == 0 {
+                ptr::null_mut()
+            } else {
+                ALLOCATED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
+                USER_USED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                addr as *mut u8
+            }
+        }
+
+        #[cfg(feature = "chunked-allocator")]
         unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
             if ptr.is_null() {
                 return;
@@ -1466,6 +1497,15 @@ mod allocator {
             let mut talc = self.talc.lock();
             talc.free(ptr::NonNull::new_unchecked(ptr), layout);
             USER_USED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+
+        #[cfg(not(feature = "chunked-allocator"))]
+        unsafe fn mmap_dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let size = layout.size().max(layout.align());
+            let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            USER_USED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+            FREED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
+            super::munmap_void(ptr as usize, alloc_size);
         }
 
         // =====================================================================
@@ -1502,21 +1542,17 @@ mod allocator {
 
         unsafe fn brk_alloc(&self, layout: Layout) -> *mut u8 {
             self.brk_init();
-
             let current_head = self.brk_head.load(Ordering::SeqCst);
             let current_end = self.brk_end.load(Ordering::SeqCst);
-
             let align = layout.align();
             let aligned = (current_head + align - 1) & !(align - 1);
             let new_head = aligned + layout.size();
-
             if new_head > current_end {
                 let needed = new_head - current_end;
                 if !self.brk_expand(needed) {
                     return ptr::null_mut();
                 }
             }
-
             self.brk_head.store(new_head, Ordering::SeqCst);
             aligned as *mut u8
         }
@@ -1535,12 +1571,10 @@ mod allocator {
             if USE_MMAP_ALLOCATOR {
                 self.mmap_dealloc(ptr, layout);
             }
-            // brk mode: no-op (bump allocator)
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             if !USE_MMAP_ALLOCATOR {
-                // brk mode fallback
                 let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                     Ok(l) => l,
                     Err(_) => return ptr::null_mut(),
@@ -1553,7 +1587,6 @@ mod allocator {
                 return new_ptr;
             }
 
-            // For Talc, we implement realloc as alloc + copy + free
             let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
@@ -1574,17 +1607,18 @@ mod allocator {
     #[global_allocator]
     pub static ALLOCATOR: HybridAllocator = HybridAllocator::new();
 
-    /// Get current total bytes requested from kernel
     pub fn total_allocated_bytes() -> usize {
         ALLOCATED_BYTES.load(Ordering::Relaxed)
     }
 
-    /// Get total bytes currently used by userspace objects
+    pub fn total_freed_bytes() -> usize {
+        FREED_BYTES.load(Ordering::Relaxed)
+    }
+
     pub fn net_memory() -> usize {
         USER_USED_BYTES.load(Ordering::Relaxed)
     }
 
-    /// Get number of allocations made
     pub fn alloc_count() -> usize {
         ALLOC_COUNT.load(Ordering::Relaxed)
     }
@@ -1600,9 +1634,9 @@ pub fn total_allocated() -> usize {
     allocator::total_allocated_bytes()
 }
 
-/// Get total freed bytes (approximated for chunked allocator)
+/// Get total freed bytes (actual unmaps)
 pub fn total_freed() -> usize {
-    total_allocated().saturating_sub(memory_usage())
+    allocator::total_freed_bytes()
 }
 
 /// Get number of allocations made

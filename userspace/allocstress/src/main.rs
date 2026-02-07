@@ -25,10 +25,9 @@ pub extern "C" fn _start() -> ! {
             println(")");
         }
         
-        // The budget is ~196,000 allocations. 
-        // If we hit 250,000 and haven't crashed, the fix might be working.
-        if count >= 250000 {
-            println("allocstress: reached 250,000 allocations without failure!");
+        // If we hit 2,000,000 and haven't crashed, the fix is definitely working.
+        if count >= 2000000 {
+            println("allocstress: reached 2,000,000 allocations without failure!");
             break;
         }
     }
