@@ -9,7 +9,7 @@ name = "scratch"
 path = "src/main.rs"
 
 [dependencies]
-libakuma = { path = "../libakuma" }
+libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }
 
 # SHA-1 hashing (no_std by default)
