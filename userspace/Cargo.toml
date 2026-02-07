@@ -4,6 +4,7 @@ members = [
     "libakuma",
     "libakuma-tls",
     "chainlink",
+    "doom",
     "echo2",
     "elftest",
     "hello",

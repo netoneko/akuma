@@ -15,6 +15,9 @@ extern uint64_t akuma_uptime(void);
 /* Exit function - provided by Rust runtime */
 extern void akuma_exit(int code);
 
+/* Print function - provided by Rust runtime */
+extern void akuma_print(const char *s, size_t len);
+
 /* Memory functions */
 void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char *)s;
@@ -95,9 +98,11 @@ char *strcpy(char *dest, const char *src) {
 }
 
 char *strncpy(char *dest, const char *src, size_t n) {
-    char *d = dest;
-    while (n && (*d++ = *src++)) n--;
-    while (n--) *d++ = '\0';
+    size_t i;
+    for (i = 0; i < n && src[i] != '\0'; i++)
+        dest[i] = src[i];
+    for (; i < n; i++)
+        dest[i] = '\0';
     return dest;
 }
 
@@ -1038,7 +1043,7 @@ int printf(const char *format, ...) {
     int result = vsnprintf(buf, sizeof(buf), format, ap);
     va_end(ap);
     /* Output via Rust - we'll provide akuma_print */
-    extern void akuma_print(const char *s, size_t len);
+
     akuma_print(buf, result);
     return result;
 }
@@ -1046,7 +1051,7 @@ int printf(const char *format, ...) {
 int vprintf(const char *format, va_list ap) {
     char buf[1024];
     int result = vsnprintf(buf, sizeof(buf), format, ap);
-    extern void akuma_print(const char *s, size_t len);
+
     akuma_print(buf, result);
     return result;
 }
@@ -1058,13 +1063,12 @@ int fprintf(void *stream, const char *format, ...) {
     va_start(ap, format);
     int result = vsnprintf(buf, sizeof(buf), format, ap);
     va_end(ap);
-    extern void akuma_print(const char *s, size_t len);
+
     akuma_print(buf, result);
     return result;
 }
 
 int puts(const char *s) {
-    extern void akuma_print(const char *s, size_t len);
     size_t len = strlen(s);
     akuma_print(s, len);
     akuma_print("\n", 1);
@@ -1073,13 +1077,11 @@ int puts(const char *s) {
 
 int fputs(const char *s, void *stream) {
     (void)stream;
-    extern void akuma_print(const char *s, size_t len);
     akuma_print(s, strlen(s));
     return 0;
 }
 
 int putchar(int c) {
-    extern void akuma_print(const char *s, size_t len);
     char ch = (char)c;
     akuma_print(&ch, 1);
     return c;
@@ -1328,7 +1330,7 @@ void clearerr(FILE *stream) {
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     (void)stream;
-    extern void akuma_print(const char *s, size_t len);
+
     akuma_print(ptr, size * nmemb);
     return nmemb;
 }

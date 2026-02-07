@@ -51,6 +51,10 @@ pub mod syscall {
     pub const SHOW_CURSOR: u64 = 311;
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
+    // Framebuffer Syscalls
+    pub const FB_INIT: u64 = 314;
+    pub const FB_DRAW: u64 = 315;
+    pub const FB_INFO: u64 = 316;
 }
 
 /// File descriptors
@@ -1730,6 +1734,55 @@ pub fn print_dec(val: usize) {
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
         print(s);
     }
+}
+
+// ============================================================================
+// Framebuffer Syscalls
+// ============================================================================
+
+/// Framebuffer information structure (matches kernel's ramfb::FBInfo)
+#[repr(C)]
+pub struct FBInfo {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+}
+
+/// Initialize the ramfb framebuffer with the given resolution.
+///
+/// Returns 0 on success, negative errno on failure.
+pub fn fb_init(width: u32, height: u32) -> i64 {
+    syscall(
+        syscall::FB_INIT,
+        width as u64,
+        height as u64,
+        0, 0, 0, 0,
+    ) as i64
+}
+
+/// Copy an XRGB8888 pixel buffer to the framebuffer.
+///
+/// `buf` must contain exactly `width * height * 4` bytes of pixel data.
+/// Returns number of bytes copied on success, negative errno on failure.
+pub fn fb_draw(buf: &[u8]) -> i64 {
+    syscall(
+        syscall::FB_DRAW,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0, 0,
+    ) as i64
+}
+
+/// Query framebuffer information.
+///
+/// Returns 0 on success and fills `info`, negative errno on failure.
+pub fn fb_info(info: &mut FBInfo) -> i64 {
+    syscall(
+        syscall::FB_INFO,
+        info as *mut FBInfo as u64,
+        0, 0, 0, 0, 0,
+    ) as i64
 }
 
 /// Panic handler for user programs
