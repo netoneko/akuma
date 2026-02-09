@@ -1,28 +1,35 @@
-# Strategy B: Smoltcp Migration
+# Strategy B: Smoltcp Migration (Implemented)
+
+**Status:** Completed on Feb 9, 2026.
 
 **Objective:** Replace the complex, `!Sync` `embassy-net` stack with a direct `smoltcp` implementation protected by kernel-level synchronization.
 
-## Tasks
+## Implementation Details
 
-1.  **Introduce Kernel Network Interface**
-    *   **File:** `src/network.rs` or `src/smoltcp_net.rs`.
-    *   **Action:** Create a global `Spinlock<smoltcp::iface::Interface>`.
-    *   **Goal:** Provide a thread-safe entry point for all network operations.
+1.  **Kernel Network Interface (`src/smoltcp_net.rs`)**:
+    *   Implemented `NetworkState` struct holding `Interface`, `SocketSet`, and devices.
+    *   Protected by a global `Spinlock<NetworkState>`.
+    *   Implemented `VirtioSmoltcpDevice` wrapper to bridge `virtio-drivers` and `smoltcp::phy::Device`.
+    *   Added Loopback support sharing the same `SocketSet`.
 
-2.  **Refactor Socket Management**
-    *   **File:** `src/socket.rs`.
-    *   **Action:** Change `KernelSocket` to store `smoltcp::socket::tcp::Socket` instead of `embassy_net::tcp::TcpSocket`.
-    *   **Goal:** Remove the need for `RefCell` and `disable_preemption` inside the socket layer by using the global interface lock.
+2.  **Socket Management (`src/socket.rs`)**:
+    *   Refactored `KernelSocket` to use `smoltcp::socket::tcp::SocketHandle`.
+    *   Implemented blocking `socket_accept`, `socket_connect`, `socket_send`, `socket_recv` using a `wait_until` helper that polls the global network stack.
 
-3.  **Unified Polling Engine**
-    *   **File:** `src/async_net.rs` (to be deprecated or refactored).
-    *   **Action:** Implement a `poll_iface()` function that handles ARP, TCP retransmits, and interface processing.
-    *   **Goal:** Allow both the background idle thread and active syscall threads to drive the network stack.
+3.  **SSH Server (`src/ssh/server.rs`)**:
+    *   Refactored to run on a dedicated system thread.
+    *   Uses a custom `block_on` helper to run the async SSH protocol handler.
 
-4.  **Remove Embassy Dependencies**
-    *   **Action:** Remove `embassy-net`, `embassy-time`, and `embassy-executor` from the kernel core where possible.
-    *   **Goal:** Reduce binary size and simplify the execution model.
+4.  **Main Loop (`src/main.rs`)**:
+    *   Simplified to just poll `smoltcp_net` and run background tasks.
+    *   Removed `embassy-net` initialization.
 
-5.  **Performance Verification**
-    *   Measure the overhead of the `Spinlock` versus the current `disable_preemption` model.
-    *   Verify that concurrent socket access (e.g., multiple SSH sessions) remains stable.
+5.  **Removed Files**:
+    *   `src/async_net.rs`
+    *   `src/embassy_net_driver.rs`
+    *   `src/embassy_virtio_driver.rs`
+
+## Benefits
+*   **Thread Safety:** Any thread can safely access the network stack via the global spinlock.
+*   **Preemption:** No need to disable global preemption during network polling.
+*   **Performance:** Direct polling from syscalls reduces latency compared to context switching to a dedicated network thread.

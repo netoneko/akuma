@@ -7,7 +7,8 @@ extern crate alloc;
 mod akuma;
 mod allocator;
 mod async_fs;
-mod async_net;
+// mod async_net;
+mod smoltcp_net;
 mod async_tests;
 mod block;
 mod boot;
@@ -16,9 +17,9 @@ mod console;
 mod dns;
 mod editor;
 mod elf_loader;
-mod embassy_net_driver;
+// mod embassy_net_driver;
 mod embassy_time_driver;
-mod embassy_virtio_driver;
+// mod embassy_virtio_driver;
 mod exceptions;
 mod executor;
 mod fs;
@@ -653,312 +654,133 @@ fn run_async_main() -> ! {
     }
 
     // =========================================================================
-    // Async Network initialization and main loop
+    // Network initialization and main loop
     // =========================================================================
-    console::print("\n--- Async Network Initialization ---\n");
+    console::print("\n--- Network Initialization ---\n");
 
-    // Initialize the async network stack
-    let net_init = match async_net::init() {
-        Ok(init) => {
-            console::print("[AsyncNet] Network initialized successfully\n");
-            init
-        }
-        Err(e) => {
-            console::print("[AsyncNet] Network init failed: ");
-            console::print(e);
-            console::print("\n");
-            console::print("[Idle] Entering idle loop (no network)\n");
-            loop {
-                threading::yield_now();
-            }
+    // Initialize the smoltcp network stack
+    if let Err(e) = smoltcp_net::init() {
+        console::print("[Net] Network init failed: ");
+        console::print(e);
+        console::print("\n");
+        console::print("[Idle] Entering idle loop (no network)\n");
+        loop {
+            threading::yield_now();
         }
     };
 
-    console::print("--- Async Network Initialization Done ---\n\n");
+    console::print("--- Network Initialization Done ---\n\n");
 
     // Initialize SSH host key
     ssh::init_host_key();
 
-    // Run the async main loop in the main thread
-    // This drives both the network runner and the SSH server
-
-    console::print("[AsyncMain] Starting async network loop...\n");
-
-    // Simple waker that does nothing (we poll in a loop)
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-    let waker = unsafe { Waker::from_raw(raw_waker) };
-    let mut cx = Context::from_waker(&waker);
-
-    let mut runner = net_init.runner;
-    let stack = net_init.stack;
-
-    // Extract loopback stack and runner
-    let mut loopback_runner = net_init.loopback.runner;
-    let loopback_stack = net_init.loopback.stack;
-
-    // First, wait for IP address (DHCP or fallback to static)
-    {
-        let mut wait_ip_pinned = pin!(async_net::wait_for_ip(&stack));
-        let runner_fut = runner.run();
-        let mut runner_pinned = pin!(runner_fut);
-        let loopback_runner_fut = loopback_runner.run();
-        let mut loopback_runner_pinned = pin!(loopback_runner_fut);
-
-        loop {
-            // Disable preemption during polling to protect embassy-net's RefCells
-            threading::disable_preemption();
-
-            // Poll the network runner (needed for DHCP to work)
-            let _ = runner_pinned.as_mut().poll(&mut cx);
-            // Poll the loopback runner
-            let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-
-            // Poll the wait_for_ip future
-            let ip_ready = matches!(wait_ip_pinned.as_mut().poll(&mut cx), Poll::Ready(()));
-
-            // Process pending IRQ work
-            executor::process_irq_work();
-            executor::run_once();
-
-            // Re-enable preemption before yielding or breaking
-            threading::enable_preemption();
-
-            if ip_ready {
-                break;
-            }
-
-            threading::yield_now();
-        }
+    console::print("[Main] Spawning SSH server thread...\n");
+    if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
+        console::print("[Main] Failed to spawn SSH server: ");
+        console::print(e);
+        console::print("\n");
     }
 
-    console::print("[AsyncMain] Network ready!\n");
+    console::print("[Main] Network ready! Running background polling loop.\n");
     console::print(
-        "[AsyncMain] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
+        "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
     );
 
-    // Store stack references for curl/nslookup commands
-    async_net::set_global_stack(stack);
-    async_net::set_loopback_stack(loopback_stack);
-
-    // Pin the futures directly using the pin! macro (no unsafe needed)
-    let mut runner_pinned = pin!(runner.run());
-    let mut loopback_runner_pinned = pin!(loopback_runner.run());
-    let mut ssh_pinned = pin!(ssh::run(stack));
-    let mut mem_monitor_pinned = pin!(memory_monitor());
-
-    // Enable IRQs for the main async loop
-    // The boot thread (thread 0) starts with all exceptions masked.
-    // We need to enable IRQs so that:
-    // 1. SGIs can be delivered for thread scheduling (yield_now)
-    // 2. Timer interrupts can fire for preemptive scheduling
-    // 3. The embassy time driver can wake up on timer interrupts
+    // Enable IRQs for the main loop
     unsafe {
-        // Clear the IRQ mask bit (bit 1 of DAIF, which is bit 7 of the value)
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
     }
 
-    // Auto-start herd process supervisor (AFTER IRQs enabled so scheduler works)
+    // Auto-start herd process supervisor
     let (_herd_tid, mut herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
         const HERD_PATH: &str = "/bin/herd";
         const HERD_ARGS: &[&str] = &["daemon"];
-        // const HERD_PATH: &str = "/bin/hello";
-        // const HERD_ARGS: &[&str] = &["10", "50"];
         if fs::exists(HERD_PATH) {
-            crate::safe_print!(64, "[AsyncMain] Starting herd supervisor...\n");
+            crate::safe_print!(64, "[Main] Starting herd supervisor...\n");
             match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
                 Ok((tid, channel, _pid)) => {
-                    crate::safe_print!(64, "[AsyncMain] Herd started (tid={})\n", tid);
+                    crate::safe_print!(64, "[Main] Herd started (tid={})\n", tid);
                     (tid, Some(channel))
                 }
                 Err(e) => {
-                    crate::safe_print!(64, "[AsyncMain] ERROR: Failed to start herd: {}\n", e);
+                    crate::safe_print!(64, "[Main] ERROR: Failed to start herd: {}\n", e);
                     (0, None)
                 }
             }
         } else {
-            crate::safe_print!(64, "[AsyncMain] WARNING: /bin/herd not found, supervisor disabled\n");
+            crate::safe_print!(64, "[Main] WARNING: /bin/herd not found, supervisor disabled\n");
             (0, None)
         }
     } else {
         (0, None)
     };
 
-    // Loop iteration counter for debugging hangs (using atomics for safety)
+    // Loop iteration counter for debugging hangs
     use core::sync::atomic::{AtomicU64, Ordering};
     static LOOP_COUNTER: AtomicU64 = AtomicU64::new(0);
     static LAST_HEARTBEAT_US: AtomicU64 = AtomicU64::new(0);
     const HEARTBEAT_INTERVAL_US: u64 = 30_000_000; // 30 seconds
     
-    // Pre-initialization phase: Poll SSH server with preemption ENABLED until
-    // its filesystem initialization is complete. This avoids deadlocks with
-    // other threads (like herd) that may hold VFS locks.
-    crate::safe_print!(64, "[AsyncMain] SSH server initialization...\n");
-    while !ssh::server::is_initialized() {
-        // Poll network runners to keep network alive
-        let _ = runner_pinned.as_mut().poll(&mut cx);
-        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-        // Poll SSH server - this progresses its initialization
-        let _ = ssh_pinned.as_mut().poll(&mut cx);
-        // Process any pending work
-        executor::process_irq_work();
-        executor::run_once();
-        // Yield to other threads (preemption is enabled here)
-        threading::yield_now();
-    }
-    crate::safe_print!(64, "[AsyncMain] SSH server initialized, entering main loop\n");
+    // Pin memory monitor
+    let mut mem_monitor_pinned = pin!(memory_monitor());
+    
+    // Simple waker for executor
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {}, |_| {}, |_| {},
+    );
+    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
 
     loop {
-        // Periodic heartbeat that doesn't rely on async (for debugging hangs)
+        // Periodic heartbeat
         let count = LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let now_us = timer::uptime_us();
         let last_heartbeat = LAST_HEARTBEAT_US.load(Ordering::Relaxed);
         if now_us.saturating_sub(last_heartbeat) >= HEARTBEAT_INTERVAL_US {
             LAST_HEARTBEAT_US.store(now_us, Ordering::Relaxed);
-            
-            // Check stack usage
-            let sp: u64;
-            unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)); }
             let tid = threading::current_thread_id();
-            
-            // Calculate stack usage based on mode
-            let (stack_used_kb, stack_mode) = if config::COOPERATIVE_MAIN_THREAD {
-                // Boot stack: 0x41F00000-0x42000000 (1MB)
-                let used = 0x4200_0000u64.saturating_sub(sp) / 1024;
-                (used, "boot-1MB")
-            } else {
-                // System thread: 512KB stack (location varies)
-                (0, "sys-512KB")
-            };
-            
             crate::safe_print!(160, 
-                "[Heartbeat] Loop {} | T{} | SP:{:#x} | Used:{}KB | Mode:{}\n",
-                count, tid, sp, stack_used_kb, stack_mode
+                "[Heartbeat] Loop {} | T{} | SmolNet Active\n",
+                count, tid
             );
         }
 
-        // Disable preemption during embassy-net polling to protect RefCells.
-        // Embassy-net uses RefCell for interior mutability, which panics on re-entrant
-        // borrows. Timer preemption mid-poll would cause this panic.
-        threading::disable_preemption();
-        
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
-        // Poll the main network runner
-        let _ = runner_pinned.as_mut().poll(&mut cx);
+        // Poll network stack (drives interface, timers, retransmits)
+        smoltcp_net::poll();
         
         GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
-        // Poll loopback runner - process any pending packets
-        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-        
-        GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
-        // Poll the SSH server (runs curl commands that send to loopback)
-        let _ = ssh_pinned.as_mut().poll(&mut cx);
-        
-        GLOBAL_POLL_STEP.store(4, Ordering::Relaxed);
-        // Poll loopback runner again - process packets sent by curl
-        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-        
-        GLOBAL_POLL_STEP.store(5, Ordering::Relaxed);
-        // Poll loopback runner again - process response packets from web server
-        let _ = loopback_runner_pinned.as_mut().poll(&mut cx);
-        
-        GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
         
-        GLOBAL_POLL_STEP.store(7, Ordering::Relaxed);
-        // Process pending IRQ work - may poll embassy tasks
+        GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
+        // Process pending IRQ work
         executor::process_irq_work();
         
-        GLOBAL_POLL_STEP.store(8, Ordering::Relaxed);
-        // Poll the executor for any other tasks - may access embassy-net
+        GLOBAL_POLL_STEP.store(4, Ordering::Relaxed);
+        // Poll executor for other tasks
         executor::run_once();
         
-        GLOBAL_POLL_STEP.store(9, Ordering::Relaxed);
-        // Process deferred buffer frees from terminated SSH sessions.
-        // This MUST happen after polling the network runner, which ensures
-        // embassy-net has finished cleaning up aborted sockets before we
-        // free their buffers for reuse.
-        ssh::server::process_pending_buffer_frees();
-        
-        GLOBAL_POLL_STEP.store(10, Ordering::Relaxed);
-        // Process deferred buffer frees from closed userspace sockets.
-        socket::process_buffer_cleanup();
-        
-        GLOBAL_POLL_STEP.store(11, Ordering::Relaxed);
-        // Re-enable preemption - safe now that embassy-net operations are done
-        threading::enable_preemption();
-
-        GLOBAL_POLL_STEP.store(12, Ordering::Relaxed);
-        // Poll herd's output and print to console (if running)
-        // This is safe outside preemption-disabled: uses Spinlock, not RefCells
+        GLOBAL_POLL_STEP.store(5, Ordering::Relaxed);
+        // Poll herd output
         if let Some(ref channel) = herd_channel {
-            // Check for output (non-blocking)
             if let Some(output) = channel.try_read() {
                 for &byte in &output {
                     console::print_char(byte as char);
                 }
             }
-            
-            // Check if process has exited
             if channel.has_exited() {
-                // Read any remaining output
-                let output = channel.read_all();
-                if !output.is_empty() {
-                    for &byte in &output {
-                        console::print_char(byte as char);
-                    }
-                }
                 let exit_code = channel.exit_code();
                 crate::safe_print!(64, "[Herd] Process exited with code {}\n", exit_code);
-                // Clear the channel to stop polling
                 herd_channel = None;
             }
         }
         
-        GLOBAL_POLL_STEP.store(13, Ordering::Relaxed);
-        
-        // Periodic stack canary check (every ~1000 iterations to reduce overhead)
-        static CANARY_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let canary_count = CANARY_CHECK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if canary_count % 1000 == 0 && config::ENABLE_STACK_CANARIES {
-            let bad = threading::check_all_stack_canaries();
-            if !bad.is_empty() {
-                // Safe print without heap allocation
-                console::print("[WARN] Stack overflow detected in threads: ");
-                for tid in &bad {
-                    console::print_dec(*tid);
-                    console::print(" ");
-                }
-                console::print("\n");
-            }
-        }
-
-        GLOBAL_POLL_STEP.store(14, Ordering::Relaxed);
-        // Yield to other threads (cooperative multitasking)
+        GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
         threading::yield_now();
-        
-        GLOBAL_POLL_STEP.store(14, Ordering::Relaxed);
-        // We're back from yield - loop continues
-        
-        // Periodically log poll step (to catch where we hang)
-        // Log every 1 million loops to see progress
-        static STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let step_count = STEP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if step_count % 1_000_000 == 0 {
-            // Safe print without heap allocation
-            console::print("[PollStep] ");
-            console::print_u64(step_count / 1_000_000);
-            console::print(" million loops, step: ");
-            console::print_dec(GLOBAL_POLL_STEP.load(Ordering::Relaxed) as usize);
-            console::print("\n");
-        }
     }
 }
 

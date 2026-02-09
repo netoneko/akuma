@@ -26,7 +26,7 @@ spinning_top = "0.3"
 hashbrown = { version = "0.14", default-features = false, features = ["allocator-api2"] }
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"] }
 fdt = "0.1"
-smoltcp = { version = "0.11", default-features = false, features = ["log", "async", "proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet"] }
+smoltcp = { version = "=0.11.0", default-features = false, features = ["log", "proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async"] }
 virtio-drivers = { version = "0.7", default-features = false }
 arm_pl031 = "0.2"
 
@@ -41,11 +41,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc", 
 rand_core = { version = "0.6", default-features = false }
 
 # Embassy async runtime (for bare metal aarch64)
+# Removed embassy-net and embassy-net-driver as we migrated to smoltcp
 embassy-executor = { version = "0.7", default-features = false, features = ["nightly", "arch-spin"] }
 embassy-time = { version = "0.4", default-features = false, features = ["generic-queue-8"] }
 embassy-time-driver = { version = "0.2", default-features = false }
-embassy-net = { version = "0.6", default-features = false, features = ["proto-ipv4", "tcp", "medium-ethernet", "dhcpv4", "dns"] }
-embassy-net-driver = { version = "0.2", default-features = false }
 embassy-sync = { version = "0.6", default-features = false }
 critical-section = { version = "1.2", default-features = false }
 static_cell = { version = "2.1" }

@@ -31,7 +31,7 @@ use super::crypto::{
     write_namelist, write_string, write_u32,
 };
 use super::keys;
-use crate::async_net::{TcpError, TcpStream};
+use crate::smoltcp_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};

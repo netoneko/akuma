@@ -1459,8 +1459,8 @@ fn cleanup_process_sockets(proc: &Process) {
     
     // Close each socket
     for (_fd, socket_idx) in socket_fds {
-        // socket_close handles abort() and deferred buffer cleanup
-        let _ = crate::socket::socket_close(socket_idx);
+        // remove_socket handles smoltcp socket removal
+        crate::socket::remove_socket(socket_idx);
     }
 }
 

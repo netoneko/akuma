@@ -1,26 +1,16 @@
-//! SSH Server - Thread-per-Session Architecture
+//! SSH Server
 //!
-//! Implements preemptive multitasking for SSH sessions:
-//! - Thread 0: Accept loop and network runner
-//! - Threads 1-7: SSH session threads (one per active session)
-//! - Threads 8+: User process threads
-//!
-//! Each SSH session runs on its own kernel thread, allowing true concurrent
-//! execution and preemption via the timer interrupt.
+//! Implements the SSH server loop using smoltcp sockets.
+//! Runs on a dedicated system thread.
 
-use core::cell::UnsafeCell;
-use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use alloc::boxed::Box;
+use alloc::format;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
-use embassy_time::Duration;
-
-use super::protocol;
-use crate::async_net::TcpStream;
+use smoltcp::socket::tcp;
+use crate::smoltcp_net::{self, SocketHandle, with_network};
 use crate::console;
+use super::protocol;
 
 // ============================================================================
 // Constants
@@ -28,427 +18,142 @@ use crate::console;
 
 const SSH_PORT: u16 = 22;
 const MAX_CONNECTIONS: usize = 4;
-const TCP_RX_BUFFER_SIZE: usize = 4096;
-const TCP_TX_BUFFER_SIZE: usize = 4096;
-
-// ============================================================================
-// Static Buffer Pool - Thread-safe using atomics
-// ============================================================================
-
-/// Buffer pool for TCP connections
-/// Uses atomics for allocation tracking and UnsafeCell for buffer storage
-struct BufferPool {
-    rx_buffers: [UnsafeCell<[u8; TCP_RX_BUFFER_SIZE]>; MAX_CONNECTIONS + 1],
-    tx_buffers: [UnsafeCell<[u8; TCP_TX_BUFFER_SIZE]>; MAX_CONNECTIONS + 1],
-    in_use: [AtomicBool; MAX_CONNECTIONS + 1],
-}
-
-// SAFETY: Access to individual buffer slots is serialized via the AtomicBool flags.
-// Each slot can only be used by one caller at a time (ensured by alloc/free protocol).
-unsafe impl Sync for BufferPool {}
-
-impl BufferPool {
-    const fn new() -> Self {
-        // Helper to create arrays with const initialization
-        const RX_INIT: UnsafeCell<[u8; TCP_RX_BUFFER_SIZE]> =
-            UnsafeCell::new([0u8; TCP_RX_BUFFER_SIZE]);
-        const TX_INIT: UnsafeCell<[u8; TCP_TX_BUFFER_SIZE]> =
-            UnsafeCell::new([0u8; TCP_TX_BUFFER_SIZE]);
-        const IN_USE_INIT: AtomicBool = AtomicBool::new(false);
-
-        Self {
-            rx_buffers: [RX_INIT; MAX_CONNECTIONS + 1],
-            tx_buffers: [TX_INIT; MAX_CONNECTIONS + 1],
-            in_use: [IN_USE_INIT; MAX_CONNECTIONS + 1],
-        }
-    }
-
-    /// Try to allocate a buffer slot
-    fn alloc(&self) -> Option<usize> {
-        for i in 0..=MAX_CONNECTIONS {
-            // Try to atomically claim this slot
-            if self.in_use[i]
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    /// Free a buffer slot
-    fn free(&self, slot: usize) {
-        if slot <= MAX_CONNECTIONS {
-            self.in_use[slot].store(false, Ordering::Release);
-        }
-    }
-
-    /// Get buffer references for an allocated slot
-    /// SAFETY: Caller must have successfully allocated this slot via `alloc()`
-    /// and not yet freed it. The slot must not be accessed concurrently.
-    unsafe fn get_buffers(&self, slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
-        debug_assert!(slot <= MAX_CONNECTIONS);
-        debug_assert!(self.in_use[slot].load(Ordering::Acquire));
-
-        // SAFETY: We have exclusive access to this slot (enforced by atomic in_use flag)
-        unsafe {
-            let rx = &mut *self.rx_buffers[slot].get();
-            let tx = &mut *self.tx_buffers[slot].get();
-            (rx, tx)
-        }
-    }
-}
-
-static BUFFER_POOL: BufferPool = BufferPool::new();
 
 /// Count of active SSH sessions
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
-// Deferred Buffer Free Queue
+// SSH Server Loop
 // ============================================================================
-//
-// When a session ends, we can't free the buffer immediately because embassy-net
-// may still reference it until the network runner is polled. Session threads
-// add their buffer slots to this queue, and the main async loop frees them
-// AFTER polling the network runner (ensuring cleanup is complete).
 
-/// Static ring buffer for pending buffer frees - no heap allocation
-const PENDING_FREE_QUEUE_SIZE: usize = 32;
-static PENDING_FREE_SLOTS: [AtomicUsize; PENDING_FREE_QUEUE_SIZE] = {
-    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = empty slot
-    [INIT; PENDING_FREE_QUEUE_SIZE]
-};
-static PENDING_FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
-static PENDING_FREE_TAIL: AtomicUsize = AtomicUsize::new(0);
-
-/// Queue a buffer slot for deferred free (called from session threads)
-fn queue_buffer_free(slot: usize) {
-    let tail = PENDING_FREE_TAIL.load(Ordering::Relaxed);
-    let next_tail = (tail + 1) % PENDING_FREE_QUEUE_SIZE;
-    let head = PENDING_FREE_HEAD.load(Ordering::Relaxed);
+/// Run the SSH server (Blocking - should be spawned on a thread)
+pub fn run() -> ! {
+    log("[SSH Server] Starting SSH server on port 22...\n");
     
-    // Check if queue is full
-    if next_tail == head {
-        // Queue full - free immediately (less safe but better than dropping)
-        BUFFER_POOL.free(slot);
-        return;
-    }
-    
-    PENDING_FREE_SLOTS[tail].store(slot, Ordering::Release);
-    PENDING_FREE_TAIL.store(next_tail, Ordering::Release);
-}
+    // Initialize host keys
+    super::init_host_key();
 
-/// Process the pending buffer free queue (called from main async loop after polling)
-/// Returns number of buffers freed
-pub fn process_pending_buffer_frees() -> usize {
-    let mut count = 0;
+    // Create initial listening socket
+    let mut listen_handle = match create_listener() {
+        Some(h) => h,
+        None => {
+            log("[SSH Server] FATAL: Failed to create listener\n");
+            loop { crate::threading::yield_now(); }
+        }
+    };
+
+    log("[SSH Server] Listening...\n");
+
     loop {
-        let head = PENDING_FREE_HEAD.load(Ordering::Acquire);
-        let tail = PENDING_FREE_TAIL.load(Ordering::Acquire);
-        
-        if head == tail {
-            break; // Queue empty
+        // Poll for new connection
+        let mut established = false;
+        with_network(|net| {
+            let socket = net.sockets.get_mut::<tcp::Socket>(listen_handle);
+            if socket.state() == tcp::State::Established {
+                established = true;
+            }
+        });
+
+        if established {
+            let active = ACTIVE_SESSIONS.load(Ordering::Relaxed);
+            if active < MAX_CONNECTIONS {
+                ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+                log(&format!("[SSH Server] Accepted connection (active: {})\n", active + 1));
+
+                // Hand off the connected socket to a session thread
+                let session_handle = listen_handle;
+                
+                let _ = crate::threading::spawn_system_thread_fn(move || {
+                    run_session(session_handle);
+                });
+
+                // Create a NEW listening socket for the server loop
+                match create_listener() {
+                    Some(h) => listen_handle = h,
+                    None => {
+                        log("[SSH Server] Failed to recreate listener\n");
+                        break;
+                    }
+                }
+            } else {
+                log("[SSH Server] Too many connections, rejecting\n");
+                smoltcp_net::socket_close(listen_handle);
+                
+                // Recreate listener
+                match create_listener() {
+                    Some(h) => listen_handle = h,
+                    None => break,
+                }
+            }
         }
-        
-        let slot = PENDING_FREE_SLOTS[head].load(Ordering::Acquire);
-        PENDING_FREE_HEAD.store((head + 1) % PENDING_FREE_QUEUE_SIZE, Ordering::Release);
-        
-        if slot != usize::MAX {
-            BUFFER_POOL.free(slot);
-            count += 1;
+
+        smoltcp_net::poll();
+        crate::threading::yield_now();
+    }
+    
+    log("[SSH Server] Server loop exited abnormally\n");
+    loop { crate::threading::yield_now(); }
+}
+
+fn create_listener() -> Option<SocketHandle> {
+    let handle = smoltcp_net::socket_create()?;
+    let res = with_network(|net| {
+        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
+        socket.listen(SSH_PORT)
+    });
+    
+    match res {
+        Some(Ok(())) => Some(handle),
+        _ => {
+            smoltcp_net::socket_close(handle);
+            None
         }
     }
-    count
 }
 
-/// Allocate a buffer slot
-fn alloc_buffer_slot() -> Option<usize> {
-    BUFFER_POOL.alloc()
-}
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-/// Free a buffer slot immediately (use queue_buffer_free for cross-thread)
-fn free_buffer_slot(slot: usize) {
-    BUFFER_POOL.free(slot);
-}
-
-/// Get buffer references for a slot
-/// SAFETY: Caller must ensure slot is allocated and not concurrently accessed
-unsafe fn get_buffer_refs(slot: usize) -> (&'static mut [u8], &'static mut [u8]) {
-    // SAFETY: Caller guarantees slot is allocated via alloc_buffer_slot()
-    unsafe { BUFFER_POOL.get_buffers(slot) }
-}
-
-// ============================================================================
-// SendableTcpStream - Wrapper for cross-thread TcpStream transfer
-// ============================================================================
-
-/// Wrapper that allows TcpStream to be sent to another thread.
-///
-/// SAFETY: This assumes the underlying embassy-net stack is thread-safe
-/// when the runner is being polled on thread 0. The TcpSocket operations
-/// go through the Stack's internal critical sections.
-struct SendableTcpStream(TcpStream);
-
-// SAFETY: We ensure that:
-// 1. The network runner is continuously polled on thread 0
-// 2. Socket operations use internal synchronization
-// 3. Each socket is only accessed from one thread at a time
-unsafe impl Send for SendableTcpStream {}
-
-// ============================================================================
-// Blocking Executor for Session Threads
-// ============================================================================
-
-/// Run an async future to completion using a blocking executor.
-///
-/// This is used by session threads to run async operations without
-/// needing embassy's executor. It polls the future in a loop, yielding
-/// to the kernel scheduler between polls.
 fn block_on<F: Future>(mut future: F) -> F::Output {
-    // Pin the future on the stack
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
-
-    // Create a no-op waker
+    
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         |_| RawWaker::new(core::ptr::null(), &VTABLE),
         |_| {},
         |_| {},
         |_| {},
     );
-
+    
     loop {
         let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
-
-        // CRITICAL: Disable preemption during poll to prevent RefCell conflicts
-        // Embassy-net uses RefCell internally which is not thread-safe.
-        // If we get preempted while borrowing the RefCell, another thread
-        // might try to borrow it too → panic.
-        crate::threading::disable_preemption();
-        let poll_result = future.as_mut().poll(&mut cx);
-        crate::threading::enable_preemption();
-
-        match poll_result {
-            Poll::Ready(output) => return output,
+        
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
             Poll::Pending => {
-                // Yield to the scheduler to allow other threads to run
-                // and to let thread 0 poll the network runner
+                smoltcp_net::poll();
                 crate::threading::yield_now();
-
-                // Small spin delay to avoid hammering the scheduler
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
             }
         }
     }
 }
 
-/// Run an SSH session on a dedicated thread.
-///
-/// This function is called by session threads to handle a single SSH connection.
-/// It runs a blocking executor that polls the async connection handler.
-fn run_session_on_thread(stream: SendableTcpStream, session_id: usize, buffer_slot: usize) -> ! {
-    log(&alloc::format!(
-        "[SSH Session {}] Starting on thread {}\n",
-        session_id,
-        crate::threading::current_thread_id()
-    ));
-
-    ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
-
-    // Run the async connection handler using our blocking executor
-    let stream = stream.0;
+fn run_session(handle: SocketHandle) -> ! {
+    let stream = smoltcp_net::TcpStream::new(handle);
+    
     block_on(async {
         protocol::handle_connection(stream).await;
     });
 
+    smoltcp_net::socket_close(handle);
     ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
-
-    log(&alloc::format!(
-        "[SSH Session {}] Ended (active: {})\n",
-        session_id,
-        ACTIVE_SESSIONS.load(Ordering::Relaxed)
-    ));
-
-    // IMPORTANT: The TcpStream was dropped when handle_connection returned,
-    // which called socket.abort(). However, embassy-net doesn't fully clean up
-    // the socket until the network runner is polled. We queue the buffer for
-    // deferred free - the main async loop will free it AFTER polling the
-    // network runner, ensuring the cleanup is complete.
-    queue_buffer_free(buffer_slot);
-
-    // Mark this thread as terminated and yield
-    crate::threading::mark_current_terminated();
-    loop {
-        crate::threading::yield_now();
-    }
-}
-
-// ============================================================================
-// SSH Server with Concurrent Connections
-// ============================================================================
-
-/// Flag to track whether SSH server initialization is complete.
-/// Used to allow the main loop to poll SSH server with preemption enabled
-/// during initialization (which does filesystem I/O), then with preemption
-/// disabled once initialization is done (accept loop).
-static SSH_INIT_DONE: AtomicBool = AtomicBool::new(false);
-
-/// Check if SSH server initialization is complete
-pub fn is_initialized() -> bool {
-    SSH_INIT_DONE.load(Ordering::Acquire)
-}
-
-/// Run the SSH server with thread-per-session architecture
-///
-/// This is the main accept loop that runs on thread 0. When a connection
-/// is accepted, it spawns a system thread (1-7) to handle the session.
-/// This allows true preemptive multitasking between SSH sessions.
-pub async fn run(stack: Stack<'static>) {
-    log("[SSH Server] Starting SSH server on port 22 (thread-per-session mode)...\n");
-    log(&alloc::format!(
-        "[SSH Server] Max concurrent sessions: {} (system threads 1-7)\n",
-        MAX_CONNECTIONS
-    ));
-    log("[SSH Server] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
-
-    // Enable async process execution now that SSH server is running
-    crate::shell::enable_async_exec();
-
-    // Initialize shared host key from filesystem
-    // NOTE: This does filesystem I/O which can block, so it must run with
-    // preemption enabled to avoid deadlocks with other threads holding VFS locks.
-    protocol::init_host_key_async().await;
-
-    // Ensure default config exists, then load and cache it
-    super::config::ensure_default_config().await;
-    super::config::load_config().await;
     
-    // Mark initialization as complete - main loop can now poll with preemption disabled
-    SSH_INIT_DONE.store(true, Ordering::Release);
-    log("[SSH Server] Initialization complete, entering accept loop\n");
-
-    let mut next_id: usize = 0;
-
-    // Listening socket state
-    let mut listen_socket: Option<TcpSocket<'static>> = None;
-    let mut listen_buffer_slot: Option<usize> = None;
-
-    loop {
-        // =====================================================================
-        // Accept new connections
-        // =====================================================================
-        let active_sessions = ACTIVE_SESSIONS.load(Ordering::Relaxed);
-        let sys_threads_avail = crate::threading::system_threads_available();
-
-        // Periodic status log (every ~10000 iterations when idle)
-        static mut ACCEPT_COUNTER: u32 = 0;
-        unsafe {
-            ACCEPT_COUNTER = ACCEPT_COUNTER.wrapping_add(1);
-            if ACCEPT_COUNTER % 10000 == 0 {
-                log(&alloc::format!(
-                    "[SSH Status] active={} sys_avail={} max={}\n",
-                    active_sessions, sys_threads_avail, MAX_CONNECTIONS
-                ));
-            }
-        }
-
-        if active_sessions < MAX_CONNECTIONS && sys_threads_avail > 0 {
-            // Ensure we have a listening socket
-            if listen_socket.is_none() {
-                let slot = listen_buffer_slot
-                    .unwrap_or_else(|| alloc_buffer_slot().expect("No buffer slots available"));
-                listen_buffer_slot = Some(slot);
-
-                let (rx, tx) = unsafe { get_buffer_refs(slot) };
-                let mut socket = TcpSocket::new(stack, rx, tx);
-                socket.set_timeout(Some(Duration::from_secs(60)));
-                listen_socket = Some(socket);
-            }
-
-            if let Some(ref mut socket) = listen_socket {
-                // Use short timeout to keep the loop responsive
-                let accept_timeout = if active_sessions == 0 {
-                    Duration::from_millis(100)
-                } else {
-                    Duration::from_millis(10)
-                };
-
-                match embassy_time::with_timeout(accept_timeout, socket.accept(SSH_PORT)).await {
-                    Ok(Ok(())) => {
-                        let id = next_id;
-                        next_id = next_id.wrapping_add(1);
-                        let buffer_slot = listen_buffer_slot.take().unwrap();
-
-                        crate::network::increment_connections();
-
-                        let connected_socket = listen_socket.take().unwrap();
-                        let stream = TcpStream::from_socket(connected_socket);
-                        let sendable = SendableTcpStream(stream);
-
-                        // Spawn system thread for this session
-                        // Note: we already checked sys_threads_avail > 0 before entering this block
-                        match crate::threading::spawn_system_thread_fn(move || {
-                            run_session_on_thread(sendable, id, buffer_slot)
-                        }) {
-                            Ok(thread_id) => {
-                                log(&alloc::format!(
-                                    "[SSH Server] Connection {} spawned on thread {} (active: {})\n",
-                                    id,
-                                    thread_id,
-                                    ACTIVE_SESSIONS.load(Ordering::Relaxed) + 1
-                                ));
-                            }
-                            Err(e) => {
-                                // Thread spawn failed - just log and drop the connection
-                                // The sendable was moved into the closure so we can't recover it
-                                log(&alloc::format!(
-                                    "[SSH Server] Thread spawn failed: {}, dropping connection\n",
-                                    e
-                                ));
-                                free_buffer_slot(buffer_slot);
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
-                        // Must abort before dropping to properly release the port in embassy-net
-                        socket.abort();
-                        listen_socket = None;
-                    }
-                    Err(_) => {
-                        // Timeout from with_timeout - abort and recreate socket
-                        socket.abort();
-                        listen_socket = None;
-                    }
-                }
-            }
-        } else {
-            // At capacity - wait briefly
-            embassy_time::Timer::after(Duration::from_millis(10)).await;
-        }
-
-        // Clean up terminated threads periodically (not every loop iteration)
-        // This reduces POOL lock contention
-        static mut CLEANUP_COUNTER: u32 = 0;
-        unsafe {
-            CLEANUP_COUNTER = CLEANUP_COUNTER.wrapping_add(1);
-            if CLEANUP_COUNTER % 100 == 0 {
-                crate::threading::cleanup_terminated();
-            }
-        }
-        
-        // Note: on_timer_interrupt() is already called by the timer interrupt handler
-        // so we don't need to call it here. Calling it redundantly could cause races
-        // with the critical section in the time driver.
-    }
+    crate::threading::mark_current_terminated();
+    loop { crate::threading::yield_now(); }
 }
 
-/// Wrapper for handle_connection that logs start/end (used for fallback async mode)
 fn log(msg: &str) {
     console::print(msg);
 }
