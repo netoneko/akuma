@@ -183,10 +183,10 @@ pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // Option to disable copying stdout to kernel log
-pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
+pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
 
 /// Option to disable [syscall] debug prints to the kernel log.
-pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
+pub const SYSCALL_DEBUG_INFO_ENABLED: bool = true;
 
 // ============================================================================
 // Network TX Queue Configuration
@@ -254,7 +254,7 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-pub const AUTO_START_HERD: bool = true;
+pub const AUTO_START_HERD: bool = false;
 
 // ============================================================================
 // Procfs Buffer Size Limits
