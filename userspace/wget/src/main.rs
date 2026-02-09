@@ -113,7 +113,7 @@ fn main() -> i32 {
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock {
-                    libakuma::sleep_ms(10);
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 print("wget: Read error: ");

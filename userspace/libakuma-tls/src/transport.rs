@@ -107,9 +107,9 @@ impl Read for TcpTransport {
                         }
                     }
                     // Yield to allow network thread to process packets.
-                    // 10ms is a good balance between responsiveness and not
+                    // 1ms is a good balance between responsiveness and not
                     // hogging CPU/syscall bandwidth which affects SSH.
-                    libakuma::sleep_ms(10);
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),
@@ -124,7 +124,7 @@ impl Write for TcpTransport {
             match self.stream.write(buf) {
                 Ok(n) => return Ok(n),
                 Err(ref e) if e.kind == ErrorKind::WouldBlock => {
-                    libakuma::sleep_ms(10);
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),

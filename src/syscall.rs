@@ -1053,9 +1053,9 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let read_len = core::cmp::min(len, KERNEL_BUF_SIZE);
 
     let mut iterations = 0usize;
-    // Short timeout (50 iterations * ~10ms yield = ~500ms) then return EAGAIN
+    // Short timeout (500 iterations * ~10ms yield = ~5s) then return EAGAIN
     // This allows userspace to do work (like print progress dots) while waiting
-    const EAGAIN_ITERATIONS: usize = 50;
+    const EAGAIN_ITERATIONS: usize = 500;
 
     loop {
         // Check for interrupt

@@ -58,7 +58,7 @@ pub fn run(db_path: &str) -> Result<(), &'static str> {
                     print("sqld: Accept error\n");
                 }
                 // Yield before retrying
-                libakuma::sleep_ms(10);
+                libakuma::sleep_ms(1);
             }
         }
     }

@@ -140,7 +140,7 @@ impl TcpListener {
 
             let errno = -new_fd;
             if errno == 11 { // WouldBlock
-                crate::sleep_ms(10);
+                crate::sleep_ms(1);
                 continue;
             }
 

@@ -131,7 +131,7 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // legacy option, now using 
 /// - ratio=8: (87.5% / 4) = ~22% CPU each
 /// 
 /// Lower values = better network responsiveness, higher = more CPU for downloads
-pub const NETWORK_THREAD_RATIO: u32 = 4;
+pub const NETWORK_THREAD_RATIO: u32 = 2;
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 

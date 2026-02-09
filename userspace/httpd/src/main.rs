@@ -59,7 +59,7 @@ fn main() {
                     print(&format!("{:?}\n", e));
                 }
                 // Yield before retrying
-                libakuma::sleep_ms(10);
+                libakuma::sleep_ms(1);
             }
         }
     }
