@@ -5,6 +5,14 @@ extern crate alloc;
 
 use libakuma::*;
 
+// Mode flags for terminal attributes (mirroring kernel's terminal/mod.rs)
+pub mod mode_flags {
+    /// Enable raw mode (disable canonical, echo, ISIG)
+    pub const RAW_MODE_ENABLE: u64 = 0x01;
+    /// Disable raw mode (restore canonical, echo, ISIG)
+    pub const RAW_MODE_DISABLE: u64 = 0x02;
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let mut once = false;
@@ -14,7 +22,17 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    let mut initial_mode_flags: u64 = 0;
     if !once {
+        // Save initial terminal attributes
+        get_terminal_attributes(
+            fd::STDIN,
+            &mut initial_mode_flags as *mut u64 as u64,
+        );
+        
+        // Enable raw mode
+        set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
+        
         clear_screen();
         hide_cursor();
     }
@@ -32,9 +50,9 @@ pub extern "C" fn _start() -> ! {
             set_cursor_position(0, 0);
         }
 
-        println("Akuma OS - CPU Stats");
+        println("Akuma OS - CPU Stats (press 'q' to quit)");
         println("TID  PID  STATE       CPU%   TIME(ms)  NAME");
-        println("----------------------------------------------");
+        println("--------------------------------------------------");
 
         for i in 0..count {
             let cur = &current_stats[i];
@@ -99,6 +117,9 @@ pub extern "C" fn _start() -> ! {
 
     if !once {
         show_cursor();
+        // Restore initial terminal attributes
+        set_terminal_attributes(fd::STDIN, 0, initial_mode_flags);
+        println("\n");
     }
     exit(0);
 }
