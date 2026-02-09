@@ -334,7 +334,9 @@ pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
         let rx_buffer = tcp::SocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
-        let socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        // Set Nagle's off for better interactive performance
+        socket.set_nagle_enabled(false);
         net.sockets.add(socket)
     })
 }
@@ -377,10 +379,6 @@ impl TcpStream {
     pub fn new(handle: SocketHandle) -> Self {
         Self { handle }
     }
-    
-    pub async fn flush(&mut self) -> Result<(), TcpError> {
-        Ok(())
-    }
 }
 
 impl embedded_io_async::ErrorType for TcpStream {
@@ -422,6 +420,8 @@ impl embedded_io_async::Write for TcpStream {
                         Ok(n) => Poll::Ready(Ok(n)),
                         Err(_) => Poll::Ready(Err(TcpError::WriteError)),
                     }
+                } else if socket.state() == tcp::State::Closed || socket.state() == tcp::State::CloseWait {
+                    Poll::Ready(Err(TcpError::WriteError)) // Broken pipe
                 } else {
                     socket.register_send_waker(cx.waker());
                     Poll::Pending
@@ -431,6 +431,18 @@ impl embedded_io_async::Write for TcpStream {
     }
     
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+        core::future::poll_fn(|cx| {
+            with_network(|net| {
+                let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
+                if socket.send_queue() == 0 {
+                    Poll::Ready(Ok(()))
+                } else if socket.state() == tcp::State::Closed || socket.state() == tcp::State::CloseWait {
+                    Poll::Ready(Err(TcpError::WriteError))
+                } else {
+                    socket.register_send_waker(cx.waker());
+                    Poll::Pending
+                }
+            }).unwrap_or(Poll::Ready(Err(TcpError::WriteError)))
+        }).await
     }
 }

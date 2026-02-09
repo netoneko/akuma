@@ -28,6 +28,7 @@ mod gic;
 mod irq;
 mod mmu;
 mod network;
+mod network_tests;
 mod pmm;
 mod process;
 mod process_tests;
@@ -670,6 +671,11 @@ fn run_async_main() -> ! {
     };
 
     console::print("--- Network Initialization Done ---\n\n");
+
+    // Run network self-tests if enabled
+    if config::RUN_NETWORK_TESTS {
+        network_tests::run_tests();
+    }
 
     // Initialize SSH host key
     ssh::init_host_key();

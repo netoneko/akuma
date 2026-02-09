@@ -155,6 +155,9 @@ pub const MINIMAL_IDLE_LOOP: bool = false;
 /// Use this to isolate whether crashes are caused by network code.
 pub const SKIP_ASYNC_NETWORK: bool = false;
 
+/// Run network self-tests after initialization
+pub const RUN_NETWORK_TESTS: bool = true;
+
 /// Skip filesystem initialization (for debugging crashes)
 ///
 /// When enabled, skips block device and filesystem init.
