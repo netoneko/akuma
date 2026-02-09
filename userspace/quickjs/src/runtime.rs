@@ -490,8 +490,29 @@ pub fn read_file(path: &str) -> Result<String, &'static str> {
 
     close(fd);
 
-    match String::from_utf8(content) {
-        Ok(s) => Ok(s),
-        Err(_) => Err("File is not valid UTF-8"),
+    let s = match String::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return Err("File is not valid UTF-8"),
+    };
+
+    // We want to ignore shebang and associated comments if they are present
+    // at the beginning of the file (lines starting with #)
+    let mut start_index = 0;
+    let bytes = s.as_bytes();
+    while start_index < bytes.len() && bytes[start_index] == b'#' {
+        // Skip until end of line
+        while start_index < bytes.len() && bytes[start_index] != b'\n' {
+            start_index += 1;
+        }
+        // Skip the newline itself
+        if start_index < bytes.len() && bytes[start_index] == b'\n' {
+            start_index += 1;
+        }
+    }
+
+    if start_index > 0 {
+        Ok(String::from(&s[start_index..]))
+    } else {
+        Ok(s)
     }
 }
