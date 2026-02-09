@@ -2,7 +2,7 @@
 //!
 //! Verifies loopback connectivity and basic TCP state transitions.
 
-use crate::smoltcp_net::{self, SocketHandle, with_network};
+use crate::smoltcp_net::{self, with_network};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpAddress;
 use crate::console;
@@ -13,18 +13,15 @@ fn log(msg: &str) {
 
 /// Run a suite of network tests. Panics on failure.
 pub fn run_tests() {
-    log("[NetTest] Starting network self-tests...
-");
+    log("[NetTest] Starting network self-tests...\n");
 
     test_loopback_connection();
 
-    log("[NetTest] All network tests passed!
-");
+    log("[NetTest] All network tests passed!\n");
 }
 
 fn test_loopback_connection() {
-    log("[NetTest] Testing loopback connection (127.0.0.1:9999)...
-");
+    log("[NetTest] Testing loopback connection (127.0.0.1:9999)...\n");
 
     const TEST_PORT: u16 = 9999;
     const TEST_DATA: &[u8] = b"Akuma Network Test";
@@ -40,7 +37,8 @@ fn test_loopback_connection() {
     let client_handle = smoltcp_net::socket_create().expect("Failed to create client socket");
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(client_handle);
-        let cx = net.iface.context();
+        // Use LOOPBACK context for 127.0.0.1
+        let cx = net.loopback_iface.context();
         socket.connect(cx, (IpAddress::v4(127, 0, 0, 1), TEST_PORT), (IpAddress::v4(127, 0, 0, 1), 0))
             .expect("Connect call failed");
     });
@@ -63,13 +61,11 @@ fn test_loopback_connection() {
     if !success {
         let client_state = with_network(|net| net.sockets.get::<tcp::Socket>(client_handle).state());
         let server_state = with_network(|net| net.sockets.get::<tcp::Socket>(listen_handle).state());
-        crate::safe_print!(128, "[NetTest] Connection failed. Client: {:?}, Server: {:?}
-", client_state, server_state);
+        crate::safe_print!(128, "[NetTest] Connection failed. Client: {:?}, Server: {:?}\n", client_state, server_state);
         panic!("Network Test Failed: Loopback connection timeout");
     }
 
-    log("[NetTest] Connection established. Sending data...
-");
+    log("[NetTest] Connection established. Sending data...\n");
 
     // 4. Send Data
     with_network(|net| {
@@ -78,8 +74,7 @@ fn test_loopback_connection() {
     });
 
     // 5. Receive Data
-    let mut received = success; // reuse bool for recv check
-    received = false;
+    let mut received = false;
     let mut buf = [0u8; 64];
     
     for _ in 0..1000 {
@@ -109,13 +104,11 @@ fn test_loopback_connection() {
         panic!("Network Test Failed: Loopback data transfer failed");
     }
 
-    log("[NetTest] Data transfer verified. Closing...
-");
+    log("[NetTest] Data transfer verified. Closing...\n");
 
     // 6. Close
     smoltcp_net::socket_close(client_handle);
     smoltcp_net::socket_close(listen_handle);
 
-    log("[NetTest] Loopback test passed.
-");
+    log("[NetTest] Loopback test passed.\n");
 }

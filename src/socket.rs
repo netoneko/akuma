@@ -3,10 +3,8 @@
 //! Provides socket abstractions for userspace programs via syscalls.
 //! Wraps smoltcp sockets via the thread-safe smoltcp_net module.
 
-use alloc::vec;
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use crate::smoltcp_net::{self, SocketHandle, with_network};
@@ -50,9 +48,6 @@ pub struct SockAddrIn {
 }
 
 impl SockAddrIn {
-    /// Size of the structure
-    pub const SIZE: usize = 16;
-
     /// Convert to SocketAddrV4 (handles byte order conversion)
     pub fn to_addr(&self) -> SocketAddrV4 {
         let ip_bytes = self.sin_addr.to_be_bytes();
@@ -78,12 +73,6 @@ impl SockAddrIn {
 pub mod socket_const {
     pub const AF_INET: i32 = 2;
     pub const SOCK_STREAM: i32 = 1;
-    pub const SOCK_DGRAM: i32 = 2;
-    pub const IPPROTO_TCP: i32 = 6;
-    pub const IPPROTO_UDP: i32 = 17;
-    pub const SHUT_RD: i32 = 0;
-    pub const SHUT_WR: i32 = 1;
-    pub const SHUT_RDWR: i32 = 2;
 }
 
 // ============================================================================
@@ -95,9 +84,7 @@ pub enum SocketType {
     Stream(SocketHandle),
     /// A listening socket (manages a pool of smoltcp handles)
     Listener {
-        local_port: u16,
         handles: VecDeque<SocketHandle>,
-        backlog: usize,
     },
 }
 
@@ -138,7 +125,7 @@ impl KernelSocket {
         }
         
         Some(Self {
-            inner: SocketType::Listener { local_port: port, handles, backlog: actual_backlog },
+            inner: SocketType::Listener { handles },
             bind_port: Some(port),
         })
     }
@@ -188,7 +175,7 @@ pub fn alloc_socket(socket_type: i32) -> Option<usize> {
 pub fn remove_socket(idx: usize) {
     with_table(|table| {
         if idx < table.len() {
-            if let Some(mut sock) = table[idx].take() {
+            if let Some(sock) = table[idx].take() {
                 match sock.inner {
                     SocketType::Stream(h) => smoltcp_net::socket_close(h),
                     SocketType::Listener { handles, .. } => {
@@ -257,7 +244,7 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
         
         let port = table[idx].as_ref().unwrap().bind_port.ok_or(libc_errno::EINVAL)?;
         
-        if let Some(mut sock) = table[idx].take() {
+        if let Some(sock) = table[idx].take() {
             if let SocketType::Stream(h) = sock.inner {
                 smoltcp_net::socket_close(h);
             }
@@ -334,10 +321,17 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
 
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-        let cx = net.iface.context();
+        
+        // Dynamically select context based on destination IP
+        let cx = if addr.ip[0] == 127 {
+            net.loopback_iface.context()
+        } else {
+            net.iface.context()
+        };
+
         socket.connect(cx, 
             (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
-            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from([0;4])), 0)
+            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(if addr.ip[0] == 127 { [127,0,0,1] } else { [0;4] })), 0)
         ).map_err(|_| libc_errno::ECONNREFUSED)
     });
     
@@ -413,26 +407,15 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
 // ============================================================================
 
 pub mod libc_errno {
-    pub const ENOENT: i32 = 2;
     pub const EINTR: i32 = 4;
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
     pub const EAGAIN: i32 = 11;
-    pub const EWOULDBLOCK: i32 = 11;
     pub const ENOMEM: i32 = 12;
-    pub const EFAULT: i32 = 14;
     pub const EINVAL: i32 = 22;
-    pub const ENOTSOCK: i32 = 88;
     pub const ENETDOWN: i32 = 100;
-    pub const EISCONN: i32 = 106;
-    pub const ENOTCONN: i32 = 107;
     pub const ETIMEDOUT: i32 = 110;
     pub const ECONNREFUSED: i32 = 111;
-    pub const EHOSTUNREACH: i32 = 113;
-    pub const EOPNOTSUPP: i32 = 95;
-    pub const ECHILD: i32 = 10;
-    pub const ESRCH: i32 = 3;
     pub const ECONNABORTED: i32 = 103;
     pub const EPIPE: i32 = 32;
-    pub const ENOTDIR: i32 = 20;
 }
