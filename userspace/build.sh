@@ -20,6 +20,7 @@ MEMBERS=(
     "wget"
     "termtest"
     "allocstress"
+    "top"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -47,6 +48,7 @@ BINARIES=(
     "chainlink"
     "termtest"
     "allocstress"
+    "top"
 )
 
 for bin in "${BINARIES[@]}"; do

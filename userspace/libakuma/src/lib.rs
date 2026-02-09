@@ -51,6 +51,19 @@ pub mod syscall {
     pub const SHOW_CURSOR: u64 = 311;
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
+    pub const GET_CPU_STATS: u64 = 314;
+}
+
+/// Thread CPU statistics for top command
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadCpuStat {
+    pub tid: u32,
+    pub pid: u32,
+    pub total_time_us: u64,
+    pub state: u8,
+    pub _reserved: [u8; 3],
+    pub name: [u8; 16],
 }
 
 /// File descriptors
@@ -1196,6 +1209,18 @@ pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
     } else {
         ret as isize // Return bytes read
     }
+}
+
+/// Get CPU statistics for all threads.
+/// 
+/// Populates the provided slice with statistics. Returns the number of threads.
+pub fn get_cpu_stats(stats: &mut [ThreadCpuStat]) -> usize {
+    syscall(
+        syscall::GET_CPU_STATS,
+        stats.as_mut_ptr() as u64,
+        stats.len() as u64,
+        0, 0, 0, 0,
+    ) as usize
 }
 
 /// Directory entry from getdents64

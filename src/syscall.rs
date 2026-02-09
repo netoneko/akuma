@@ -46,6 +46,19 @@ pub mod nr {
     pub const SHOW_CURSOR: u64 = 311;
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
+    pub const GET_CPU_STATS: u64 = 314;
+}
+
+/// Thread CPU statistics for top command
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadCpuStat {
+    pub tid: u32,
+    pub pid: u32,
+    pub total_time_us: u64,
+    pub state: u8,
+    pub _reserved: [u8; 3],
+    pub name: [u8; 16],
 }
 
 /// Error code for interrupted syscall
@@ -121,6 +134,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHOW_CURSOR => sys_show_cursor(),
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1], args[2]),
+        nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
         _ => {
             if config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
@@ -928,14 +942,9 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
         let result = socket::with_socket_handle(socket_idx, |socket| {
             use core::future::Future;
             use core::pin::Pin;
-            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            use core::task::{Context, Poll};
 
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(
-                |_| RawWaker::new(core::ptr::null(), &VTABLE),
-                |_| {}, |_| {}, |_| {},
-            );
-
-            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let waker = crate::threading::current_thread_waker();
             let mut cx = Context::from_waker(&waker);
 
             let mut write_future = socket.write(&kernel_buf[..chunk_size]);
@@ -1003,8 +1012,9 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
                         (-libc_errno::ETIMEDOUT as i64) as u64
                     };
                 }
-                crate::threading::yield_now();
-                for _ in 0..100 { core::hint::spin_loop(); }
+                
+                // Block until woken
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
             Ok(Err(e)) | Err(e) => {
                 socket::socket_dec_ref(socket_idx);
@@ -1058,14 +1068,9 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
         let result = socket::with_socket_handle(socket_idx, |socket| {
             use core::future::Future;
             use core::pin::Pin;
-            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            use core::task::{Context, Poll};
 
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(
-                |_| RawWaker::new(core::ptr::null(), &VTABLE),
-                |_| {}, |_| {}, |_| {},
-            );
-
-            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let waker = crate::threading::current_thread_waker();
             let mut cx = Context::from_waker(&waker);
 
             let mut read_future = socket.read(&mut kernel_buf[..read_len]);
@@ -1102,8 +1107,9 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
                     socket::socket_dec_ref(socket_idx);
                     return (-libc_errno::EAGAIN as i64) as u64;
                 }
-                crate::threading::yield_now();
-                for _ in 0..100 { core::hint::spin_loop(); }
+                
+                // Block until woken
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
             Ok(Err(e)) | Err(e) => {
                 socket::socket_dec_ref(socket_idx);
@@ -1553,13 +1559,8 @@ where
     // Pin the future on the stack
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
 
-    // Create a no-op waker (we poll manually)
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    // Use current thread waker
+    let waker = crate::threading::current_thread_waker();
 
     let mut iterations = 0;
     const MAX_ITERATIONS: usize = 100_000; // ~100 seconds with 1ms yield
@@ -1570,14 +1571,9 @@ where
             return Err(libc_errno::EINTR);
         }
 
-        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
         // CRITICAL: Disable preemption during poll
-        // Embassy-net uses RefCell internally which panics on re-entrant borrow.
-        // If we get preempted while holding a RefCell borrow, another thread
-        // might try to borrow it too.
         crate::threading::disable_preemption();
         let poll_result = future.as_mut().poll(&mut cx);
         crate::threading::enable_preemption();
@@ -1594,14 +1590,10 @@ where
                     return Err(libc_errno::ETIMEDOUT);
                 }
 
-                // Yield to scheduler - this allows thread 0 to poll the network runner
-                // which processes actual network I/O
-                crate::threading::yield_now();
-
-                // Small spin delay to reduce scheduler overhead
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
+                // Block until woken by embassy (or timer)
+                // Use a far deadline (1 second) to ensure we don't hang forever
+                // if something goes wrong with waking, but short enough to be responsive.
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
         }
     }
@@ -1621,12 +1613,8 @@ where
 {
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
 
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    // Use current thread waker
+    let waker = crate::threading::current_thread_waker();
 
     let mut iterations = 0;
     const MAX_ITERATIONS: usize = 100_000;
@@ -1636,8 +1624,6 @@ where
             return Err(libc_errno::EINTR);
         }
 
-        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
         crate::threading::disable_preemption();
@@ -1651,10 +1637,9 @@ where
                 if iterations >= MAX_ITERATIONS {
                     return Err(libc_errno::ETIMEDOUT);
                 }
-                crate::threading::yield_now();
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
+                
+                // Block until woken
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
         }
     }
@@ -1684,12 +1669,8 @@ fn block_on_accept(
     use core::cell::UnsafeCell;
     use embassy_net::tcp::TcpSocket;
 
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    // Use current thread waker
+    let waker = crate::threading::current_thread_waker();
 
     // Create socket DIRECTLY IN A BOX to avoid any moves after creation
     // TcpSocket registers itself with smoltcp's internal state during accept,
@@ -1730,7 +1711,6 @@ fn block_on_accept(
             return Err(libc_errno::EINTR);
         }
 
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
         let mut cx = Context::from_waker(&waker);
 
         // Poll with preemption disabled
@@ -1785,10 +1765,9 @@ fn block_on_accept(
                     drop(socket_boxed);
                     return Err(libc_errno::ETIMEDOUT);
                 }
-                crate::threading::yield_now();
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
+                
+                // Block until woken
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
         }
     }
@@ -1804,12 +1783,8 @@ fn block_on_connect(
     use core::cell::UnsafeCell;
     use embassy_net::tcp::TcpSocket;
 
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    // Use current thread waker
+    let waker = crate::threading::current_thread_waker();
 
     // Create socket with preemption disabled
     crate::threading::disable_preemption();
@@ -1839,7 +1814,6 @@ fn block_on_connect(
             return Err(libc_errno::EINTR);
         }
 
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
         let mut cx = Context::from_waker(&waker);
 
         crate::threading::disable_preemption();
@@ -1875,10 +1849,9 @@ fn block_on_connect(
                     drop(socket);
                     return Err(libc_errno::ETIMEDOUT);
                 }
-                crate::threading::yield_now();
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
+                
+                // Block until woken
+                crate::threading::schedule_blocking(crate::timer::uptime_us() + 1_000_000);
             }
         }
     }
@@ -2433,4 +2406,64 @@ fn sys_chdir(path_ptr: u64, path_len: usize) -> u64 {
     }
 
     0
+}
+
+/// sys_get_cpu_stats - Get CPU consumption for all threads
+/// 
+/// # Arguments
+/// * `buf_ptr` - Pointer to array of ThreadCpuStat
+/// * `max_count` - Maximum number of threads to return
+/// 
+/// # Returns
+/// Number of threads returned
+fn sys_get_cpu_stats(buf_ptr: u64, max_count: usize) -> u64 {
+    if buf_ptr == 0 || max_count == 0 {
+        return 0;
+    }
+
+    let count = core::cmp::min(max_count, config::MAX_THREADS);
+    let stats_ptr = buf_ptr as *mut ThreadCpuStat;
+
+    for i in 0..count {
+        let state = crate::threading::get_thread_state(i);
+        if state == crate::threading::thread_state::FREE {
+            unsafe {
+                core::ptr::write_volatile(stats_ptr.add(i), ThreadCpuStat::default());
+            }
+            continue;
+        }
+
+        let mut stat = ThreadCpuStat {
+            tid: i as u32,
+            pid: 0,
+            total_time_us: crate::threading::get_thread_cpu_time(i),
+            state,
+            _reserved: [0; 3],
+            name: [0; 16],
+        };
+
+        // Try to find associated process
+        if let Some(pid) = crate::process::find_pid_by_thread(i) {
+            stat.pid = pid;
+            if let Some(proc) = crate::process::lookup_process(pid) {
+                let name_bytes = proc.name.as_bytes();
+                let len = core::cmp::min(name_bytes.len(), 16);
+                stat.name[..len].copy_from_slice(&name_bytes[..len]);
+            }
+        } else if i == 0 {
+            let name = b"idle/network";
+            let len = core::cmp::min(name.len(), 16);
+            stat.name[..len].copy_from_slice(&name[..len]);
+        } else {
+            let name = b"kernel";
+            let len = core::cmp::min(name.len(), 16);
+            stat.name[..len].copy_from_slice(&name[..len]);
+        }
+
+        unsafe {
+            core::ptr::write_volatile(stats_ptr.add(i), stat);
+        }
+    }
+
+    count as u64
 }

@@ -17,7 +17,8 @@ members = [
     "stdcheck",
     "wget",
     "termtest",
-    "allocstress"
+    "allocstress",
+    "top"
 ]
 
 [profile.dev]
