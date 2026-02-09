@@ -13,8 +13,8 @@ use super::Command;
 
 // Re-export static command instances
 pub use builtin::{
-    AKUMA_CMD, CD_CMD, ECHO_CMD, FREE_CMD, GREP_CMD, HELP_CMD, KILL_CMD, KTHREADS_CMD,
-    PMM_CMD, PS_CMD, PWD_CMD, STATS_CMD, UPTIME_CMD,
+    AKUMA_CMD, CD_CMD, CLEAR_CMD, ECHO_CMD, FREE_CMD, GREP_CMD, HELP_CMD, KILL_CMD, KTHREADS_CMD,
+    PMM_CMD, PS_CMD, PWD_CMD, RESET_CMD, STATS_CMD, UPTIME_CMD,
 };
 pub use exec::EXEC_CMD;
 pub use fs::{APPEND_CMD, CAT_CMD, DF_CMD, LS_CMD, MKDIR_CMD, MOUNT_CMD, MV_CMD, RM_CMD, WRITE_CMD};
@@ -87,6 +87,8 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&CD_CMD);
     registry.register(&UPTIME_CMD);
     registry.register(&PMM_CMD);
+    registry.register(&CLEAR_CMD);
+    registry.register(&RESET_CMD);
 
     // Filesystem commands
     registry.register(&LS_CMD);
