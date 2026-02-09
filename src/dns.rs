@@ -11,7 +11,7 @@ use smoltcp::wire::{IpAddress, Ipv4Address};
 // ============================================================================
 
 /// Loopback IP address
-pub const LOOPBACK_IP: Ipv4Address = Ipv4Address([127, 0, 0, 1]);
+pub const LOOPBACK_IP: Ipv4Address = Ipv4Address::new(127, 0, 0, 1);
 
 // ============================================================================
 // Error Types

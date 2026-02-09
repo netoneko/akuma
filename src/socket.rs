@@ -3,6 +3,7 @@
 //! Provides socket abstractions for userspace programs via syscalls.
 //! Wraps smoltcp sockets via the thread-safe smoltcp_net module.
 
+use alloc::vec;
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +17,10 @@ use smoltcp::socket::tcp;
 // ============================================================================
 
 /// Maximum number of concurrent sockets (FDs)
-pub const MAX_SOCKETS: usize = 64;
+pub const MAX_SOCKETS: usize = 128;
+
+/// Maximum number of sockets to pre-allocate for a listener's backlog
+const MAX_BACKLOG: usize = 8;
 
 // ============================================================================
 // Socket Address Types
@@ -116,8 +120,10 @@ impl KernelSocket {
     }
 
     pub fn new_listener(port: u16, backlog: usize) -> Option<Self> {
+        let actual_backlog = backlog.min(MAX_BACKLOG);
         let mut handles = VecDeque::new();
-        for _ in 0..backlog {
+        
+        for _ in 0..actual_backlog {
             if let Some(handle) = smoltcp_net::socket_create() {
                 with_network(|net| {
                     let socket = net.sockets.get_mut::<tcp::Socket>(handle);
@@ -127,8 +133,12 @@ impl KernelSocket {
             }
         }
         
+        if handles.is_empty() {
+            return None;
+        }
+        
         Some(Self {
-            inner: SocketType::Listener { local_port: port, handles, backlog },
+            inner: SocketType::Listener { local_port: port, handles, backlog: actual_backlog },
             bind_port: Some(port),
         })
     }
@@ -287,15 +297,15 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
                 let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
                 if state == Some(tcp::State::Established) {
                     let h = handles.remove(i).unwrap();
-                    let local_port = with_network(|net| net.sockets.get::<tcp::Socket>(h).local_endpoint().map(|ep| ep.port).unwrap_or(0));
+                    let local_port = with_network(|net| net.sockets.get::<tcp::Socket>(h).local_endpoint().map(|ep| ep.port));
                     if let Some(new_h) = smoltcp_net::socket_create() {
-                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(local_port.unwrap_or(0)); });
+                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(local_port.unwrap_or(Some(0)).unwrap_or(0)); });
                         handles.push_back(new_h);
                     }
                     let remote = with_network(|net| {
                         let socket = net.sockets.get::<tcp::Socket>(h);
                         socket.remote_endpoint().map(|ep| SocketAddrV4 { 
-                            ip: if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr { addr.0 } else { [0;4] },
+                            ip: if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr { addr.octets() } else { [0;4] },
                             port: ep.port 
                         })
                     }).unwrap_or(None).unwrap_or(SocketAddrV4::new([0;4], 0));
@@ -326,8 +336,8 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         let cx = net.iface.context();
         socket.connect(cx, 
-            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address(addr.ip)), addr.port),
-            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address([0;4])), 0)
+            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
+            (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from([0;4])), 0)
         ).map_err(|_| libc_errno::ECONNREFUSED)
     });
     

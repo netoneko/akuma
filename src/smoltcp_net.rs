@@ -4,15 +4,14 @@
 //! This allows any thread (kernel or userspace via syscall) to drive the network stack,
 //! eliminating the need for a dedicated network thread and complex preemption management.
 
-use alloc::boxed::Box;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
 use smoltcp::phy::{Device, Medium, Loopback};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, dhcpv4};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -26,7 +25,7 @@ use crate::virtio_hal::VirtioHal;
 // Constants
 // ============================================================================
 
-const MAX_SOCKETS: usize = 32;
+const MAX_SOCKETS: usize = 128;
 const TCP_RX_BUFFER_SIZE: usize = 65535;
 const TCP_TX_BUFFER_SIZE: usize = 65535;
 
@@ -59,6 +58,7 @@ pub struct NetworkState {
     pub sockets: SocketSet<'static>,
     pub device: VirtioSmoltcpDevice,
     pub loopback_device: Loopback,
+    pub dhcp_handle: Option<SocketHandle>,
 }
 
 /// Global network stack protected by a Spinlock.
@@ -96,13 +96,11 @@ impl Device for VirtioSmoltcpDevice {
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Use poll_receive to check if a packet is available
         if self.inner.poll_receive().is_some() {
             match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
                 Ok(token) => {
                     match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
                         Ok((_hdr_len, pkt_len)) => {
-                            // SAFETY: pkt_len is validated by receive_complete
                             let rx = VirtioRxToken {
                                 buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr(), pkt_len) },
                             };
@@ -122,7 +120,6 @@ impl Device for VirtioSmoltcpDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        // Assume we can always send for now (virtio queue management is handled by inner)
         Some(VirtioTxToken {
             inner: unsafe { &mut *(&mut self.inner as *mut _) },
             buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
@@ -143,7 +140,7 @@ pub struct VirtioRxToken<'a> {
 impl<'a> smoltcp::phy::RxToken for VirtioRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         f(self.buffer)
     }
@@ -212,11 +209,8 @@ pub fn init() -> Result<(), &'static str> {
     config.random_seed = crate::timer::uptime_us();
     
     let mut iface = Interface::new(config, &mut device, timestamp);
-    iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-    });
-    iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address([10, 0, 2, 2])).unwrap();
 
+    // Initialize Loopback Interface
     let mut loopback_device = Loopback::new(Medium::Ethernet);
     let mut loopback_config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0; 6])));
     loopback_config.random_seed = crate::timer::uptime_us() ^ 0xCAFEBABE;
@@ -226,7 +220,11 @@ pub fn init() -> Result<(), &'static str> {
         ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
     });
 
-    let sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
+    let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
+
+    // Initialize DHCP
+    let dhcp_socket = dhcpv4::Socket::new();
+    let dhcp_handle = sockets.add(dhcp_socket);
 
     *NETWORK.lock() = Some(NetworkState {
         iface,
@@ -234,10 +232,11 @@ pub fn init() -> Result<(), &'static str> {
         sockets,
         device,
         loopback_device,
+        dhcp_handle: Some(dhcp_handle),
     });
 
     NETWORK_READY.store(true, Ordering::Release);
-    log("[SmolNet] Initialized successfully (VirtIO + Loopback)\n");
+    log("[SmolNet] Initialized successfully (DHCP started)\n");
     Ok(())
 }
 
@@ -252,11 +251,42 @@ pub fn poll() -> bool {
         let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         let p2 = net.loopback_iface.poll(timestamp, &mut net.loopback_device, &mut net.sockets);
         
-        let progress = p1 || p2;
-        if progress {
-            POLL_COUNT.fetch_add(1, Ordering::Release);
+        // Handle DHCP
+        if let Some(handle) = net.dhcp_handle {
+            let event = net.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
+            if let Some(event) = event {
+                match event {
+                    dhcpv4::Event::Configured(config) => {
+                        log("[SmolNet] DHCP configured\n");
+                        net.iface.update_ip_addrs(|addrs| {
+                            addrs.clear();
+                            addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                        });
+                        if let Some(router) = config.router {
+                            net.iface.routes_mut().add_default_ipv4_route(router).unwrap();
+                        }
+                        
+                        log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
+                    }
+                    dhcpv4::Event::Deconfigured => {
+                        log("[SmolNet] DHCP deconfigured\n");
+                        net.iface.update_ip_addrs(|addrs| {
+                            addrs.clear();
+                        });
+                        net.iface.routes_mut().remove_default_ipv4_route();
+                    }
+                }
+            }
         }
-        progress
+
+        if matches!(p1, PollResult::SocketStateChanged) || matches!(p2, PollResult::SocketStateChanged) {
+            POLL_COUNT.fetch_add(1, Ordering::Release);
+            return true;
+        }
+        // Even if no socket state changed, some packets might have been processed or emitted.
+        // For simplicity, we increment poll count if anything happened.
+        // Actually, in 0.12 poll returns SocketStateChanged if anything happened that sockets should care about.
+        false
     } else {
         false
     }
@@ -331,7 +361,7 @@ impl embedded_io_async::ErrorType for TcpStream {
 
 impl embedded_io_async::Read for TcpStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        core::future::poll_fn(|_cx| {
+        core::future::poll_fn(|cx| {
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_recv() {
@@ -344,6 +374,7 @@ impl embedded_io_async::Read for TcpStream {
                         Err(_) => Poll::Ready(Err(TcpError::ReadError)),
                     }
                 } else {
+                    socket.register_recv_waker(cx.waker());
                     Poll::Pending
                 }
             }).unwrap_or(Poll::Ready(Err(TcpError::ReadError)))
@@ -353,7 +384,7 @@ impl embedded_io_async::Read for TcpStream {
 
 impl embedded_io_async::Write for TcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        core::future::poll_fn(|_cx| {
+        core::future::poll_fn(|cx| {
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_send() {
@@ -362,6 +393,7 @@ impl embedded_io_async::Write for TcpStream {
                         Err(_) => Poll::Ready(Err(TcpError::WriteError)),
                     }
                 } else {
+                    socket.register_send_waker(cx.waker());
                     Poll::Pending
                 }
             }).unwrap_or(Poll::Ready(Err(TcpError::WriteError)))
