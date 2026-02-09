@@ -5,6 +5,7 @@
 //! eliminating the need for a dedicated network thread and complex preemption management.
 
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
@@ -59,6 +60,8 @@ pub struct NetworkState {
     pub device: VirtioSmoltcpDevice,
     pub loopback_device: Loopback,
     pub dhcp_handle: Option<SocketHandle>,
+    /// Sockets that have been closed by the user but are waiting for the stack to finish
+    pub pending_removal: Vec<SocketHandle>,
 }
 
 /// Global network stack protected by a Spinlock.
@@ -209,6 +212,12 @@ pub fn init() -> Result<(), &'static str> {
     config.random_seed = crate::timer::uptime_us();
     
     let mut iface = Interface::new(config, &mut device, timestamp);
+    
+    // Set static IP fallback (standard QEMU user networking)
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+    });
+    iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
 
     // Initialize Loopback Interface
     let mut loopback_device = Loopback::new(Medium::Ethernet);
@@ -233,10 +242,11 @@ pub fn init() -> Result<(), &'static str> {
         device,
         loopback_device,
         dhcp_handle: Some(dhcp_handle),
+        pending_removal: Vec::new(),
     });
 
     NETWORK_READY.store(true, Ordering::Release);
-    log("[SmolNet] Initialized successfully (DHCP started)\n");
+    log("[SmolNet] Initialized successfully (Static IP 10.0.2.15 + DHCP started)\n");
     Ok(())
 }
 
@@ -269,13 +279,32 @@ pub fn poll() -> bool {
                         log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
                     }
                     dhcpv4::Event::Deconfigured => {
-                        log("[SmolNet] DHCP deconfigured\n");
+                        log("[SmolNet] DHCP deconfigured - reverting to static fallback\n");
                         net.iface.update_ip_addrs(|addrs| {
                             addrs.clear();
+                            addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
                         });
-                        net.iface.routes_mut().remove_default_ipv4_route();
+                        net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
                     }
                 }
+            }
+        }
+
+        // Garbage collect pending removals
+        let mut i = 0;
+        while i < net.pending_removal.len() {
+            let handle = net.pending_removal[i];
+            let should_remove = match net.sockets.get::<tcp::Socket>(handle).state() {
+                tcp::State::Closed => true,
+                _ => false,
+            };
+            
+            if should_remove {
+                net.sockets.remove(handle);
+                net.pending_removal.swap_remove(i);
+                // Don't increment i
+            } else {
+                i += 1;
             }
         }
 
@@ -283,9 +312,6 @@ pub fn poll() -> bool {
             POLL_COUNT.fetch_add(1, Ordering::Release);
             return true;
         }
-        // Even if no socket state changed, some packets might have been processed or emitted.
-        // For simplicity, we increment poll count if anything happened.
-        // Actually, in 0.12 poll returns SocketStateChanged if anything happened that sockets should care about.
         false
     } else {
         false
@@ -315,7 +341,9 @@ pub fn socket_create() -> Option<SocketHandle> {
 
 pub fn socket_close(handle: SocketHandle) {
     with_network(|net| {
-        net.sockets.remove(handle);
+        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
+        socket.close();
+        net.pending_removal.push(handle);
     });
 }
 
@@ -373,6 +401,8 @@ impl embedded_io_async::Read for TcpStream {
                         Ok(n) => Poll::Ready(Ok(n)),
                         Err(_) => Poll::Ready(Err(TcpError::ReadError)),
                     }
+                } else if socket.state() == tcp::State::Closed || socket.state() == tcp::State::CloseWait {
+                    Poll::Ready(Ok(0)) // EOF
                 } else {
                     socket.register_recv_waker(cx.waker());
                     Poll::Pending
