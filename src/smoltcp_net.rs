@@ -77,6 +77,11 @@ pub struct VirtioSmoltcpDevice {
     inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
     rx_buffer: [u8; 2048],
     tx_buffer: [u8; 2048],
+    /// Token for a pending VirtIO receive buffer that has been submitted to the device.
+    /// VirtIO requires buffers to be posted via receive_begin() before the device can
+    /// DMA received packets into them. We track the token so we can call receive_complete()
+    /// once poll_receive() indicates the device has filled the buffer.
+    rx_token: Option<u16>,
 }
 
 impl VirtioSmoltcpDevice {
@@ -85,6 +90,7 @@ impl VirtioSmoltcpDevice {
             inner,
             rx_buffer: [0u8; 2048],
             tx_buffer: [0u8; 2048],
+            rx_token: None,
         }
     }
 
@@ -98,22 +104,29 @@ impl Device for VirtioSmoltcpDevice {
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.inner.poll_receive().is_some() {
+        // Phase 1: Ensure a receive buffer is posted to the device.
+        // VirtIO requires the driver to submit buffers in advance; the device
+        // DMAs received packets into them.
+        if self.rx_token.is_none() {
             match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
-                Ok(token) => {
-                    match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
-                        Ok((hdr_len, pkt_len)) => {
-                            let rx = VirtioRxToken {
-                                buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
-                            };
-                            let tx = VirtioTxToken {
-                                inner: unsafe { &mut *(&mut self.inner as *mut _) },
-                                buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
-                            };
-                            return Some((rx, tx));
-                        }
-                        Err(_) => return None,
-                    }
+                Ok(token) => self.rx_token = Some(token),
+                Err(_) => return None,
+            }
+        }
+
+        // Phase 2: Check if the device has completed the receive (filled our buffer).
+        if self.inner.poll_receive().is_some() {
+            let token = self.rx_token.take().unwrap();
+            match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
+                Ok((hdr_len, pkt_len)) => {
+                    let rx = VirtioRxToken {
+                        buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
+                    };
+                    let tx = VirtioTxToken {
+                        inner: unsafe { &mut *(&mut self.inner as *mut _) },
+                        buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
+                    };
+                    return Some((rx, tx));
                 }
                 Err(_) => return None,
             }
@@ -228,38 +241,43 @@ impl Device for LoopbackAwareDevice {
             return Some((rx, tx));
         }
 
-        // Fall back to VirtIO
-        if self.virtio.inner.poll_receive().is_some() {
+        // Fall back to VirtIO: two-phase receive pattern
+        // Phase 1: Ensure a receive buffer is posted to the device
+        if self.virtio.rx_token.is_none() {
             match unsafe { self.virtio.inner.receive_begin(&mut self.virtio.rx_buffer) } {
-                Ok(token) => {
-                    match unsafe {
-                        self.virtio
-                            .inner
-                            .receive_complete(token, &mut self.virtio.rx_buffer)
-                    } {
-                        Ok((hdr_len, pkt_len)) => {
-                            let rx = LoopbackAwareRxToken::Virtio(unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    self.virtio.rx_buffer.as_mut_ptr().add(hdr_len),
-                                    pkt_len,
-                                )
-                            });
-                            let tx = LoopbackAwareTxToken {
-                                virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
-                                virtio_buffer: unsafe {
-                                    core::slice::from_raw_parts_mut(
-                                        self.virtio.tx_buffer.as_mut_ptr(),
-                                        2048,
-                                    )
-                                },
-                                loopback_queue: unsafe {
-                                    &mut *(&mut self.loopback_queue as *mut _)
-                                },
-                            };
-                            return Some((rx, tx));
-                        }
-                        Err(_) => return None,
-                    }
+                Ok(token) => self.virtio.rx_token = Some(token),
+                Err(_) => return None,
+            }
+        }
+
+        // Phase 2: Check if the device has completed the receive
+        if self.virtio.inner.poll_receive().is_some() {
+            let token = self.virtio.rx_token.take().unwrap();
+            match unsafe {
+                self.virtio
+                    .inner
+                    .receive_complete(token, &mut self.virtio.rx_buffer)
+            } {
+                Ok((hdr_len, pkt_len)) => {
+                    let rx = LoopbackAwareRxToken::Virtio(unsafe {
+                        core::slice::from_raw_parts_mut(
+                            self.virtio.rx_buffer.as_mut_ptr().add(hdr_len),
+                            pkt_len,
+                        )
+                    });
+                    let tx = LoopbackAwareTxToken {
+                        virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
+                        virtio_buffer: unsafe {
+                            core::slice::from_raw_parts_mut(
+                                self.virtio.tx_buffer.as_mut_ptr(),
+                                2048,
+                            )
+                        },
+                        loopback_queue: unsafe {
+                            &mut *(&mut self.loopback_queue as *mut _)
+                        },
+                    };
+                    return Some((rx, tx));
                 }
                 Err(_) => return None,
             }
