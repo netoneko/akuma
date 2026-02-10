@@ -11,7 +11,7 @@ use spinning_top::Spinlock;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
-use smoltcp::phy::{Device, Medium, Loopback};
+use smoltcp::phy::Device;
 use smoltcp::socket::{tcp, dhcpv4};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
@@ -55,10 +55,8 @@ pub fn poll_count() -> usize {
 
 pub struct NetworkState {
     pub iface: Interface,
-    pub loopback_iface: Interface,
     pub sockets: SocketSet<'static>,
     pub device: VirtioSmoltcpDevice,
-    pub loopback_device: Loopback,
     pub dhcp_handle: Option<SocketHandle>,
     /// Sockets that have been closed by the user but are waiting for the stack to finish
     pub pending_removal: Vec<SocketHandle>,
@@ -170,7 +168,7 @@ impl<'a> smoltcp::phy::TxToken for VirtioTxToken<'a> {
 // ============================================================================
 
 pub fn init() -> Result<(), &'static str> {
-    log("[SmolNet] Initializing network stack...\n");
+    log("[SmolNet] Initializing network stack (Single Interface)...\n");
 
     let mut found_device: Option<VirtIONetRaw<VirtioHal, MmioTransport, 16>> = None;
 
@@ -213,21 +211,14 @@ pub fn init() -> Result<(), &'static str> {
     
     let mut iface = Interface::new(config, &mut device, timestamp);
     
-    // Set static IP fallback (standard QEMU user networking)
+    // Set BOTH local and external addresses on the same interface
     iface.update_ip_addrs(|ip_addrs| {
+        // Loopback (RFC 1122)
+        ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+        // Static IP fallback (standard QEMU user networking)
         ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
     });
     iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
-
-    // Initialize Loopback Interface
-    let mut loopback_device = Loopback::new(Medium::Ethernet);
-    let mut loopback_config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0; 6])));
-    loopback_config.random_seed = crate::timer::uptime_us() ^ 0xCAFEBABE;
-    
-    let mut loopback_iface = Interface::new(loopback_config, &mut loopback_device, timestamp);
-    loopback_iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
-    });
 
     let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
 
@@ -237,16 +228,14 @@ pub fn init() -> Result<(), &'static str> {
 
     *NETWORK.lock() = Some(NetworkState {
         iface,
-        loopback_iface,
         sockets,
         device,
-        loopback_device,
         dhcp_handle: Some(dhcp_handle),
         pending_removal: Vec::new(),
     });
 
     NETWORK_READY.store(true, Ordering::Release);
-    log("[SmolNet] Initialized successfully (Static IP 10.0.2.15 + DHCP started)\n");
+    log("[SmolNet] Initialized successfully (Loopback + Static 10.0.2.15 + DHCP)\n");
     Ok(())
 }
 
@@ -258,8 +247,7 @@ pub fn poll() -> bool {
     if let Some(net) = NETWORK.lock().as_mut() {
         let timestamp = Instant::from_micros(crate::timer::uptime_us() as i64);
         
-        let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
-        let p2 = net.loopback_iface.poll(timestamp, &mut net.loopback_device, &mut net.sockets);
+        let p = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         
         // Handle DHCP
         if let Some(handle) = net.dhcp_handle {
@@ -269,11 +257,17 @@ pub fn poll() -> bool {
                     dhcpv4::Event::Configured(config) => {
                         log("[SmolNet] DHCP configured\n");
                         net.iface.update_ip_addrs(|addrs| {
-                            addrs.clear();
+                            // Clear all but keep 127.0.0.1
+                            addrs.retain(|cidr| {
+                                match cidr.address() {
+                                    IpAddress::Ipv4(addr) => addr.is_loopback(),
+                                    _ => false
+                                }
+                            });
                             addrs.push(IpCidr::Ipv4(config.address)).unwrap();
                         });
                         if let Some(router) = config.router {
-                            net.iface.routes_mut().add_default_ipv4_route(router).unwrap();
+                            let _ = net.iface.routes_mut().add_default_ipv4_route(router);
                         }
                         
                         log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
@@ -281,10 +275,15 @@ pub fn poll() -> bool {
                     dhcpv4::Event::Deconfigured => {
                         log("[SmolNet] DHCP deconfigured - reverting to static fallback\n");
                         net.iface.update_ip_addrs(|addrs| {
-                            addrs.clear();
+                            addrs.retain(|cidr| {
+                                match cidr.address() {
+                                    IpAddress::Ipv4(addr) => addr.is_loopback(),
+                                    _ => false
+                                }
+                            });
                             addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
                         });
-                        net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+                        let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
                     }
                 }
             }
@@ -302,13 +301,12 @@ pub fn poll() -> bool {
             if should_remove {
                 net.sockets.remove(handle);
                 net.pending_removal.swap_remove(i);
-                // Don't increment i
             } else {
                 i += 1;
             }
         }
 
-        if matches!(p1, PollResult::SocketStateChanged) || matches!(p2, PollResult::SocketStateChanged) {
+        if matches!(p, PollResult::SocketStateChanged) {
             POLL_COUNT.fetch_add(1, Ordering::Release);
             return true;
         }
@@ -335,7 +333,6 @@ pub fn socket_create() -> Option<SocketHandle> {
         let rx_buffer = tcp::SocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-        // Set Nagle's off for better interactive performance
         socket.set_nagle_enabled(false);
         net.sockets.add(socket)
     })

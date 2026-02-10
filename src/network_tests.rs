@@ -24,6 +24,7 @@ fn test_loopback_connection() {
     log("[NetTest] Testing loopback connection (127.0.0.1:9999)...\n");
 
     const TEST_PORT: u16 = 9999;
+    const LOCAL_PORT: u16 = 40000;
     const TEST_DATA: &[u8] = b"Akuma Network Test";
 
     // 1. Create Listener
@@ -37,9 +38,9 @@ fn test_loopback_connection() {
     let client_handle = smoltcp_net::socket_create().expect("Failed to create client socket");
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(client_handle);
-        // Use LOOPBACK context for 127.0.0.1
-        let cx = net.loopback_iface.context();
-        socket.connect(cx, (IpAddress::v4(127, 0, 0, 1), TEST_PORT), (IpAddress::v4(127, 0, 0, 1), 0))
+        let cx = net.iface.context();
+        // Use a valid local port (non-zero)
+        socket.connect(cx, (IpAddress::v4(127, 0, 0, 1), TEST_PORT), LOCAL_PORT)
             .expect("Connect call failed");
     });
 
