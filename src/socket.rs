@@ -362,12 +362,8 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(h);
         
-        // Dynamically select context based on destination IP
-        let cx = if addr.ip[0] == 127 {
-            net.loopback_iface.context()
-        } else {
-            net.iface.context()
-        };
+        // Single-interface model: loopback is handled by the main interface
+        let cx = net.iface.context();
 
         socket.connect(cx, 
             (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
