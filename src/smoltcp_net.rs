@@ -178,11 +178,40 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
         return false;
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    match ethertype {
-        0x0806 => frame.len() >= 42 && frame[38] == 127, // ARP target IP
-        0x0800 => frame.len() >= 34 && frame[30] == 127, // IPv4 dest IP
+    let result = match ethertype {
+        0x0806 => {
+            // ARP: check both sender (bytes 28-31) and target (bytes 38-41) protocol addresses
+            if frame.len() >= 42 {
+                let op = u16::from_be_bytes([frame[20], frame[21]]);
+                crate::safe_print!(128, "[LoDev] ARP op={}, sender={}.{}.{}.{}, target={}.{}.{}.{}\n",
+                    op,
+                    frame[28], frame[29], frame[30], frame[31],
+                    frame[38], frame[39], frame[40], frame[41]);
+                // Match if EITHER sender or target IP is 127.x.x.x
+                frame[28] == 127 || frame[38] == 127
+            } else {
+                false
+            }
+        }
+        0x0800 => {
+            // IPv4: source IP at bytes [26:30], dest IP at bytes [30:34]
+            // Any packet involving a loopback address must stay local
+            if frame.len() >= 34 {
+                let src_lo = frame[26] == 127;
+                let dst_lo = frame[30] == 127;
+                crate::safe_print!(128, "[LoDev] IPv4 src={}.{}.{}.{}, dst={}.{}.{}.{}\n",
+                    frame[26], frame[27], frame[28], frame[29],
+                    frame[30], frame[31], frame[32], frame[33]);
+                src_lo || dst_lo
+            } else {
+                false
+            }
+        }
         _ => false,
-    }
+    };
+    crate::safe_print!(128, "[LoDev] is_loopback_frame: len={}, ethertype=0x{:04x}, result={}\n",
+        frame.len(), ethertype, result);
+    result
 }
 
 /// A composite device that wraps VirtIO for external traffic and an internal
@@ -192,7 +221,7 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
 /// the loopback queue first, then falls back to VirtIO.
 pub struct LoopbackAwareDevice {
     virtio: VirtioSmoltcpDevice,
-    loopback_queue: VecDeque<Vec<u8>>,
+    pub loopback_queue: VecDeque<Vec<u8>>,
 }
 
 impl LoopbackAwareDevice {
@@ -215,6 +244,8 @@ impl Device for LoopbackAwareDevice {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Priority: loopback queue first
         if let Some(frame) = self.loopback_queue.pop_front() {
+            crate::safe_print!(128, "[LoDev] receive: loopback frame dequeued, len={}, queue_remaining={}\n",
+                frame.len(), self.loopback_queue.len());
             let rx = LoopbackAwareRxToken::Loopback(frame);
             let tx = LoopbackAwareTxToken {
                 virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
@@ -317,9 +348,12 @@ impl<'a> smoltcp::phy::TxToken for LoopbackAwareTxToken<'a> {
             // Loopback: copy into an owned Vec and queue for the next receive()
             let mut frame = vec![0u8; len];
             frame.copy_from_slice(&self.virtio_buffer[..len]);
+            crate::safe_print!(64, "[LoDev] TX: loopback queued, len={}, queue_size={}\n",
+                len, self.loopback_queue.len() + 1);
             self.loopback_queue.push_back(frame);
         } else {
             // External: send through VirtIO
+            crate::safe_print!(64, "[LoDev] TX: sent via VirtIO, len={}\n", len);
             let _ = self.virtio_inner.send(&self.virtio_buffer[..len]);
         }
 
