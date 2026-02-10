@@ -38,7 +38,8 @@ fn test_loopback_connection() {
     let client_handle = smoltcp_net::socket_create().expect("Failed to create client socket");
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(client_handle);
-        let cx = net.iface.context();
+        // Use LOOPBACK context for 127.0.0.1
+        let cx = net.loopback_iface.context();
         // Use a valid local port (non-zero)
         socket.connect(cx, (IpAddress::v4(127, 0, 0, 1), TEST_PORT), LOCAL_PORT)
             .expect("Connect call failed");
