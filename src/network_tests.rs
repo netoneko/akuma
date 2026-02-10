@@ -46,22 +46,11 @@ fn test_loopback_connection() {
 
     // 3. Drive stack until established
     let mut success = false;
-    let mut last_client_state = None;
-    let mut last_server_state = None;
-    for i in 0..1000 {
-        let poll_result = smoltcp_net::poll();
+    for _ in 0..1000 {
+        smoltcp_net::poll();
         
         let client_state = with_network(|net| net.sockets.get::<tcp::Socket>(client_handle).state());
         let server_state = with_network(|net| net.sockets.get::<tcp::Socket>(listen_handle).state());
-
-        // Log on first 10 iterations and on any state change
-        if i < 10 || client_state != last_client_state || server_state != last_server_state {
-            let queue_len = with_network(|net| net.device.loopback_queue.len()).unwrap_or(0);
-            crate::safe_print!(192, "[NetTest] poll#{}: result={}, client={:?}, server={:?}, lo_queue={}\n",
-                i, poll_result, client_state, server_state, queue_len);
-            last_client_state = client_state;
-            last_server_state = server_state;
-        }
 
         if client_state == Some(tcp::State::Established) && server_state == Some(tcp::State::Established) {
             success = true;
