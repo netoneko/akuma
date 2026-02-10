@@ -21,7 +21,6 @@ use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::console;
 use crate::virtio_hal::VirtioHal;
-use crate::config;
 
 // ============================================================================
 // Constants
@@ -234,6 +233,7 @@ pub fn init() -> Result<(), &'static str> {
 
     // Initialize DHCP if enabled
     let dhcp_handle = if crate::config::ENABLE_DHCP {
+        log("[SmolNet] DHCP enabled\n");
         let dhcp_socket = dhcpv4::Socket::new();
         Some(sockets.add(dhcp_socket))
     } else {

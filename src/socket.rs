@@ -93,6 +93,7 @@ pub enum SocketType {
     Stream(SocketHandle),
     /// A listening socket (manages a pool of smoltcp handles)
     Listener {
+        local_port: u16,
         handles: VecDeque<SocketHandle>,
     },
 }
@@ -134,7 +135,7 @@ impl KernelSocket {
         }
         
         Some(Self {
-            inner: SocketType::Listener { handles },
+            inner: SocketType::Listener { local_port: port, handles },
             bind_port: Some(port),
         })
     }
@@ -303,14 +304,14 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
     }, None)?;
 
     let (handle, addr) = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, .. }, .. })) = table.get_mut(idx) {
+        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port }, .. })) = table.get_mut(idx) {
+             let port = *local_port;
              for (i, &handle) in handles.iter().enumerate() {
                 let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
                 if state == Some(tcp::State::Established) {
                     let h = handles.remove(i).unwrap();
-                    let local_port = with_network(|net| net.sockets.get::<tcp::Socket>(h).local_endpoint().map(|ep| ep.port)).flatten();
                     if let Some(new_h) = smoltcp_net::socket_create() {
-                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(local_port.unwrap_or(0)); });
+                        with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(port); });
                         handles.push_back(new_h);
                     }
                     let remote = with_network(|net| {
@@ -339,10 +340,10 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
 }
 
 pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
-    let (handle, bound_port): (SocketHandle, Option<u16>) = with_table(|table| {
+    let (h, bound_port): (SocketHandle, Option<u16>) = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
-            if let SocketType::Stream(h) = sock.inner {
-                return Some((h, sock.bind_port));
+            if let SocketType::Stream(handle) = sock.inner {
+                return Some((handle, sock.bind_port));
             }
         }
         None
@@ -359,8 +360,14 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     });
 
     let res = with_network(|net| {
-        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-        let cx = net.iface.context();
+        let socket = net.sockets.get_mut::<tcp::Socket>(h);
+        
+        // Dynamically select context based on destination IP
+        let cx = if addr.ip[0] == 127 {
+            net.loopback_iface.context()
+        } else {
+            net.iface.context()
+        };
 
         socket.connect(cx, 
             (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
@@ -376,7 +383,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
 
     wait_until(|| {
         with_network(|net| {
-            let socket = net.sockets.get::<tcp::Socket>(handle);
+            let socket = net.sockets.get::<tcp::Socket>(h);
             match socket.state() {
                 tcp::State::Established => true,
                 tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait => true,
@@ -385,7 +392,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
         }).unwrap_or(true)
     }, Some(10_000_000))?;
 
-    let connected = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established).unwrap_or(false);
+    let connected = with_network(|net| net.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established).unwrap_or(false);
     if connected { Ok(()) } else { Err(libc_errno::ECONNREFUSED) }
 }
 
