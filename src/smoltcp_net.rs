@@ -7,13 +7,13 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
 use smoltcp::phy::Device;
-use smoltcp::socket::{tcp, dhcpv4};
+use smoltcp::socket::{tcp, dhcpv4, dns};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -30,6 +30,18 @@ use crate::virtio_hal::VirtioHal;
 const MAX_SOCKETS: usize = 128;
 const TCP_RX_BUFFER_SIZE: usize = 65535;
 const TCP_TX_BUFFER_SIZE: usize = 65535;
+const EPHEMERAL_PORT_START: u16 = 49152;
+static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);
+
+fn alloc_ephemeral_port() -> u16 {
+    let port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+    if port >= 65535 {
+        NEXT_EPHEMERAL_PORT.store(EPHEMERAL_PORT_START, Ordering::Relaxed);
+        EPHEMERAL_PORT_START
+    } else {
+        port
+    }
+}
 
 /// QEMU virt machine virtio MMIO addresses
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
@@ -54,11 +66,15 @@ pub fn poll_count() -> usize {
     POLL_COUNT.load(Ordering::Acquire)
 }
 
+/// QEMU user-mode networking DNS server address
+const QEMU_DNS_SERVER: IpAddress = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 2, 3));
+
 pub struct NetworkState {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
     pub device: LoopbackAwareDevice,
     pub dhcp_handle: Option<SocketHandle>,
+    pub dns_handle: SocketHandle,
     /// Sockets that have been closed by the user but are waiting for the stack to finish
     pub pending_removal: Vec<SocketHandle>,
 }
@@ -417,11 +433,18 @@ pub fn init() -> Result<(), &'static str> {
         None
     };
 
+    // Initialize DNS socket with QEMU's DNS server (10.0.2.3)
+    let dns_servers = &[QEMU_DNS_SERVER];
+    let dns_socket = dns::Socket::new(dns_servers, vec![]);
+    let dns_handle = sockets.add(dns_socket);
+    log("[SmolNet] DNS socket initialized (server: 10.0.2.3)\n");
+
     *NETWORK.lock() = Some(NetworkState {
         iface,
         sockets,
         device,
         dhcp_handle,
+        dns_handle,
         pending_removal: Vec::new(),
     });
 
@@ -504,6 +527,116 @@ where
 {
     let mut guard = NETWORK.lock();
     guard.as_mut().map(f)
+}
+
+// ============================================================================
+// DNS Resolution
+// ============================================================================
+
+/// Blocking DNS query - resolves a hostname to an IPv4 address.
+/// Polls the network stack and yields the current thread until a result is available.
+/// Used by the syscall handler for userspace programs and by kernel services.
+pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryError> {
+    // Fast path: try parsing as IP literal first
+    if let Ok(ip) = hostname.parse::<smoltcp::wire::Ipv4Address>() {
+        return Ok(ip);
+    }
+    if hostname == "localhost" {
+        return Ok(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1));
+    }
+
+    // Start a DNS query
+    let query_handle = with_network(|net| {
+        let dns_socket = net.sockets.get_mut::<dns::Socket>(net.dns_handle);
+        let cx = net.iface.context();
+        dns_socket.start_query(cx, hostname, smoltcp::wire::DnsQueryType::A).ok()
+    }).flatten().ok_or(DnsQueryError::StartFailed)?;
+
+    // Poll until we get a result or timeout (10 seconds)
+    let start = crate::timer::uptime_us();
+    let timeout_us = 10_000_000u64;
+
+    loop {
+        poll();
+
+        let result = with_network(|net| {
+            let dns_socket = net.sockets.get_mut::<dns::Socket>(net.dns_handle);
+            match dns_socket.get_query_result(query_handle) {
+                Ok(addrs) => {
+                    for addr in addrs.iter() {
+                        if let IpAddress::Ipv4(v4) = addr {
+                            return Some(Ok(*v4));
+                        }
+                    }
+                    Some(Err(DnsQueryError::NoRecords))
+                }
+                Err(dns::GetQueryResultError::Pending) => None,
+                Err(dns::GetQueryResultError::Failed) => Some(Err(DnsQueryError::QueryFailed)),
+            }
+        }).flatten();
+
+        match result {
+            Some(Ok(addr)) => return Ok(addr),
+            Some(Err(e)) => return Err(e),
+            None => {
+                if crate::timer::uptime_us() - start > timeout_us {
+                    return Err(DnsQueryError::Timeout);
+                }
+                crate::threading::yield_now();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DnsQueryError {
+    StartFailed,
+    QueryFailed,
+    NoRecords,
+    Timeout,
+}
+
+// ============================================================================
+// Async TCP Connect
+// ============================================================================
+
+/// Async TCP connect - creates a socket, connects to the remote, and returns a TcpStream.
+/// Suitable for use from async shell commands running in block_on contexts.
+pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, SocketHandle), TcpError> {
+    let handle = socket_create().ok_or(TcpError::WriteError)?;
+    let local_port = alloc_ephemeral_port();
+
+    let connected = with_network(|net| {
+        let socket = net.sockets.get_mut::<tcp::Socket>(handle);
+        let cx = net.iface.context();
+        socket.connect(cx, (addr, port), local_port).is_ok()
+    }).unwrap_or(false);
+
+    if !connected {
+        socket_close(handle);
+        return Err(TcpError::WriteError);
+    }
+
+    // Wait for connection to be established
+    core::future::poll_fn(|cx| {
+        // Drive the network stack forward
+        poll();
+        with_network(|net| {
+            let socket = net.sockets.get_mut::<tcp::Socket>(handle);
+            match socket.state() {
+                tcp::State::Established => Poll::Ready(Ok(())),
+                tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait => {
+                    Poll::Ready(Err(TcpError::WriteError))
+                }
+                _ => {
+                    socket.register_send_waker(cx.waker());
+                    Poll::Pending
+                }
+            }
+        }).unwrap_or(Poll::Ready(Err(TcpError::WriteError)))
+    }).await?;
+
+    Ok((TcpStream::new(handle), handle))
 }
 
 // ============================================================================

@@ -348,9 +348,13 @@ fn sys_uptime() -> u64 { crate::timer::uptime_us() }
 
 fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
     let host = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    if host == "localhost" { unsafe { *(res_ptr as *mut [u8; 4]) = [127,0,0,1]; } return 0; }
-    if let Ok(ip) = host.parse::<smoltcp::wire::Ipv4Address>() { unsafe { *(res_ptr as *mut [u8; 4]) = ip.octets(); } return 0; }
-    !0u64
+    match crate::dns::resolve_host_blocking(host) {
+        Ok(ipv4) => {
+            unsafe { *(res_ptr as *mut [u8; 4]) = ipv4.octets(); }
+            0
+        }
+        Err(_) => !0u64,
+    }
 }
 
 fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
