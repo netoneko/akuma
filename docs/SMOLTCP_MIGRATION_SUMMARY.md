@@ -21,4 +21,5 @@ Successfully migrated the Akuma network stack from `embassy-net` to a direct `sm
 - Kernel builds in `--release`.
 - Network initializes and starts DHCP.
 - `httpd` and `ssh` servers are started.
-- **Ongoing Issue**: Investigating connectivity resets and refused connections likely related to port forwarding or DHCP timing.
+- Loopback networking works via `LoopbackAwareDevice` (intercepts 127.x.x.x at the device layer).
+- External connectivity (SSH, HTTP) restored after fixing VirtIO receive bugs. See `docs/VIRTIO_RECEIVE_FIX.md`.
