@@ -159,7 +159,7 @@ pub const SKIP_ASYNC_NETWORK: bool = false;
 pub const RUN_NETWORK_TESTS: bool = true;
 
 /// Enable DHCP for automatic IP configuration
-pub const ENABLE_DHCP: bool = false;
+pub const ENABLE_DHCP: bool = true;
 
 /// Skip filesystem initialization (for debugging crashes)
 ///

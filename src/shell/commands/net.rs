@@ -276,6 +276,11 @@ impl Command for PkgCommand {
                         return Ok(());
                     }
 
+                    // Ensure /bin directory exists
+                    if crate::fs::create_dir("/bin").is_err() {
+                        // Ignore error - directory may already exist
+                    }
+
                     // Write to /bin/<package>
                     let dest = format!("/bin/{}", package);
                     match crate::fs::write_file(&dest, &body) {
@@ -288,8 +293,9 @@ impl Command for PkgCommand {
                             );
                             let _ = stdout.write(msg.as_bytes()).await;
                         }
-                        Err(_) => {
-                            let _ = stdout.write(b"Error: Failed to write to /bin/\r\n").await;
+                        Err(e) => {
+                            let msg = format!("Error: Failed to write to /bin/: {}\r\n", e);
+                            let _ = stdout.write(msg.as_bytes()).await;
                         }
                     }
                 }
