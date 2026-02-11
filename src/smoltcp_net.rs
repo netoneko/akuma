@@ -62,6 +62,17 @@ pub fn is_ready() -> bool {
     NETWORK_READY.load(Ordering::Acquire)
 }
 
+/// Returns true once DHCP has acquired a lease (Configured event was processed).
+/// Returns true immediately if DHCP is disabled.
+static DHCP_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+pub fn is_dhcp_configured() -> bool {
+    if !crate::config::ENABLE_DHCP {
+        return true;
+    }
+    DHCP_CONFIGURED.load(Ordering::Acquire)
+}
+
 pub fn poll_count() -> usize {
     POLL_COUNT.load(Ordering::Acquire)
 }
@@ -464,6 +475,7 @@ pub fn poll() -> bool {
         let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         
         // Handle DHCP
+        let mut dhcp_changed = false;
         if let Some(handle) = net.dhcp_handle {
             let event = net.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
             if let Some(event) = event {
@@ -480,8 +492,11 @@ pub fn poll() -> bool {
                         }
                         
                         log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
+                        DHCP_CONFIGURED.store(true, Ordering::Release);
+                        dhcp_changed = true;
                     }
                     dhcpv4::Event::Deconfigured => {
+                        DHCP_CONFIGURED.store(false, Ordering::Release);
                         log("[SmolNet] DHCP deconfigured - reverting to static fallback\n");
                         net.iface.update_ip_addrs(|addrs| {
                             addrs.clear();
@@ -489,9 +504,20 @@ pub fn poll() -> bool {
                             addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
                         });
                         let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
+                        dhcp_changed = true;
                     }
                 }
             }
+        }
+
+        // Re-poll after DHCP reconfiguration so the stack immediately processes
+        // any in-flight packets (e.g. loopback TCP handshake) with the updated
+        // IP configuration. Without this, the address change isn't picked up
+        // until the next external poll() call, which can cause loopback TCP
+        // connections to stall (server stuck in SynReceived).
+        if dhcp_changed {
+            let timestamp = Instant::from_micros(crate::timer::uptime_us() as i64);
+            net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         }
 
         // Garbage collect pending removals

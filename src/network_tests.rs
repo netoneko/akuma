@@ -15,6 +15,32 @@ fn log(msg: &str) {
 pub fn run_tests() {
     log("[NetTest] Starting network self-tests...\n");
 
+    // If DHCP is enabled, let it settle before running tests.
+    // DHCP Deconfigured/Configured events fire shortly after init and call
+    // update_ip_addrs(clear + push), which disrupts in-progress loopback
+    // TCP handshakes. Draining DHCP events first avoids this.
+    if crate::config::ENABLE_DHCP {
+        log("[NetTest] Waiting for DHCP to settle...\n");
+        let start = crate::timer::uptime_us();
+        let timeout_us = 5_000_000u64; // 5 seconds
+        let mut settled = false;
+        for _ in 0..5000 {
+            smoltcp_net::poll();
+            if smoltcp_net::is_dhcp_configured() {
+                log("[NetTest] DHCP settled\n");
+                settled = true;
+                break;
+            }
+            if crate::timer::uptime_us() - start > timeout_us {
+                break;
+            }
+            crate::threading::yield_now();
+        }
+        if !settled {
+            log("[NetTest] DHCP did not settle, continuing with static IP\n");
+        }
+    }
+
     test_loopback_connection();
 
     log("[NetTest] All network tests passed!\n");
