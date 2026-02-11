@@ -87,35 +87,72 @@ async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, &'static str> {
     let _ = stream.write(request.as_bytes()).await.map_err(|_| "Send failed")?;
     let _ = stream.flush().await;
 
-    // Read the full response
+    // Read the full response.
+    // Poll the network stack between reads to ensure TCP ACKs are sent
+    // promptly. Without this, ACKs are only sent when the receive buffer
+    // is fully drained (Pending), creating a stop-and-go pattern that can
+    // cause connection resets during large transfers through QEMU slirp.
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut had_error = false;
     loop {
+        // Drive the network stack so ACKs and window updates are sent
+        // between reads, not just when the buffer is empty
+        smoltcp_net::poll();
         match embedded_io_async::Read::read(&mut stream, &mut buf).await {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(_) => break,
+            Err(_) => {
+                had_error = true;
+                break;
+            }
         }
     }
 
     smoltcp_net::socket_close(handle);
 
+    if response.is_empty() {
+        return Err(if had_error { "TCP read error" } else { "Empty response" });
+    }
+
     // Parse HTTP response: find end of headers (\r\n\r\n)
-    if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-        let header_bytes = &response[..pos];
-        // Check for successful status
-        if let Ok(header_str) = core::str::from_utf8(header_bytes) {
-            if let Some(status_line) = header_str.lines().next() {
-                if !status_line.contains("200") && !status_line.contains("301") && !status_line.contains("302") {
-                    return Err("HTTP error response");
+    let pos = match response.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => p,
+        None => return Err("Malformed HTTP response (no header terminator)"),
+    };
+
+    let header_bytes = &response[..pos];
+    // Check for successful status
+    if let Ok(header_str) = core::str::from_utf8(header_bytes) {
+        if let Some(status_line) = header_str.lines().next() {
+            if !status_line.contains("200") && !status_line.contains("301") && !status_line.contains("302") {
+                return Err("HTTP error response");
+            }
+        }
+    }
+
+    let body = response[pos + 4..].to_vec();
+
+    // Verify against Content-Length if present (case-insensitive header match)
+    if let Ok(header_str) = core::str::from_utf8(header_bytes) {
+        for line in header_str.lines() {
+            // HTTP headers are case-insensitive
+            if line.len() > 15 && line.as_bytes()[..15].eq_ignore_ascii_case(b"content-length:") {
+                if let Ok(expected) = line[15..].trim().parse::<usize>() {
+                    if body.len() < expected {
+                        // Download was truncated - don't silently return partial data
+                        return Err("Download incomplete (connection lost)");
+                    }
                 }
             }
         }
-        Ok(response[pos + 4..].to_vec())
-    } else {
-        // No headers found, return as-is (shouldn't happen)
-        Ok(response)
     }
+
+    if had_error && body.is_empty() {
+        return Err("TCP read error (no body received)");
+    }
+
+    Ok(body)
 }
 
 // ============================================================================
@@ -276,6 +313,9 @@ impl Command for PkgCommand {
                         return Ok(());
                     }
 
+                    let size_msg = format!("pkg: downloaded {} bytes\r\n", body.len());
+                    let _ = stdout.write(size_msg.as_bytes()).await;
+
                     // Ensure /bin directory exists
                     if crate::fs::create_dir("/bin").is_err() {
                         // Ignore error - directory may already exist
@@ -294,7 +334,7 @@ impl Command for PkgCommand {
                             let _ = stdout.write(msg.as_bytes()).await;
                         }
                         Err(e) => {
-                            let msg = format!("Error: Failed to write to /bin/: {}\r\n", e);
+                            let msg = format!("Error: Failed to write to /bin/ ({} bytes): {}\r\n", body.len(), e);
                             let _ = stdout.write(msg.as_bytes()).await;
                         }
                     }
