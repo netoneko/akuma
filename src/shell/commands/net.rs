@@ -262,10 +262,102 @@ pub static NSLOOKUP_CMD: NslookupCommand = NslookupCommand;
 
 pub struct PkgCommand;
 
+impl PkgCommand {
+    async fn install_package(
+        package: &str,
+        stdout: &mut VecWriter,
+    ) -> Result<(), ShellError> {
+        if package.is_empty() {
+            return Ok(());
+        }
+
+        // Download from host HTTP server (10.0.2.2:8000)
+        let url_str = format!(
+            "http://10.0.2.2:8000/target/aarch64-unknown-none/release/{}",
+            package
+        );
+        let url = match parse_url(&url_str) {
+            Some(u) => u,
+            None => {
+                let _ = stdout.write(b"Error: Failed to construct URL\r\n").await;
+                return Ok(());
+            }
+        };
+
+        let msg = format!("pkg: downloading {}...\r\n", package);
+        let _ = stdout.write(msg.as_bytes()).await;
+
+        match http_get(&url).await {
+            Ok(body) => {
+                if body.is_empty() {
+                    let msg = format!("Error: Empty response for {} (package not found?)\r\n", package);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Ok(());
+                }
+
+                let size_msg = format!("pkg: downloaded {} bytes\r\n", body.len());
+                let _ = stdout.write(size_msg.as_bytes()).await;
+
+                // Check filesystem capacity before writing
+                if let Ok(stats) = crate::fs::stats() {
+                    let free_bytes = stats.free_bytes();
+                    let block_size = stats.cluster_size;
+                    let blocks_needed = (body.len() as u64 + block_size as u64 - 1) / block_size as u64;
+                    let diag = format!(
+                        "pkg: fs: block_size={}, free={} bytes ({} blocks), need ~{} blocks\r\n",
+                        block_size, free_bytes, stats.free_clusters, blocks_needed
+                    );
+                    let _ = stdout.write(diag.as_bytes()).await;
+
+                    if (body.len() as u64) > free_bytes {
+                        let msg = format!("Error: Not enough disk space for {}\r\n", package);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                        return Ok(());
+                    }
+                }
+
+                // Check disk device capacity
+                if let Some(disk_cap) = crate::block::capacity() {
+                    let diag = format!("pkg: disk capacity={} bytes\r\n", disk_cap);
+                    let _ = stdout.write(diag.as_bytes()).await;
+                }
+
+                // Ensure /bin directory exists
+                if crate::fs::create_dir("/bin").is_err() {
+                    // Ignore error - directory may already exist
+                }
+
+                // Write to /bin/<package>
+                let dest = format!("/bin/{}", package);
+                match crate::fs::write_file(&dest, &body) {
+                    Ok(()) => {
+                        let msg = format!(
+                            "pkg: installed {} ({} bytes) -> {}\r\n",
+                            package,
+                            body.len(),
+                            dest
+                        );
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                    Err(e) => {
+                        let msg = format!("Error: Failed to write {} to /bin/ ({} bytes): {}\r\n", package, body.len(), e);
+                        let _ = stdout.write(msg.as_bytes()).await;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("Error downloading {}: {}\r\n", package, e);
+                let _ = stdout.write(msg.as_bytes()).await;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Command for PkgCommand {
     fn name(&self) -> &'static str { "pkg" }
     fn description(&self) -> &'static str { "Package manager" }
-    fn usage(&self) -> &'static str { "pkg install <package>" }
+    fn usage(&self) -> &'static str { "pkg install <package1> [package2] ..." }
 
     fn execute<'a>(
         &'a self,
@@ -277,96 +369,21 @@ impl Command for PkgCommand {
         Box::pin(async move {
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
 
-            // Parse "install <package>"
-            let package = if let Some(rest) = args_str.strip_prefix("install") {
-                rest.trim()
-            } else {
-                let _ = stdout.write(b"Usage: pkg install <package>\r\n\r\nExamples:\r\n  pkg install stdcheck\r\n  pkg install echo2\r\n").await;
-                return Ok(());
-            };
-
-            if package.is_empty() {
-                let _ = stdout.write(b"Error: No package name specified\r\nUsage: pkg install <package>\r\n").await;
-                return Ok(());
-            }
-
-            // Download from host HTTP server (10.0.2.2:8000)
-            let url_str = format!(
-                "http://10.0.2.2:8000/target/aarch64-unknown-none/release/{}",
-                package
-            );
-            let url = match parse_url(&url_str) {
-                Some(u) => u,
-                None => {
-                    let _ = stdout.write(b"Error: Failed to construct URL\r\n").await;
+            // Parse "install <package1> <package2> ..."
+            if let Some(rest) = args_str.strip_prefix("install") {
+                let packages = rest.trim();
+                if packages.is_empty() {
+                    let _ = stdout.write(b"Error: No package name specified\r\nUsage: pkg install <package1> [package2] ...\r\n").await;
                     return Ok(());
                 }
-            };
 
-            let msg = format!("pkg: downloading {}...\r\n", package);
-            let _ = stdout.write(msg.as_bytes()).await;
-
-            match http_get(&url).await {
-                Ok(body) => {
-                    if body.is_empty() {
-                        let _ = stdout.write(b"Error: Empty response (package not found?)\r\n").await;
-                        return Ok(());
-                    }
-
-                    let size_msg = format!("pkg: downloaded {} bytes\r\n", body.len());
-                    let _ = stdout.write(size_msg.as_bytes()).await;
-
-                    // Check filesystem capacity before writing
-                    if let Ok(stats) = crate::fs::stats() {
-                        let free_bytes = stats.free_bytes();
-                        let block_size = stats.cluster_size;
-                        let blocks_needed = (body.len() as u64 + block_size as u64 - 1) / block_size as u64;
-                        let diag = format!(
-                            "pkg: fs: block_size={}, free={} bytes ({} blocks), need ~{} blocks\r\n",
-                            block_size, free_bytes, stats.free_clusters, blocks_needed
-                        );
-                        let _ = stdout.write(diag.as_bytes()).await;
-
-                        if (body.len() as u64) > free_bytes {
-                            let _ = stdout.write(b"Error: Not enough disk space\r\n").await;
-                            return Ok(());
-                        }
-                    }
-
-                    // Check disk device capacity
-                    if let Some(disk_cap) = crate::block::capacity() {
-                        let diag = format!("pkg: disk capacity={} bytes\r\n", disk_cap);
-                        let _ = stdout.write(diag.as_bytes()).await;
-                    }
-
-                    // Ensure /bin directory exists
-                    if crate::fs::create_dir("/bin").is_err() {
-                        // Ignore error - directory may already exist
-                    }
-
-                    // Write to /bin/<package>
-                    let dest = format!("/bin/{}", package);
-                    match crate::fs::write_file(&dest, &body) {
-                        Ok(()) => {
-                            let msg = format!(
-                                "pkg: installed {} ({} bytes) -> {}\r\n",
-                                package,
-                                body.len(),
-                                dest
-                            );
-                            let _ = stdout.write(msg.as_bytes()).await;
-                        }
-                        Err(e) => {
-                            let msg = format!("Error: Failed to write to /bin/ ({} bytes): {}\r\n", body.len(), e);
-                            let _ = stdout.write(msg.as_bytes()).await;
-                        }
-                    }
+                for package in packages.split_whitespace() {
+                    let _ = Self::install_package(package, stdout).await;
                 }
-                Err(e) => {
-                    let msg = format!("Error downloading {}: {}\r\n", package, e);
-                    let _ = stdout.write(msg.as_bytes()).await;
-                }
+            } else {
+                let _ = stdout.write(b"Usage: pkg install <package1> [package2] ...\r\n\r\nExamples:\r\n  pkg install stdcheck\r\n  pkg install echo2 hello\r\n").await;
             }
+
             Ok(())
         })
     }

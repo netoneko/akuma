@@ -24,19 +24,19 @@ Akuma includes a simple package manager (`pkg`) that downloads and installs user
 
 ## Using the Package Manager
 
-### Installing a Package
+### Installing Packages
 
 ```
-pkg install <package-name>
+pkg install <package1> [package2] ...
 ```
 
-This downloads the binary from `http://10.0.2.2:8000/target/aarch64-unknown-none/release/<package>` and saves it to `/bin/<package>`.
+This downloads binaries from `http://10.0.2.2:8000/target/aarch64-unknown-none/release/<package>` and saves them to `/bin/<package>`. Multiple packages can be specified in a single command, and they will be installed one by one. If one package fails to install, the process will continue with the remaining packages.
 
 ### Examples
 
 ```
 pkg install stdcheck
-pkg install echo2
+pkg install echo2 hello
 ```
 
 ### Running Without Arguments
@@ -44,11 +44,11 @@ pkg install echo2
 Running `pkg` without arguments shows usage information:
 
 ```
-Usage: pkg install <package>
+Usage: pkg install <package1> [package2] ...
 
 Examples:
   pkg install stdcheck
-  pkg install echo2
+  pkg install echo2 hello
 ```
 
 ## Userspace Package Structure
