@@ -26,6 +26,33 @@ pub fn decompress_header(data: &[u8], out: &mut [u8]) -> Result<(usize, usize)> 
     }
 }
 
+/// Decompress a zlib stream incrementally and pass chunks to a callback.
+pub fn decompress_to_callback<F>(data: &[u8], mut callback: F) -> Result<()> 
+where F: FnMut(&[u8]) -> Result<()> {
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut out_buf = [0u8; 16384]; // 16KB transit buffer
+    let mut consumed = 0;
+
+    loop {
+        let result = inflate(&mut state, &data[consumed..], &mut out_buf, MZFlush::None);
+        consumed += result.bytes_consumed;
+        
+        if result.bytes_written > 0 {
+            callback(&out_buf[..result.bytes_written])?;
+        }
+
+        match result.status {
+            Ok(MZStatus::StreamEnd) => return Ok(()),
+            Ok(MZStatus::Ok) => {
+                if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    return Err(Error::decompress());
+                }
+            }
+            _ => return Err(Error::decompress()),
+        }
+    }
+}
+
 /// Compress data with zlib
 pub fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, 6)

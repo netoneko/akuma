@@ -566,7 +566,9 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
             // Write file
             
             // Warn BEFORE reading/decompressing the full content
+            let mut file_size = 0;
             if let Ok((_obj_type, size)) = store.read_info(&entry.sha) {
+                file_size = size;
                 if size > 300 * 1024 {
                     print("\nscratch: warning: checking out large file ");
                     print(&entry.name);
@@ -580,48 +582,41 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                 }
             }
 
-            // Now perform the full read/write
-            if let Ok((_obj_type, content)) = store.read_raw_content(&entry.sha) {
-                let size = content.len();
-                let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-                if fd >= 0 {
-                    let chunk_size = 64 * 1024;
-                    let mut written = 0;
-                    while written < size {
-                        let to_write = core::cmp::min(size - written, chunk_size);
-                        let n = write_fd(fd, &content[written..written + to_write]);
-                        if n <= 0 {
-                            break;
-                        }
-                        written += n as usize;
-                        if size >= chunk_size {
+            // Now perform the streaming read/write
+            let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+            if fd >= 0 {
+                let mut total_written = 0;
+                let mut last_dot = 0;
+                let chunk_size = 64 * 1024;
+
+                let result = store.read_to_callback(&entry.sha, |chunk| {
+                    let n = write_fd(fd, chunk);
+                    if n < 0 {
+                        return Err(Error::io("write failed"));
+                    }
+                    total_written += n as usize;
+                    
+                    // Progress dots for large files
+                    if file_size >= chunk_size {
+                        if total_written - last_dot >= chunk_size {
                             print(".");
+                            last_dot = total_written;
                         }
                     }
-                    close(fd);
+                    Ok(())
+                });
+
+                close(fd);
+                
+                if result.is_err() {
+                    print("scratch: checkout: failed to stream ");
+                    print(&entry.name);
+                    print("\n");
                 }
             } else {
-                // Fallback to standard read if optimized read fails
-                let blob_obj = match store.read(&entry.sha) {
-                    Ok(obj) => obj,
-                    Err(e) => {
-                        print("scratch: checkout: blob ");
-                        print(&crate::sha1::to_hex(&entry.sha));
-                        print(" (");
-                        print(&entry.name);
-                        print("): ");
-                        print(e.message());
-                        print("\n");
-                        return Err(e);
-                    }
-                };
-                let content = blob_obj.as_blob()?;
-                let size = content.len();
-                let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-                if fd >= 0 {
-                    let _ = write_fd(fd, content);
-                    close(fd);
-                }
+                print("scratch: checkout: failed to open ");
+                print(&entry.name);
+                print("\n");
             }
 
             *file_count += 1;

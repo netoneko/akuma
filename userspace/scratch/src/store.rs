@@ -133,6 +133,40 @@ impl ObjectStore {
         Ok((obj_type, size))
     }
 
+    /// Read an object and stream its content (after decompression) to a callback.
+    /// This avoids loading the entire decompressed object into memory.
+    pub fn read_to_callback<F>(&self, sha: &Sha1Hash, mut callback: F) -> Result<()>
+    where F: FnMut(&[u8]) -> Result<()> {
+        let compressed = self.read_raw_compressed(sha)?;
+        
+        let mut header_skipped = false;
+        let mut header_buf = Vec::new();
+
+        zlib::decompress_to_callback(&compressed, |chunk| {
+            if header_skipped {
+                callback(chunk)
+            } else {
+                // We need to find the null byte in the first few chunks to skip the header
+                header_buf.extend_from_slice(chunk);
+                if let Some(null_pos) = header_buf.iter().position(|&b| b == 0) {
+                    header_skipped = true;
+                    if null_pos + 1 < header_buf.len() {
+                        callback(&header_buf[null_pos + 1..])?;
+                    }
+                    // Free the header buffer memory early
+                    header_buf = Vec::new();
+                    Ok(())
+                } else {
+                    // Still haven't found the end of the header
+                    if header_buf.len() > 1024 {
+                        return Err(Error::invalid_object("header too long"));
+                    }
+                    Ok(())
+                }
+            }
+        })
+    }
+
     /// Read an object's raw content (after decompression, without parsing)
     pub fn read_raw_content(&self, sha: &Sha1Hash) -> Result<(ObjectType, Vec<u8>)> {
         let compressed = self.read_raw_compressed(sha)?;
