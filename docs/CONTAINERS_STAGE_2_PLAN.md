@@ -13,11 +13,35 @@ Implement the userspace `box` utility (CLI) to manage containers. This tool will
 ### 2. Implement Core Commands
 Implement the following subcommands in `box`:
 
-- **`box open <name> [--directory <dir>] [--tmp] <cmd>`**
+- **`box open <name> [--directory <dir>] [--interactive|-i] [cmd]`**
     - Spawns a new process with `sys_spawn_ext`.
     - Sets `root_dir` and `box_id` (auto-generated or derived from name).
-    - Acts as the supervisor/reaper for the container's init process.
-    - If `--tmp` is set, cleans up the directory after exit (optional for initial implementation).
+    - If `cmd` is omitted, creates an "Empty Box" by registering the metadata in the kernel and exiting. This allows later populating via `box use`.
+    - If `--interactive` is set, captures and streams stdout to the caller.
+
+- **`box cp <source_dir> <destination_dir>`**
+    - Recursive copy utility to set up box root filesystems.
+    - Essential for initializing containers from templates.
+
+- **`box show <name|id>`**
+    - Displays detailed metadata about a box.
+    - Lists all processes currently assigned to that `box_id`.
+
+- **`box ps`**
+    - Lists active boxes.
+    - Reads from `/proc/boxes`.
+
+- **`box use <name> <cmd>`**
+    - "Injects" a command into an existing running box.
+
+- **`box close <name|id>`**
+    - Terminates all processes in an existing box and unregisters it.
+
+### 5. Docker Compatibility Aliases
+- `box run` -> `box open`
+- `box exec` -> `box use`
+- `box stop` -> `box close`
+- `box inspect` -> `box show`
 
 - **`box cp <source_dir> <box_name>`**
     - Copies a directory (e.g., a template) to a new box root location (e.g., `/data/boxes/<name>`).

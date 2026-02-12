@@ -213,6 +213,33 @@ pub fn init_box_registry() {
     });
 }
 
+/// Kill all processes in a box and unregister it
+pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
+    if box_id == 0 {
+        return Err("Cannot kill Box 0 (Host)");
+    }
+
+    // 1. Get list of PIDs in this box
+    let pids: Vec<Pid> = crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.box_id == box_id)
+            .map(|(&pid, _)| pid)
+            .collect()
+    });
+
+    // 2. Kill each process
+    for pid in pids {
+        // kill_process handles unregistering and thread termination
+        let _ = kill_process(pid);
+    }
+
+    // 3. Unregister the box from the global registry
+    unregister_box(box_id);
+
+    Ok(())
+}
+
 // ============================================================================
 // Stdio Buffer (thread-safe stdin/stdout with size limits)
 // ============================================================================

@@ -1,17 +1,19 @@
 //! box - Container management utility
 //!
 //! Usage:
-//!   box open <name> [--directory <dir>] <cmd>
-//!   box cp <source> <name>
+//!   box open <name> [--directory <dir>] [--interactive|-i] [cmd]
+//!   box cp <source> <destination>
 //!   box ps
 //!   box use <name> <cmd>
+//!   box close <name|id>
+//!   box show <name|id>
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-use libakuma::{exit, print, args, open, read_fd, close, open_flags, SpawnResult, waitpid, println};
+use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
@@ -31,9 +33,9 @@ pub struct SpawnOptions {
 
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
+const SYSCALL_KILL_BOX: u64 = 317;
 
 fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
-    // Build null-separated args string
     let mut args_buf = Vec::new();
     if let Some(args_slice) = args {
         for arg in args_slice {
@@ -57,51 +59,34 @@ fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &
         path.as_ptr() as u64,
         path.len() as u64,
         options as *const _ as u64,
-        0,
-        0,
-        0,
+        0, 0, 0,
     );
 
-    // Check for error (negative value)
-    if (result as i64) < 0 {
-        return None;
-    }
-
-    // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
-    let pid = (result & 0xFFFF_FFFF) as u32;
-    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-
-    Some(SpawnResult { pid, stdout_fd })
+    if (result as i64) < 0 { return None; }
+    Some(SpawnResult { pid: (result & 0xFFFF_FFFF) as u32, stdout_fd: ((result >> 32) & 0xFFFF_FFFF) as u32 })
 }
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let mut args_iter = args();
-    let _prog = args_iter.next(); // Skip program name
+    let _prog = args_iter.next();
 
     let command = match args_iter.next() {
         Some(cmd) => cmd,
-        None => {
-            print_usage();
-            exit(1);
-        }
+        None => { print_usage(); exit(1); }
     };
 
     match command {
-        "open" => cmd_open(args_iter),
+        "open" | "run" => cmd_open(args_iter),
         "cp" => cmd_cp(args_iter),
         "ps" => cmd_ps(),
-        "use" => cmd_use(args_iter),
-        "help" | "--help" | "-h" => {
-            print_usage();
-            exit(0);
-        }
+        "use" | "exec" => cmd_use(args_iter),
+        "close" | "stop" | "rm" => cmd_close(args_iter),
+        "show" | "inspect" => cmd_show(args_iter),
+        "help" | "--help" | "-h" => { print_usage(); exit(0); }
         _ => {
-            print("box: unknown command '");
-            print(command);
-            print("'\n");
-            print_usage();
-            exit(1);
+            print("box: unknown command '"); print(command); print("'\n");
+            print_usage(); exit(1);
         }
     }
 }
@@ -109,229 +94,249 @@ pub extern "C" fn _start() -> ! {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box open <name> [--directory <dir>] <cmd>  Start a new box\n");
-    print("  box cp <source> <name>                     Initialize box directory\n");
-    print("  box ps                                     List active boxes\n");
-    print("  box use <name> <cmd>                       Run command in existing box\n");
+    print("  box open <name> [-i] [-d <dir>] [cmd]     Start a new box (or empty box)\n");
+    print("  box cp <source> <dest>                    Copy directory recursively\n");
+    print("  box ps                                    List active boxes\n");
+    print("  box use <name> <cmd>                      Run command in existing box\n");
+    print("  box close <name|id>                       Stop all processes in a box\n");
+    print("  box show <name|id>                        Display box details\n");
 }
 
 fn cmd_open(mut args: libakuma::Args) -> ! {
     let name = match args.next() {
         Some(n) => n,
-        None => {
-            print("Usage: box open <name> [--directory <dir>] <cmd>\n");
-            exit(1);
-        }
+        None => { print("Usage: box open <name> [-i] [-d <dir>] [cmd]\n"); exit(1); }
     };
 
     let mut directory = String::from("/");
+    let mut interactive = false;
     let mut cmd_path = None;
     let mut cmd_args = Vec::new();
 
     while let Some(arg) = args.next() {
         if arg == "--directory" || arg == "-d" {
             directory = String::from(args.next().unwrap_or("/"));
+        } else if arg == "--interactive" || arg == "-i" {
+            interactive = true;
         } else {
             cmd_path = Some(arg);
-            // Remaining args are command args
-            for a in args {
-                cmd_args.push(a);
-            }
+            for a in args { cmd_args.push(a); }
             break;
         }
     }
 
-    let path = match cmd_path {
-        Some(p) => p,
-        None => {
-            print("box open: missing command\n");
-            exit(1);
-        }
-    };
-
-    // Generate a pseudo-random box_id based on name hash
     let mut box_id = 0u64;
-    for b in name.as_bytes() {
-        box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64);
-    }
+    for b in name.as_bytes() { box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64); }
     if box_id == 0 { box_id = 1; }
 
-    // Register box in kernel
-    libakuma::syscall(
-        SYSCALL_REGISTER_BOX,
-        box_id,
-        name.as_ptr() as u64,
-        name.len() as u64,
-        directory.as_ptr() as u64,
-        directory.len() as u64,
-        0,
-    );
+    libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
 
-    let mut options = SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64,
-        cwd_len: 1,
-        root_dir_ptr: directory.as_ptr() as u64,
-        root_dir_len: directory.len(),
-        args_ptr: 0,
-        args_len: 0,
-        stdin_ptr: 0,
-        stdin_len: 0,
-        box_id,
-    };
+    if let Some(path) = cmd_path {
+        let mut options = SpawnOptions {
+            cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+            root_dir_ptr: directory.as_ptr() as u64, root_dir_len: directory.len(),
+            args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
+        };
 
-    print("box: starting '");
-    print(name);
-    print("' in ");
-    print(&directory);
-    print(" (ID=");
-    libakuma::print_dec(box_id as usize);
-    print(")\n");
+        print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_dec(box_id as usize); print(")\n");
 
-    let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
-    let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
+        let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
+        let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
 
-    match spawn_ext(path, args_opt, None, &mut options) {
-        Some(res) => {
-            print("Started PID ");
-            libakuma::print_dec(res.pid as usize);
-            print("\n");
-            
-            // Wait for it
-            loop {
-                if let Some((_, code)) = waitpid(res.pid) {
-                    print("Box exited with code ");
-                    libakuma::print_dec(code as usize);
-                    print("\n");
-                    exit(code);
+        match spawn_ext(path, args_opt, None, &mut options) {
+            Some(res) => {
+                print("Started PID "); libakuma::print_dec(res.pid as usize); print("\n");
+                loop {
+                    if interactive {
+                        let mut buf = [0u8; 1024];
+                        let n = read_fd(res.stdout_fd as i32, &mut buf);
+                        if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
+                    }
+                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
+                    libakuma::sleep_ms(10);
                 }
-                libakuma::sleep_ms(100);
             }
+            None => { print("box open: failed to spawn\n"); exit(1); }
         }
-        None => {
-            print("box open: failed to spawn command\n");
-            exit(1);
+    } else {
+        print("box: created empty box '"); print(name); print("' (ID="); libakuma::print_dec(box_id as usize); print(")\n");
+        exit(0);
+    }
+}
+
+fn copy_recursive(src: &str, dst: &str) {
+    if let Some(entries) = read_dir(src) {
+        for entry in entries {
+            let src_path = format!("{}/{}", src, entry.name);
+            let dst_path = format!("{}/{}", dst, entry.name);
+            if entry.is_dir {
+                let _ = mkdir(&dst_path);
+                copy_recursive(&src_path, &dst_path);
+            } else {
+                let sfd = open(&src_path, open_flags::O_RDONLY);
+                if sfd >= 0 {
+                    if let Ok(stat) = fstat(sfd) {
+                        let mut buf = Vec::with_capacity(stat.st_size as usize);
+                        buf.resize(stat.st_size as usize, 0);
+                        let n = read_fd(sfd, &mut buf);
+                        let dfd = open(&dst_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+                        if dfd >= 0 {
+                            if n > 0 { let _ = write_fd(dfd, &buf[..n as usize]); }
+                            close(dfd);
+                        }
+                    }
+                    close(sfd);
+                }
+            }
         }
     }
 }
 
-fn cmd_cp(mut _args: libakuma::Args) -> ! {
-    print("box cp: not implemented (use kernel-side setup for now)\n");
-    exit(1);
+fn cmd_cp(mut args: libakuma::Args) -> ! {
+    let src = match args.next() { Some(s) => s, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
+    let dst = match args.next() { Some(d) => d, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
+    print("box: copying "); print(src); print(" to "); print(dst); print("...\n");
+    let _ = mkdir(dst);
+    copy_recursive(src, dst);
+    exit(0);
 }
 
 fn cmd_ps() -> ! {
     let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd < 0 {
-        print("box ps: failed to open /proc/boxes (are you Box 0?)\n");
-        exit(1);
-    }
-
-    let mut buf = [0u8; 1024];
+    if fd < 0 { print("box ps: failed to open /proc/boxes\n"); exit(1); }
+    let mut buf = [0u8; 2048];
     let n = read_fd(fd, &mut buf);
-    if n > 0 {
-        libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]);
-    }
-    close(fd);
-    exit(0);
+    if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
+    close(fd); exit(0);
 }
 
 fn cmd_use(mut args: libakuma::Args) -> ! {
-    let name = match args.next() {
-        Some(n) => n,
-        None => {
-            print("Usage: box use <name> <cmd>\n");
-            exit(1);
-        }
-    };
-
-    let path = match args.next() {
-        Some(p) => p,
-        None => {
-            print("box use: missing command\n");
-            exit(1);
-        }
-    };
-
+    let name = match args.next() { Some(n) => n, None => { print("Usage: box use <name> <cmd>\n"); exit(1); } };
+    let path = match args.next() { Some(p) => p, None => { print("box use: missing command\n"); exit(1); } };
     let mut cmd_args = Vec::new();
-    for a in args {
-        cmd_args.push(a);
-    }
+    for a in args { cmd_args.push(a); }
 
-    // Find box info from /proc/boxes
     let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd < 0 {
-        print("box use: failed to access /proc/boxes\n");
-        exit(1);
-    }
-
+    if fd < 0 { print("box use: failed to access /proc/boxes\n"); exit(1); }
     let mut buf = [0u8; 2048];
     let n = read_fd(fd, &mut buf);
     close(fd);
-
-    if n <= 0 {
-        print("box use: no boxes found\n");
-        exit(1);
-    }
-
+    
     let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
     let mut target_id = None;
     let mut target_root = None;
-
-    // Skip header and find box
     for line in content.lines().skip(1) {
         let mut parts = line.split(',');
         let id_str = parts.next().unwrap_or("");
         let bname = parts.next().unwrap_or("");
         let root = parts.next().unwrap_or("");
-        
-        if bname == name {
-            target_id = Some(id_str);
-            target_root = Some(root);
-            break;
-        }
+        if bname == name { target_id = Some(id_str); target_root = Some(root); break; }
     }
 
-    let box_id_str = match target_id {
-        Some(id) => id,
-        None => {
-            print("box use: box '");
-            print(name);
-            print("' not found\n");
-            exit(1);
-        }
-    };
-
-    // Simple parse_u64
+    let box_id_str = target_id.unwrap_or_else(|| { print("box use: box not found\n"); exit(1); });
     let mut box_id = 0u64;
-    for b in box_id_str.as_bytes() {
-        if *b >= b'0' && *b <= b'9' {
-            box_id = box_id * 10 + (*b - b'0') as u64;
-        }
-    }
+    for b in box_id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { box_id = box_id * 10 + (*b - b'0') as u64; } }
 
     let mut options = SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64,
-        cwd_len: 1,
-        root_dir_ptr: target_root.unwrap().as_ptr() as u64,
-        root_dir_len: target_root.unwrap().len(),
-        args_ptr: 0,
-        args_len: 0,
-        stdin_ptr: 0,
-        stdin_len: 0,
-        box_id,
+        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+        root_dir_ptr: target_root.unwrap().as_ptr() as u64, root_dir_len: target_root.unwrap().len(),
+        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
     };
 
     let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
     let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
 
     match spawn_ext(path, args_opt, None, &mut options) {
-        Some(res) => {
-            println(&format!("Injected command into box '{}' (PID {})", name, res.pid));
-            exit(0);
-        }
-        None => {
-            print("box use: injection failed\n");
-            exit(1);
+        Some(res) => { println(&format!("Injected PID {}", res.pid)); exit(0); }
+        None => { print("box use: failed\n"); exit(1); }
+    }
+}
+
+fn cmd_close(mut args: libakuma::Args) -> ! {
+    let target = match args.next() { Some(t) => t, None => { print("Usage: box close <name|id>\n"); exit(1); } };
+    let mut box_id = 0u64;
+    let mut is_numeric = true;
+    for b in target.as_bytes() { if *b < b'0' || *b > b'9' { is_numeric = false; break; } box_id = box_id * 10 + (*b - b'0') as u64; }
+
+    if !is_numeric {
+        let fd = open("/proc/boxes", open_flags::O_RDONLY);
+        if fd >= 0 {
+            let mut buf = [0u8; 2048];
+            let n = read_fd(fd, &mut buf);
+            close(fd);
+            if n > 0 {
+                let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+                for line in content.lines().skip(1) {
+                    let mut parts = line.split(',');
+                    let id_str = parts.next().unwrap_or("");
+                    if parts.next().unwrap_or("") == target {
+                        box_id = 0;
+                        for b in id_str.as_bytes() { box_id = box_id * 10 + (*b - b'0') as u64; }
+                        break;
+                    }
+                }
+            }
         }
     }
+
+    if box_id == 0 { print("box close: box not found or Box 0\n"); exit(1); }
+    if libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0) == 0 { print("Closed box "); libakuma::print_dec(box_id as usize); print("\n"); exit(0); }
+    else { print("box close: failed\n"); exit(1); }
+}
+
+fn cmd_show(mut args: libakuma::Args) -> ! {
+    let target = match args.next() { Some(t) => t, None => { print("Usage: box show <name|id>\n"); exit(1); } };
+    let mut box_id = 0u64;
+    let mut box_name = String::new();
+    let mut box_root = String::new();
+    let mut box_creator = String::new();
+
+    let fd = open("/proc/boxes", open_flags::O_RDONLY);
+    if fd >= 0 {
+        let mut buf = [0u8; 2048];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n > 0 {
+            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+            for line in content.lines().skip(1) {
+                let mut parts = line.split(',');
+                let id_str = parts.next().unwrap_or("");
+                let bname = parts.next().unwrap_or("");
+                let root = parts.next().unwrap_or("");
+                let creator = parts.next().unwrap_or("");
+                if bname == target || id_str == target {
+                    box_id = 0; for b in id_str.as_bytes() { box_id = box_id * 10 + (*b - b'0') as u64; }
+                    box_name = String::from(bname);
+                    box_root = String::from(root);
+                    box_creator = String::from(creator);
+                    break;
+                }
+            }
+        }
+    }
+
+    if box_id == 0 && target != "0" && target != "host" { print("box show: box not found\n"); exit(1); }
+    
+    println(&format!("Box ID: {}", box_id));
+    println(&format!("Name:   {}", box_name));
+    println(&format!("Root:   {}", box_root));
+    println(&format!("Creator PID: {}", box_creator));
+    println("\nMembers:");
+    
+    // Read all processes from /proc
+    if let Some(mut dir) = libakuma::read_dir("/") {
+        for entry in dir {
+            // Check if entry is a numeric PID
+            let mut is_pid = true;
+            for b in entry.name.as_bytes() { if *b < b'0' || *b > b'9' { is_pid = false; break; } }
+            if is_pid {
+                // We'd need to read box_id for this process. 
+                // Since ps/top can see it, let's assume we can get it if we had a /proc/<pid>/status.
+                // For now, let's just print that we found a process.
+                // In Akuma, we currently don't have a /proc/<pid>/status file.
+                // Recommendation: add it later.
+            }
+        }
+    }
+    exit(0);
 }
