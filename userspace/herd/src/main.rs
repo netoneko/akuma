@@ -388,15 +388,19 @@ fn reload_config(state: &mut HerdState) {
         }
     }
 
-    // Remove services that are no longer enabled (and not running)
+    // Remove services that are no longer enabled
     let to_remove: Vec<String> = state.services.iter()
-        .filter(|(name, svc)| {
-            !found_services.iter().any(|n| n == *name) && svc.state != ServiceState::Running
+        .filter(|(name, _)| {
+            !found_services.iter().any(|n| n == *name)
         })
         .map(|(name, _)| name.clone())
         .collect();
 
     for name in to_remove {
+        print("[herd] Stopping and removing disabled service: ");
+        print(&name);
+        print("\n");
+        stop_service(state, &name);
         state.services.remove(&name);
     }
 }
@@ -843,13 +847,16 @@ fn cmd_disable(name: &str) {
         return;
     }
     
-    // Remove from enabled (we don't have unlink syscall, so just write empty file)
-    // TODO: Add proper file deletion when unlink syscall is available
-    // For now, we can't actually delete files - just inform the user
-    print("Note: File deletion not yet supported.\n");
-    print("Manually remove: ");
-    print(&path);
-    print("\n");
+    // Remove from enabled
+    if libakuma::unlink(&path) == 0 {
+        print("Disabled service '");
+        print(name);
+        print("'\n");
+    } else {
+        print("Error: Failed to delete ");
+        print(&path);
+        print("\n");
+    }
 }
 
 fn cmd_log(name: &str) {

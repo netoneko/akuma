@@ -35,6 +35,7 @@ pub mod syscall {
     pub const MMAP: u64 = 222;
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
+    pub const UNLINKAT: u64 = 35;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
@@ -887,6 +888,18 @@ pub fn mkdir(path: &str) -> i32 {
         path.as_ptr() as u64,
         path.len() as u64,
         0o755u64, // mode
+        0, 0,
+    ) as i32
+}
+
+/// Delete a file
+pub fn unlink(path: &str) -> i32 {
+    syscall(
+        syscall::UNLINKAT,
+        -100i32 as u64, // AT_FDCWD
+        path.as_ptr() as u64,
+        path.len() as u64,
+        0, // flags
         0, 0,
     ) as i32
 }
