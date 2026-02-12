@@ -241,7 +241,19 @@ fn cmd_ps() -> ! {
 }
 
 fn cmd_use(mut args: libakuma::Args) -> ! {
-    let name = match args.next() { Some(n) => n, None => { print("Usage: box use <name> <cmd>\n"); exit(1); } };
+    let mut interactive = false;
+    let mut target_name = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--interactive" || arg == "-i" {
+            interactive = true;
+        } else {
+            target_name = Some(arg);
+            break;
+        }
+    }
+
+    let name = match target_name { Some(n) => n, None => { print("Usage: box use [-i] <name> <cmd>\n"); exit(1); } };
     let path = match args.next() { Some(p) => p, None => { print("box use: missing command\n"); exit(1); } };
     let mut cmd_args = Vec::new();
     for a in args { cmd_args.push(a); }
@@ -277,7 +289,27 @@ fn cmd_use(mut args: libakuma::Args) -> ! {
     let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
 
     match spawn_ext(path, args_opt, None, &mut options) {
-        Some(res) => { println(&format!("Injected PID {}", res.pid)); exit(0); }
+        Some(res) => {
+            if interactive {
+                loop {
+                    let mut buf = [0u8; 1024];
+                    let n = read_fd(res.stdout_fd as i32, &mut buf);
+                    if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
+                    if let Some((_, code)) = waitpid(res.pid) { 
+                        loop {
+                            let n = read_fd(res.stdout_fd as i32, &mut buf);
+                            if n <= 0 { break; }
+                            libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]);
+                        }
+                        exit(code); 
+                    }
+                    libakuma::sleep_ms(10);
+                }
+            } else {
+                println(&format!("Injected PID {}", res.pid));
+                exit(0);
+            }
+        }
         None => { print("box use: failed\n"); exit(1); }
     }
 }
