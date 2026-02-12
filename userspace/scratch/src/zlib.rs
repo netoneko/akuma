@@ -36,21 +36,19 @@ pub fn decompress_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     // Use heap-allocated state since InflateState is large (~32KB)
     let mut state = InflateState::new_boxed(DataFormat::Zlib);
 
-    // Start with a reasonable output buffer size
-    let mut output = Vec::with_capacity(data.len() * 2);
+    // Start small — `data` may be the entire remaining pack file,
+    // not just this object's compressed data.
+    let mut output = Vec::with_capacity(8192);
     let mut total_consumed = 0usize;
     let mut total_written = 0usize;
-    let mut iterations = 0usize;
 
     loop {
-        iterations += 1;
-        if iterations > 1000 {
-            return Err(Error::decompress());
-        }
-
-        // Extend output buffer if needed
-        if output.len() < total_written + 4096 {
-            output.resize(total_written + 4096, 0);
+        // Grow output buffer with doubling strategy (like Vec):
+        // starts at 8KB, doubles each time, so large objects need few iterations.
+        let available = output.len() - total_written;
+        if available < 4096 {
+            let growth = output.len().max(4096);
+            output.resize(total_written + growth, 0);
         }
 
         let input_slice = &data[total_consumed..];
@@ -63,7 +61,6 @@ pub fn decompress_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
 
         match result.status {
             Ok(MZStatus::Ok) => {
-                // Need more output space or more input
                 if result.bytes_consumed == 0 && result.bytes_written == 0 {
                     return Err(Error::decompress());
                 }
