@@ -99,6 +99,95 @@ impl Command for LsCommand {
 pub static LS_CMD: LsCommand = LsCommand;
 
 // ============================================================================
+// Find Command
+// ============================================================================
+
+/// Find command - list files and directories recursively
+pub struct FindCommand;
+
+impl Command for FindCommand {
+    fn name(&self) -> &'static str {
+        "find"
+    }
+    fn description(&self) -> &'static str {
+        "List files and directories recursively"
+    }
+    fn usage(&self) -> &'static str {
+        "find [path]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let path = if args.is_empty() {
+                ctx.cwd().to_string()
+            } else {
+                let arg_str = core::str::from_utf8(args).unwrap_or(".");
+                ctx.resolve_path(arg_str)
+            };
+
+            if !crate::fs::is_initialized() {
+                let _ = stdout.write(b"Error: Filesystem not initialized\r\n").await;
+                return Ok(());
+            }
+
+            match find_recursive(&path, stdout).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("Error finding files: {}\r\n", e);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Recursively find and list files/directories
+async fn find_recursive(path: &str, stdout: &mut VecWriter) -> Result<(), crate::fs::FsError> {
+    // List directory contents
+    let entries = match async_fs::list_dir(path).await {
+        Ok(e) => e,
+        Err(e) => return Err(e),
+    };
+
+    for entry in entries {
+        // Yield to allow other tasks to run
+        crate::threading::yield_now();
+
+        // Construct full path
+        let full_path = if path == "/" {
+            format!("/{}", entry.name)
+        } else if path.ends_with('/') {
+            format!("{}{}", path, entry.name)
+        } else {
+            format!("{}/{}", path, entry.name)
+        };
+
+        // Print path
+        let line = format!("{}\r\n", full_path);
+        let _ = stdout.write(line.as_bytes()).await;
+
+        // If directory, recurse
+        if entry.is_dir {
+            // Avoid infinite recursion for . and .. (though our FS doesn't usually return them)
+            if entry.name != "." && entry.name != ".." {
+                Box::pin(find_recursive(&full_path, stdout)).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Static instance
+pub static FIND_CMD: FindCommand = FindCommand;
+
+// ============================================================================
 // Cat Command
 // ============================================================================
 
