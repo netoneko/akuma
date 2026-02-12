@@ -36,6 +36,7 @@ pub mod syscall {
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
+    pub const RENAMEAT: u64 = 38;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
@@ -902,6 +903,19 @@ pub fn unlink(path: &str) -> i32 {
         path.len() as u64,
         0, // flags
         0, 0,
+    ) as i32
+}
+
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> i32 {
+    syscall(
+        syscall::RENAMEAT,
+        -100i32 as u64, // AT_FDCWD
+        old_path.as_ptr() as u64,
+        old_path.len() as u64,
+        -100i32 as u64, // AT_FDCWD
+        new_path.as_ptr() as u64,
+        new_path.len() as u64,
     ) as i32
 }
 

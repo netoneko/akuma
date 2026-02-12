@@ -104,6 +104,12 @@ pub async fn remove_dir(path: &str) -> Result<(), FsError> {
     fs::remove_dir(path)
 }
 
+/// Async wrapper for renaming a file or directory
+pub async fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    yield_now().await;
+    fs::rename(old_path, new_path)
+}
+
 /// Async wrapper for checking if path exists
 pub async fn exists(path: &str) -> bool {
     yield_now().await;

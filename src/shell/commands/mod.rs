@@ -18,7 +18,8 @@ pub use builtin::{
 };
 pub use exec::EXEC_CMD;
 pub use fs::{
-    APPEND_CMD, CAT_CMD, DF_CMD, FIND_CMD, LS_CMD, MKDIR_CMD, MOUNT_CMD, MV_CMD, RM_CMD, WRITE_CMD,
+    APPEND_CMD, CAT_CMD, CP_CMD, DF_CMD, FIND_CMD, LS_CMD, MKDIR_CMD, MOUNT_CMD, MV_CMD, RM_CMD,
+    WRITE_CMD,
 };
 pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
 
@@ -100,6 +101,7 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&APPEND_CMD);
     registry.register(&RM_CMD);
     registry.register(&MV_CMD);
+    registry.register(&CP_CMD);
     registry.register(&MKDIR_CMD);
     registry.register(&DF_CMD);
     registry.register(&MOUNT_CMD);

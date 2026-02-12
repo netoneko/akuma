@@ -34,6 +34,7 @@ pub mod nr {
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
+    pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
@@ -109,6 +110,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
+        nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
@@ -281,6 +283,13 @@ fn sys_unlinkat(_dirfd: i32, path_ptr: u64, path_len: usize, _flags: u32) -> u64
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     crate::safe_print!(128, "[syscall] unlinkat: {}\n", path);
     if crate::fs::remove_file(path).is_ok() { 0 } else { !0u64 }
+}
+
+fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, oldpath_len: usize, _newdirfd: i32, newpath_ptr: u64, newpath_len: usize) -> u64 {
+    let oldpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(oldpath_ptr as *const u8, oldpath_len)).unwrap_or("") };
+    let newpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(newpath_ptr as *const u8, newpath_len)).unwrap_or("") };
+    crate::safe_print!(128, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
+    if crate::fs::rename(oldpath, newpath).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {

@@ -220,6 +220,11 @@ pub trait Filesystem: Send + Sync {
     /// Get metadata for a path
     fn metadata(&self, path: &str) -> Result<Metadata, FsError>;
 
+    /// Rename/move a file or directory
+    fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
     /// Get filesystem statistics
     fn stats(&self) -> Result<FsStats, FsError>;
 
@@ -507,6 +512,44 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
 /// Get metadata for a path
 pub fn metadata(path: &str) -> Result<Metadata, FsError> {
     with_fs(path, |fs, rel| fs.metadata(rel))
+}
+
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    // Both paths must be on the same filesystem for an atomic rename
+    let mut old_normalized = normalize_path_owned(old_path);
+    let mut new_normalized = normalize_path_owned(new_path);
+
+    // Apply process scoping (root_dir)
+    if let Some(proc) = crate::process::current_process() {
+        if proc.root_dir != "/" {
+            old_normalized = if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &old_normalized[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, old_normalized)
+            };
+            new_normalized = if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &new_normalized[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, new_normalized)
+            };
+        }
+    }
+
+    let table = MOUNT_TABLE.lock();
+    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+
+    let (old_fs, old_rel) = table.resolve(&old_normalized).ok_or(FsError::NotFound)?;
+    let (new_fs, new_rel) = table.resolve(&new_normalized).ok_or(FsError::NotFound)?;
+
+    // Check if they are the same filesystem instance
+    // Note: We compare filesystem name and root path for now as a proxy for identity
+    // Ideally we'd compare pointers or IDs
+    if old_fs.name() != new_fs.name() {
+        return Err(FsError::NotSupported); // Cross-FS rename not supported
+    }
+
+    old_fs.rename(old_rel, new_rel)
 }
 
 /// Get filesystem statistics for a path

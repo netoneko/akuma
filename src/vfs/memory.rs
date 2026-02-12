@@ -324,6 +324,47 @@ impl Filesystem for MemoryFilesystem {
         }
     }
 
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        let mut root = self.root.lock();
+
+        // 1. Get the node from old_path
+        let (old_parent, old_filename) = Self::navigate_parent(&mut root, old_path)?;
+        let node = old_parent.remove(&old_filename).ok_or(FsError::NotFound)?;
+
+        // 2. Insert into new_path
+        // We need to re-navigate because removing from old_parent might have changed the tree structure 
+        // if old_parent and new_parent are the same or related.
+        // Actually, we need to be careful with borrowing.
+        
+        // Since we already have the node, we just need to find the new parent.
+        // Re-locking or re-navigating might be needed if we didn't use a single lock.
+        // But we have a single lock on the entire root, so we are safe.
+        
+        // We need to re-navigate because we can't have two mutable references to different parts of the tree 
+        // easily without unsafe or RefCell. But since we already removed the node, we can just navigate again.
+        
+        let (new_parent, new_filename) = match Self::navigate_parent(&mut root, new_path) {
+            Ok(p) => p,
+            Err(e) => {
+                // Restore the node if navigation fails
+                let (old_parent_retry, _) = Self::navigate_parent(&mut root, old_path)?;
+                old_parent_retry.insert(old_filename, node);
+                return Err(e);
+            }
+        };
+
+        if new_parent.contains_key(&new_filename) {
+            // Restore the node if destination exists
+            // Linux rename replaces the destination if it's a file, but let's be safe for now
+            let (old_parent_retry, _) = Self::navigate_parent(&mut root, old_path)?;
+            old_parent_retry.insert(old_filename, node);
+            return Err(FsError::AlreadyExists);
+        }
+
+        new_parent.insert(new_filename, node);
+        Ok(())
+    }
+
     fn exists(&self, path: &str) -> bool {
         let root = self.root.lock();
         Self::navigate(&root, path).is_ok()

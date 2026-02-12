@@ -200,6 +200,14 @@ pub fn remove_dir(path: &str) -> Result<(), FsError> {
     vfs::remove_dir(path)
 }
 
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    vfs::rename(old_path, new_path)
+}
+
 /// Check if a file or directory exists
 pub fn exists(path: &str) -> bool {
     if !is_initialized() {
