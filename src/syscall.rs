@@ -7,6 +7,7 @@ use crate::console;
 use crate::config;
 use crate::terminal::mode_flags;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -122,7 +123,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
-        nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5]),
+        nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3], args[4], args[5]),
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize),
         _ => !0 // ENOSYS
     }
@@ -458,22 +459,50 @@ pub struct SpawnOptions {
     pub cwd_len: usize,
     pub root_dir_ptr: u64,
     pub root_dir_len: usize,
+    pub args_ptr: u64,
+    pub args_len: usize,
+    pub stdin_ptr: u64,
+    pub stdin_len: usize,
     pub box_id: u64,
 }
 
-fn sys_spawn(path_ptr: u64, path_len: usize, _args_ptr: u64, _args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
+/// Helper to parse null-separated strings from userspace into a Vec<&str>
+fn parse_args(ptr: u64, len: usize) -> Vec<String> {
+    if ptr == 0 || len == 0 { return Vec::new(); }
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let mut args = Vec::new();
+    let mut start = 0;
+    for i in 0..len {
+        if slice[i] == 0 {
+            if let Ok(s) = core::str::from_utf8(&slice[start..i]) {
+                args.push(String::from(s));
+            }
+            start = i + 1;
+        }
+    }
+    args
+}
+
+fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, None, stdin) {
+    
+    // Parse arguments
+    let args_vec = parse_args(args_ptr, args_len);
+    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
+    let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, args_opt, stdin) {
         crate::process::register_child_channel(pid, ch);
-        if let Some(proc) = crate::process::current_process() { return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32); }
+        if let Some(proc) = crate::process::current_process() {
+            return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+        }
     }
     !0u64
 }
 
-fn sys_spawn_ext(path_ptr: u64, path_len: usize, stdin_ptr: u64, stdin_len: usize, options_ptr: u64, _reserved: u64) -> u64 {
+fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
     
     let options = if options_ptr != 0 {
         Some(unsafe { &*(options_ptr as *const SpawnOptions) })
@@ -481,26 +510,33 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, stdin_ptr: u64, stdin_len: usiz
         None
     };
 
-    let cwd = options.and_then(|o| {
-        if o.cwd_ptr != 0 {
-            Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.cwd_ptr as *const u8, o.cwd_len)).unwrap_or("/") })
-        } else {
-            None
-        }
-    });
+    if options.is_none() { return !0u64; }
+    let o = options.unwrap();
 
-    let root_dir = options.and_then(|o| {
-        if o.root_dir_ptr != 0 {
-            Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.root_dir_ptr as *const u8, o.root_dir_len)).unwrap_or("/") })
-        } else {
-            None
-        }
-    });
+    let cwd = if o.cwd_ptr != 0 {
+        Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.cwd_ptr as *const u8, o.cwd_len)).unwrap_or("/") })
+    } else {
+        None
+    };
 
-    let box_id = options.map(|o| o.box_id).unwrap_or(0);
+    let root_dir = if o.root_dir_ptr != 0 {
+        Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.root_dir_ptr as *const u8, o.root_dir_len)).unwrap_or("/") })
+    } else {
+        None
+    };
+
+    let args_vec = parse_args(o.args_ptr, o.args_len);
+    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
+    let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+
+    let stdin = if o.stdin_ptr != 0 {
+        Some(unsafe { core::slice::from_raw_parts(o.stdin_ptr as *const u8, o.stdin_len) })
+    } else {
+        None
+    };
 
     // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, None, stdin, cwd, root_dir, box_id) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, stdin, cwd, root_dir, o.box_id) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);

@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 libakuma = { path = "../libakuma" }
-alloc = { version = "1.0.0", optional = true }
 
 [[bin]]
 name = "box"

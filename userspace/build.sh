@@ -20,8 +20,8 @@ MEMBERS=(
     "wget"
     "termtest"
     "allocstress"
-    "top",
-    "cat",
+    "top"
+    "cat"
     "box"
 )
 
@@ -51,8 +51,7 @@ BINARIES=(
     "chainlink"
     "termtest"
     "allocstress"
-    "top",
-    "cat",
+    "top"
     "box"
 )
 

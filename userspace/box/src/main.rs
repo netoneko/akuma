@@ -22,13 +22,17 @@ pub struct SpawnOptions {
     pub cwd_len: usize,
     pub root_dir_ptr: u64,
     pub root_dir_len: usize,
+    pub args_ptr: u64,
+    pub args_len: usize,
+    pub stdin_ptr: u64,
+    pub stdin_len: usize,
     pub box_id: u64,
 }
 
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
 
-fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &SpawnOptions) -> Option<SpawnResult> {
+fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
     // Build null-separated args string
     let mut args_buf = Vec::new();
     if let Some(args_slice) = args {
@@ -38,19 +42,23 @@ fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &
         }
     }
 
-    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
-    let args_len = args_buf.len();
+    if !args_buf.is_empty() {
+        options.args_ptr = args_buf.as_ptr() as u64;
+        options.args_len = args_buf.len();
+    }
     
-    let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
-    let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
+    if let Some(s) = stdin {
+        options.stdin_ptr = s.as_ptr() as u64;
+        options.stdin_len = s.len();
+    }
 
     let result = libakuma::syscall(
         SYSCALL_SPAWN_EXT,
         path.as_ptr() as u64,
         path.len() as u64,
-        stdin_ptr,
-        stdin_len,
         options as *const _ as u64,
+        0,
+        0,
         0,
     );
 
@@ -159,11 +167,15 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
         0,
     );
 
-    let options = SpawnOptions {
+    let mut options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
         cwd_len: 1,
         root_dir_ptr: directory.as_ptr() as u64,
         root_dir_len: directory.len(),
+        args_ptr: 0,
+        args_len: 0,
+        stdin_ptr: 0,
+        stdin_len: 0,
         box_id,
     };
 
@@ -178,7 +190,7 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
     let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
     let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
 
-    match spawn_ext(path, args_opt, None, &options) {
+    match spawn_ext(path, args_opt, None, &mut options) {
         Some(res) => {
             print("Started PID ");
             libakuma::print_dec(res.pid as usize);
@@ -297,18 +309,22 @@ fn cmd_use(mut args: libakuma::Args) -> ! {
         }
     }
 
-    let options = SpawnOptions {
+    let mut options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
         cwd_len: 1,
         root_dir_ptr: target_root.unwrap().as_ptr() as u64,
         root_dir_len: target_root.unwrap().len(),
+        args_ptr: 0,
+        args_len: 0,
+        stdin_ptr: 0,
+        stdin_len: 0,
         box_id,
     };
 
     let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
     let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
 
-    match spawn_ext(path, args_opt, None, &options) {
+    match spawn_ext(path, args_opt, None, &mut options) {
         Some(res) => {
             println(&format!("Injected command into box '{}' (PID {})", name, res.pid));
             exit(0);

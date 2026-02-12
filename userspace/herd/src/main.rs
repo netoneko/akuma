@@ -436,6 +436,10 @@ pub struct SpawnOptions {
     pub cwd_len: usize,
     pub root_dir_ptr: u64,
     pub root_dir_len: usize,
+    pub args_ptr: u64,
+    pub args_len: usize,
+    pub stdin_ptr: u64,
+    pub stdin_len: usize,
     pub box_id: u64,
 }
 
@@ -474,14 +478,6 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             0,
         );
 
-        let options = SpawnOptions {
-            cwd_ptr: "/".as_ptr() as u64,
-            cwd_len: 1,
-            root_dir_ptr: config.box_root.as_ptr() as u64,
-            root_dir_len: config.box_root.len(),
-            box_id,
-        };
-
         // Build null-separated args string for internal syscall call
         let mut args_buf = Vec::new();
         if let Some(args_slice) = args_opt {
@@ -493,12 +489,25 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
         let args_len = args_buf.len();
 
+        let options = SpawnOptions {
+            cwd_ptr: "/".as_ptr() as u64,
+            cwd_len: 1,
+            root_dir_ptr: config.box_root.as_ptr() as u64,
+            root_dir_len: config.box_root.len(),
+            args_ptr,
+            args_len,
+            stdin_ptr: 0,
+            stdin_len: 0,
+            box_id,
+        };
+
         let result = libakuma::syscall(
             SYSCALL_SPAWN_EXT,
             config.command.as_ptr() as u64,
             config.command.len() as u64,
-            0, 0, // No stdin for now
             &options as *const _ as u64,
+            0,
+            0,
             0,
         );
 
