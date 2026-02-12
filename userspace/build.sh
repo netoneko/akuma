@@ -34,6 +34,7 @@ mkdir -p ../bootstrap/bin
 # Copy binaries (only if they exist)
 BINARIES=(
     "hello"
+    "cat"
     "echo2"
     "stackstress"
     "stdcheck"
