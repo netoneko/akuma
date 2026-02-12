@@ -124,10 +124,9 @@ impl ObjectStore {
     pub fn write_raw(&self, data: &[u8]) -> Result<Sha1Hash> {
         let sha = sha1::hash(data);
         
-        // Check if already exists
-        if self.exists(&sha) {
-            return Ok(sha);
-        }
+        // Always write the file even if it exists - a previous failed clone
+        // may have left corrupt object files that need to be overwritten.
+        // O_TRUNC ensures the file is truncated before writing.
         
         // Compress
         let compressed = zlib::compress(data);

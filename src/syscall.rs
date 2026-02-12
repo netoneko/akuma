@@ -193,6 +193,11 @@ fn sys_brk(new_brk: usize) -> u64 {
 fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u32) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     if let Some(proc) = crate::process::current_process() {
+        // Handle O_TRUNC: truncate existing file to zero length
+        if flags & crate::process::open_flags::O_TRUNC != 0 {
+            // Only truncate if file exists; ignore errors (file might not exist yet with O_CREAT)
+            let _ = crate::fs::write_file(path, &[]);
+        }
         let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.into(), flags)));
         fd as u64
     } else { !0u64 }
