@@ -564,48 +564,64 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
             checkout_tree_recursive(store, &entry.sha, &path, file_count)?;
         } else {
             // Write file
-            let blob_obj = match store.read(&entry.sha) {
-                Ok(obj) => obj,
-                Err(e) => {
-                    print("scratch: checkout: blob ");
-                    print(&crate::sha1::to_hex(&entry.sha));
-                    print(" (");
+            
+            // Warn BEFORE reading/decompressing the full content
+            if let Ok((_obj_type, size)) = store.read_info(&entry.sha) {
+                if size > 300 * 1024 {
+                    print("\nscratch: warning: checking out large file ");
                     print(&entry.name);
-                    print("): ");
-                    print(e.message());
+                    print(" (");
+                    print_num(size / 1024);
+                    print(" KB)");
+                    if size > 5 * 1024 * 1024 {
+                        print(" - WARNING: MASSIVE FILE");
+                    }
                     print("\n");
-                    return Err(e);
                 }
-            };
-            let content = blob_obj.as_blob()?;
-            let size = content.len();
-
-            if size > 300 * 1024 {
-                print("\nscratch: warning: checking out large file ");
-                print(&entry.name);
-                print(" (");
-                print_num(size / 1024);
-                print(" KB)\n");
             }
 
-            let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-            if fd >= 0 {
-                let chunk_size = 65536;
-                let mut written = 0;
-                while written < size {
-                    let to_write = core::cmp::min(size - written, chunk_size);
-                    let n = write_fd(fd, &content[written..written + to_write]);
-                    if n <= 0 {
-                        break;
-                    }
-                    written += n as usize;
-                    if written % chunk_size == 0 || written == size {
+            // Now perform the full read/write
+            if let Ok((_obj_type, content)) = store.read_raw_content(&entry.sha) {
+                let size = content.len();
+                let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+                if fd >= 0 {
+                    let chunk_size = 64 * 1024;
+                    let mut written = 0;
+                    while written < size {
+                        let to_write = core::cmp::min(size - written, chunk_size);
+                        let n = write_fd(fd, &content[written..written + to_write]);
+                        if n <= 0 {
+                            break;
+                        }
+                        written += n as usize;
                         if size >= chunk_size {
                             print(".");
                         }
                     }
+                    close(fd);
                 }
-                close(fd);
+            } else {
+                // Fallback to standard read if optimized read fails
+                let blob_obj = match store.read(&entry.sha) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        print("scratch: checkout: blob ");
+                        print(&crate::sha1::to_hex(&entry.sha));
+                        print(" (");
+                        print(&entry.name);
+                        print("): ");
+                        print(e.message());
+                        print("\n");
+                        return Err(e);
+                    }
+                };
+                let content = blob_obj.as_blob()?;
+                let size = content.len();
+                let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+                if fd >= 0 {
+                    let _ = write_fd(fd, content);
+                    close(fd);
+                }
             }
 
             *file_count += 1;

@@ -89,10 +89,54 @@ impl ObjectStore {
         Object::parse(&decompressed)
     }
 
+    /// Read an object's type and size without decompressing the entire content.
+    pub fn read_info(&self, sha: &Sha1Hash) -> Result<(ObjectType, usize)> {
+        let path = self.object_path(sha);
+        let fd = open(&path, open_flags::O_RDONLY);
+        if fd < 0 {
+            return Err(Error::object_not_found());
+        }
+
+        // Read just the first 1KB of compressed data - usually enough for the header
+        let mut compressed = [0u8; 1024];
+        let n = read_fd(fd, &mut compressed);
+        close(fd);
+        
+        if n <= 0 {
+            return Err(Error::io("failed to read object"));
+        }
+
+        // Decompress just the beginning
+        let mut decompressed = [0u8; 128];
+        let (_, written) = zlib::decompress_header(&compressed[..n as usize], &mut decompressed)?;
+
+        // Find the null byte separating header from content
+        let null_pos = decompressed[..written].iter().position(|&b| b == 0)
+            .ok_or_else(|| Error::invalid_object("missing null byte in header"))?;
+
+        let header = core::str::from_utf8(&decompressed[..null_pos])
+            .map_err(|_| Error::invalid_object("invalid UTF-8 in header"))?;
+
+        // Parse "{type} {size}"
+        let mut parts = header.split(' ');
+        let type_str = parts.next()
+            .ok_or_else(|| Error::invalid_object("missing type in header"))?;
+        let size_str = parts.next()
+            .ok_or_else(|| Error::invalid_object("missing size in header"))?;
+
+        let obj_type = ObjectType::from_str(type_str)
+            .ok_or_else(|| Error::invalid_object("unknown object type"))?;
+
+        let size: usize = size_str.parse()
+            .map_err(|_| Error::invalid_object("invalid size in header"))?;
+
+        Ok((obj_type, size))
+    }
+
     /// Read an object's raw content (after decompression, without parsing)
     pub fn read_raw_content(&self, sha: &Sha1Hash) -> Result<(ObjectType, Vec<u8>)> {
         let compressed = self.read_raw_compressed(sha)?;
-        let decompressed = zlib::decompress(&compressed)?;
+        let mut decompressed = zlib::decompress(&compressed)?;
         
         // Parse just the header to get type and size
         let null_pos = decompressed.iter().position(|&b| b == 0)
@@ -108,8 +152,13 @@ impl ObjectStore {
         let obj_type = ObjectType::from_str(type_str)
             .ok_or_else(|| Error::invalid_object("unknown type"))?;
         
-        let content = decompressed[null_pos + 1..].to_vec();
-        Ok((obj_type, content))
+        // Move content to the beginning and truncate to avoid a new allocation (8MB+ save)
+        let content_start = null_pos + 1;
+        let content_len = decompressed.len() - content_start;
+        decompressed.copy_within(content_start.., 0);
+        decompressed.truncate(content_len);
+        
+        Ok((obj_type, decompressed))
     }
 
     /// Write an object to the store

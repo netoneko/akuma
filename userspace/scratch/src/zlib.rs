@@ -15,6 +15,17 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| Error::decompress())
 }
 
+/// Decompress only the beginning of a zlib stream to extract headers.
+/// Returns (bytes_consumed, bytes_written)
+pub fn decompress_header(data: &[u8], out: &mut [u8]) -> Result<(usize, usize)> {
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let result = inflate(&mut state, data, out, MZFlush::None);
+    match result.status {
+        Ok(_) => Ok((result.bytes_consumed, result.bytes_written)),
+        Err(_) => Err(Error::decompress()),
+    }
+}
+
 /// Compress data with zlib
 pub fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
