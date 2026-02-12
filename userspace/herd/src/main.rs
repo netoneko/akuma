@@ -51,21 +51,23 @@ const HERD_LOG_DIR: &str = "/var/log/herd";
 fn ensure_directories() {
     // Create /etc/herd/enabled
     if mkdir_p(HERD_ENABLED_DIR) {
-        print("[herd] Created ");
+        // Only print if we are sure it didn't exist or we don't care to be too verbose
+    } else {
+        print("[herd] Warning: Failed to create ");
         print(HERD_ENABLED_DIR);
         print("\n");
     }
     
     // Create /etc/herd/available
-    if mkdir_p(HERD_AVAILABLE_DIR) {
-        print("[herd] Created ");
+    if !mkdir_p(HERD_AVAILABLE_DIR) {
+        print("[herd] Warning: Failed to create ");
         print(HERD_AVAILABLE_DIR);
         print("\n");
     }
     
     // Create /var/log/herd
-    if mkdir_p(HERD_LOG_DIR) {
-        print("[herd] Created ");
+    if !mkdir_p(HERD_LOG_DIR) {
+        print("[herd] Warning: Failed to create ");
         print(HERD_LOG_DIR);
         print("\n");
     }
@@ -640,13 +642,14 @@ fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
     Some(content)
 }
 
-fn write_file(path: &str, data: &[u8]) {
+fn write_file(path: &str, data: &[u8]) -> bool {
     let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
-        return;
+        return false;
     }
     write_fd(fd, data);
     close(fd);
+    true
 }
 
 fn append_file(path: &str, data: &[u8]) {
@@ -735,15 +738,20 @@ fn cmd_add(name: &str) {
         name, name, DEFAULT_RESTART_DELAY_MS, DEFAULT_MAX_RETRIES
     );
     
-    write_file(&path, default_config.as_bytes());
-    print("Created service '");
-    print(name);
-    print("' in ");
-    print(HERD_AVAILABLE_DIR);
-    print("/\n");
-    print("Edit this file and then run 'herd enable ");
-    print(name);
-    print("' to start it.\n");
+    if write_file(&path, default_config.as_bytes()) {
+        print("Created service '");
+        print(name);
+        print("' in ");
+        print(HERD_AVAILABLE_DIR);
+        print("/\n");
+        print("Edit this file and then run 'herd enable ");
+        print(name);
+        print("' to start it.\n");
+    } else {
+        print("Error: Failed to create service configuration at ");
+        print(&path);
+        print("\n");
+    }
 }
 
 fn cmd_config(name: &str) {
@@ -809,11 +817,18 @@ fn cmd_enable(name: &str) {
     };
     
     // Write to enabled
-    write_file(&dst_path, &content);
-    print("Enabled service '");
-    print(name);
-    print("'\n");
-    print("Service will start on next config reload (within 20s) or reboot.\n");
+    if write_file(&dst_path, &content) {
+        print("Enabled service '");
+        print(name);
+        print("'\n");
+        print("Service will start on next config reload (within 20s) or reboot.\n");
+    } else {
+        print("Error: Failed to enable service '");
+        print(name);
+        print("'. Could not write to ");
+        print(&dst_path);
+        print("\n");
+    }
 }
 
 fn cmd_disable(name: &str) {
