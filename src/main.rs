@@ -750,8 +750,22 @@ fn run_async_main() -> ! {
         }
 
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
-        // Poll network stack (drives interface, timers, retransmits)
-        smoltcp_net::poll();
+        // Poll network stack in a loop until no more progress.
+        // Each poll() may only process one RX packet (single VirtIO buffer),
+        // so we need to loop to drain bursts of incoming packets. This is
+        // critical for bulk transfer throughput (e.g. git clone over SSH):
+        // without draining, TCP ACKs/window updates are delayed until the
+        // next scheduler slot, causing the remote sender's TCP window to
+        // shrink and throughput to collapse.
+        {
+            let mut polls = 0u32;
+            while smoltcp_net::poll() {
+                polls += 1;
+                if polls >= 64 {
+                    break; // Safety cap to avoid starving other threads
+                }
+            }
+        }
         
         GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {

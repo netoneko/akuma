@@ -37,7 +37,11 @@ pub extern "C" fn _start() -> ! {
         hide_cursor();
     }
 
+    // Pre-populate last_stats with real data to avoid astronomical CPU%
+    // on the first frame (where delta_time would be near-zero and
+    // delta_cpu_time would be total accumulated time since boot).
     let mut last_stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
+    get_cpu_stats(&mut last_stats);
     let mut last_time = uptime();
 
     loop {
@@ -152,9 +156,11 @@ fn print_u64_fixed(val: u64, width: usize) {
 }
 
 fn print_f64_fixed(val: f64, _precision: usize) {
-    let whole = val as u64;
+    // Clamp to 100.0% max (a single core can't exceed 100%)
+    let clamped = if val > 100.0 { 100.0 } else { val };
+    let whole = clamped as u64;
     print_u64_fixed(whole, 3);
     print(".");
-    let frac = ((val - whole as f64) * 10.0) as u64;
+    let frac = ((clamped - whole as f64) * 10.0) as u64;
     print_u64_fixed(frac % 10, 1);
 }

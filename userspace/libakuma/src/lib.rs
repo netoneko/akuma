@@ -1198,9 +1198,9 @@ pub fn clear_screen() -> i32 {
 pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
     let ret = syscall(
         syscall::POLL_INPUT_EVENT,
-        timeout_ms,
         event_buf.as_mut_ptr() as u64,
         event_buf.len() as u64,
+        timeout_ms * 1000, // convert ms to us (kernel expects microseconds)
         0, 0, 0,
     ) as i64;
 
