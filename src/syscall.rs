@@ -58,6 +58,7 @@ pub mod nr {
 pub struct ThreadCpuStat {
     pub tid: u32,
     pub pid: u32,
+    pub box_id: u64,
     pub total_time_us: u64,
     pub state: u8,
     pub _reserved: [u8; 3],
@@ -699,7 +700,27 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
 fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
     let count = max.min(config::MAX_THREADS);
     for i in 0..count {
-        let mut stat = ThreadCpuStat { tid: i as u32, total_time_us: crate::threading::get_thread_cpu_time(i), state: crate::threading::get_thread_state(i), ..Default::default() };
+        let mut stat = ThreadCpuStat {
+            tid: i as u32,
+            total_time_us: crate::threading::get_thread_cpu_time(i),
+            state: crate::threading::get_thread_state(i),
+            ..Default::default()
+        };
+
+        // Lookup PID and name from process table
+        if let Some(pid) = crate::process::find_pid_by_thread(i) {
+            stat.pid = pid;
+            if let Some(proc) = crate::process::lookup_process(pid) {
+                stat.box_id = proc.box_id;
+                let name_bytes = proc.name.as_bytes();
+                let to_copy = name_bytes.len().min(stat.name.len());
+                stat.name[..to_copy].copy_from_slice(&name_bytes[..to_copy]);
+            }
+        } else if i == 0 {
+            // Thread 0 is special (Kernel/Idle)
+            stat.name[..6].copy_from_slice(b"kernel");
+        }
+
         unsafe { core::ptr::write_volatile((ptr as *mut ThreadCpuStat).add(i), stat); }
     }
     count as u64

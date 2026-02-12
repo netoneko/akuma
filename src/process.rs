@@ -688,6 +688,7 @@ pub fn get_stack_bounds() -> (usize, usize) {
 pub struct ProcessInfo2 {
     pub pid: Pid,
     pub ppid: Pid,
+    pub box_id: u64,
     pub name: String,
     pub state: &'static str,
 }
@@ -713,6 +714,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
             result.push(ProcessInfo2 {
                 pid,
                 ppid: proc.parent_pid,
+                box_id: proc.box_id,
                 name: proc.name.clone(),
                 state,
             });

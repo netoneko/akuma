@@ -55,8 +55,8 @@ pub extern "C" fn _start() -> ! {
         }
 
         println("Akuma OS - CPU Stats (press 'q' to quit)");
-        println("TID  PID  STATE       CPU%   TIME(ms)  NAME");
-        println("--------------------------------------------------");
+        println("TID  PID  BOX  STATE       CPU%   TIME(ms)  NAME");
+        println("-------------------------------------------------------");
 
         for i in 0..count {
             let cur = &current_stats[i];
@@ -83,6 +83,8 @@ pub extern "C" fn _start() -> ! {
             print_u32_fixed(cur.tid, 3);
             print("  ");
             print_u32_fixed(cur.pid, 3);
+            print("  ");
+            print_u64_fixed(cur.box_id, 3);
             print("  ");
             print(state_str);
             print("  ");

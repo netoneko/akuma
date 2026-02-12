@@ -61,6 +61,7 @@ pub mod syscall {
 pub struct ThreadCpuStat {
     pub tid: u32,
     pub pid: u32,
+    pub box_id: u64,
     pub total_time_us: u64,
     pub state: u8,
     pub _reserved: [u8; 3],

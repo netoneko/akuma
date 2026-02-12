@@ -465,7 +465,7 @@ impl Command for PsCommand {
             use crate::process;
 
             // Header
-            let _ = stdout.write(b"  PID  PPID  STATE     NAME\r\n").await;
+            let _ = stdout.write(b"  PID  PPID  BOX  STATE     NAME\r\n").await;
 
             let procs = process::list_processes();
 
@@ -474,8 +474,8 @@ impl Command for PsCommand {
             } else {
                 for p in procs {
                     let line = format!(
-                        "{:>5}  {:>4}  {:<8}  {}\r\n",
-                        p.pid, p.ppid, p.state, p.name
+                        "{:>5}  {:>4}  {:>3}  {:<8}  {}\r\n",
+                        p.pid, p.ppid, p.box_id, p.state, p.name
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }
