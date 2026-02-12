@@ -565,22 +565,82 @@ fn sys_clear_screen() -> u64 {
     write_to_process_channel(b"\x1b[2J")
 }
 
-fn sys_poll_input_event(ptr: u64, count: usize, timeout_us: u64) -> u64 {
-    let deadline = if timeout_us == !0 { !0 } else { crate::timer::uptime_us() + timeout_us };
-    if let Some(proc) = crate::process::current_process() {
+fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64,
+    };
+
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let mut kernel_buf = alloc::vec![0u8; buf_len];
+    let bytes_read;
+
+    if timeout_us == 0 {
+        // Non-blocking read
+        bytes_read = proc_channel.read_stdin(&mut kernel_buf);
+    } else {
+        // Blocking or timed read
+        let deadline = if timeout_us == u64::MAX {
+            u64::MAX
+        } else {
+            crate::timer::uptime_us() + timeout_us
+        };
+
         loop {
-            let mut buf = [0u8; 128];
-            let n = proc.terminal_state.lock().read_input(&mut buf);
-            if n > 0 { 
-                let to_copy = n.min(count);
-                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, to_copy); } 
-                return to_copy as u64; 
+            // CRITICAL: Register waker BEFORE checking for data to avoid lost wake-up race
+            {
+                crate::threading::disable_preemption();
+                let mut term_state = term_state_lock.lock();
+                let thread_id = crate::threading::current_thread_id();
+                term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
+                crate::threading::enable_preemption();
             }
-            if crate::timer::uptime_us() >= deadline { return 0; }
+
+            // Check for data AFTER registering waker
+            let n = proc_channel.read_stdin(&mut kernel_buf);
+            if n > 0 {
+                bytes_read = n;
+                break;
+            }
+
+            if crate::process::is_current_interrupted() {
+                return (-libc_errno::EINTR as i64) as u64;
+            }
+
+            if crate::timer::uptime_us() >= deadline {
+                bytes_read = 0;
+                break;
+            }
+
+            // Yield, will be woken by SSH if input arrives (calling waker.wake())
             crate::threading::schedule_blocking(deadline);
+
+            // Clear waker after being woken up or timeout
+            {
+                crate::threading::disable_preemption();
+                let mut term_state = term_state_lock.lock();
+                term_state.input_waker.lock().take();
+                crate::threading::enable_preemption();
+            }
         }
     }
-    0
+
+    if bytes_read > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, bytes_read);
+        }
+        bytes_read as u64
+    } else {
+        0
+    }
 }
 
 fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
