@@ -578,15 +578,33 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                 }
             };
             let content = blob_obj.as_blob()?;
+            let size = content.len();
 
-            // Print a dot for large files (>64KB) since they take a while
-            if content.len() > 65536 {
-                print(".");
+            if size > 300 * 1024 {
+                print("\nscratch: warning: checking out large file ");
+                print(&entry.name);
+                print(" (");
+                print_num(size / 1024);
+                print(" KB)\n");
             }
 
             let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
             if fd >= 0 {
-                let _ = write_fd(fd, content);
+                let chunk_size = 65536;
+                let mut written = 0;
+                while written < size {
+                    let to_write = core::cmp::min(size - written, chunk_size);
+                    let n = write_fd(fd, &content[written..written + to_write]);
+                    if n <= 0 {
+                        break;
+                    }
+                    written += n as usize;
+                    if written % chunk_size == 0 || written == size {
+                        if size >= chunk_size {
+                            print(".");
+                        }
+                    }
+                }
                 close(fd);
             }
 
