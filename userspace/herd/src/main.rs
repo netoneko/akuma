@@ -270,6 +270,7 @@ fn main() {
         if now_ms.saturating_sub(state.last_config_reload_ms) >= CONFIG_RELOAD_INTERVAL_MS {
             print("[herd] Reloading config...\n");
             reload_config(&mut state);
+            start_stopped_services(&mut state);
             state.last_config_reload_ms = now_ms;
         }
 
