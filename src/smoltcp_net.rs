@@ -146,6 +146,12 @@ impl Device for VirtioSmoltcpDevice {
             let token = self.rx_token.take().unwrap();
             match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
                 Ok((hdr_len, pkt_len)) => {
+                    // Validate buffer bounds — a malformed VirtIO response could
+                    // report hdr_len + pkt_len > buffer size, causing an out-of-bounds
+                    // slice that corrupts adjacent memory (e.g. NETWORK static fields).
+                    if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
+                        return None;
+                    }
                     let rx = VirtioRxToken {
                         buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
                     };
@@ -286,6 +292,10 @@ impl Device for LoopbackAwareDevice {
                     .receive_complete(token, &mut self.virtio.rx_buffer)
             } {
                 Ok((hdr_len, pkt_len)) => {
+                    // Validate buffer bounds — see VirtioSmoltcpDevice::receive()
+                    if hdr_len.saturating_add(pkt_len) > self.virtio.rx_buffer.len() {
+                        return None;
+                    }
                     let rx = LoopbackAwareRxToken::Virtio(unsafe {
                         core::slice::from_raw_parts_mut(
                             self.virtio.rx_buffer.as_mut_ptr().add(hdr_len),
@@ -524,6 +534,17 @@ pub fn poll() -> bool {
         let mut i = 0;
         while i < net.pending_removal.len() {
             let handle = net.pending_removal[i];
+            // Skip handles that have been corrupted — remove them from
+            // the pending list without touching the socket set.
+            if !is_valid_handle(handle) {
+                crate::safe_print!(
+                    128,
+                    "[NET] CORRUPT HANDLE in poll GC: handle={}\n",
+                    handle
+                );
+                net.pending_removal.swap_remove(i);
+                continue;
+            }
             let should_remove = match net.sockets.get::<tcp::Socket>(handle).state() {
                 tcp::State::Closed => true,
                 _ => false,
@@ -645,6 +666,9 @@ pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, Socke
 
     // Wait for connection to be established
     core::future::poll_fn(|cx| {
+        if !is_valid_handle(handle) {
+            return Poll::Ready(Err(TcpError::WriteError));
+        }
         // Drive the network stack forward
         poll();
         with_network(|net| {
@@ -687,6 +711,14 @@ pub fn socket_create() -> Option<SocketHandle> {
 }
 
 pub fn socket_close(handle: SocketHandle) {
+    if !is_valid_handle(handle) {
+        crate::safe_print!(
+            128,
+            "[NET] CORRUPT HANDLE in socket_close: handle={}\n",
+            handle
+        );
+        return;
+    }
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
@@ -718,11 +750,36 @@ impl embedded_io_async::Error for TcpError {
 
 pub struct TcpStream {
     handle: SocketHandle,
+    /// Cached socket index for corruption detection. Must always be < MAX_SOCKETS.
+    handle_index: usize,
+}
+
+/// Extract the internal index from a SocketHandle.
+///
+/// SocketHandle is a newtype wrapper around a single `usize` field (the socket
+/// set index). Since it has no public accessor, we use transmute to read it.
+/// This is safe because SocketHandle contains exactly one usize and both types
+/// have identical size and alignment.
+fn socket_handle_index(handle: SocketHandle) -> usize {
+    // Safety: SocketHandle(usize) is a single-field struct with the same
+    // layout as usize. Verified by the static_assert below.
+    const _: () = assert!(
+        core::mem::size_of::<SocketHandle>() == core::mem::size_of::<usize>()
+    );
+    unsafe { core::mem::transmute::<SocketHandle, usize>(handle) }
+}
+
+/// Check if a SocketHandle index is within the valid range for our socket set.
+fn is_valid_handle(handle: SocketHandle) -> bool {
+    socket_handle_index(handle) < MAX_SOCKETS
 }
 
 impl TcpStream {
     pub fn new(handle: SocketHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            handle_index: socket_handle_index(handle),
+        }
     }
 }
 
@@ -733,6 +790,18 @@ impl embedded_io_async::ErrorType for TcpStream {
 impl embedded_io_async::Read for TcpStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         core::future::poll_fn(|cx| {
+            // Validate handle before accessing the socket set. A corrupted
+            // async state machine could overwrite handle_index with garbage;
+            // catch it here instead of panicking inside smoltcp's get_mut.
+            if self.handle_index >= MAX_SOCKETS {
+                crate::safe_print!(
+                    128,
+                    "[NET] CORRUPT HANDLE in TcpStream::read: index={}, handle={}\n",
+                    self.handle_index,
+                    self.handle
+                );
+                return Poll::Ready(Err(TcpError::ReadError));
+            }
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_recv() {
@@ -758,6 +827,15 @@ impl embedded_io_async::Read for TcpStream {
 impl embedded_io_async::Write for TcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         core::future::poll_fn(|cx| {
+            if self.handle_index >= MAX_SOCKETS {
+                crate::safe_print!(
+                    128,
+                    "[NET] CORRUPT HANDLE in TcpStream::write: index={}, handle={}\n",
+                    self.handle_index,
+                    self.handle
+                );
+                return Poll::Ready(Err(TcpError::WriteError));
+            }
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_send() {
@@ -777,6 +855,15 @@ impl embedded_io_async::Write for TcpStream {
     
     async fn flush(&mut self) -> Result<(), Self::Error> {
         core::future::poll_fn(|cx| {
+            if self.handle_index >= MAX_SOCKETS {
+                crate::safe_print!(
+                    128,
+                    "[NET] CORRUPT HANDLE in TcpStream::flush: index={}, handle={}\n",
+                    self.handle_index,
+                    self.handle
+                );
+                return Poll::Ready(Err(TcpError::WriteError));
+            }
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.send_queue() == 0 {
