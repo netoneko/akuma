@@ -309,6 +309,7 @@ where
     let mut temp = [0u8; 4096];
     let mut headers_parsed = false;
     let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
     let mut chunk_state = ChunkedState::new();
     let mut total_bytes = 0usize;
     let mut last_progress = 0usize;
@@ -329,6 +330,13 @@ where
                         }
                         
                         is_chunked = chunked;
+                        if !is_chunked {
+                            for (name, value) in &headers {
+                                if name.eq_ignore_ascii_case("Content-Length") {
+                                    content_length = value.trim().parse::<usize>().ok();
+                                }
+                            }
+                        }
                         headers_parsed = true;
                         
                         // Process any body data that came with headers
@@ -387,7 +395,22 @@ where
                 }
             }
             Err(_) => {
-                print("\nscratch: TLS read error, stopping\n");
+                if total_bytes == 0 {
+                    return Err(Error::network("TLS read error before receiving data"));
+                }
+                // Chunked: must have seen the final zero-length chunk
+                if is_chunked && !chunk_state.done {
+                    return Err(Error::network("TLS connection lost during chunked transfer"));
+                }
+                // Non-chunked with Content-Length: must have received all bytes
+                if let Some(expected) = content_length {
+                    if total_bytes < expected {
+                        return Err(Error::network("TLS connection lost, download incomplete"));
+                    }
+                }
+                // Non-chunked without Content-Length (Connection: close):
+                // TLS EOF is the normal end-of-stream signal; some servers
+                // close TCP without a clean TLS close_notify, so this is ok.
                 break;
             }
         }

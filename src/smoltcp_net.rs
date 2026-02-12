@@ -675,6 +675,13 @@ pub fn socket_create() -> Option<SocketHandle> {
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
+        // Disable delayed ACK (default is 10ms). With delayed ACK, smoltcp
+        // waits 10ms before sending an ACK, hoping to piggyback it on data.
+        // For receive-heavy workloads (downloads), there's no outgoing data to
+        // piggyback on, so every ACK is delayed by 10ms. This limits throughput
+        // to ~65KB/10ms = 6.5 MB/s theoretical max, and much less in practice
+        // due to scheduler delays. It also slows SSH handshakes under load.
+        socket.set_ack_delay(None);
         net.sockets.add(socket)
     })
 }

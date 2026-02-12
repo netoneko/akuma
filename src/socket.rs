@@ -218,15 +218,25 @@ pub fn remove_socket(idx: usize) {
 // Socket Operations (Blocking with Yield)
 // ============================================================================
 
-/// Helper to poll and yield until a condition is met or timeout
+/// Helper to poll and yield until a condition is met or timeout.
+///
+/// Drains all pending network work before checking the condition, since the
+/// calling thread is about to block anyway. This ensures TCP ACKs, window
+/// updates, and retransmissions are processed promptly.
 fn wait_until<F>(mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
 where F: FnMut() -> bool
 {
     let start = crate::timer::uptime_us();
-    let mut last_poll = smoltcp_net::poll_count();
     
     loop {
-        smoltcp_net::poll();
+        // Drain all pending network work (not just one poll)
+        let mut any_progress = false;
+        for _ in 0..64 {
+            if !smoltcp_net::poll() {
+                break;
+            }
+            any_progress = true;
+        }
 
         if condition() {
             return Ok(());
@@ -242,11 +252,9 @@ where F: FnMut() -> bool
             }
         }
 
-        let current_poll = smoltcp_net::poll_count();
-        if current_poll == last_poll {
+        if !any_progress {
             crate::threading::yield_now();
         }
-        last_poll = current_poll;
     }
 }
 
@@ -405,6 +413,9 @@ pub fn socket_send(idx: usize, buf: &[u8]) -> Result<usize, i32> {
         socket.send_slice(buf).map_err(|_| libc_errno::EIO)
     });
     
+    // Poll immediately to transmit the queued data without waiting for thread 0
+    smoltcp_net::poll();
+    
     match res {
         Some(r) => r,
         None => Err(libc_errno::ENETDOWN),
@@ -431,6 +442,13 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
             }).map_err(|_| libc_errno::EIO)
         } else if !socket.is_active() { Ok(0) } else { Err(libc_errno::EAGAIN) }
     });
+    
+    // Poll immediately after recv to send TCP window update ACK.
+    // Reading data frees RX buffer space, but the updated window is only
+    // advertised to the remote when the next ACK goes out. Without this,
+    // the window update waits until thread 0 polls, causing the remote
+    // sender to stall with a shrunken/zero window.
+    smoltcp_net::poll();
     
     match res {
         Some(r) => r,

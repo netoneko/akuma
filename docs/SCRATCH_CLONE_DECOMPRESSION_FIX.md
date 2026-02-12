@@ -2,21 +2,30 @@
 
 ## Symptom
 
-`scratch clone` fails during checkout with "zlib decompression failed" even though
-all 908 pack objects were fetched and stored successfully:
+`scratch clone` fails during checkout with "zlib decompression failed":
 
 ```
-scratch: decompress done consumed=34 output=25
-scratch: stored 908 objects
 scratch: stored 908 objects
 scratch: HEAD set to main
 scratch: checking out files
 scratch: clone failed: zlib decompression failed
 ```
 
+Or, with larger repos, the TLS connection drops mid-download but the clone
+continues anyway with a truncated pack:
+
+```
+scratch: received 194 KB (58 kbps)
+scratch: TLS read error, stopping
+scratch: download finished, total 255 KB (80 kbps)
+scratch: downloaded 245771 bytes
+scratch: parsing pack file...
+scratch: pack contains 3763 objects
+```
+
 ## Root Cause
 
-Two interacting bugs:
+Three interacting bugs:
 
 ### 1. `sys_openat` ignores `O_TRUNC`
 
@@ -73,6 +82,31 @@ Removed the `exists()` early return from `write_raw()`. Objects are always fresh
 compressed and written with `O_TRUNC`, ensuring the data on disk matches what was
 just decompressed from the pack. The slight extra cost of recompression is
 negligible for scratch's use case.
+
+### `userspace/scratch/src/stream.rs` — TLS errors must not be swallowed
+
+`process_pack_streaming` had:
+
+```rust
+Err(_) => {
+    print("\nscratch: TLS read error, stopping\n");
+    break;  // returns Ok(()) — caller parses truncated pack!
+}
+```
+
+A TLS read error broke out of the loop and returned `Ok(())`. The caller then
+parsed the truncated pack file, which either failed during decompression or
+produced corrupt objects. This was the primary trigger for the error.
+
+Fixed to return `Err(...)` when:
+
+- No body data has been received at all.
+- Chunked transfer has not seen the final zero-length chunk.
+- Content-Length is known and total received bytes are less than expected.
+
+A TLS error is only tolerated for non-chunked responses without Content-Length
+(pure `Connection: close`), where some servers drop TCP without a clean TLS
+`close_notify`.
 
 ## Related
 

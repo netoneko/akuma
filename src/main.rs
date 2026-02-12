@@ -757,9 +757,11 @@ fn run_async_main() -> ! {
         // without draining, TCP ACKs/window updates are delayed until the
         // next scheduler slot, causing the remote sender's TCP window to
         // shrink and throughput to collapse.
+        let mut net_progress = false;
         {
             let mut polls = 0u32;
             while smoltcp_net::poll() {
+                net_progress = true;
                 polls += 1;
                 if polls >= 64 {
                     break; // Safety cap to avoid starving other threads
@@ -788,7 +790,12 @@ fn run_async_main() -> ! {
         }
         
         GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
-        threading::yield_now();
+        // Only yield when idle. During active network transfers, keep running
+        // to process packets as fast as possible. The preemptive scheduler
+        // (10ms timer) still ensures other threads get CPU time.
+        if !net_progress {
+            threading::yield_now();
+        }
     }
 }
 
