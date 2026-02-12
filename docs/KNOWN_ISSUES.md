@@ -74,26 +74,88 @@ Likely causes:
 
 ## 3. SSH terminal rewriting is broken (no proper cursor movement)
 
-**Status:** Open
-**Component:** SSH server / PTY layer
+**Status:** Open — root cause identified
+**Component:** `src/syscall.rs` (terminal syscalls), `src/shell/mod.rs` (streaming loop)
 
 When connected via SSH, programs that repaint the terminal (e.g. `top`, `meow`,
 any fullscreen TUI) do not clear/reposition the cursor properly. Instead of
 redrawing in place, output appears to scroll continuously in a single moving
 line, making interactive programs unusable over SSH.
 
-**Symptoms:**
+**Example output (meow):**
 
-- Screen content is appended rather than overwritten.
-- ANSI escape sequences for cursor positioning (`\x1b[H`, `\x1b[2J`, etc.)
-  appear to be ignored or not transmitted correctly.
-- Works fine over the direct UART/telnet console.
+Each render cycle's footer is appended instead of drawn in place, producing an
+endlessly growing stream of repeated status bars:
 
-Likely causes:
+```
+...━━━━━━━━  [Provider: ollama] [Model: gemma3:4b]  [2k/128k|24K|Hist: 2K] (=^･ω･^=) >
+  [MEOW] awaiting user input.....━━━━━━━━  [Provider: ollama] [Model: gemma3:4b] ...
+```
 
-- The SSH channel is not advertising terminal capabilities correctly (missing
-  `TERM` environment variable or pty allocation).
-- Escape sequences are being filtered or corrupted in the SSH data path.
-- The SSH server's PTY emulation does not handle cursor-addressing escapes.
-- Window-size (`SIGWINCH` equivalent) is not being forwarded, causing programs
-  to assume a 0×0 or 1-column terminal.
+### Root cause: terminal control syscalls are all stubs
+
+All six terminal syscalls (307-312) in `src/syscall.rs:108-113` return `0`
+without doing anything:
+
+```rust
+nr::SET_TERMINAL_ATTRIBUTES => 0,  // 307 — should set raw mode
+nr::GET_TERMINAL_ATTRIBUTES => 0,  // 308 — should return current mode
+nr::SET_CURSOR_POSITION => 0,      // 309 — should write \x1b[{row};{col}H
+nr::HIDE_CURSOR => 0,              // 310 — should write \x1b[?25l
+nr::SHOW_CURSOR => 0,              // 311 — should write \x1b[?25h
+nr::CLEAR_SCREEN => 0,             // 312 — should write \x1b[2J\x1b[H
+```
+
+Userspace programs (meow, top, etc.) call these through `libakuma` wrappers
+(`set_cursor_position()`, `clear_screen()`, `hide_cursor()`, `show_cursor()`).
+Since the kernel never emits the corresponding ANSI escape sequences to the
+process's stdout `ProcessChannel`, the SSH client never sees any cursor
+movement. All text is simply appended.
+
+For example, `meow`'s `render_footer` calls `set_cursor_position()` ~15 times
+per render cycle. None of these actually move the cursor.
+
+### Secondary issue: raw mode is never activated
+
+Because `SET_TERMINAL_ATTRIBUTES` (307) is a stub:
+
+1. When meow calls `set_terminal_attributes(STDIN, 0, RAW_MODE_ENABLE)`, it's
+   a no-op.
+2. `ProcessChannel.raw_mode` stays `false` (initialized as `false`, `set_raw_mode(true)` is never called anywhere in the kernel).
+3. The SSH input handler (`src/ssh/protocol.rs:798-821`) always takes the
+   cooked-mode branch — line editing, echo, Enter-to-submit — instead of
+   passing raw keystrokes to the process.
+
+This means TUI apps cannot receive individual keystrokes, arrow keys, etc.
+
+### Tertiary issue: unconditional `\n` → `\r\n` conversion
+
+The shell streaming loop (`src/shell/mod.rs:541-546`) converts every `\n` byte
+to `\r\n` in process output, regardless of raw/cooked mode. This is correct for
+normal line-oriented output but:
+
+- TUI apps that emit `\r\n` themselves would get double-CR (`\r\r\n`).
+- Binary protocols or raw escape sequences containing `0x0A` would be corrupted
+  (though common ANSI CSI sequences don't contain `\n`).
+
+### Fix plan
+
+The syscalls need to write the corresponding escape sequences into the
+calling process's `ProcessChannel` stdout buffer (the same buffer that
+`sys_write` uses). Specifically:
+
+| Syscall                  | Should emit                             |
+|--------------------------|-----------------------------------------|
+| `SET_CURSOR_POSITION(c,r)` | `\x1b[{r+1};{c+1}H`                 |
+| `HIDE_CURSOR`            | `\x1b[?25l`                             |
+| `SHOW_CURSOR`            | `\x1b[?25h`                             |
+| `CLEAR_SCREEN`           | `\x1b[2J\x1b[H`                        |
+| `SET_TERMINAL_ATTRIBUTES`| Call `channel.set_raw_mode(true/false)` |
+| `GET_TERMINAL_ATTRIBUTES`| Return current `raw_mode` flag          |
+
+Additionally:
+- The `\n` → `\r\n` conversion should be skipped when the channel is in
+  raw mode (TUI apps handle their own line endings).
+- The SSH `pty-req` TERM variable (currently discarded at
+  `src/ssh/protocol.rs:1270`) should be stored and made available to
+  processes.

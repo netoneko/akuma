@@ -895,34 +895,45 @@ pub fn mkdir(path: &str) -> i32 {
 ///
 /// Returns true on success (directory exists or was created).
 pub fn mkdir_p(path: &str) -> bool {
-    // First check if it already exists by trying to open it
-    let fd = open(path, open_flags::O_RDONLY);
-    if fd >= 0 {
-        close(fd);
-        return true; // Already exists
+    // If path is empty, we're done
+    if path.is_empty() {
+        return true;
     }
 
     // Try to create parent directories
     let mut current = alloc::string::String::new();
-    for component in path.split('/') {
+    let components: alloc::vec::Vec<&str> = path.split('/').collect();
+    
+    for (i, component) in components.iter().enumerate() {
         if component.is_empty() {
-            current.push('/');
+            if i == 0 {
+                current.push('/');
+            }
             continue;
         }
+        
         if !current.is_empty() && !current.ends_with('/') {
             current.push('/');
         }
         current.push_str(component);
         
-        // Try to create this directory (ignore errors for existing dirs)
+        // Try to create this directory
         let _ = mkdir(&current);
     }
 
-    // Check if final path exists now
+    // Check if the final path exists and is a directory
+    // We use fstat to check if it's a directory
     let fd = open(path, open_flags::O_RDONLY);
     if fd >= 0 {
+        let mut success = false;
+        if let Ok(stat) = fstat(fd) {
+            // S_IFDIR is 0x4000
+            if (stat.st_mode & 0xF000) == 0x4000 {
+                success = true;
+            }
+        }
         close(fd);
-        true
+        success
     } else {
         false
     }

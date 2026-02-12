@@ -63,6 +63,8 @@ pub struct ThreadCpuStat {
 
 /// Error code for interrupted syscall
 const EINTR: u64 = (-4i64) as u64;
+/// Error code for no such file or directory
+const ENOENT: u64 = (-2i64) as u64;
 
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
@@ -192,6 +194,24 @@ fn sys_brk(new_brk: usize) -> u64 {
 
 fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u32) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+    
+    // Validate path existence
+    if !crate::fs::exists(path) {
+        let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
+        if !is_creat {
+            return ENOENT;
+        }
+        
+        // For O_CREAT, check if parent directory exists
+        let (parent, _) = crate::vfs::split_path(path);
+        if !parent.is_empty() && !crate::fs::exists(parent) {
+            // Special case: parent might be root
+            if parent != "/" && !crate::fs::exists(&alloc::format!("/{}", parent)) {
+                 return ENOENT;
+            }
+        }
+    }
+
     if let Some(proc) = crate::process::current_process() {
         // Handle O_TRUNC: truncate existing file to zero length
         if flags & crate::process::open_flags::O_TRUNC != 0 {
@@ -243,6 +263,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
 
 fn sys_mkdirat(_dirfd: i32, path_ptr: u64, path_len: usize, _mode: u32) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+    crate::safe_print!(128, "[syscall] mkdirat: {}\n", path);
     if crate::fs::create_dir(path).is_ok() { 0 } else { !0u64 }
 }
 
