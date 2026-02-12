@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use libakuma::print;
 
 use crate::error::{Error, Result};
-use crate::pack_stream::StreamingPackParser;
 use crate::stream::process_pack_streaming;
 
 fn print_status(status: u16) {
@@ -198,7 +197,7 @@ impl ProtocolClient {
         parse_upload_pack_response(&response.body, caps)
     }
 
-    /// Fetch pack with streaming - downloads to temp file, then parses
+    /// Fetch pack with streaming - downloads to memory, then parses
     /// Returns the number of objects parsed
     pub fn fetch_pack_streaming(
         &mut self,
@@ -207,6 +206,9 @@ impl ProtocolClient {
         caps: &Capabilities,
         git_dir: &str,
     ) -> Result<u32> {
+        use crate::pack::PackParser;
+        use crate::store::ObjectStore;
+
         let path = self.url.upload_pack_url();
         
         print("scratch: requesting pack from ");
@@ -223,21 +225,12 @@ impl ProtocolClient {
         let use_sideband = caps.side_band || caps.side_band_64k;
         let mut sideband_state = SidebandState::new(use_sideband);
         
-        // Temporary file path for pack
-        let pack_path = format!("{}/objects/pack/tmp.pack", git_dir);
-        
-        // Open temp file for writing
-        let pack_fd = libakuma::open(
-            &pack_path,
-            libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC
-        );
-        if pack_fd < 0 {
-            return Err(Error::io("failed to create temp pack file"));
-        }
-        
-        let mut pack_size = 0usize;
+        // Accumulate pack data in memory instead of writing to disk and reading
+        // back — the kernel's sys_read re-reads the entire file on every call,
+        // making the round-trip O(n^2) for large files.
+        let mut pack_data: Vec<u8> = Vec::new();
 
-        // Download pack to file
+        // Download pack to memory
         let download_result = process_pack_streaming(
             &self.url,
             resolved_ip,
@@ -246,80 +239,40 @@ impl ProtocolClient {
             &request_body,
             |chunk| {
                 // Process through sideband demuxer
-                let pack_data = sideband_state.process(chunk)?;
+                let data = sideband_state.process(chunk)?;
                 
-                if !pack_data.is_empty() {
-                    // Write to temp file instead of parsing
-                    let written = libakuma::write_fd(pack_fd, &pack_data);
-                    if written < 0 {
-                        return Err(Error::io("failed to write pack data"));
-                    }
-                    pack_size += pack_data.len();
+                if !data.is_empty() {
+                    pack_data.extend_from_slice(&data);
                 }
                 
                 Ok(true) // Continue
             },
         );
         
-        libakuma::close(pack_fd);
-        
         download_result?;
         
         print("scratch: downloaded ");
-        print_num(pack_size);
+        print_num(pack_data.len());
         print(" bytes\n");
         
-        // Now parse the pack file from disk using the original parser
+        // Parse pack directly from memory
         print("scratch: parsing pack file...\n");
         
-        let count = parse_pack_from_file(&pack_path, git_dir)?;
+        let store = ObjectStore::new(git_dir);
+        let mut parser = PackParser::new(&pack_data)?;
         
-        print("scratch: stored ");
-        print_num(count as usize);
+        print("scratch: pack contains ");
+        print_num(parser.object_count() as usize);
         print(" objects\n");
         
-        // Clean up temp file (best effort)
-        // Note: libakuma doesn't have unlink, so file stays around
+        let shas = parser.parse_all(&store)?;
         
-        Ok(count)
+        print("scratch: stored ");
+        print_num(shas.len());
+        print(" objects\n");
+        
+        Ok(shas.len() as u32)
     }
-}
-
-/// Parse pack file from disk using small batches
-fn parse_pack_from_file(pack_path: &str, git_dir: &str) -> Result<u32> {
-    use crate::pack::PackParser;
-    use crate::store::ObjectStore;
-    
-    // Read pack file in chunks
-    let fd = libakuma::open(pack_path, libakuma::open_flags::O_RDONLY);
-    if fd < 0 {
-        return Err(Error::io("failed to open pack file"));
-    }
-    
-    // Read entire pack (we've already saved it to disk, memory is freed)
-    let mut pack_data = Vec::new();
-    let mut buf = [0u8; 4096];
-    
-    loop {
-        let n = libakuma::read_fd(fd, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        pack_data.extend_from_slice(&buf[..n as usize]);
-    }
-    libakuma::close(fd);
-    
-    // Now parse with the original parser
-    let store = ObjectStore::new(git_dir);
-    let mut parser = PackParser::new(&pack_data)?;
-    
-    print("scratch: pack contains ");
-    print_num(parser.object_count() as usize);
-    print(" objects\n");
-    
-    let shas = parser.parse_all(&store)?;
-    
-    Ok(shas.len() as u32)
 }
 
 /// State machine for sideband demultiplexing during streaming

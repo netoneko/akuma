@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 use crate::object::ObjectType;
-use crate::sha1::{self, Sha1Hash};
+use crate::sha1::Sha1Hash;
 use crate::store::ObjectStore;
 use crate::zlib;
 
@@ -52,23 +52,20 @@ impl PackObjectType {
     }
 }
 
-/// A parsed pack entry (before delta resolution)
-#[derive(Debug, Clone)] // Clone is now cheap as it only copies metadata
-struct PackEntry {
-    /// Offset in pack file
+/// Lightweight metadata from the scan phase (no decompressed data kept)
+struct EntryMeta {
+    /// Offset of this entry in the pack file
     offset: usize,
     /// Object type
     obj_type: PackObjectType,
-    /// Decompressed size
-    size: usize,
+    /// Start of compressed data in pack buffer
+    compressed_offset: usize,
+    /// Length of compressed data
+    compressed_len: usize,
     /// For OFS_DELTA: negative offset to base
     ofs_delta_offset: Option<usize>,
     /// For REF_DELTA: base object SHA
     ref_delta_sha: Option<Sha1Hash>,
-    /// Offset of the compressed data in the original pack_data buffer
-    compressed_data_offset: usize,
-    /// Length of the compressed data (after header, before SHA)
-    compressed_data_len: usize,
 }
 
 /// Pack file parser
@@ -113,159 +110,135 @@ impl<'a> PackParser<'a> {
         self.object_count
     }
 
-    /// Parse all objects and store them
-    /// This now does two passes: first pass to collect all entry metadata,
-    /// second pass to resolve deltas and store. Only keeps necessary data in memory.
+    /// Parse all objects and store them.
+    ///
+    /// Two-phase approach to keep memory bounded:
+    ///  - Phase 1 (scan): parse headers and decompress to find boundaries.
+    ///    Builds lightweight metadata and identifies which offsets are needed
+    ///    as delta bases.  Decompressed data is immediately discarded.
+    ///  - Phase 2 (process): decompress each object again and store it.
+    ///    Only objects that serve as delta bases are retained in memory.
     pub fn parse_all(&mut self, store: &ObjectStore) -> Result<Vec<Sha1Hash>> {
-        use libakuma::print;
         use alloc::collections::BTreeSet;
-        
-        print("scratch: parse_all starting\n");
-        
-        // First pass: collect all entry metadata and identify needed delta bases
-        let mut entries: Vec<PackEntry> = Vec::with_capacity(self.object_count as usize);
-        let mut offset_to_index: BTreeMap<usize, usize> = BTreeMap::new();
-        // Sets for tracking which objects need their decompressed data kept in memory
-        let mut needed_bases_offsets: BTreeSet<usize> = BTreeSet::new(); // For OFS_DELTA base offsets
-        let mut needed_bases_shas: BTreeSet<Sha1Hash> = BTreeSet::new(); // For REF_DELTA base SHAs
+        use libakuma::print;
 
-        for i in 0..self.object_count {
-            print("scratch: parsing object ");
-            print_num(i as usize);
-            print(" at pos ");
-            print_num(self.pos);
-            print("\n");
-            
-            let entry = self.parse_entry_metadata()?; // Parse only metadata
-            
-            // For logging, we need to temporarily decompress to get the size
-            // We pass the compressed slice directly to decompress_with_consumed
-            let compressed_slice = &self.data[entry.compressed_data_offset..entry.compressed_data_offset + entry.compressed_data_len];
-            let (decompressed_preview, _) = zlib::decompress_with_consumed(compressed_slice)?;
+        let total = self.object_count as usize;
 
-            print("scratch: parsed object type=");
-            print_num(entry.obj_type as u8 as usize);
-            print(" size=");
-            print_num(decompressed_preview.len());
-            print("\n");
+        // ---- Phase 1: scan metadata, identify needed delta bases ----
+        let mut entries: Vec<EntryMeta> = Vec::with_capacity(total);
+        let mut needed_base_offsets: BTreeSet<usize> = BTreeSet::new();
 
-            // Identify potential delta bases
-            match entry.obj_type {
-                PackObjectType::OfsDelta => {
-                    let base_offset = entry.offset - entry.ofs_delta_offset.unwrap();
-                    needed_bases_offsets.insert(base_offset);
-                }
-                PackObjectType::RefDelta => {
-                    // RefDelta bases refer to objects by SHA, which we don't know until it's stored.
-                    // For now, assume all RefDelta refer to *some* object that might need its SHA.
-                    // This is less efficient, but safer. Better would be to resolve base SHAs in a separate pass.
-                    // However, we track `ref_delta_sha` for the actual lookup.
-                    // For now, we only need to store the base data of objects that match `ref_delta_sha` later.
-                }
-                _ => {} // Non-delta objects might be bases for other deltas, so their actual SHA will be checked later.
+        for _ in 0..self.object_count {
+            let entry = self.scan_entry()?;
+
+            // Record which offsets are referenced as delta bases
+            if let Some(ofs) = entry.ofs_delta_offset {
+                needed_base_offsets.insert(entry.offset - ofs);
             }
+            // (RefDelta bases are looked up by SHA later — they may come
+            //  from outside the pack, so we can't pre-mark offsets for them.)
 
-            offset_to_index.insert(entry.offset, i as usize);
             entries.push(entry);
         }
-        
-        // After first pass, we now know all OFS_DELTA base offsets that are needed.
-        // For REF_DELTA bases, we need to know their SHA. Since we don't have all SHAs yet,
-        // we'll rely on the `store.read_raw_content` for those.
 
-        // Second pass: process non-delta objects and store them
-        let mut shas = Vec::with_capacity(entries.len());
-        // `resolved_bases` now only stores data for objects that are bases for *other* deltas *within this pack*.
-        // Key is the offset of the object in the pack file.
+        // ---- Phase 2: decompress, store, retain only needed bases ----
+        let mut shas = Vec::with_capacity(total);
+        // Only keeps decompressed data for objects that are delta bases
         let mut resolved_bases: BTreeMap<usize, (ObjectType, Vec<u8>)> = BTreeMap::new();
-        // Keep track of deltas that need resolving
+        // SHA → pack offset for O(log n) RefDelta lookup
+        let mut sha_to_offset: BTreeMap<Sha1Hash, usize> = BTreeMap::new();
+        // Delta entries whose base isn't resolved yet (indices into `entries`)
         let mut remaining_deltas: Vec<usize> = Vec::new();
 
         for (i, entry) in entries.iter().enumerate() {
-            if entry.obj_type == PackObjectType::OfsDelta || entry.obj_type == PackObjectType::RefDelta {
-                remaining_deltas.push(i); // Add deltas to a list for later resolution
+            if i % 500 == 0 {
+                print("scratch: processing ");
+                print_num(i);
+                print("/");
+                print_num(total);
+                print("\n");
+            }
+
+            let is_delta = entry.obj_type == PackObjectType::OfsDelta
+                || entry.obj_type == PackObjectType::RefDelta;
+
+            if is_delta {
+                remaining_deltas.push(i);
                 continue;
             }
 
-            // This is a non-delta object (Commit, Tree, Blob, Tag)
-            let compressed_slice = &self.data[entry.compressed_data_offset..entry.compressed_data_offset + entry.compressed_data_len];
-            let decompressed_data = Self::decompress_slice(compressed_slice)?;
-            
+            // Non-delta object — decompress and store
+            let decompressed = Self::decompress_entry(self.data, entry)?;
             let obj_type = entry.obj_type.to_object_type().unwrap();
-            let sha = store.write_content(obj_type, &decompressed_data)?;
+            let sha = store.write_content(obj_type, &decompressed)?;
+            sha_to_offset.insert(sha, entry.offset);
             shas.push(sha);
 
-            // If this non-delta object is needed as a base (by offset or by its SHA), store its data in `resolved_bases`
-            if needed_bases_offsets.contains(&entry.offset) || needed_bases_shas.contains(&sha) {
-                 resolved_bases.insert(entry.offset, (obj_type, decompressed_data));
+            // Only retain data if this object is a base for some delta
+            if needed_base_offsets.contains(&entry.offset) {
+                resolved_bases.insert(entry.offset, (obj_type, decompressed));
             }
-            // Decompressed data is dropped here if not inserted into `resolved_bases`
+            // Otherwise `decompressed` is dropped here, freeing memory
         }
 
-        // Third pass: resolve deltas (may need multiple passes for chained deltas)
-        let mut iteration_count = 0;
-        let max_iterations = remaining_deltas.len() + 1; // Limit iterations in case of circular references or missing bases
+        // ---- Phase 3: resolve deltas (may need multiple iterations for chains) ----
+        let max_iterations = remaining_deltas.len() + 1;
+        let mut iteration = 0;
 
-        while !remaining_deltas.is_empty() && iteration_count < max_iterations {
-            iteration_count += 1;
-            let mut still_remaining = Vec::new();
+        while !remaining_deltas.is_empty() && iteration < max_iterations {
+            iteration += 1;
+            let prev_count = remaining_deltas.len();
+            let mut still_remaining: Vec<usize> = Vec::new();
 
             for &idx in &remaining_deltas {
                 let entry = &entries[idx];
-                
-                let base: Option<(ObjectType, Vec<u8>)> = match entry.obj_type {
+
+                let base: Option<(ObjectType, &[u8])> = match entry.obj_type {
                     PackObjectType::OfsDelta => {
                         let base_offset = entry.offset - entry.ofs_delta_offset.unwrap();
-                        resolved_bases.get(&base_offset).cloned()
+                        resolved_bases.get(&base_offset).map(|(t, d)| (*t, d.as_slice()))
                     }
                     PackObjectType::RefDelta => {
                         let base_sha = entry.ref_delta_sha.unwrap();
-                        // Try resolved_bases first
-                        let mut found = None;
-                        for (&offset, (ot, d)) in resolved_bases.iter() {
-                            let hash = sha1::hash_object(ot.as_str(), d); // This is expensive!
-                            if hash == base_sha {
-                                found = Some((*ot, d.clone()));
-                                // If this object's data is needed by offset for a future delta, add its offset.
-                                needed_bases_offsets.insert(offset);
-                                break;
-                            }
-                        }
-                        // If not found in resolved_bases, try to read from the ObjectStore
-                        if found.is_none() {
-                            if let Ok((obj_type, data)) = store.read_raw_content(&base_sha) {
-                                found = Some((obj_type, data));
-                                // Data from store is not automatically put into `resolved_bases`
-                                // This assumes store has it, and doesn't need to be kept in `resolved_bases`.
-                            }
-                        }
-                        found
+                        sha_to_offset.get(&base_sha)
+                            .and_then(|off| resolved_bases.get(off))
+                            .map(|(t, d)| (*t, d.as_slice()))
                     }
                     _ => unreachable!(),
                 };
 
                 if let Some((base_type, base_data)) = base {
-                    let compressed_slice = &self.data[entry.compressed_data_offset..entry.compressed_data_offset + entry.compressed_data_len];
-                    let delta_data = Self::decompress_slice(compressed_slice)?;
-                    
-                    let result = apply_delta(&base_data, &delta_data)?;
+                    let delta_data = Self::decompress_entry(self.data, entry)?;
+                    let result = apply_delta(base_data, &delta_data)?;
                     let sha = store.write_content(base_type, &result)?;
+                    sha_to_offset.insert(sha, entry.offset);
                     shas.push(sha);
 
-                    // If this newly resolved object is also needed as a base, store its data in `resolved_bases`
-                    if needed_bases_offsets.contains(&entry.offset) || needed_bases_shas.contains(&sha) {
+                    if needed_base_offsets.contains(&entry.offset) {
                         resolved_bases.insert(entry.offset, (base_type, result));
                     }
-                    // `result` (Vec<u8>) is dropped here if not inserted into `resolved_bases`
+                } else if entry.obj_type == PackObjectType::RefDelta {
+                    // Try reading base from the on-disk object store
+                    let base_sha = entry.ref_delta_sha.unwrap();
+                    if let Ok((base_type, base_data)) = store.read_raw_content(&base_sha) {
+                        let delta_data = Self::decompress_entry(self.data, entry)?;
+                        let result = apply_delta(&base_data, &delta_data)?;
+                        let sha = store.write_content(base_type, &result)?;
+                        sha_to_offset.insert(sha, entry.offset);
+                        shas.push(sha);
+
+                        if needed_base_offsets.contains(&entry.offset) {
+                            resolved_bases.insert(entry.offset, (base_type, result));
+                        }
+                    } else {
+                        still_remaining.push(idx);
+                    }
                 } else {
-                    // Base object for this delta is not yet resolved, keep it for the next iteration
                     still_remaining.push(idx);
                 }
             }
 
-            if still_remaining.len() == remaining_deltas.len() && !remaining_deltas.is_empty() {
-                // No progress was made in resolving deltas during this iteration,
-                // indicating either a circular dependency or a missing base.
+            if still_remaining.len() == prev_count {
                 return Err(Error::delta_base_not_found());
             }
             remaining_deltas = still_remaining;
@@ -275,20 +248,20 @@ impl<'a> PackParser<'a> {
             return Err(Error::delta_base_not_found());
         }
 
+        print("scratch: resolved ");
+        print_num(shas.len());
+        print(" objects\n");
+
         Ok(shas)
     }
 
-    /// Parse a single pack entry's metadata, without decompressing its data.
-    /// Updates self.pos past the compressed data.
-    fn parse_entry_metadata(&mut self) -> Result<PackEntry> {
-        let entry_start_pos = self.pos;
-        
-        // Parse type and size (variable-length encoding)
-        let (obj_type, size, header_bytes_len) = self.parse_type_and_size()?;
-        
-        let _header_end_pos = self.pos; // Position after type/size and any delta headers
+    /// Phase 1 helper: parse entry header and skip over compressed data.
+    /// Returns lightweight metadata; decompressed data is discarded.
+    fn scan_entry(&mut self) -> Result<EntryMeta> {
+        let entry_offset = self.pos;
 
-        // For delta types, read additional header
+        let (obj_type, _size, _) = self.parse_type_and_size()?;
+
         let (ofs_delta_offset, ref_delta_sha) = match obj_type {
             PackObjectType::OfsDelta => {
                 let offset = self.parse_ofs_delta_offset()?;
@@ -306,24 +279,26 @@ impl<'a> PackParser<'a> {
             _ => (None, None),
         };
 
-        // The start of the compressed data is at the current `self.pos`
-        let compressed_data_start = self.pos;
-        let compressed_data_slice = &self.data[compressed_data_start..];
-        
-        // We need to determine the length of the compressed data
-        // by performing a dummy decompression to find how many input bytes are consumed.
-        let (_, consumed_compressed_bytes) = zlib::decompress_with_consumed(compressed_data_slice)?;
-        self.pos += consumed_compressed_bytes; // Advance parser position past the compressed data
+        let compressed_offset = self.pos;
+        // Must decompress to find where the zlib stream ends
+        let (_decompressed, consumed) = zlib::decompress_with_consumed(&self.data[compressed_offset..])?;
+        self.pos += consumed;
 
-        Ok(PackEntry {
-            offset: entry_start_pos, // The offset of the entire entry in the pack file
+        Ok(EntryMeta {
+            offset: entry_offset,
             obj_type,
-            size, // Decompressed size
+            compressed_offset,
+            compressed_len: consumed,
             ofs_delta_offset,
             ref_delta_sha,
-            compressed_data_offset: compressed_data_start,
-            compressed_data_len: consumed_compressed_bytes,
         })
+    }
+
+    /// Phase 2 helper: decompress an entry's data from the pack buffer.
+    fn decompress_entry(pack_data: &[u8], entry: &EntryMeta) -> Result<Vec<u8>> {
+        let slice = &pack_data[entry.compressed_offset..entry.compressed_offset + entry.compressed_len];
+        let (decompressed, _) = zlib::decompress_with_consumed(slice)?;
+        Ok(decompressed)
     }
 
     /// Parse type and size from variable-length header
@@ -384,13 +359,6 @@ impl<'a> PackParser<'a> {
         Ok(offset)
     }
 
-    /// Decompress a specific zlib stream from a slice.
-    /// Returns the decompressed data.
-    fn decompress_slice(compressed_data: &[u8]) -> Result<Vec<u8>> {
-        // Use streaming decompression that tracks exact bytes consumed
-        let (decompressed, _consumed) = zlib::decompress_with_consumed(compressed_data)?;
-        Ok(decompressed)
-    }
 }
 
 /// Apply a delta to a base object
