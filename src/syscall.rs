@@ -167,6 +167,16 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
+        crate::process::FileDescriptor::ChildStdout(child_pid) => {
+            if let Some(ch) = crate::process::get_child_channel(child_pid) {
+                let mut temp = alloc::vec![0u8; count];
+                let n = ch.read(&mut temp);
+                if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                n as u64
+            } else {
+                !0u64
+            }
+        }
         _ => !0u64
     }
 }

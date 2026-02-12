@@ -125,9 +125,11 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
         }
     }
 
-    let mut box_id = 0u64;
-    for b in name.as_bytes() { box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64); }
-    if box_id == 0 { box_id = 1; }
+    // Generate a pseudo-random 32-bit hex ID based on name hash
+    let mut hash = 0u32;
+    for b in name.as_bytes() { hash = hash.wrapping_mul(31).wrapping_add(*b as u32); }
+    if hash == 0 { hash = 1; }
+    let box_id = hash as u64;
 
     libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
 
@@ -138,7 +140,7 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
             args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
         };
 
-        print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_dec(box_id as usize); print(")\n");
+        print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_hex(box_id as usize); print(")\n");
 
         let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
         let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
@@ -159,7 +161,7 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
             None => { print("box open: failed to spawn\n"); exit(1); }
         }
     } else {
-        print("box: created empty box '"); print(name); print("' (ID="); libakuma::print_dec(box_id as usize); print(")\n");
+        print("box: created empty box '"); print(name); print("' (ID="); libakuma::print_hex(box_id as usize); print(")\n");
         exit(0);
     }
 }
@@ -206,8 +208,30 @@ fn cmd_ps() -> ! {
     if fd < 0 { print("box ps: failed to open /proc/boxes\n"); exit(1); }
     let mut buf = [0u8; 2048];
     let n = read_fd(fd, &mut buf);
-    if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
-    close(fd); exit(0);
+    close(fd);
+
+    if n > 0 {
+        let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+        println("  ID            NAME        ROOT        CREATOR");
+        println("  ---------------------------------------------");
+        for line in content.lines().skip(1) {
+            let mut parts = line.split(',');
+            let id_str = parts.next().unwrap_or("");
+            let name = parts.next().unwrap_or("");
+            let root = parts.next().unwrap_or("");
+            let creator = parts.next().unwrap_or("");
+            
+            // Parse ID to reformat as hex
+            let mut id_val = 0u64;
+            for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { id_val = id_val * 10 + (*b - b'0') as u64; } }
+            let id_hex = if id_val == 0 { String::from("0") } else { format!("{:08x}", id_val) };
+
+            println(&format!("  {:<12}  {:<10}  {:<10}  {}", id_hex, name, root, creator));
+        }
+    } else {
+        println("No active boxes found.");
+    }
+    exit(0);
 }
 
 fn cmd_use(mut args: libakuma::Args) -> ! {

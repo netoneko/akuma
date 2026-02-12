@@ -476,6 +476,19 @@ impl ProcessChannel {
         })
     }
 
+    /// Read available data from the channel into a buffer
+    /// Returns number of bytes read
+    pub fn read(&self, buf: &mut [u8]) -> usize {
+        crate::irq::with_irqs_disabled(|| {
+            let mut buffer = self.buffer.lock();
+            let to_read = buf.len().min(buffer.len());
+            for (i, byte) in buffer.drain(..to_read).enumerate() {
+                buf[i] = byte;
+            }
+            to_read
+        })
+    }
+
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
         crate::irq::with_irqs_disabled(|| {

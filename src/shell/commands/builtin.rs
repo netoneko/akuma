@@ -473,9 +473,10 @@ impl Command for PsCommand {
                 let _ = stdout.write(b"(no processes running)\r\n").await;
             } else {
                 for p in procs {
+                    let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
                     let line = format!(
-                        "{:>5}  {:>4}  {:>3}  {:<8}  {}\r\n",
-                        p.pid, p.ppid, p.box_id, p.state, p.name
+                        "{:>5}  {:>4}  {:<8}  {:<8}  {}\r\n",
+                        p.pid, p.ppid, box_str, p.state, p.name
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }
