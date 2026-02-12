@@ -167,6 +167,9 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() {
+    // Ensure required directories exist
+    ensure_directories();
+
     // Check for command-line arguments
     let argc = libakuma::argc();
     
@@ -181,6 +184,14 @@ fn main() {
             }
             "status" => {
                 cmd_status();
+                return;
+            }
+            "add" => {
+                if let Some(name) = service_name {
+                    cmd_add(name);
+                } else {
+                    print("Usage: herd add <service>\n");
+                }
                 return;
             }
             "config" => {
@@ -231,9 +242,6 @@ fn main() {
 
     // Daemon mode - run supervisor loop
     print("[herd] Userspace supervisor starting...\n");
-
-    // Ensure required directories exist
-    ensure_directories();
 
     let mut state = HerdState::new();
 
@@ -668,6 +676,7 @@ fn print_usage() {
     print("Commands:\n");
     print("  daemon         Run supervisor in foreground\n");
     print("  status         List enabled services\n");
+    print("  add <svc>      Create a new service configuration\n");
     print("  config <svc>   Show service configuration\n");
     print("  enable <svc>   Enable a service\n");
     print("  disable <svc>  Disable a service\n");
@@ -702,6 +711,39 @@ fn cmd_status() {
             print("/\n");
         }
     }
+}
+
+fn cmd_add(name: &str) {
+    let path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
+    
+    // Check if already exists
+    if read_file_bytes(&path).is_some() {
+        print("Service '");
+        print(name);
+        print("' already exists in ");
+        print(HERD_AVAILABLE_DIR);
+        print("/\n");
+        return;
+    }
+    
+    let default_config = format!(
+        "# Herd Service Configuration for {}\n\
+        command = /bin/{}\n\
+        args = \n\
+        restart_delay = {}\n\
+        max_retries = {}\n",
+        name, name, DEFAULT_RESTART_DELAY_MS, DEFAULT_MAX_RETRIES
+    );
+    
+    write_file(&path, default_config.as_bytes());
+    print("Created service '");
+    print(name);
+    print("' in ");
+    print(HERD_AVAILABLE_DIR);
+    print("/\n");
+    print("Edit this file and then run 'herd enable ");
+    print(name);
+    print("' to start it.\n");
 }
 
 fn cmd_config(name: &str) {
