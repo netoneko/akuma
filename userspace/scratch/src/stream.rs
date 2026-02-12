@@ -512,12 +512,10 @@ impl ChunkedState {
                     }
                 }
                 ChunkParseState::ExpectingCrlf => {
-                    // Need to consume trailing CRLF
+                    // Need to consume trailing CRLF after chunk data
                     if self.buffer.len() >= 2 {
-                        if &self.buffer[..2] == b"\r\n" {
-                            self.buffer = self.buffer[2..].to_vec();
-                        }
-                        // Even if it's not CRLF, move on (corrupted but try to continue)
+                        // Always consume 2 bytes (should be \r\n per spec)
+                        self.buffer = self.buffer[2..].to_vec();
                         self.state = ChunkParseState::ExpectingSize;
                     } else {
                         // Need more data for trailing CRLF

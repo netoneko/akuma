@@ -344,9 +344,7 @@ impl SidebandState {
             // Skip NAK line if present at start
             if !self.in_pack_data {
                 if data.starts_with(b"NAK") || data.starts_with(b"0008NAK") {
-                    // Skip NAK packet
                     self.in_pack_data = true;
-                    // Find pack data start
                     if let Some(pos) = find_pack_start(data) {
                         return Ok(data[pos..].to_vec());
                     }
@@ -360,63 +358,67 @@ impl SidebandState {
             return Ok(data.to_vec());
         }
 
-        // Sideband enabled - need to demux
+        // Sideband enabled - need to demux pkt-line framed data
         self.buffer.extend_from_slice(data);
-        
-        // Debug: show sideband buffer growth
-        if self.buffer.len() > 50000 && !self.in_pack_data {
-            print("scratch: sideband buffer ");
-            print_num(self.buffer.len());
-            print(" bytes, first bytes: ");
-            let preview_len = core::cmp::min(20, self.buffer.len());
-            if let Ok(s) = core::str::from_utf8(&self.buffer[..preview_len]) {
-                print(s);
-            } else {
-                print("<binary>");
-            }
-            print("\n");
-        }
         let mut pack_data = Vec::new();
 
+        // If we already switched to raw mode, just drain the buffer
+        if self.in_pack_data {
+            pack_data.extend_from_slice(&self.buffer);
+            self.buffer.clear();
+            return Ok(pack_data);
+        }
+
         while self.buffer.len() >= 4 {
-            // Parse pkt-line length
+            // Try to parse pkt-line length (first 4 bytes must be ASCII hex)
             let len_hex = &self.buffer[..4];
-            let len_str = core::str::from_utf8(len_hex).unwrap_or("0000");
-            
-            let len = match u16::from_str_radix(len_str, 16) {
-                Ok(l) => l as usize,
-                Err(_) => {
-                    // Not a valid pkt-line, might be raw pack data
-                    if self.buffer.starts_with(b"PACK") {
-                        pack_data.extend_from_slice(&self.buffer);
-                        self.buffer.clear();
-                    }
-                    break;
+
+            // All 4 bytes must be ASCII hex digits
+            let valid_hex = len_hex.iter().all(|b| matches!(b,
+                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'));
+
+            if !valid_hex {
+                // Not a pkt-line. Scan for PACK magic to resynchronize.
+                if let Some(pos) = find_pack_start(&self.buffer) {
+                    // Found raw PACK data — switch to raw mode
+                    pack_data.extend_from_slice(&self.buffer[pos..]);
+                    self.buffer.clear();
+                    self.in_pack_data = true;
+                } else {
+                    // No PACK magic yet. Drop bytes up to the last 3
+                    // (PACK might be split across calls).
+                    let keep = core::cmp::min(3, self.buffer.len());
+                    let drain = self.buffer.len() - keep;
+                    self.buffer = self.buffer[drain..].to_vec();
                 }
-            };
+                break;
+            }
+
+            let len_str = core::str::from_utf8(len_hex).unwrap_or("0000");
+            let len = u16::from_str_radix(len_str, 16).unwrap_or(0) as usize;
 
             if len == 0 {
-                // Flush packet
+                // Flush packet — may signal end of sideband section
                 self.buffer = self.buffer[4..].to_vec();
                 continue;
             }
 
             if len < 4 || self.buffer.len() < len {
-                // Need more data
+                // Need more data for this pkt-line
                 break;
             }
 
-            // Get packet content
+            // Get packet content (after 4-byte length header)
             let content = &self.buffer[4..len];
-            
+
             if !content.is_empty() {
                 match content[0] {
                     1 => {
-                        // Pack data
+                        // Channel 1: pack data
                         pack_data.extend_from_slice(&content[1..]);
                     }
                     2 => {
-                        // Progress - print it
+                        // Channel 2: progress
                         if let Ok(msg) = core::str::from_utf8(&content[1..]) {
                             print("remote: ");
                             print(msg.trim());
@@ -424,17 +426,13 @@ impl SidebandState {
                         }
                     }
                     3 => {
-                        // Error
+                        // Channel 3: error
                         if let Ok(msg) = core::str::from_utf8(&content[1..]) {
                             return Err(Error::protocol(msg.trim()));
                         }
                     }
                     _ => {
-                        // Unknown, might be NAK/ACK
-                        let line = core::str::from_utf8(content).unwrap_or("");
-                        if !line.starts_with("NAK") && !line.starts_with("ACK") {
-                            // Unknown content
-                        }
+                        // NAK/ACK or other protocol lines — ignore
                     }
                 }
             }
