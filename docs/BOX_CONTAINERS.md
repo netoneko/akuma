@@ -79,20 +79,45 @@ The `box` binary acts as both the container manager and the session host.
 
 ### 2.2 Commands
 
-*   **`box open <name> --directory <dir> <cmd>`**:
+*   **`box open <name> [--directory <dir>] [--tmp] <cmd>`**:
     *   Starts a new box daemon.
     *   Spawns `<cmd>` with `root_dir` set to `<dir>`.
+    *   `--tmp` (or `-rm`): Equivalent to `docker run --rm`. The root directory is a temporary overlay or the box is deleted upon primary process exit.
+*   **`box use <name> <cmd>`**:
+    *   Equivalent to `docker exec`.
+    *   Injects a new process into an existing box.
+    *   Requires the kernel to support `sys_spawn_ext` with an existing `box_id`.
 *   **`box peek <name>`**:
-    *   Attaches to the stdout/stdin of the box.
+    *   Equivalent to `docker attach`.
+    *   Attaches to the stdout/stdin of the box's primary process.
     *   Uses a Unix socket for IPC with the daemon.
 *   **`box close <name|id>`**:
+    *   Equivalent to `docker stop` / `docker rm -f`.
     *   Sends a termination signal to all processes in the box.
     *   The daemon performs cleanup of IPC sockets and temporary mounts.
-    *   The box entry is removed from the system.
 *   **`box ps`**:
+    *   Equivalent to `docker ps`.
     *   Lists all active boxes, their IDs, names, root directories, and primary process PIDs.
 *   **`box show <name|id>`**:
+    *   Equivalent to `docker inspect`.
     *   Displays detailed information about a box: uptime, resource usage (if available), and a list of all member PIDs.
+*   **`box cp <source_dir> <box_name>`**:
+    *   Helper command to initialize a box's root directory.
+    *   Copies a template or base system into the target directory before `box open`.
+    *   Useful for setting up isolated environments for `herd` services.
+
+### 2.3 Docker-Compatible Aliases
+
+To ease transition for users familiar with Docker, the `box` utility should support the following aliases:
+
+| Box Command | Docker Equivalent | Description |
+|-------------|-------------------|-------------|
+| `box open` | `docker run` | Create and start a container |
+| `box use` | `docker exec` | Run a command in a running container |
+| `box peek` | `docker attach` | Attach to a container's IO |
+| `box close` | `docker stop` / `rm` | Stop and remove a container |
+| `box ps` | `docker ps` | List containers |
+| `box show` | `docker inspect` | Display container details |
 
 ## 3. Kernel Architecture Updates
 
@@ -114,6 +139,9 @@ static BOX_REGISTRY: Spinlock<BTreeMap<u64, BoxInfo>> = ...;
 ### 3.2 Process Management
 
 *   **`sys_kill_box(box_id)`**: A new syscall to kill all processes sharing a specific `box_id`. This ensures that even if a process forks, the entire container can be brought down.
+*   **`ps` and `procfs` Updates**:
+    *   The system `ps` command (and `/proc/all`) should be updated to show a `BOX` column.
+    *   It should display the `box_id` (or `None`/`Host`) for each process.
 *   **`procfs` Extension**: `/proc/boxes` will expose the box registry to userspace, allowing `box ps` to work without needing a centralized daemon (though individual box daemons still handle I/O).
 
 ## 4. Herd Integration (`userspace/herd`)
@@ -137,7 +165,34 @@ box_root = /data/jail/myservice
 4.  **Userspace:** Create `userspace/box` binary.
 5.  **Herd:** Update parser and spawn logic.
 
-## 6. Future Considerations
+## 6. Implementation Recommendations
+
+### 6.1 Supervisor & Shell Strategy
+
+*   **Box Daemon as Supervisor:** For `box open`, the `box` utility acts as the primary supervisor and reaper. For complex multi-service containers, `herd` should be run as the entry point within the box.
+*   **Standalone Shell:** The current kernel-integrated shell must be ported to `userspace/shell` to run as a process inside a box. The shell should support basic pipelines and I/O redirection using `libakuma`.
+*   **Direct Execution (`noshell`):** `box use` should execute commands directly via the kernel rather than wrapping them in a shell. This avoids PID pollution and simplifies signal propagation.
+*   **Terminal-less IO (`noterm`):** Use raw byte-piping for `box peek` and `box use`. The `ProcessChannel` should be treated as a transparent pipe, allowing the host's terminal to handle all escape sequences and line editing.
+
+### 6.2 Attachment (`box peek`) Architecture
+
+1.  **Daemon Ownership:** The `box` daemon maintains the `Arc<ProcessChannel>` for the container's primary process.
+2.  **Unix Socket Proxy:** `box peek` connects to the daemon via a Unix socket.
+3.  **Transparent Piping:** The daemon proxies data bi-directionally between the Unix socket and the `ProcessChannel` without modification. This ensures that interactive applications (like editors or `top`) render correctly.
+
+### 6.3 ProcFS & Networking Support
+
+*   **Network Sockets:** `procfs` must be extended to support `/proc/net/tcp` and `/proc/net/udp`. This allows tools like `netstat` to function inside boxes.
+*   **Namespace Filtering:** Entries in `/proc/net/*` must be filtered by `box_id`. A process inside a box should only see the sockets belonging to processes within the same box (or host sockets if network isolation is not yet enforced).
+*   **Process Isolation:** Existing `/proc/<pid>` entries must continue to be filtered so boxes cannot see host processes or other boxes.
+
+### 6.4 Kernel Requirements for Injection (`box use`)
+
+To support "injecting" a process into an existing box:
+*   **`sys_spawn_ext`:** Must support a `target_box_id` or `target_pid` parameter.
+*   **Context Inheritance:** The injected process must inherit the `root_dir` and `box_id` of the target.
+
+## 7. Future Considerations
 
 *   **Networking Isolation:** Later phases can introduce network namespaces (separate IP stacks per box).
 *   **Resource Limits:** Cgroup-like CPU/Memory limits per box.
