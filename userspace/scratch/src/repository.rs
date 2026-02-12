@@ -589,6 +589,11 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                 let mut last_dot = 0;
                 let chunk_size = 64 * 1024;
 
+                // Print an initial dot to show we've started the decompression/write process
+                if file_size >= chunk_size {
+                    print(".");
+                }
+
                 let result = store.read_to_callback(&entry.sha, |chunk| {
                     let n = write_fd(fd, chunk);
                     if n < 0 {
@@ -598,7 +603,8 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                     
                     // Progress dots for large files
                     if file_size >= chunk_size {
-                        if total_written - last_dot >= chunk_size {
+                        // We check >= last_dot + chunk_size to handle potential small chunks from decompressor
+                        if total_written >= last_dot + chunk_size {
                             print(".");
                             last_dot = total_written;
                         }
@@ -609,7 +615,7 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                 close(fd);
                 
                 if result.is_err() {
-                    print("scratch: checkout: failed to stream ");
+                    print("\nscratch: checkout: failed to stream ");
                     print(&entry.name);
                     print("\n");
                 }

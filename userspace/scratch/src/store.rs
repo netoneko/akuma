@@ -134,37 +134,59 @@ impl ObjectStore {
     }
 
     /// Read an object and stream its content (after decompression) to a callback.
-    /// This avoids loading the entire decompressed object into memory.
+    /// This avoids loading the entire object (even compressed) into memory.
     pub fn read_to_callback<F>(&self, sha: &Sha1Hash, mut callback: F) -> Result<()>
     where F: FnMut(&[u8]) -> Result<()> {
-        let compressed = self.read_raw_compressed(sha)?;
-        
+        let path = self.object_path(sha);
+        let fd = open(&path, open_flags::O_RDONLY);
+        if fd < 0 {
+            return Err(Error::object_not_found());
+        }
+
+        let mut state = zlib::InflateState::new_boxed(zlib::DataFormat::Zlib);
         let mut header_skipped = false;
         let mut header_buf = Vec::new();
-
-        zlib::decompress_to_callback(&compressed, |chunk| {
-            if header_skipped {
-                callback(chunk)
-            } else {
-                // We need to find the null byte in the first few chunks to skip the header
-                header_buf.extend_from_slice(chunk);
-                if let Some(null_pos) = header_buf.iter().position(|&b| b == 0) {
-                    header_skipped = true;
-                    if null_pos + 1 < header_buf.len() {
-                        callback(&header_buf[null_pos + 1..])?;
-                    }
-                    // Free the header buffer memory early
-                    header_buf = Vec::new();
-                    Ok(())
-                } else {
-                    // Still haven't found the end of the header
-                    if header_buf.len() > 1024 {
-                        return Err(Error::invalid_object("header too long"));
-                    }
-                    Ok(())
-                }
+        let mut compressed_buf = [0u8; 32768]; // 32KB compressed chunk
+        
+        loop {
+            let n = read_fd(fd, &mut compressed_buf);
+            if n < 0 {
+                close(fd);
+                return Err(Error::io("failed to read object file"));
             }
-        })
+            if n == 0 {
+                break;
+            }
+
+            let result = zlib::decompress_with_state_to_callback(&mut state, &compressed_buf[..n as usize], |chunk| {
+                if header_skipped {
+                    callback(chunk)
+                } else {
+                    header_buf.extend_from_slice(chunk);
+                    if let Some(null_pos) = header_buf.iter().position(|&b| b == 0) {
+                        header_skipped = true;
+                        if null_pos + 1 < header_buf.len() {
+                            callback(&header_buf[null_pos + 1..])?;
+                        }
+                        header_buf = Vec::new();
+                        Ok(())
+                    } else {
+                        if header_buf.len() > 1024 {
+                            return Err(Error::invalid_object("header too long"));
+                        }
+                        Ok(())
+                    }
+                }
+            });
+
+            if let Err(e) = result {
+                close(fd);
+                return Err(e);
+            }
+        }
+
+        close(fd);
+        Ok(())
     }
 
     /// Read an object's raw content (after decompression, without parsing)

@@ -4,8 +4,10 @@
 
 use alloc::vec::Vec;
 
-use miniz_oxide::inflate::stream::{inflate, InflateState};
-use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+pub use miniz_oxide::inflate::stream::InflateState;
+pub use miniz_oxide::DataFormat;
+use miniz_oxide::inflate::stream::inflate;
+use miniz_oxide::{MZFlush, MZStatus};
 
 use crate::error::{Error, Result};
 
@@ -30,11 +32,17 @@ pub fn decompress_header(data: &[u8], out: &mut [u8]) -> Result<(usize, usize)> 
 pub fn decompress_to_callback<F>(data: &[u8], mut callback: F) -> Result<()> 
 where F: FnMut(&[u8]) -> Result<()> {
     let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    decompress_with_state_to_callback(&mut state, data, callback)
+}
+
+/// Decompress using an existing state and pass chunks to a callback.
+pub fn decompress_with_state_to_callback<F>(state: &mut InflateState, data: &[u8], mut callback: F) -> Result<()>
+where F: FnMut(&[u8]) -> Result<()> {
     let mut out_buf = [0u8; 16384]; // 16KB transit buffer
     let mut consumed = 0;
 
     loop {
-        let result = inflate(&mut state, &data[consumed..], &mut out_buf, MZFlush::None);
+        let result = inflate(state, &data[consumed..], &mut out_buf, MZFlush::None);
         consumed += result.bytes_consumed;
         
         if result.bytes_written > 0 {
@@ -45,6 +53,12 @@ where F: FnMut(&[u8]) -> Result<()> {
             Ok(MZStatus::StreamEnd) => return Ok(()),
             Ok(MZStatus::Ok) => {
                 if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    // If we haven't consumed all input and haven't written anything, 
+                    // it means we need more space in out_buf (which we have in the next loop)
+                    // or more input (which we don't have here).
+                    if consumed >= data.len() {
+                        return Ok(());
+                    }
                     return Err(Error::decompress());
                 }
             }
