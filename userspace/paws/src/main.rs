@@ -26,6 +26,11 @@ fn main() {
         let trimmed = input.trim();
         
         if trimmed.is_empty() {
+            if input.is_empty() && !input.is_empty() { // Placeholder for potential logic
+            }
+            // If input is truly empty (EOF), we should exit
+            // but read_line currently returns "" on both empty and EOF
+            // Let's check for EOF specifically.
             continue;
         }
 
@@ -62,8 +67,20 @@ fn read_line() -> String {
     let mut buf = [0u8; 1];
     
     loop {
-        let n = read(fd::STDIN, &mut buf);
-        if n <= 0 {
+        // Use blocking poll instead of non-blocking read
+        let n = poll_input_event(core::u64::MAX, &mut buf);
+        
+        if n < 0 {
+            // Error
+            break;
+        }
+        
+        if n == 0 {
+            // EOF (Ctrl+D)
+            if line.is_empty() {
+                println("exit");
+                exit(0);
+            }
             break;
         }
         
@@ -77,7 +94,15 @@ fn read_line() -> String {
                 line.pop();
                 print("\x08 \x08"); // Erase on terminal
             }
-        } else {
+        } else if c == 4 {
+            // Ctrl+D
+            if line.is_empty() {
+                println("exit");
+                exit(0);
+            }
+            // ignore if line not empty or handle as EOF
+            break;
+        } else if c >= 32 {
             line.push(c as char);
             let s = core::str::from_utf8(&buf).unwrap_or("");
             print(s);

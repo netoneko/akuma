@@ -439,6 +439,9 @@ pub struct ProcessChannel {
     raw_mode: AtomicBool,
 }
 
+/// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
+const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
 impl ProcessChannel {
     /// Create a new empty process channel
     pub fn new() -> Self {
@@ -459,7 +462,26 @@ impl ProcessChannel {
         // Also, VecDeque operations can trigger heap allocations which need IRQ protection.
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
-            buf.extend(data);
+            
+            // Check for buffer overflow
+            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+                // If the write itself is larger than the buffer, truncate it
+                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
+                    &data[data.len() - MAX_BUFFER_SIZE..]
+                } else {
+                    data
+                };
+                
+                // Remove old data to make room
+                let current_len = buf.len();
+                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
+                if overflow > 0 {
+                    buf.drain(..overflow.min(current_len));
+                }
+                buf.extend(data_to_write);
+            } else {
+                buf.extend(data);
+            }
         })
     }
 
@@ -501,7 +523,24 @@ impl ProcessChannel {
     pub fn write_stdin(&self, data: &[u8]) {
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.stdin_buffer.lock();
-            buf.extend(data);
+            
+            // Check for buffer overflow
+            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
+                    &data[data.len() - MAX_BUFFER_SIZE..]
+                } else {
+                    data
+                };
+                
+                let current_len = buf.len();
+                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
+                if overflow > 0 {
+                    buf.drain(..overflow.min(current_len));
+                }
+                buf.extend(data_to_write);
+            } else {
+                buf.extend(data);
+            }
         })
     }
 

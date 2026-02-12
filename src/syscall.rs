@@ -250,7 +250,14 @@ fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u3
 fn sys_close(fd: u32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
         if let Some(entry) = proc.remove_fd(fd) {
-            if let crate::process::FileDescriptor::Socket(idx) = entry { crate::socket::remove_socket(idx); }
+            match entry {
+                crate::process::FileDescriptor::Socket(idx) => { crate::socket::remove_socket(idx); }
+                crate::process::FileDescriptor::ChildStdout(child_pid) => {
+                    // Important: Cleanup the child channel to avoid memory leaks if parent closes it
+                    crate::process::remove_child_channel(child_pid);
+                }
+                _ => {}
+            }
             0
         } else { !0u64 }
     } else { !0u64 }
