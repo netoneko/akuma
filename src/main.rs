@@ -427,6 +427,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize threading (but don't enable timer yet!)
     console::print("Initializing threading...\n");
     threading::init();
+    process::init_box_registry(); // Init Box 0
     console::print("Threading system initialized\n");
 
     // =========================================================================

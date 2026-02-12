@@ -105,14 +105,17 @@ pub enum SocketType {
 pub struct KernelSocket {
     pub inner: SocketType,
     pub bind_port: Option<u16>,
+    pub box_id: u64,
 }
 
 impl KernelSocket {
     pub fn new_stream() -> Option<Self> {
         let handle = smoltcp_net::socket_create()?;
+        let box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
         Some(Self {
             inner: SocketType::Stream(handle),
             bind_port: None,
+            box_id,
         })
     }
 
@@ -134,9 +137,12 @@ impl KernelSocket {
             return None;
         }
         
+        let box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+        
         Some(Self {
             inner: SocketType::Listener { local_port: port, handles },
             bind_port: Some(port),
+            box_id,
         })
     }
 }
@@ -336,7 +342,12 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
         None
     }).ok_or(libc_errno::ECONNABORTED)?;
 
-    let new_sock = KernelSocket { inner: SocketType::Stream(handle), bind_port: None };
+    let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+    let new_sock = KernelSocket { 
+        inner: SocketType::Stream(handle), 
+        bind_port: None,
+        box_id: current_box_id,
+    };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {
             if slot.is_none() { *slot = Some(new_sock); return Some(i); }
@@ -454,6 +465,71 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
         Some(r) => r,
         None => Err(libc_errno::ENETDOWN),
     }
+}
+
+pub struct SocketStat {
+    pub local_port: u16,
+    pub remote_ip: [u8; 4],
+    pub remote_port: u16,
+    pub state: &'static str,
+    pub box_id: u64,
+}
+
+pub fn list_sockets() -> Vec<SocketStat> {
+    let mut stats = Vec::new();
+    let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+
+    with_table(|table| {
+        for slot in table.iter().flatten() {
+            // Isolation: only show sockets from current box (unless Box 0)
+            if current_box_id != 0 && slot.box_id != current_box_id {
+                continue;
+            }
+
+            match slot.inner {
+                SocketType::Stream(h) => {
+                    with_network(|net| {
+                        let socket = net.sockets.get::<tcp::Socket>(h);
+                        let remote = socket.remote_endpoint().map(|ep| {
+                            (if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr { addr.octets() } else { [0;4] }, ep.port)
+                        }).unwrap_or(([0;4], 0));
+                        
+                        let state = match socket.state() {
+                            tcp::State::Closed => "CLOSED",
+                            tcp::State::Listen => "LISTEN",
+                            tcp::State::SynSent => "SYN_SENT",
+                            tcp::State::SynReceived => "SYN_RECV",
+                            tcp::State::Established => "ESTABLISHED",
+                            tcp::State::FinWait1 => "FIN_WAIT1",
+                            tcp::State::FinWait2 => "FIN_WAIT2",
+                            tcp::State::CloseWait => "CLOSE_WAIT",
+                            tcp::State::Closing => "CLOSING",
+                            tcp::State::LastAck => "LAST_ACK",
+                            tcp::State::TimeWait => "TIME_WAIT",
+                        };
+
+                        stats.push(SocketStat {
+                            local_port: slot.bind_port.unwrap_or(0),
+                            remote_ip: remote.0,
+                            remote_port: remote.1,
+                            state,
+                            box_id: slot.box_id,
+                        });
+                    });
+                }
+                SocketType::Listener { local_port, .. } => {
+                    stats.push(SocketStat {
+                        local_port,
+                        remote_ip: [0;4],
+                        remote_port: 0,
+                        state: "LISTEN",
+                        box_id: slot.box_id,
+                    });
+                }
+            }
+        }
+    });
+    stats
 }
 
 // ============================================================================

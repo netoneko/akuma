@@ -77,7 +77,7 @@ impl Filesystem for ProcFilesystem {
         if path.is_empty() {
             // Root: list all process PIDs as directories, filtered by box_id
             let processes = process::list_processes();
-            let entries = processes
+            let mut entries: Vec<DirEntry> = processes
                 .into_iter()
                 .filter(|p| {
                     // Box 0 (Host) sees everything. Box N only sees its own.
@@ -97,12 +97,36 @@ impl Filesystem for ProcFilesystem {
                     size: 0,
                 })
                 .collect();
+
+            // Host context only: add "boxes" virtual file
+            if current_box_id == 0 {
+                entries.push(DirEntry {
+                    name: String::from("boxes"),
+                    is_dir: false,
+                    size: 0, // Dynamic
+                });
+            }
+
+            // Everyone sees "net" directory
+            entries.push(DirEntry {
+                name: String::from("net"),
+                is_dir: true,
+                size: 0,
+            });
+
             return Ok(entries);
         }
 
         let parts: Vec<&str> = path.split('/').collect();
 
         if parts.len() == 1 {
+            if parts[0] == "net" {
+                return Ok(alloc::vec![
+                    DirEntry { name: String::from("tcp"), is_dir: false, size: 0 },
+                    DirEntry { name: String::from("udp"), is_dir: false, size: 0 },
+                ]);
+            }
+
             // /<pid> - list "fd" directory
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             if !Self::process_exists(pid) {
@@ -144,6 +168,41 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        let path = path.trim_start_matches('/');
+        let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+
+        // Handle /proc/boxes
+        if path == "boxes" {
+            if current_box_id != 0 {
+                return Err(FsError::NotFound);
+            }
+            
+            let boxes = process::list_boxes();
+            let mut out = String::from("ID,NAME,ROOT,CREATOR\n");
+            for b in boxes {
+                out.push_str(&alloc::format!("{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid));
+            }
+            return Ok(out.into_bytes());
+        }
+
+        if path == "net/tcp" {
+            let sockets = crate::socket::list_sockets();
+            let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
+            for s in sockets {
+                out.push_str(&alloc::format!("{},{}:{},{},{}\n", 
+                    s.local_port, 
+                    alloc::format!("{}.{}.{}.{}", s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3]),
+                    s.remote_port,
+                    s.state,
+                    s.box_id));
+            }
+            return Ok(out.into_bytes());
+        }
+
+        if path == "net/udp" {
+            return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
+        }
+
         let (pid, fd_num) = Self::parse_fd_path(path)?;
 
         let current_proc = crate::process::current_process();
@@ -234,6 +293,15 @@ impl Filesystem for ProcFilesystem {
             return true; // Root always exists
         }
 
+        if path == "boxes" {
+            let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            return current_box_id == 0;
+        }
+
+        if path == "net" || path == "net/tcp" || path == "net/udp" {
+            return true;
+        }
+
         // Try to parse as fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
             return Self::process_exists(pid) && fd_num <= 1;
@@ -260,6 +328,40 @@ impl Filesystem for ProcFilesystem {
             // Root directory
             return Ok(Metadata {
                 is_dir: true,
+                size: 0,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        if path == "boxes" {
+            let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            if current_box_id != 0 {
+                return Err(FsError::NotFound);
+            }
+            return Ok(Metadata {
+                is_dir: false,
+                size: 0, // Dynamic
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        if path == "net" {
+            return Ok(Metadata {
+                is_dir: true,
+                size: 0,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        if path == "net/tcp" || path == "net/udp" {
+            return Ok(Metadata {
+                is_dir: false,
                 size: 0,
                 created: None,
                 modified: None,

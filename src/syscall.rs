@@ -6,6 +6,7 @@
 use crate::console;
 use crate::config;
 use crate::terminal::mode_flags;
+use alloc::string::String;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -50,6 +51,7 @@ pub mod nr {
     pub const POLL_INPUT_EVENT: u64 = 313;
     pub const GET_CPU_STATS: u64 = 314;
     pub const SPAWN_EXT: u64 = 315;
+    pub const REGISTER_BOX: u64 = 316;
 }
 
 /// Thread CPU statistics for top command
@@ -121,6 +123,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
         nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5]),
+        nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize),
         _ => !0 // ENOSYS
     }
 }
@@ -392,6 +395,20 @@ fn sys_munmap(addr: usize, _len: usize) -> u64 {
         }
     }
     !0u64
+}
+
+fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize) -> u64 {
+    let name = unsafe { core::str::from_utf8(core::slice::from_raw_parts(name_ptr as *const u8, name_len)).unwrap_or("unknown") };
+    let root = unsafe { core::str::from_utf8(core::slice::from_raw_parts(root_ptr as *const u8, root_len)).unwrap_or("/") };
+    let creator_pid = crate::process::read_current_pid().unwrap_or(0);
+
+    crate::process::register_box(crate::process::BoxInfo {
+        id,
+        name: String::from(name),
+        root_dir: String::from(root),
+        creator_pid,
+    });
+    0
 }
 
 fn sys_uptime() -> u64 { crate::timer::uptime_us() }

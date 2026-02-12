@@ -159,6 +159,61 @@ const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 pub type Pid = u32;
 
 // ============================================================================
+// Box Registry (for container management)
+// ============================================================================
+
+/// Information about an active box (container)
+#[derive(Debug, Clone)]
+pub struct BoxInfo {
+    pub id: u64,
+    pub name: String,
+    pub root_dir: String,
+    pub creator_pid: Pid,
+}
+
+/// Global registry of active boxes
+static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Register a new box in the global registry
+pub fn register_box(info: BoxInfo) {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().insert(info.id, info);
+    })
+}
+
+/// Unregister a box from the global registry
+pub fn unregister_box(id: u64) -> Option<BoxInfo> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().remove(&id)
+    })
+}
+
+/// List all active boxes
+pub fn list_boxes() -> Vec<BoxInfo> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().values().cloned().collect()
+    })
+}
+
+/// Find a box ID by name
+pub fn find_box_by_name(name: &str) -> Option<u64> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().values().find(|b| b.name == name).map(|b| b.id)
+    })
+}
+
+/// Initialize the box registry with Box 0 (Host)
+pub fn init_box_registry() {
+    register_box(BoxInfo {
+        id: 0,
+        name: String::from("host"),
+        root_dir: String::from("/"),
+        creator_pid: 0, // System
+    });
+}
+
+// ============================================================================
 // Stdio Buffer (thread-safe stdin/stdout with size limits)
 // ============================================================================
 
