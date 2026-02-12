@@ -73,7 +73,7 @@ pub extern "C" fn _start() -> ! {
 
     let command = match args_iter.next() {
         Some(cmd) => cmd,
-        None => { print_usage(); exit(1); }
+        None => { print_usage(); exit(0); }
     };
 
     match command {
