@@ -134,8 +134,11 @@ fn collect_objects_recursive(
             // Don't recurse into parents - they should already be on remote
         }
         crate::object::Object::Tree(tree) => {
-            // Add all entries
+            // Add all entries (skip submodules — their objects live in another repo)
             for entry in &tree.entries {
+                if entry.is_submodule() {
+                    continue;
+                }
                 collect_objects_recursive(&entry.sha, have, store, objects, visited)?;
             }
         }

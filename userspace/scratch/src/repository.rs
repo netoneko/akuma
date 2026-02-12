@@ -523,12 +523,17 @@ fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Resu
     };
     let commit = commit_obj.as_commit()?;
 
-    // Checkout tree
-    checkout_tree_recursive(store, &commit.tree, dest)
+    // Checkout tree with progress tracking
+    let mut file_count: usize = 0;
+    checkout_tree_recursive(store, &commit.tree, dest, &mut file_count)?;
+    print("scratch: checked out ");
+    print_num(file_count);
+    print(" files\n");
+    Ok(())
 }
 
 /// Recursively checkout a tree
-fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str) -> Result<()> {
+fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str, file_count: &mut usize) -> Result<()> {
     let tree_obj = match store.read(tree_sha) {
         Ok(obj) => obj,
         Err(e) => {
@@ -547,10 +552,16 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str)
     for entry in &tree.entries {
         let path = format!("{}/{}", dest, entry.name);
 
-        if entry.is_dir() {
+        if entry.is_submodule() {
+            // Submodules reference commits in external repos — skip checkout
+            print("scratch: skipping submodule ");
+            print(&entry.name);
+            print("\n");
+            continue;
+        } else if entry.is_dir() {
             // Create directory and recurse
             let _ = mkdir(&path);
-            checkout_tree_recursive(store, &entry.sha, &path)?;
+            checkout_tree_recursive(store, &entry.sha, &path, file_count)?;
         } else {
             // Write file
             let blob_obj = match store.read(&entry.sha) {
@@ -572,6 +583,13 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str)
             if fd >= 0 {
                 let _ = write_fd(fd, content);
                 close(fd);
+            }
+
+            *file_count += 1;
+            if *file_count % 100 == 0 {
+                print("scratch: checked out ");
+                print_num(*file_count);
+                print(" files...\n");
             }
         }
     }
