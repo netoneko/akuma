@@ -361,7 +361,7 @@ fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<Vec<u8>, Error> {
 
     loop {
         match tls.read(&mut buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => break, // Clean EOF
             Ok(n) => {
                 if response.len() + n > MAX_RESPONSE_SIZE {
                     // Truncate to max size
@@ -371,7 +371,16 @@ fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<Vec<u8>, Error> {
                 }
                 response.extend_from_slice(&buf[..n]);
             }
-            Err(_) => break, // Error or connection closed
+            Err(_) => {
+                // TLS error (not a clean close_notify).
+                // If we haven't received anything, this is a real failure.
+                // If we have partial data, some servers drop TCP without
+                // close_notify on HTTP/1.0, so let the header parser decide.
+                if response.is_empty() {
+                    return Err(Error::IoError);
+                }
+                break;
+            }
         }
     }
 
@@ -382,13 +391,11 @@ fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<Vec<u8>, Error> {
 fn read_response_tcp(stream: &TcpStream) -> Result<Vec<u8>, Error> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
-    let mut empty_reads = 0u32;
 
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => break, // Clean EOF
             Ok(n) => {
-                empty_reads = 0;
                 if response.len() + n > MAX_RESPONSE_SIZE {
                     let remaining = MAX_RESPONSE_SIZE - response.len();
                     response.extend_from_slice(&buf[..remaining]);
@@ -401,10 +408,18 @@ fn read_response_tcp(stream: &TcpStream) -> Result<Vec<u8>, Error> {
                     || e.kind == libakuma::net::ErrorKind::TimedOut =>
             {
                 // Kernel recv already blocks up to 30s, so TimedOut here
-                // means no data for a long time. Break immediately.
+                // means no data for a long time.
+                if response.is_empty() {
+                    return Err(Error::IoError);
+                }
                 break;
             }
-            Err(_) => break,
+            Err(_) => {
+                if response.is_empty() {
+                    return Err(Error::IoError);
+                }
+                break;
+            }
         }
     }
 
@@ -559,7 +574,7 @@ impl HttpStream {
             Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
                 StreamResult::WouldBlock
             }
-            Err(_) => StreamResult::Done,
+            Err(_) => StreamResult::Error(Error::IoError),
         }
     }
 
@@ -672,7 +687,7 @@ impl<'a> HttpStreamTls<'a> {
                 self.pending_data.extend_from_slice(&buf[..n]);
                 self.process_pending_data()
             }
-            Err(_) => StreamResult::Done,
+            Err(e) => StreamResult::Error(e),
         }
     }
 
