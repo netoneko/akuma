@@ -1194,6 +1194,50 @@ impl Filesystem for Ext2Filesystem {
         }
     }
 
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let inode_num = self.lookup_path(path)?;
+        let state = self.state.lock();
+        let inode = Self::read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
+
+        let file_size = inode.size_lower as usize;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let block_size = state.block_size;
+        let end = core::cmp::min(offset + buf.len(), file_size);
+        let mut total_read = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+
+            if let Some(phys_block) = Self::get_block_num(&state, &inode, logical_block)? {
+                let block_data = Self::read_block(&state, phys_block)?;
+                buf[total_read..total_read + chunk]
+                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
+            } else {
+                // Sparse block — fill with zeros
+                buf[total_read..total_read + chunk].fill(0);
+            }
+
+            pos += chunk;
+            total_read += chunk;
+        }
+
+        Ok(total_read)
+    }
+
     fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
         if data.is_empty() {
             return Ok(0);

@@ -152,6 +152,14 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     vfs::write_file(path, data)
 }
 
+/// Read data from a specific offset within a file
+pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    vfs::read_at(path, offset, buf)
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if !is_initialized() {

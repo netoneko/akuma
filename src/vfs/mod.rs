@@ -176,6 +176,20 @@ pub trait Filesystem: Send + Sync {
     /// Append data to a file
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
 
+    /// Read data from a specific offset within a file.
+    /// Returns the number of bytes actually read (may be less than buf.len()
+    /// at end-of-file, or 0 if offset is past the end).
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Default: fall back to read-entire-file-and-slice (slow but correct)
+        let data = self.read_file(path)?;
+        if offset >= data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(data.len() - offset);
+        buf[..n].copy_from_slice(&data[offset..offset + n]);
+        Ok(n)
+    }
+
     /// Write data at a specific offset within a file.
     /// Extends the file if offset + data.len() > current size.
     /// Returns the number of bytes written.
@@ -439,6 +453,11 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 /// Append data to a file
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.append_file(rel, data))
+}
+
+/// Read data from a specific offset within a file
+pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, rel| fs.read_at(rel, offset, buf))
 }
 
 /// Write data at a specific offset within a file
