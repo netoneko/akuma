@@ -166,13 +166,13 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             count as u64
         }
         crate::process::FileDescriptor::File(ref f) => {
-            let mut data = crate::fs::read_file(&f.path).unwrap_or_default();
-            if f.position + count > data.len() { data.resize(f.position + count, 0); }
-            data[f.position..f.position + count].copy_from_slice(buf);
-            if crate::fs::write_file(&f.path, &data).is_ok() {
-                proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += count; });
-                count as u64
-            } else { !0u64 }
+            match crate::fs::write_at(&f.path, f.position, buf) {
+                Ok(n) => {
+                    proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
         }
         crate::process::FileDescriptor::Socket(_) => {
             match crate::socket::socket_send(fd_num as usize, buf) {

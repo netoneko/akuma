@@ -176,6 +176,21 @@ pub trait Filesystem: Send + Sync {
     /// Append data to a file
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
 
+    /// Write data at a specific offset within a file.
+    /// Extends the file if offset + data.len() > current size.
+    /// Returns the number of bytes written.
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        // Default: fall back to read-modify-write (slow but correct)
+        let mut contents = self.read_file(path).unwrap_or_default();
+        let end = offset + data.len();
+        if end > contents.len() {
+            contents.resize(end, 0);
+        }
+        contents[offset..end].copy_from_slice(data);
+        self.write_file(path, &contents)?;
+        Ok(data.len())
+    }
+
     /// Create a directory
     fn create_dir(&self, path: &str) -> Result<(), FsError>;
 
@@ -424,6 +439,11 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 /// Append data to a file
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.append_file(rel, data))
+}
+
+/// Write data at a specific offset within a file
+pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, rel| fs.write_at(rel, offset, data))
 }
 
 /// Create a directory

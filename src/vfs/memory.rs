@@ -219,6 +219,29 @@ impl Filesystem for MemoryFilesystem {
         Ok(())
     }
 
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let mut root = self.root.lock();
+        let (parent, filename) = Self::navigate_parent(&mut root, path)?;
+
+        match parent.get_mut(&filename) {
+            Some(FsNode::File { data: file_data, modified, .. }) => {
+                let end = offset + data.len();
+                if end > file_data.len() {
+                    file_data.resize(end, 0);
+                }
+                file_data[offset..end].copy_from_slice(data);
+                *modified = current_time();
+                Ok(data.len())
+            }
+            Some(FsNode::Directory { .. }) => Err(FsError::NotAFile),
+            None => Err(FsError::NotFound),
+        }
+    }
+
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         let mut root = self.root.lock();
 

@@ -1176,6 +1176,67 @@ impl Filesystem for Ext2Filesystem {
         }
     }
 
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let inode_num = match self.lookup_path(path) {
+            Ok(n) => n,
+            Err(FsError::NotFound) => {
+                // Create the file first, then write into it
+                self.write_file(path, &[])?;
+                self.lookup_path(path)?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut state = self.state.lock();
+        let mut inode = Self::read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
+
+        let block_size = state.block_size;
+        let end = offset + data.len();
+        let mut written = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+
+            let phys_block = Self::ensure_block(&mut state, &mut inode, logical_block)?;
+
+            if offset_in_block == 0 && chunk == block_size {
+                // Full block write — no need to read first
+                let mut block_data = vec![0u8; block_size];
+                block_data.copy_from_slice(&data[written..written + chunk]);
+                Self::write_block(&state, phys_block, &block_data)?;
+            } else {
+                // Partial block — read-modify-write just this one block
+                let mut block_data = Self::read_block(&state, phys_block)?;
+                block_data[offset_in_block..offset_in_block + chunk]
+                    .copy_from_slice(&data[written..written + chunk]);
+                Self::write_block(&state, phys_block, &block_data)?;
+            }
+
+            pos += chunk;
+            written += chunk;
+        }
+
+        // Update size if we extended the file
+        if end > inode.size_lower as usize {
+            inode.size_lower = end as u32;
+        }
+        inode.modification_time = current_time();
+        Self::write_inode(&state, inode_num, &inode)?;
+
+        Ok(written)
+    }
+
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         match self.lookup_path(path) {
             Ok(inode_num) => {
