@@ -118,7 +118,7 @@ where
     let timeout_us = 5_000_000; // 5 seconds
 
     loop {
-        crate::embassy_time_driver::on_timer_interrupt();
+        crate::kernel_timer::on_timer_interrupt();
 
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(result) => return result,

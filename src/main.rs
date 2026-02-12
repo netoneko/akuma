@@ -18,10 +18,10 @@ mod dns;
 mod editor;
 mod elf_loader;
 // mod embassy_net_driver;
-mod embassy_time_driver;
+// mod embassy_time_driver; // replaced by kernel_timer
 // mod embassy_virtio_driver;
 mod exceptions;
-mod executor;
+mod kernel_timer;
 mod fs;
 mod fs_tests;
 mod gic;
@@ -399,12 +399,8 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         }
     }
 
-    // Initialize Embassy time driver (bridges ARM timer to Embassy async)
-    embassy_time_driver::init();
-    console::print("Embassy time driver initialized\n");
-
-    // Initialize Embassy executor
-    executor::init();
+    // Initialize kernel timer (CNTV alarm queue for async timeouts)
+    kernel_timer::init();
 
     // Check timer hardware
     let freq = timer::read_frequency();
@@ -441,10 +437,10 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Registering timer IRQ...\n");
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
     
-    // Register virtual timer IRQ (27) for Embassy async wakeups
-    // Embassy uses CNTV (virtual timer) to avoid conflict with scheduler's CNTP
+    // Register virtual timer IRQ (27) for kernel timer async wakeups
+    // CNTV (virtual timer) avoids conflict with scheduler's CNTP
     irq::register_handler(27, |_irq| {
-        embassy_time_driver::on_timer_interrupt();
+        kernel_timer::on_timer_interrupt();
     });
     gic::enable_irq(27); // Enable virtual timer interrupt
 
@@ -635,7 +631,7 @@ fn run_async_main_preemptive() -> ! {
 fn run_async_main() -> ! {
     use core::future::Future;
     use core::pin::pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 
     // =========================================================================
     // Skip async network if disabled (for debugging)
@@ -763,14 +759,6 @@ fn run_async_main() -> ! {
         }
         
         GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
-        // Process pending IRQ work
-        executor::process_irq_work();
-        
-        GLOBAL_POLL_STEP.store(4, Ordering::Relaxed);
-        // Poll executor for other tasks
-        executor::run_once();
-        
-        GLOBAL_POLL_STEP.store(5, Ordering::Relaxed);
         // Poll herd output
         if let Some(ref channel) = herd_channel {
             if let Some(output) = channel.try_read() {
@@ -809,7 +797,7 @@ async fn memory_monitor() -> ! {
         }
     }
     use core::fmt::Write;
-    use embassy_time::{Duration, Timer};
+    use crate::kernel_timer::{Duration, Timer};
 
     // Stack-allocated buffer to avoid heap allocation when printing stats
     struct StackBuffer {

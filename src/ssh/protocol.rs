@@ -37,7 +37,7 @@ use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
 use crate::process::{self, Pid};
 use crate::terminal::{self, mode_flags};
-use embassy_time::Duration;
+use crate::kernel_timer::Duration;
 
 // ============================================================================
 // SSH Constants
@@ -237,7 +237,7 @@ impl<'a> SshChannelStream<'a> {
             }
 
             // Read more data from the network with timeout
-            let read_result = embassy_time::with_timeout(
+            let read_result = crate::kernel_timer::with_timeout(
                 SSH_READ_TIMEOUT,
                 self.stream.read(&mut buf)
             ).await;
@@ -298,7 +298,7 @@ impl<'a> SshChannelStream<'a> {
 
         // Try a very short timeout read from the network
         let mut tcp_buf = [0u8; 512];
-        let read_result = embassy_time::with_timeout(
+        let read_result = crate::kernel_timer::with_timeout(
             SSH_INTERACTIVE_READ_TIMEOUT,
             self.stream.read(&mut tcp_buf)
         ).await;
@@ -496,7 +496,7 @@ impl Write for SshChannelStream<'_> {
 
         // Auto-flush to ensure immediate transmission for interactive sessions
         // Use a timeout (10ms) to prevent blocking if the network is backed up
-        let _ = embassy_time::with_timeout(
+        let _ = crate::kernel_timer::with_timeout(
             SSH_INTERACTIVE_READ_TIMEOUT,
             self.flush()
         ).await;
@@ -1506,7 +1506,7 @@ pub async fn handle_connection(mut stream: TcpStream) {
             SSH_HANDSHAKE_TIMEOUT
         };
         
-        let read_result = embassy_time::with_timeout(timeout, stream.read(&mut buf)).await;
+        let read_result = crate::kernel_timer::with_timeout(timeout, stream.read(&mut buf)).await;
         
         match read_result {
             Err(_timeout) => {
