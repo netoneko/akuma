@@ -111,11 +111,14 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
     pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if buf.len() % SECTOR_SIZE != 0 {
+            crate::safe_print!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
+            crate::safe_print!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
+                sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
 
@@ -125,9 +128,11 @@ impl VirtioBlockDevice {
         for i in 0..num_sectors {
             let offset = i * SECTOR_SIZE;
             let sector_buf = &mut buf[offset..offset + SECTOR_SIZE];
-            inner
-                .read_blocks(sector as usize + i, sector_buf)
-                .map_err(|_| BlockError::ReadError)?;
+            if let Err(e) = inner.read_blocks(sector as usize + i, sector_buf) {
+                crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, err={:?}\n",
+                    sector as usize + i, e);
+                return Err(BlockError::ReadError);
+            }
         }
 
         Ok(())
@@ -140,11 +145,14 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
     pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
         if buf.len() % SECTOR_SIZE != 0 {
+            crate::safe_print!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
+            crate::safe_print!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
+                sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
 
@@ -154,9 +162,11 @@ impl VirtioBlockDevice {
         for i in 0..num_sectors {
             let offset = i * SECTOR_SIZE;
             let sector_buf = &buf[offset..offset + SECTOR_SIZE];
-            inner
-                .write_blocks(sector as usize + i, sector_buf)
-                .map_err(|_| BlockError::WriteError)?;
+            if let Err(e) = inner.write_blocks(sector as usize + i, sector_buf) {
+                crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, err={:?}\n",
+                    sector as usize + i, e);
+                return Err(BlockError::WriteError);
+            }
         }
 
         Ok(())

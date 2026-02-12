@@ -316,6 +316,29 @@ impl Command for PkgCommand {
                     let size_msg = format!("pkg: downloaded {} bytes\r\n", body.len());
                     let _ = stdout.write(size_msg.as_bytes()).await;
 
+                    // Check filesystem capacity before writing
+                    if let Ok(stats) = crate::fs::stats() {
+                        let free_bytes = stats.free_bytes();
+                        let block_size = stats.cluster_size;
+                        let blocks_needed = (body.len() as u64 + block_size as u64 - 1) / block_size as u64;
+                        let diag = format!(
+                            "pkg: fs: block_size={}, free={} bytes ({} blocks), need ~{} blocks\r\n",
+                            block_size, free_bytes, stats.free_clusters, blocks_needed
+                        );
+                        let _ = stdout.write(diag.as_bytes()).await;
+
+                        if (body.len() as u64) > free_bytes {
+                            let _ = stdout.write(b"Error: Not enough disk space\r\n").await;
+                            return Ok(());
+                        }
+                    }
+
+                    // Check disk device capacity
+                    if let Some(disk_cap) = crate::block::capacity() {
+                        let diag = format!("pkg: disk capacity={} bytes\r\n", disk_cap);
+                        let _ = stdout.write(diag.as_bytes()).await;
+                    }
+
                     // Ensure /bin directory exists
                     if crate::fs::create_dir("/bin").is_err() {
                         // Ignore error - directory may already exist

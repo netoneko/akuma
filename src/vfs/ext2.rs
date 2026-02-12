@@ -56,7 +56,7 @@ struct Superblock {
     superuser_blocks: u32,
     unallocated_blocks: u32,
     unallocated_inodes: u32,
-    superblock_block: u32,
+    first_data_block: u32,
     block_size_log: u32,
     fragment_size_log: u32,
     blocks_per_group: u32,
@@ -179,6 +179,7 @@ struct Ext2State {
     inode_size: u16,
     block_group_count: u32,
     blocks_per_group: u32,
+    first_data_block: u32,
 }
 
 // ============================================================================
@@ -225,14 +226,18 @@ impl Ext2Filesystem {
         } else {
             128
         };
-        let block_group_count = (total_blocks + blocks_per_group - 1) / blocks_per_group;
+        let first_data_block = superblock.first_data_block;
+        // Correct block group count: (total_blocks - first_data_block) / blocks_per_group, rounded up
+        let block_group_count =
+            (total_blocks - first_data_block + blocks_per_group - 1) / blocks_per_group;
 
-        crate::safe_print!(160, 
-            "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups\n",
+        crate::safe_print!(192, 
+            "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups, first_data_block={}\n",
             total_blocks,
             total_inodes,
             block_size,
-            block_group_count
+            block_group_count,
+            first_data_block
         );
 
         let state = Ext2State {
@@ -242,6 +247,7 @@ impl Ext2Filesystem {
             inode_size,
             block_group_count,
             blocks_per_group,
+            first_data_block,
         };
 
         Ok(Self {
@@ -294,7 +300,8 @@ impl Ext2Filesystem {
     // ========================================================================
 
     fn bgd_offset(state: &Ext2State, group: u32) -> u64 {
-        let bgd_table_block = if state.block_size == 1024 { 2 } else { 1 };
+        // BGD table starts in the block immediately after the superblock block
+        let bgd_table_block = state.first_data_block + 1;
         bgd_table_block as u64 * state.block_size as u64
             + group as u64 * size_of::<BlockGroupDescriptor>() as u64
     }
@@ -433,7 +440,7 @@ impl Ext2Filesystem {
                         return Err(e);
                     }
 
-                    let block_num = group * state.blocks_per_group + bit;
+                    let block_num = state.first_data_block + group * state.blocks_per_group + bit;
 
                     // Zero the block
                     let zeros = vec![0u8; state.block_size];
@@ -455,8 +462,10 @@ impl Ext2Filesystem {
             return Ok(());
         }
 
-        let group = block_num / state.blocks_per_group;
-        let bit = block_num % state.blocks_per_group;
+        // Block numbering starts at first_data_block (1 for 1024-byte blocks)
+        let adjusted = block_num - state.first_data_block;
+        let group = adjusted / state.blocks_per_group;
+        let bit = adjusted % state.blocks_per_group;
 
         let mut bgd = Self::read_bgd(state, group)?;
         let bitmap_block = bgd.block_bitmap;
