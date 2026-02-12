@@ -31,6 +31,9 @@ This document outlines the roadmap for building `paws` (Process Awareness & Work
 - [ ] **History:** Maintain a simple in-memory command history.
 - [ ] **SSH Readiness:** Ensure `paws` handles the environment correctly so it can be used as a login shell.
 
+## Known Issues
+- **No Input Echo:** In some environments (like interactive boxes), `paws` may not echo typed characters to the screen, although it correctly captures and executes commands. This is likely related to terminal mode settings or the `poll_input_event` interaction.
+
 ## Future Goal: Login Shell Integration
 Once `paws` is stable, the SSH server in `src/ssh/server.rs` can be updated to:
 1. Check for the existence of `/bin/paws`.
