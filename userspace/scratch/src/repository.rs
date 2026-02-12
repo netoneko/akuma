@@ -526,7 +526,7 @@ fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Resu
     // Checkout tree with progress tracking
     let mut file_count: usize = 0;
     checkout_tree_recursive(store, &commit.tree, dest, &mut file_count)?;
-    print("scratch: checked out ");
+    print("\nscratch: checked out ");
     print_num(file_count);
     print(" files\n");
     Ok(())
@@ -579,6 +579,11 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
             };
             let content = blob_obj.as_blob()?;
 
+            // Print a dot for large files (>64KB) since they take a while
+            if content.len() > 65536 {
+                print(".");
+            }
+
             let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
             if fd >= 0 {
                 let _ = write_fd(fd, content);
@@ -586,10 +591,8 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
             }
 
             *file_count += 1;
-            if *file_count % 100 == 0 {
-                print("scratch: checked out ");
-                print_num(*file_count);
-                print(" files...\n");
+            if *file_count % 50 == 0 {
+                print(".");
             }
         }
     }
