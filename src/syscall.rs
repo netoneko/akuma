@@ -5,6 +5,7 @@
 
 use crate::console;
 use crate::config;
+use crate::terminal::mode_flags;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -109,12 +110,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
         nr::CHDIR => sys_chdir(args[0], args[1] as usize),
-        nr::SET_TERMINAL_ATTRIBUTES => 0,
-        nr::GET_TERMINAL_ATTRIBUTES => 0,
-        nr::SET_CURSOR_POSITION => 0,
-        nr::HIDE_CURSOR => 0,
-        nr::SHOW_CURSOR => 0,
-        nr::CLEAR_SCREEN => 0,
+        nr::SET_TERMINAL_ATTRIBUTES => sys_set_terminal_attributes(args[0], args[1], args[2]),
+        nr::GET_TERMINAL_ATTRIBUTES => sys_get_terminal_attributes(args[0], args[1]),
+        nr::SET_CURSOR_POSITION => sys_set_cursor_position(args[0], args[1]),
+        nr::HIDE_CURSOR => sys_hide_cursor(),
+        nr::SHOW_CURSOR => sys_show_cursor(),
+        nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
         _ => !0 // ENOSYS
@@ -466,6 +467,102 @@ fn sys_chdir(ptr: u64, len: usize) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)).unwrap_or("") };
     if let Some(proc) = crate::process::current_process() { proc.set_cwd(path); return 0; }
     !0u64
+}
+
+/// Helper: write data to the current process's ProcessChannel (stdout buffer)
+fn write_to_process_channel(data: &[u8]) -> u64 {
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64,
+    };
+    proc_channel.write(data);
+    data.len() as u64
+}
+
+/// sys_set_terminal_attributes - Sets terminal control attributes
+fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::ENOMEM as i64) as u64,
+    };
+
+    let mut term_state = term_state_lock.lock();
+    term_state.mode_flags = mode_flags_arg;
+
+    // Propagate raw mode setting to the ProcessChannel
+    let proc_channel = match crate::process::current_channel() {
+        Some(channel) => channel,
+        None => return (-libc_errno::ENOMEM as i64) as u64,
+    };
+    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n",
+            fd, action, mode_flags_arg, term_state.mode_flags);
+    }
+
+    0
+}
+
+/// sys_get_terminal_attributes - Retrieves current terminal control attributes
+fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
+    if attr_ptr == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    let term_state_lock = match crate::process::current_terminal_state() {
+        Some(state) => state,
+        None => return (-libc_errno::ENOMEM as i64) as u64,
+    };
+
+    let term_state = term_state_lock.lock();
+
+    unsafe {
+        *(attr_ptr as *mut u64) = term_state.mode_flags;
+    }
+
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n",
+            fd, attr_ptr, term_state.mode_flags);
+    }
+
+    0
+}
+
+/// sys_set_cursor_position - Sets the cursor position via ANSI escape sequence
+fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
+    }
+    // VT100/ANSI escape sequence: ESC[{row};{col}H (1-indexed)
+    let row_1 = row + 1;
+    let col_1 = col + 1;
+    let sequence = alloc::format!("\x1b[{};{}H", row_1, col_1);
+    write_to_process_channel(sequence.as_bytes())
+}
+
+/// sys_hide_cursor - Hides the terminal cursor
+fn sys_hide_cursor() -> u64 {
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
+    }
+    write_to_process_channel(b"\x1b[?25l")
+}
+
+/// sys_show_cursor - Shows the terminal cursor
+fn sys_show_cursor() -> u64 {
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
+    }
+    write_to_process_channel(b"\x1b[?25h")
+}
+
+/// sys_clear_screen - Clears the entire terminal screen
+fn sys_clear_screen() -> u64 {
+    if config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
+    }
+    write_to_process_channel(b"\x1b[2J")
 }
 
 fn sys_poll_input_event(ptr: u64, count: usize, timeout_us: u64) -> u64 {
