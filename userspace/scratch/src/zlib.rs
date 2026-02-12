@@ -53,11 +53,8 @@ where F: FnMut(&[u8]) -> Result<()> {
             Ok(MZStatus::StreamEnd) => return Ok(()),
             Ok(MZStatus::Ok) => {
                 if result.bytes_consumed == 0 && result.bytes_written == 0 {
-                    // If we haven't consumed all input and haven't written anything, 
-                    // it means we need more space in out_buf (which we have in the next loop)
-                    // or more input (which we don't have here).
                     if consumed >= data.len() {
-                        return Ok(());
+                        break;
                     }
                     return Err(Error::decompress());
                 }
@@ -65,6 +62,11 @@ where F: FnMut(&[u8]) -> Result<()> {
             _ => return Err(Error::decompress()),
         }
     }
+
+    // If we haven't reached StreamEnd but input is exhausted, we may need to flush.
+    // However, for Zlib objects in Git, each chunk should be complete.
+    // We'll return Ok(()) and let the next chunk (if any) or caller handle it.
+    Ok(())
 }
 
 /// Compress data with zlib

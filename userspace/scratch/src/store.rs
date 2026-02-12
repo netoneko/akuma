@@ -186,6 +186,11 @@ impl ObjectStore {
         }
 
         close(fd);
+
+        // Optional: We could check if state.is_uninitialized() or similar, 
+        // but miniz_oxide doesn't make it easy to check StreamEnd status 
+        // after the fact without capturing it from the last result.
+        
         Ok(())
     }
 

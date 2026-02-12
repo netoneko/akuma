@@ -614,9 +614,14 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
 
                 close(fd);
                 
-                if result.is_err() {
+                if let Err(e) = result {
                     print("\nscratch: checkout: failed to stream ");
                     print(&entry.name);
+                    print(": ");
+                    print(e.message());
+                    print("\n");
+                } else if file_size > 300 * 1024 {
+                    // Newline after dots for large files
                     print("\n");
                 }
             } else {
