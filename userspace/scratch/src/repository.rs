@@ -137,9 +137,18 @@ pub fn clone(url: &str) -> Result<()> {
     print(default_branch);
     print("\n");
 
+    // Verify HEAD commit exists before checkout
+    let head_commit_sha = ref_manager.resolve_head()?;
+    print("scratch: HEAD commit: ");
+    print(&crate::sha1::to_hex(&head_commit_sha));
+    print("\n");
+
+    if !store.exists(&head_commit_sha) {
+        print("scratch: WARNING: HEAD commit object not on disk!\n");
+    }
+
     // Checkout working tree
     print("scratch: checking out files\n");
-    let head_commit_sha = ref_manager.resolve_head()?;
     checkout_tree(&store, &head_commit_sha, &repo_name)?;
 
     print("scratch: done\n");
@@ -501,7 +510,17 @@ fn extract_repo_name(path: &str) -> String {
 /// Checkout the tree for a commit
 fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Result<()> {
     // Read commit
-    let commit_obj = store.read(commit_sha)?;
+    let commit_obj = match store.read(commit_sha) {
+        Ok(obj) => obj,
+        Err(e) => {
+            print("scratch: checkout: commit ");
+            print(&crate::sha1::to_hex(commit_sha));
+            print(": ");
+            print(e.message());
+            print("\n");
+            return Err(e);
+        }
+    };
     let commit = commit_obj.as_commit()?;
 
     // Checkout tree
@@ -510,7 +529,19 @@ fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Resu
 
 /// Recursively checkout a tree
 fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str) -> Result<()> {
-    let tree_obj = store.read(tree_sha)?;
+    let tree_obj = match store.read(tree_sha) {
+        Ok(obj) => obj,
+        Err(e) => {
+            print("scratch: checkout: tree ");
+            print(&crate::sha1::to_hex(tree_sha));
+            print(" in ");
+            print(dest);
+            print(": ");
+            print(e.message());
+            print("\n");
+            return Err(e);
+        }
+    };
     let tree = tree_obj.as_tree()?;
 
     for entry in &tree.entries {
@@ -522,7 +553,19 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str)
             checkout_tree_recursive(store, &entry.sha, &path)?;
         } else {
             // Write file
-            let blob_obj = store.read(&entry.sha)?;
+            let blob_obj = match store.read(&entry.sha) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    print("scratch: checkout: blob ");
+                    print(&crate::sha1::to_hex(&entry.sha));
+                    print(" (");
+                    print(&entry.name);
+                    print("): ");
+                    print(e.message());
+                    print("\n");
+                    return Err(e);
+                }
+            };
             let content = blob_obj.as_blob()?;
 
             let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);

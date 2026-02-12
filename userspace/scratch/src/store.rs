@@ -148,6 +148,9 @@ impl ObjectStore {
         if written < 0 {
             return Err(Error::io("failed to write object file"));
         }
+        if (written as usize) < compressed.len() {
+            return Err(Error::io("short write to object file"));
+        }
         
         Ok(sha)
     }
