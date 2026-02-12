@@ -194,6 +194,9 @@ pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = true;
 
+/// Option to disable [ext2] debug prints to the kernel log.
+pub const DEBUG_EXT2: bool = false;
+
 // ============================================================================
 // Network TX Queue Configuration
 // ============================================================================

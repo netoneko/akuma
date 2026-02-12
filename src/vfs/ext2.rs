@@ -212,11 +212,13 @@ impl Ext2Filesystem {
         let inodes_per_group = superblock.inodes_per_group;
 
         if magic != EXT2_MAGIC {
-            crate::safe_print!(96, 
-                "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
-                magic,
-                EXT2_MAGIC
-            );
+            if crate::config::DEBUG_EXT2 {
+                crate::safe_print!(96, 
+                    "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
+                    magic,
+                    EXT2_MAGIC
+                );
+            }
             return Err(FsError::NoFilesystem);
         }
 
@@ -231,14 +233,16 @@ impl Ext2Filesystem {
         let block_group_count =
             (total_blocks - first_data_block + blocks_per_group - 1) / blocks_per_group;
 
-        crate::safe_print!(192, 
-            "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups, first_data_block={}\n",
-            total_blocks,
-            total_inodes,
-            block_size,
-            block_group_count,
-            first_data_block
-        );
+        if crate::config::DEBUG_EXT2 {
+            crate::safe_print!(192, 
+                "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups, first_data_block={}\n",
+                total_blocks,
+                total_inodes,
+                block_size,
+                block_group_count,
+                first_data_block
+            );
+        }
 
         let state = Ext2State {
             superblock,
@@ -422,21 +426,27 @@ impl Ext2Filesystem {
                     // Found free block
                     Self::set_bit(&mut bitmap, bit, true);
                     if let Err(e) = Self::write_block(state, bitmap_block, &bitmap) {
-                        crate::safe_print!(96, "[ext2] alloc_block: bitmap write failed grp={} bit={}: {}\n", group, bit, e);
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: bitmap write failed grp={} bit={}: {}\n", group, bit, e);
+                        }
                         return Err(e);
                     }
 
                     // Update BGD
                     bgd.free_blocks_count = free_count - 1;
                     if let Err(e) = Self::write_bgd(state, group, &bgd) {
-                        crate::safe_print!(96, "[ext2] alloc_block: bgd write failed grp={}: {}\n", group, e);
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: bgd write failed grp={}: {}\n", group, e);
+                        }
                         return Err(e);
                     }
 
                     // Update superblock
                     state.superblock.unallocated_blocks = unalloc - 1;
                     if let Err(e) = Self::write_superblock(state) {
-                        crate::safe_print!(96, "[ext2] alloc_block: superblock write failed: {}\n", e);
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: superblock write failed: {}\n", e);
+                        }
                         return Err(e);
                     }
 
@@ -445,7 +455,9 @@ impl Ext2Filesystem {
                     // Zero the block
                     let zeros = vec![0u8; state.block_size];
                     if let Err(e) = Self::write_block(state, block_num, &zeros) {
-                        crate::safe_print!(96, "[ext2] alloc_block: zero block {} failed: {}\n", block_num, e);
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: zero block {} failed: {}\n", block_num, e);
+                        }
                         return Err(e);
                     }
 
@@ -730,15 +742,19 @@ impl Ext2Filesystem {
     ) -> Result<(), FsError> {
         let blocks_needed = (data.len() + state.block_size - 1) / state.block_size;
 
-        crate::safe_print!(96, "[ext2] write_inode_data: {} bytes, {} blocks needed, block_size={}\n",
-            data.len(), blocks_needed, state.block_size);
+        if crate::config::DEBUG_EXT2 {
+            crate::safe_print!(96, "[ext2] write_inode_data: {} bytes, {} blocks needed, block_size={}\n",
+                data.len(), blocks_needed, state.block_size);
+        }
 
         for logical_block in 0..blocks_needed as u32 {
             let phys_block = match Self::ensure_block(state, inode, logical_block) {
                 Ok(b) => b,
                 Err(e) => {
-                    crate::safe_print!(96, "[ext2] ensure_block FAILED at logical_block={}: {}\n",
-                        logical_block, e);
+                    if crate::config::DEBUG_EXT2 {
+                        crate::safe_print!(96, "[ext2] ensure_block FAILED at logical_block={}: {}\n",
+                            logical_block, e);
+                    }
                     return Err(e);
                 }
             };
@@ -750,8 +766,10 @@ impl Ext2Filesystem {
             block_data[..end - start].copy_from_slice(&data[start..end]);
 
             if let Err(e) = Self::write_block(state, phys_block, &block_data) {
-                crate::safe_print!(96, "[ext2] write_block FAILED at logical={} phys={}: {}\n",
-                    logical_block, phys_block, e);
+                if crate::config::DEBUG_EXT2 {
+                    crate::safe_print!(96, "[ext2] write_block FAILED at logical={} phys={}: {}\n",
+                        logical_block, phys_block, e);
+                }
                 return Err(e);
             }
         }
@@ -1466,5 +1484,7 @@ impl Filesystem for Ext2Filesystem {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    if crate::config::DEBUG_EXT2 {
+        console::print(msg);
+    }
 }
