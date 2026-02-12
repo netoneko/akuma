@@ -72,12 +72,25 @@ impl Filesystem for ProcFilesystem {
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = path.trim_matches('/');
+        let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
 
         if path.is_empty() {
-            // Root: list all process PIDs as directories
+            // Root: list all process PIDs as directories, filtered by box_id
             let processes = process::list_processes();
             let entries = processes
                 .into_iter()
+                .filter(|p| {
+                    // Box 0 (Host) sees everything. Box N only sees its own.
+                    if current_box_id == 0 {
+                        true
+                    } else {
+                        if let Some(proc) = process::lookup_process(p.pid) {
+                            proc.box_id == current_box_id
+                        } else {
+                            false
+                        }
+                    }
+                })
                 .map(|p| DirEntry {
                     name: alloc::format!("{}", p.pid),
                     is_dir: true,
@@ -133,7 +146,15 @@ impl Filesystem for ProcFilesystem {
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let (pid, fd_num) = Self::parse_fd_path(path)?;
 
+        let current_proc = crate::process::current_process();
+        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+
         let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+        
+        // BOX ISOLATION: Box N only sees its own processes.
+        if current_box_id != 0 && proc.box_id != current_box_id {
+            return Err(FsError::NotFound);
+        }
 
         // Lock the appropriate buffer and clone data (thread-safe)
         match fd_num {
@@ -145,9 +166,16 @@ impl Filesystem for ProcFilesystem {
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         let (target_pid, fd_num) = Self::parse_fd_path(path)?;
+        let caller_proc = crate::process::current_process();
         let caller_pid = process::read_current_pid();
+        let caller_box_id = caller_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
         let target = process::lookup_process(target_pid).ok_or(FsError::NotFound)?;
+
+        // BOX ISOLATION: Box N only sees its own processes.
+        if caller_box_id != 0 && target.box_id != caller_box_id {
+            return Err(FsError::NotFound);
+        }
 
         match fd_num {
             0 => {

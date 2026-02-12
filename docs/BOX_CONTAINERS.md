@@ -30,6 +30,9 @@ pub struct Process {
 }
 ```
 
+*   **Box 0 Safety:** Box 0 is the host system and **MUST NOT** be closed or killed via `sys_kill_box`.
+*   **Inheritance:** By default, all new processes created via `sys_spawn` or kernel internal spawning MUST inherit the `box_id` and `root_dir` of their parent process. This ensures that a process spawning children inside a box keeps those children inside the same box.
+
 ### 1.2 VFS Path Resolution (`src/vfs/mod.rs`)
 
 The VFS layer's path resolution (`resolve` and `normalize_path`) must be aware of the current process's `root_dir`.
@@ -174,11 +177,14 @@ box_root = /data/jail/myservice
 *   **Direct Execution (`noshell`):** `box use` should execute commands directly via the kernel rather than wrapping them in a shell. This avoids PID pollution and simplifies signal propagation.
 *   **Terminal-less IO (`noterm`):** Use raw byte-piping for `box peek` and `box use`. The `ProcessChannel` should be treated as a transparent pipe, allowing the host's terminal to handle all escape sequences and line editing.
 
-### 6.2 Attachment (`box peek`) Architecture
+### 6.2 Attachment (`box peek`) & Reconnection
 
-1.  **Daemon Ownership:** The `box` daemon maintains the `Arc<ProcessChannel>` for the container's primary process.
-2.  **Unix Socket Proxy:** `box peek` connects to the daemon via a Unix socket.
-3.  **Transparent Piping:** The daemon proxies data bi-directionally between the Unix socket and the `ProcessChannel` without modification. This ensures that interactive applications (like editors or `top`) render correctly.
+To achieve a "screen -dr" (re-attach and detach others) experience:
+1.  **Daemon Persistence:** The `box` daemon remains the owner of the child's `ProcessChannel`. It stays alive even when no users are "peeking."
+2.  **Broadcast/Multiplexing:** The daemon should support multiple simultaneous "peeks" by broadcasting stdout to all connected Unix sockets.
+3.  **Stdin Arbitration:** Only one "peek" session should have active stdin control at a time, or the daemon should multiplex them.
+4.  **Re-attach Strategy:** `box peek --detach` should signal the daemon to drop existing Unix socket connections before establishing the new one, ensuring a clean transition of control.
+5.  **Kernel Role:** The kernel's `ProcessChannel` already uses `Arc`, ensuring the I/O buffers stay alive as long as the daemon holds a reference, even if the primary process exits (allowing for "post-mortem" log peeking).
 
 ### 6.3 ProcFS & Networking Support
 

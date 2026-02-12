@@ -19,7 +19,7 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::ssh::crypto::{split_first_word, trim_bytes};
-use crate::process::{self, Pid};
+use crate::process;
 use crate::ssh::protocol::SshChannelStream;
 use embedded_io_async::Write; // Added this line
 
@@ -509,7 +509,7 @@ pub async fn execute_external_interactive(
     cwd: Option<&str>,
     channel_stream: &mut SshChannelStream<'_>,
 ) -> Result<(), ShellError> {
-    use crate::process::{spawn_process_with_channel_cwd, YieldOnce};
+    use crate::process::spawn_process_with_channel_cwd;
     
     // Spawn process with channel and cwd
     let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {

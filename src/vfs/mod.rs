@@ -406,7 +406,21 @@ where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
     // Normalize path (ensure leading /)
-    let normalized = normalize_path_owned(path);
+    let mut normalized = normalize_path_owned(path);
+
+    // VFS SCOPING: Prepend process root_dir if not /
+    if let Some(proc) = crate::process::current_process() {
+        if proc.root_dir != "/" {
+            // Join root_dir and normalized path
+            // e.g. root_dir="/box1", normalized="/etc" -> "/box1/etc"
+            let scoped = if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &normalized[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, normalized)
+            };
+            normalized = scoped;
+        }
+    }
 
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;

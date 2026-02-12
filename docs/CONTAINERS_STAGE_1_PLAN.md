@@ -11,7 +11,8 @@ Userspace processes **MUST NOT** be aware of their host-side `root_dir`. To a bo
 ### 1. Process Metadata Update (`src/process.rs`)
 - Add `box_id: u64` and `root_dir: String` to the `Process` struct.
 - Initialize `Process` with `box_id: 0` and `root_dir: "/"` by default (Box 0 / Host).
-- Update `Process::from_elf` and `spawn_process` logic to inherit or set these values.
+- **Inheritance Logic:** Update `spawn_process_with_channel_ext` and `sys_spawn` to default to the caller's `box_id` and `root_dir` if not explicitly overridden.
+- **Safety:** Prevent `sys_kill_box` from accepting `box_id: 0`.
 
 ### 2. VFS Scoping (`src/vfs/mod.rs`)
 - Update `vfs::resolve` (and `with_fs`) to respect the current process's `root_dir`.

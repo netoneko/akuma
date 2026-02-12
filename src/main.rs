@@ -14,6 +14,7 @@ mod block;
 mod boot;
 mod config;
 mod console;
+mod container_tests;
 mod dns;
 mod editor;
 mod elf_loader;
@@ -520,6 +521,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
                             // Run shell tests (pipelines with /bin binaries)
                             shell_tests::run_all_tests();
+
+                            // Run container isolation tests
+                            if config::RUN_CONTAINER_TESTS {
+                                container_tests::run_all();
+                            }
                         }
                     }
                     Err(e) => {

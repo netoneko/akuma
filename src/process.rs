@@ -978,6 +978,12 @@ pub struct Process {
     pub spawner_pid: Option<Pid>,
     // ========== Terminal State ==========
     pub terminal_state: Spinlock<terminal::TerminalState>,
+
+    // ========== Isolation Context ==========
+    /// Box ID (0 = Host, >0 = Isolated Box)
+    pub box_id: u64,
+    /// Virtual Root Directory (host path that acts as / for this process)
+    pub root_dir: String,
 }
 
 
@@ -1056,6 +1062,10 @@ impl Process {
             spawner_pid: None,
             // Terminal State - default for new processes
             terminal_state: Spinlock::new(terminal::TerminalState::default()),
+
+            // Isolation defaults: Host context (Box 0, root at /)
+            box_id: 0,
+            root_dir: String::from("/"),
         })
     }
 
@@ -1650,6 +1660,18 @@ pub fn spawn_process_with_channel_cwd(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    spawn_process_with_channel_ext(path, args, stdin, cwd, None, 0)
+}
+
+/// Extended version of spawn_process_with_channel
+pub fn spawn_process_with_channel_ext(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
+    root_dir: Option<&str>,
+    box_id: u64,
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // Check if user threads are available
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
@@ -1678,6 +1700,32 @@ pub fn spawn_process_with_channel_cwd(
         process.set_cwd(dir);
     }
 
+    // Set up isolation context (Inherit from caller by default)
+    let (caller_box_id, caller_root_dir) = match read_current_pid() {
+        Some(pid) => {
+            if let Some(proc) = lookup_process(pid) {
+                (proc.box_id, proc.root_dir.clone())
+            } else {
+                (0, String::from("/"))
+            }
+        }
+        None => (0, String::from("/")), // Kernel context
+    };
+
+    if let Some(root) = root_dir {
+        process.root_dir = String::from(root);
+    } else {
+        process.root_dir = caller_root_dir;
+    }
+
+    if box_id != 0 {
+        process.box_id = box_id;
+    } else {
+        // Note: box_id 0 means "unspecified" in the arg, 
+        // so we inherit unless it's explicitly 0 from a non-boxed caller.
+        process.box_id = caller_box_id;
+    }
+
     // Set spawner PID (the process that called spawn, if any)
     // This is used by procfs to control who can write to stdin
     process.spawner_pid = read_current_pid();
@@ -1685,11 +1733,7 @@ pub fn spawn_process_with_channel_cwd(
     // Get the PID before boxing
     let pid = process.pid;
 
-    // Box the process for heap allocation - this is CRITICAL for memory management.
-    // Previously, the Process lived on the closure's stack, but execute() never returns
-    // (it ERETs to userspace), so Process::drop() was never called, causing memory leaks.
-    // Now we Box it and register in PROCESS_TABLE which owns it. When the process exits,
-    // unregister_process() returns the Box which is then dropped, freeing all memory.
+    // Box the process for heap allocation
     let mut boxed_process = Box::new(process);
 
     // Create a channel for this process
@@ -1697,24 +1741,10 @@ pub fn spawn_process_with_channel_cwd(
     let channel_for_thread = channel.clone();
 
     // Spawn on a user thread
-    // Use spawn_user_thread_fn_for_process which starts with IRQs disabled
-    // to prevent the race where timer fires before activate() sets user TTBR0.
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
-        // NOTE: IRQs are already disabled from thread creation.
-        // spawn_user_thread_fn_for_process starts the thread with DAIF.I set,
-        // preventing timer from preempting before activate() sets user TTBR0.
-        
-        // Register channel for this thread so syscalls can find it
-        // return_to_kernel() will call remove_channel() and set_exited() when process exits
         let tid = crate::threading::current_thread_id();
         register_channel(tid, channel_for_thread);
-
-        // Set thread_id on process for kill support
         boxed_process.thread_id = Some(tid);
-
-        // Execute the process using execute_boxed which registers the Box
-        // in PROCESS_TABLE (transferring ownership) then enters userspace.
-        // This never returns - when user exits, return_to_kernel() handles cleanup.
         execute_boxed(boxed_process)
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;

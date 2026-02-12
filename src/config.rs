@@ -158,6 +158,9 @@ pub const SKIP_ASYNC_NETWORK: bool = false;
 /// Run network self-tests after initialization
 pub const RUN_NETWORK_TESTS: bool = true;
 
+/// Run container isolation tests after initialization
+pub const RUN_CONTAINER_TESTS: bool = false;
+
 /// Enable DHCP for automatic IP configuration
 pub const ENABLE_DHCP: bool = true;
 

@@ -49,6 +49,7 @@ pub mod nr {
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
     pub const GET_CPU_STATS: u64 = 314;
+    pub const SPAWN_EXT: u64 = 315;
 }
 
 /// Thread CPU statistics for top command
@@ -118,6 +119,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
+        nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5]),
         _ => !0 // ENOSYS
     }
 }
@@ -432,6 +434,15 @@ fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     !0u64
 }
 
+#[repr(C)]
+pub struct SpawnOptions {
+    pub cwd_ptr: u64,
+    pub cwd_len: usize,
+    pub root_dir_ptr: u64,
+    pub root_dir_len: usize,
+    pub box_id: u64,
+}
+
 fn sys_spawn(path_ptr: u64, path_len: usize, _args_ptr: u64, _args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
@@ -442,7 +453,49 @@ fn sys_spawn(path_ptr: u64, path_len: usize, _args_ptr: u64, _args_len: usize, s
     !0u64
 }
 
-fn sys_kill(pid: u32) -> u64 { if crate::process::kill_process(pid).is_ok() { 0 } else { !0u64 } }
+fn sys_spawn_ext(path_ptr: u64, path_len: usize, stdin_ptr: u64, stdin_len: usize, options_ptr: u64, _reserved: u64) -> u64 {
+    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+    let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
+    
+    let options = if options_ptr != 0 {
+        Some(unsafe { &*(options_ptr as *const SpawnOptions) })
+    } else {
+        None
+    };
+
+    let cwd = options.and_then(|o| {
+        if o.cwd_ptr != 0 {
+            Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.cwd_ptr as *const u8, o.cwd_len)).unwrap_or("/") })
+        } else {
+            None
+        }
+    });
+
+    let root_dir = options.and_then(|o| {
+        if o.root_dir_ptr != 0 {
+            Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.root_dir_ptr as *const u8, o.root_dir_len)).unwrap_or("/") })
+        } else {
+            None
+        }
+    });
+
+    let box_id = options.map(|o| o.box_id).unwrap_or(0);
+
+    // Call internal helper with extended options
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, None, stdin, cwd, root_dir, box_id) {
+        crate::process::register_child_channel(pid, ch);
+        if let Some(proc) = crate::process::current_process() {
+            return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+        }
+    }
+    !0u64
+}
+
+fn sys_kill(pid: u32) -> u64 {
+    // Safety: prevent killing init or Box 0 implicitly if we add box killing logic here
+    if pid <= 1 { return !0u64; }
+    if crate::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
+}
 
 fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if let Some(ch) = crate::process::get_child_channel(pid) {
