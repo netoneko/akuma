@@ -112,9 +112,9 @@ fn main() -> i32 {
                 response.extend_from_slice(&buf[..n]);
             }
             Err(e) => {
-                if e.kind == libakuma::net::ErrorKind::WouldBlock {
-                    libakuma::sleep_ms(1);
-                    continue;
+                if e.kind == libakuma::net::ErrorKind::WouldBlock || e.kind == libakuma::net::ErrorKind::TimedOut {
+                    // Kernel recv already blocks, break on timeout.
+                    break;
                 }
                 print("wget: Read error: ");
                 print(&format!("{:?}\n", e));

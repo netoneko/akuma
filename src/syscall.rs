@@ -299,14 +299,26 @@ fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
-    if let Some(idx) = get_socket_from_fd(fd) { if let Ok(n) = socket::socket_send(idx, buf) { return n as u64; } }
-    !0u64
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+    match socket::socket_send(idx, buf) {
+        Ok(n) => n as u64,
+        Err(e) => (-e as i64) as u64,
+    }
 }
 
 fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-    if let Some(idx) = get_socket_from_fd(fd) { if let Ok(n) = socket::socket_recv(idx, buf) { return n as u64; } }
-    !0u64
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+    match socket::socket_recv(idx, buf) {
+        Ok(n) => n as u64,
+        Err(e) => (-e as i64) as u64,
+    }
 }
 
 fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }

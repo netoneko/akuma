@@ -87,29 +87,24 @@ impl ErrorType for TcpTransport {
 
 impl Read for TcpTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        // Loop until we get data or a real error
-        // Handle WouldBlock by retrying with a minimal delay
+        // The kernel recv blocks until data is available (up to 30s timeout),
+        // so we just pass through the result. No retry loop needed.
         loop {
             match self.stream.read(buf) {
                 Ok(n) => {
-                    // Reset counter on successful read
                     self.wait_counter = 0;
                     return Ok(n);
                 }
                 Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
-                    // Print dots periodically to keep SSH alive
+                    // Kernel already blocks, so these are rare edge cases.
+                    // Retry immediately without sleeping.
                     if self.print_dots {
                         self.wait_counter += 1;
-                        // Print a dot every ~500ms (50 * 10ms)
                         if self.wait_counter % 50 == 0 {
                             libakuma::print(".");
                             self.dots_printed += 1;
                         }
                     }
-                    // Yield to allow network thread to process packets.
-                    // 1ms is a good balance between responsiveness and not
-                    // hogging CPU/syscall bandwidth which affects SSH.
-                    libakuma::sleep_ms(1);
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),
@@ -123,8 +118,8 @@ impl Write for TcpTransport {
         loop {
             match self.stream.write(buf) {
                 Ok(n) => return Ok(n),
-                Err(ref e) if e.kind == ErrorKind::WouldBlock => {
-                    libakuma::sleep_ms(1);
+                Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
+                    // Kernel already blocks, retry immediately without sleeping.
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),

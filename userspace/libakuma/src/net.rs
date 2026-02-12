@@ -139,8 +139,7 @@ impl TcpListener {
             }
 
             let errno = -new_fd;
-            if errno == 11 { // WouldBlock
-                crate::sleep_ms(1);
+            if errno == 11 { // EAGAIN/WouldBlock - kernel accept blocks, so this is rare
                 continue;
             }
 
@@ -247,8 +246,8 @@ impl TcpStream {
             match self.write(buf) {
                 Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer")),
                 Ok(n) => buf = &buf[n..],
-                Err(e) if e.kind == ErrorKind::WouldBlock => {
-                    crate::sleep_ms(1);
+                Err(e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
+                    // Kernel already blocks, so these are rare. Retry immediately.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -264,8 +263,8 @@ impl TcpStream {
             match self.read(&mut buf[filled..]) {
                 Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
                 Ok(n) => filled += n,
-                Err(e) if e.kind == ErrorKind::WouldBlock => {
-                    crate::sleep_ms(1);
+                Err(e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
+                    // Kernel already blocks, so these are rare. Retry immediately.
                     continue;
                 }
                 Err(e) => return Err(e),
