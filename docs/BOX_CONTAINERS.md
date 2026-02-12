@@ -24,9 +24,9 @@ pub struct Process {
     pub root_dir: String,
 
     /// Box ID (Namespace ID)
-    /// None = Host System
-    /// Some(id) = Inside a Box
-    pub box_id: Option<u64>,
+    /// 0 = Host System (Default)
+    /// >0 = Inside an isolated Box
+    pub box_id: u64,
 }
 ```
 
@@ -43,9 +43,9 @@ The VFS layer's path resolution (`resolve` and `normalize_path`) must be aware o
 
 `ProcFilesystem::read_dir` will be modified to filter entries based on `box_id`.
 
-*   **Host Process (Box ID = None):** Sees all processes and the `/proc/boxes` registry.
-*   **Boxed Process (Box ID = X):** Sees only processes with `box_id == X`.
-*   **Isolation Guard:** The `/proc/boxes` virtual file **MUST NOT** be mounted or accessible from within a boxed environment. This prevents processes from discovering other boxes or the host-level management registry.
+*   **Host Process (Box ID = 0):** Sees all processes and the `/proc/boxes` registry.
+*   **Boxed Process (Box ID = X > 0):** Sees only processes with `box_id == X`.
+*   **Isolation Guard:** The `/proc/boxes` virtual file **MUST NOT** be mounted or accessible from within a boxed environment (Box ID > 0). This prevents processes from discovering other boxes or the host-level management registry.
 
 ### 1.4 Syscall Interface (`src/syscall.rs`)
 
@@ -141,7 +141,7 @@ static BOX_REGISTRY: Spinlock<BTreeMap<u64, BoxInfo>> = ...;
 *   **`sys_kill_box(box_id)`**: A new syscall to kill all processes sharing a specific `box_id`. This ensures that even if a process forks, the entire container can be brought down.
 *   **`ps` and `procfs` Updates**:
     *   The system `ps` command (and `/proc/all`) should be updated to show a `BOX` column.
-    *   It should display the `box_id` (or `None`/`Host`) for each process.
+    *   It should display the `box_id` (`0` for Host, or the container ID) for each process.
 *   **`procfs` Extension**: `/proc/boxes` will expose the box registry to userspace, allowing `box ps` to work without needing a centralized daemon (though individual box daemons still handle I/O).
 
 ## 4. Herd Integration (`userspace/herd`)
