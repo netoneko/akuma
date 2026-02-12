@@ -20,7 +20,8 @@ members = [
     "wget",
     "termtest",
     "allocstress",
-    "top"
+    "top",
+    "paws"
 ]
 
 [profile.dev]

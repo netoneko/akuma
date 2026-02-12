@@ -24,6 +24,7 @@ To reduce the need for external binaries in minimal boxes, `paws` will include:
 - `pwd`: Print current working directory (using `sys_getcwd`).
 - `ls [dir]`: List directory contents (built-in to avoid dependency on an external `ls` binary).
 - `ps`: List processes within the current box (using `sys_get_cpu_stats` filtered by `box_id`).
+- `pkg install <package>`: Download and install a package from the host server (built-in to allow bootstrapping a box).
 - `exit`: Terminate the shell session.
 - `help`: Display available commands and usage.
 - `echo`: Print arguments to stdout.

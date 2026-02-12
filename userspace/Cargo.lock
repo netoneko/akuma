@@ -565,6 +565,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "paws"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

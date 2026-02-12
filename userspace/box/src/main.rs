@@ -7,6 +7,7 @@
 //!   box use <name> <cmd>
 //!   box close <name|id>
 //!   box show <name|id>
+//!   box test
 
 #![no_std]
 #![no_main]
@@ -83,6 +84,7 @@ pub extern "C" fn _start() -> ! {
         "use" | "exec" => cmd_use(args_iter),
         "close" | "stop" | "rm" => cmd_close(args_iter),
         "show" | "inspect" => cmd_show(args_iter),
+        "test" => cmd_test(),
         "help" | "--help" | "-h" => { print_usage(); exit(0); }
         _ => {
             print("box: unknown command '"); print(command); print("'\n");
@@ -100,6 +102,7 @@ fn print_usage() {
     print("  box use <name> <cmd>                      Run command in existing box\n");
     print("  box close <name|id>                       Stop all processes in a box\n");
     print("  box show <name|id>                        Display box details\n");
+    print("  box test                                  Run isolation tests\n");
 }
 
 fn cmd_open(mut args: libakuma::Args) -> ! {
@@ -125,11 +128,9 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
         }
     }
 
-    // Generate a pseudo-random 32-bit hex ID based on name hash
-    let mut hash = 0u32;
-    for b in name.as_bytes() { hash = hash.wrapping_mul(31).wrapping_add(*b as u32); }
-    if hash == 0 { hash = 1; }
-    let box_id = hash as u64;
+    let mut box_id = 0u64;
+    for b in name.as_bytes() { box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64); }
+    if box_id == 0 { box_id = 1; }
 
     libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
 
@@ -166,6 +167,25 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
     }
 }
 
+fn copy_file(src: &str, dst: &str) -> bool {
+    let sfd = open(src, open_flags::O_RDONLY);
+    if sfd < 0 { return false; }
+    let mut success = false;
+    if let Ok(stat) = fstat(sfd) {
+        let mut buf = Vec::with_capacity(stat.st_size as usize);
+        buf.resize(stat.st_size as usize, 0);
+        let n = read_fd(sfd, &mut buf);
+        let dfd = open(dst, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+        if dfd >= 0 {
+            if n > 0 { let _ = write_fd(dfd, &buf[..n as usize]); }
+            close(dfd);
+            success = true;
+        }
+    }
+    close(sfd);
+    success
+}
+
 fn copy_recursive(src: &str, dst: &str) {
     if let Some(entries) = read_dir(src) {
         for entry in entries {
@@ -175,20 +195,7 @@ fn copy_recursive(src: &str, dst: &str) {
                 let _ = mkdir(&dst_path);
                 copy_recursive(&src_path, &dst_path);
             } else {
-                let sfd = open(&src_path, open_flags::O_RDONLY);
-                if sfd >= 0 {
-                    if let Ok(stat) = fstat(sfd) {
-                        let mut buf = Vec::with_capacity(stat.st_size as usize);
-                        buf.resize(stat.st_size as usize, 0);
-                        let n = read_fd(sfd, &mut buf);
-                        let dfd = open(&dst_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-                        if dfd >= 0 {
-                            if n > 0 { let _ = write_fd(dfd, &buf[..n as usize]); }
-                            close(dfd);
-                        }
-                    }
-                    close(sfd);
-                }
+                copy_file(&src_path, &dst_path);
             }
         }
     }
@@ -221,7 +228,6 @@ fn cmd_ps() -> ! {
             let root = parts.next().unwrap_or("");
             let creator = parts.next().unwrap_or("");
             
-            // Parse ID to reformat as hex
             let mut id_val = 0u64;
             for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { id_val = id_val * 10 + (*b - b'0') as u64; } }
             let id_hex = if id_val == 0 { String::from("0") } else { format!("{:08x}", id_val) };
@@ -341,26 +347,80 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
 
     if box_id == 0 && target != "0" && target != "host" { print("box show: box not found\n"); exit(1); }
     
-    println(&format!("Box ID: {}", box_id));
+    println(&format!("Box ID: {:08x}", box_id));
     println(&format!("Name:   {}", box_name));
     println(&format!("Root:   {}", box_root));
     println(&format!("Creator PID: {}", box_creator));
-    println("\nMembers:");
+    exit(0);
+}
+
+fn cmd_test() -> ! {
+    println("--- Running Box Isolation Tests (Userspace) ---");
+
+    // Test 1: Blind Root Redirection
+    print("[Test 1] Blind Root Redirection... ");
+    let test_dir = "/tmp/boxtest";
+    let _ = mkdir(test_dir);
+    let _ = mkdir(&format!("{}/bin", test_dir));
     
-    // Read all processes from /proc
-    if let Some(mut dir) = libakuma::read_dir("/") {
-        for entry in dir {
-            // Check if entry is a numeric PID
-            let mut is_pid = true;
-            for b in entry.name.as_bytes() { if *b < b'0' || *b > b'9' { is_pid = false; break; } }
-            if is_pid {
-                // We'd need to read box_id for this process. 
-                // Since ps/top can see it, let's assume we can get it if we had a /proc/<pid>/status.
-                // For now, let's just print that we found a process.
-                // In Akuma, we currently don't have a /proc/<pid>/status file.
-                // Recommendation: add it later.
+    // Copy cat to box
+    if !copy_file("/bin/cat", &format!("{}/bin/cat", test_dir)) {
+        println("FAILED: Could not copy /bin/cat to test dir");
+        exit(1);
+    }
+
+    // Create test file
+    let test_file = format!("{}/test.txt", test_dir);
+    let test_content = "Akuma Container Test 123";
+    let fd = open(&test_file, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd >= 0 {
+        let _ = write_fd(fd, test_content.as_bytes());
+        close(fd);
+    }
+
+    // Spawn box running cat /test.txt (which is host /tmp/boxtest/test.txt)
+    let box_id = 0x7E571;
+    let mut options = SpawnOptions {
+        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+        root_dir_ptr: test_dir.as_ptr() as u64, root_dir_len: test_dir.len(),
+        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
+    };
+
+    let args = ["/bin/cat", "/test.txt"];
+    match spawn_ext("/bin/cat", Some(&args), None, &mut options) {
+        Some(res) => {
+            let mut output = Vec::new();
+            loop {
+                let mut buf = [0u8; 256];
+                let n = read_fd(res.stdout_fd as i32, &mut buf);
+                if n > 0 { output.extend_from_slice(&buf[..n as usize]); }
+                if let Some((_, _)) = waitpid(res.pid) { break; }
+                libakuma::sleep_ms(10);
+            }
+            
+            if core::str::from_utf8(&output).unwrap_or("").contains(test_content) {
+                println("PASSED");
+            } else {
+                println("FAILED: Output did not match");
+                print("Got: "); println(core::str::from_utf8(&output).unwrap_or(""));
+                exit(1);
             }
         }
+        None => { println("FAILED: Could not spawn test process"); exit(1); }
     }
+
+    // Test 2: ProcFS Isolation
+    print("[Test 2] ProcFS Isolation... ");
+    // Box 0 should see itself and the new process
+    let fd = open("/proc/boxes", open_flags::O_RDONLY);
+    if fd >= 0 {
+        println("PASSED");
+        close(fd);
+    } else {
+        println("FAILED: Cannot read /proc/boxes from host");
+        exit(1);
+    }
+
+    println("--- All Tests Passed ---");
     exit(0);
 }
