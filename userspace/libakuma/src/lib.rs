@@ -488,7 +488,7 @@ pub fn sleep(seconds: u64) {
 /// Sleep for the specified number of milliseconds
 #[inline(never)]
 pub fn sleep_ms(milliseconds: u64) {
-    let nanos = milliseconds * 1_000_000;
+    let nanos = milliseconds.saturating_mul(1000_000);
     syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
 }
 
@@ -1220,11 +1220,17 @@ pub fn clear_screen() -> i32 {
 
 /// Checks for and returns pending input events.
 pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
+    let timeout_us = if timeout_ms == core::u64::MAX {
+        core::u64::MAX
+    } else {
+        timeout_ms.saturating_mul(1000)
+    };
+
     let ret = syscall(
         syscall::POLL_INPUT_EVENT,
         event_buf.as_mut_ptr() as u64,
         event_buf.len() as u64,
-        timeout_ms * 1000, // convert ms to us (kernel expects microseconds)
+        timeout_us,
         0, 0, 0,
     ) as i64;
 

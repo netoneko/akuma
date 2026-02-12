@@ -277,8 +277,8 @@ fn sys_unlinkat(_dirfd: i32, path_ptr: u64, path_len: usize, _flags: u32) -> u64
 }
 
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
-    let total_us = seconds * 1_000_000 + nanoseconds / 1_000;
-    let deadline = crate::timer::uptime_us() + total_us;
+    let total_us = seconds.saturating_mul(1_000_000).saturating_add(nanoseconds / 1_000);
+    let deadline = crate::timer::uptime_us().saturating_add(total_us);
     loop {
         if crate::timer::uptime_us() >= deadline { return 0; }
         if crate::process::is_current_interrupted() { return EINTR; }
@@ -591,7 +591,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
         let deadline = if timeout_us == u64::MAX {
             u64::MAX
         } else {
-            crate::timer::uptime_us() + timeout_us
+            crate::timer::uptime_us().saturating_add(timeout_us)
         };
 
         loop {
