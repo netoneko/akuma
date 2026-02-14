@@ -51,6 +51,7 @@ fn main() {
             "rm" => cmd_rm(&args),
             "find" => cmd_find(&args),
             "grep" => cmd_grep(&args),
+            "echo" => cmd_echo(&args),
             _ => execute_external(&args),
         }
     }
@@ -145,9 +146,20 @@ fn cmd_help() {
     println("  rm <path>             Remove file");
     println("  find <path> [name]    Find files recursively");
     println("  grep <pat> <file>     Search for pattern in file");
+    println("  echo [args...]        Print arguments");
     println("  pkg install <pkgs>    Install packages");
     println("  help                  Show this help");
     println("  exit                  Exit paws");
+}
+
+fn cmd_echo(args: &[String]) {
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        if i > 1 {
+            print(" ");
+        }
+        print(arg);
+    }
+    println("");
 }
 
 fn cmd_cd(args: &[String]) {
@@ -164,21 +176,45 @@ fn cmd_cd(args: &[String]) {
 }
 
 fn cmd_ls(args: &[String]) {
-    let path = if args.len() < 2 {
-        "."
-    } else {
-        &args[1]
-    };
+    let mut show_all = false;
+    let mut path = ".";
+
+    for arg in args.iter().skip(1) {
+        if arg == "-a" {
+            show_all = true;
+        } else if !arg.starts_with('-') {
+            path = arg;
+        }
+    }
 
     if let Some(reader) = read_dir(path) {
-        for entry in reader {
-            if entry.is_dir {
-                print("[DIR] ");
-            } else {
-                print("      ");
+        let mut entries: Vec<DirEntryInfo> = reader.collect();
+        // Sort entries alphabetically
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for entry in entries {
+            if !show_all && entry.name.starts_with('.') && entry.name != "." && entry.name != ".." {
+                // In most unix systems, . and .. are shown even without -a if they are the only ones?
+                // Actually no, they are hidden. But we should check if they are returned.
+                continue;
             }
-            println(&entry.name);
+            
+            // Skip hidden files if not show_all
+            if !show_all && entry.name.starts_with('.') {
+                continue;
+            }
+
+            if entry.is_dir {
+                print("\x1b[1;34m"); // Bold Blue
+                print(&entry.name);
+                print("\x1b[0m");
+                print("/");
+            } else {
+                print(&entry.name);
+            }
+            print("  ");
         }
+        println("");
     } else {
         print("ls: cannot access ");
         println(path);
@@ -447,18 +483,51 @@ fn execute_external(args: &[String]) {
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     
     if let Some(res) = spawn(&path, Some(&arg_refs)) {
-        // Simple wait for the process to exit
+        let mut child_stdout_buf = [0u8; 1024];
+        let mut user_input_buf = [0u8; 1];
+
+        // Interactive loop for streaming output and catching Ctrl+C
         loop {
+            // 1. Check for child output (non-blocking)
+            let n = read_fd(res.stdout_fd as i32, &mut child_stdout_buf);
+            if n > 0 {
+                // Stream child output to our stdout
+                write(fd::STDOUT, &child_stdout_buf[..n as usize]);
+            }
+
+            // 2. Check for user input (short timeout to keep loop responsive)
+            let n_in = poll_input_event(10, &mut user_input_buf);
+            if n_in > 0 {
+                if user_input_buf[0] == 0x03 {
+                    // Ctrl+C detected - send interrupt to child
+                    println("^C");
+                    kill(res.pid);
+                } else {
+                    // Forward other input to child stdin (if supported by kernel)
+                    // Currently Akuma might not fully support writing to child's Stdin FD
+                    // but we can try if there was a mechanism. For now we just catch Ctrl+C.
+                }
+            }
+
+            // 3. Check if child has exited
             if let Some((_, exit_code)) = waitpid(res.pid) {
-                if exit_code != 0 {
+                // Final drain of stdout
+                loop {
+                    let n = read_fd(res.stdout_fd as i32, &mut child_stdout_buf);
+                    if n <= 0 { break; }
+                    write(fd::STDOUT, &child_stdout_buf[..n as usize]);
+                }
+
+                if exit_code != 0 && exit_code != 130 { // 130 is standard for SIGINT
                     print("[process exited with ");
                     print_dec(exit_code as usize);
                     println("]");
                 }
                 break;
             }
-            // Yield or sleep briefly to avoid busy waiting
-            sleep_ms(10);
+
+            // Small yield to prevent 100% CPU while waiting
+            sleep_ms(5);
         }
     } else {
         print("paws: command not found: ");
