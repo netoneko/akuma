@@ -1,7 +1,7 @@
 //! box - Container management utility
 //!
 //! Usage:
-//!   box open <name> [--directory <dir>] [-i] [-d] [cmd] [args...]
+//!   box open <name> [--root <dir>] [-i] [-d] [cmd] [args...]
 //!   box cp <source> <destination>
 //!   box ps
 //!   box use <name|id> [-i] [-d] <cmd> [args...]
@@ -101,14 +101,14 @@ pub extern "C" fn _start() -> ! {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box open <name> [-i] [-d] [-dir <dir>] [cmd] [args...]  Start a box\n");
-    print("  box use <name|id> [-i] [-d] <cmd> [args...]            Run in box\n");
-    print("  box grab <name|id> [pid]                               Reattach to process\n");
-    print("  box cp <source> <dest>                                 Copy directory\n");
-    print("  box ps                                                 List active boxes\n");
-    print("  box close <name|id>                                    Stop a box\n");
-    print("  box show <name|id>                                     Display details\n");
-    print("  box test                                               Run isolation tests\n");
+    print("  box open <name> [-i] [-d] [--root <dir>] [cmd] [args...]  Start a box\n");
+    print("  box use <name|id> [-i] [-d] <cmd> [args...]               Run in box\n");
+    print("  box grab <name|id> [pid]                                  Reattach to process\n");
+    print("  box cp <source> <dest>                                    Copy directory\n");
+    print("  box ps                                                    List active boxes\n");
+    print("  box close <name|id>                                       Stop a box\n");
+    print("  box show <name|id>                                        Display details\n");
+    print("  box test                                                  Run isolation tests\n");
 }
 
 fn resolve_target_id(target: &str) -> Option<u64> {
@@ -178,6 +178,7 @@ fn get_target_root(target_id: u64) -> Option<String> {
                 let id_str = parts.next().unwrap_or("");
                 let _bname = parts.next().unwrap_or("");
                 let root = parts.next().unwrap_or("");
+                // ... skip creator, primary
                 
                 let mut found_id = 0u64;
                 for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
@@ -192,7 +193,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
     let mut args = args.peekable();
     let name = match args.next() {
         Some(n) => n,
-        None => { print("Usage: box open <name> [-i] [-d] [-dir <dir>] [cmd] [args...]\n"); exit(1); }
+        None => { print("Usage: box open <name> [-i] [-d] [--root <dir>] [cmd] [args...]\n"); exit(1); }
     };
 
     let mut directory = String::from("/");
@@ -202,7 +203,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
     let mut cmd_args = Vec::new();
 
     while let Some(arg) = args.next() {
-        if arg == "--directory" || arg == "-dir" || (arg == "-d" && args.peek().is_some() && !args.peek().unwrap().starts_with('-')) {
+        if arg == "--root" || arg == "-r" {
             directory = String::from(args.next().unwrap_or("/"));
         } else if arg == "-i" || arg == "--interactive" {
             interactive = true;
@@ -397,7 +398,7 @@ fn copy_file(src: &str, dst: &str) -> bool {
         if dfd >= 0 {
             if total_read > 0 { let _ = write_fd(dfd, &buf[..total_read]); }
             close(dfd);
-            success = (total_read == size);
+            success = total_read == size;
         }
     }
     close(sfd);
@@ -437,20 +438,21 @@ fn cmd_ps() -> ! {
 
     if n > 0 {
         let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-        println("  ID            NAME        ROOT        CREATOR");
-        println("  ---------------------------------------------");
+        println("  ID            NAME        ROOT        CREATOR     PRIMARY");
+        println("  ---------------------------------------------------------");
         for line in content.lines().skip(1) {
             let mut parts = line.split(',');
             let id_str = parts.next().unwrap_or("");
             let name = parts.next().unwrap_or("");
             let root = parts.next().unwrap_or("");
             let creator = parts.next().unwrap_or("");
+            let primary = parts.next().unwrap_or("-");
             
             let mut id_val = 0u64;
             for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { id_val = id_val * 10 + (*b - b'0') as u64; } }
             let id_hex = if id_val == 0 { String::from("0") } else { format!("{:08x}", id_val) };
 
-            println(&format!("  {:<12}  {:<10}  {:<10}  {}", id_hex, name, root, creator));
+            println(&format!("  {:<12}  {:<10}  {:<10}  {:<10}  {}", id_hex, name, root, creator, primary));
         }
     } else {
         println("No active boxes found.");

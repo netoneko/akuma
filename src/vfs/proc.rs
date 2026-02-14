@@ -168,6 +168,19 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        let path = path.trim_start_matches('/');
+        
+        // Handle virtual files first (boxes, net/tcp, etc.)
+        if path == "boxes" || path.starts_with("net/") {
+            let data = self.read_file(path)?;
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - offset);
+            buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
+        }
+
         let (pid, fd_num) = Self::parse_fd_path(path)?;
         let current_proc = crate::process::current_process();
         let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
