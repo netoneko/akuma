@@ -193,6 +193,23 @@ impl Filesystem for MemoryFilesystem {
         }
     }
 
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        let root = self.root.lock();
+        let node = Self::navigate(&root, path)?;
+
+        match node {
+            FsNode::File { data, .. } => {
+                if offset >= data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(data.len() - offset);
+                buf[..n].copy_from_slice(&data[offset..offset + n]);
+                Ok(n)
+            }
+            FsNode::Directory { .. } => Err(FsError::NotAFile),
+        }
+    }
+
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         let mut root = self.root.lock();
 

@@ -153,12 +153,22 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             n as u64
         }
         crate::process::FileDescriptor::File(ref f) => {
-            let data = match crate::fs::read_file(&f.path) { Ok(d) => d, Err(_) => return !0u64 };
-            if f.position >= data.len() { return 0; }
-            let n = count.min(data.len() - f.position);
-            unsafe { core::ptr::copy_nonoverlapping(data[f.position..].as_ptr(), buf_ptr as *mut u8, n); }
-            proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
-            n as u64
+            // Memory safety: Limit the amount of memory allocated in the kernel per syscall.
+            // Userspace is expected to call read in a loop.
+            let limit = 64 * 1024; // 64KB chunks
+            let to_read = count.min(limit);
+            let mut temp = alloc::vec![0u8; to_read];
+            
+            match crate::fs::read_at(&f.path, f.position, &mut temp) {
+                Ok(n) => {
+                    if n > 0 {
+                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                        proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    }
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
         }
         crate::process::FileDescriptor::Socket(_) => {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };

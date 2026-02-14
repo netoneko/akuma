@@ -167,6 +167,42 @@ impl Filesystem for ProcFilesystem {
         Err(FsError::NotFound)
     }
 
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        let (pid, fd_num) = Self::parse_fd_path(path)?;
+        let current_proc = crate::process::current_process();
+        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+
+        let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+        
+        // BOX ISOLATION: Box N only sees its own processes.
+        if current_box_id != 0 && proc.box_id != current_box_id {
+            return Err(FsError::NotFound);
+        }
+
+        // Lock the appropriate buffer
+        match fd_num {
+            0 => {
+                let stdin = proc.stdin.lock();
+                if offset >= stdin.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(stdin.data.len() - offset);
+                buf[..n].copy_from_slice(&stdin.data[offset..offset + n]);
+                Ok(n)
+            }
+            1 => {
+                let stdout = proc.stdout.lock();
+                if offset >= stdout.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(stdout.data.len() - offset);
+                buf[..n].copy_from_slice(&stdout.data[offset..offset + n]);
+                Ok(n)
+            }
+            _ => Err(FsError::NotFound),
+        }
+    }
+
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let path = path.trim_start_matches('/');
         let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);

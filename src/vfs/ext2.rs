@@ -715,6 +715,16 @@ impl Ext2Filesystem {
 
     fn read_inode_data(state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
         let size = inode.size_lower as usize;
+
+        // Safety: Limit maximum kernel-side file allocation to 16MB to prevent OOM/panic.
+        // Large files should be accessed via read_at() instead of read_file().
+        if size > 16 * 1024 * 1024 {
+            if crate::config::DEBUG_EXT2 {
+                crate::safe_print!(128, "[ext2] read_inode_data: size {} exceeds 16MB limit\n", size);
+            }
+            return Err(FsError::Internal);
+        }
+
         let mut data = Vec::with_capacity(size);
         let blocks_needed = (size + state.block_size - 1) / state.block_size;
 
@@ -1300,29 +1310,9 @@ impl Filesystem for Ext2Filesystem {
     }
 
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        match self.lookup_path(path) {
-            Ok(inode_num) => {
-                let mut state = self.state.lock();
-                let mut inode = Self::read_inode(&state, inode_num)?;
-
-                if (inode.type_perms & 0xF000) == S_IFDIR {
-                    return Err(FsError::NotAFile);
-                }
-
-                // Read existing data
-                let mut existing = Self::read_inode_data(&state, &inode)?;
-                existing.extend_from_slice(data);
-
-                // Write back
-                Self::write_inode_data(&mut state, inode_num, &mut inode, &existing)?;
-                Ok(())
-            }
-            Err(FsError::NotFound) => {
-                // Create new file
-                self.write_file(path, data)
-            }
-            Err(e) => Err(e),
-        }
+        let size = self.metadata(path)?.size as usize;
+        self.write_at(path, size, data)?;
+        Ok(())
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {

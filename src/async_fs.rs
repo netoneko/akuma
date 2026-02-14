@@ -179,21 +179,10 @@ impl AsyncFile {
 
         yield_now().await;
 
-        // Read entire file and extract the portion we need
-        let data = fs::read_file(&self.path)?;
+        let n = fs::read_at(&self.path, self.position as usize, buf)?;
+        self.position += n as u64;
 
-        if self.position >= data.len() as u64 {
-            return Ok(0);
-        }
-
-        let start = self.position as usize;
-        let available = data.len() - start;
-        let to_read = core::cmp::min(buf.len(), available);
-
-        buf[..to_read].copy_from_slice(&data[start..start + to_read]);
-        self.position += to_read as u64;
-
-        Ok(to_read)
+        Ok(n)
     }
 
     /// Write data to the file at the current position
@@ -205,55 +194,18 @@ impl AsyncFile {
         yield_now().await;
 
         match self.mode {
-            OpenMode::Write => {
-                // For write mode, we write from position 0 (truncate handled at open)
-                if self.position == 0 {
-                    fs::write_file(&self.path, data)?;
-                } else {
-                    // Read existing content, modify, write back
-                    let mut existing = fs::read_file(&self.path).unwrap_or_default();
-                    let pos = self.position as usize;
-
-                    // Extend if necessary
-                    if pos > existing.len() {
-                        existing.resize(pos, 0);
-                    }
-
-                    // Insert/overwrite data
-                    if pos + data.len() > existing.len() {
-                        existing.resize(pos + data.len(), 0);
-                    }
-                    existing[pos..pos + data.len()].copy_from_slice(data);
-
-                    fs::write_file(&self.path, &existing)?;
-                }
+            OpenMode::Write | OpenMode::ReadWrite => {
+                let n = fs::write_at(&self.path, self.position as usize, data)?;
+                self.position += n as u64;
+                Ok(n)
             }
             OpenMode::Append => {
                 fs::append_file(&self.path, data)?;
-            }
-            OpenMode::ReadWrite => {
-                // Read existing content, modify, write back
-                let mut existing = fs::read_file(&self.path).unwrap_or_default();
-                let pos = self.position as usize;
-
-                // Extend if necessary
-                if pos > existing.len() {
-                    existing.resize(pos, 0);
-                }
-
-                // Insert/overwrite data
-                if pos + data.len() > existing.len() {
-                    existing.resize(pos + data.len(), 0);
-                }
-                existing[pos..pos + data.len()].copy_from_slice(data);
-
-                fs::write_file(&self.path, &existing)?;
+                self.position = fs::file_size(&self.path).unwrap_or(self.position + data.len() as u64);
+                Ok(data.len())
             }
             OpenMode::Read => unreachable!(),
         }
-
-        self.position += data.len() as u64;
-        Ok(data.len())
     }
 
     /// Seek to a position in the file
