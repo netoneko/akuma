@@ -54,6 +54,10 @@ pub mod syscall {
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
     pub const GET_CPU_STATS: u64 = 314;
+    pub const SPAWN_EXT: u64 = 315;
+    pub const REGISTER_BOX: u64 = 316;
+    pub const KILL_BOX: u64 = 317;
+    pub const REATTACH: u64 = 318;
 }
 
 /// Thread CPU statistics for top command
@@ -1145,6 +1149,11 @@ pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
 /// Returns 0 on success, negative errno on error.
 pub fn kill(pid: u32) -> i32 {
     syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
+}
+
+/// Reattach I/O to a target process
+pub fn reattach(pid: u32) -> i32 {
+    syscall(syscall::REATTACH, pid as u64, 0, 0, 0, 0, 0) as i32
 }
 
 /// Wait for a child process (non-blocking)

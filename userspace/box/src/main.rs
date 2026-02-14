@@ -154,41 +154,18 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
             Some(res) => {
                 print("Started PID "); libakuma::print_dec(res.pid as usize); print("\n");
                 
-                let child_stdin_path = format!("/proc/{}/fd/0", res.pid);
-                let c_stdin_fd = if interactive { open(&child_stdin_path, open_flags::O_WRONLY) } else { -1 };
+                if interactive {
+                    if libakuma::reattach(res.pid) != 0 {
+                        print("box: reattach failed\n");
+                        exit(1);
+                    }
+                }
 
                 loop {
-                    if interactive {
-                        // 1. Forward child stdout (non-blocking read)
-                        let mut buf = [0u8; 1024];
-                        let n = read_fd(res.stdout_fd as i32, &mut buf);
-                        if n > 0 { 
-                            libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]);
-                        }
-
-                        // 2. Forward host stdin (blocking read with 10ms timeout)
-                        let mut in_buf = [0u8; 256];
-                        let n_in = libakuma::poll_input_event(10, &mut in_buf);
-                        if n_in > 0 && c_stdin_fd >= 0 {
-                            let _ = write_fd(c_stdin_fd, &in_buf[..n_in as usize]);
-                        }
-                    }
-
                     if let Some((_, code)) = waitpid(res.pid) {
-                        if interactive {
-                            // Final stdout drain
-                            let mut buf = [0u8; 1024];
-                            while read_fd(res.stdout_fd as i32, &mut buf) > 0 {
-                                libakuma::write(libakuma::fd::STDOUT, &buf);
-                            }
-                            if c_stdin_fd >= 0 { close(c_stdin_fd); }
-                        }
                         exit(code);
                     }
-                    
-                    if !interactive {
-                        libakuma::sleep_ms(10);
-                    }
+                    libakuma::sleep_ms(100);
                 }
             }
             None => { print("box open: failed to spawn\n"); exit(1); }
@@ -327,29 +304,15 @@ fn cmd_use(mut args: libakuma::Args) -> ! {
     match spawn_ext(path, args_opt, None, &mut options) {
         Some(res) => {
             if interactive {
-                let child_stdin_path = format!("/proc/{}/fd/0", res.pid);
-                let c_stdin_fd = open(&child_stdin_path, open_flags::O_WRONLY);
+                if libakuma::reattach(res.pid) != 0 {
+                    print("box use: reattach failed\n");
+                    exit(1);
+                }
                 loop {
-                    // 1. Forward child stdout
-                    let mut buf = [0u8; 1024];
-                    let n = read_fd(res.stdout_fd as i32, &mut buf);
-                    if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
-
-                    // 2. Forward host stdin
-                    let mut in_buf = [0u8; 256];
-                    let n_in = libakuma::poll_input_event(10, &mut in_buf);
-                    if n_in > 0 && c_stdin_fd >= 0 {
-                        let _ = write_fd(c_stdin_fd, &in_buf[..n_in as usize]);
+                    if let Some((_, code)) = waitpid(res.pid) {
+                        exit(code);
                     }
-
-                    if let Some((_, code)) = waitpid(res.pid) { 
-                        let mut buf = [0u8; 1024];
-                        while read_fd(res.stdout_fd as i32, &mut buf) > 0 {
-                            libakuma::write(libakuma::fd::STDOUT, &buf);
-                        }
-                        if c_stdin_fd >= 0 { close(c_stdin_fd); }
-                        exit(code); 
-                    }
+                    libakuma::sleep_ms(100);
                 }
             } else {
                 println(&format!("Injected PID {}", res.pid));
@@ -437,7 +400,7 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
     for i in 0..count {
         if stats[i].state != 0 && stats[i].box_id == box_id {
             let mut name_len = 0;
-            while name_len < 16 && stats[i].name[name_len] != 0 { name_len += 1; }
+            while name_len < 16 && stats[i].name[name_len] >= 32 && stats[i].name[name_len] < 127 { name_len += 1; }
             let name = core::str::from_utf8(&stats[i].name[..name_len]).unwrap_or("?");
             println(&format!("  PID {:>3}  {}", stats[i].pid, name));
             found = true;

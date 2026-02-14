@@ -217,6 +217,13 @@ pub fn init_box_registry() {
 pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
     let proc = lookup_process(pid).ok_or("Process not found")?;
     
+    // If this process has delegated its I/O to another PID (reattach), forward it
+    if let Some(target_pid) = proc.delegate_pid {
+        // Use with_irqs_disabled or release lock before recursing if needed, 
+        // but lookup_process handles its own locking.
+        return write_to_process_stdin(target_pid, data);
+    }
+
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[Process] Writing {} bytes to PID {} ({}) stdin\n", data.len(), pid, proc.name);
     }
@@ -246,6 +253,62 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
         crate::threading::enable_preemption();
     }
     
+    Ok(())
+}
+
+/// Reattach I/O from the current process to a target PID
+pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+    let caller_pid = read_current_pid().ok_or("No caller context")?;
+    
+    // 1. Validate hierarchy permissions
+    let (caller_box_id, channel) = {
+        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+        (caller.box_id, caller.channel.clone())
+    };
+
+    let target_box_id = {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.box_id
+    };
+
+    let mut allowed = false;
+    if caller_box_id == 0 {
+        allowed = true; // Host can reattach anything
+    } else if target_box_id == caller_box_id {
+        allowed = true; // Same box
+    } else {
+        // Check if caller created the target's box (child box)
+        let box_info = crate::irq::with_irqs_disabled(|| {
+            BOX_REGISTRY.lock().get(&target_box_id).cloned()
+        });
+        if let Some(info) = box_info {
+            if info.creator_pid == caller_pid {
+                allowed = true;
+            }
+        }
+    }
+
+    if !allowed {
+        return Err("Permission denied: cannot reattach process outside hierarchy");
+    }
+
+    // 2. Perform the delegation
+    // Current process (e.g. 'box') now points its input to target (e.g. 'paws')
+    {
+        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+        caller.delegate_pid = Some(target_pid);
+    }
+
+    // Target process now uses caller's output channel
+    {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.channel = channel;
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Reattached PID {} -> PID {}\n", caller_pid, target_pid);
+    }
+
     Ok(())
 }
 
@@ -1166,6 +1229,9 @@ pub struct Process {
 
     /// I/O Channel for async/interactive communication
     pub channel: Option<Arc<ProcessChannel>>,
+
+    /// PID to which this process has delegated its I/O (for reattach)
+    pub delegate_pid: Option<Pid>,
 }
 
 
@@ -1249,6 +1315,7 @@ impl Process {
             box_id: 0,
             root_dir: String::from("/"),
             channel: None,
+            delegate_pid: None,
         })
     }
 
@@ -1881,7 +1948,7 @@ pub fn spawn_process_with_channel_ext(
 
     // Set up arguments if provided
     if let Some(arg_slice) = args {
-        process.set_args(arg_slice);
+        process.args = arg_slice.iter().map(|s| String::from(*s)).collect();
     }
 
     // Set up stdin if provided
@@ -1932,26 +1999,63 @@ pub fn spawn_process_with_channel_ext(
     let pid = process.pid;
 
     // Box the process for heap allocation
-    let mut boxed_process = Box::new(process);
+    let boxed_process = Box::new(process);
+
+    // CRITICAL: Register the process in the table immediately.
+    // This ensures that lookup_process(pid) works as soon as this function returns,
+    // allowing reattach() to succeed without races.
+    register_process(pid, boxed_process);
+
+    // Register the channel for the thread ID placeholder (0 for now, will be updated)
+    // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
+    register_channel(0, channel.clone());
 
     // Spawn on a user thread
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
         let tid = crate::threading::current_thread_id();
-        // Important: set thread_id in the process struct before it's registered
-        boxed_process.thread_id = Some(tid);
-        execute_boxed(boxed_process)
+        
+        // Update thread_id in the registered process
+        if let Some(p) = lookup_process(pid) {
+            p.thread_id = Some(tid);
+            
+            // Move the channel registration to the correct TID
+            remove_channel(0);
+            register_channel(tid, p.channel.as_ref().unwrap().clone());
+            
+            // Execute the process (already in the table)
+            run_registered_process(pid);
+        } else {
+            crate::safe_print!(64, "[Process] FATAL: PID {} disappeared during spawn\n", pid);
+            loop { crate::threading::yield_now(); }
+        }
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
-    // CRITICAL: Register the channel for the thread ID so return_to_kernel can find it
-    // and signal exit to the shell. Also set it in the process struct if it's already registered.
-    register_channel(thread_id, channel.clone());
-    
+    // Set the thread ID in the process table entry for the parent to see immediately
     if let Some(p) = lookup_process(pid) {
         p.thread_id = Some(thread_id);
     }
 
     Ok((thread_id, channel, pid))
+}
+
+/// Execute a process that is already registered in the PROCESS_TABLE
+fn run_registered_process(pid: Pid) -> ! {
+    let proc = lookup_process(pid).expect("Process not found in run_registered_process");
+    
+    // Prepare the process (set state, write process info page)
+    proc.prepare_for_execution();
+    
+    // Activate the user address space (sets TTBR0)
+    proc.address_space.activate();
+
+    // Now safe to enable IRQs - TTBR0 is set to user tables
+    crate::irq::enable_irqs();
+
+    // Enter user mode via ERET - this never returns
+    unsafe {
+        enter_user_mode(&proc.context);
+    }
 }
 
 /// Execute a binary asynchronously and return its output when complete

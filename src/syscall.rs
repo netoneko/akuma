@@ -55,6 +55,7 @@ pub mod nr {
     pub const SPAWN_EXT: u64 = 315;
     pub const REGISTER_BOX: u64 = 316;
     pub const KILL_BOX: u64 = 317;
+    pub const REATTACH: u64 = 318;
 }
 
 /// Thread CPU statistics for top command
@@ -129,6 +130,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3], args[4], args[5]),
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize),
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
+        nr::REATTACH => sys_reattach(args[0] as u32),
         _ => !0 // ENOSYS
     }
 }
@@ -590,10 +592,26 @@ fn sys_kill(pid: u32) -> u64 {
 }
 
 fn sys_kill_box(box_id: u64) -> u64 {
+
     if crate::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
+
 }
 
+
+
+fn sys_reattach(pid: u32) -> u64 {
+
+    if crate::process::reattach_process(pid).is_ok() { 0 } else { !0u64 }
+
+}
+
+
+
+
+
 fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
+
+
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
             if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; } }
