@@ -335,10 +335,54 @@ impl MountTable {
 // Path Utilities
 // ============================================================================
 
-/// Normalize a path: ensure leading /, remove trailing /, handle empty -> "/"
+/// Non-allocating normalization (trims trailing slashes)
 fn normalize_path(path: &str) -> &str {
     let path = path.trim_end_matches('/');
     if path.is_empty() { "/" } else { path }
+}
+
+/// Robust normalization (resolves . and ..)
+pub fn canonicalize_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => {
+                components.push(c);
+            }
+        }
+    }
+
+    if components.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for c in components {
+            result.push('/');
+            result.push_str(c);
+        }
+        result
+    }
+}
+
+/// Resolve a path relative to a base directory
+pub fn resolve_path(base_cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        // Absolute path
+        canonicalize_path(path)
+    } else {
+        // Relative path
+        let full_path = if base_cwd == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}/{}", base_cwd, path)
+        };
+        canonicalize_path(&full_path)
+    }
 }
 
 /// Normalize path with allocation (adds leading / if missing)
@@ -410,22 +454,26 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    // Normalize path (ensure leading /)
-    let mut normalized = normalize_path_owned(path);
-
-    // VFS SCOPING: Prepend process root_dir if not /
-    if let Some(proc) = crate::process::current_process() {
+    let mut normalized = if let Some(proc) = crate::process::current_process() {
+        // 1. Resolve relative path against process CWD
+        let absolute = resolve_path(&proc.cwd, path);
+        
+        // 2. VFS SCOPING: Prepend process root_dir if not /
         if proc.root_dir != "/" {
-            // Join root_dir and normalized path
-            // e.g. root_dir="/box1", normalized="/etc" -> "/box1/etc"
-            let scoped = if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &normalized[1..])
+            // Join root_dir and absolute path
+            // e.g. root_dir="/box1", absolute="/etc" -> "/box1/etc"
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &absolute[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, normalized)
-            };
-            normalized = scoped;
+                alloc::format!("{}{}", proc.root_dir, absolute)
+            }
+        } else {
+            absolute
         }
-    }
+    } else {
+        // Fallback for kernel context (no process)
+        normalize_path_owned(path)
+    };
 
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
@@ -517,34 +565,43 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
 /// Rename/move a file or directory
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     // Both paths must be on the same filesystem for an atomic rename
-    let mut old_normalized = normalize_path_owned(old_path);
-    let mut new_normalized = normalize_path_owned(new_path);
-
-    // Apply process scoping (root_dir)
-    if let Some(proc) = crate::process::current_process() {
+    let mut old_full = if let Some(proc) = crate::process::current_process() {
+        let abs = resolve_path(&proc.cwd, old_path);
         if proc.root_dir != "/" {
-            old_normalized = if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &old_normalized[1..])
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &abs[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, old_normalized)
-            };
-            new_normalized = if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &new_normalized[1..])
-            } else {
-                alloc::format!("{}{}", proc.root_dir, new_normalized)
-            };
+                alloc::format!("{}{}", proc.root_dir, abs)
+            }
+        } else {
+            abs
         }
-    }
+    } else {
+        normalize_path_owned(old_path)
+    };
+
+    let mut new_full = if let Some(proc) = crate::process::current_process() {
+        let abs = resolve_path(&proc.cwd, new_path);
+        if proc.root_dir != "/" {
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, abs)
+            }
+        } else {
+            abs
+        }
+    } else {
+        normalize_path_owned(new_path)
+    };
 
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
 
-    let (old_fs, old_rel) = table.resolve(&old_normalized).ok_or(FsError::NotFound)?;
-    let (new_fs, new_rel) = table.resolve(&new_normalized).ok_or(FsError::NotFound)?;
+    let (old_fs, old_rel) = table.resolve(&old_full).ok_or(FsError::NotFound)?;
+    let (new_fs, new_rel) = table.resolve(&new_full).ok_or(FsError::NotFound)?;
 
     // Check if they are the same filesystem instance
-    // Note: We compare filesystem name and root path for now as a proxy for identity
-    // Ideally we'd compare pointers or IDs
     if old_fs.name() != new_fs.name() {
         return Err(FsError::NotSupported); // Cross-FS rename not supported
     }

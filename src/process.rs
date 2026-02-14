@@ -1333,6 +1333,15 @@ impl Process {
     /// The cwd will be passed to the process via the ProcessInfo page.
     pub fn set_cwd(&mut self, cwd: &str) {
         self.cwd = String::from(cwd);
+        
+        // Also update the ProcessInfo page so userspace getcwd() sees it
+        unsafe {
+            let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let mut info = core::ptr::read(info_ptr);
+            if info.set_cwd(cwd) {
+                core::ptr::write(info_ptr, info);
+            }
+        }
     }
 
     /// Start executing this process (enters user mode)

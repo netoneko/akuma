@@ -633,7 +633,23 @@ fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
 
 fn sys_chdir(ptr: u64, len: usize) -> u64 {
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)).unwrap_or("") };
-    if let Some(proc) = crate::process::current_process() { proc.set_cwd(path); return 0; }
+    
+    if let Some(proc) = crate::process::current_process() {
+        // Resolve path relative to current CWD
+        let new_cwd = crate::vfs::resolve_path(&proc.cwd, path);
+        
+        // Validate that the directory exists
+        if crate::fs::exists(&new_cwd) {
+            // Check if it's actually a directory
+            if let Ok(meta) = crate::vfs::metadata(&new_cwd) {
+                if meta.is_dir {
+                    proc.set_cwd(&new_cwd);
+                    return 0;
+                }
+            }
+        }
+        return ENOENT;
+    }
     !0u64
 }
 

@@ -23,6 +23,7 @@ MEMBERS=(
     "top"
     "cat"
     "box"
+    "paws"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -53,6 +54,7 @@ BINARIES=(
     "allocstress"
     "top"
     "box"
+    "paws"
 )
 
 for bin in "${BINARIES[@]}"; do
@@ -68,5 +70,11 @@ for bin in "${BINARIES[@]}"; do
         fi
     fi
 done
+
+# Link sh to paws
+PAWS_BIN="../bootstrap/bin/paws"
+if [ -f "$PAWS_BIN" ]; then
+    cp "$PAWS_BIN" "../bootstrap/bin/sh"
+fi
 
 echo "Build process completed."
