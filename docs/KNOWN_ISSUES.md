@@ -159,3 +159,40 @@ Additionally:
 - The SSH `pty-req` TERM variable (currently discarded at
   `src/ssh/protocol.rs:1270`) should be stored and made available to
   processes.
+
+---
+
+## 4. `reattach` fails to wake target process
+
+**Status:** Open
+**Component:** `src/process.rs`, `src/threading.rs`
+
+The `sys_reattach` syscall successfully delegates I/O channels, but the target
+process (often `paws` or `meow`) remains in a `WAITING` state and does not
+respond to input, even when the kernel logs show explicit wake-up calls.
+
+**Observation:**
+Kernel logs show `Writing X bytes to PID Y stdin` followed by `Waking PID Y`,
+but the target process thread does not transition to `READY` or resume
+execution to consume the buffer. This occurs despite the implementation of
+"Sticky Wake" logic.
+
+---
+
+## 5. `/proc/boxes` appears empty in userspace
+
+**Status:** Open
+**Component:** `src/vfs/proc.rs`
+
+While kernel logs indicate that boxes are being registered (e.g., `[ProcFS] Reading boxes (count=2)`), 
+the userspace `box ps` utility frequently reports "No active boxes found."
+
+**Reproduction:**
+```
+akuma:/> box ps
+No active boxes found.
+```
+
+This may indicate a discrepancy in how `read_at` or `read_dir` handles virtual
+ProcFS files, or a synchronization issue between the global `BOX_REGISTRY`
+and the VFS view.

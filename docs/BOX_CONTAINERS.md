@@ -215,8 +215,12 @@ To support "injecting" a process into an existing box:
 
 ### 7.4 Resolved Issues
 *   **Argument Passing:** Fixed a bug where arguments were not passed to containerized processes.
-*   **Registry Visibility:** Improved synchronization in the box registry to ensure boxes are always visible in `/proc/boxes`.
 *   **Ghost Processes:** Refactored spawning logic to ensure the `box` utility itself exits cleanly when not needed, reducing process pollution.
+*   **Thread/Proc Alignment:** Pad and aligned the `ThreadCpuStat` struct to ensure consistency between kernel and userspace tools like `top`.
+
+### 7.5 Current Challenges
+*   **Wake-up Failure:** The `REATTACH` mechanism currently fails to resume processes that are blocked in `WAITING` state, even with the implementation of a "Sticky Wake" flag. Input characters are delivered to the buffer, but the thread does not transition to `READY`.
+*   **Registry Persistence:** Boxes registered in the kernel are sometimes missing from the userspace view of `/proc/boxes`, requiring further investigation into ProcFS virtual file handling.
 
 ## 8. Future Considerations
 
