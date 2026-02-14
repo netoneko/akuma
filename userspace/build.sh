@@ -5,7 +5,6 @@ set -e
 MEMBERS=(
     "libakuma"
     "libakuma-tls"
-    "chainlink"
     "echo2"
     "elftest"
     "hello"
