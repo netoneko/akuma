@@ -57,7 +57,7 @@ pub mod syscall {
 }
 
 /// Thread CPU statistics for top command
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThreadCpuStat {
     pub tid: u32,
@@ -65,7 +65,7 @@ pub struct ThreadCpuStat {
     pub box_id: u64,
     pub total_time_us: u64,
     pub state: u8,
-    pub _reserved: [u8; 3],
+    pub _reserved: [u8; 7],
     pub name: [u8; 16],
 }
 

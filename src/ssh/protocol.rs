@@ -803,17 +803,9 @@ async fn run_shell_session(
 
                 if is_raw_mode {
                     // Raw mode: Pass input directly to the process's stdin buffer
-                    if let Some(channel) = &channel_stream.current_process_channel {
-                        (*channel).write_stdin(&read_buf[..n]);
-                        // Wake up the process if it's waiting for input
-                        // This uses the waker registered by sys_poll_input_event
-                        if let Some(proc) = channel_stream.current_process_pid.and_then(|pid| process::lookup_process(pid)) {
-                            crate::threading::disable_preemption();
-                            if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-                                waker.wake();
-                            }
-                            crate::threading::enable_preemption();
-                        }
+                    // using unified helper (UNIFIED I/O)
+                    if let Some(pid) = channel_stream.current_process_pid {
+                        let _ = process::write_to_process_stdin(pid, &read_buf[..n]);
                     }
                     // No echo, no line editing in raw mode
                 } else {

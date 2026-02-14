@@ -58,7 +58,7 @@ pub mod nr {
 }
 
 /// Thread CPU statistics for top command
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThreadCpuStat {
     pub tid: u32,
@@ -66,7 +66,7 @@ pub struct ThreadCpuStat {
     pub box_id: u64,
     pub total_time_us: u64,
     pub state: u8,
-    pub _reserved: [u8; 3],
+    pub _reserved: [u8; 7],
     pub name: [u8; 16],
 }
 
@@ -719,6 +719,11 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
         return (-libc_errno::EINVAL as i64) as u64;
     }
 
+    if config::SYSCALL_DEBUG_INFO_ENABLED && timeout_us > 0 && timeout_us != u64::MAX {
+        // Only print for non-infinite timeouts to avoid noise
+        // crate::safe_print!(64, "[syscall] poll_input_event: timeout={}us\n", timeout_us);
+    }
+
     let proc_channel = match crate::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
@@ -808,12 +813,20 @@ fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             if let Some(proc) = crate::process::lookup_process(pid) {
                 stat.box_id = proc.box_id;
                 let name_bytes = proc.name.as_bytes();
+                // Ensure name is clean (already zeroed by Default::default(), but being explicit)
                 let to_copy = name_bytes.len().min(stat.name.len());
                 stat.name[..to_copy].copy_from_slice(&name_bytes[..to_copy]);
+                if to_copy < stat.name.len() {
+                    for b in &mut stat.name[to_copy..] { *b = 0; }
+                }
             }
         } else if i == 0 {
             // Thread 0 is special (Kernel/Idle)
             stat.name[..6].copy_from_slice(b"kernel");
+            for b in &mut stat.name[6..] { *b = 0; }
+        } else {
+            // Ensure name is empty if no process found
+            for b in &mut stat.name { *b = 0; }
         }
 
         unsafe { core::ptr::write_volatile((ptr as *mut ThreadCpuStat).add(i), stat); }

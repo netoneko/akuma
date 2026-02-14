@@ -205,7 +205,8 @@ impl Filesystem for ProcFilesystem {
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let path = path.trim_start_matches('/');
-        let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+        let current_proc = crate::process::current_process();
+        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
         // Handle /proc/boxes
         if path == "boxes" {
@@ -214,6 +215,9 @@ impl Filesystem for ProcFilesystem {
             }
             
             let boxes = process::list_boxes();
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[ProcFS] Reading boxes (count={})\n", boxes.len());
+            }
             let mut out = String::from("ID,NAME,ROOT,CREATOR\n");
             for b in boxes {
                 out.push_str(&alloc::format!("{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid));

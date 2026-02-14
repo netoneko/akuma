@@ -218,25 +218,32 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     let proc = lookup_process(pid).ok_or("Process not found")?;
     
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Writing {} bytes to PID {} stdin\n", data.len(), pid);
+        crate::safe_print!(128, "[Process] Writing {} bytes to PID {} ({}) stdin\n", data.len(), pid, proc.name);
     }
 
     // 1. Write to the legacy StdioBuffer (for procfs visibility)
     proc.stdin.lock().write_with_limit(data, crate::config::PROC_STDIN_MAX_SIZE);
     
-    // 2. If the process has a ProcessChannel (it was spawned via spawn_process_with_channel),
-    // write to it so the process actually receives the input in sys_read/sys_poll_input_event.
-    if let Some(tid) = proc.thread_id {
-        if let Some(channel) = get_channel(tid) {
-            channel.write_stdin(data);
-            
-            // 3. Wake up the process if it's waiting for input in sys_poll_input_event
-            crate::threading::disable_preemption();
-            if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-                waker.wake();
+    // 2. If the process has a ProcessChannel, write to it so the process actually 
+    // receives the input in sys_read/sys_poll_input_event.
+    if let Some(ref channel) = proc.channel {
+        channel.write_stdin(data);
+        
+        // 3. Wake up the process if it's waiting for input in sys_poll_input_event
+        crate::threading::disable_preemption();
+        if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(64, "[Process] Waking PID {}\n", pid);
             }
-            crate::threading::enable_preemption();
+            waker.wake();
+            // Ensure scheduler runs to pick up the newly ready process
+            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+        } else {
+            // Even if no waker is registered, we should still trigger SGI
+            // to ensure the process gets a chance to poll soon.
+            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
         }
+        crate::threading::enable_preemption();
     }
     
     Ok(())
@@ -698,6 +705,13 @@ pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
 
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
+    if let Some(proc) = current_process() {
+        if let Some(ref ch) = proc.channel {
+            return Some(ch.clone());
+        }
+    }
+    
+    // Fallback to thread-ID based lookup for legacy system threads
     let thread_id = crate::threading::current_thread_id();
     get_channel(thread_id)
 }
@@ -1149,6 +1163,9 @@ pub struct Process {
     pub box_id: u64,
     /// Virtual Root Directory (host path that acts as / for this process)
     pub root_dir: String,
+
+    /// I/O Channel for async/interactive communication
+    pub channel: Option<Arc<ProcessChannel>>,
 }
 
 
@@ -1231,6 +1248,7 @@ impl Process {
             // Isolation defaults: Host context (Box 0, root at /)
             box_id: 0,
             root_dir: String::from("/"),
+            channel: None,
         })
     }
 
@@ -1850,6 +1868,17 @@ pub fn spawn_process_with_channel_ext(
     let mut process = Process::from_elf(path, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
+    // Create a channel for this process
+    let channel = Arc::new(ProcessChannel::new());
+    
+    // Seed the channel with initial stdin data if provided
+    if let Some(data) = stdin {
+        channel.write_stdin(data);
+    }
+
+    // Set the channel in the process struct (UNIFIED I/O)
+    process.channel = Some(channel.clone());
+
     // Set up arguments if provided
     if let Some(arg_slice) = args {
         process.set_args(arg_slice);
@@ -1905,24 +1934,22 @@ pub fn spawn_process_with_channel_ext(
     // Box the process for heap allocation
     let mut boxed_process = Box::new(process);
 
-    // Create a channel for this process
-    let channel = Arc::new(ProcessChannel::new());
-    
-    // Seed the channel with initial stdin data if provided
-    if let Some(data) = stdin {
-        channel.write_stdin(data);
-    }
-    
-    let channel_for_thread = channel.clone();
-
     // Spawn on a user thread
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
         let tid = crate::threading::current_thread_id();
-        register_channel(tid, channel_for_thread);
+        // Important: set thread_id in the process struct before it's registered
         boxed_process.thread_id = Some(tid);
         execute_boxed(boxed_process)
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
+
+    // CRITICAL: Register the channel for the thread ID so return_to_kernel can find it
+    // and signal exit to the shell. Also set it in the process struct if it's already registered.
+    register_channel(thread_id, channel.clone());
+    
+    if let Some(p) = lookup_process(pid) {
+        p.thread_id = Some(thread_id);
+    }
 
     Ok((thread_id, channel, pid))
 }
@@ -2016,49 +2043,22 @@ where
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
-    // Poll for output and completion
+    // Stream output until process exits
     loop {
-        // Drain any available output and write to stream
+        // Read available data
         if let Some(data) = channel.try_read() {
-            // Write all data at once, then flush
-            let mut buf = alloc::vec::Vec::new();
-            for &byte in &data {
-                if byte == b'\n' {
-                    buf.extend_from_slice(b"\r\n");
-                } else {
-                    buf.push(byte);
-                }
-            }
-            
-            let _ = output.write_all(&buf).await;
-            
-            // Flush output to push to network
-            let _ = output.flush().await;
-            
-            // Yield aggressively to allow network transmission
-            for _ in 0..100 {
-                crate::threading::yield_now();
+            if let Err(_e) = output.write_all(&data).await {
+                // Writer failed, likely connection closed
+                break;
             }
         }
 
         // Check if process has exited
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
-            // Drain any remaining output
-            while let Some(data) = channel.try_read() {
-                let mut buf = alloc::vec::Vec::new();
-                for &byte in &data {
-                    if byte == b'\n' {
-                        buf.extend_from_slice(b"\r\n");
-                    } else {
-                        buf.push(byte);
-                    }
-                }
-                let _ = output.write_all(&buf).await;
-            }
-            let _ = output.flush().await;
-            for _ in 0..100 {
-                crate::threading::yield_now();
-            }
+            break;
+        }
+
+        if channel.is_interrupted() {
             break;
         }
 
@@ -2066,11 +2066,19 @@ where
         YieldOnce::new().await;
     }
 
-    let exit_code = channel.exit_code();
+    // Drain remaining output
+    if let Some(data) = channel.try_read() {
+        let _ = output.write_all(&data).await;
+    }
+
+    let exit_code = if channel.is_interrupted() && !channel.has_exited() {
+        130 // Interrupted
+    } else {
+        channel.exit_code()
+    };
 
     // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok(exit_code)
 }
-

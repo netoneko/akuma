@@ -38,8 +38,6 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Pre-populate last_stats with real data to avoid astronomical CPU%
-    // on the first frame (where delta_time would be near-zero and
-    // delta_cpu_time would be total accumulated time since boot).
     let mut last_stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
     get_cpu_stats(&mut last_stats);
     let mut last_time = uptime();
@@ -55,7 +53,7 @@ pub extern "C" fn _start() -> ! {
         }
 
         println("Akuma OS - CPU Stats (press 'q' to quit)");
-        println("TID  PID  BOX  STATE       CPU%   TIME(ms)  NAME");
+        println("TID  PID  BOX ID    STATE       CPU%   TIME(ms)  NAME");
         println("-------------------------------------------------------");
 
         for i in 0..count {
@@ -84,8 +82,15 @@ pub extern "C" fn _start() -> ! {
             print("  ");
             print_u32_fixed(cur.pid, 3);
             print("  ");
-            print_u64_fixed(cur.box_id, 3);
-            print("  ");
+            
+            // Box ID in hex
+            if cur.box_id == 0 {
+                print("host      ");
+            } else {
+                print_hex_fixed(cur.box_id, 8);
+                print("  ");
+            }
+
             print(state_str);
             print("  ");
             print_f64_fixed(cpu_usage, 1);
@@ -93,15 +98,19 @@ pub extern "C" fn _start() -> ! {
             print_u64_fixed(cur.total_time_us / 1000, 8);
             print("  ");
             
-            // Print name
+            // Print name safely
             let mut name_len = 0;
-            while name_len < 16 && cur.name[name_len] != 0 {
+            while name_len < 16 && cur.name[name_len] >= 32 && cur.name[name_len] < 127 {
                 name_len += 1;
             }
-            if let Ok(name) = core::str::from_utf8(&cur.name[..name_len]) {
-                println(name);
+            if name_len > 0 {
+                if let Ok(name) = core::str::from_utf8(&cur.name[..name_len]) {
+                    println(name);
+                } else {
+                    println("???");
+                }
             } else {
-                println("???");
+                println("-");
             }
         }
 
@@ -132,6 +141,20 @@ pub extern "C" fn _start() -> ! {
 
 fn print_u32_fixed(val: u32, width: usize) {
     print_u64_fixed(val as u64, width);
+}
+
+fn print_hex_fixed(val: u64, width: usize) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut buf = [b'0'; 16];
+    let mut v = val;
+    for i in 0..16 {
+        buf[15 - i] = HEX[(v & 0xf) as usize];
+        v >>= 4;
+    }
+    
+    let start = 16usize.saturating_sub(width);
+    let s = core::str::from_utf8(&buf[start..]).unwrap_or("");
+    print(s);
 }
 
 fn print_u64_fixed(val: u64, width: usize) {
