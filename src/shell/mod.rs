@@ -704,6 +704,7 @@ pub async fn execute_command_streaming(
     registry: &CommandRegistry,
     ctx: &mut ShellContext,
     channel_stream: &mut SshChannelStream<'_>,
+    stdin: Option<&[u8]>,
 ) -> Option<ChainExecutionResult>
 {
     // Skip interactive check entirely if not enabled - avoid double filesystem lookups
@@ -731,7 +732,7 @@ pub async fn execute_command_streaming(
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
             // Execute with interactive bidirectional I/O (pass shell's cwd)
-            let success = execute_external_interactive(&bin_path, args_slice, None, Some(ctx.cwd()), channel_stream).await.is_ok();
+            let success = execute_external_interactive(&bin_path, args_slice, stdin, Some(ctx.cwd()), channel_stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,

@@ -2,11 +2,15 @@
 //!
 //! Usage:
 //!   box open <name> [--directory <dir>] [--interactive|-i] [cmd]
+//!   box run <name> [-i] [-d <dir>] [cmd]
 //!   box cp <source> <destination>
 //!   box ps
-//!   box use <name> <cmd>
+//!   box use <name> [-i] <cmd>
+//!   box exec <name> [-i] <cmd>
 //!   box close <name|id>
+//!   box stop <name|id>
 //!   box show <name|id>
+//!   box inspect <name|id>
 //!   box test
 
 #![no_std]
@@ -14,7 +18,7 @@
 
 extern crate alloc;
 
-use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat};
+use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
@@ -99,7 +103,7 @@ fn print_usage() {
     print("  box open <name> [-i] [-d <dir>] [cmd]     Start a new box (or empty box)\n");
     print("  box cp <source> <dest>                    Copy directory recursively\n");
     print("  box ps                                    List active boxes\n");
-    print("  box use <name> <cmd>                      Run command in existing box\n");
+    print("  box use <name> [-i] <cmd>                 Run command in existing box\n");
     print("  box close <name|id>                       Stop all processes in a box\n");
     print("  box show <name|id>                        Display box details\n");
     print("  box test                                  Run isolation tests\n");
@@ -149,14 +153,42 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
         match spawn_ext(path, args_opt, None, &mut options) {
             Some(res) => {
                 print("Started PID "); libakuma::print_dec(res.pid as usize); print("\n");
+                
+                let child_stdin_path = format!("/proc/{}/fd/0", res.pid);
+                let c_stdin_fd = if interactive { open(&child_stdin_path, open_flags::O_WRONLY) } else { -1 };
+
                 loop {
                     if interactive {
+                        // 1. Forward child stdout (non-blocking read)
                         let mut buf = [0u8; 1024];
                         let n = read_fd(res.stdout_fd as i32, &mut buf);
-                        if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
+                        if n > 0 { 
+                            libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]);
+                        }
+
+                        // 2. Forward host stdin (blocking read with 10ms timeout)
+                        let mut in_buf = [0u8; 256];
+                        let n_in = libakuma::poll_input_event(10, &mut in_buf);
+                        if n_in > 0 && c_stdin_fd >= 0 {
+                            let _ = write_fd(c_stdin_fd, &in_buf[..n_in as usize]);
+                        }
                     }
-                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
-                    libakuma::sleep_ms(10);
+
+                    if let Some((_, code)) = waitpid(res.pid) {
+                        if interactive {
+                            // Final stdout drain
+                            let mut buf = [0u8; 1024];
+                            while read_fd(res.stdout_fd as i32, &mut buf) > 0 {
+                                libakuma::write(libakuma::fd::STDOUT, &buf);
+                            }
+                            if c_stdin_fd >= 0 { close(c_stdin_fd); }
+                        }
+                        exit(code);
+                    }
+                    
+                    if !interactive {
+                        libakuma::sleep_ms(10);
+                    }
                 }
             }
             None => { print("box open: failed to spawn\n"); exit(1); }
@@ -172,14 +204,22 @@ fn copy_file(src: &str, dst: &str) -> bool {
     if sfd < 0 { return false; }
     let mut success = false;
     if let Ok(stat) = fstat(sfd) {
-        let mut buf = Vec::with_capacity(stat.st_size as usize);
-        buf.resize(stat.st_size as usize, 0);
-        let n = read_fd(sfd, &mut buf);
+        let size = stat.st_size as usize;
+        let mut buf = Vec::with_capacity(size);
+        buf.resize(size, 0);
+        
+        let mut total_read = 0;
+        while total_read < size {
+            let n = read_fd(sfd, &mut buf[total_read..]);
+            if n <= 0 { break; }
+            total_read += n as usize;
+        }
+
         let dfd = open(dst, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
         if dfd >= 0 {
-            if n > 0 { let _ = write_fd(dfd, &buf[..n as usize]); }
+            if total_read > 0 { let _ = write_fd(dfd, &buf[..total_read]); }
             close(dfd);
-            success = true;
+            success = (total_read == size);
         }
     }
     close(sfd);
@@ -205,7 +245,7 @@ fn cmd_cp(mut args: libakuma::Args) -> ! {
     let src = match args.next() { Some(s) => s, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
     let dst = match args.next() { Some(d) => d, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
     print("box: copying "); print(src); print(" to "); print(dst); print("...\n");
-    let _ = mkdir(dst);
+    let _ = mkdir_p(dst);
     copy_recursive(src, dst);
     exit(0);
 }
@@ -245,12 +285,8 @@ fn cmd_use(mut args: libakuma::Args) -> ! {
     let mut target_name = None;
 
     while let Some(arg) = args.next() {
-        if arg == "--interactive" || arg == "-i" {
-            interactive = true;
-        } else {
-            target_name = Some(arg);
-            break;
-        }
+        if arg == "--interactive" || arg == "-i" { interactive = true; }
+        else { target_name = Some(arg); break; }
     }
 
     let name = match target_name { Some(n) => n, None => { print("Usage: box use [-i] <name> <cmd>\n"); exit(1); } };
@@ -291,19 +327,29 @@ fn cmd_use(mut args: libakuma::Args) -> ! {
     match spawn_ext(path, args_opt, None, &mut options) {
         Some(res) => {
             if interactive {
+                let child_stdin_path = format!("/proc/{}/fd/0", res.pid);
+                let c_stdin_fd = open(&child_stdin_path, open_flags::O_WRONLY);
                 loop {
+                    // 1. Forward child stdout
                     let mut buf = [0u8; 1024];
                     let n = read_fd(res.stdout_fd as i32, &mut buf);
                     if n > 0 { libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]); }
+
+                    // 2. Forward host stdin
+                    let mut in_buf = [0u8; 256];
+                    let n_in = libakuma::poll_input_event(10, &mut in_buf);
+                    if n_in > 0 && c_stdin_fd >= 0 {
+                        let _ = write_fd(c_stdin_fd, &in_buf[..n_in as usize]);
+                    }
+
                     if let Some((_, code)) = waitpid(res.pid) { 
-                        loop {
-                            let n = read_fd(res.stdout_fd as i32, &mut buf);
-                            if n <= 0 { break; }
-                            libakuma::write(libakuma::fd::STDOUT, &buf[..n as usize]);
+                        let mut buf = [0u8; 1024];
+                        while read_fd(res.stdout_fd as i32, &mut buf) > 0 {
+                            libakuma::write(libakuma::fd::STDOUT, &buf);
                         }
+                        if c_stdin_fd >= 0 { close(c_stdin_fd); }
                         exit(code); 
                     }
-                    libakuma::sleep_ms(10);
                 }
             } else {
                 println(&format!("Injected PID {}", res.pid));
@@ -383,34 +429,41 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
     println(&format!("Name:   {}", box_name));
     println(&format!("Root:   {}", box_root));
     println(&format!("Creator PID: {}", box_creator));
+    println("\nMembers:");
+    
+    let mut stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
+    let count = get_cpu_stats(&mut stats);
+    let mut found = false;
+    for i in 0..count {
+        if stats[i].state != 0 && stats[i].box_id == box_id {
+            let mut name_len = 0;
+            while name_len < 16 && stats[i].name[name_len] != 0 { name_len += 1; }
+            let name = core::str::from_utf8(&stats[i].name[..name_len]).unwrap_or("?");
+            println(&format!("  PID {:>3}  {}", stats[i].pid, name));
+            found = true;
+        }
+    }
+    if !found { println("  (none)"); }
     exit(0);
 }
 
 fn cmd_test() -> ! {
     println("--- Running Box Isolation Tests (Userspace) ---");
 
-    // Test 1: Blind Root Redirection
     print("[Test 1] Blind Root Redirection... ");
     let test_dir = "/tmp/boxtest";
-    let _ = mkdir(test_dir);
+    let _ = mkdir_p(test_dir);
     let _ = mkdir(&format!("{}/bin", test_dir));
     
-    // Copy cat to box
     if !copy_file("/bin/cat", &format!("{}/bin/cat", test_dir)) {
-        println("FAILED: Could not copy /bin/cat to test dir");
-        exit(1);
+        println("FAILED: Could not copy /bin/cat to test dir"); exit(1);
     }
 
-    // Create test file
     let test_file = format!("{}/test.txt", test_dir);
     let test_content = "Akuma Container Test 123";
     let fd = open(&test_file, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd >= 0 {
-        let _ = write_fd(fd, test_content.as_bytes());
-        close(fd);
-    }
+    if fd >= 0 { let _ = write_fd(fd, test_content.as_bytes()); close(fd); }
 
-    // Spawn box running cat /test.txt (which is host /tmp/boxtest/test.txt)
     let box_id = 0x7E571;
     let mut options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
@@ -418,7 +471,7 @@ fn cmd_test() -> ! {
         args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
     };
 
-    let args = ["/bin/cat", "/test.txt"];
+    let args = ["/test.txt"];
     match spawn_ext("/bin/cat", Some(&args), None, &mut options) {
         Some(res) => {
             let mut output = Vec::new();
@@ -426,31 +479,78 @@ fn cmd_test() -> ! {
                 let mut buf = [0u8; 256];
                 let n = read_fd(res.stdout_fd as i32, &mut buf);
                 if n > 0 { output.extend_from_slice(&buf[..n as usize]); }
-                if let Some((_, _)) = waitpid(res.pid) { break; }
+                if let Some((_, _)) = waitpid(res.pid) { 
+                    loop {
+                        let n = read_fd(res.stdout_fd as i32, &mut buf);
+                        if n <= 0 { break; }
+                        output.extend_from_slice(&buf[..n as usize]);
+                    }
+                    break; 
+                }
                 libakuma::sleep_ms(10);
             }
-            
-            if core::str::from_utf8(&output).unwrap_or("").contains(test_content) {
-                println("PASSED");
-            } else {
+            if core::str::from_utf8(&output).unwrap_or("").contains(test_content) { println("PASSED"); }
+            else {
                 println("FAILED: Output did not match");
-                print("Got: "); println(core::str::from_utf8(&output).unwrap_or(""));
-                exit(1);
+                print("Got: "); println(core::str::from_utf8(&output).unwrap_or("")); exit(1);
             }
         }
         None => { println("FAILED: Could not spawn test process"); exit(1); }
     }
 
-    // Test 2: ProcFS Isolation
     print("[Test 2] ProcFS Isolation... ");
-    // Box 0 should see itself and the new process
     let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd >= 0 {
-        println("PASSED");
-        close(fd);
-    } else {
-        println("FAILED: Cannot read /proc/boxes from host");
-        exit(1);
+    if fd >= 0 { println("PASSED"); close(fd); }
+    else { println("FAILED: Cannot read /proc/boxes from host"); exit(1); }
+
+    print("[Test 3] Stdin/Stdout Pipeline... ");
+    let pipe_test_dir = "/tmp/pipetest";
+    let _ = mkdir_p(pipe_test_dir);
+    let _ = mkdir(&format!("{}/bin", pipe_test_dir));
+    if !copy_file("/bin/cat", &format!("{}/bin/cat", pipe_test_dir)) {
+        println("FAILED: Could not copy /bin/cat"); exit(1);
+    }
+
+    let mut pipe_options = SpawnOptions {
+        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+        root_dir_ptr: pipe_test_dir.as_ptr() as u64, root_dir_len: pipe_test_dir.len(),
+        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0,
+        box_id: 0x919E,
+    };
+
+    let pipe_input = "Hello through the pipe!";
+    match spawn_ext("/bin/cat", None, Some(pipe_input.as_bytes()), &mut pipe_options) {
+        Some(res) => {
+            let mut output = Vec::new();
+            let start_time = libakuma::uptime();
+            loop {
+                let mut buf = [0u8; 256];
+                let n = read_fd(res.stdout_fd as i32, &mut buf);
+                if n > 0 { output.extend_from_slice(&buf[..n as usize]); }
+                
+                if let Some((_, _)) = waitpid(res.pid) { 
+                    loop {
+                        let n = read_fd(res.stdout_fd as i32, &mut buf);
+                        if n <= 0 { break; }
+                        output.extend_from_slice(&buf[..n as usize]);
+                    }
+                    break; 
+                }
+
+                if libakuma::uptime() - start_time > 2_000_000 {
+                    println("FAILED: Timeout (2s)");
+                    libakuma::kill(res.pid);
+                    exit(1);
+                }
+                libakuma::sleep_ms(10);
+            }
+            if core::str::from_utf8(&output).unwrap_or("").contains(pipe_input) { println("PASSED"); }
+            else {
+                println("FAILED: Output did not match");
+                print("Got: "); println(core::str::from_utf8(&output).unwrap_or("")); exit(1);
+            }
+        }
+        None => { println("FAILED: Could not spawn"); exit(1); }
     }
 
     println("--- All Tests Passed ---");

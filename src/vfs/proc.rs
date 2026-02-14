@@ -284,8 +284,10 @@ impl Filesystem for ProcFilesystem {
                 // If spawner_pid is None (kernel spawned), allow any caller
                 // If caller_pid is None (kernel context), also allow
 
-                // Write with size limit (thread-safe via Spinlock)
-                target.stdin.lock().write_with_limit(data, PROC_STDIN_MAX_SIZE);
+                // Use the unified helper to write to both legacy buffer and ProcessChannel
+                if process::write_to_process_stdin(target_pid, data).is_err() {
+                    return Err(FsError::Internal);
+                }
                 Ok(())
             }
             1 => {
@@ -300,6 +302,13 @@ impl Filesystem for ProcFilesystem {
             }
             _ => Err(FsError::NotFound),
         }
+    }
+
+    fn write_at(&self, path: &str, _offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        // For ProcFS, we ignore the offset and treat it as a direct write/append
+        // to the process buffers. This avoids the default read-modify-write behavior.
+        self.write_file(path, data)?;
+        Ok(data.len())
     }
 
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {

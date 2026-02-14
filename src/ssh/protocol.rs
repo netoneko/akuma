@@ -876,7 +876,7 @@ async fn run_shell_session(
                                             // This provides real-time output for long-running commands
                                             let result = if let Some(streaming_result) = 
                                                 shell::execute_command_streaming(
-                                                    trimmed, &registry, &mut ctx, &mut channel_stream,
+                                                    trimmed, &registry, &mut ctx, &mut channel_stream, None,
                                                 ).await 
                                             {
                                                 streaming_result
@@ -1318,7 +1318,7 @@ async fn handle_message(
                             // Try streaming execution for simple external binaries
                             if let Some(_streaming_result) = 
                                 shell::execute_command_streaming(
-                                    trimmed, &registry, &mut exec_ctx, &mut channel_stream,
+                                    trimmed, &registry, &mut exec_ctx, &mut channel_stream, None,
                                 ).await 
                             {
                                 // Output was already streamed

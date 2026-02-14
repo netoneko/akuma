@@ -213,6 +213,35 @@ pub fn init_box_registry() {
     });
 }
 
+/// Write data to a process's stdin (handling both legacy buffer and ProcessChannel)
+pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
+    let proc = lookup_process(pid).ok_or("Process not found")?;
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Writing {} bytes to PID {} stdin\n", data.len(), pid);
+    }
+
+    // 1. Write to the legacy StdioBuffer (for procfs visibility)
+    proc.stdin.lock().write_with_limit(data, crate::config::PROC_STDIN_MAX_SIZE);
+    
+    // 2. If the process has a ProcessChannel (it was spawned via spawn_process_with_channel),
+    // write to it so the process actually receives the input in sys_read/sys_poll_input_event.
+    if let Some(tid) = proc.thread_id {
+        if let Some(channel) = get_channel(tid) {
+            channel.write_stdin(data);
+            
+            // 3. Wake up the process if it's waiting for input in sys_poll_input_event
+            crate::threading::disable_preemption();
+            if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+                waker.wake();
+            }
+            crate::threading::enable_preemption();
+        }
+    }
+    
+    Ok(())
+}
+
 /// Kill all processes in a box and unregister it
 pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     if box_id == 0 {
@@ -1862,6 +1891,10 @@ pub fn spawn_process_with_channel_ext(
         process.box_id = caller_box_id;
     }
 
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Spawning {} (box_id={}, root_dir={})\n", path, process.box_id, process.root_dir);
+    }
+
     // Set spawner PID (the process that called spawn, if any)
     // This is used by procfs to control who can write to stdin
     process.spawner_pid = read_current_pid();
@@ -1874,6 +1907,12 @@ pub fn spawn_process_with_channel_ext(
 
     // Create a channel for this process
     let channel = Arc::new(ProcessChannel::new());
+    
+    // Seed the channel with initial stdin data if provided
+    if let Some(data) = stdin {
+        channel.write_stdin(data);
+    }
+    
     let channel_for_thread = channel.clone();
 
     // Spawn on a user thread
