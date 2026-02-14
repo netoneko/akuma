@@ -218,9 +218,9 @@ impl Filesystem for ProcFilesystem {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[ProcFS] Reading boxes (count={})\n", boxes.len());
             }
-            let mut out = String::from("ID,NAME,ROOT,CREATOR\n");
+            let mut out = String::from("ID,NAME,ROOT,CREATOR,PRIMARY\n");
             for b in boxes {
-                out.push_str(&alloc::format!("{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid));
+                out.push_str(&alloc::format!("{},{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid, b.primary_pid));
             }
             return Ok(out.into_bytes());
         }

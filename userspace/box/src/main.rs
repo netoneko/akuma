@@ -1,12 +1,11 @@
 //! box - Container management utility
 //!
 //! Usage:
-//!   box open <name> [--directory <dir>] [--interactive|-i] [cmd]
-//!   box run <name> [-i] [-d <dir>] [cmd]
+//!   box open <name> [--directory <dir>] [-i] [-d] [cmd] [args...]
 //!   box cp <source> <destination>
 //!   box ps
-//!   box use <name> [-i] <cmd>
-//!   box exec <name> [-i] <cmd>
+//!   box use <name|id> [-i] [-d] <cmd> [args...]
+//!   box grab <name|id> [pid]
 //!   box close <name|id>
 //!   box stop <name|id>
 //!   box show <name|id>
@@ -22,6 +21,7 @@ use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, Sp
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
+use core::iter::Peekable;
 
 #[repr(C)]
 pub struct SpawnOptions {
@@ -86,6 +86,7 @@ pub extern "C" fn _start() -> ! {
         "cp" => cmd_cp(args_iter),
         "ps" => cmd_ps(),
         "use" | "exec" => cmd_use(args_iter),
+        "grab" | "attach" => cmd_grab(args_iter),
         "close" | "stop" | "rm" => cmd_close(args_iter),
         "show" | "inspect" => cmd_show(args_iter),
         "test" => cmd_test(),
@@ -100,31 +101,113 @@ pub extern "C" fn _start() -> ! {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box open <name> [-i] [-d <dir>] [cmd]     Start a new box (or empty box)\n");
-    print("  box cp <source> <dest>                    Copy directory recursively\n");
-    print("  box ps                                    List active boxes\n");
-    print("  box use <name> [-i] <cmd>                 Run command in existing box\n");
-    print("  box close <name|id>                       Stop all processes in a box\n");
-    print("  box show <name|id>                        Display box details\n");
-    print("  box test                                  Run isolation tests\n");
+    print("  box open <name> [-i] [-d] [-dir <dir>] [cmd] [args...]  Start a box\n");
+    print("  box use <name|id> [-i] [-d] <cmd> [args...]            Run in box\n");
+    print("  box grab <name|id> [pid]                               Reattach to process\n");
+    print("  box cp <source> <dest>                                 Copy directory\n");
+    print("  box ps                                                 List active boxes\n");
+    print("  box close <name|id>                                    Stop a box\n");
+    print("  box show <name|id>                                     Display details\n");
+    print("  box test                                               Run isolation tests\n");
 }
 
-fn cmd_open(mut args: libakuma::Args) -> ! {
+fn resolve_target_id(target: &str) -> Option<u64> {
+    // 1. Try numeric/hex ID first
+    let mut id_val = 0u64;
+    let mut is_hex = false;
+    let mut s = target;
+    if target.starts_with("0x") {
+        is_hex = true;
+        s = &target[2..];
+    }
+
+    if is_hex {
+        for b in s.as_bytes() {
+            let digit = match *b {
+                b'0'..=b'9' => *b - b'0',
+                b'a'..=b'f' => *b - b'a' + 10,
+                b'A'..=b'F' => *b - b'A' + 10,
+                _ => return None,
+            };
+            id_val = (id_val << 4) | digit as u64;
+        }
+        return Some(id_val);
+    } else {
+        // Try parsing as decimal, but only if all chars are digits
+        let mut all_digits = true;
+        for b in s.as_bytes() {
+            if *b < b'0' || *b > b'9' { all_digits = false; break; }
+            id_val = id_val * 10 + (*b - b'0') as u64;
+        }
+        if all_digits && !target.is_empty() { return Some(id_val); }
+    }
+
+    // 2. Try lookup by name in /proc/boxes
+    let fd = open("/proc/boxes", open_flags::O_RDONLY);
+    if fd >= 0 {
+        let mut buf = [0u8; 2048];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n > 0 {
+            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+            for line in content.lines().skip(1) {
+                let mut parts = line.split(',');
+                let id_str = parts.next().unwrap_or("");
+                let bname = parts.next().unwrap_or("");
+                if bname == target {
+                    let mut found_id = 0u64;
+                    for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
+                    return Some(found_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_target_root(target_id: u64) -> Option<String> {
+    let fd = open("/proc/boxes", open_flags::O_RDONLY);
+    if fd >= 0 {
+        let mut buf = [0u8; 2048];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n > 0 {
+            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+            for line in content.lines().skip(1) {
+                let mut parts = line.split(',');
+                let id_str = parts.next().unwrap_or("");
+                let _bname = parts.next().unwrap_or("");
+                let root = parts.next().unwrap_or("");
+                
+                let mut found_id = 0u64;
+                for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
+                if found_id == target_id { return Some(String::from(root)); }
+            }
+        }
+    }
+    None
+}
+
+fn cmd_open(args: libakuma::Args) -> ! {
+    let mut args = args.peekable();
     let name = match args.next() {
         Some(n) => n,
-        None => { print("Usage: box open <name> [-i] [-d <dir>] [cmd]\n"); exit(1); }
+        None => { print("Usage: box open <name> [-i] [-d] [-dir <dir>] [cmd] [args...]\n"); exit(1); }
     };
 
     let mut directory = String::from("/");
     let mut interactive = false;
+    let mut detached = false;
     let mut cmd_path = None;
     let mut cmd_args = Vec::new();
 
     while let Some(arg) = args.next() {
-        if arg == "--directory" || arg == "-d" {
+        if arg == "--directory" || arg == "-dir" || (arg == "-d" && args.peek().is_some() && !args.peek().unwrap().starts_with('-')) {
             directory = String::from(args.next().unwrap_or("/"));
-        } else if arg == "--interactive" || arg == "-i" {
+        } else if arg == "-i" || arg == "--interactive" {
             interactive = true;
+        } else if arg == "-d" || arg == "--detached" {
+            detached = true;
         } else {
             cmd_path = Some(arg);
             for a in args { cmd_args.push(a); }
@@ -147,13 +230,18 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
 
         print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_hex(box_id as usize); print(")\n");
 
-        let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
-        let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
+        let args_opt = if cmd_args.is_empty() { None } else { Some(cmd_args.as_slice()) };
 
         match spawn_ext(path, args_opt, None, &mut options) {
             Some(res) => {
-                print("Started PID "); libakuma::print_dec(res.pid as usize); print("\n");
-                
+                // Update registry with real primary PID
+                libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, res.pid as u64);
+
+                if detached {
+                    println(&format!("Started PID {} in detached mode. (Log persistence TBD)", res.pid));
+                    exit(0);
+                }
+
                 if interactive {
                     if libakuma::reattach(res.pid) != 0 {
                         print("box: reattach failed\n");
@@ -162,9 +250,7 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
                 }
 
                 loop {
-                    if let Some((_, code)) = waitpid(res.pid) {
-                        exit(code);
-                    }
+                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
                     libakuma::sleep_ms(100);
                 }
             }
@@ -173,6 +259,121 @@ fn cmd_open(mut args: libakuma::Args) -> ! {
     } else {
         print("box: created empty box '"); print(name); print("' (ID="); libakuma::print_hex(box_id as usize); print(")\n");
         exit(0);
+    }
+}
+
+fn cmd_use(args: libakuma::Args) -> ! {
+    let mut args = args.peekable();
+    let target = match args.next() {
+        Some(t) => t,
+        None => { print("Usage: box use <name|id> [-i] [-d] <cmd> [args...]\n"); exit(1); }
+    };
+
+    let target_id = resolve_target_id(target).unwrap_or_else(|| {
+        print("box use: target not found\n"); exit(1);
+    });
+
+    let target_root = get_target_root(target_id).unwrap_or_else(|| {
+        String::from("/")
+    });
+
+    let mut interactive = false;
+    let mut detached = false;
+    let mut cmd_path = None;
+    let mut cmd_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        if arg == "-i" || arg == "--interactive" {
+            interactive = true;
+        } else if arg == "-d" || arg == "--detached" {
+            detached = true;
+        } else {
+            cmd_path = Some(arg);
+            for a in args { cmd_args.push(a); }
+            break;
+        }
+    }
+
+    let path = cmd_path.unwrap_or_else(|| {
+        print("box use: missing command\n"); exit(1);
+    });
+
+    let mut options = SpawnOptions {
+        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+        root_dir_ptr: target_root.as_ptr() as u64, root_dir_len: target_root.len(),
+        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: target_id,
+    };
+
+    let args_opt = if cmd_args.is_empty() { None } else { Some(cmd_args.as_slice()) };
+
+    match spawn_ext(path, args_opt, None, &mut options) {
+        Some(res) => {
+            if detached {
+                println(&format!("Injected PID {} (detached)", res.pid));
+                exit(0);
+            }
+
+            if interactive {
+                if libakuma::reattach(res.pid) != 0 {
+                    print("box use: reattach failed\n");
+                    exit(1);
+                }
+                loop {
+                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
+                    libakuma::sleep_ms(100);
+                }
+            } else {
+                println(&format!("Injected PID {}", res.pid));
+                exit(0);
+            }
+        }
+        None => { print("box use: failed\n"); exit(1); }
+    }
+}
+
+fn cmd_grab(mut args: libakuma::Args) -> ! {
+    let target = match args.next() {
+        Some(t) => t,
+        None => { print("Usage: box grab <name|id> [pid]\n"); exit(1); }
+    };
+
+    let target_id = resolve_target_id(target).unwrap_or_else(|| {
+        print("box grab: target box not found\n"); exit(1);
+    });
+
+    let specific_pid = args.next().and_then(|s| {
+        let mut p = 0u32;
+        for b in s.as_bytes() { if *b >= b'0' && *b <= b'9' { p = p * 10 + (*b - b'0') as u32; } }
+        if p > 0 { Some(p) } else { None }
+    });
+
+    let pid_to_grab = if let Some(p) = specific_pid {
+        p
+    } else {
+        // Find first process in this box from top stats
+        let mut stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
+        let count = get_cpu_stats(&mut stats);
+        let mut found = None;
+        for i in 0..count {
+            if stats[i].state != 0 && stats[i].box_id == target_id && stats[i].pid > 1 {
+                found = Some(stats[i].pid);
+                break;
+            }
+        }
+        found.unwrap_or_else(|| {
+            print("box grab: no processes found in box\n"); exit(1);
+        })
+    };
+
+    print("box: grabbing PID "); libakuma::print_dec(pid_to_grab as usize); print("\n");
+    if libakuma::reattach(pid_to_grab) == 0 {
+        loop {
+            if let Some((_, code)) = waitpid(pid_to_grab) { exit(code); }
+            libakuma::sleep_ms(100);
+        }
+    } else {
+        print("box grab: failed to reattach\n");
+        exit(1);
     }
 }
 
@@ -257,107 +458,27 @@ fn cmd_ps() -> ! {
     exit(0);
 }
 
-fn cmd_use(mut args: libakuma::Args) -> ! {
-    let mut interactive = false;
-    let mut target_name = None;
-
-    while let Some(arg) = args.next() {
-        if arg == "--interactive" || arg == "-i" { interactive = true; }
-        else { target_name = Some(arg); break; }
-    }
-
-    let name = match target_name { Some(n) => n, None => { print("Usage: box use [-i] <name> <cmd>\n"); exit(1); } };
-    let path = match args.next() { Some(p) => p, None => { print("box use: missing command\n"); exit(1); } };
-    let mut cmd_args = Vec::new();
-    for a in args { cmd_args.push(a); }
-
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd < 0 { print("box use: failed to access /proc/boxes\n"); exit(1); }
-    let mut buf = [0u8; 2048];
-    let n = read_fd(fd, &mut buf);
-    close(fd);
-    
-    let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-    let mut target_id = None;
-    let mut target_root = None;
-    for line in content.lines().skip(1) {
-        let mut parts = line.split(',');
-        let id_str = parts.next().unwrap_or("");
-        let bname = parts.next().unwrap_or("");
-        let root = parts.next().unwrap_or("");
-        if bname == name { target_id = Some(id_str); target_root = Some(root); break; }
-    }
-
-    let box_id_str = target_id.unwrap_or_else(|| { print("box use: box not found\n"); exit(1); });
-    let mut box_id = 0u64;
-    for b in box_id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { box_id = box_id * 10 + (*b - b'0') as u64; } }
-
-    let mut options = SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
-        root_dir_ptr: target_root.unwrap().as_ptr() as u64, root_dir_len: target_root.unwrap().len(),
-        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
-    };
-
-    let cmd_args_refs: Vec<&str> = cmd_args.iter().map(|s| *s).collect();
-    let args_opt = if cmd_args_refs.is_empty() { None } else { Some(cmd_args_refs.as_slice()) };
-
-    match spawn_ext(path, args_opt, None, &mut options) {
-        Some(res) => {
-            if interactive {
-                if libakuma::reattach(res.pid) != 0 {
-                    print("box use: reattach failed\n");
-                    exit(1);
-                }
-                loop {
-                    if let Some((_, code)) = waitpid(res.pid) {
-                        exit(code);
-                    }
-                    libakuma::sleep_ms(100);
-                }
-            } else {
-                println(&format!("Injected PID {}", res.pid));
-                exit(0);
-            }
-        }
-        None => { print("box use: failed\n"); exit(1); }
-    }
-}
-
 fn cmd_close(mut args: libakuma::Args) -> ! {
     let target = match args.next() { Some(t) => t, None => { print("Usage: box close <name|id>\n"); exit(1); } };
-    let mut box_id = 0u64;
-    let mut is_numeric = true;
-    for b in target.as_bytes() { if *b < b'0' || *b > b'9' { is_numeric = false; break; } box_id = box_id * 10 + (*b - b'0') as u64; }
+    let box_id = resolve_target_id(target).unwrap_or_else(|| {
+        print("box close: box not found\n"); exit(1);
+    });
 
-    if !is_numeric {
-        let fd = open("/proc/boxes", open_flags::O_RDONLY);
-        if fd >= 0 {
-            let mut buf = [0u8; 2048];
-            let n = read_fd(fd, &mut buf);
-            close(fd);
-            if n > 0 {
-                let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-                for line in content.lines().skip(1) {
-                    let mut parts = line.split(',');
-                    let id_str = parts.next().unwrap_or("");
-                    if parts.next().unwrap_or("") == target {
-                        box_id = 0;
-                        for b in id_str.as_bytes() { box_id = box_id * 10 + (*b - b'0') as u64; }
-                        break;
-                    }
-                }
-            }
-        }
+    if box_id == 0 { print("box close: cannot kill Box 0 (Host)\n"); exit(1); }
+    if libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0) == 0 { 
+        print("Closed box "); libakuma::print_hex(box_id as usize); print("\n"); 
+        exit(0); 
+    } else { 
+        print("box close: failed\n"); exit(1); 
     }
-
-    if box_id == 0 { print("box close: box not found or Box 0\n"); exit(1); }
-    if libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0) == 0 { print("Closed box "); libakuma::print_dec(box_id as usize); print("\n"); exit(0); }
-    else { print("box close: failed\n"); exit(1); }
 }
 
 fn cmd_show(mut args: libakuma::Args) -> ! {
     let target = match args.next() { Some(t) => t, None => { print("Usage: box show <name|id>\n"); exit(1); } };
-    let mut box_id = 0u64;
+    let target_id = resolve_target_id(target).unwrap_or_else(|| {
+        print("box show: box not found\n"); exit(1);
+    });
+
     let mut box_name = String::new();
     let mut box_root = String::new();
     let mut box_creator = String::new();
@@ -375,8 +496,10 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
                 let bname = parts.next().unwrap_or("");
                 let root = parts.next().unwrap_or("");
                 let creator = parts.next().unwrap_or("");
-                if bname == target || id_str == target {
-                    box_id = 0; for b in id_str.as_bytes() { box_id = box_id * 10 + (*b - b'0') as u64; }
+                
+                let mut found_id = 0u64;
+                for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
+                if found_id == target_id {
                     box_name = String::from(bname);
                     box_root = String::from(root);
                     box_creator = String::from(creator);
@@ -386,9 +509,7 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
         }
     }
 
-    if box_id == 0 && target != "0" && target != "host" { print("box show: box not found\n"); exit(1); }
-    
-    println(&format!("Box ID: {:08x}", box_id));
+    println(&format!("Box ID: {:08x}", target_id));
     println(&format!("Name:   {}", box_name));
     println(&format!("Root:   {}", box_root));
     println(&format!("Creator PID: {}", box_creator));
@@ -398,7 +519,7 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
     let count = get_cpu_stats(&mut stats);
     let mut found = false;
     for i in 0..count {
-        if stats[i].state != 0 && stats[i].box_id == box_id {
+        if stats[i].state != 0 && stats[i].box_id == target_id {
             let mut name_len = 0;
             while name_len < 16 && stats[i].name[name_len] >= 32 && stats[i].name[name_len] < 127 { name_len += 1; }
             let name = core::str::from_utf8(&stats[i].name[..name_len]).unwrap_or("?");

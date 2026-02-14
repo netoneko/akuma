@@ -512,10 +512,21 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         );
 
         if (result as i64) >= 0 {
-            Some(SpawnResult { 
-                pid: (result & 0xFFFF_FFFF) as u32,
-                stdout_fd: ((result >> 32) & 0xFFFF_FFFF) as u32
-            })
+            let pid = (result & 0xFFFF_FFFF) as u32;
+            let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+
+            // Update registry with real primary PID
+            libakuma::syscall(
+                SYSCALL_REGISTER_BOX,
+                box_id,
+                name.as_ptr() as u64,
+                name.len() as u64,
+                config.box_root.as_ptr() as u64,
+                config.box_root.len() as u64,
+                pid as u64,
+            );
+
+            Some(SpawnResult { pid, stdout_fd })
         } else {
             None
         }

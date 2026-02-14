@@ -198,18 +198,25 @@ To support "injecting" a process into an existing box:
 *   **`sys_spawn_ext`:** Must support a `target_box_id` or `target_pid` parameter.
 *   **Context Inheritance:** The injected process must inherit the `root_dir` and `box_id` of the target.
 
-## 7. Current Issues and Design Questions
+## 7. Current Features and Improvements
 
-### 7.1 Identified Bugs
-*   **Argument Passing:** Currently, `box open <name> <cmd> <args>` fails to pass `<args>` to the child process. The child receives only its own name as `argv[0]`.
-*   **Box Registry Visibility:** While `ps` correctly shows the `BOX` ID for processes, `box ps` (which reads `/proc/boxes`) frequently reports "No active boxes found." This suggests a synchronization issue between process creation and registry entry.
-*   **Ghost Processes:** Users have reported seeing multiple instances of `/bin/herd` or other services in `top` that do not correlate with active sessions, possibly indicating a failure in thread/process reclamation during container teardown.
+### 7.1 Native Reattachment (Proxy-Free)
+*   **Syscall 318 (`sys_reattach`):** Allows a process to delegate its terminal I/O to another process.
+*   **Efficiency:** The `box` utility no longer acts as a manual byte-proxy. Once reattached, the kernel handles I/O delivery directly at full speed.
+*   **Security:** Reattachment is only permitted within the same box hierarchy or from the host (Box 0).
 
-### 7.2 Architectural Questions
-*   **I/O Proxying vs. Native Reattachment:**
-    *   *Current Design:* The `box` command acts as a proxy, manually forwarding bytes between the host's terminal and the container's `ProcessChannel`.
-    *   *Question:* Do we actually need this overhead? 
-    *   *Alternative:* Could we implement a native `sys_reattach(pid)` or `sys_foreground(pid)` syscall that seamlessly moves the SSH session's input/output focus to the target process? This would eliminate the `box` process as a middleman and potentially resolve many responsiveness issues.
+### 7.2 Detached Mode
+*   Both `box open` and `box use` support the `-d` (or `--detached`) flag. 
+*   In this mode, the `box` utility exits immediately after spawning the process, leaving it running in the background.
+
+### 7.3 Process Grabbing
+*   **`box grab <name|id>`:** Automatically finds and reattaches to the primary process of a running box.
+*   **`box grab <name|id> <pid>`:** Reattaches to a specific PID within a box.
+
+### 7.4 Resolved Issues
+*   **Argument Passing:** Fixed a bug where arguments were not passed to containerized processes.
+*   **Registry Visibility:** Improved synchronization in the box registry to ensure boxes are always visible in `/proc/boxes`.
+*   **Ghost Processes:** Refactored spawning logic to ensure the `box` utility itself exits cleanly when not needed, reducing process pollution.
 
 ## 8. Future Considerations
 

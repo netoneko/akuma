@@ -169,6 +169,7 @@ pub struct BoxInfo {
     pub name: String,
     pub root_dir: String,
     pub creator_pid: Pid,
+    pub primary_pid: Pid,
 }
 
 /// Global registry of active boxes
@@ -210,6 +211,7 @@ pub fn init_box_registry() {
         name: String::from("host"),
         root_dir: String::from("/"),
         creator_pid: 0, // System
+        primary_pid: 1, // Init
     });
 }
 
@@ -1680,6 +1682,22 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // - The ASID
     // This fixes the memory leak where processes would never free their pages.
     if let Some(pid) = pid {
+        // Check if this was a primary process for an active box.
+        // If so, the entire box should be shut down.
+        let box_to_kill = crate::irq::with_irqs_disabled(|| {
+            BOX_REGISTRY.lock().values()
+                .find(|b| b.primary_pid == pid && b.id != 0)
+                .map(|b| b.id)
+        });
+
+        if let Some(bid) = box_to_kill {
+            crate::safe_print!(128, "[Process] Primary PID {} exited, shutting down box {:08x}\n", pid, bid);
+            // kill_box handles unregistering the box and killing remaining PIDs
+            if let Err(e) = kill_box(bid) {
+                crate::safe_print!(128, "[Process] Error: Failed to kill box {:08x}: {}\n", bid, e);
+            }
+        }
+
         let _dropped_process = unregister_process(pid);
         // _dropped_process goes out of scope here and is dropped, freeing all memory
         crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
