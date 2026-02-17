@@ -56,10 +56,60 @@ fn main() {
         .compile(libc_stubs_obj_name);
 
     // Compile src/setjmp.S
-    let mut setjmp_compiler = common_build; // Use the last common_build clone
+    let mut setjmp_compiler = common_build.clone(); // Use a clone here for setjmp
     setjmp_compiler
         .file("src/setjmp.S")
         .compile(setjmp_obj_name);
+
+    // Compile lib/crt1.S for embedding
+    let mut crt1_compiler = cc::Build::new(); // Use a fresh build to avoid inherited flags
+    crt1_compiler
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-nostdinc")
+        .flag("-w") // Suppress warnings
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .file("lib/crt1.S")
+        .compile("crt1.o"); // Compile to crt1.o
+    
+    // Compile lib/libc.c for embedding
+    let mut libc_compiler = cc::Build::new(); // Use a fresh build to avoid inherited flags
+    libc_compiler
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-nostdinc")
+        .flag("-w") // Suppress warnings
+        .include("include") // libc.c needs system headers
+        .define("time_t", "long long")
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .file("lib/libc.c")
+        .compile("libc.o"); // Compile to libc.o
+
+    // Compile lib/crti.S for embedding
+    let mut crti_compiler = cc::Build::new(); // Use a fresh build to avoid inherited flags
+    crti_compiler
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-nostdinc")
+        .flag("-w") // Suppress warnings
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .file("lib/crti.S")
+        .compile("crti.o"); // Compile to crti.o
+
+    // Compile lib/crtn.S for embedding
+    let mut crtn_compiler = cc::Build::new(); // Use a fresh build to avoid inherited flags
+    crtn_compiler
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-nostdinc")
+        .flag("-w") // Suppress warnings
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .file("lib/crtn.S")
+        .compile("crtn.o"); // Compile to crtn.o
 
     // Manually create a single archive libtcc_all_objs.a from all object files
     let lib_tcc_core_path = out_dir.join("libtcc_all_objs.a");
