@@ -4,8 +4,8 @@
 
 #include "stddef.h"
 
-typedef long time_t;
-typedef long clock_t;
+// typedef long long time_t; // Removed
+typedef long long clock_t; // Keep this consistent
 
 struct tm {
     int tm_sec;
@@ -19,7 +19,9 @@ struct tm {
     int tm_isdst;
 };
 
+// time_t time(time_t *tloc); // Will be defined by -Dtime_t
 time_t time(time_t *tloc);
+
 #define localtime(x) ((struct tm*)0)
 #define gmtime(x) ((struct tm*)0)
 #define strftime(...) (0)

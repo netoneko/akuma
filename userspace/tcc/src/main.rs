@@ -4,12 +4,17 @@
 
 extern crate alloc;
 
-use alloc::alloc::{GlobalAlloc, Layout};
+use alloc::alloc::Layout;
 use core::ffi::{c_char, c_void, c_int};
 use core::ptr;
 use libakuma::{
-    close, exit, open, open_flags, read_fd, seek_mode, write_fd,
-    lseek, unlink, rename, mkdir, getcwd, fd, print, Stat,
+    close as akuma_close, exit as akuma_exit,
+    open as akuma_open, open_flags,
+    read_fd, seek_mode, write_fd,
+    unlink as akuma_unlink,
+    rename as akuma_rename, mkdir as akuma_mkdir,
+    getcwd as akuma_getcwd, Stat,
+    mmap as akuma_mmap, munmap as akuma_munmap,
 };
 
 // ============================================================================
@@ -39,6 +44,8 @@ pub static mut stdout: *mut FILE = ptr::null_mut();
 #[no_mangle]
 pub static mut stderr: *mut FILE = ptr::null_mut();
 
+type TimeT = i64;
+
 // Static buffers for standard streams
 static mut STDIN_FILE: FILE = FILE { fd: 0, error: 0, eof: 0, ungot: -1 };
 static mut STDOUT_FILE: FILE = FILE { fd: 1, error: 0, eof: 0, ungot: -1 };
@@ -56,9 +63,9 @@ extern "C" {
 pub extern "C" fn _start() -> ! {
     unsafe {
         // Initialize standard streams
-        stdin = &mut STDIN_FILE;
-        stdout = &mut STDOUT_FILE;
-        stderr = &mut STDERR_FILE;
+        stdin = &raw mut STDIN_FILE;
+        stdout = &raw mut STDOUT_FILE;
+        stderr = &raw mut STDERR_FILE;
 
         // Get args from libakuma
         let args_iter = libakuma::args();
@@ -159,7 +166,7 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
 pub unsafe extern "C" fn open(pathname: *const c_char, flags: c_int, _mode: c_int) -> c_int {
     let path = cstr_to_str(pathname);
     // Ignore mode for now, libakuma uses default
-    libakuma::open(path, flags as u32)
+    akuma_open(path, flags as u32)
 }
 
 #[no_mangle]
@@ -181,7 +188,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
-    let cwd = libakuma::getcwd();
+    let cwd = akuma_getcwd();
     let len = cwd.len();
     if len + 1 > size {
         return ptr::null_mut(); // ERANGE
@@ -194,7 +201,7 @@ pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn mmap(addr: *mut c_void, length: usize, prot: c_int, flags: c_int, _fd: c_int, _offset: i64) -> *mut c_void {
     // libakuma::mmap(addr, len, prot, flags)
-    let ret = libakuma::mmap(addr as usize, length, prot as u32, flags as u32);
+    let ret = akuma_mmap(addr as usize, length, prot as u32, flags as u32);
     if ret == usize::MAX {
         return -1isize as *mut c_void; // MAP_FAILED
     }
@@ -203,7 +210,7 @@ pub unsafe extern "C" fn mmap(addr: *mut c_void, length: usize, prot: c_int, fla
 
 #[no_mangle]
 pub unsafe extern "C" fn munmap(addr: *mut c_void, length: usize) -> c_int {
-    libakuma::munmap(addr as usize, length) as c_int
+    akuma_munmap(addr as usize, length) as c_int
 }
 
 #[no_mangle]
@@ -220,7 +227,7 @@ pub unsafe extern "C" fn fcntl(_fd: c_int, _cmd: c_int, _arg: c_int) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn fopen(filename: *const c_char, mode: *const c_char) -> *mut FILE {
-    let filename_str = cstr_to_str(filename);
+    let _filename_str = cstr_to_str(filename);
     let mode_str = cstr_to_str(mode);
     
     let mut flags = 0;
@@ -239,7 +246,7 @@ pub unsafe extern "C" fn fopen(filename: *const c_char, mode: *const c_char) -> 
         flags |= open_flags::O_CREAT | open_flags::O_APPEND;
     }
 
-    let fd = open(filename_str, flags);
+    let fd = open(filename, flags as c_int, 0);
     if fd < 0 {
         return ptr::null_mut();
     }
@@ -396,7 +403,7 @@ pub unsafe extern "C" fn fputs(s: *const c_char, stream: *mut FILE) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fflush(stream: *mut FILE) -> c_int {
+pub unsafe extern "C" fn fflush(_stream: *mut FILE) -> c_int {
     0 // No buffering yet
 }
 
@@ -436,14 +443,14 @@ pub unsafe extern "C" fn feof(stream: *mut FILE) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn remove(pathname: *const c_char) -> c_int {
     let path = cstr_to_str(pathname);
-    unlink(path)
+    akuma_unlink(path)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
     let old = cstr_to_str(oldpath);
     let new = cstr_to_str(newpath);
-    rename(old, new)
+    akuma_rename(old, new)
 }
 
 #[no_mangle]
@@ -457,8 +464,7 @@ pub unsafe extern "C" fn gettimeofday(tv: *mut timeval, _tz: *mut c_void) -> c_i
 
 #[no_mangle]
 pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut Stat) -> c_int {
-    let path = cstr_to_str(pathname);
-    let fd = open(path, open_flags::O_RDONLY);
+    let fd = open(pathname, open_flags::O_RDONLY as c_int, 0);
     if fd < 0 {
         return -1;
     }
@@ -487,7 +493,198 @@ unsafe fn fstat_impl(fd: i32, statbuf: *mut Stat) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn mkdir(pathname: *const c_char, _mode: u32) -> c_int {
     let path = cstr_to_str(pathname);
-    libakuma::mkdir(path)
+    akuma_mkdir(path)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn close(fd: c_int) -> c_int {
+    akuma_close(fd)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn freopen(filename: *const c_char, mode: *const c_char, stream: *mut FILE) -> *mut FILE {
+    if stream.is_null() { return ptr::null_mut(); }
+    
+    akuma_close((*stream).fd); 
+
+    let new_stream_ptr = fopen(filename, mode);
+    if new_stream_ptr.is_null() { return ptr::null_mut(); }
+    
+    let new_stream = &*new_stream_ptr;
+    (*stream).fd = new_stream.fd;
+    (*stream).error = new_stream.error;
+    (*stream).eof = new_stream.eof;
+    (*stream).ungot = new_stream.ungot;
+    
+    free(new_stream_ptr as *mut c_void);
+    
+    stream
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
+    let path = cstr_to_str(pathname);
+    akuma_unlink(path)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn exit(status: c_int) -> ! {
+    akuma_exit(status)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn time(tloc: *mut TimeT) -> TimeT {
+    let t = (libakuma::time() / 1_000_000) as TimeT; // Akuma returns microseconds, C time() expects seconds
+    if !tloc.is_null() {
+        *tloc = t;
+    }
+    t
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
+    ptr::null_mut() // No environment variables supported yet
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtod(_nptr: *const c_char, _endptr: *mut *mut c_char) -> f64 {
+    0.0 // Stub
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtof(_nptr: *const c_char, _endptr: *mut *mut c_char) -> f32 {
+    0.0f32 // Stub
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtold(_nptr: *const c_char, _endptr: *mut *mut c_char) -> f64 { // long double as f64
+    0.0 // Stub
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtol(nptr: *const c_char, endptr: *mut *mut c_char, base: c_int) -> i64 {
+    let s = cstr_to_str(nptr);
+    let mut current_ptr = s.as_ptr();
+    let mut result: i64 = 0;
+    let mut negative = false;
+
+    while *current_ptr as char == ' ' || *current_ptr as char == '\t' {
+        current_ptr = current_ptr.add(1);
+    }
+
+    if *current_ptr as char == '-' {
+        negative = true;
+        current_ptr = current_ptr.add(1);
+    } else if *current_ptr as char == '+' {
+        current_ptr = current_ptr.add(1);
+    }
+
+    let mut current_base = base;
+    if current_base == 0 {
+        if *current_ptr as char == '0' {
+            if *current_ptr.add(1) as char == 'x' || *current_ptr.add(1) as char == 'X' {
+                current_base = 16;
+                current_ptr = current_ptr.add(2);
+            } else {
+                current_base = 8;
+                current_ptr = current_ptr.add(1);
+            }
+        } else {
+            current_base = 10;
+        }
+    }
+
+    while *current_ptr != 0 {
+        let digit = match *current_ptr as char {
+            '0'..='9' => (*current_ptr as i64) - ('0' as i64),
+            'a'..='z' => (*current_ptr as i64) - ('a' as i64) + 10,
+            'A'..='Z' => (*current_ptr as i64) - ('A' as i64) + 10,
+            _ => break,
+        };
+        if digit >= current_base as i64 {
+            break;
+        }
+        result = result * current_base as i64 + digit;
+        current_ptr = current_ptr.add(1);
+    }
+
+    if !endptr.is_null() {
+        *endptr = current_ptr as *mut c_char;
+    }
+
+    if negative { -result } else { result }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtoul(nptr: *const c_char, endptr: *mut *mut c_char, base: c_int) -> u64 {
+    let s = cstr_to_str(nptr);
+    let mut current_ptr = s.as_ptr();
+    let mut result: u64 = 0;
+
+    while *current_ptr as char == ' ' || *current_ptr as char == '\t' {
+        current_ptr = current_ptr.add(1);
+    }
+
+    if *current_ptr as char == '+' {
+        current_ptr = current_ptr.add(1);
+    }
+
+    let mut current_base = base;
+    if current_base == 0 {
+        if *current_ptr as char == '0' {
+            if *current_ptr.add(1) as char == 'x' || *current_ptr.add(1) as char == 'X' {
+                current_base = 16;
+                current_ptr = current_ptr.add(2);
+            } else {
+                current_base = 8;
+                current_ptr = current_ptr.add(1);
+            }
+        } else {
+            current_base = 10;
+        }
+    }
+
+    while *current_ptr != 0 {
+        let digit = match *current_ptr as char {
+            '0'..='9' => (*current_ptr as u64) - ('0' as u64),
+            'a'..='z' => (*current_ptr as u64) - ('a' as u64) + 10,
+            'A'..='Z' => (*current_ptr as u64) - ('A' as u64) + 10,
+            _ => break,
+        };
+        if digit >= current_base as u64 {
+            break;
+        }
+        result = result * current_base as u64 + digit;
+        current_ptr = current_ptr.add(1);
+    }
+
+    if !endptr.is_null() {
+        *endptr = current_ptr as *mut c_char;
+    }
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtoll(nptr: *const c_char, endptr: *mut *mut c_char, base: c_int) -> i64 {
+    strtol(nptr, endptr, base)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strtoull(nptr: *const c_char, endptr: *mut *mut c_char, base: c_int) -> u64 {
+    strtoul(nptr, endptr, base)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn atoi(nptr: *const c_char) -> c_int {
+    strtol(nptr, ptr::null_mut(), 10) as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __clear_cache(_beg: *mut c_void, _end: *mut c_void) {
+    // AArch64 cache invalidation (simplified, might need more for correctness)
+    // For now, a no-op should be fine.
+    // asm volatile ("dsb sy" ::: "memory"); // Data synchronization barrier
+    // asm volatile ("isb sy" ::: "memory"); // Instruction synchronization barrier
 }
 
 // ============================================================================

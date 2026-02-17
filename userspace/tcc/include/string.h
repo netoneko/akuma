@@ -21,6 +21,7 @@ char *strstr(const char *haystack, const char *needle);
 size_t strspn(const char *s, const char *accept);
 size_t strcspn(const char *s, const char *reject);
 void *memchr(const void *s, int c, size_t n);
+char *strpbrk(const char *s, const char *accept);
 char *strerror(int errnum);
 
 #endif /* _STRING_H */

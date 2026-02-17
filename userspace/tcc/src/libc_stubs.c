@@ -1,22 +1,20 @@
-/*
- * Libc stubs for TinyCC on Akuma
- * 
- * Implements string, memory, and printf functions.
- * File I/O and memory allocation are implemented in Rust.
- */
-
 #include "stddef.h"
 #include "stdarg.h"
 #include "stdio.h"
+#include "ctype.h" // For isdigit, isalpha etc.
 
 /* errno global */
 int errno = 0;
+
+/* Environment */
+char *__environ[] = { NULL };
+char **environ = __environ;
 
 /* External functions implemented in Rust */
 extern size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 extern int fputc(int c, FILE *stream);
 extern void *malloc(size_t size);
-extern void free(void *ptr);
+extern void *free(void *ptr);
 extern void *realloc(void *ptr, size_t size);
 
 /* Memory functions */
@@ -150,6 +148,28 @@ char *strstr(const char *haystack, const char *needle) {
     return NULL;
 }
 
+char *strpbrk(const char *s, const char *accept) {
+    while (*s) {
+        const char *a = accept;
+        while (*a) {
+            if (*s == *a++) return (char *)s;
+        }
+        s++;
+    }
+    return NULL;
+}
+
+char *realpath(const char *path, char *resolved_path) {
+    if (!resolved_path) {
+        resolved_path = malloc(1024); // Assuming max path length
+        if (!resolved_path) {
+            return NULL; // OOM
+        }
+    }
+    strcpy(resolved_path, path);
+    return resolved_path;
+}
+
 char *strdup(const char *s) {
     size_t len = strlen(s) + 1;
     char *new = malloc(len);
@@ -162,49 +182,10 @@ char *strerror(int errnum) {
 }
 
 /* Math stubs (minimal) */
-double strtod(const char *nptr, char **endptr) {
-    return 0.0; /* TODO */
-}
-
-long strtol(const char *nptr, char **endptr, int base) {
-    long result = 0;
-    int negative = 0;
-    while (*nptr == ' ' || *nptr == '	') nptr++;
-    if (*nptr == '-') { negative = 1; nptr++; }
-    else if (*nptr == '+') nptr++;
-    
-    if (base == 0) {
-        if (*nptr == '0') {
-            if (nptr[1] == 'x' || nptr[1] == 'X') { base = 16; nptr += 2; }
-            else { base = 8; nptr++; }
-        } else base = 10;
-    }
-    
-    while (*nptr) {
-        int digit;
-        if (*nptr >= '0' && *nptr <= '9') digit = *nptr - '0';
-        else if (*nptr >= 'a' && *nptr <= 'z') digit = *nptr - 'a' + 10;
-        else if (*nptr >= 'A' && *nptr <= 'Z') digit = *nptr - 'A' + 10;
-        else break;
-        if (digit >= base) break;
-        result = result * base + digit;
-        nptr++;
-    }
-    if (endptr) *endptr = (char *)nptr;
-    return negative ? -result : result;
-}
-
-unsigned long strtoul(const char *nptr, char **endptr, int base) {
-    return (unsigned long)strtol(nptr, endptr, base);
-}
-
-int atoi(const char *nptr) {
-    return (int)strtol(nptr, NULL, 10);
-}
-
 /* Character functions */
-int isspace(int c) { return c == ' ' || c == '	' || c == '
-' || c == ''; }
+int isspace(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
 int isdigit(int c) { return c >= '0' && c <= '9'; }
 int isalpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 int isalnum(int c) { return isalpha(c) || isdigit(c); }
@@ -322,6 +303,29 @@ int printf(const char *format, ...) {
     int ret = vfprintf(stdout, format, ap);
     va_end(ap);
     return ret;
+}
+
+int system(const char *command) {
+    (void)command;
+    return -1; // Not supported
+}
+
+/* Simple qsort implementation (bubble sort for simplicity) */
+void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
+    char *arr = (char *)base;
+    char temp[256]; /* Assumes elements are smaller than 256 bytes */
+    
+    if (size > sizeof(temp)) return; // Too large to copy
+    
+    for (size_t i = 0; i < nmemb; i++) {
+        for (size_t j = i + 1; j < nmemb; j++) {
+            if (compar(arr + i * size, arr + j * size) > 0) {
+                memcpy(temp, arr + i * size, size);
+                memcpy(arr + i * size, arr + j * size, size);
+                memcpy(arr + j * size, temp, size);
+            }
+        }
+    }
 }
 
 /* Dynamic loading stubs */
