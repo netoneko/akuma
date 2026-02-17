@@ -146,7 +146,7 @@ pub extern "C" fn _start() -> ! {
 
 fn install_tcc_runtime() {
     for (rel_path, content) in FILES_TO_INSTALL.iter() {
-        let full_path = alloc::format!("/usr/tcc-runtime/{}", rel_path);
+        let full_path = alloc::format!("/usr/{}", rel_path);
         
         // Ensure parent directories exist
         let parent_dir_path = PathBuf::from(&full_path).parent().unwrap();
