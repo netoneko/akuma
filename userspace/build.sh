@@ -29,6 +29,17 @@ MEMBERS=(
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
     cargo build --release -p "$member"
+    # Special handling for tcc to copy its sysroot archive
+    if [ "$member" == "tcc" ]; then
+        TCC_SYSROOT_ARCHIVE="tcc/dist/tcc_sysroot.tar.gz"
+        if [ -f "$TCC_SYSROOT_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/lib/tcc/
+            cp "$TCC_SYSROOT_ARCHIVE" ../bootstrap/lib/tcc/
+            echo "Copied $TCC_SYSROOT_ARCHIVE to ../bootstrap/lib/tcc/"
+        else
+            echo "Warning: TCC sysroot archive not found at $TCC_SYSROOT_ARCHIVE"
+        fi
+    fi
 done
 
 # Create bin directory if it doesn't exist

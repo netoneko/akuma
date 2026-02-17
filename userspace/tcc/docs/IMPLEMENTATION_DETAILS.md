@@ -60,3 +60,12 @@ When `tcc install` is executed, the embedded files will be written to the Akuma 
 **Base Installation Directory**: `/usr`
 
 This setup makes TCC a self-sufficient C compiler that can bootstrap its own development environment on Akuma OS.
+
+## MISSING PARTS
+
+in build.rs, compile everything as expected, including a libc binary, then put the headers and
+   object files and libc into a zlib archive (if it does not support files use tar I guess)
+   update build.sh to put this into correct target directory
+   then update built-in "pkg install" so it would know to try to download the binary and if it does not
+   exist try to download and extract an archive
+   first extract to a temporary location, then move the files
