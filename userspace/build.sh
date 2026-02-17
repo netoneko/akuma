@@ -74,12 +74,6 @@ for bin in "${BINARIES[@]}"; do
     fi
 done
 
-# Copy TCC headers and libs
-mkdir -p ../bootstrap/usr/include
-mkdir -p ../bootstrap/usr/include/sys
-mkdir -p ../bootstrap/usr/lib
-cp -r tcc/include/* ../bootstrap/usr/include/
-cp tcc/lib/* ../bootstrap/usr/lib/
 # Copy hello world example
 cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
 
