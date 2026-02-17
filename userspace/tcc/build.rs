@@ -7,12 +7,18 @@ fn main() {
     println!("cargo:rerun-if-changed=src/libc_stubs.c");
     println!("cargo:rerun-if-changed=src/setjmp.S");
     println!("cargo:rerun-if-changed=src/config.h");
+    println!("cargo:rerun-if-changed=tinycc/tccdefs.h"); // tccdefs.h
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap(); // e.g., aarch64-unknown-none
     
-    let mut build = cc::Build::new();
-    build
+    // Object file names for TCC core
+    let tcc_main_obj_name = "tcc_main.o";
+    let libc_stubs_obj_name = "libc_stubs.o";
+    let setjmp_obj_name = "setjmp.o";
+
+    let mut common_build = cc::Build::new();
+    common_build
         .define("TCC_TARGET_ARM64", "1")
         .define("ONE_SOURCE", "1")
         .define("CONFIG_TCC_STATIC", "1")
@@ -33,18 +39,43 @@ fn main() {
         "s" | "z" => 3, // For optimized size
         _ => opt_level_str.parse().unwrap_or(0), // Parse to u32, default to 0 if parsing fails
     };
-    build.opt_level(opt_level_num)
+    common_build.opt_level(opt_level_num)
         .out_dir(&out_dir);
 
-    // Add all source files to a single compilation step
-    build
+    // Compile tinycc/tcc.c
+    let mut tcc_compiler = common_build.clone();
+    tcc_compiler
         .file("tinycc/tcc.c")
-        .file("src/libc_stubs.c")
-        .file("src/setjmp.S")
         .define("main", "tcc_main") // Rename main to tcc_main
-        .compile("tcc_all_objs"); // Compile all into one static library libtcc_all_objs.a
+        .compile(tcc_main_obj_name);
 
-    // Instruct rustc to link against this library
+    // Compile src/libc_stubs.c
+    let mut stubs_compiler = common_build.clone();
+    stubs_compiler
+        .file("src/libc_stubs.c")
+        .compile(libc_stubs_obj_name);
+
+    // Compile src/setjmp.S
+    let mut setjmp_compiler = common_build; // Use the last common_build clone
+    setjmp_compiler
+        .file("src/setjmp.S")
+        .compile(setjmp_obj_name);
+
+    // Manually create a single archive libtcc_all_objs.a from all object files
+    let lib_tcc_core_path = out_dir.join("libtcc_all_objs.a");
+    
+    let mut ar_command = cc::Build::new().target(&target).get_archiver();
+    ar_command
+        .arg("rcs") // r: insert or replace, c: create, s: write archive index
+        .arg(&lib_tcc_core_path)
+        .arg(out_dir.join(tcc_main_obj_name))
+        .arg(out_dir.join(libc_stubs_obj_name))
+        .arg(out_dir.join(setjmp_obj_name))
+        .current_dir(&out_dir) // Run ar in out_dir so paths are relative
+        .status()
+        .expect("Failed to create libtcc_all_objs.a archive");
+
+    // Instruct rustc to link against the manually created archive
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=tcc_all_objs");
 }

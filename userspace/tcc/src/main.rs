@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::alloc::Layout;
 use core::ffi::{c_char, c_void, c_int};
 use core::ptr;
+use alloc::string::ToString;
 
 // Need a basic PathBuf implementation for install_tcc_runtime in no_std
 struct PathBuf {
@@ -75,30 +76,33 @@ static mut STDERR_FILE: FILE = FILE { fd: 2, error: 0, eof: 0, ungot: -1 };
 // Embedded Files for Installation
 // ============================================================================
 
-const FILES_TO_INSTALL: &[(&str, &str)] = &[
-    ("include/assert.h", include_str!("../include/assert.h")),
-    ("include/ctype.h", include_str!("../include/ctype.h")),
-    ("include/dlfcn.h", include_str!("../include/dlfcn.h")),
-    ("include/errno.h", include_str!("../include/errno.h")),
-    ("include/fcntl.h", include_str!("../include/fcntl.h")),
-    ("include/inttypes.h", include_str!("../include/inttypes.h")),
-    ("include/limits.h", include_str!("../include/limits.h")),
-    ("include/math.h", include_str!("../include/math.h")),
-    ("include/setjmp.h", include_str!("../include/setjmp.h")),
-    ("include/stdarg.h", include_str!("../include/stdarg.h")),
-    ("include/stddef.h", include_str!("../include/stddef.h")),
-    ("include/stdint.h", include_str!("../include/stdint.h")),
-    ("include/stdio.h", include_str!("../include/stdio.h")),
-    ("include/stdlib.h", include_str!("../include/stdlib.h")),
-    ("include/string.h", include_str!("../include/string.h")),
-    ("include/time.h", include_str!("../include/time.h")),
-    ("include/unistd.h", include_str!("../include/unistd.h")),
-    ("include/sys/mman.h", include_str!("../include/sys/mman.h")),
-    ("include/sys/stat.h", include_str!("../include/sys/stat.h")),
-    ("include/sys/time.h", include_str!("../include/sys/time.h")),
-    ("include/sys/types.h", include_str!("../include/sys/types.h")),
-    ("lib/crt0.S", include_str!("../lib/crt0.S")),
-    ("lib/libc.c", include_str!("../lib/libc.c")),
+const FILES_TO_INSTALL: &[(&str, &[u8])] = &[
+    ("include/assert.h", include_str!("../include/assert.h").as_bytes()),
+    ("include/ctype.h", include_str!("../include/ctype.h").as_bytes()),
+    ("include/dlfcn.h", include_str!("../include/dlfcn.h").as_bytes()),
+    ("include/errno.h", include_str!("../include/errno.h").as_bytes()),
+    ("include/fcntl.h", include_str!("../include/fcntl.h").as_bytes()),
+    ("include/inttypes.h", include_str!("../include/inttypes.h").as_bytes()),
+    ("include/limits.h", include_str!("../include/limits.h").as_bytes()),
+    ("include/math.h", include_str!("../include/math.h").as_bytes()),
+    ("include/setjmp.h", include_str!("../include/setjmp.h").as_bytes()),
+    ("include/stdarg.h", include_str!("../include/stdarg.h").as_bytes()),
+    ("include/stddef.h", include_str!("../include/stddef.h").as_bytes()),
+    ("include/stdint.h", include_str!("../include/stdint.h").as_bytes()),
+    ("include/stdio.h", include_str!("../include/stdio.h").as_bytes()),
+    ("include/stdlib.h", include_str!("../include/stdlib.h").as_bytes()),
+    ("include/string.h", include_str!("../include/string.h").as_bytes()),
+    ("include/time.h", include_str!("../include/time.h").as_bytes()),
+    ("include/unistd.h", include_str!("../include/unistd.h").as_bytes()),
+    ("include/sys/mman.h", include_str!("../include/sys/mman.h").as_bytes()),
+    ("include/sys/stat.h", include_str!("../include/sys/stat.h").as_bytes()),
+    ("include/sys/time.h", include_str!("../include/sys/time.h").as_bytes()),
+    ("include/sys/types.h", include_str!("../include/sys/types.h").as_bytes()),
+    ("include/tccdefs.h", include_str!("../tinycc/include/tccdefs.h").as_bytes()), // Add tccdefs.h
+    ("lib/crt1.S", include_str!("../lib/crt1.S").as_bytes()), // Use crt1.S source
+    ("lib/libc.c", include_str!("../lib/libc.c").as_bytes()), // Use libc.c source
+    ("lib/crti.S", include_str!("../lib/crti.S").as_bytes()), // Use crti.S source
+    ("lib/crtn.S", include_str!("../lib/crtn.S").as_bytes()), // Use crtn.S source
 ];
 
 // ============================================================================
@@ -158,7 +162,7 @@ fn install_tcc_runtime() {
                 libakuma::eprintln(&alloc::format!("Error: Could not open {} for writing.", full_path));
                 libakuma::exit(1);
             }
-            let bytes_written = libakuma::write(fd as u64, content.as_bytes());
+            let bytes_written = libakuma::write(fd as u64, *content);
             if bytes_written < 0 || bytes_written as usize != content.len() {
                 libakuma::eprintln(&alloc::format!("Error: Could not write to {}.", full_path));
                 libakuma::exit(1);
@@ -171,6 +175,50 @@ fn install_tcc_runtime() {
         }
     }
     libakuma::println("TCC runtime installed successfully.");
+
+    // Now compile the crt files using the newly installed tcc
+    let crt_sources = [
+        "/usr/lib/crt1.S",
+        "/usr/lib/libc.c",
+        "/usr/lib/crti.S",
+        "/usr/lib/crtn.S",
+    ];
+    let crt_objects = [
+        "/usr/lib/crt1.o",
+        "/usr/lib/libc.o",
+        "/usr/lib/crti.o",
+        "/usr/lib/crtn.o",
+    ];
+
+    for (i, src_path) in crt_sources.iter().enumerate() {
+        let obj_path = crt_objects[i];
+        libakuma::println(&alloc::format!("Compiling {} to {}...", src_path, obj_path));
+
+        // Use Command::new from libakuma if available, or manually create argv for tcc
+        let mut tcc_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        tcc_argv.push("tcc".to_string() + "\0");
+        tcc_argv.push("-c".to_string() + "\0"); // Compile only
+        tcc_argv.push((*src_path).to_string() + "\0");
+        tcc_argv.push("-o".to_string() + "\0");
+        tcc_argv.push((*obj_path).to_string() + "\0");
+        
+        let mut tcc_argv_ptrs: alloc::vec::Vec<*const c_char> = alloc::vec::Vec::new();
+        for arg_string in tcc_argv.iter() {
+            tcc_argv_ptrs.push(arg_string.as_ptr() as *const c_char);
+        }
+        tcc_argv_ptrs.push(ptr::null());
+
+        let argc = (tcc_argv_ptrs.len() - 1) as c_int;
+        unsafe { // Call to unsafe function tcc_main
+            let ret = tcc_main(argc, tcc_argv_ptrs.as_ptr()); // Call tcc_main as a function
+            
+            if ret != 0 {
+                libakuma::eprintln(&alloc::format!("Error: Failed to compile {}.", src_path));
+                libakuma::exit(1);
+            }
+        }
+    }
+    libakuma::println("TCC runtime object files compiled successfully.");
 }
 
 // ============================================================================
