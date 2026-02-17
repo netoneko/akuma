@@ -2,11 +2,11 @@
 #define _CONFIG_H
 
 #define TCC_VERSION "0.9.27"
-#define CONFIG_TCCDIR "/usr/tcc-runtime"
+#define CONFIG_TCCDIR "/usr"
 #define CONFIG_LDDIR "lib"
-#define CONFIG_TCC_SYSINCLUDE_PATHS "/usr/tcc-runtime/include"
-#define CONFIG_TCC_LIBPATHS "/usr/tcc-runtime/lib"
-#define CONFIG_TCC_CRTPREFIX "/usr/tcc-runtime"
+#define CONFIG_TCC_SYSINCLUDE_PATHS "/usr/include"
+#define CONFIG_TCC_LIBPATHS "/usr/lib"
+#define CONFIG_TCC_CRTPREFIX "/usr"
 #define CONFIG_TCC_ELFINTERP ""
 #define CONFIG_TCC_M32 0
 #define CONFIG_TCC_BCHECK 0
