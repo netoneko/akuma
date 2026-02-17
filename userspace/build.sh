@@ -54,6 +54,7 @@ BINARIES=(
     "top"
     "box"
     "paws"
+    "tcc"
 )
 
 for bin in "${BINARIES[@]}"; do
@@ -69,6 +70,15 @@ for bin in "${BINARIES[@]}"; do
         fi
     fi
 done
+
+# Copy TCC headers and libs
+mkdir -p ../bootstrap/usr/include
+mkdir -p ../bootstrap/usr/include/sys
+mkdir -p ../bootstrap/usr/lib
+cp -r tcc/include/* ../bootstrap/usr/include/
+cp tcc/lib/* ../bootstrap/usr/lib/
+# Copy hello world example
+cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
 
 # Link sh to paws
 PAWS_BIN="../bootstrap/bin/paws"

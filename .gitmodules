@@ -1,3 +1,6 @@
 [submodule "userspace/meow"]
 	path = userspace/meow
 	url = git@github.com:netoneko/meow.git
+[submodule "userspace/tcc/tinycc"]
+	path = userspace/tcc/tinycc
+	url = https://repo.or.cz/tinycc.git

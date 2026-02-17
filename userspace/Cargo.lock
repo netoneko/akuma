@@ -911,6 +911,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcc"
+version = "0.9.27"
+dependencies = [
+ "cc",
+ "libakuma",
+]
+
+[[package]]
 name = "termtest"
 version = "0.1.0"
 dependencies = [

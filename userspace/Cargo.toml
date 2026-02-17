@@ -20,7 +20,8 @@ members = [
     "termtest",
     "allocstress",
     "top",
-    "paws"
+    "paws",
+    "tcc"
 ]
 
 [profile.dev]
