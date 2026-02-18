@@ -48,8 +48,7 @@ Update the `paws` shell's built-in `pkg install` command to handle both binaries
 
 ## 4. Technical Requirements
 
-*   **Decompression:** `paws` will need a `no_std` compatible zlib/deflate decompressor (e.g., `miniz_oxide`, as used in `scratch`).
-*   **Tar Handling:** A minimal `tar` parser will be needed in `paws` to iterate through the archive entries and write them to the filesystem.
+*   **Decompression:** `paws` should spawn a new process that runs `tar zxvf`
 *   **Filesystem Operations:** `libakuma` must support the necessary directory creation (`mkdir_p`) and file writing operations.
 
 ## 5. Verification Steps
