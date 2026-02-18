@@ -8,22 +8,14 @@ long write(int fd, const void *buf, size_t count);
 static inline long syscall(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
     long ret;
     asm volatile(
-        "mov x8, %1
-"
-        "mov x0, %2
-"
-        "mov x1, %3
-"
-        "mov x2, %4
-"
-        "mov x3, %5
-"
-        "mov x4, %6
-"
-        "mov x5, %7
-"
-        "svc #0
-"
+        "mov x8, %1\n"
+        "mov x0, %2\n"
+        "mov x1, %3\n"
+        "mov x2, %4\n"
+        "mov x3, %5\n"
+        "mov x4, %6\n"
+        "mov x5, %7\n"
+        "svc #0\n"
         "mov %0, x0"
         : "=r"(ret)
         : "r"(num), "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5)

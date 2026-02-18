@@ -32,13 +32,13 @@ for member in "${MEMBERS[@]}"; do
     cargo build --release -p "$member"
     # Special handling for tcc to copy its sysroot archive
     if [ "$member" == "tcc" ]; then
-        TCC_SYSROOT_ARCHIVE="tcc/dist/tcc_sysroot.tar.gz"
-        if [ -f "$TCC_SYSROOT_ARCHIVE" ]; then
+        LIBC_ARCHIVE="tcc/dist/libc.tar.gz"
+        if [ -f "$LIBC_ARCHIVE" ]; then
             mkdir -p ../bootstrap/archives/
-            cp "$TCC_SYSROOT_ARCHIVE" ../bootstrap/archives/tcc-sysroot.tar.gz
-            echo "Copied $TCC_SYSROOT_ARCHIVE to ../bootstrap/archives/tcc-sysroot.tar.gz"
+            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar.gz
+            echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar.gz"
         else
-            echo "Warning: TCC sysroot archive not found at $TCC_SYSROOT_ARCHIVE"
+            echo "Warning: libc archive not found at $LIBC_ARCHIVE"
         fi
     fi
 done
