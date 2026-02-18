@@ -24,6 +24,7 @@ MEMBERS=(
     "box"
     "paws"
     "tcc"
+    "tar"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -33,9 +34,9 @@ for member in "${MEMBERS[@]}"; do
     if [ "$member" == "tcc" ]; then
         TCC_SYSROOT_ARCHIVE="tcc/dist/tcc_sysroot.tar.gz"
         if [ -f "$TCC_SYSROOT_ARCHIVE" ]; then
-            mkdir -p ../bootstrap/lib/tcc/
-            cp "$TCC_SYSROOT_ARCHIVE" ../bootstrap/lib/tcc/
-            echo "Copied $TCC_SYSROOT_ARCHIVE to ../bootstrap/lib/tcc/"
+            mkdir -p ../bootstrap/archives/
+            cp "$TCC_SYSROOT_ARCHIVE" ../bootstrap/archives/tcc-sysroot.tar.gz
+            echo "Copied $TCC_SYSROOT_ARCHIVE to ../bootstrap/archives/tcc-sysroot.tar.gz"
         else
             echo "Warning: TCC sysroot archive not found at $TCC_SYSROOT_ARCHIVE"
         fi
@@ -67,6 +68,7 @@ BINARIES=(
     "box"
     "paws"
     "tcc"
+    "tar"
 )
 
 for bin in "${BINARIES[@]}"; do

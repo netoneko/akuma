@@ -21,7 +21,8 @@ members = [
     "allocstress",
     "top",
     "paws",
-    "tcc"
+    "tcc",
+    "tar"
 ]
 
 [profile.dev]
