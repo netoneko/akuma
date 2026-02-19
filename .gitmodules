@@ -4,3 +4,6 @@
 [submodule "userspace/tcc/tinycc"]
 	path = userspace/tcc/tinycc
 	url = https://repo.or.cz/tinycc.git
+[submodule "userspace/musl/musl"]
+	path = userspace/musl/musl
+	url = https://git.musl-libc.org/git/musl
