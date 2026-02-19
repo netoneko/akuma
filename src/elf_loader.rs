@@ -355,34 +355,49 @@ pub fn load_elf_with_stack(
     }
     argv_addrs.reverse();
 
-    // Align SP to 16 bytes for AArch64 ABI
+    // Align SP to 16 bytes AFTER strings
     sp &= !0xF;
 
-    // 2. Prepare Auxiliary Vector
+    // 2. Prepare random data for AT_RANDOM (16 bytes)
+    sp -= 16;
+    let random_ptr = sp;
+    let frame_idx = (sp - stack_bottom) / PAGE_SIZE;
+    let offset = sp % PAGE_SIZE;
+    unsafe {
+        let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset) as *mut u64;
+        *dst = 0x123456789abcdef0;
+        *dst.add(1) = 0x0fedcba987654321;
+    }
+
+    // 3. Prepare Auxiliary Vector
     let auxv = [
         AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 },
         AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 },
         AuxEntry { a_type: auxv::AT_PHENT, a_val: loaded.phent as u64 },
         AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 },
         AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 },
+        AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 },
+        AuxEntry { a_type: auxv::AT_HWCAP, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 },
+        AuxEntry { a_type: auxv::AT_UID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_EUID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_GID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_EGID, a_val: 0 },
         AuxEntry { a_type: auxv::AT_NULL, a_val: 0 },
     ];
 
-    // 3. Push everything onto stack in reverse order:
-    // [AuxV]
-    // [Envp (NULL)]
-    // [Argv pointers]
-    // [Argc]
-
-    // Calculate space needed
-    let auxv_size = auxv.len() * core::mem::size_of::<AuxEntry>();
-    let envp_size = 8; // Just NULL
-    let argv_size = (args.len() + 1) * 8; // ptrs + NULL
+    // 4. Calculate total space for the table
+    // Layout: [argc] [argv...] [NULL] [envp...] [NULL] [auxv...]
     let argc_size = 8;
+    let argv_size = (args.len() + 1) * 8;
+    let envp_size = 8; // NULL envp
+    let auxv_size = auxv.len() * 16;
     
-    let total_ptr_space = auxv_size + envp_size + argv_size + argc_size;
-    sp -= total_ptr_space;
-    sp &= !0xF; // Re-align
+    let total_table_size = argc_size + argv_size + envp_size + auxv_size;
+    
+    // Align total size to 16 bytes so SP stays aligned
+    let total_table_size_aligned = (total_table_size + 15) & !0xF;
+    sp -= total_table_size_aligned;
 
     let mut current_sp = sp;
     let write_stack = |addr: usize, val: u64| {
@@ -394,11 +409,11 @@ pub fn load_elf_with_stack(
         }
     };
 
-    // argc
+    // Write argc
     write_stack(current_sp, args.len() as u64);
     current_sp += 8;
 
-    // argv pointers
+    // Write argv pointers
     for addr in argv_addrs {
         write_stack(current_sp, addr as u64);
         current_sp += 8;
@@ -406,11 +421,11 @@ pub fn load_elf_with_stack(
     write_stack(current_sp, 0); // argv NULL
     current_sp += 8;
 
-    // envp NULL
+    // Write envp NULL
     write_stack(current_sp, 0);
     current_sp += 8;
 
-    // AuxV
+    // Write AuxV
     for entry in auxv {
         write_stack(current_sp, entry.a_type);
         write_stack(current_sp + 8, entry.a_val);

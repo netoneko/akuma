@@ -595,6 +595,7 @@ pub struct UserTrapFrame {
     pub sp_el0: u64,
     pub elr_el1: u64, // User PC
     pub spsr_el1: u64,
+    pub tpidr_el0: u64,
     pub _padding: u64,
 }
 
@@ -1028,6 +1029,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             // Handle syscall
             let ret = crate::syscall::handle_syscall(syscall_num, &args);
+
+            // SYNC TLS: If the syscall modified TPIDR_EL0 (e.g. SET_TPIDR_EL0),
+            // update the trap frame so the change persists after register restoration.
+            unsafe {
+                let current_tls: u64;
+                core::arch::asm!("mrs {}, tpidr_el0", out(reg) current_tls);
+                (*frame).tpidr_el0 = current_tls;
+            }
             
             // Check if process exited - if so, return to kernel
             if let Some(proc) = crate::process::current_process() {

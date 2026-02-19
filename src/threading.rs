@@ -590,6 +590,7 @@ switch_context:
     // Restore TPIDR_EL0 (user TLS pointer)
     ldr x9, [x1, #160]
     msr tpidr_el0, x9
+    isb
     
     isb                       // Ensure TTBR0 change visible
     tlbi vmalle1              // Flush all EL1 TLB entries
