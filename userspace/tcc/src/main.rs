@@ -252,8 +252,15 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
 #[no_mangle]
 pub unsafe extern "C" fn open(pathname: *const c_char, flags: c_int, _mode: c_int) -> c_int {
     let path = cstr_to_str(pathname);
-    // Ignore mode for now, libakuma uses default
-    akuma_open(path, flags as u32)
+    let fd = akuma_open(path, flags as u32);
+    if fd < 0 {
+        // Only print if not trying to find something that might not exist (optional headers)
+        // or if it's a crt object which we KNOW should exist.
+        if path.contains("crt") || path.contains("tccdefs.h") || path.contains("libc.a") {
+            libakuma::eprintln(&alloc::format!("tcc: open('{}', flags={}) failed: {}", path, flags, fd));
+        }
+    }
+    fd
 }
 
 #[no_mangle]
