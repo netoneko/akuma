@@ -14,6 +14,7 @@ pub mod nr {
     pub const EXIT: u64 = 93;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const IOCTL: u64 = 29;
     pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
@@ -94,6 +95,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
+        nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
         nr::CLOSE => sys_close(args[0] as u32),
@@ -137,7 +139,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
-        _ => !0 // ENOSYS
+        _ => {
+            crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
+                syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
+            !0 // ENOSYS
+        }
     }
 }
 
