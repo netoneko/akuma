@@ -472,49 +472,60 @@ fn download_file(url: &str, dest_path: &str) -> i32 {
         return -1;
     }
 
-    // Read response
-    let mut response = Vec::new();
+    // Read response headers
+    let mut response_buf = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut headers_end = None;
     
-    loop {
+    while headers_end.is_none() {
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(n) => {
-                response.extend_from_slice(&buf[..n]);
+                response_buf.extend_from_slice(&buf[..n]);
+                headers_end = find_headers_end(&response_buf);
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock || e.kind == libakuma::net::ErrorKind::TimedOut {
-                    break;
+                    continue;
                 }
-                print("paws: read error: ");
+                print("paws: header read error: ");
                 print(&format!("{:?}\n", e));
                 return -1;
             }
         }
     }
 
-    print("paws: received ");
-    print_dec(response.len());
-    println(" bytes");
-
-    // Parse HTTP response
-    let (status, headers_end, _body) = match parse_http_response(&response) {
-        Some(r) => r,
+    let end_pos = match headers_end {
+        Some(pos) => pos,
         None => {
-            println("paws: failed to parse HTTP response");
+            println("paws: failed to find HTTP headers");
             return -1;
         }
     };
 
-    print("paws: HTTP status ");
-    print_dec(status as usize);
-    println("");
+    // Parse HTTP response status and find content length
+    let header_str = core::str::from_utf8(&response_buf[..end_pos]).unwrap_or("");
+    let mut status = 0;
+    let mut content_length = None;
+
+    for (i, line) in header_str.lines().enumerate() {
+        if i == 0 {
+            let mut parts = line.split_whitespace();
+            parts.next(); // Skip version
+            status = parts.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+        } else if line.to_lowercase().starts_with("content-length:") {
+            content_length = line["content-length:".len()..].trim().parse::<usize>().ok();
+        }
+    }
 
     if status != 200 {
+        print("paws: server returned HTTP ");
+        print_dec(status as usize);
+        println("");
         return -1;
     }
 
-    // Write body to file
+    // Prepare destination file
     let fd = open(dest_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
         print("paws: failed to open destination: ");
@@ -523,16 +534,62 @@ fn download_file(url: &str, dest_path: &str) -> i32 {
         return -1;
     }
 
-    let body_data = &response[headers_end..];
-    let written = write_fd(fd, body_data);
-    close(fd);
-
-    if written < 0 {
-        println("paws: failed to write data");
-        return -1;
+    // Write initial data from buffer
+    let initial_body = &response_buf[end_pos..];
+    if !initial_body.is_empty() {
+        write_fd(fd, initial_body);
     }
 
+    let mut total_downloaded = initial_body.len();
+    
+    // Read remainder of body directly to disk
+    loop {
+        if let Some(len) = content_length {
+            if total_downloaded >= len {
+                break;
+            }
+        }
+
+        match stream.read(&mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                write_fd(fd, &buf[..n]);
+                total_downloaded += n;
+            }
+            Err(e) => {
+                if e.kind == libakuma::net::ErrorKind::WouldBlock || e.kind == libakuma::net::ErrorKind::TimedOut {
+                    continue;
+                }
+                print("paws: body read error: ");
+                print(&format!("{:?}\n", e));
+                close(fd);
+                return -1;
+            }
+        }
+    }
+
+    close(fd);
+    print("paws: received ");
+    print_dec(total_downloaded);
+    println(" bytes");
+
     0
+}
+
+trait ToLowercaseExt {
+    fn to_lowercase(&self) -> String;
+}
+
+impl ToLowercaseExt for &str {
+    fn to_lowercase(&self) -> String {
+        let mut s = String::with_capacity(self.len());
+        for c in self.chars() {
+            for lc in c.to_lowercase() {
+                s.push(lc);
+            }
+        }
+        s
+    }
 }
 
 struct ParsedUrl<'a> {
