@@ -149,27 +149,22 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
 }
 
 fn untar(archive_path: &str, target_dir: &str, gzip: bool, verbose: bool) -> Result<(), TarError> {
-    print("tar: untar path='");
-    print(archive_path);
-    print("' target='");
-    print(target_dir);
-    print("' gzip=");
-    print(if gzip { "true" } else { "false" });
-    print(" verbose=");
-    println(if verbose { "true" } else { "false" });
+    if verbose {
+        print("tar: untar path='");
+        print(archive_path);
+        print("' target='");
+        print(target_dir);
+        print("' gzip=");
+        print(if gzip { "true" } else { "false" });
+        print(" verbose=");
+        println(if verbose { "true" } else { "false" });
+    }
 
     let raw_data = read_file_to_vec(archive_path)?;
-    print("tar: read ");
-    print_dec(raw_data.len());
-    println(" bytes");
-
-    if raw_data.len() >= 16 {
-        print("tar: header hex: ");
-        for i in 0..16 {
-            print_hex(raw_data[i] as usize);
-            print(" ");
-        }
-        println("");
+    if verbose {
+        print("tar: read ");
+        print_dec(raw_data.len());
+        println(" bytes");
     }
 
     let decompressed_data;

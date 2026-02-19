@@ -24,6 +24,7 @@ fn main() {
         .define("ONE_SOURCE", "1")
         .define("CONFIG_TCC_STATIC", "1")
         .define("CONFIG_TCC_SEMLOCK", "0")
+        .define("CONFIG_TCCDIR", "\"/usr/lib/tcc\"")
         .define("time_t", "long long")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
@@ -92,30 +93,39 @@ fn main() {
         .out_dir(&out_dir)
         .compile("crtn");
 
+    // libtcc1.a (TCC's own runtime)
+    cc::Build::new()
+        .file("tinycc/lib/libtcc1.c")
+        .file("tinycc/lib/lib-arm64.c")
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-nostdinc")
+        .include("tinycc")
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .opt_level(3)
+        .out_dir(&out_dir)
+        .compile("tcc1");
+
     // 3. Stage the sysroot
     let staging_dir = out_dir.join("sysroot_staging");
-    let usr_dir = staging_dir.join("usr");
-    let lib_dest_dir = usr_dir.join("lib");
-    let include_dest_dir = usr_dir.join("include");
+    let lib_dir = staging_dir.join("usr/lib");
+    let include_dir = staging_dir.join("usr/include");
+    let tcc_lib_dir = lib_dir.join("tcc");
+    let tcc_include_dir = tcc_lib_dir.join("include");
 
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir).unwrap();
     }
-    fs::create_dir_all(&lib_dest_dir).unwrap();
-    fs::create_dir_all(&include_dest_dir).unwrap();
+    fs::create_dir_all(&lib_dir).unwrap();
+    fs::create_dir_all(&include_dir).unwrap();
+    fs::create_dir_all(&tcc_lib_dir).unwrap();
+    fs::create_dir_all(&tcc_include_dir).unwrap();
 
-    // Copy runtime libraries
-    fs::copy(out_dir.join("libakuma_libc.a"), lib_dest_dir.join("libc.a")).unwrap();
+    fs::copy(out_dir.join("libakuma_libc.a"), lib_dir.join("libc.a")).unwrap();
+    fs::copy(out_dir.join("libtcc1.a"), tcc_lib_dir.join("libtcc1.a")).unwrap();
     
-    // TCC expects .o files for crt1, crti, crtn
-    // The cc crate creates libNAME.a which contains NAME.o
-    // We'll extract or rename them. Actually, TCC can sometimes handle .a if we are lucky,
-    // but better to give it what it wants.
-    // For now, let's try to find the .o files in out_dir.
-    
-    // Helper to find and copy .o file
     let find_and_copy_o = |name: &str, dest: &Path| {
-        // cc-rs usually names them like "UUID-name.o"
         for entry in fs::read_dir(&out_dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -127,26 +137,24 @@ fn main() {
                 }
             }
         }
-        // Fallback: copy the .a as .o (might work if TCC is flexible)
         fs::copy(out_dir.join(format!("lib{}.a", name)), dest).unwrap();
     };
 
-    find_and_copy_o("crt1", &lib_dest_dir.join("crt1.o"));
-    find_and_copy_o("crti", &lib_dest_dir.join("crti.o"));
-    find_and_copy_o("crtn", &lib_dest_dir.join("crtn.o"));
+    find_and_copy_o("crt1", &tcc_lib_dir.join("crt1.o"));
+    find_and_copy_o("crti", &tcc_lib_dir.join("crti.o"));
+    find_and_copy_o("crtn", &tcc_lib_dir.join("crtn.o"));
     
-    // Copy headers from userspace/tcc/include
-    copy_dir_recursive(Path::new("include"), &include_dest_dir).unwrap();
+    copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
+    copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
 
     // 4. Create the archive
     let archive_name = "libc.tar";
     let archive_path = out_dir.join(archive_name);
 
-    // Use specific flags to avoid macOS metadata and extended headers
     let status = Command::new("tar")
-        .env("COPYFILE_DISABLE", "1") // Disable macOS metadata
-        .arg("--no-xattrs")           // No extended attributes
-        .arg("--format=ustar")        // Use standard ustar format
+        .env("COPYFILE_DISABLE", "1")
+        .arg("--no-xattrs")
+        .arg("--format=ustar")
         .arg("-cf")
         .arg(&archive_path)
         .arg("-C")

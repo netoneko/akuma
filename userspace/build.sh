@@ -32,11 +32,11 @@ for member in "${MEMBERS[@]}"; do
     cargo build --release -p "$member"
     # Special handling for tcc to copy its sysroot archive
     if [ "$member" == "tcc" ]; then
-        LIBC_ARCHIVE="tcc/dist/libc.tar.gz"
+        LIBC_ARCHIVE="tcc/dist/libc.tar"
         if [ -f "$LIBC_ARCHIVE" ]; then
             mkdir -p ../bootstrap/archives/
-            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar.gz
-            echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar.gz"
+            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar
+            echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
         else
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
         fi
@@ -80,7 +80,7 @@ for bin in "${BINARIES[@]}"; do
         if [ "$bin" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
             cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
 	elif [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/cc" ]; then
-            cp "target/aarch64-unknown-none/release/tcc" ../bootstrap/bin/
+            cp "target/aarch64-unknown-none/release/cc" ../bootstrap/bin/tcc
         else
             echo "Warning: Binary $bin not found at $SRC"
         fi
