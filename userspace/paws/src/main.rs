@@ -393,27 +393,33 @@ fn cmd_pkg(args: &[String]) {
         }
 
         // 2. Fallback to downloading as an archive
-        let archive_url = format!("http://{}/archives/{}.tar.gz", server, package);
-        let archive_dest = format!("/tmp/{}.tar.gz", package);
+        let archive_url_gz = format!("http://{}/archives/{}.tar.gz", server, package);
+        let archive_dest_gz = format!("/tmp/{}.tar.gz", package);
+        let archive_url_raw = format!("http://{}/archives/{}.tar", server, package);
+        let archive_dest_raw = format!("/tmp/{}.tar", package);
         
-        println(format!("Binary not found, trying archive from {}...", archive_url).as_str());
-        if download_file(&archive_url, &archive_dest) == 0 {
-            println(format!("Extracting {}.tar.gz to /...", package).as_str());
-            let tar_args = [
-                String::from("tar"),
-                String::from("-xzvf"),
-                archive_dest.clone(),
-                String::from("-C"),
-                String::from("/")
-            ];
-            if execute_external_with_status(&tar_args) == 0 {
-                println("Successfully extracted archive.");
-            } else {
-                println("Failed to extract archive.");
-            }
-            let _ = unlink(&archive_dest);
+        let (_archive_url, archive_dest, is_gz) = if download_file(&archive_url_gz, &archive_dest_gz) == 0 {
+            (archive_url_gz, archive_dest_gz, true)
+        } else if download_file(&archive_url_raw, &archive_dest_raw) == 0 {
+            (archive_url_raw, archive_dest_raw, false)
         } else {
             println(format!("Failed to find package {} as binary or archive.", package).as_str());
+            continue;
+        };
+
+        println(format!("Extracting {} to /...", archive_dest).as_str());
+        let mut tar_args = Vec::new();
+        tar_args.push(String::from("tar"));
+        tar_args.push(String::from(if is_gz { "-xzvf" } else { "-xvf" }));
+        tar_args.push(archive_dest.clone());
+        tar_args.push(String::from("-C"));
+        tar_args.push(String::from("/"));
+
+        if execute_external_with_status(&tar_args) == 0 {
+            println("Successfully extracted archive.");
+            let _ = unlink(&archive_dest);
+        } else {
+            println("Failed to extract archive.");
         }
     }
 }
@@ -553,7 +559,14 @@ fn download_file(url: &str, dest_path: &str) -> i32 {
         match stream.read(&mut buf) {
             Ok(0) => break, // EOF
             Ok(n) => {
-                write_fd(fd, &buf[..n]);
+                let res = write_fd(fd, &buf[..n]);
+                if res < 0 {
+                    print("paws: failed to write to destination file: ");
+                    print_dec((-res) as usize);
+                    println("");
+                    close(fd);
+                    return -1;
+                }
                 total_downloaded += n;
             }
             Err(e) => {
@@ -572,6 +585,16 @@ fn download_file(url: &str, dest_path: &str) -> i32 {
     print("paws: received ");
     print_dec(total_downloaded);
     println(" bytes");
+
+    // Verify file exists and has data before returning
+    let verify_fd = open(dest_path, open_flags::O_RDONLY);
+    if verify_fd < 0 {
+        print("paws: verify failed - file not found after closing: ");
+        print_dec((-verify_fd) as usize);
+        println("");
+        return -1;
+    }
+    close(verify_fd);
 
     0
 }
@@ -715,7 +738,13 @@ fn execute_external_with_status(args: &[String]) -> i32 {
     println("");
 
     if let Some(res) = spawn(&path, Some(&arg_refs)) {
-        return stream_output(res.stdout_fd, res.pid);
+        let status = stream_output(res.stdout_fd, res.pid);
+        print("paws: process ");
+        print(&path);
+        print(" exited with status ");
+        print_dec(status as usize);
+        println("");
+        return status;
     } else {
         print("paws: command not found: ");
         println(&args[0]);

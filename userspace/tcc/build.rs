@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/setjmp.S");
     println!("cargo:rerun-if-changed=src/config.h");
     println!("cargo:rerun-if-changed=lib/crt0.S");
+    println!("cargo:rerun-if-changed=lib/crti.S");
+    println!("cargo:rerun-if-changed=lib/crtn.S");
     println!("cargo:rerun-if-changed=lib/libc.c");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -52,9 +54,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=tcc_all_objs");
 
     // 2. Build runtime objects for the sysroot
-    // We compile crt0.o and libc.o separately
     
-    // libc.o
+    // libc.a
     cc::Build::new()
         .file("lib/libc.c")
         .flag("-ffreestanding")
@@ -65,21 +66,37 @@ fn main() {
         .host(&env::var("HOST").unwrap())
         .opt_level(3)
         .out_dir(&out_dir)
-        .compile("akuma_libc"); // This creates libakuma_libc.a
+        .compile("akuma_libc");
 
-    // For crt0.o, we might need a direct command if we want exactly crt0.o
-    // But we can also use cc crate to build it.
+    // crt1.o (from crt0.S)
     cc::Build::new()
         .file("lib/crt0.S")
         .target(&target)
         .host(&env::var("HOST").unwrap())
         .out_dir(&out_dir)
-        .compile("crt0"); // This creates libcrt0.a
+        .compile("crt1");
+
+    // crti.o
+    cc::Build::new()
+        .file("lib/crti.S")
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .out_dir(&out_dir)
+        .compile("crti");
+
+    // crtn.o
+    cc::Build::new()
+        .file("lib/crtn.S")
+        .target(&target)
+        .host(&env::var("HOST").unwrap())
+        .out_dir(&out_dir)
+        .compile("crtn");
 
     // 3. Stage the sysroot
     let staging_dir = out_dir.join("sysroot_staging");
-    let lib_dest_dir = staging_dir.join("lib");
-    let include_dest_dir = staging_dir.join("include");
+    let usr_dir = staging_dir.join("usr");
+    let lib_dest_dir = usr_dir.join("lib");
+    let include_dest_dir = usr_dir.join("include");
 
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir).unwrap();
@@ -88,29 +105,53 @@ fn main() {
     fs::create_dir_all(&include_dest_dir).unwrap();
 
     // Copy runtime libraries
-    // We rename them to standard names if needed, or just copy the .a files
     fs::copy(out_dir.join("libakuma_libc.a"), lib_dest_dir.join("libc.a")).unwrap();
-    fs::copy(out_dir.join("libcrt0.a"), lib_dest_dir.join("crt0.a")).unwrap();
     
-    // Also copy as .o if TCC prefers that (it often does for crt0)
-    // The cc crate keeps the .o files in the out_dir
-    // Finding them might be tricky, let's just use the .a for now or try to find them.
-    // Actually, let's just copy the .a as .o if we really want to be sure.
-    // TCC can link .a files.
+    // TCC expects .o files for crt1, crti, crtn
+    // The cc crate creates libNAME.a which contains NAME.o
+    // We'll extract or rename them. Actually, TCC can sometimes handle .a if we are lucky,
+    // but better to give it what it wants.
+    // For now, let's try to find the .o files in out_dir.
+    
+    // Helper to find and copy .o file
+    let find_and_copy_o = |name: &str, dest: &Path| {
+        // cc-rs usually names them like "UUID-name.o"
+        for entry in fs::read_dir(&out_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "o") {
+                let file_name = path.file_name().unwrap().to_str().unwrap();
+                if file_name.ends_with(&format!("{}.o", name)) {
+                    fs::copy(&path, dest).unwrap();
+                    return;
+                }
+            }
+        }
+        // Fallback: copy the .a as .o (might work if TCC is flexible)
+        fs::copy(out_dir.join(format!("lib{}.a", name)), dest).unwrap();
+    };
+
+    find_and_copy_o("crt1", &lib_dest_dir.join("crt1.o"));
+    find_and_copy_o("crti", &lib_dest_dir.join("crti.o"));
+    find_and_copy_o("crtn", &lib_dest_dir.join("crtn.o"));
     
     // Copy headers from userspace/tcc/include
     copy_dir_recursive(Path::new("include"), &include_dest_dir).unwrap();
 
     // 4. Create the archive
-    let archive_name = "libc.tar.gz";
+    let archive_name = "libc.tar";
     let archive_path = out_dir.join(archive_name);
 
+    // Use specific flags to avoid macOS metadata and extended headers
     let status = Command::new("tar")
-        .arg("-czf")
+        .env("COPYFILE_DISABLE", "1") // Disable macOS metadata
+        .arg("--no-xattrs")           // No extended attributes
+        .arg("--format=ustar")        // Use standard ustar format
+        .arg("-cf")
         .arg(&archive_path)
         .arg("-C")
         .arg(&staging_dir)
-        .arg(".")
+        .arg("usr")
         .status()
         .expect("Failed to execute tar");
 
@@ -122,9 +163,9 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let dist_dir = manifest_dir.join("dist");
     fs::create_dir_all(&dist_dir).unwrap();
-    fs::copy(&archive_path, dist_dir.join(archive_name)).unwrap();
+    fs::copy(&archive_path, dist_dir.join("libc.tar")).unwrap();
 
-    println!("cargo:warning=libc archive created at {}", dist_dir.join(archive_name).display());
+    println!("cargo:warning=libc archive created at {}", dist_dir.join("libc.tar").display());
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
