@@ -139,6 +139,25 @@ pub extern "C" fn _start() -> ! {
         }
 
         let argc = (argv_ptrs.len() - 1) as c_int;
+
+        // Debug: check libraries to be sure
+        if actual_args.iter().any(|&a| a == "-vv") {
+            let paths = ["/usr/lib/libc.a", "/usr/lib/tcc/libc.a", "/usr/lib/tcc/crt1.o"];
+            for path in paths {
+                let fd = libakuma::open(path, libakuma::open_flags::O_RDONLY);
+                if fd >= 0 {
+                    let mut stat = libakuma::Stat::default();
+                    if libakuma::fstat(fd).is_ok() {
+                        stat = libakuma::fstat(fd).unwrap();
+                    }
+                    libakuma::println(&alloc::format!("tcc: debug: found {} ({} bytes)", path, stat.st_size));
+                    libakuma::close(fd);
+                } else {
+                    libakuma::println(&alloc::format!("tcc: debug: {} NOT FOUND ({})", path, fd));
+                }
+            }
+        }
+
         let ret = tcc_main(argc, argv_ptrs.as_ptr());
         akuma_exit(ret); // Use akuma_exit here
     }
