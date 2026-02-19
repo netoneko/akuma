@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
-    pub const EXIT: u64 = 0;
-    pub const READ: u64 = 1;
-    pub const WRITE: u64 = 2;
-    pub const BRK: u64 = 3;
+    pub const EXIT: u64 = 93;
+    pub const READ: u64 = 63;
+    pub const WRITE: u64 = 64;
+    pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const LSEEK: u64 = 62;
@@ -29,18 +29,17 @@ pub mod nr {
     pub const RECVFROM: u64 = 207;
     pub const SHUTDOWN: u64 = 210;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
-    pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
+    pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
-    pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
     pub const CHDIR: u64 = 306;       // Change current working directory
     // Terminal Syscalls (307-313)
@@ -56,6 +55,7 @@ pub mod nr {
     pub const REGISTER_BOX: u64 = 316;
     pub const KILL_BOX: u64 = 317;
     pub const REATTACH: u64 = 318;
+    pub const UPTIME: u64 = 319;
 }
 
 /// Thread CPU statistics for top command

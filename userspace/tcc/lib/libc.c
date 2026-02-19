@@ -26,12 +26,12 @@ static inline long syscall(long num, long a0, long a1, long a2, long a3, long a4
 
 __attribute__((visibility("default")))
 void exit(int status) {
-    syscall(0, status, 0, 0, 0, 0, 0);
+    syscall(93, status, 0, 0, 0, 0, 0);
     while (1) {}
 }
 
 long write(int fd, const void *buf, size_t count) {
-    return syscall(2, fd, (long)buf, count, 0, 0, 0);
+    return syscall(64, fd, (long)buf, count, 0, 0, 0);
 }
 
 void __arm64_clear_cache(void *beg, void *end) {
