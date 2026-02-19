@@ -557,15 +557,6 @@ pub unsafe extern "C" fn exit(status: c_int) -> ! {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn time(tloc: *mut TimeT) -> TimeT {
-    let t = (libakuma::time() / 1_000_000) as TimeT; // Akuma returns microseconds, C time() expects seconds
-    if !tloc.is_null() {
-        *tloc = t;
-    }
-    t
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
     ptr::null_mut() // No environment variables supported yet
 }
@@ -699,16 +690,12 @@ pub unsafe extern "C" fn strtoull(nptr: *const c_char, endptr: *mut *mut c_char,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn atoi(nptr: *const c_char) -> c_int {
-    strtol(nptr, ptr::null_mut(), 10) as c_int
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn __clear_cache(_beg: *mut c_void, _end: *mut c_void) {
-    // AArch64 cache invalidation (simplified, might need more for correctness)
-    // For now, a no-op should be fine.
-    // asm volatile ("dsb sy" ::: "memory"); // Data synchronization barrier
-    // asm volatile ("isb sy" ::: "memory"); // Instruction synchronization barrier
+pub unsafe extern "C" fn time(tloc: *mut i64) -> i64 {
+    let t = (libakuma::time() / 1_000_000) as i64;
+    if !tloc.is_null() {
+        *tloc = t;
+    }
+    t
 }
 
 // ============================================================================

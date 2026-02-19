@@ -659,7 +659,6 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
             if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; } }
-            crate::process::remove_child_channel(pid);
             return pid as u64;
         }
     }

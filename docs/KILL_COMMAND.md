@@ -55,7 +55,7 @@ The `kill_process(pid)` function in `src/process.rs` performs the following step
 
 2. **Yield to Blocked Thread**: Gives the blocked syscall a chance to detect the interrupt and abort its resources (e.g., abort TcpSocket to release port binding).
 
-3. **Socket Cleanup**: Closes all sockets in the process's file descriptor table via `cleanup_process_sockets()`.
+3. **FD Cleanup**: Closes all sockets and child channels in the process's file descriptor table via `cleanup_process_fds()`.
 
 4. **Mark Process State**: Sets `exited = true`, `exit_code = 137`, and `state = Zombie(137)`.
 

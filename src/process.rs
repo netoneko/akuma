@@ -1733,40 +1733,30 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 
 /// Clean up all file descriptors owned by a process
 fn cleanup_process_fds(proc: &Process) {
-    // 1. Clean up sockets (needs special handling for smoltcp)
-    cleanup_process_sockets(proc);
+    // 1. Collect all special FDs that need manual cleanup
+    let fds: alloc::vec::Vec<FileDescriptor> = {
+        let table = proc.fd_table.lock();
+        table.values().cloned().collect()
+    };
     
-    // 2. Clear the FD table. 
+    // 2. Perform manual cleanup for special FDs
+    for fd in fds {
+        match fd {
+            FileDescriptor::Socket(idx) => {
+                crate::socket::remove_socket(idx);
+            }
+            FileDescriptor::ChildStdout(child_pid) => {
+                crate::process::remove_child_channel(child_pid);
+            }
+            _ => {}
+        }
+    }
+    
+    // 3. Clear the FD table. 
     // This will drop KernelFile and other descriptors, 
     // which in turn will call their respective cleanup logic (like VFS close).
     let mut table = proc.fd_table.lock();
     table.clear();
-}
-
-/// Clean up all sockets owned by a process
-///
-/// Called during process exit to close all open sockets and free resources.
-/// This prevents socket/buffer leaks when processes exit without properly closing their sockets.
-fn cleanup_process_sockets(proc: &Process) {
-    // Get all socket FDs from the process's fd_table
-    let socket_fds: alloc::vec::Vec<(u32, usize)> = {
-        let table = proc.fd_table.lock();
-        table.iter()
-            .filter_map(|(&fd, desc)| {
-                if let FileDescriptor::Socket(idx) = desc {
-                    Some((fd, *idx))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-    
-    // Close each socket
-    for (_fd, socket_idx) in socket_fds {
-        // remove_socket handles smoltcp socket removal
-        crate::socket::remove_socket(socket_idx);
-    }
 }
 
 /// Kill a process by PID
@@ -1804,10 +1794,10 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
         crate::threading::yield_now();
     }
     
-    // Clean up all open sockets for this process
+    // Clean up all open FDs for this process
     // Note: This cleans up sockets in the fd_table, but sockets created inside
     // syscalls (like the TcpSocket in accept()) are handled by the interrupt mechanism.
-    cleanup_process_sockets(proc);
+    cleanup_process_fds(proc);
     
     // Mark process as killed (using signal 9 = SIGKILL)
     proc.exited = true;

@@ -3,6 +3,10 @@
 #include "stdio.h"
 #include "ctype.h" // For isdigit, isalpha etc.
 
+/* Forward declarations */
+long strtol(const char *nptr, char **endptr, int base);
+unsigned long strtoul(const char *nptr, char **endptr, int base);
+
 /* errno global */
 int errno = 0;
 
@@ -453,3 +457,16 @@ void *dlopen(const char *filename, int flag) { return NULL; }
 char *dlerror(void) { return "Dynamic loading not supported"; }
 void *dlsym(void *handle, const char *symbol) { return NULL; }
 int dlclose(void *handle) { return 0; }
+
+int atoi(const char *nptr) {
+    return (int)strtol(nptr, NULL, 10);
+}
+
+void __arm64_clear_cache(void *beg, void *end) {
+    // Dummy implementation for Akuma OS
+}
+
+void __clear_cache(void *beg, void *end) {
+    // AArch64 cache invalidation (simplified, might need more for correctness)
+    // For now, a no-op should be fine.
+}

@@ -76,7 +76,7 @@ fn main() {
 
     // 2. Build TCC runtime objects
     run_cc("tinycc/lib/libtcc1.c", "libtcc1_base.o", &["-I", "tinycc", "-I", "tinycc/include", "-I", musl_dist.join("include").to_str().unwrap()]);
-    run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "tinycc/include", "-I", musl_dist.join("include").to_str().unwrap()]);
+    run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-D__arm64_clear_cache=__clear_cache", "-I", "tinycc", "-I", "tinycc/include", "-I", musl_dist.join("include").to_str().unwrap()]);
 
     // Create archives manually
     let find_tool = |name: &str| {
