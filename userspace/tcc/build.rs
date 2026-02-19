@@ -98,6 +98,9 @@ fn main() {
     let ranlib_bin_clone = ranlib_bin.clone();
     let run_ar = move |archive: &Path, objs: &[&Path]| {
         let mut cmd = Command::new(&ar_bin_clone);
+        if ar_bin_clone.contains("llvm-ar") {
+            cmd.arg("--format=gnu");
+        }
         cmd.arg("rcs").arg(archive);
         for obj in objs {
             cmd.arg(obj);
