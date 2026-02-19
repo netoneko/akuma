@@ -25,7 +25,6 @@ fn main() {
         .define("ONE_SOURCE", "1")
         .define("CONFIG_TCC_STATIC", "1")
         .define("CONFIG_TCC_SEMLOCK", "0")
-        .define("CONFIG_TCCDIR", "\"/usr/lib/tcc\"")
         .define("time_t", "long long")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
@@ -56,7 +55,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=tcc_all_objs");
 
     // 2. Build runtime objects for the sysroot
-    let compiler = build.get_compiler();
+    // Use a fresh Build object to avoid flag leakage (like -Dmain=tcc_main)
+    let mut sysroot_build = cc::Build::new();
+    sysroot_build.target(&target).host(&host);
+    let compiler = sysroot_build.get_compiler();
     
     let run_cc = |src: &str, obj: &str, extra_args: &[&str]| {
         let mut cmd = compiler.to_command();
@@ -114,6 +116,9 @@ fn main() {
     fs::copy(out_dir.join("crti.o"), tcc_lib_dir.join("crti.o")).unwrap();
     fs::copy(out_dir.join("crtn.o"), tcc_lib_dir.join("crtn.o")).unwrap();
     
+    // Also copy a duplicate of libc.a into tcc lib dir just in case
+    fs::copy(out_dir.join("libc.a"), tcc_lib_dir.join("libc.a")).unwrap();
+
     copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
     copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
 
