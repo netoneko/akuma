@@ -6,7 +6,7 @@
 #define CONFIG_TCC_CRTPREFIX "/usr/lib"
 #define CONFIG_LDDIR "lib"
 #define CONFIG_TCC_SYSINCLUDEPATHS "/usr/lib/tcc/include:/usr/include"
-#define CONFIG_TCC_LIBPATHS "/usr/lib"
+#define CONFIG_TCC_LIBPATHS "/usr/lib:/usr/lib/tcc"
 #define CONFIG_TCC_ELFINTERP ""
 #define CONFIG_TCC_M32 0
 #define CONFIG_TCC_BCHECK 0

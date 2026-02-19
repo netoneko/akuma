@@ -80,6 +80,7 @@ fn main() {
 
     // Create archives manually
     let ar_bin = "ar";
+    let ranlib_bin = "ranlib";
     let run_ar = |archive: &Path, objs: &[&Path]| {
         let mut cmd = Command::new(ar_bin);
         cmd.arg("rcs").arg(archive);
@@ -89,6 +90,13 @@ fn main() {
         let status = cmd.status().expect("Failed to run ar");
         if !status.success() {
             panic!("ar failed for archive: {:?}", archive);
+        }
+
+        let mut cmd = Command::new(ranlib_bin);
+        cmd.arg(archive);
+        let status = cmd.status().expect("Failed to run ranlib");
+        if !status.success() {
+            panic!("ranlib failed for archive: {:?}", archive);
         }
     };
 

@@ -196,10 +196,9 @@ fn install_tcc_runtime() {
 
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
-    if size == 0 {
-        return ptr::null_mut();
-    }
-    let layout = match Layout::from_size_align(size + 8, 8) {
+    // Ensure size + 8 is a multiple of 8 for Layout
+    let alloc_size = (size + 8 + 7) & !7;
+    let layout = match Layout::from_size_align(alloc_size, 8) {
         Ok(l) => l,
         Err(_) => return ptr::null_mut(),
     };
@@ -207,7 +206,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     if ptr.is_null() {
         return ptr::null_mut();
     }
-    *(ptr as *mut usize) = size;
+    *(ptr as *mut usize) = alloc_size;
     ptr.add(8) as *mut c_void
 }
 
@@ -217,8 +216,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
         return;
     }
     let real_ptr = (ptr as *mut u8).sub(8);
-    let size = *(real_ptr as *const usize);
-    let layout = match Layout::from_size_align(size + 8, 8) {
+    let alloc_size = *(real_ptr as *const usize);
+    let layout = match Layout::from_size_align(alloc_size, 8) {
         Ok(l) => l,
         Err(_) => return,
     };
@@ -230,25 +229,22 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
     if ptr.is_null() {
         return malloc(new_size);
     }
-    if new_size == 0 {
-        free(ptr);
-        return ptr::null_mut();
-    }
     
     let real_ptr = (ptr as *mut u8).sub(8);
-    let old_size = *(real_ptr as *const usize);
+    let old_alloc_size = *(real_ptr as *const usize);
     
-    let old_layout = match Layout::from_size_align(old_size + 8, 8) {
+    let old_layout = match Layout::from_size_align(old_alloc_size, 8) {
         Ok(l) => l,
         Err(_) => return ptr::null_mut(),
     };
     
-    let new_ptr = alloc::alloc::realloc(real_ptr, old_layout, new_size + 8);
+    let new_alloc_size = (new_size + 8 + 7) & !7;
+    let new_ptr = alloc::alloc::realloc(real_ptr, old_layout, new_alloc_size);
     if new_ptr.is_null() {
         return ptr::null_mut();
     }
     
-    *(new_ptr as *mut usize) = new_size;
+    *(new_ptr as *mut usize) = new_alloc_size;
     new_ptr.add(8) as *mut c_void
 }
 

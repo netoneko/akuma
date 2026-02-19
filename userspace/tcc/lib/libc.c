@@ -37,12 +37,55 @@ int printf(const char *format, ...) {
     va_list ap;
     va_start(ap, format);
     while (*format) {
-        if (*format == '%' && *(format + 1) == 's') {
-            char *s = va_arg(ap, char*);
-            size_t len = 0;
-            while (s[len]) len++;
-            write(1, s, len);
-            format += 2;
+        if (*format == '%') {
+            format++;
+            if (*format == 's') {
+                char *s = va_arg(ap, char*);
+                if (!s) s = "(null)";
+                size_t len = 0;
+                while (s[len]) len++;
+                write(1, s, len);
+            } else if (*format == 'd' || *format == 'i') {
+                int val = va_arg(ap, int);
+                if (val < 0) {
+                    write(1, "-", 1);
+                    val = -val;
+                }
+                char buf[12];
+                int i = 0;
+                if (val == 0) buf[i++] = '0';
+                else {
+                    while (val > 0) {
+                        buf[i++] = (val % 10) + '0';
+                        val /= 10;
+                    }
+                }
+                while (i > 0) write(1, &buf[--i], 1);
+            } else if (*format == 'x' || *format == 'p') {
+                unsigned long val;
+                if (*format == 'p') {
+                    val = (unsigned long)va_arg(ap, void*);
+                    write(1, "0x", 2);
+                } else {
+                    val = (unsigned int)va_arg(ap, unsigned int);
+                }
+                char buf[16];
+                int i = 0;
+                if (val == 0) buf[i++] = '0';
+                else {
+                    while (val > 0) {
+                        int digit = val % 16;
+                        buf[i++] = digit < 10 ? digit + '0' : digit - 10 + 'a';
+                        val /= 16;
+                    }
+                }
+                while (i > 0) write(1, &buf[--i], 1);
+            } else if (*format == '%') {
+                write(1, "%", 1);
+            } else {
+                write(1, "?", 1);
+            }
+            format++;
         } else {
             write(1, format, 1);
             format++;

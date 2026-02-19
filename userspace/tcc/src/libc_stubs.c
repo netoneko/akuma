@@ -192,7 +192,7 @@ int isalnum(int c) { return isalpha(c) || isdigit(c); }
 
 /* Printf family */
 
-/* Helper for vsnprintf - copied from sqlite_stubs.c */
+/* Helper for vsnprintf - improved to handle width and precision */
 int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
     char *out = str;
     char *end = str + size - 1;
@@ -205,52 +205,130 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
         }
         format++;
         
+        // Handle flags
         int width = 0;
+        int precision = -1;
         int zero_pad = 0;
+        int left_justify = 0;
+        
+        if (*format == '-') { left_justify = 1; format++; }
         if (*format == '0') { zero_pad = 1; format++; }
-        while (isdigit(*format)) { width = width * 10 + (*format - '0'); format++; }
+        
+        // Width
+        if (*format == '*') {
+            width = va_arg(ap, int);
+            format++;
+        } else {
+            while (isdigit(*format)) { width = width * 10 + (*format - '0'); format++; }
+        }
+        
+        // Precision
+        if (*format == '.') {
+            format++;
+            if (*format == '*') {
+                precision = va_arg(ap, int);
+                format++;
+            } else {
+                precision = 0;
+                while (isdigit(*format)) { precision = precision * 10 + (*format - '0'); format++; }
+            }
+        }
         
         int is_long = 0;
-        if (*format == 'l') { is_long = 1; format++; if (*format == 'l') format++; }
+        int is_longlong = 0;
+        if (*format == 'l') { 
+            is_long = 1; format++; 
+            if (*format == 'l') { is_longlong = 1; format++; } 
+        } else if (*format == 'z') {
+            is_long = (sizeof(size_t) == sizeof(long));
+            is_longlong = (sizeof(size_t) == sizeof(long long));
+            format++;
+        }
         
         switch (*format) {
             case 's': {
                 const char *s = va_arg(ap, const char *);
                 if (!s) s = "(null)";
-                while (*s && out < end) *out++ = *s++;
+                int len = 0;
+                while (s[len] && (precision < 0 || len < precision)) len++;
+                
+                int pad = width - len;
+                if (!left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = ' ';
+                }
+                while (*s && (precision < 0 || precision-- > 0) && out < end) *out++ = *s++;
+                if (left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = ' ';
+                }
                 break;
             }
             case 'd':
             case 'i': {
-                long val = is_long ? va_arg(ap, long) : va_arg(ap, int);
-                char buf[32];
+                long long val;
+                if (is_longlong) val = va_arg(ap, long long);
+                else if (is_long) val = va_arg(ap, long);
+                else val = va_arg(ap, int);
+                
+                char buf[64];
                 int neg = val < 0;
-                if (neg) val = -val;
+                unsigned long long uval = neg ? -val : val;
                 int i = 0;
-                do { buf[i++] = '0' + (val % 10); val /= 10; } while (val);
+                do { buf[i++] = '0' + (uval % 10); uval /= 10; } while (uval);
                 if (neg) buf[i++] = '-';
-                while (i < width) buf[i++] = zero_pad ? '0' : ' ';
+                
+                int pad = width - i;
+                if (!left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = zero_pad ? '0' : ' ';
+                }
                 while (i > 0 && out < end) *out++ = buf[--i];
+                if (left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = ' ';
+                }
                 break;
             }
+            case 'u':
             case 'x': 
+            case 'X':
             case 'p': {
-                unsigned long val = is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
-                if (*format == 'p') { val = (unsigned long)va_arg(ap, void*); }
-                char buf[32];
+                unsigned long long val;
+                const char *hex = (*format == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                int base = (*format == 'u') ? 10 : 16;
+                
+                if (*format == 'p') {
+                    val = (unsigned long long)va_arg(ap, void*);
+                    if (out < end) *out++ = '0';
+                    if (out < end) *out++ = 'x';
+                    width -= 2;
+                } else {
+                    if (is_longlong) val = va_arg(ap, unsigned long long);
+                    else if (is_long) val = va_arg(ap, unsigned long);
+                    else val = va_arg(ap, unsigned int);
+                }
+                
+                char buf[64];
                 int i = 0;
                 do { 
-                    int d = val & 0xF;
-                    buf[i++] = (d < 10) ? ('0' + d) : ('a' + d - 10);
-                    val >>= 4; 
+                    buf[i++] = hex[val % base];
+                    val /= base; 
                 } while (val);
-                while (i < width) buf[i++] = zero_pad ? '0' : ' ';
+                
+                int pad = width - i;
+                if (!left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = zero_pad ? '0' : ' ';
+                }
                 while (i > 0 && out < end) *out++ = buf[--i];
+                if (left_justify) {
+                    while (pad-- > 0 && out < end) *out++ = ' ';
+                }
                 break;
             }
             case 'c': {
                 char c = (char)va_arg(ap, int);
                 if (out < end) *out++ = c;
+                break;
+            }
+            case '%': {
+                if (out < end) *out++ = '%';
                 break;
             }
             default:
@@ -303,6 +381,20 @@ int printf(const char *format, ...) {
     int ret = vfprintf(stdout, format, ap);
     va_end(ap);
     return ret;
+}
+
+int vprintf(const char *format, va_list ap) {
+    return vfprintf(stdout, format, ap);
+}
+
+int puts(const char *s) {
+    int ret = fprintf(stdout, "%s\n", s);
+    return ret >= 0 ? 0 : -1;
+}
+
+void abort(void) {
+    printf("abort() called\n");
+    while(1);
 }
 
 int system(const char *command) {
