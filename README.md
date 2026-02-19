@@ -60,6 +60,7 @@ You can probably run it with Docker: [docs/DOCKER.md](docs/DOCKER.md)
 | **Networking** | smoltcp TCP/IP stack, VirtIO-net driver, Embassy async |
 | **Memory** | Talc allocator with 120MB heap, IRQ-safe allocation |
 | **Hardware** | GICv2 interrupts, PL011 UART, PL031 RTC, ARM Generic Timer |
+| **Standard C** | Full `musl` libc integration, self-hosted `tcc` compiler |
 
 ## Quick Start
 
