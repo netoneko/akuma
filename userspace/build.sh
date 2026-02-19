@@ -23,6 +23,7 @@ MEMBERS=(
     "cat"
     "box"
     "paws"
+    "musl"
     "tcc"
     "tar"
 )
@@ -30,6 +31,15 @@ MEMBERS=(
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
     cargo build --release -p "$member"
+    # Special handling for musl to copy its sysroot archive
+    if [ "$member" == "musl" ]; then
+        MUSL_ARCHIVE="musl/dist/musl.tar"
+        if [ -f "$MUSL_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$MUSL_ARCHIVE" ../bootstrap/archives/musl.tar
+            echo "Copied $MUSL_ARCHIVE to ../bootstrap/archives/musl.tar"
+        fi
+    fi
     # Special handling for tcc to copy its sysroot archive
     if [ "$member" == "tcc" ]; then
         LIBC_ARCHIVE="tcc/dist/libc.tar"
