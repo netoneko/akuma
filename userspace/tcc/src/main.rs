@@ -142,14 +142,12 @@ pub extern "C" fn _start() -> ! {
 
         // Debug: check libraries to be sure
         if actual_args.iter().any(|&a| a == "-vv") {
-            let paths = ["/usr/lib/libc.a", "/usr/lib/tcc/libc.a", "/usr/lib/tcc/crt1.o"];
+            let paths = ["/usr/lib/libc.a", "/usr/lib/crt1.o", "/usr/lib/tcc/libtcc1.a"];
             for path in paths {
                 let fd = libakuma::open(path, libakuma::open_flags::O_RDONLY);
                 if fd >= 0 {
                     let mut stat = libakuma::Stat::default();
-                    if libakuma::fstat(fd).is_ok() {
-                        stat = libakuma::fstat(fd).unwrap();
-                    }
+                    if let Ok(s) = libakuma::fstat(fd) { stat = s; }
                     libakuma::println(&alloc::format!("tcc: debug: found {} ({} bytes)", path, stat.st_size));
                     libakuma::close(fd);
                 } else {
@@ -272,11 +270,13 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
 pub unsafe extern "C" fn open(pathname: *const c_char, flags: c_int, _mode: c_int) -> c_int {
     let path = cstr_to_str(pathname);
     let fd = akuma_open(path, flags as u32);
-    if fd < 0 {
-        // Only print if not trying to find something that might not exist (optional headers)
-        // or if it's a crt object which we KNOW should exist.
-        if path.contains("crt") || path.contains("tccdefs.h") || path.contains("libc.a") {
-            libakuma::eprintln(&alloc::format!("tcc: open('{}', flags={}) failed: {}", path, flags, fd));
+    
+    // Log library and object file access to help debug search paths and linking
+    if path.contains("crt") || path.contains(".a") || path.contains(".o") {
+        if fd >= 0 {
+            libakuma::println(&alloc::format!("tcc: open('{}') -> SUCCESS (fd={})", path, fd));
+        } else {
+            libakuma::eprintln(&alloc::format!("tcc: open('{}') -> FAILED ({})", path, fd));
         }
     }
     fd

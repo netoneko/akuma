@@ -44,7 +44,7 @@ fn main() {
     build.opt_level(opt_level_num)
         .out_dir(&out_dir);
 
-    // Apply -Dmain=tcc_main only to files that define the compiler's main
+    // Apply -Dmain=tcc_main only to compiler sources
     build
         .file("tinycc/tcc.c")
         .file("src/libc_stubs.c")
@@ -113,15 +113,12 @@ fn main() {
 
     // Standard location for libraries
     fs::copy(out_dir.join("libc.a"), lib_dir.join("libc.a")).unwrap();
+    fs::copy(out_dir.join("crt1.o"), lib_dir.join("crt1.o")).unwrap();
+    fs::copy(out_dir.join("crti.o"), lib_dir.join("crti.o")).unwrap();
+    fs::copy(out_dir.join("crtn.o"), lib_dir.join("crtn.o")).unwrap();
     
-    // TCC specific objects and its runtime
+    // TCC specific runtime
     fs::copy(out_dir.join("libtcc1.a"), tcc_dir.join("libtcc1.a")).unwrap();
-    fs::copy(out_dir.join("crt1.o"), tcc_dir.join("crt1.o")).unwrap();
-    fs::copy(out_dir.join("crti.o"), tcc_dir.join("crti.o")).unwrap();
-    fs::copy(out_dir.join("crtn.o"), tcc_dir.join("crtn.o")).unwrap();
-    
-    // ALSO copy libc.a to /usr/lib/tcc/ explicitly
-    fs::copy(out_dir.join("libc.a"), tcc_dir.join("libc.a")).unwrap();
 
     // Headers
     copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
