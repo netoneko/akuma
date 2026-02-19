@@ -44,6 +44,7 @@ fn main() {
     build.opt_level(opt_level_num)
         .out_dir(&out_dir);
 
+    // Apply -Dmain=tcc_main only to files that define the compiler's main
     build
         .file("tinycc/tcc.c")
         .file("src/libc_stubs.c")
@@ -55,7 +56,6 @@ fn main() {
     println!("cargo:rustc-link-lib=static=tcc_all_objs");
 
     // 2. Build runtime objects for the sysroot
-    // Use a fresh Build object to avoid flag leakage (like -Dmain=tcc_main)
     let mut sysroot_build = cc::Build::new();
     sysroot_build.target(&target).host(&host);
     let compiler = sysroot_build.get_compiler();
@@ -97,28 +97,33 @@ fn main() {
 
     // 3. Stage the sysroot
     let staging_dir = out_dir.join("sysroot_staging");
-    let lib_dir = staging_dir.join("usr/lib");
-    let include_dir = staging_dir.join("usr/include");
-    let tcc_lib_dir = lib_dir.join("tcc");
-    let tcc_include_dir = tcc_lib_dir.join("include");
-
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir).unwrap();
     }
+
+    let lib_dir = staging_dir.join("usr/lib");
+    let include_dir = staging_dir.join("usr/include");
+    let tcc_dir = staging_dir.join("usr/lib/tcc");
+    let tcc_include_dir = tcc_dir.join("include");
+
     fs::create_dir_all(&lib_dir).unwrap();
     fs::create_dir_all(&include_dir).unwrap();
-    fs::create_dir_all(&tcc_lib_dir).unwrap();
+    fs::create_dir_all(&tcc_dir).unwrap();
     fs::create_dir_all(&tcc_include_dir).unwrap();
 
+    // Standard location for libraries
     fs::copy(out_dir.join("libc.a"), lib_dir.join("libc.a")).unwrap();
-    fs::copy(out_dir.join("libtcc1.a"), tcc_lib_dir.join("libtcc1.a")).unwrap();
-    fs::copy(out_dir.join("crt1.o"), tcc_lib_dir.join("crt1.o")).unwrap();
-    fs::copy(out_dir.join("crti.o"), tcc_lib_dir.join("crti.o")).unwrap();
-    fs::copy(out_dir.join("crtn.o"), tcc_lib_dir.join("crtn.o")).unwrap();
     
-    // Also copy a duplicate of libc.a into tcc lib dir just in case
-    fs::copy(out_dir.join("libc.a"), tcc_lib_dir.join("libc.a")).unwrap();
+    // TCC specific objects and its runtime
+    fs::copy(out_dir.join("libtcc1.a"), tcc_dir.join("libtcc1.a")).unwrap();
+    fs::copy(out_dir.join("crt1.o"), tcc_dir.join("crt1.o")).unwrap();
+    fs::copy(out_dir.join("crti.o"), tcc_dir.join("crti.o")).unwrap();
+    fs::copy(out_dir.join("crtn.o"), tcc_dir.join("crtn.o")).unwrap();
+    
+    // ALSO copy libc.a to /usr/lib/tcc/ explicitly
+    fs::copy(out_dir.join("libc.a"), tcc_dir.join("libc.a")).unwrap();
 
+    // Headers
     copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
     copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
 
