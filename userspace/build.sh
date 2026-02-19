@@ -79,8 +79,8 @@ for bin in "${BINARIES[@]}"; do
         # For quickjs the bin name might be qjs
         if [ "$bin" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
             cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
-	elif [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/cc" ]; then
-            cp "target/aarch64-unknown-none/release/cc" ../bootstrap/bin/tcc
+	elif [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/tcc" ]; then
+            cp "target/aarch64-unknown-none/release/tcc" ../bootstrap/bin/tcc
         else
             echo "Warning: Binary $bin not found at $SRC"
         fi

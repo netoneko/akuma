@@ -15,7 +15,8 @@ fn main() {
     println!("cargo:rerun-if-changed=lib/libc.c");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target = env::var("TARGET").unwrap(); // e.g., aarch64-unknown-none
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
     
     // 1. Build TCC compiler itself
     let mut build = cc::Build::new();
@@ -34,7 +35,7 @@ fn main() {
         .include("src")
         .include("include")
         .target(&target)
-        .host(&env::var("HOST").unwrap());
+        .host(&host);
     
     let opt_level_str = env::var("OPT_LEVEL").unwrap();
     let opt_level_num = match opt_level_str.as_str() {
@@ -55,57 +56,42 @@ fn main() {
     println!("cargo:rustc-link-lib=static=tcc_all_objs");
 
     // 2. Build runtime objects for the sysroot
+    let compiler = build.get_compiler();
     
-    // libc.a
-    cc::Build::new()
-        .file("lib/libc.c")
-        .flag("-ffreestanding")
-        .flag("-fno-builtin")
-        .flag("-nostdinc")
-        .include("include")
-        .target(&target)
-        .host(&env::var("HOST").unwrap())
-        .opt_level(3)
-        .out_dir(&out_dir)
-        .compile("akuma_libc");
+    let run_cc = |src: &str, obj: &str, extra_args: &[&str]| {
+        let mut cmd = compiler.to_command();
+        cmd.arg("-ffreestanding").arg("-fno-builtin").arg("-nostdinc").arg("-O3");
+        cmd.args(extra_args);
+        cmd.arg("-c").arg(src).arg("-o").arg(out_dir.join(obj));
+        let status = cmd.status().expect("Failed to run compiler");
+        if !status.success() {
+            panic!("Compiler failed for src: {}", src);
+        }
+    };
 
-    // crt1.o (from crt0.S)
-    cc::Build::new()
-        .file("lib/crt0.S")
-        .target(&target)
-        .host(&env::var("HOST").unwrap())
-        .out_dir(&out_dir)
-        .compile("crt1");
+    run_cc("lib/libc.c", "libc.o", &["-I", "include"]);
+    run_cc("lib/crt0.S", "crt1.o", &[]);
+    run_cc("lib/crti.S", "crti.o", &[]);
+    run_cc("lib/crtn.S", "crtn.o", &[]);
+    run_cc("tinycc/lib/libtcc1.c", "libtcc1_base.o", &["-I", "tinycc", "-I", "include"]);
+    run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "include"]);
 
-    // crti.o
-    cc::Build::new()
-        .file("lib/crti.S")
-        .target(&target)
-        .host(&env::var("HOST").unwrap())
-        .out_dir(&out_dir)
-        .compile("crti");
+    // Create archives manually
+    let ar_bin = "ar";
+    let run_ar = |archive: &Path, objs: &[&Path]| {
+        let mut cmd = Command::new(ar_bin);
+        cmd.arg("rcs").arg(archive);
+        for obj in objs {
+            cmd.arg(obj);
+        }
+        let status = cmd.status().expect("Failed to run ar");
+        if !status.success() {
+            panic!("ar failed for archive: {:?}", archive);
+        }
+    };
 
-    // crtn.o
-    cc::Build::new()
-        .file("lib/crtn.S")
-        .target(&target)
-        .host(&env::var("HOST").unwrap())
-        .out_dir(&out_dir)
-        .compile("crtn");
-
-    // libtcc1.a (TCC's own runtime)
-    cc::Build::new()
-        .file("tinycc/lib/libtcc1.c")
-        .file("tinycc/lib/lib-arm64.c")
-        .flag("-ffreestanding")
-        .flag("-fno-builtin")
-        .flag("-nostdinc")
-        .include("tinycc")
-        .target(&target)
-        .host(&env::var("HOST").unwrap())
-        .opt_level(3)
-        .out_dir(&out_dir)
-        .compile("tcc1");
+    run_ar(&out_dir.join("libc.a"), &[&out_dir.join("libc.o")]);
+    run_ar(&out_dir.join("libtcc1.a"), &[&out_dir.join("libtcc1_base.o"), &out_dir.join("lib-arm64.o")]);
 
     // 3. Stage the sysroot
     let staging_dir = out_dir.join("sysroot_staging");
@@ -122,27 +108,11 @@ fn main() {
     fs::create_dir_all(&tcc_lib_dir).unwrap();
     fs::create_dir_all(&tcc_include_dir).unwrap();
 
-    fs::copy(out_dir.join("libakuma_libc.a"), lib_dir.join("libc.a")).unwrap();
+    fs::copy(out_dir.join("libc.a"), lib_dir.join("libc.a")).unwrap();
     fs::copy(out_dir.join("libtcc1.a"), tcc_lib_dir.join("libtcc1.a")).unwrap();
-    
-    let find_and_copy_o = |name: &str, dest: &Path| {
-        for entry in fs::read_dir(&out_dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "o") {
-                let file_name = path.file_name().unwrap().to_str().unwrap();
-                if file_name.ends_with(&format!("{}.o", name)) {
-                    fs::copy(&path, dest).unwrap();
-                    return;
-                }
-            }
-        }
-        fs::copy(out_dir.join(format!("lib{}.a", name)), dest).unwrap();
-    };
-
-    find_and_copy_o("crt1", &tcc_lib_dir.join("crt1.o"));
-    find_and_copy_o("crti", &tcc_lib_dir.join("crti.o"));
-    find_and_copy_o("crtn", &tcc_lib_dir.join("crtn.o"));
+    fs::copy(out_dir.join("crt1.o"), tcc_lib_dir.join("crt1.o")).unwrap();
+    fs::copy(out_dir.join("crti.o"), tcc_lib_dir.join("crti.o")).unwrap();
+    fs::copy(out_dir.join("crtn.o"), tcc_lib_dir.join("crtn.o")).unwrap();
     
     copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
     copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
