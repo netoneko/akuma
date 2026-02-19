@@ -147,7 +147,7 @@ pub fn print_u64(n: u64) {
 // ============================================================================
 
 /// A stack-allocated buffer for formatting without heap allocation.
-/// Use with `core::fmt::Write` or the `format_no_std` crate.
+/// Use with `core::fmt::Write`.
 pub struct StackWriter<const N: usize> {
     buf: [u8; N],
     pos: usize,

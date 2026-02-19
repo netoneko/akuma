@@ -1,0 +1,10 @@
+[package]
+name = "tcc"
+version = "0.9.27"
+edition = "2021"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+
+[build-dependencies]
+cc = "1.0"

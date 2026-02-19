@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use libakuma::print;
 
 use crate::error::{Error, Result};
-use crate::pack_stream::StreamingPackParser;
 use crate::stream::process_pack_streaming;
 
 fn print_status(status: u16) {
@@ -198,7 +197,7 @@ impl ProtocolClient {
         parse_upload_pack_response(&response.body, caps)
     }
 
-    /// Fetch pack with streaming - downloads to temp file, then parses
+    /// Fetch pack with streaming - downloads to memory, then parses
     /// Returns the number of objects parsed
     pub fn fetch_pack_streaming(
         &mut self,
@@ -207,6 +206,9 @@ impl ProtocolClient {
         caps: &Capabilities,
         git_dir: &str,
     ) -> Result<u32> {
+        use crate::pack::PackParser;
+        use crate::store::ObjectStore;
+
         let path = self.url.upload_pack_url();
         
         print("scratch: requesting pack from ");
@@ -223,21 +225,12 @@ impl ProtocolClient {
         let use_sideband = caps.side_band || caps.side_band_64k;
         let mut sideband_state = SidebandState::new(use_sideband);
         
-        // Temporary file path for pack
-        let pack_path = format!("{}/objects/pack/tmp.pack", git_dir);
-        
-        // Open temp file for writing
-        let pack_fd = libakuma::open(
-            &pack_path,
-            libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC
-        );
-        if pack_fd < 0 {
-            return Err(Error::io("failed to create temp pack file"));
-        }
-        
-        let mut pack_size = 0usize;
+        // Accumulate pack data in memory instead of writing to disk and reading
+        // back — the kernel's sys_read re-reads the entire file on every call,
+        // making the round-trip O(n^2) for large files.
+        let mut pack_data: Vec<u8> = Vec::new();
 
-        // Download pack to file
+        // Download pack to memory
         let download_result = process_pack_streaming(
             &self.url,
             resolved_ip,
@@ -246,80 +239,40 @@ impl ProtocolClient {
             &request_body,
             |chunk| {
                 // Process through sideband demuxer
-                let pack_data = sideband_state.process(chunk)?;
+                let data = sideband_state.process(chunk)?;
                 
-                if !pack_data.is_empty() {
-                    // Write to temp file instead of parsing
-                    let written = libakuma::write_fd(pack_fd, &pack_data);
-                    if written < 0 {
-                        return Err(Error::io("failed to write pack data"));
-                    }
-                    pack_size += pack_data.len();
+                if !data.is_empty() {
+                    pack_data.extend_from_slice(&data);
                 }
                 
                 Ok(true) // Continue
             },
         );
         
-        libakuma::close(pack_fd);
-        
         download_result?;
         
         print("scratch: downloaded ");
-        print_num(pack_size);
+        print_num(pack_data.len());
         print(" bytes\n");
         
-        // Now parse the pack file from disk using the original parser
+        // Parse pack directly from memory
         print("scratch: parsing pack file...\n");
         
-        let count = parse_pack_from_file(&pack_path, git_dir)?;
+        let store = ObjectStore::new(git_dir);
+        let mut parser = PackParser::new(&pack_data)?;
         
-        print("scratch: stored ");
-        print_num(count as usize);
+        print("scratch: pack contains ");
+        print_num(parser.object_count() as usize);
         print(" objects\n");
         
-        // Clean up temp file (best effort)
-        // Note: libakuma doesn't have unlink, so file stays around
+        let shas = parser.parse_all(&store)?;
         
-        Ok(count)
+        print("scratch: stored ");
+        print_num(shas.len());
+        print(" objects\n");
+        
+        Ok(shas.len() as u32)
     }
-}
-
-/// Parse pack file from disk using small batches
-fn parse_pack_from_file(pack_path: &str, git_dir: &str) -> Result<u32> {
-    use crate::pack::PackParser;
-    use crate::store::ObjectStore;
-    
-    // Read pack file in chunks
-    let fd = libakuma::open(pack_path, libakuma::open_flags::O_RDONLY);
-    if fd < 0 {
-        return Err(Error::io("failed to open pack file"));
-    }
-    
-    // Read entire pack (we've already saved it to disk, memory is freed)
-    let mut pack_data = Vec::new();
-    let mut buf = [0u8; 4096];
-    
-    loop {
-        let n = libakuma::read_fd(fd, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        pack_data.extend_from_slice(&buf[..n as usize]);
-    }
-    libakuma::close(fd);
-    
-    // Now parse with the original parser
-    let store = ObjectStore::new(git_dir);
-    let mut parser = PackParser::new(&pack_data)?;
-    
-    print("scratch: pack contains ");
-    print_num(parser.object_count() as usize);
-    print(" objects\n");
-    
-    let shas = parser.parse_all(&store)?;
-    
-    Ok(shas.len() as u32)
 }
 
 /// State machine for sideband demultiplexing during streaming
@@ -344,9 +297,7 @@ impl SidebandState {
             // Skip NAK line if present at start
             if !self.in_pack_data {
                 if data.starts_with(b"NAK") || data.starts_with(b"0008NAK") {
-                    // Skip NAK packet
                     self.in_pack_data = true;
-                    // Find pack data start
                     if let Some(pos) = find_pack_start(data) {
                         return Ok(data[pos..].to_vec());
                     }
@@ -360,63 +311,67 @@ impl SidebandState {
             return Ok(data.to_vec());
         }
 
-        // Sideband enabled - need to demux
+        // Sideband enabled - need to demux pkt-line framed data
         self.buffer.extend_from_slice(data);
-        
-        // Debug: show sideband buffer growth
-        if self.buffer.len() > 50000 && !self.in_pack_data {
-            print("scratch: sideband buffer ");
-            print_num(self.buffer.len());
-            print(" bytes, first bytes: ");
-            let preview_len = core::cmp::min(20, self.buffer.len());
-            if let Ok(s) = core::str::from_utf8(&self.buffer[..preview_len]) {
-                print(s);
-            } else {
-                print("<binary>");
-            }
-            print("\n");
-        }
         let mut pack_data = Vec::new();
 
+        // If we already switched to raw mode, just drain the buffer
+        if self.in_pack_data {
+            pack_data.extend_from_slice(&self.buffer);
+            self.buffer.clear();
+            return Ok(pack_data);
+        }
+
         while self.buffer.len() >= 4 {
-            // Parse pkt-line length
+            // Try to parse pkt-line length (first 4 bytes must be ASCII hex)
             let len_hex = &self.buffer[..4];
-            let len_str = core::str::from_utf8(len_hex).unwrap_or("0000");
-            
-            let len = match u16::from_str_radix(len_str, 16) {
-                Ok(l) => l as usize,
-                Err(_) => {
-                    // Not a valid pkt-line, might be raw pack data
-                    if self.buffer.starts_with(b"PACK") {
-                        pack_data.extend_from_slice(&self.buffer);
-                        self.buffer.clear();
-                    }
-                    break;
+
+            // All 4 bytes must be ASCII hex digits
+            let valid_hex = len_hex.iter().all(|b| matches!(b,
+                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'));
+
+            if !valid_hex {
+                // Not a pkt-line. Scan for PACK magic to resynchronize.
+                if let Some(pos) = find_pack_start(&self.buffer) {
+                    // Found raw PACK data — switch to raw mode
+                    pack_data.extend_from_slice(&self.buffer[pos..]);
+                    self.buffer.clear();
+                    self.in_pack_data = true;
+                } else {
+                    // No PACK magic yet. Drop bytes up to the last 3
+                    // (PACK might be split across calls).
+                    let keep = core::cmp::min(3, self.buffer.len());
+                    let drain = self.buffer.len() - keep;
+                    self.buffer = self.buffer[drain..].to_vec();
                 }
-            };
+                break;
+            }
+
+            let len_str = core::str::from_utf8(len_hex).unwrap_or("0000");
+            let len = u16::from_str_radix(len_str, 16).unwrap_or(0) as usize;
 
             if len == 0 {
-                // Flush packet
+                // Flush packet — may signal end of sideband section
                 self.buffer = self.buffer[4..].to_vec();
                 continue;
             }
 
             if len < 4 || self.buffer.len() < len {
-                // Need more data
+                // Need more data for this pkt-line
                 break;
             }
 
-            // Get packet content
+            // Get packet content (after 4-byte length header)
             let content = &self.buffer[4..len];
-            
+
             if !content.is_empty() {
                 match content[0] {
                     1 => {
-                        // Pack data
+                        // Channel 1: pack data
                         pack_data.extend_from_slice(&content[1..]);
                     }
                     2 => {
-                        // Progress - print it
+                        // Channel 2: progress
                         if let Ok(msg) = core::str::from_utf8(&content[1..]) {
                             print("remote: ");
                             print(msg.trim());
@@ -424,17 +379,13 @@ impl SidebandState {
                         }
                     }
                     3 => {
-                        // Error
+                        // Channel 3: error
                         if let Ok(msg) = core::str::from_utf8(&content[1..]) {
                             return Err(Error::protocol(msg.trim()));
                         }
                     }
                     _ => {
-                        // Unknown, might be NAK/ACK
-                        let line = core::str::from_utf8(content).unwrap_or("");
-                        if !line.starts_with("NAK") && !line.starts_with("ACK") {
-                            // Unknown content
-                        }
+                        // NAK/ACK or other protocol lines — ignore
                     }
                 }
             }

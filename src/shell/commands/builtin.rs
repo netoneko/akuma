@@ -243,6 +243,12 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  kthreads              - List kernel threads with stack info\r\n")
                 .await;
+            let _ = stdout
+                .write(b"  clear                 - Clear the terminal screen\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  reset                 - Reset terminal to initial state\r\n")
+                .await;
             let _ = stdout.write(b"\r\nNavigation commands:\r\n").await;
             let _ = stdout
                 .write(b"  pwd                   - Print current working directory\r\n")
@@ -459,7 +465,7 @@ impl Command for PsCommand {
             use crate::process;
 
             // Header
-            let _ = stdout.write(b"  PID  PPID  STATE     NAME\r\n").await;
+            let _ = stdout.write(b"  PID  PPID  BOX  STATE     NAME\r\n").await;
 
             let procs = process::list_processes();
 
@@ -467,9 +473,10 @@ impl Command for PsCommand {
                 let _ = stdout.write(b"(no processes running)\r\n").await;
             } else {
                 for p in procs {
+                    let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
                     let line = format!(
-                        "{:>5}  {:>4}  {:<8}  {}\r\n",
-                        p.pid, p.ppid, p.state, p.name
+                        "{:>5}  {:>4}  {:<8}  {:<8}  {}\r\n",
+                        p.pid, p.ppid, box_str, p.state, p.name
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }
@@ -889,3 +896,77 @@ impl Command for KillCommand {
 
 /// Static instance
 pub static KILL_CMD: KillCommand = KillCommand;
+
+// ============================================================================
+// Clear Command
+// ============================================================================
+
+/// Clear command - clears the terminal screen
+pub struct ClearCommand;
+
+impl Command for ClearCommand {
+    fn name(&self) -> &'static str {
+        "clear"
+    }
+    fn description(&self) -> &'static str {
+        "Clear the terminal screen"
+    }
+    fn usage(&self) -> &'static str {
+        "clear"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            // ANSI escape: [2J clears screen, [H moves cursor to 0,0
+            let _ = stdout.write(b"\x1b[2J\x1b[H").await;
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static CLEAR_CMD: ClearCommand = ClearCommand;
+
+// ============================================================================
+// Reset Command
+// ============================================================================
+
+/// Reset command - resets terminal to initial state
+pub struct ResetCommand;
+
+impl Command for ResetCommand {
+    fn name(&self) -> &'static str {
+        "reset"
+    }
+    fn description(&self) -> &'static str {
+        "Reset terminal to initial state"
+    }
+    fn usage(&self) -> &'static str {
+        "reset"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        _ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            // ANSI escape: RIS (Reset to Initial State)
+            let _ = stdout.write(b"\x1bc").await;
+            // Also clear screen and home cursor just in case
+            let _ = stdout.write(b"\x1b[2J\x1b[H").await;
+            Ok(())
+        })
+    }
+}
+
+/// Static instance
+pub static RESET_CMD: ResetCommand = ResetCommand;

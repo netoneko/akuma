@@ -176,6 +176,35 @@ pub trait Filesystem: Send + Sync {
     /// Append data to a file
     fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
 
+    /// Read data from a specific offset within a file.
+    /// Returns the number of bytes actually read (may be less than buf.len()
+    /// at end-of-file, or 0 if offset is past the end).
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Default: fall back to read-entire-file-and-slice (slow but correct)
+        let data = self.read_file(path)?;
+        if offset >= data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(data.len() - offset);
+        buf[..n].copy_from_slice(&data[offset..offset + n]);
+        Ok(n)
+    }
+
+    /// Write data at a specific offset within a file.
+    /// Extends the file if offset + data.len() > current size.
+    /// Returns the number of bytes written.
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        // Default: fall back to read-modify-write (slow but correct)
+        let mut contents = self.read_file(path).unwrap_or_default();
+        let end = offset + data.len();
+        if end > contents.len() {
+            contents.resize(end, 0);
+        }
+        contents[offset..end].copy_from_slice(data);
+        self.write_file(path, &contents)?;
+        Ok(data.len())
+    }
+
     /// Create a directory
     fn create_dir(&self, path: &str) -> Result<(), FsError>;
 
@@ -190,6 +219,11 @@ pub trait Filesystem: Send + Sync {
 
     /// Get metadata for a path
     fn metadata(&self, path: &str) -> Result<Metadata, FsError>;
+
+    /// Rename/move a file or directory
+    fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
 
     /// Get filesystem statistics
     fn stats(&self) -> Result<FsStats, FsError>;
@@ -301,10 +335,54 @@ impl MountTable {
 // Path Utilities
 // ============================================================================
 
-/// Normalize a path: ensure leading /, remove trailing /, handle empty -> "/"
+/// Non-allocating normalization (trims trailing slashes)
 fn normalize_path(path: &str) -> &str {
     let path = path.trim_end_matches('/');
     if path.is_empty() { "/" } else { path }
+}
+
+/// Robust normalization (resolves . and ..)
+pub fn canonicalize_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => {
+                components.push(c);
+            }
+        }
+    }
+
+    if components.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for c in components {
+            result.push('/');
+            result.push_str(c);
+        }
+        result
+    }
+}
+
+/// Resolve a path relative to a base directory
+pub fn resolve_path(base_cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        // Absolute path
+        canonicalize_path(path)
+    } else {
+        // Relative path
+        let full_path = if base_cwd == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}/{}", base_cwd, path)
+        };
+        canonicalize_path(&full_path)
+    }
 }
 
 /// Normalize path with allocation (adds leading / if missing)
@@ -376,8 +454,26 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    // Normalize path (ensure leading /)
-    let normalized = normalize_path_owned(path);
+    let mut normalized = if let Some(proc) = crate::process::current_process() {
+        // 1. Resolve relative path against process CWD
+        let absolute = resolve_path(&proc.cwd, path);
+        
+        // 2. VFS SCOPING: Prepend process root_dir if not /
+        if proc.root_dir != "/" {
+            // Join root_dir and absolute path
+            // e.g. root_dir="/box1", absolute="/etc" -> "/box1/etc"
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &absolute[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, absolute)
+            }
+        } else {
+            absolute
+        }
+    } else {
+        // Fallback for kernel context (no process)
+        normalize_path_owned(path)
+    };
 
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
@@ -426,6 +522,16 @@ pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.append_file(rel, data))
 }
 
+/// Read data from a specific offset within a file
+pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, rel| fs.read_at(rel, offset, buf))
+}
+
+/// Write data at a specific offset within a file
+pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, rel| fs.write_at(rel, offset, data))
+}
+
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.create_dir(rel))
@@ -454,6 +560,53 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
 /// Get metadata for a path
 pub fn metadata(path: &str) -> Result<Metadata, FsError> {
     with_fs(path, |fs, rel| fs.metadata(rel))
+}
+
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    // Both paths must be on the same filesystem for an atomic rename
+    let mut old_full = if let Some(proc) = crate::process::current_process() {
+        let abs = resolve_path(&proc.cwd, old_path);
+        if proc.root_dir != "/" {
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, abs)
+            }
+        } else {
+            abs
+        }
+    } else {
+        normalize_path_owned(old_path)
+    };
+
+    let mut new_full = if let Some(proc) = crate::process::current_process() {
+        let abs = resolve_path(&proc.cwd, new_path);
+        if proc.root_dir != "/" {
+            if proc.root_dir.ends_with('/') {
+                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+            } else {
+                alloc::format!("{}{}", proc.root_dir, abs)
+            }
+        } else {
+            abs
+        }
+    } else {
+        normalize_path_owned(new_path)
+    };
+
+    let table = MOUNT_TABLE.lock();
+    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+
+    let (old_fs, old_rel) = table.resolve(&old_full).ok_or(FsError::NotFound)?;
+    let (new_fs, new_rel) = table.resolve(&new_full).ok_or(FsError::NotFound)?;
+
+    // Check if they are the same filesystem instance
+    if old_fs.name() != new_fs.name() {
+        return Err(FsError::NotSupported); // Cross-FS rename not supported
+    }
+
+    old_fs.rename(old_rel, new_rel)
 }
 
 /// Get filesystem statistics for a path

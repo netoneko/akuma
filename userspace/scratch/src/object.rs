@@ -191,6 +191,11 @@ impl TreeEntry {
     pub fn is_file(&self) -> bool {
         self.mode == 100644 || self.mode == 100755 || self.mode == 0o100644 || self.mode == 0o100755
     }
+
+    /// Check if this entry is a submodule (gitlink)
+    pub fn is_submodule(&self) -> bool {
+        self.mode == 160000 || self.mode == 0o160000
+    }
 }
 
 /// A Git tree (directory listing)

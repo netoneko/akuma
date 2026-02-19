@@ -55,6 +55,8 @@ impl core::fmt::Display for ElfError {
 
 use alloc::collections::BTreeMap;
 
+const R_AARCH64_RELATIVE: u32 = 1027;
+
 /// Load an ELF binary from memory
 ///
 /// # Arguments
@@ -172,6 +174,35 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let segment_end = vaddr + memsz;
         if segment_end > brk {
             brk = segment_end;
+        }
+    }
+
+    // Apply relocations
+    // For now we only support R_AARCH64_RELATIVE which is common in TCC binaries
+    if let Some(shdrs) = elf.section_headers() {
+        for shdr in shdrs {
+            if shdr.sh_type == elf::abi::SHT_RELA {
+                if let Ok(relas) = elf.section_data_as_relas(&shdr) {
+                    for rela in relas {
+                        if rela.r_type == R_AARCH64_RELATIVE {
+                            let vaddr = rela.r_offset as usize;
+                            let addend = rela.r_addend as usize;
+                            
+                            // Find physical page for this virtual address
+                            let page_va = vaddr & !(PAGE_SIZE - 1);
+                            if let Some(&pa) = mapped_pages.get(&page_va) {
+                                let offset_in_page = vaddr & (PAGE_SIZE - 1);
+                                unsafe {
+                                    let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
+                                    // R_AARCH64_RELATIVE: *ptr = B + A
+                                    // Since we load at preferred address, B = 0
+                                    *ptr = addend;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

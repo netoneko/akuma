@@ -152,6 +152,22 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     vfs::write_file(path, data)
 }
 
+/// Read data from a specific offset within a file
+pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    vfs::read_at(path, offset, buf)
+}
+
+/// Write data at a specific offset within a file
+pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    vfs::write_at(path, offset, data)
+}
+
 /// Append data to a file
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     if !is_initialized() {
@@ -182,6 +198,14 @@ pub fn remove_dir(path: &str) -> Result<(), FsError> {
         return Err(FsError::NotInitialized);
     }
     vfs::remove_dir(path)
+}
+
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    if !is_initialized() {
+        return Err(FsError::NotInitialized);
+    }
+    vfs::rename(old_path, new_path)
 }
 
 /// Check if a file or directory exists

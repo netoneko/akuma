@@ -51,21 +51,23 @@ const HERD_LOG_DIR: &str = "/var/log/herd";
 fn ensure_directories() {
     // Create /etc/herd/enabled
     if mkdir_p(HERD_ENABLED_DIR) {
-        print("[herd] Created ");
+        // Only print if we are sure it didn't exist or we don't care to be too verbose
+    } else {
+        print("[herd] Warning: Failed to create ");
         print(HERD_ENABLED_DIR);
         print("\n");
     }
     
     // Create /etc/herd/available
-    if mkdir_p(HERD_AVAILABLE_DIR) {
-        print("[herd] Created ");
+    if !mkdir_p(HERD_AVAILABLE_DIR) {
+        print("[herd] Warning: Failed to create ");
         print(HERD_AVAILABLE_DIR);
         print("\n");
     }
     
     // Create /var/log/herd
-    if mkdir_p(HERD_LOG_DIR) {
-        print("[herd] Created ");
+    if !mkdir_p(HERD_LOG_DIR) {
+        print("[herd] Warning: Failed to create ");
         print(HERD_LOG_DIR);
         print("\n");
     }
@@ -93,6 +95,8 @@ struct ServiceConfig {
     args: Vec<String>,
     restart_delay_ms: u64,
     max_retries: u32,
+    boxed: bool,
+    box_root: String,
 }
 
 impl Default for ServiceConfig {
@@ -102,6 +106,8 @@ impl Default for ServiceConfig {
             args: Vec::new(),
             restart_delay_ms: DEFAULT_RESTART_DELAY_MS,
             max_retries: DEFAULT_MAX_RETRIES,
+            boxed: false,
+            box_root: String::from("/"),
         }
     }
 }
@@ -167,6 +173,9 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() {
+    // Ensure required directories exist
+    ensure_directories();
+
     // Check for command-line arguments
     let argc = libakuma::argc();
     
@@ -181,6 +190,14 @@ fn main() {
             }
             "status" => {
                 cmd_status();
+                return;
+            }
+            "add" => {
+                if let Some(name) = service_name {
+                    cmd_add(name);
+                } else {
+                    print("Usage: herd add <service>\n");
+                }
                 return;
             }
             "config" => {
@@ -232,9 +249,6 @@ fn main() {
     // Daemon mode - run supervisor loop
     print("[herd] Userspace supervisor starting...\n");
 
-    // Ensure required directories exist
-    ensure_directories();
-
     let mut state = HerdState::new();
 
     // Initial config load
@@ -260,6 +274,7 @@ fn main() {
         if now_ms.saturating_sub(state.last_config_reload_ms) >= CONFIG_RELOAD_INTERVAL_MS {
             print("[herd] Reloading config...\n");
             reload_config(&mut state);
+            start_stopped_services(&mut state);
             state.last_config_reload_ms = now_ms;
         }
 
@@ -298,6 +313,12 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 "max_retries" => {
                     config.max_retries = parse_u32(value).unwrap_or(DEFAULT_MAX_RETRIES);
+                }
+                "boxed" => {
+                    config.boxed = value == "true" || value == "1";
+                }
+                "box_root" => {
+                    config.box_root = String::from(value);
                 }
                 _ => {}
             }
@@ -377,15 +398,19 @@ fn reload_config(state: &mut HerdState) {
         }
     }
 
-    // Remove services that are no longer enabled (and not running)
+    // Remove services that are no longer enabled
     let to_remove: Vec<String> = state.services.iter()
-        .filter(|(name, svc)| {
-            !found_services.iter().any(|n| n == *name) && svc.state != ServiceState::Running
+        .filter(|(name, _)| {
+            !found_services.iter().any(|n| n == *name)
         })
         .map(|(name, _)| name.clone())
         .collect();
 
     for name in to_remove {
+        print("[herd] Stopping and removing disabled service: ");
+        print(&name);
+        print("\n");
+        stop_service(state, &name);
         state.services.remove(&name);
     }
 }
@@ -405,9 +430,28 @@ fn start_stopped_services(state: &mut HerdState) {
     }
 }
 
+#[repr(C)]
+pub struct SpawnOptions {
+    pub cwd_ptr: u64,
+    pub cwd_len: usize,
+    pub root_dir_ptr: u64,
+    pub root_dir_len: usize,
+    pub args_ptr: u64,
+    pub args_len: usize,
+    pub stdin_ptr: u64,
+    pub stdin_len: usize,
+    pub box_id: u64,
+}
+
+const SYSCALL_SPAWN_EXT: u64 = 315;
+const SYSCALL_REGISTER_BOX: u64 = 316;
+
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     print("[herd] Starting service: ");
     print(name);
+    if config.boxed {
+        print(" (boxed)");
+    }
     print("\n");
 
     // Build args
@@ -415,7 +459,82 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
 
     // Spawn the process
-    match spawn(&config.command, args_opt) {
+    let spawn_res = if config.boxed {
+        // Generate box_id from name
+        let mut box_id = 0u64;
+        for b in name.as_bytes() {
+            box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64);
+        }
+        if box_id == 0 { box_id = 1; }
+
+        // Register box in kernel
+        libakuma::syscall(
+            SYSCALL_REGISTER_BOX,
+            box_id,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            config.box_root.as_ptr() as u64,
+            config.box_root.len() as u64,
+            0,
+        );
+
+        // Build null-separated args string for internal syscall call
+        let mut args_buf = Vec::new();
+        if let Some(args_slice) = args_opt {
+            for arg in args_slice {
+                args_buf.extend_from_slice(arg.as_bytes());
+                args_buf.push(0);
+            }
+        }
+        let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
+        let args_len = args_buf.len();
+
+        let options = SpawnOptions {
+            cwd_ptr: "/".as_ptr() as u64,
+            cwd_len: 1,
+            root_dir_ptr: config.box_root.as_ptr() as u64,
+            root_dir_len: config.box_root.len(),
+            args_ptr,
+            args_len,
+            stdin_ptr: 0,
+            stdin_len: 0,
+            box_id,
+        };
+
+        let result = libakuma::syscall(
+            SYSCALL_SPAWN_EXT,
+            config.command.as_ptr() as u64,
+            config.command.len() as u64,
+            &options as *const _ as u64,
+            0,
+            0,
+            0,
+        );
+
+        if (result as i64) >= 0 {
+            let pid = (result & 0xFFFF_FFFF) as u32;
+            let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+
+            // Update registry with real primary PID
+            libakuma::syscall(
+                SYSCALL_REGISTER_BOX,
+                box_id,
+                name.as_ptr() as u64,
+                name.len() as u64,
+                config.box_root.as_ptr() as u64,
+                config.box_root.len() as u64,
+                pid as u64,
+            );
+
+            Some(SpawnResult { pid, stdout_fd })
+        } else {
+            None
+        }
+    } else {
+        spawn(&config.command, args_opt)
+    };
+
+    match spawn_res {
         Some(SpawnResult { pid, stdout_fd }) => {
             if let Some(svc) = state.services.get_mut(name) {
                 svc.pid = Some(pid);
@@ -632,13 +751,14 @@ fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
     Some(content)
 }
 
-fn write_file(path: &str, data: &[u8]) {
+fn write_file(path: &str, data: &[u8]) -> bool {
     let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
-        return;
+        return false;
     }
     write_fd(fd, data);
     close(fd);
+    true
 }
 
 fn append_file(path: &str, data: &[u8]) {
@@ -668,6 +788,7 @@ fn print_usage() {
     print("Commands:\n");
     print("  daemon         Run supervisor in foreground\n");
     print("  status         List enabled services\n");
+    print("  add <svc>      Create a new service configuration\n");
     print("  config <svc>   Show service configuration\n");
     print("  enable <svc>   Enable a service\n");
     print("  disable <svc>  Disable a service\n");
@@ -701,6 +822,44 @@ fn cmd_status() {
             print(HERD_ENABLED_DIR);
             print("/\n");
         }
+    }
+}
+
+fn cmd_add(name: &str) {
+    let path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
+    
+    // Check if already exists
+    if read_file_bytes(&path).is_some() {
+        print("Service '");
+        print(name);
+        print("' already exists in ");
+        print(HERD_AVAILABLE_DIR);
+        print("/\n");
+        return;
+    }
+    
+    let default_config = format!(
+        "# Herd Service Configuration for {}\n\
+        command = /bin/{}\n\
+        args = \n\
+        restart_delay = {}\n\
+        max_retries = {}\n",
+        name, name, DEFAULT_RESTART_DELAY_MS, DEFAULT_MAX_RETRIES
+    );
+    
+    if write_file(&path, default_config.as_bytes()) {
+        print("Created service '");
+        print(name);
+        print("' in ");
+        print(HERD_AVAILABLE_DIR);
+        print("/\n");
+        print("Edit this file and then run 'herd enable ");
+        print(name);
+        print("' to start it.\n");
+    } else {
+        print("Error: Failed to create service configuration at ");
+        print(&path);
+        print("\n");
     }
 }
 
@@ -767,11 +926,18 @@ fn cmd_enable(name: &str) {
     };
     
     // Write to enabled
-    write_file(&dst_path, &content);
-    print("Enabled service '");
-    print(name);
-    print("'\n");
-    print("Service will start on next config reload (within 20s) or reboot.\n");
+    if write_file(&dst_path, &content) {
+        print("Enabled service '");
+        print(name);
+        print("'\n");
+        print("Service will start on next config reload (within 20s) or reboot.\n");
+    } else {
+        print("Error: Failed to enable service '");
+        print(name);
+        print("'. Could not write to ");
+        print(&dst_path);
+        print("\n");
+    }
 }
 
 fn cmd_disable(name: &str) {
@@ -785,13 +951,16 @@ fn cmd_disable(name: &str) {
         return;
     }
     
-    // Remove from enabled (we don't have unlink syscall, so just write empty file)
-    // TODO: Add proper file deletion when unlink syscall is available
-    // For now, we can't actually delete files - just inform the user
-    print("Note: File deletion not yet supported.\n");
-    print("Manually remove: ");
-    print(&path);
-    print("\n");
+    // Remove from enabled
+    if libakuma::unlink(&path) == 0 {
+        print("Disabled service '");
+        print(name);
+        print("'\n");
+    } else {
+        print("Error: Failed to delete ");
+        print(&path);
+        print("\n");
+    }
 }
 
 fn cmd_log(name: &str) {

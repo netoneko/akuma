@@ -42,6 +42,18 @@ static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
+/// Atomic total CPU time in microseconds for each thread
+static TOTAL_CPU_TIMES: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; config::MAX_THREADS]
+};
+
+/// Atomic "sticky wake" flags - set when wake() is called, cleared when thread resumes
+static WOKEN_STATES: [AtomicBool; config::MAX_THREADS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; config::MAX_THREADS]
+};
+
 /// Current running thread - stored in TPIDR_EL0 register
 /// Using a CPU register avoids race conditions with global atomics.
 /// TPIDR_EL0 is accessible from EL1 and provides per-CPU thread tracking.
@@ -161,6 +173,28 @@ pub fn get_thread_state(idx: usize) -> u8 {
 /// Check if a thread is terminated (lock-free)
 pub fn is_thread_terminated(thread_id: usize) -> bool {
     get_thread_state(thread_id) == thread_state::TERMINATED
+}
+
+/// Get total CPU time for a thread in microseconds
+pub fn get_thread_cpu_time(idx: usize) -> u64 {
+    if idx < config::MAX_THREADS {
+        let mut total = TOTAL_CPU_TIMES[idx].load(Ordering::Relaxed);
+        
+        // If the thread is currently running, add the time since it started
+        if get_thread_state(idx) == thread_state::RUNNING {
+            let start_time = with_irqs_disabled(|| {
+                let pool = POOL.lock();
+                pool.slots[idx].start_time_us
+            });
+            if start_time > 0 {
+                let now = crate::timer::uptime_us();
+                total += now.saturating_sub(start_time);
+            }
+        }
+        total
+    } else {
+        0
+    }
 }
 
 /// Count free slots in range (lock-free)
@@ -1479,13 +1513,21 @@ impl ThreadPool {
         // Don't change state if thread is TERMINATED or WAITING
         // WAITING threads keep their state - scheduler handles wake time
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
+        let now = crate::timer::uptime_us();
+
+        // Accumulate CPU time for the thread being scheduled out
+        if current.start_time_us > 0 {
+            let elapsed = now.saturating_sub(current.start_time_us);
+            TOTAL_CPU_TIMES[current_idx].fetch_add(elapsed, Ordering::Relaxed);
+        }
+
         if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
         }
         THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
         
         // Update timing (still in slot, but we own it)
-        self.slots[next_idx].start_time_us = crate::timer::uptime_us();
+        self.slots[next_idx].start_time_us = now;
 
         // Update current thread in CPU register (authoritative source of truth)
         set_current_thread_register(next_idx);
@@ -1982,17 +2024,50 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
+/// Waker implementation for thread-based waking
+pub struct ThreadWaker {
+    thread_id: usize,
+}
+
+impl ThreadWaker {
+    pub fn new(thread_id: usize) -> Self {
+        Self { thread_id }
+    }
+
+    /// Wake the thread associated with this waker
+    pub fn wake(&self) {
+        let tid = self.thread_id;
+        if tid < config::MAX_THREADS {
+            // Set sticky wake flag so schedule_blocking knows we were woken
+            WOKEN_STATES[tid].store(true, Ordering::SeqCst);
+
+            // Only wake if thread is actually WAITING
+            if THREAD_STATES[tid].load(Ordering::SeqCst) == thread_state::WAITING {
+                WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+                THREAD_STATES[tid].store(thread_state::READY, Ordering::SeqCst);
+                // Trigger SGI to ensure scheduler runs and picks up the thread
+                crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+            }
+        }
+    }
+}
+
 /// Marks the thread with the given ID as READY.
 fn mark_thread_ready_from_waker(thread_id: usize) {
-    mark_thread_ready(thread_id);
-    // Trigger an SGI to ensure the scheduler runs and picks up the ready thread
-    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+    let waker = ThreadWaker::new(thread_id);
+    waker.wake();
 }
 
 /// Creates a RawWaker that, when woken, marks the specified thread as READY.
 fn waker_from_thread_id(thread_id: usize) -> RawWaker {
     let ptr = thread_id as *const ();
     RawWaker::new(ptr, &THREAD_WAKER_VTABLE)
+}
+
+/// Creates a waker for the current thread.
+pub fn current_thread_waker() -> Waker {
+    let tid = get_current_thread_register();
+    unsafe { Waker::from_raw(waker_from_thread_id(tid)) }
 }
 
 const THREAD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -2043,6 +2118,12 @@ pub fn get_waker_for_thread(thread_id: usize) -> Waker {
 /// After resuming, we restore the user TTBR0 before returning to syscall handler.
 pub fn schedule_blocking(wake_time_us: u64) {
     let tid = current_thread_id();
+    
+    // Check if we were already woken (sticky wake)
+    if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
+        return;
+    }
+
     let now = crate::timer::uptime_us();
     
     // Check if already past deadline - don't bother blocking
@@ -2067,6 +2148,13 @@ pub fn schedule_blocking(wake_time_us: u64) {
     
     // Wait for timer to preempt us and for scheduler to wake us
     loop {
+        // Double check sticky wake flag in loop
+        if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
+            WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+            THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            break;
+        }
+
         let state = THREAD_STATES[tid].load(Ordering::SeqCst);
         if state != thread_state::WAITING {
             break;

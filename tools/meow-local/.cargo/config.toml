@@ -1,3 +1,0 @@
-# Override the parent config to use native target
-[build]
-target = "aarch64-apple-darwin"

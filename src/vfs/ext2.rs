@@ -56,7 +56,7 @@ struct Superblock {
     superuser_blocks: u32,
     unallocated_blocks: u32,
     unallocated_inodes: u32,
-    superblock_block: u32,
+    first_data_block: u32,
     block_size_log: u32,
     fragment_size_log: u32,
     blocks_per_group: u32,
@@ -179,6 +179,7 @@ struct Ext2State {
     inode_size: u16,
     block_group_count: u32,
     blocks_per_group: u32,
+    first_data_block: u32,
 }
 
 // ============================================================================
@@ -211,11 +212,13 @@ impl Ext2Filesystem {
         let inodes_per_group = superblock.inodes_per_group;
 
         if magic != EXT2_MAGIC {
-            crate::safe_print!(96, 
-                "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
-                magic,
-                EXT2_MAGIC
-            );
+            if crate::config::DEBUG_EXT2 {
+                crate::safe_print!(96, 
+                    "[Ext2] Invalid magic: 0x{:04X} (expected 0x{:04X})\n",
+                    magic,
+                    EXT2_MAGIC
+                );
+            }
             return Err(FsError::NoFilesystem);
         }
 
@@ -225,15 +228,21 @@ impl Ext2Filesystem {
         } else {
             128
         };
-        let block_group_count = (total_blocks + blocks_per_group - 1) / blocks_per_group;
+        let first_data_block = superblock.first_data_block;
+        // Correct block group count: (total_blocks - first_data_block) / blocks_per_group, rounded up
+        let block_group_count =
+            (total_blocks - first_data_block + blocks_per_group - 1) / blocks_per_group;
 
-        crate::safe_print!(160, 
-            "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups\n",
-            total_blocks,
-            total_inodes,
-            block_size,
-            block_group_count
-        );
+        if crate::config::DEBUG_EXT2 {
+            crate::safe_print!(192, 
+                "[Ext2] Mounted: {} blocks, {} inodes, {} byte blocks, {} groups, first_data_block={}\n",
+                total_blocks,
+                total_inodes,
+                block_size,
+                block_group_count,
+                first_data_block
+            );
+        }
 
         let state = Ext2State {
             superblock,
@@ -242,6 +251,7 @@ impl Ext2Filesystem {
             inode_size,
             block_group_count,
             blocks_per_group,
+            first_data_block,
         };
 
         Ok(Self {
@@ -294,7 +304,8 @@ impl Ext2Filesystem {
     // ========================================================================
 
     fn bgd_offset(state: &Ext2State, group: u32) -> u64 {
-        let bgd_table_block = if state.block_size == 1024 { 2 } else { 1 };
+        // BGD table starts in the block immediately after the superblock block
+        let bgd_table_block = state.first_data_block + 1;
         bgd_table_block as u64 * state.block_size as u64
             + group as u64 * size_of::<BlockGroupDescriptor>() as u64
     }
@@ -414,21 +425,41 @@ impl Ext2Filesystem {
                 if !Self::get_bit(&bitmap, bit) {
                     // Found free block
                     Self::set_bit(&mut bitmap, bit, true);
-                    Self::write_block(state, bitmap_block, &bitmap)?;
+                    if let Err(e) = Self::write_block(state, bitmap_block, &bitmap) {
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: bitmap write failed grp={} bit={}: {}\n", group, bit, e);
+                        }
+                        return Err(e);
+                    }
 
                     // Update BGD
                     bgd.free_blocks_count = free_count - 1;
-                    Self::write_bgd(state, group, &bgd)?;
+                    if let Err(e) = Self::write_bgd(state, group, &bgd) {
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: bgd write failed grp={}: {}\n", group, e);
+                        }
+                        return Err(e);
+                    }
 
                     // Update superblock
                     state.superblock.unallocated_blocks = unalloc - 1;
-                    Self::write_superblock(state)?;
+                    if let Err(e) = Self::write_superblock(state) {
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: superblock write failed: {}\n", e);
+                        }
+                        return Err(e);
+                    }
 
-                    let block_num = group * state.blocks_per_group + bit;
+                    let block_num = state.first_data_block + group * state.blocks_per_group + bit;
 
                     // Zero the block
                     let zeros = vec![0u8; state.block_size];
-                    Self::write_block(state, block_num, &zeros)?;
+                    if let Err(e) = Self::write_block(state, block_num, &zeros) {
+                        if crate::config::DEBUG_EXT2 {
+                            crate::safe_print!(96, "[ext2] alloc_block: zero block {} failed: {}\n", block_num, e);
+                        }
+                        return Err(e);
+                    }
 
                     return Ok(block_num);
                 }
@@ -443,8 +474,10 @@ impl Ext2Filesystem {
             return Ok(());
         }
 
-        let group = block_num / state.blocks_per_group;
-        let bit = block_num % state.blocks_per_group;
+        // Block numbering starts at first_data_block (1 for 1024-byte blocks)
+        let adjusted = block_num - state.first_data_block;
+        let group = adjusted / state.blocks_per_group;
+        let bit = adjusted % state.blocks_per_group;
 
         let mut bgd = Self::read_bgd(state, group)?;
         let bitmap_block = bgd.block_bitmap;
@@ -682,6 +715,16 @@ impl Ext2Filesystem {
 
     fn read_inode_data(state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
         let size = inode.size_lower as usize;
+
+        // Safety: Limit maximum kernel-side file allocation to 16MB to prevent OOM/panic.
+        // Large files should be accessed via read_at() instead of read_file().
+        if size > 16 * 1024 * 1024 {
+            if crate::config::DEBUG_EXT2 {
+                crate::safe_print!(128, "[ext2] read_inode_data: size {} exceeds 16MB limit\n", size);
+            }
+            return Err(FsError::Internal);
+        }
+
         let mut data = Vec::with_capacity(size);
         let blocks_needed = (size + state.block_size - 1) / state.block_size;
 
@@ -709,8 +752,22 @@ impl Ext2Filesystem {
     ) -> Result<(), FsError> {
         let blocks_needed = (data.len() + state.block_size - 1) / state.block_size;
 
+        if crate::config::DEBUG_EXT2 {
+            crate::safe_print!(96, "[ext2] write_inode_data: {} bytes, {} blocks needed, block_size={}\n",
+                data.len(), blocks_needed, state.block_size);
+        }
+
         for logical_block in 0..blocks_needed as u32 {
-            let phys_block = Self::ensure_block(state, inode, logical_block)?;
+            let phys_block = match Self::ensure_block(state, inode, logical_block) {
+                Ok(b) => b,
+                Err(e) => {
+                    if crate::config::DEBUG_EXT2 {
+                        crate::safe_print!(96, "[ext2] ensure_block FAILED at logical_block={}: {}\n",
+                            logical_block, e);
+                    }
+                    return Err(e);
+                }
+            };
 
             let start = logical_block as usize * state.block_size;
             let end = core::cmp::min(start + state.block_size, data.len());
@@ -718,7 +775,13 @@ impl Ext2Filesystem {
             let mut block_data = vec![0u8; state.block_size];
             block_data[..end - start].copy_from_slice(&data[start..end]);
 
-            Self::write_block(state, phys_block, &block_data)?;
+            if let Err(e) = Self::write_block(state, phys_block, &block_data) {
+                if crate::config::DEBUG_EXT2 {
+                    crate::safe_print!(96, "[ext2] write_block FAILED at logical={} phys={}: {}\n",
+                        logical_block, phys_block, e);
+                }
+                return Err(e);
+            }
         }
 
         inode.size_lower = data.len() as u32;
@@ -1141,30 +1204,115 @@ impl Filesystem for Ext2Filesystem {
         }
     }
 
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        match self.lookup_path(path) {
-            Ok(inode_num) => {
-                let mut state = self.state.lock();
-                let mut inode = Self::read_inode(&state, inode_num)?;
-
-                if (inode.type_perms & 0xF000) == S_IFDIR {
-                    return Err(FsError::NotAFile);
-                }
-
-                // Read existing data
-                let mut existing = Self::read_inode_data(&state, &inode)?;
-                existing.extend_from_slice(data);
-
-                // Write back
-                Self::write_inode_data(&mut state, inode_num, &mut inode, &existing)?;
-                Ok(())
-            }
-            Err(FsError::NotFound) => {
-                // Create new file
-                self.write_file(path, data)
-            }
-            Err(e) => Err(e),
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        if buf.is_empty() {
+            return Ok(0);
         }
+
+        let inode_num = self.lookup_path(path)?;
+        let state = self.state.lock();
+        let inode = Self::read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
+
+        let file_size = inode.size_lower as usize;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let block_size = state.block_size;
+        let end = core::cmp::min(offset + buf.len(), file_size);
+        let mut total_read = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+
+            if let Some(phys_block) = Self::get_block_num(&state, &inode, logical_block)? {
+                let block_data = Self::read_block(&state, phys_block)?;
+                buf[total_read..total_read + chunk]
+                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
+            } else {
+                // Sparse block — fill with zeros
+                buf[total_read..total_read + chunk].fill(0);
+            }
+
+            pos += chunk;
+            total_read += chunk;
+        }
+
+        Ok(total_read)
+    }
+
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let inode_num = match self.lookup_path(path) {
+            Ok(n) => n,
+            Err(FsError::NotFound) => {
+                // Create the file first, then write into it
+                self.write_file(path, &[])?;
+                self.lookup_path(path)?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut state = self.state.lock();
+        let mut inode = Self::read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
+
+        let block_size = state.block_size;
+        let end = offset + data.len();
+        let mut written = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+
+            let phys_block = Self::ensure_block(&mut state, &mut inode, logical_block)?;
+
+            if offset_in_block == 0 && chunk == block_size {
+                // Full block write — no need to read first
+                let mut block_data = vec![0u8; block_size];
+                block_data.copy_from_slice(&data[written..written + chunk]);
+                Self::write_block(&state, phys_block, &block_data)?;
+            } else {
+                // Partial block — read-modify-write just this one block
+                let mut block_data = Self::read_block(&state, phys_block)?;
+                block_data[offset_in_block..offset_in_block + chunk]
+                    .copy_from_slice(&data[written..written + chunk]);
+                Self::write_block(&state, phys_block, &block_data)?;
+            }
+
+            pos += chunk;
+            written += chunk;
+        }
+
+        // Update size if we extended the file
+        if end > inode.size_lower as usize {
+            inode.size_lower = end as u32;
+        }
+        inode.modification_time = current_time();
+        Self::write_inode(&state, inode_num, &inode)?;
+
+        Ok(written)
+    }
+
+    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        let size = self.metadata(path)?.size as usize;
+        self.write_at(path, size, data)?;
+        Ok(())
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
@@ -1370,5 +1518,7 @@ impl Filesystem for Ext2Filesystem {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    if crate::config::DEBUG_EXT2 {
+        console::print(msg);
+    }
 }

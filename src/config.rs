@@ -132,7 +132,7 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // legacy option, now using 
 /// - ratio=8: (87.5% / 4) = ~22% CPU each
 /// 
 /// Lower values = better network responsiveness, higher = more CPU for downloads
-pub const NETWORK_THREAD_RATIO: u32 = 4;
+pub const NETWORK_THREAD_RATIO: u32 = 2;
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 
@@ -155,6 +155,15 @@ pub const MINIMAL_IDLE_LOOP: bool = false;
 /// When enabled, skips the async network stack and services (SSH, HTTP, etc.).
 /// Use this to isolate whether crashes are caused by network code.
 pub const SKIP_ASYNC_NETWORK: bool = false;
+
+/// Run network self-tests after initialization
+pub const RUN_NETWORK_TESTS: bool = true;
+
+/// Run container isolation tests after initialization
+pub const RUN_CONTAINER_TESTS: bool = false;
+
+/// Enable DHCP for automatic IP configuration
+pub const ENABLE_DHCP: bool = true;
 
 /// Skip filesystem initialization (for debugging crashes)
 ///
@@ -184,10 +193,13 @@ pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // Option to disable copying stdout to kernel log
-pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
+pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
 
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
+
+/// Option to disable [ext2] debug prints to the kernel log.
+pub const DEBUG_EXT2: bool = false;
 
 // ============================================================================
 // Network TX Queue Configuration

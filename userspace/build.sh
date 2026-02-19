@@ -5,7 +5,6 @@ set -e
 MEMBERS=(
     "libakuma"
     "libakuma-tls"
-    "chainlink"
     "echo2"
     "elftest"
     "hello"
@@ -20,11 +19,28 @@ MEMBERS=(
     "wget"
     "termtest"
     "allocstress"
+    "top"
+    "cat"
+    "box"
+    "paws"
+    "tcc"
+    "tar"
 )
 
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
     cargo build --release -p "$member"
+    # Special handling for tcc to copy its sysroot archive
+    if [ "$member" == "tcc" ]; then
+        LIBC_ARCHIVE="tcc/dist/libc.tar"
+        if [ -f "$LIBC_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar
+            echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
+        else
+            echo "Warning: libc archive not found at $LIBC_ARCHIVE"
+        fi
+    fi
 done
 
 # Create bin directory if it doesn't exist
@@ -33,6 +49,7 @@ mkdir -p ../bootstrap/bin
 # Copy binaries (only if they exist)
 BINARIES=(
     "hello"
+    "cat"
     "echo2"
     "stackstress"
     "stdcheck"
@@ -47,6 +64,11 @@ BINARIES=(
     "chainlink"
     "termtest"
     "allocstress"
+    "top"
+    "box"
+    "paws"
+    "tcc"
+    "tar"
 )
 
 for bin in "${BINARIES[@]}"; do
@@ -57,10 +79,21 @@ for bin in "${BINARIES[@]}"; do
         # For quickjs the bin name might be qjs
         if [ "$bin" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
             cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
+	elif [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/tcc" ]; then
+            cp "target/aarch64-unknown-none/release/tcc" ../bootstrap/bin/tcc
         else
             echo "Warning: Binary $bin not found at $SRC"
         fi
     fi
 done
+
+# Copy hello world example
+cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
+
+# Link sh to paws
+PAWS_BIN="../bootstrap/bin/paws"
+if [ -f "$PAWS_BIN" ]; then
+    cp "$PAWS_BIN" "../bootstrap/bin/sh"
+fi
 
 echo "Build process completed."

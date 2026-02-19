@@ -170,7 +170,13 @@ fn merge_index_with_tree(index: &Index, parent_tree_sha: &Sha1Hash, store: &Obje
     
     // Process parent tree entries
     for parent_entry in &parent_tree.entries {
-        if parent_entry.mode == 0o040000 {
+        if parent_entry.is_submodule() {
+            // Submodule entries are preserved as-is — scratch does not manage submodules
+            print("scratch: warning: preserving submodule entry: ");
+            print(&parent_entry.name);
+            print("\n");
+            new_entries.push(parent_entry.clone());
+        } else if parent_entry.mode == 0o040000 {
             // Directory - check if we have staged entries that modify it
             if let Some(staged_in_dir) = staged_top_level.get(&parent_entry.name) {
                 // Recursively merge this subdirectory
@@ -270,7 +276,10 @@ fn merge_subtree_with_staged(
     let mut processed_dirs: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
     
     for parent_entry in &parent_tree.entries {
-        if parent_entry.mode == 0o040000 {
+        if parent_entry.is_submodule() {
+            // Preserve submodule entries unchanged
+            new_entries.push(parent_entry.clone());
+        } else if parent_entry.mode == 0o040000 {
             if let Some(staged_in_dir) = staged_subdirs.get(&parent_entry.name) {
                 let new_subtree_sha = merge_subtree_with_staged(
                     &parent_entry.sha,

@@ -137,9 +137,18 @@ pub fn clone(url: &str) -> Result<()> {
     print(default_branch);
     print("\n");
 
+    // Verify HEAD commit exists before checkout
+    let head_commit_sha = ref_manager.resolve_head()?;
+    print("scratch: HEAD commit: ");
+    print(&crate::sha1::to_hex(&head_commit_sha));
+    print("\n");
+
+    if !store.exists(&head_commit_sha) {
+        print("scratch: WARNING: HEAD commit object not on disk!\n");
+    }
+
     // Checkout working tree
     print("scratch: checking out files\n");
-    let head_commit_sha = ref_manager.resolve_head()?;
     checkout_tree(&store, &head_commit_sha, &repo_name)?;
 
     print("scratch: done\n");
@@ -501,34 +510,129 @@ fn extract_repo_name(path: &str) -> String {
 /// Checkout the tree for a commit
 fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Result<()> {
     // Read commit
-    let commit_obj = store.read(commit_sha)?;
+    let commit_obj = match store.read(commit_sha) {
+        Ok(obj) => obj,
+        Err(e) => {
+            print("scratch: checkout: commit ");
+            print(&crate::sha1::to_hex(commit_sha));
+            print(": ");
+            print(e.message());
+            print("\n");
+            return Err(e);
+        }
+    };
     let commit = commit_obj.as_commit()?;
 
-    // Checkout tree
-    checkout_tree_recursive(store, &commit.tree, dest)
+    // Checkout tree with progress tracking
+    let mut file_count: usize = 0;
+    checkout_tree_recursive(store, &commit.tree, dest, &mut file_count)?;
+    print("\nscratch: checked out ");
+    print_num(file_count);
+    print(" files\n");
+    Ok(())
 }
 
 /// Recursively checkout a tree
-fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str) -> Result<()> {
-    let tree_obj = store.read(tree_sha)?;
+fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str, file_count: &mut usize) -> Result<()> {
+    let tree_obj = match store.read(tree_sha) {
+        Ok(obj) => obj,
+        Err(e) => {
+            print("scratch: checkout: tree ");
+            print(&crate::sha1::to_hex(tree_sha));
+            print(" in ");
+            print(dest);
+            print(": ");
+            print(e.message());
+            print("\n");
+            return Err(e);
+        }
+    };
     let tree = tree_obj.as_tree()?;
 
     for entry in &tree.entries {
         let path = format!("{}/{}", dest, entry.name);
 
-        if entry.is_dir() {
+        if entry.is_submodule() {
+            // Submodules reference commits in external repos — skip checkout
+            print("scratch: skipping submodule ");
+            print(&entry.name);
+            print("\n");
+            continue;
+        } else if entry.is_dir() {
             // Create directory and recurse
             let _ = mkdir(&path);
-            checkout_tree_recursive(store, &entry.sha, &path)?;
+            checkout_tree_recursive(store, &entry.sha, &path, file_count)?;
         } else {
             // Write file
-            let blob_obj = store.read(&entry.sha)?;
-            let content = blob_obj.as_blob()?;
+            
+            // Warn BEFORE reading/decompressing the full content
+            let mut file_size = 0;
+            if let Ok((_obj_type, size)) = store.read_info(&entry.sha) {
+                file_size = size;
+                if size > 300 * 1024 {
+                    print("\nscratch: warning: checking out large file ");
+                    print(&entry.name);
+                    print(" (");
+                    print_num(size / 1024);
+                    print(" KB)");
+                    if size > 5 * 1024 * 1024 {
+                        print(" - WARNING: MASSIVE FILE");
+                    }
+                    print("\n");
+                }
+            }
 
+            // Now perform the streaming read/write
             let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
             if fd >= 0 {
-                let _ = write_fd(fd, content);
+                let mut total_written = 0;
+                let mut last_dot = 0;
+                let chunk_size = 64 * 1024;
+
+                // Print an initial dot to show we've started the decompression/write process
+                if file_size >= chunk_size {
+                    print(".");
+                }
+
+                let result = store.read_to_callback(&entry.sha, |chunk| {
+                    let n = write_fd(fd, chunk);
+                    if n < 0 {
+                        return Err(Error::io("write failed"));
+                    }
+                    total_written += n as usize;
+                    
+                    // Progress dots for large files
+                    if file_size >= chunk_size {
+                        // We check >= last_dot + chunk_size to handle potential small chunks from decompressor
+                        if total_written >= last_dot + chunk_size {
+                            print(".");
+                            last_dot = total_written;
+                        }
+                    }
+                    Ok(())
+                });
+
                 close(fd);
+                
+                if let Err(e) = result {
+                    print("\nscratch: checkout: failed to stream ");
+                    print(&entry.name);
+                    print(": ");
+                    print(e.message());
+                    print("\n");
+                } else if file_size > 300 * 1024 {
+                    // Newline after dots for large files
+                    print("\n");
+                }
+            } else {
+                print("scratch: checkout: failed to open ");
+                print(&entry.name);
+                print("\n");
+            }
+
+            *file_count += 1;
+            if *file_count % 50 == 0 {
+                print(".");
             }
         }
     }

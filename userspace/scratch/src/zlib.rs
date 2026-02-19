@@ -4,8 +4,10 @@
 
 use alloc::vec::Vec;
 
-use miniz_oxide::inflate::stream::{inflate, InflateState};
-use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+pub use miniz_oxide::inflate::stream::InflateState;
+pub use miniz_oxide::DataFormat;
+use miniz_oxide::inflate::stream::inflate;
+use miniz_oxide::{MZFlush, MZStatus};
 
 use crate::error::{Error, Result};
 
@@ -13,6 +15,58 @@ use crate::error::{Error, Result};
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_zlib(data)
         .map_err(|_| Error::decompress())
+}
+
+/// Decompress only the beginning of a zlib stream to extract headers.
+/// Returns (bytes_consumed, bytes_written)
+pub fn decompress_header(data: &[u8], out: &mut [u8]) -> Result<(usize, usize)> {
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let result = inflate(&mut state, data, out, MZFlush::None);
+    match result.status {
+        Ok(_) => Ok((result.bytes_consumed, result.bytes_written)),
+        Err(_) => Err(Error::decompress()),
+    }
+}
+
+/// Decompress a zlib stream incrementally and pass chunks to a callback.
+pub fn decompress_to_callback<F>(data: &[u8], mut callback: F) -> Result<()> 
+where F: FnMut(&[u8]) -> Result<()> {
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    decompress_with_state_to_callback(&mut state, data, callback)
+}
+
+/// Decompress using an existing state and pass chunks to a callback.
+pub fn decompress_with_state_to_callback<F>(state: &mut InflateState, data: &[u8], mut callback: F) -> Result<()>
+where F: FnMut(&[u8]) -> Result<()> {
+    let mut out_buf = [0u8; 16384]; // 16KB transit buffer
+    let mut consumed = 0;
+
+    loop {
+        let result = inflate(state, &data[consumed..], &mut out_buf, MZFlush::None);
+        consumed += result.bytes_consumed;
+        
+        if result.bytes_written > 0 {
+            callback(&out_buf[..result.bytes_written])?;
+        }
+
+        match result.status {
+            Ok(MZStatus::StreamEnd) => return Ok(()),
+            Ok(MZStatus::Ok) => {
+                if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    if consumed >= data.len() {
+                        break;
+                    }
+                    return Err(Error::decompress());
+                }
+            }
+            _ => return Err(Error::decompress()),
+        }
+    }
+
+    // If we haven't reached StreamEnd but input is exhausted, we may need to flush.
+    // However, for Zlib objects in Git, each chunk should be complete.
+    // We'll return Ok(()) and let the next chunk (if any) or caller handle it.
+    Ok(())
 }
 
 /// Compress data with zlib
@@ -33,93 +87,45 @@ pub fn decompress_with_size(data: &[u8], _expected_size: usize) -> Result<Vec<u8
 ///
 /// Uses the streaming inflate API to get exact byte counts.
 pub fn decompress_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
-    use libakuma::print;
-    
-    print("scratch: decompress_with_consumed input_len=");
-    print_num(data.len());
-    print("\n");
-    
     // Use heap-allocated state since InflateState is large (~32KB)
     let mut state = InflateState::new_boxed(DataFormat::Zlib);
-    
-    print("scratch: InflateState created\n");
-    
-    // Start with a reasonable output buffer size
-    let mut output = Vec::with_capacity(data.len() * 2);
+
+    // Start small — `data` may be the entire remaining pack file,
+    // not just this object's compressed data.
+    let mut output = Vec::with_capacity(8192);
     let mut total_consumed = 0usize;
     let mut total_written = 0usize;
-    let mut iterations = 0usize;
-    
+
     loop {
-        iterations += 1;
-        if iterations > 1000 {
-            print("scratch: too many iterations\n");
-            return Err(Error::decompress());
+        // Grow output buffer with doubling strategy (like Vec):
+        // starts at 8KB, doubles each time, so large objects need few iterations.
+        let available = output.len() - total_written;
+        if available < 4096 {
+            let growth = output.len().max(4096);
+            output.resize(total_written + growth, 0);
         }
-        
-        // Extend output buffer if needed
-        if output.len() < total_written + 4096 {
-            output.resize(total_written + 4096, 0);
-        }
-        
+
         let input_slice = &data[total_consumed..];
         let output_slice = &mut output[total_written..];
-        
+
         let result = inflate(&mut state, input_slice, output_slice, MZFlush::None);
-        
+
         total_consumed += result.bytes_consumed;
         total_written += result.bytes_written;
-        
+
         match result.status {
             Ok(MZStatus::Ok) => {
-                // Need more output space or more input
                 if result.bytes_consumed == 0 && result.bytes_written == 0 {
-                    // No progress - need more data
-                    print("scratch: decompress no progress\n");
                     return Err(Error::decompress());
                 }
-                // Continue decompressing
             }
             Ok(MZStatus::StreamEnd) => {
-                // Done! Truncate output to actual size
                 output.truncate(total_written);
-                print("scratch: decompress done consumed=");
-                print_num(total_consumed);
-                print(" output=");
-                print_num(total_written);
-                print("\n");
                 return Ok((output, total_consumed));
             }
-            Ok(MZStatus::NeedDict) => {
-                // Preset dictionary required - not supported
-                print("scratch: decompress need dict\n");
-                return Err(Error::decompress());
-            }
-            Err(_) => {
-                print("scratch: decompress error\n");
+            Ok(MZStatus::NeedDict) | Err(_) => {
                 return Err(Error::decompress());
             }
         }
-    }
-}
-
-fn print_num(n: usize) {
-    use libakuma::print;
-    if n == 0 {
-        print("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut val = n;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        let s = core::str::from_utf8(&buf[i..i+1]).unwrap();
-        print(s);
     }
 }

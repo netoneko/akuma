@@ -19,7 +19,7 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::ssh::crypto::{split_first_word, trim_bytes};
-use crate::process::{self, Pid};
+use crate::process;
 use crate::ssh::protocol::SshChannelStream;
 use embedded_io_async::Write; // Added this line
 
@@ -509,7 +509,7 @@ pub async fn execute_external_interactive(
     cwd: Option<&str>,
     channel_stream: &mut SshChannelStream<'_>,
 ) -> Result<(), ShellError> {
-    use crate::process::{spawn_process_with_channel_cwd, YieldOnce};
+    use crate::process::spawn_process_with_channel_cwd;
     
     // Spawn process with channel and cwd
     let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
@@ -595,17 +595,8 @@ pub async fn execute_external_interactive(
                     }
                 }
                 
-                // Forward to process stdin
-                channel.write_stdin(input_data);
-
-                // Wake up the process if it's waiting for input
-                if let Some(proc) = process::lookup_process(pid) {
-                    crate::threading::disable_preemption();
-                    if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-                        waker.wake();
-                    }
-                    crate::threading::enable_preemption();
-                }
+                // Forward to process stdin using unified helper (UNIFIED I/O)
+                let _ = process::write_to_process_stdin(pid, input_data);
             }
             Err(_) => {
                 // Read error - continue
@@ -717,6 +708,7 @@ pub async fn execute_command_streaming(
     registry: &CommandRegistry,
     ctx: &mut ShellContext,
     channel_stream: &mut SshChannelStream<'_>,
+    stdin: Option<&[u8]>,
 ) -> Option<ChainExecutionResult>
 {
     // Skip interactive check entirely if not enabled - avoid double filesystem lookups
@@ -744,7 +736,7 @@ pub async fn execute_command_streaming(
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
             // Execute with interactive bidirectional I/O (pass shell's cwd)
-            let success = execute_external_interactive(&bin_path, args_slice, None, Some(ctx.cwd()), channel_stream).await.is_ok();
+            let success = execute_external_interactive(&bin_path, args_slice, stdin, Some(ctx.cwd()), channel_stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,

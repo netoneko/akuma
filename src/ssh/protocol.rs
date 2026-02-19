@@ -31,13 +31,13 @@ use super::crypto::{
     write_namelist, write_string, write_u32,
 };
 use super::keys;
-use crate::async_net::{TcpError, TcpStream};
+use crate::smoltcp_net::{TcpError, TcpStream};
 use crate::console;
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
 use crate::process::{self, Pid};
 use crate::terminal::{self, mode_flags};
-use embassy_time::Duration;
+use crate::kernel_timer::Duration;
 
 // ============================================================================
 // SSH Constants
@@ -237,7 +237,7 @@ impl<'a> SshChannelStream<'a> {
             }
 
             // Read more data from the network with timeout
-            let read_result = embassy_time::with_timeout(
+            let read_result = crate::kernel_timer::with_timeout(
                 SSH_READ_TIMEOUT,
                 self.stream.read(&mut buf)
             ).await;
@@ -298,7 +298,7 @@ impl<'a> SshChannelStream<'a> {
 
         // Try a very short timeout read from the network
         let mut tcp_buf = [0u8; 512];
-        let read_result = embassy_time::with_timeout(
+        let read_result = crate::kernel_timer::with_timeout(
             SSH_INTERACTIVE_READ_TIMEOUT,
             self.stream.read(&mut tcp_buf)
         ).await;
@@ -507,7 +507,7 @@ impl Write for SshChannelStream<'_> {
 
         // Auto-flush to ensure immediate transmission for interactive sessions
         // Use a timeout (10ms) to prevent blocking if the network is backed up
-        let _ = embassy_time::with_timeout(
+        let _ = crate::kernel_timer::with_timeout(
             SSH_INTERACTIVE_READ_TIMEOUT,
             self.flush()
         ).await;
@@ -814,17 +814,9 @@ async fn run_shell_session(
 
                 if is_raw_mode {
                     // Raw mode: Pass input directly to the process's stdin buffer
-                    if let Some(channel) = &channel_stream.current_process_channel {
-                        (*channel).write_stdin(&read_buf[..n]);
-                        // Wake up the process if it's waiting for input
-                        // This uses the waker registered by sys_poll_input_event
-                        if let Some(proc) = channel_stream.current_process_pid.and_then(|pid| process::lookup_process(pid)) {
-                            crate::threading::disable_preemption();
-                            if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-                                waker.wake();
-                            }
-                            crate::threading::enable_preemption();
-                        }
+                    // using unified helper (UNIFIED I/O)
+                    if let Some(pid) = channel_stream.current_process_pid {
+                        let _ = process::write_to_process_stdin(pid, &read_buf[..n]);
                     }
                     // No echo, no line editing in raw mode
                 } else {
@@ -887,7 +879,7 @@ async fn run_shell_session(
                                             // This provides real-time output for long-running commands
                                             let result = if let Some(streaming_result) = 
                                                 shell::execute_command_streaming(
-                                                    trimmed, &registry, &mut ctx, &mut channel_stream,
+                                                    trimmed, &registry, &mut ctx, &mut channel_stream, None,
                                                 ).await 
                                             {
                                                 streaming_result
@@ -1329,7 +1321,7 @@ async fn handle_message(
                             // Try streaming execution for simple external binaries
                             if let Some(_streaming_result) = 
                                 shell::execute_command_streaming(
-                                    trimmed, &registry, &mut exec_ctx, &mut channel_stream,
+                                    trimmed, &registry, &mut exec_ctx, &mut channel_stream, None,
                                 ).await 
                             {
                                 // Output was already streamed
@@ -1517,7 +1509,7 @@ pub async fn handle_connection(mut stream: TcpStream) {
             SSH_HANDSHAKE_TIMEOUT
         };
         
-        let read_result = embassy_time::with_timeout(timeout, stream.read(&mut buf)).await;
+        let read_result = crate::kernel_timer::with_timeout(timeout, stream.read(&mut buf)).await;
         
         match read_result {
             Err(_timeout) => {

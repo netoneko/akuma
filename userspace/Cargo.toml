@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "libakuma",
     "libakuma-tls",
-    "chainlink",
+    "box",
+    "cat",
     "doom",
     "echo2",
     "elftest",
@@ -18,7 +19,11 @@ members = [
     "stdcheck",
     "wget",
     "termtest",
-    "allocstress"
+    "allocstress",
+    "top",
+    "paws",
+    "tcc",
+    "tar"
 ]
 
 [profile.dev]

@@ -35,6 +35,8 @@ pub mod syscall {
     pub const MMAP: u64 = 222;
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
+    pub const UNLINKAT: u64 = 35;
+    pub const RENAMEAT: u64 = 38;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
@@ -51,10 +53,28 @@ pub mod syscall {
     pub const SHOW_CURSOR: u64 = 311;
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
+    pub const GET_CPU_STATS: u64 = 314;
+    pub const SPAWN_EXT: u64 = 315;
+    pub const REGISTER_BOX: u64 = 316;
+    pub const KILL_BOX: u64 = 317;
+    pub const REATTACH: u64 = 318;
     // Framebuffer Syscalls
-    pub const FB_INIT: u64 = 314;
-    pub const FB_DRAW: u64 = 315;
-    pub const FB_INFO: u64 = 316;
+    pub const FB_INIT: u64 = 319;
+    pub const FB_DRAW: u64 = 320;
+    pub const FB_INFO: u64 = 321;
+}
+
+/// Thread CPU statistics for top command
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadCpuStat {
+    pub tid: u32,
+    pub pid: u32,
+    pub box_id: u64,
+    pub total_time_us: u64,
+    pub state: u8,
+    pub _reserved: [u8; 7],
+    pub name: [u8; 16],
 }
 
 /// File descriptors
@@ -478,7 +498,7 @@ pub fn sleep(seconds: u64) {
 /// Sleep for the specified number of milliseconds
 #[inline(never)]
 pub fn sleep_ms(milliseconds: u64) {
-    let nanos = milliseconds * 1_000_000;
+    let nanos = milliseconds.saturating_mul(1000_000);
     syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
 }
 
@@ -882,38 +902,74 @@ pub fn mkdir(path: &str) -> i32 {
     ) as i32
 }
 
+/// Delete a file
+pub fn unlink(path: &str) -> i32 {
+    syscall(
+        syscall::UNLINKAT,
+        -100i32 as u64, // AT_FDCWD
+        path.as_ptr() as u64,
+        path.len() as u64,
+        0, // flags
+        0, 0,
+    ) as i32
+}
+
+/// Rename/move a file or directory
+pub fn rename(old_path: &str, new_path: &str) -> i32 {
+    syscall(
+        syscall::RENAMEAT,
+        -100i32 as u64, // AT_FDCWD
+        old_path.as_ptr() as u64,
+        old_path.len() as u64,
+        -100i32 as u64, // AT_FDCWD
+        new_path.as_ptr() as u64,
+        new_path.len() as u64,
+    ) as i32
+}
+
 /// Create a directory and all parent directories
 ///
 /// Returns true on success (directory exists or was created).
 pub fn mkdir_p(path: &str) -> bool {
-    // First check if it already exists by trying to open it
-    let fd = open(path, open_flags::O_RDONLY);
-    if fd >= 0 {
-        close(fd);
-        return true; // Already exists
+    // If path is empty, we're done
+    if path.is_empty() {
+        return true;
     }
 
     // Try to create parent directories
     let mut current = alloc::string::String::new();
-    for component in path.split('/') {
+    let components: alloc::vec::Vec<&str> = path.split('/').collect();
+    
+    for (i, component) in components.iter().enumerate() {
         if component.is_empty() {
-            current.push('/');
+            if i == 0 {
+                current.push('/');
+            }
             continue;
         }
+        
         if !current.is_empty() && !current.ends_with('/') {
             current.push('/');
         }
         current.push_str(component);
         
-        // Try to create this directory (ignore errors for existing dirs)
+        // Try to create this directory
         let _ = mkdir(&current);
     }
 
-    // Check if final path exists now
+    // Check if the final path exists and is a directory
+    // We use fstat to check if it's a directory
     let fd = open(path, open_flags::O_RDONLY);
     if fd >= 0 {
+        let mut success = false;
+        if let Ok(stat) = fstat(fd) {
+            // S_IFDIR is 0x4000
+            if (stat.st_mode & 0xF000) == 0x4000 {
+                success = true;
+            }
+        }
         close(fd);
-        true
+        success
     } else {
         false
     }
@@ -1099,6 +1155,11 @@ pub fn kill(pid: u32) -> i32 {
     syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
 }
 
+/// Reattach I/O to a target process
+pub fn reattach(pid: u32) -> i32 {
+    syscall(syscall::REATTACH, pid as u64, 0, 0, 0, 0, 0) as i32
+}
+
 /// Wait for a child process (non-blocking)
 ///
 /// Returns:
@@ -1187,11 +1248,17 @@ pub fn clear_screen() -> i32 {
 
 /// Checks for and returns pending input events.
 pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
+    let timeout_us = if timeout_ms == core::u64::MAX {
+        core::u64::MAX
+    } else {
+        timeout_ms.saturating_mul(1000)
+    };
+
     let ret = syscall(
         syscall::POLL_INPUT_EVENT,
-        timeout_ms,
         event_buf.as_mut_ptr() as u64,
         event_buf.len() as u64,
+        timeout_us,
         0, 0, 0,
     ) as i64;
 
@@ -1200,6 +1267,18 @@ pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
     } else {
         ret as isize // Return bytes read
     }
+}
+
+/// Get CPU statistics for all threads.
+/// 
+/// Populates the provided slice with statistics. Returns the number of threads.
+pub fn get_cpu_stats(stats: &mut [ThreadCpuStat]) -> usize {
+    syscall(
+        syscall::GET_CPU_STATS,
+        stats.as_mut_ptr() as u64,
+        stats.len() as u64,
+        0, 0, 0, 0,
+    ) as usize
 }
 
 /// Directory entry from getdents64

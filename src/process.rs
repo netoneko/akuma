@@ -159,6 +159,189 @@ const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 pub type Pid = u32;
 
 // ============================================================================
+// Box Registry (for container management)
+// ============================================================================
+
+/// Information about an active box (container)
+#[derive(Debug, Clone)]
+pub struct BoxInfo {
+    pub id: u64,
+    pub name: String,
+    pub root_dir: String,
+    pub creator_pid: Pid,
+    pub primary_pid: Pid,
+}
+
+/// Global registry of active boxes
+static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Register a new box in the global registry
+pub fn register_box(info: BoxInfo) {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().insert(info.id, info);
+    })
+}
+
+/// Unregister a box from the global registry
+pub fn unregister_box(id: u64) -> Option<BoxInfo> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().remove(&id)
+    })
+}
+
+/// List all active boxes
+pub fn list_boxes() -> Vec<BoxInfo> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().values().cloned().collect()
+    })
+}
+
+/// Find a box ID by name
+pub fn find_box_by_name(name: &str) -> Option<u64> {
+    crate::irq::with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().values().find(|b| b.name == name).map(|b| b.id)
+    })
+}
+
+/// Initialize the box registry with Box 0 (Host)
+pub fn init_box_registry() {
+    register_box(BoxInfo {
+        id: 0,
+        name: String::from("host"),
+        root_dir: String::from("/"),
+        creator_pid: 0, // System
+        primary_pid: 1, // Init
+    });
+}
+
+/// Write data to a process's stdin (handling both legacy buffer and ProcessChannel)
+pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
+    let proc = lookup_process(pid).ok_or("Process not found")?;
+    
+    // If this process has delegated its I/O to another PID (reattach), forward it
+    if let Some(target_pid) = proc.delegate_pid {
+        // Use with_irqs_disabled or release lock before recursing if needed, 
+        // but lookup_process handles its own locking.
+        return write_to_process_stdin(target_pid, data);
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Writing {} bytes to PID {} ({}) stdin\n", data.len(), pid, proc.name);
+    }
+
+    // 1. Write to the legacy StdioBuffer (for procfs visibility)
+    proc.stdin.lock().write_with_limit(data, crate::config::PROC_STDIN_MAX_SIZE);
+    
+    // 2. If the process has a ProcessChannel, write to it so the process actually 
+    // receives the input in sys_read/sys_poll_input_event.
+    if let Some(ref channel) = proc.channel {
+        channel.write_stdin(data);
+        
+        // 3. Wake up the process if it's waiting for input in sys_poll_input_event
+        crate::threading::disable_preemption();
+        if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(64, "[Process] Waking PID {}\n", pid);
+            }
+            waker.wake();
+            // Ensure scheduler runs to pick up the newly ready process
+            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+        } else {
+            // Even if no waker is registered, we should still trigger SGI
+            // to ensure the process gets a chance to poll soon.
+            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+        }
+        crate::threading::enable_preemption();
+    }
+    
+    Ok(())
+}
+
+/// Reattach I/O from the current process to a target PID
+pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+    let caller_pid = read_current_pid().ok_or("No caller context")?;
+    
+    // 1. Validate hierarchy permissions
+    let (caller_box_id, channel) = {
+        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+        (caller.box_id, caller.channel.clone())
+    };
+
+    let target_box_id = {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.box_id
+    };
+
+    let mut allowed = false;
+    if caller_box_id == 0 {
+        allowed = true; // Host can reattach anything
+    } else if target_box_id == caller_box_id {
+        allowed = true; // Same box
+    } else {
+        // Check if caller created the target's box (child box)
+        let box_info = crate::irq::with_irqs_disabled(|| {
+            BOX_REGISTRY.lock().get(&target_box_id).cloned()
+        });
+        if let Some(info) = box_info {
+            if info.creator_pid == caller_pid {
+                allowed = true;
+            }
+        }
+    }
+
+    if !allowed {
+        return Err("Permission denied: cannot reattach process outside hierarchy");
+    }
+
+    // 2. Perform the delegation
+    // Current process (e.g. 'box') now points its input to target (e.g. 'paws')
+    {
+        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+        caller.delegate_pid = Some(target_pid);
+    }
+
+    // Target process now uses caller's output channel
+    {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.channel = channel;
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Reattached PID {} -> PID {}\n", caller_pid, target_pid);
+    }
+
+    Ok(())
+}
+
+/// Kill all processes in a box and unregister it
+pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
+    if box_id == 0 {
+        return Err("Cannot kill Box 0 (Host)");
+    }
+
+    // 1. Get list of PIDs in this box
+    let pids: Vec<Pid> = crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.box_id == box_id)
+            .map(|(&pid, _)| pid)
+            .collect()
+    });
+
+    // 2. Kill each process
+    for pid in pids {
+        // kill_process handles unregistering and thread termination
+        let _ = kill_process(pid);
+    }
+
+    // 3. Unregister the box from the global registry
+    unregister_box(box_id);
+
+    Ok(())
+}
+
+// ============================================================================
 // Stdio Buffer (thread-safe stdin/stdout with size limits)
 // ============================================================================
 
@@ -357,6 +540,9 @@ pub struct ProcessChannel {
     raw_mode: AtomicBool,
 }
 
+/// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
+const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
 impl ProcessChannel {
     /// Create a new empty process channel
     pub fn new() -> Self {
@@ -377,7 +563,26 @@ impl ProcessChannel {
         // Also, VecDeque operations can trigger heap allocations which need IRQ protection.
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
-            buf.extend(data);
+            
+            // Check for buffer overflow
+            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+                // If the write itself is larger than the buffer, truncate it
+                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
+                    &data[data.len() - MAX_BUFFER_SIZE..]
+                } else {
+                    data
+                };
+                
+                // Remove old data to make room
+                let current_len = buf.len();
+                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
+                if overflow > 0 {
+                    buf.drain(..overflow.min(current_len));
+                }
+                buf.extend(data_to_write);
+            } else {
+                buf.extend(data);
+            }
         })
     }
 
@@ -394,6 +599,19 @@ impl ProcessChannel {
         })
     }
 
+    /// Read available data from the channel into a buffer
+    /// Returns number of bytes read
+    pub fn read(&self, buf: &mut [u8]) -> usize {
+        crate::irq::with_irqs_disabled(|| {
+            let mut buffer = self.buffer.lock();
+            let to_read = buf.len().min(buffer.len());
+            for (i, byte) in buffer.drain(..to_read).enumerate() {
+                buf[i] = byte;
+            }
+            to_read
+        })
+    }
+
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
         crate::irq::with_irqs_disabled(|| {
@@ -406,7 +624,24 @@ impl ProcessChannel {
     pub fn write_stdin(&self, data: &[u8]) {
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.stdin_buffer.lock();
-            buf.extend(data);
+            
+            // Check for buffer overflow
+            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
+                    &data[data.len() - MAX_BUFFER_SIZE..]
+                } else {
+                    data
+                };
+                
+                let current_len = buf.len();
+                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
+                if overflow > 0 {
+                    buf.drain(..overflow.min(current_len));
+                }
+                buf.extend(data_to_write);
+            } else {
+                buf.extend(data);
+            }
         })
     }
 
@@ -535,6 +770,13 @@ pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
 
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
+    if let Some(proc) = current_process() {
+        if let Some(ref ch) = proc.channel {
+            return Some(ch.clone());
+        }
+    }
+    
+    // Fallback to thread-ID based lookup for legacy system threads
     let thread_id = crate::threading::current_thread_id();
     get_channel(thread_id)
 }
@@ -688,6 +930,7 @@ pub fn get_stack_bounds() -> (usize, usize) {
 pub struct ProcessInfo2 {
     pub pid: Pid,
     pub ppid: Pid,
+    pub box_id: u64,
     pub name: String,
     pub state: &'static str,
 }
@@ -713,6 +956,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
             result.push(ProcessInfo2 {
                 pid,
                 ppid: proc.parent_pid,
+                box_id: proc.box_id,
                 name: proc.name.clone(),
                 state,
             });
@@ -978,6 +1222,18 @@ pub struct Process {
     pub spawner_pid: Option<Pid>,
     // ========== Terminal State ==========
     pub terminal_state: Spinlock<terminal::TerminalState>,
+
+    // ========== Isolation Context ==========
+    /// Box ID (0 = Host, >0 = Isolated Box)
+    pub box_id: u64,
+    /// Virtual Root Directory (host path that acts as / for this process)
+    pub root_dir: String,
+
+    /// I/O Channel for async/interactive communication
+    pub channel: Option<Arc<ProcessChannel>>,
+
+    /// PID to which this process has delegated its I/O (for reattach)
+    pub delegate_pid: Option<Pid>,
 }
 
 
@@ -1056,6 +1312,12 @@ impl Process {
             spawner_pid: None,
             // Terminal State - default for new processes
             terminal_state: Spinlock::new(terminal::TerminalState::default()),
+
+            // Isolation defaults: Host context (Box 0, root at /)
+            box_id: 0,
+            root_dir: String::from("/"),
+            channel: None,
+            delegate_pid: None,
         })
     }
 
@@ -1071,6 +1333,15 @@ impl Process {
     /// The cwd will be passed to the process via the ProcessInfo page.
     pub fn set_cwd(&mut self, cwd: &str) {
         self.cwd = String::from(cwd);
+        
+        // Also update the ProcessInfo page so userspace getcwd() sees it
+        unsafe {
+            let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let mut info = core::ptr::read(info_ptr);
+            if info.set_cwd(cwd) {
+                core::ptr::write(info_ptr, info);
+            }
+        }
     }
 
     /// Start executing this process (enters user mode)
@@ -1420,6 +1691,22 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // - The ASID
     // This fixes the memory leak where processes would never free their pages.
     if let Some(pid) = pid {
+        // Check if this was a primary process for an active box.
+        // If so, the entire box should be shut down.
+        let box_to_kill = crate::irq::with_irqs_disabled(|| {
+            BOX_REGISTRY.lock().values()
+                .find(|b| b.primary_pid == pid && b.id != 0)
+                .map(|b| b.id)
+        });
+
+        if let Some(bid) = box_to_kill {
+            crate::safe_print!(128, "[Process] Primary PID {} exited, shutting down box {:08x}\n", pid, bid);
+            // kill_box handles unregistering the box and killing remaining PIDs
+            if let Err(e) = kill_box(bid) {
+                crate::safe_print!(128, "[Process] Error: Failed to kill box {:08x}: {}\n", bid, e);
+            }
+        }
+
         let _dropped_process = unregister_process(pid);
         // _dropped_process goes out of scope here and is dropped, freeing all memory
         crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
@@ -1459,8 +1746,8 @@ fn cleanup_process_sockets(proc: &Process) {
     
     // Close each socket
     for (_fd, socket_idx) in socket_fds {
-        // socket_close handles abort() and deferred buffer cleanup
-        let _ = crate::socket::socket_close(socket_idx);
+        // remove_socket handles smoltcp socket removal
+        crate::socket::remove_socket(socket_idx);
     }
 }
 
@@ -1650,6 +1937,18 @@ pub fn spawn_process_with_channel_cwd(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    spawn_process_with_channel_ext(path, args, stdin, cwd, None, 0)
+}
+
+/// Extended version of spawn_process_with_channel
+pub fn spawn_process_with_channel_ext(
+    path: &str,
+    args: Option<&[&str]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
+    root_dir: Option<&str>,
+    box_id: u64,
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // Check if user threads are available
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
@@ -1663,9 +1962,20 @@ pub fn spawn_process_with_channel_cwd(
     let mut process = Process::from_elf(path, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
+    // Create a channel for this process
+    let channel = Arc::new(ProcessChannel::new());
+    
+    // Seed the channel with initial stdin data if provided
+    if let Some(data) = stdin {
+        channel.write_stdin(data);
+    }
+
+    // Set the channel in the process struct (UNIFIED I/O)
+    process.channel = Some(channel.clone());
+
     // Set up arguments if provided
     if let Some(arg_slice) = args {
-        process.set_args(arg_slice);
+        process.args = arg_slice.iter().map(|s| String::from(*s)).collect();
     }
 
     // Set up stdin if provided
@@ -1678,6 +1988,36 @@ pub fn spawn_process_with_channel_cwd(
         process.set_cwd(dir);
     }
 
+    // Set up isolation context (Inherit from caller by default)
+    let (caller_box_id, caller_root_dir) = match read_current_pid() {
+        Some(pid) => {
+            if let Some(proc) = lookup_process(pid) {
+                (proc.box_id, proc.root_dir.clone())
+            } else {
+                (0, String::from("/"))
+            }
+        }
+        None => (0, String::from("/")), // Kernel context
+    };
+
+    if let Some(root) = root_dir {
+        process.root_dir = String::from(root);
+    } else {
+        process.root_dir = caller_root_dir;
+    }
+
+    if box_id != 0 {
+        process.box_id = box_id;
+    } else {
+        // Note: box_id 0 means "unspecified" in the arg, 
+        // so we inherit unless it's explicitly 0 from a non-boxed caller.
+        process.box_id = caller_box_id;
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[Process] Spawning {} (box_id={}, root_dir={})\n", path, process.box_id, process.root_dir);
+    }
+
     // Set spawner PID (the process that called spawn, if any)
     // This is used by procfs to control who can write to stdin
     process.spawner_pid = read_current_pid();
@@ -1685,41 +2025,64 @@ pub fn spawn_process_with_channel_cwd(
     // Get the PID before boxing
     let pid = process.pid;
 
-    // Box the process for heap allocation - this is CRITICAL for memory management.
-    // Previously, the Process lived on the closure's stack, but execute() never returns
-    // (it ERETs to userspace), so Process::drop() was never called, causing memory leaks.
-    // Now we Box it and register in PROCESS_TABLE which owns it. When the process exits,
-    // unregister_process() returns the Box which is then dropped, freeing all memory.
-    let mut boxed_process = Box::new(process);
+    // Box the process for heap allocation
+    let boxed_process = Box::new(process);
 
-    // Create a channel for this process
-    let channel = Arc::new(ProcessChannel::new());
-    let channel_for_thread = channel.clone();
+    // CRITICAL: Register the process in the table immediately.
+    // This ensures that lookup_process(pid) works as soon as this function returns,
+    // allowing reattach() to succeed without races.
+    register_process(pid, boxed_process);
+
+    // Register the channel for the thread ID placeholder (0 for now, will be updated)
+    // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
+    register_channel(0, channel.clone());
 
     // Spawn on a user thread
-    // Use spawn_user_thread_fn_for_process which starts with IRQs disabled
-    // to prevent the race where timer fires before activate() sets user TTBR0.
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
-        // NOTE: IRQs are already disabled from thread creation.
-        // spawn_user_thread_fn_for_process starts the thread with DAIF.I set,
-        // preventing timer from preempting before activate() sets user TTBR0.
-        
-        // Register channel for this thread so syscalls can find it
-        // return_to_kernel() will call remove_channel() and set_exited() when process exits
         let tid = crate::threading::current_thread_id();
-        register_channel(tid, channel_for_thread);
-
-        // Set thread_id on process for kill support
-        boxed_process.thread_id = Some(tid);
-
-        // Execute the process using execute_boxed which registers the Box
-        // in PROCESS_TABLE (transferring ownership) then enters userspace.
-        // This never returns - when user exits, return_to_kernel() handles cleanup.
-        execute_boxed(boxed_process)
+        
+        // Update thread_id in the registered process
+        if let Some(p) = lookup_process(pid) {
+            p.thread_id = Some(tid);
+            
+            // Move the channel registration to the correct TID
+            remove_channel(0);
+            register_channel(tid, p.channel.as_ref().unwrap().clone());
+            
+            // Execute the process (already in the table)
+            run_registered_process(pid);
+        } else {
+            crate::safe_print!(64, "[Process] FATAL: PID {} disappeared during spawn\n", pid);
+            loop { crate::threading::yield_now(); }
+        }
     })
     .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
 
+    // Set the thread ID in the process table entry for the parent to see immediately
+    if let Some(p) = lookup_process(pid) {
+        p.thread_id = Some(thread_id);
+    }
+
     Ok((thread_id, channel, pid))
+}
+
+/// Execute a process that is already registered in the PROCESS_TABLE
+fn run_registered_process(pid: Pid) -> ! {
+    let proc = lookup_process(pid).expect("Process not found in run_registered_process");
+    
+    // Prepare the process (set state, write process info page)
+    proc.prepare_for_execution();
+    
+    // Activate the user address space (sets TTBR0)
+    proc.address_space.activate();
+
+    // Now safe to enable IRQs - TTBR0 is set to user tables
+    crate::irq::enable_irqs();
+
+    // Enter user mode via ERET - this never returns
+    unsafe {
+        enter_user_mode(&proc.context);
+    }
 }
 
 /// Execute a binary asynchronously and return its output when complete
@@ -1811,49 +2174,22 @@ where
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
 
-    // Poll for output and completion
+    // Stream output until process exits
     loop {
-        // Drain any available output and write to stream
+        // Read available data
         if let Some(data) = channel.try_read() {
-            // Write all data at once, then flush
-            let mut buf = alloc::vec::Vec::new();
-            for &byte in &data {
-                if byte == b'\n' {
-                    buf.extend_from_slice(b"\r\n");
-                } else {
-                    buf.push(byte);
-                }
-            }
-            
-            let _ = output.write_all(&buf).await;
-            
-            // Flush output to push to network
-            let _ = output.flush().await;
-            
-            // Yield aggressively to allow network transmission
-            for _ in 0..100 {
-                crate::threading::yield_now();
+            if let Err(_e) = output.write_all(&data).await {
+                // Writer failed, likely connection closed
+                break;
             }
         }
 
         // Check if process has exited
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
-            // Drain any remaining output
-            while let Some(data) = channel.try_read() {
-                let mut buf = alloc::vec::Vec::new();
-                for &byte in &data {
-                    if byte == b'\n' {
-                        buf.extend_from_slice(b"\r\n");
-                    } else {
-                        buf.push(byte);
-                    }
-                }
-                let _ = output.write_all(&buf).await;
-            }
-            let _ = output.flush().await;
-            for _ in 0..100 {
-                crate::threading::yield_now();
-            }
+            break;
+        }
+
+        if channel.is_interrupted() {
             break;
         }
 
@@ -1861,11 +2197,19 @@ where
         YieldOnce::new().await;
     }
 
-    let exit_code = channel.exit_code();
+    // Drain remaining output
+    if let Some(data) = channel.try_read() {
+        let _ = output.write_all(&data).await;
+    }
+
+    let exit_code = if channel.is_interrupted() && !channel.has_exited() {
+        130 // Interrupted
+    } else {
+        channel.exit_code()
+    };
 
     // Final cleanup
     crate::threading::cleanup_terminated();
 
     Ok(exit_code)
 }
-
