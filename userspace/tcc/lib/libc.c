@@ -34,6 +34,10 @@ long write(int fd, const void *buf, size_t count) {
     return syscall(2, fd, (long)buf, count, 0, 0, 0);
 }
 
+void __arm64_clear_cache(void *beg, void *end) {
+    // Stub
+}
+
 __attribute__((visibility("default")))
 int printf(const char *format, ...) {
     va_list ap;
@@ -82,12 +86,18 @@ int printf(const char *format, ...) {
                     }
                 }
                 while (i > 0) write(1, &buf[--i], 1);
+            } else if (*format == 'c') {
+                char c = (char)va_arg(ap, int);
+                write(1, &c, 1);
             } else if (*format == '%') {
                 write(1, "%", 1);
             } else {
                 write(1, "?", 1);
             }
             format++;
+        } else if (*format == '\\' && *(format + 1) == 'n') {
+            write(1, "\n", 1);
+            format += 2;
         } else {
             write(1, format, 1);
             format++;

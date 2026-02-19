@@ -41,4 +41,6 @@ typedef unsigned long long uintmax_t;
 #define INTMAX_MIN INT64_MIN
 #define UINTMAX_MAX UINT64_MAX
 
+void __arm64_clear_cache(void *beg, void *end);
+
 #endif /* _STDINT_H */
