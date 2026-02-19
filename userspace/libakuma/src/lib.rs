@@ -58,6 +58,8 @@ pub mod syscall {
     pub const KILL_BOX: u64 = 317;
     pub const REATTACH: u64 = 318;
     pub const UPTIME: u64 = 319;
+    pub const SET_TID_ADDRESS: u64 = 96;
+    pub const SET_TPIDR_EL0: u64 = 320;
 }
 
 /// Thread CPU statistics for top command

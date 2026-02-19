@@ -34,6 +34,7 @@ pub mod nr {
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
+    pub const SET_TID_ADDRESS: u64 = 96;
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
@@ -56,6 +57,7 @@ pub mod nr {
     pub const KILL_BOX: u64 = 317;
     pub const REATTACH: u64 = 318;
     pub const UPTIME: u64 = 319;
+    pub const SET_TPIDR_EL0: u64 = 320;
 }
 
 /// Thread CPU statistics for top command
@@ -131,8 +133,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
+        nr::SET_TID_ADDRESS => 0, // Stub for now
+        nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => !0 // ENOSYS
     }
+}
+
+fn sys_set_tpidr_el0(address: u64) -> u64 {
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) address);
+    }
+    0
 }
 
 fn sys_exit(code: i32) -> u64 {

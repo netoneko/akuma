@@ -102,17 +102,17 @@ sync_el0_handler:
     // CRITICAL: We must save ALL user registers we're about to clobber!
     
     // First, allocate space for the ENTIRE trap frame at once to avoid overlap issues.
-    // Trap frame: 280 bytes for user regs + 16 bytes for saved kernel SP = 296 bytes
-    sub     sp, sp, #296
+// Trap frame: 288 bytes for user regs + 16 bytes for saved kernel SP = 304 bytes
+    sub     sp, sp, #304
     
     // Now save user x8-x11 first (we'll clobber these for stack operations)
     stp     x8, x9, [sp, #64]       // x8, x9 at offset 64, 72
     stp     x10, x11, [sp, #80]     // x10, x11 at offset 80, 88
     
     // Save kernel SP (for return_to_kernel) at the top of our frame
-    // Kernel SP = current SP + 296 (the value before we allocated)
-    add     x9, sp, #296
-    str     x9, [sp, #280]          // Saved at offset 280
+    // Kernel SP = current SP + 304 (the value before we allocated)
+    add     x9, sp, #304
+    str     x9, [sp, #288]          // Saved at offset 288
     
     // Save x0-x7 (not clobbered)
     stp     x0, x1, [sp, #0]
@@ -141,8 +141,12 @@ sync_el0_handler:
     // Save SPSR_EL1
     mrs     x0, spsr_el1
     str     x0, [sp, #264]
+
+    // Save TPIDR_EL0 (TLS)
+    mrs     x0, tpidr_el0
+    str     x0, [sp, #272]
     
-    // Padding at [sp, #272], kernel SP at [sp, #280]
+    // Padding at [sp, #280], kernel SP at [sp, #288]
     
     // Pass pointer to saved context as first arg
     mov     x0, sp
@@ -161,7 +165,7 @@ sync_el0_handler:
     
     // x0 now has the syscall return value
     // Save it to scratch area while we restore other registers
-    str     x0, [sp, #272]
+    str     x0, [sp, #280]
     
     // Restore SPSR_EL1 (clear IL bit to prevent EC=0xe)
     ldr     x0, [sp, #264]
@@ -175,6 +179,10 @@ sync_el0_handler:
     // Restore SP_EL0
     ldr     x0, [sp, #248]
     msr     sp_el0, x0
+
+    // Restore TPIDR_EL0 (TLS)
+    ldr     x0, [sp, #272]
+    msr     tpidr_el0, x0
     
     // Restore x30
     ldr     x30, [sp, #240]
@@ -225,10 +233,10 @@ sync_el0_handler:
     ldr     x1, [sp, #8]
     
     // Load syscall return value into x0
-    ldr     x0, [sp, #272]
+    ldr     x0, [sp, #280]
     
-    // Cleanup stack frame (296 bytes)
-    add     sp, sp, #296
+    // Cleanup stack frame (304 bytes)
+    add     sp, sp, #304
     
     // Return to user mode
     eret
@@ -237,7 +245,7 @@ sync_el0_handler:
 // UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 // 
-// EL0 IRQ frame layout (288 bytes total):
+// EL0 IRQ frame layout (304 bytes total):
 //   [sp+0]:   x30 + padding
 //   [sp+16]:  x28, x29
 //   [sp+32]:  x26, x27
@@ -255,15 +263,20 @@ sync_el0_handler:
 //   [sp+224]: x0, x1
 //   [sp+240]: ELR_EL1, SPSR_EL1
 //   [sp+256]: SP_EL0 + padding
-//   [sp+272]: x10, x11
+//   [sp+272]: TPIDR_EL0 + padding
+//   [sp+288]: x10, x11
 irq_el0_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
-    // EL0 IRQ frame: 288 bytes (includes SP_EL0)
+    // EL0 IRQ frame: 304 bytes (includes SP_EL0, TPIDR_EL0)
     // ============================================================
     
-    // First save x10, x11 (need them for ELR/SPSR/SP_EL0)
+    // First save x10, x11 (need them for system registers)
     stp     x10, x11, [sp, #-16]!
+
+    // Save TPIDR_EL0 (TLS thread pointer)
+    mrs     x10, tpidr_el0
+    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
     
     // Save SP_EL0 (user stack pointer) - unique to EL0 handler
     mrs     x10, sp_el0
@@ -344,6 +357,10 @@ irq_el0_handler:
     // Restore SP_EL0 (user stack pointer)
     ldr     x10, [sp], #16           // Load SP_EL0 from stack
     msr     sp_el0, x10
+
+    // Restore TPIDR_EL0 (TLS thread pointer)
+    ldr     x10, [sp], #16
+    msr     tpidr_el0, x10
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16
@@ -354,7 +371,7 @@ irq_el0_handler:
 // UNIFIED: Stack-based save/restore, same frame layout as EL0 IRQ handler.
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 //
-// UNIFIED IRQ frame layout (288 bytes total) - same as EL0:
+// UNIFIED IRQ frame layout (304 bytes total) - same as EL0:
 //   [sp+0]:   x30 + padding
 //   [sp+16]:  x28, x29
 //   [sp+32]:  x26, x27
@@ -371,16 +388,21 @@ irq_el0_handler:
 //   [sp+208]: x2, x3
 //   [sp+224]: x0, x1
 //   [sp+240]: ELR_EL1, SPSR_EL1
-//   [sp+256]: SP_EL0 + padding (preserved for user stack during syscalls)
-//   [sp+272]: x10, x11
+//   [sp+256]: SP_EL0 + padding
+//   [sp+272]: TPIDR_EL0 + padding
+//   [sp+288]: x10, x11
 irq_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
-    // IRQ frame: 288 bytes total (unified with EL0 handler)
+    // IRQ frame: 304 bytes total (unified with EL0 handler)
     // ============================================================
     
-    // First save x10, x11 (need them for ELR/SPSR/SP_EL0)
+    // First save x10, x11 (need them for system registers)
     stp     x10, x11, [sp, #-16]!
+
+    // Save TPIDR_EL0 (TLS thread pointer)
+    mrs     x10, tpidr_el0
+    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
     
     // Save SP_EL0 - preserves user stack during syscalls and enables
     // unified frame layout between EL0 and EL1 handlers
@@ -462,6 +484,10 @@ irq_handler:
     // Restore SP_EL0 (user stack pointer) - matches EL0 handler frame layout
     ldr     x10, [sp], #16
     msr     sp_el0, x10
+
+    // Restore TPIDR_EL0 (TLS thread pointer)
+    ldr     x10, [sp], #16
+    msr     tpidr_el0, x10
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16

@@ -6,6 +6,8 @@ use crate::config;
 use crate::console;
 use crate::fs;
 use crate::process;
+use alloc::string::String;
+use alloc::string::ToString;
 
 /// Run all process tests
 pub fn run_all_tests() {
@@ -125,7 +127,7 @@ fn test_echo2() {
             );
 
             // Try to create a process from the ELF
-            match process::Process::from_elf("echo2", &data) {
+            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &data) {
                 Ok(proc) => {
                     crate::safe_print!(96, 
                         "[Test] Process created: PID={}, entry={:#x}\n",
