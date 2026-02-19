@@ -53,19 +53,42 @@ To create a new userspace program, the `cc` binary (powered by `tinycc`), for Ak
 *   **`config.h` Paths**: TCC's internal configuration (specifically `CONFIG_TCCDIR`, `CONFIG_TCC_SYSINCLUDE_PATHS`, `CONFIG_TCC_LIBPATHS`, `CONFIG_TCC_CRTPREFIX` in `userspace/tcc/src/config.h`) was updated to point directly to `/usr/include` and `/usr/lib`. This ensures that after `tcc install` is run, `tcc` automatically finds its runtime dependencies in the standard FHS locations.
 *   **Build System Cleanup**: The `cp` commands that previously copied these files into the `bootstrap` directory (for disk image creation) were removed from `userspace/build.sh`, as `tcc` now handles its own runtime installation.
 
-### Exact File Extraction Locations
+### 6. Stability and Runtime Fixes (2026)
 
-When `tcc install` is executed, the embedded files will be written to the Akuma filesystem at the following locations:
+Several critical issues were resolved to move TCC from a crashing state to a functional compiler producing working binaries.
 
-**Base Installation Directory**: `/usr`
+**A. `vsnprintf` Synchronization and `*` Support**
+*   **Problem**: TCC's verbose output uses `%*s` for indentation. The previous minimal `vsnprintf` did not handle the `*` width specifier, causing it to skip the `int` argument in the `va_list`. This desynchronized the argument pointer, leading to subsequent strings being interpreted as pointers to invalid memory, causing segmentation faults.
+*   **Solution**: Replaced the minimal `vsnprintf` in `libc_stubs.c` with a robust implementation that correctly handles variable width (`*`), precision, and various length modifiers (`l`, `ll`, `z`).
 
-This setup makes TCC a self-sufficient C compiler that can bootstrap its own development environment on Akuma OS.
+**B. Memory Allocation Alignment (`Layout`)**
+*   **Problem**: The Rust `malloc` wrapper used `Layout::from_size_align(size + 8, 8)`. If `size + 8` was not a multiple of 8, `Layout` creation could fail on some Rust versions, returning `NULL` to TCC. Additionally, `malloc(0)` was returning `NULL`, which some C programs treat as an error.
+*   **Solution**: Updated `malloc`, `realloc`, and `free` in `main.rs` to always round the allocation size up to the nearest 8-byte boundary. Added support for `malloc(0)` returning a valid unique pointer.
+
+**C. Cross-Compilation of Runtime Objects**
+*   **Problem**: When building on macOS, `cc-rs` defaulted to the host compiler, producing Mach-O objects for `libc.o`, `crt1.o`, etc. TCC's ELF linker could not resolve symbols from these mismatched formats, leading to `undefined symbol 'printf'` errors.
+*   **Solution**: Updated `build.rs` to explicitly pass `-target aarch64-none-elf` to the compiler for all runtime objects and support libraries.
+
+**D. GNU Archive Format and Symbol Indexing**
+*   **Problem**: On macOS, `ar` produces BSD-style archives with a `__.SYMDEF` member for the symbol table. TCC's ELF linker expects the GNU-style symbol table (named `/`). Furthermore, archives without a proper index caused symbol resolution failures.
+*   **Solution**: 
+    *   Modified `build.rs` to prefer `llvm-ar` and `llvm-ranlib` (from Homebrew paths if necessary).
+    *   Forced the GNU archive format using the `--format=gnu` flag for `llvm-ar`.
+    *   Explicitly ran `ranlib` on all generated archives to ensure a valid symbol map.
+
+**E. Kernel-Side Relocation Support**
+*   **Problem**: TCC generates position-independent-like code using a Global Offset Table (GOT) for strings and global data. It emits `R_AARCH64_RELATIVE` relocations that must be applied at load time. Akuma's `elf_loader` previously ignored these, leaving GOT entries as zero and causing null pointer dereferences (Data Aborts).
+*   **Solution**: Updated `src/elf_loader.rs` in the Akuma kernel to parse the ELF section headers, locate `SHT_RELA` sections, and apply `R_AARCH64_RELATIVE` relocations by writing the `addend` into the target virtual address.
+
+**F. Runtime `printf` Escaping and `__arm64_clear_cache`**
+*   **Problem**: Compiled binaries printed `\n` literally instead of a newline because the minimal `libc.c` didn't handle the sequence. Also, TCC's internal runtime library (`lib-arm64.c`) failed to build due to a missing declaration of `__arm64_clear_cache`.
+*   **Solution**:
+    *   Improved `printf` in `lib/libc.c` to handle `\n` and added `%c` support.
+    *   Added a declaration for `__arm64_clear_cache` in `include/stdint.h` and a stub in `lib/libc.c` to satisfy the compiler.
 
 ## MISSING PARTS
 
-in build.rs, compile everything as expected, including a libc binary, then put the headers and
-   object files and libc into a zlib archive (if it does not support files use tar I guess)
-   update build.sh to put this into correct target directory
-   then update built-in "pkg install" so it would know to try to download the binary and if it does not
-   exist try to download and extract an archive
-   first extract to a temporary location, then move the files
+*   Update `built-in "pkg install"` so it would know to try to download the binary and if it does not
+   exist try to download and extract an archive (Partially implemented: `paws` now handles this).
+*   Implement more complete C library functions in `lib/libc.c` (e.g., `fopen`, `fread`) to allow more complex C programs to run.
+*   Support more relocation types in the kernel ELF loader if needed for larger programs.
