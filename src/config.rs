@@ -39,8 +39,9 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// Stack allocated for user-space ELF processes.
 /// Increased from 64KB due to stack overflow in scratch (git clone)
 /// when using miniz_oxide zlib decompression with deep call stacks.
+/// Increased to 512KB for DOOM which has deep rendering call stacks.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 128 * 1024;
+pub const USER_STACK_SIZE: usize = 512 * 1024;
 
 /// Maximum kernel threads
 ///

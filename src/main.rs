@@ -21,6 +21,7 @@ mod embassy_time_driver;
 mod embassy_virtio_driver;
 mod exceptions;
 mod executor;
+mod fw_cfg;
 mod fs;
 mod fs_tests;
 mod gic;
@@ -30,6 +31,7 @@ mod network;
 mod pmm;
 mod process;
 mod process_tests;
+mod ramfb;
 mod rng;
 mod shell;
 mod shell_tests;
@@ -394,6 +396,20 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         Err(e) => {
             console::print("[RNG] Hardware RNG not available: ");
             crate::safe_print!(32, "{}\n", e);
+        }
+    }
+
+    // =========================================================================
+    // Framebuffer initialization (ramfb via fw_cfg)
+    // =========================================================================
+    match ramfb::init(320, 200) {
+        Ok(()) => {
+            console::print("[ramfb] Framebuffer ready\n");
+        }
+        Err(e) => {
+            console::print("[ramfb] Not available: ");
+            console::print(e);
+            console::print("\n");
         }
     }
 

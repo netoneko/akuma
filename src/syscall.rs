@@ -46,6 +46,10 @@ pub mod nr {
     pub const SHOW_CURSOR: u64 = 311;
     pub const CLEAR_SCREEN: u64 = 312;
     pub const POLL_INPUT_EVENT: u64 = 313;
+    // Framebuffer Syscalls (314-316)
+    pub const FB_INIT: u64 = 314;
+    pub const FB_DRAW: u64 = 315;
+    pub const FB_INFO: u64 = 316;
 }
 
 /// Error code for interrupted syscall
@@ -121,6 +125,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHOW_CURSOR => sys_show_cursor(),
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1], args[2]),
+        nr::FB_INIT => sys_fb_init(args[0] as u32, args[1] as u32),
+        nr::FB_DRAW => sys_fb_draw(args[0], args[1] as usize),
+        nr::FB_INFO => sys_fb_info(args[0]),
         _ => {
             if config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(64, "[Syscall] Unknown syscall: {}\n", syscall_num);
@@ -2433,4 +2440,78 @@ fn sys_chdir(path_ptr: u64, path_len: usize) -> u64 {
     }
 
     0
+}
+
+// ============================================================================
+// Framebuffer Syscalls
+// ============================================================================
+
+/// sys_fb_init - Initialize the ramfb framebuffer
+///
+/// # Arguments
+/// * `width` - Desired framebuffer width in pixels
+/// * `height` - Desired framebuffer height in pixels
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+fn sys_fb_init(width: u32, height: u32) -> u64 {
+    if width == 0 || height == 0 || width > 1920 || height > 1080 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    match crate::ramfb::init(width, height) {
+        Ok(()) => 0,
+        Err(_) => (-libc_errno::EIO as i64) as u64,
+    }
+}
+
+/// sys_fb_draw - Copy pixel data from userspace buffer to framebuffer
+///
+/// # Arguments
+/// * `buf_ptr` - Pointer to userspace XRGB8888 pixel buffer
+/// * `buf_len` - Length of the buffer in bytes
+///
+/// # Returns
+/// Number of bytes copied on success, negative errno on failure
+fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    if !crate::ramfb::is_initialized() {
+        return (-libc_errno::EIO as i64) as u64;
+    }
+
+    // Read pixels from userspace buffer
+    let src = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, buf_len) };
+
+    let copied = crate::ramfb::draw(src);
+    if copied == 0 {
+        (-libc_errno::EIO as i64) as u64
+    } else {
+        copied as u64
+    }
+}
+
+/// sys_fb_info - Get framebuffer information
+///
+/// # Arguments
+/// * `info_ptr` - Pointer to userspace FBInfo struct to fill
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+fn sys_fb_info(info_ptr: u64) -> u64 {
+    if info_ptr == 0 {
+        return (-libc_errno::EINVAL as i64) as u64;
+    }
+
+    match crate::ramfb::info() {
+        Some(info) => {
+            unsafe {
+                core::ptr::write(info_ptr as *mut crate::ramfb::FBInfo, info);
+            }
+            0
+        }
+        None => (-libc_errno::EIO as i64) as u64,
+    }
 }

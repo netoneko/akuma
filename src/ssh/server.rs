@@ -366,7 +366,7 @@ pub async fn run(stack: Stack<'static>) {
 
                 let (rx, tx) = unsafe { get_buffer_refs(slot) };
                 let mut socket = TcpSocket::new(stack, rx, tx);
-                socket.set_timeout(Some(Duration::from_secs(60)));
+                socket.set_timeout(Some(Duration::from_secs(3600)));
                 listen_socket = Some(socket);
             }
 

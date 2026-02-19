@@ -386,6 +386,17 @@ impl<'a> SshChannelStream<'a> {
                 self.session.channel_eof = true;
                 return Ok(true);
             }
+            SSH_MSG_GLOBAL_REQUEST => {
+                // Respond to global requests (e.g. keepalive@openssh.com)
+                // so the SSH client doesn't time out during long-running processes
+                let mut offset = 0;
+                let _req_name = read_string(payload, &mut offset);
+                let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
+                if want_reply {
+                    let reply = alloc::vec![SSH_MSG_REQUEST_FAILURE];
+                    let _ = send_packet(self.stream, &reply, self.session).await;
+                }
+            }
             SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
             SSH_MSG_DISCONNECT => {
                 log("[SSH] Client disconnected\n");

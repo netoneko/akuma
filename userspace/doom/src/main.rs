@@ -169,14 +169,30 @@ pub extern "C" fn akuma_exit(code: c_int) {
     libakuma::exit(code);
 }
 
-/// Print to stdout
+/// Print to stdout, converting bare \n to \r\n for correct terminal display.
+///
+/// The shell's \n→\r\n translation races with the process setting raw_mode:
+/// if raw_mode is set before the shell reads buffered output, init text gets
+/// bare \n which causes staircase rendering. Converting here avoids the race.
 #[no_mangle]
 pub unsafe extern "C" fn akuma_print(s: *const c_char, len: usize) {
-    if s.is_null() {
+    if s.is_null() || len == 0 {
         return;
     }
     let bytes = unsafe { core::slice::from_raw_parts(s as *const u8, len) };
-    write(fd::STDOUT, bytes);
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            if i > start {
+                write(fd::STDOUT, &bytes[start..i]);
+            }
+            write(fd::STDOUT, b"\r\n");
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        write(fd::STDOUT, &bytes[start..]);
+    }
 }
 
 /// Open a file, returns fd or negative errno
@@ -267,7 +283,7 @@ const KEY_RSHIFT: u8 = 0x80 + 0x36;
 const KEY_RCTRL: u8 = 0x80 + 0x1d;
 
 // ============================================================================
-// Input key queue
+// Input key queue and held-key tracking
 // ============================================================================
 
 /// Key event: (pressed, doom_keycode)
@@ -277,7 +293,7 @@ struct KeyEvent {
 }
 
 /// Simple ring buffer for key events
-const KEY_QUEUE_SIZE: usize = 32;
+const KEY_QUEUE_SIZE: usize = 64;
 static mut KEY_QUEUE: [KeyEvent; KEY_QUEUE_SIZE] = {
     const EMPTY: KeyEvent = KeyEvent { pressed: false, key: 0 };
     [EMPTY; KEY_QUEUE_SIZE]
@@ -286,91 +302,146 @@ static mut KEY_QUEUE_HEAD: usize = 0;
 static mut KEY_QUEUE_TAIL: usize = 0;
 
 unsafe fn key_queue_push(pressed: bool, key: u8) {
-    unsafe {
-        let next = (KEY_QUEUE_HEAD + 1) % KEY_QUEUE_SIZE;
-        if next != KEY_QUEUE_TAIL {
-            KEY_QUEUE[KEY_QUEUE_HEAD] = KeyEvent { pressed, key };
-            KEY_QUEUE_HEAD = next;
-        }
+    let next = (KEY_QUEUE_HEAD + 1) % KEY_QUEUE_SIZE;
+    if next != KEY_QUEUE_TAIL {
+        KEY_QUEUE[KEY_QUEUE_HEAD] = KeyEvent { pressed, key };
+        KEY_QUEUE_HEAD = next;
     }
 }
 
 unsafe fn key_queue_pop() -> Option<KeyEvent> {
-    unsafe {
-        if KEY_QUEUE_HEAD == KEY_QUEUE_TAIL {
-            return None;
+    if KEY_QUEUE_HEAD == KEY_QUEUE_TAIL {
+        return None;
+    }
+    let ev = KeyEvent {
+        pressed: KEY_QUEUE[KEY_QUEUE_TAIL].pressed,
+        key: KEY_QUEUE[KEY_QUEUE_TAIL].key,
+    };
+    KEY_QUEUE_TAIL = (KEY_QUEUE_TAIL + 1) % KEY_QUEUE_SIZE;
+    Some(ev)
+}
+
+/// Track held keys with timestamps for release-timeout simulation.
+/// Terminals only send key-down events. When a key is held, autorepeat sends
+/// repeated bytes (~30ms apart). We detect "key released" when autorepeat stops
+/// (no new byte within RELEASE_TIMEOUT_US microseconds).
+const MAX_HELD_KEYS: usize = 16;
+const RELEASE_TIMEOUT_US: u64 = 150_000; // 150ms — long enough for autorepeat gaps
+
+struct HeldKey {
+    key: u8,
+    last_seen_us: u64,
+    active: bool,
+}
+
+static mut HELD_KEYS: [HeldKey; MAX_HELD_KEYS] = {
+    const EMPTY: HeldKey = HeldKey { key: 0, last_seen_us: 0, active: false };
+    [EMPTY; MAX_HELD_KEYS]
+};
+
+/// Mark a key as pressed. Returns true if this is a new press (was not held).
+unsafe fn hold_key(key: u8, now_us: u64) -> bool {
+    // Check if already held
+    for i in 0..MAX_HELD_KEYS {
+        if HELD_KEYS[i].active && HELD_KEYS[i].key == key {
+            HELD_KEYS[i].last_seen_us = now_us;
+            return false; // Already held, just refresh timestamp
         }
-        let ev = KeyEvent {
-            pressed: KEY_QUEUE[KEY_QUEUE_TAIL].pressed,
-            key: KEY_QUEUE[KEY_QUEUE_TAIL].key,
-        };
-        KEY_QUEUE_TAIL = (KEY_QUEUE_TAIL + 1) % KEY_QUEUE_SIZE;
-        Some(ev)
+    }
+    // New key press — find an empty slot
+    for i in 0..MAX_HELD_KEYS {
+        if !HELD_KEYS[i].active {
+            HELD_KEYS[i] = HeldKey { key, last_seen_us: now_us, active: true };
+            return true; // New press
+        }
+    }
+    false // No slot available
+}
+
+/// Check for keys that haven't been refreshed within the timeout and release them.
+unsafe fn expire_held_keys(now_us: u64) {
+    for i in 0..MAX_HELD_KEYS {
+        if HELD_KEYS[i].active && now_us.wrapping_sub(HELD_KEYS[i].last_seen_us) > RELEASE_TIMEOUT_US {
+            key_queue_push(false, HELD_KEYS[i].key);
+            HELD_KEYS[i].active = false;
+        }
     }
 }
 
-/// Translate SSH terminal bytes to DOOM keycodes and enqueue them
-fn process_input() {
-    let mut buf = [0u8; 32];
-    let n = libakuma::poll_input_event(0, &mut buf);
-    if n <= 0 {
-        return;
-    }
+/// Returns true if a key should use held-key tracking (movement, action keys).
+/// One-shot keys (Enter, Escape, numbers) get instant press+release instead.
+fn is_holdable_key(key: u8) -> bool {
+    matches!(key,
+        KEY_UPARROW | KEY_DOWNARROW | KEY_LEFTARROW | KEY_RIGHTARROW |
+        KEY_FIRE | KEY_USE | KEY_RSHIFT | KEY_RCTRL | KEY_TAB
+    )
+}
 
-    let bytes = &buf[..n as usize];
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
-            // VT100 escape sequence
-            let doom_key = match bytes[i + 2] {
-                b'A' => Some(KEY_UPARROW),
-                b'B' => Some(KEY_DOWNARROW),
-                b'C' => Some(KEY_RIGHTARROW),
-                b'D' => Some(KEY_LEFTARROW),
-                _ => None,
-            };
-            if let Some(k) = doom_key {
-                unsafe {
-                    key_queue_push(true, k);
-                    key_queue_push(false, k);
-                }
-            }
-            i += 3;
-        } else {
-            let ch = bytes[i];
-            let doom_key = match ch {
-                // Arrow key alternatives
-                b'w' | b'W' => Some(KEY_UPARROW),
-                b's' | b'S' => Some(KEY_DOWNARROW),
-                b'a' | b'A' => Some(KEY_LEFTARROW),
-                b'd' | b'D' => Some(KEY_RIGHTARROW),
-                // Action keys
-                b' ' => Some(KEY_FIRE),       // Space = fire
-                b'e' | b'E' => Some(KEY_USE), // E = use/open
-                0x0d => Some(KEY_ENTER),       // Enter
-                0x1b => Some(KEY_ESCAPE),      // Escape
-                0x09 => Some(KEY_TAB),         // Tab = map
-                // Weapon selection (1-7)
-                b'1'..=b'7' => Some(ch),
-                // Shift, Ctrl (if terminal sends them)
-                _ => {
-                    // Pass through printable ASCII as-is
-                    if ch >= 0x20 && ch < 0x7f {
-                        Some(ch)
-                    } else {
-                        None
-                    }
-                }
-            };
-            if let Some(k) = doom_key {
-                unsafe {
-                    key_queue_push(true, k);
-                    key_queue_push(false, k);
-                }
-            }
-            i += 1;
+/// Translate a single terminal byte to a DOOM keycode
+fn byte_to_doom_key(ch: u8) -> Option<u8> {
+    match ch {
+        b'w' | b'W' => Some(KEY_UPARROW),
+        b's' | b'S' => Some(KEY_DOWNARROW),
+        b'a' | b'A' => Some(KEY_LEFTARROW),
+        b'd' | b'D' => Some(KEY_RIGHTARROW),
+        b' ' => Some(KEY_FIRE),
+        b'e' | b'E' => Some(KEY_USE),
+        b'q' | b'Q' => Some(KEY_RSHIFT), // Q = run (shift)
+        0x0d => Some(KEY_ENTER),
+        0x1b => Some(KEY_ESCAPE),
+        0x09 => Some(KEY_TAB),
+        b'1'..=b'7' => Some(ch),
+        b'y' | b'Y' | b'n' | b'N' => Some(ch), // Yes/No prompts
+        _ => {
+            if ch >= 0x20 && ch < 0x7f { Some(ch) } else { None }
         }
     }
+}
+
+/// Read terminal input, translate to DOOM keycodes, and manage held-key state.
+fn process_input() {
+    let now_us = libakuma::uptime();
+
+    let mut buf = [0u8; 64];
+    let n = libakuma::poll_input_event(0, &mut buf);
+
+    if n > 0 {
+        let bytes = &buf[..n as usize];
+        let mut i = 0;
+        while i < bytes.len() {
+            let doom_key = if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+                let k = match bytes[i + 2] {
+                    b'A' => Some(KEY_UPARROW),
+                    b'B' => Some(KEY_DOWNARROW),
+                    b'C' => Some(KEY_RIGHTARROW),
+                    b'D' => Some(KEY_LEFTARROW),
+                    _ => None,
+                };
+                i += 3;
+                k
+            } else {
+                let k = byte_to_doom_key(bytes[i]);
+                i += 1;
+                k
+            };
+
+            if let Some(k) = doom_key {
+                unsafe {
+                    if is_holdable_key(k) {
+                        if hold_key(k, now_us) {
+                            key_queue_push(true, k);
+                        }
+                    } else {
+                        key_queue_push(true, k);
+                        key_queue_push(false, k);
+                    }
+                }
+            }
+        }
+    }
+
+    // Release keys that haven't been refreshed
+    unsafe { expire_held_keys(now_us); }
 }
 
 // ============================================================================
@@ -380,13 +451,13 @@ fn process_input() {
 /// Initialize the platform
 #[no_mangle]
 pub extern "C" fn DG_Init() {
-    print("[DOOM] Initializing framebuffer...\n");
+    print("[DOOM] Initializing framebuffer...\r\n");
     let ret = libakuma::fb_init(DOOM_WIDTH, DOOM_HEIGHT);
     if ret < 0 {
-        print("[DOOM] ERROR: Failed to initialize framebuffer!\n");
-        print("[DOOM] Make sure QEMU was started with -device ramfb\n");
+        print("[DOOM] ERROR: Failed to initialize framebuffer!\r\n");
+        print("[DOOM] Make sure QEMU was started with -device ramfb\r\n");
     } else {
-        print("[DOOM] Framebuffer ready (320x200)\n");
+        print("[DOOM] Framebuffer ready (320x200)\r\n");
     }
 
     // Set terminal to raw mode for input (flag 0x01 = RAW_MODE_ENABLE)
@@ -458,16 +529,13 @@ unsafe fn render_ansi_frame(fb: *mut u32) {
     let buf = &mut ANSI_BUF;
     let mut pos: usize = 0;
 
-    // On first frame: enter alternate screen buffer + clear (like vim/less)
-    // This separates DOOM rendering from the init text scrollback
     if !ANSI_SCREEN_INIT {
         ANSI_SCREEN_INIT = true;
-        // \x1b[?1049h = enter alternate screen buffer
-        // \x1b[2J     = clear entire screen
-        pos = buf_copy(buf, pos, b"\x1b[?1049h\x1b[2J");
+        // First frame: clear visible display + scrollback, then home
+        pos = buf_copy(buf, pos, b"\x1b[2J\x1b[3J\x1b[H");
     }
 
-    // Hide cursor + move to top-left (row 1, col 1)
+    // Every frame: hide cursor + move to row 1, col 1
     pos = buf_copy(buf, pos, b"\x1b[?25l\x1b[H");
 
     // Track previous cell colors to skip redundant escape sequences.
@@ -619,8 +687,8 @@ pub unsafe extern "C" fn DG_SetWindowTitle(_title: *const c_char) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    print("=== DOOM on Akuma ===\n");
-    print("Starting DOOM engine...\n");
+    print("=== DOOM on Akuma ===\r\n");
+    print("Starting DOOM engine...\r\n");
 
     // Set up arguments: pass the WAD file path
     // doomgeneric expects: argv[0] = program name, -iwad <path>
@@ -638,7 +706,7 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         doomgeneric_Create(3, argv.as_mut_ptr());
 
-        print("[DOOM] Engine initialized, entering main loop\n");
+        print("[DOOM] Engine initialized, entering main loop\r\n");
 
         loop {
             doomgeneric_Tick();

@@ -535,24 +535,16 @@ pub async fn execute_external_interactive(
             break;
         }
 
+        // Check raw mode each iteration — processes like DOOM enable it after init.
+        // In raw mode, skip \n → \r\n translation since the process sends its own
+        // line endings and binary ANSI escape data that must not be modified.
+        let raw_mode = channel.is_raw_mode();
+
         // 1. Drain process stdout and write to SSH
         if let Some(data) = channel.try_read() {
-            let mut buf = Vec::new();
-            for &byte in &data {
-                if byte == b'\n' {
-                    buf.extend_from_slice(b"\r\n");
-                } else {
-                    buf.push(byte);
-                }
-            }
-            let _ = channel_stream.write_all(&buf).await;
-            let _ = channel_stream.flush().await;
-        }
-
-        // 2. Check for process exit
-        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
-            // Drain remaining output
-            while let Some(data) = channel.try_read() {
+            if raw_mode {
+                let _ = channel_stream.write_all(&data).await;
+            } else {
                 let mut buf = Vec::new();
                 for &byte in &data {
                     if byte == b'\n' {
@@ -562,6 +554,27 @@ pub async fn execute_external_interactive(
                     }
                 }
                 let _ = channel_stream.write_all(&buf).await;
+            }
+            let _ = channel_stream.flush().await;
+        }
+
+        // 2. Check for process exit
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            // Drain remaining output
+            while let Some(data) = channel.try_read() {
+                if raw_mode {
+                    let _ = channel_stream.write_all(&data).await;
+                } else {
+                    let mut buf = Vec::new();
+                    for &byte in &data {
+                        if byte == b'\n' {
+                            buf.extend_from_slice(b"\r\n");
+                        } else {
+                            buf.push(byte);
+                        }
+                    }
+                    let _ = channel_stream.write_all(&buf).await;
+                }
             }
             let _ = channel_stream.flush().await;
             break;
