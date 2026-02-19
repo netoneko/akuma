@@ -62,6 +62,7 @@ fn main() {
     
     let run_cc = |src: &str, obj: &str, extra_args: &[&str]| {
         let mut cmd = compiler.to_command();
+        cmd.arg("-target").arg("aarch64-none-elf");
         cmd.arg("-ffreestanding").arg("-fno-builtin").arg("-nostdinc").arg("-O3");
         cmd.args(extra_args);
         cmd.arg("-c").arg(src).arg("-o").arg(out_dir.join(obj));
@@ -79,8 +80,9 @@ fn main() {
     run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "include"]);
 
     // Create archives manually
-    let ar_bin = "ar";
-    let ranlib_bin = "ranlib";
+    let ar_bin = if Command::new("llvm-ar").arg("--version").status().is_ok() { "llvm-ar" } else { "ar" };
+    let ranlib_bin = if Command::new("llvm-ranlib").arg("--version").status().is_ok() { "llvm-ranlib" } else { "ranlib" };
+    
     let run_ar = |archive: &Path, objs: &[&Path]| {
         let mut cmd = Command::new(ar_bin);
         cmd.arg("rcs").arg(archive);
