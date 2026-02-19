@@ -1665,9 +1665,9 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         if let Some(proc) = current_process() {
             let pid = proc.pid;
             
-            // Clean up all open sockets for this process
+            // Clean up all open FDs for this process (sockets, child channels)
             // This must happen before unregistering the process so we can access fd_table
-            cleanup_process_sockets(proc);
+            cleanup_process_fds(proc);
             
             Some(pid)
         } else {
@@ -1729,6 +1729,18 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     loop {
         crate::threading::yield_now();
     }
+}
+
+/// Clean up all file descriptors owned by a process
+fn cleanup_process_fds(proc: &Process) {
+    // 1. Clean up sockets (needs special handling for smoltcp)
+    cleanup_process_sockets(proc);
+    
+    // 2. Clear the FD table. 
+    // This will drop KernelFile and other descriptors, 
+    // which in turn will call their respective cleanup logic (like VFS close).
+    let mut table = proc.fd_table.lock();
+    table.clear();
 }
 
 /// Clean up all sockets owned by a process

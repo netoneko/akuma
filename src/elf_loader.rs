@@ -92,6 +92,9 @@ impl core::fmt::Display for ElfError {
 
 use alloc::collections::BTreeMap;
 
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE: u32 = 1027;
 
 /// Load an ELF binary from memory
@@ -232,25 +235,47 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     }
 
     // Apply relocations
-    // For now we only support R_AARCH64_RELATIVE which is common in TCC binaries
     if let Some(shdrs) = elf.section_headers() {
+        // Try to get dynamic symbol table if it exists
+        let dynsyms = elf.dynamic_symbol_table().ok().flatten();
+
         for shdr in shdrs {
             if shdr.sh_type == elf::abi::SHT_RELA {
                 if let Ok(relas) = elf.section_data_as_relas(&shdr) {
                     for rela in relas {
-                        if rela.r_type == R_AARCH64_RELATIVE {
-                            let vaddr = rela.r_offset as usize;
-                            let addend = rela.r_addend as usize;
-                            
-                            // Find physical page for this virtual address
-                            let page_va = vaddr & !(PAGE_SIZE - 1);
-                            if let Some(&pa) = mapped_pages.get(&page_va) {
-                                let offset_in_page = vaddr & (PAGE_SIZE - 1);
-                                unsafe {
-                                    let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
-                                    // R_AARCH64_RELATIVE: *ptr = B + A
-                                    // Since we load at preferred address, B = 0
-                                    *ptr = addend;
+                        let r_type = rela.r_type;
+                        let vaddr = rela.r_offset as usize;
+                        let addend = rela.r_addend as usize;
+                        let sym_idx = rela.r_sym as usize;
+
+                        let mut sym_value = 0;
+                        if sym_idx != 0 {
+                            if let Some(ref syms) = dynsyms {
+                                if let Ok(sym) = syms.0.get(sym_idx) {
+                                    sym_value = sym.st_value as usize;
+                                }
+                            }
+                        }
+
+                        // Find physical page for this virtual address
+                        let page_va = vaddr & !(PAGE_SIZE - 1);
+                        if let Some(&pa) = mapped_pages.get(&page_va) {
+                            let offset_in_page = vaddr & (PAGE_SIZE - 1);
+                            unsafe {
+                                let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
+                                match r_type {
+                                    R_AARCH64_RELATIVE => {
+                                        // *ptr = B + A
+                                        // Since we load at preferred address, B = 0
+                                        *ptr = addend;
+                                    }
+                                    R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
+                                        // *ptr = S + A
+                                        *ptr = sym_value + addend;
+                                    }
+                                    _ => {
+                                        // Unsupported relocation type
+                                    }
                                 }
                             }
                         }
