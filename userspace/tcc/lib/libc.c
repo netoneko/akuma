@@ -24,6 +24,7 @@ static inline long syscall(long num, long a0, long a1, long a2, long a3, long a4
     return ret;
 }
 
+__attribute__((visibility("default")))
 void exit(int status) {
     syscall(0, status, 0, 0, 0, 0, 0);
     while (1) {}
@@ -33,6 +34,7 @@ long write(int fd, const void *buf, size_t count) {
     return syscall(2, fd, (long)buf, count, 0, 0, 0);
 }
 
+__attribute__((visibility("default")))
 int printf(const char *format, ...) {
     va_list ap;
     va_start(ap, format);

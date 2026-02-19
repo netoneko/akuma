@@ -80,11 +80,24 @@ fn main() {
     run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "include"]);
 
     // Create archives manually
-    let ar_bin = if Command::new("llvm-ar").arg("--version").status().is_ok() { "llvm-ar" } else { "ar" };
-    let ranlib_bin = if Command::new("llvm-ranlib").arg("--version").status().is_ok() { "llvm-ranlib" } else { "ranlib" };
+    let find_tool = |name: &str| {
+        if Command::new(name).arg("--version").status().is_ok() {
+            return Some(name.to_string());
+        }
+        let homebrew_path = format!("/opt/homebrew/opt/llvm/bin/{}", name);
+        if Command::new(&homebrew_path).arg("--version").status().is_ok() {
+            return Some(homebrew_path);
+        }
+        None
+    };
+
+    let ar_bin = find_tool("llvm-ar").unwrap_or_else(|| "ar".to_string());
+    let ranlib_bin = find_tool("llvm-ranlib").unwrap_or_else(|| "ranlib".to_string());
     
-    let run_ar = |archive: &Path, objs: &[&Path]| {
-        let mut cmd = Command::new(ar_bin);
+    let ar_bin_clone = ar_bin.clone();
+    let ranlib_bin_clone = ranlib_bin.clone();
+    let run_ar = move |archive: &Path, objs: &[&Path]| {
+        let mut cmd = Command::new(&ar_bin_clone);
         cmd.arg("rcs").arg(archive);
         for obj in objs {
             cmd.arg(obj);
@@ -94,7 +107,7 @@ fn main() {
             panic!("ar failed for archive: {:?}", archive);
         }
 
-        let mut cmd = Command::new(ranlib_bin);
+        let mut cmd = Command::new(&ranlib_bin_clone);
         cmd.arg(archive);
         let status = cmd.status().expect("Failed to run ranlib");
         if !status.success() {
