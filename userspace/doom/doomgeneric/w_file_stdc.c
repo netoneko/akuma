@@ -60,13 +60,24 @@ static wad_file_t *W_StdC_OpenFile(char *path)
     if (result->wad.mapped != NULL)
     {
         fseek(fstream, 0, SEEK_SET);
-        size_t got = fread(result->wad.mapped, 1, result->wad.length, fstream);
-        if (got < result->wad.length)
+        size_t total = result->wad.length;
+        size_t done = 0;
+        unsigned char *dest = (unsigned char *)result->wad.mapped;
+        while (done < total)
+        {
+            size_t chunk = total - done;
+            if (chunk > 32768) chunk = 32768;
+            size_t got = fread(dest + done, 1, chunk, fstream);
+            if (got == 0) break;
+            done += got;
+        }
+        if (done < total)
         {
             printf("[WAD] Warning: only read %u of %u bytes\n",
-                   (unsigned)got, result->wad.length);
+                   (unsigned)done, (unsigned)total);
         }
-        printf("[WAD] WAD loaded into memory at %p\n", result->wad.mapped);
+        printf("[WAD] WAD loaded into memory at %p (%u bytes)\n",
+               result->wad.mapped, (unsigned)done);
     }
     else
     {

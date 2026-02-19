@@ -106,7 +106,7 @@ pub const CWD_DATA_SIZE: usize = 256;
 /// A guard page is placed below the stack to detect overflow.
 ///
 /// WARNING: This value must be kept in sync with src/config.rs USER_STACK_SIZE.
-pub const USER_STACK_SIZE: usize = 128 * 1024;
+pub const USER_STACK_SIZE: usize = 512 * 1024;
 
 /// Top of userspace address space (stack grows down from here)
 pub const STACK_TOP: usize = 0x4000_0000;

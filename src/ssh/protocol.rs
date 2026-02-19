@@ -62,6 +62,7 @@ const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
 const SSH_MSG_CHANNEL_EOF: u8 = 96;
 const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
@@ -396,6 +397,10 @@ impl<'a> SshChannelStream<'a> {
                     let reply = alloc::vec![SSH_MSG_REQUEST_FAILURE];
                     let _ = send_packet(self.stream, &reply, self.session).await;
                 }
+            }
+            SSH_MSG_CHANNEL_WINDOW_ADJUST => {
+                // Client is adjusting its receive window; we don't enforce
+                // flow control, so just silently consume the message.
             }
             SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
             SSH_MSG_DISCONNECT => {

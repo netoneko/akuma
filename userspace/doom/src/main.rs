@@ -688,6 +688,7 @@ pub unsafe extern "C" fn DG_SetWindowTitle(_title: *const c_char) {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     print("=== DOOM on Akuma ===\r\n");
+    print("Use: ssh -t ... \"doom\" (the -t flag is required for controls)\r\n");
     print("Starting DOOM engine...\r\n");
 
     // Set up arguments: pass the WAD file path

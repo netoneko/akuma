@@ -613,13 +613,19 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     if (!stream || !ptr || size == 0 || nmemb == 0) return 0;
     DoomFile *f = (DoomFile *)stream;
     size_t total = size * nmemb;
-    int got = akuma_read(f->fd, ptr, total);
-    if (got <= 0) {
-        f->eof_flag = 1;
-        return 0;
+    size_t done = 0;
+    while (done < total) {
+        size_t chunk = total - done;
+        if (chunk > 32768) chunk = 32768;
+        int got = akuma_read(f->fd, (char *)ptr + done, chunk);
+        if (got <= 0) {
+            if (done == 0) f->eof_flag = 1;
+            break;
+        }
+        done += got;
+        f->position += got;
     }
-    f->position += got;
-    return got / size;
+    return done / size;
 }
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
