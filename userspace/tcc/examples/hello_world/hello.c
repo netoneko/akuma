@@ -1,7 +1,1 @@
-#include <stdio.h>
-
-int main() {
-    printf("Hello from TinyCC on Akuma!
-");
-    return 0;
-}
+#include <stdio.h>\n\nint main() {\n    printf("Hello, Akuma!\\n");\n    return 0;\n}

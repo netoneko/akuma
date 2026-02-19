@@ -1,23 +1,15 @@
 #![no_std]
-#![no_main] // This tells rustc that this crate does not use the standard main entry point.
-// #![feature(naked_functions)] // Stable since 1.88.0
-// #![feature(asm_const)] // Stable since 1.82.0
-// #![feature(const_pin)] // Stable since 1.84.0
-// #![feature(const_mut_refs)] // Stable since 1.83.0
-// #![feature(const_btree_new)] // Replaced by const_btree_len (partially stabilized 1.66.0)
-// #![feature(const_for)] // Stable since 1.79.0
-// #![feature(const_heap_allocated)] // This feature is unknown
+#![no_main]
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-// Use specific libakuma functions
-use libakuma::{self, exit, args, eprintln, open, close, read_fd};
-use libakuma::open_flags; // For open flags constants
+use libakuma::{self, exit, args, eprintln, println, open, close, read_fd, write_fd, mkdir_p, open_flags};
 use miniz_oxide::inflate;
-use tar_no_std::TarArchiveRef; // Use TarArchiveRef
+use tar_no_std::TarArchiveRef;
 
 #[no_mangle]
 fn _start() -> ! {
@@ -27,7 +19,6 @@ fn _start() -> ! {
 
 fn main() {
     let args_iter = args();
-    // Convert libakuma::args() iterator to Vec<String>
     let mut args_vec: Vec<String> = Vec::new();
     for arg in args_iter {
         args_vec.push(String::from(arg));
@@ -37,8 +28,9 @@ fn main() {
     let mut gzip = false;
     let mut verbose = false;
     let mut archive_file: Option<String> = None;
+    let mut target_dir: String = String::from(".");
 
-    let mut i = 1; // Skip program name
+    let mut i = 1;
     while i < args_vec.len() {
         let arg = &args_vec[i];
         if arg.starts_with('-') {
@@ -50,14 +42,23 @@ fn main() {
                     'f' => {
                         if i + 1 < args_vec.len() {
                             archive_file = Some(args_vec[i + 1].clone());
-                            i += 1; // Consume the next argument as the file name
+                            i += 1;
                         } else {
                             eprintln("tar: option requires an argument -- f");
                             exit(1);
                         }
                     }
+                    'C' => {
+                        if i + 1 < args_vec.len() {
+                            target_dir = args_vec[i + 1].clone();
+                            i += 1;
+                        } else {
+                            eprintln("tar: option requires an argument -- C");
+                            exit(1);
+                        }
+                    }
                     _ => {
-                        eprintln(&alloc::format!("tar: invalid option -- '{}'", c));
+                        eprintln(&format!("tar: invalid option -- '{}'", c));
                         exit(1);
                     }
                 }
@@ -65,7 +66,7 @@ fn main() {
         } else if archive_file.is_none() {
             archive_file = Some(arg.clone());
         } else {
-            eprintln(&alloc::format!("tar: extra operand '{}'", arg));
+            eprintln(&format!("tar: extra operand '{}'", arg));
             exit(1);
         }
         i += 1;
@@ -89,31 +90,22 @@ fn main() {
         }
     };
 
-    match untar_gz(&archive_path, verbose) {
+    match untar_gz(&archive_path, &target_dir, verbose) {
         Ok(_) => {},
         Err(e) => {
-            eprintln(&alloc::format!("tar: error: {:?}", e)); // Changed to {:?}
+            eprintln(&format!("tar: error: {:?}", e));
             exit(1);
         }
     }
 }
 
-// Custom Error type
 #[derive(Debug)]
 enum TarError {
     LibakumaError(i32),
     GzipDecompressionError(&'static str),
     TarArchiveError(&'static str),
-    Other(&'static str),
 }
 
-impl ToString for TarError {
-    fn to_string(&self) -> String {
-        alloc::format!("{:?}", self)
-    }
-}
-
-// Helper to read the entire file into a Vec<u8>
 fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
     let fd = open(path, open_flags::O_RDONLY);
     if fd < 0 {
@@ -121,7 +113,7 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
     }
 
     let mut buffer = Vec::new();
-    let mut temp_buf = [0u8; 4096]; // Read in chunks
+    let mut temp_buf = [0u8; 4096];
 
     loop {
         let bytes_read = read_fd(fd, &mut temp_buf);
@@ -130,7 +122,7 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
             return Err(TarError::LibakumaError(bytes_read as i32));
         }
         if bytes_read == 0 {
-            break; // EOF
+            break;
         }
         buffer.extend_from_slice(&temp_buf[..bytes_read as usize]);
     }
@@ -138,30 +130,58 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
     Ok(buffer)
 }
 
-fn untar_gz(archive_path: &str, verbose: bool) -> Result<(), TarError> {
+fn untar_gz(archive_path: &str, target_dir: &str, verbose: bool) -> Result<(), TarError> {
     let compressed_data = read_file_to_vec(archive_path)?;
 
     let decompressed_data = inflate::decompress_to_vec(&compressed_data)
-        .map_err(|_| TarError::GzipDecompressionError("decompression failed"))?; // Fixed DecompressError field
+        .map_err(|_| TarError::GzipDecompressionError("decompression failed"))?;
 
     let archive = TarArchiveRef::new(&decompressed_data)
         .map_err(|_| TarError::TarArchiveError("invalid tar archive"))?;
 
-    for entry in archive.entries() { // Iterate directly over ArchiveEntry
-        let path = entry.filename(); // filename() returns TarFormatString<256> directly
-        let path_str = path.as_str().unwrap_or("invalid filename"); // Convert TarFormatString to &str
+    for entry in archive.entries() {
+        let filename = entry.filename();
+        let path = filename.as_str().unwrap_or("unknown");
+        
+        // Skip empty paths or entries without data
+        if path.is_empty() || path == "." {
+            continue;
+        }
+
+        // Clean path and prepend target_dir
+        let mut full_path = String::from(target_dir);
+        if !full_path.ends_with('/') && !path.starts_with('/') {
+            full_path.push('/');
+        }
+        full_path.push_str(path);
 
         if verbose {
-            eprintln(&alloc::format!("{}", path_str));
+            println(&format!("{}", path));
         }
-        
-        // This unpack_in expects a path to create files.
-        // `tar-no-std`'s `Entry::unpack_in` internally uses `std::fs` calls,
-        // which are not available in our `no_std` Akuma environment.
-        // TODO: Implement custom filesystem for tar-no_std extraction.
-        // For now, we will just print the file names.
-        
-        // entry.unpack_in(".")?; // This will fail because it uses std::fs
+
+        // Handle directories (tar entries for directories usually end in /)
+        if path.ends_with('/') {
+            mkdir_p(&full_path);
+            continue;
+        }
+
+        // Ensure parent directory exists
+        if let Some(last_slash) = full_path.rfind('/') {
+            let parent = &full_path[..last_slash];
+            if !parent.is_empty() {
+                mkdir_p(parent);
+            }
+        }
+
+        // Write file data
+        let data = entry.data();
+        let fd = open(&full_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+        if fd >= 0 {
+            write_fd(fd, data);
+            close(fd);
+        } else if verbose {
+            eprintln(&format!("tar: failed to create file {}: errno {}", full_path, -fd));
+        }
     }
 
     Ok(())

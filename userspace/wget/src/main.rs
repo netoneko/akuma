@@ -70,8 +70,10 @@ fn main() -> i32 {
     print("\n");
 
     // Connect
-    let addr = SocketAddrV4::new(ip, parsed.port);
     let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+    print("wget: Connecting to address: ");
+    print(&addr_str);
+    print("\n");
     
     let stream = match TcpStream::connect(&addr_str) {
         Ok(s) => s,
@@ -81,8 +83,6 @@ fn main() -> i32 {
             return 1;
         }
     };
-
-    print("wget: Connected, sending request...\n");
 
     // Send HTTP request
     let request = format!(
@@ -94,6 +94,9 @@ fn main() -> i32 {
         parsed.path,
         parsed.host
     );
+
+    print("wget: Connected, sending request:\n");
+    print(&request);
 
     if let Err(e) = stream.write_all(request.as_bytes()) {
         print("wget: Failed to send request: ");
