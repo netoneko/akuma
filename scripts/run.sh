@@ -16,7 +16,7 @@ qemu-system-aarch64 \
   -m 128M \
   -L qemu-roms \
   -serial mon:stdio \
-  -display gtk \
+  -display none \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080 \
   -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \

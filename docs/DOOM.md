@@ -6,7 +6,7 @@ A `no_std` port of DOOM running as a userspace ELF binary on the Akuma bare-meta
 
 DOOM runs on Akuma using [doomgeneric](https://github.com/ozkl/doomgeneric), a portable C DOOM engine. The C code is cross-compiled for `aarch64-unknown-none` via the `cc` crate and linked into a Rust `no_std` userspace binary that provides platform callbacks and C library stubs.
 
-**Display:** Dual output — ramfb framebuffer (QEMU GTK window) and ANSI truecolor art over SSH.
+**Display:** ANSI truecolor half-block art rendered over SSH. Also outputs to ramfb framebuffer (visible if QEMU is started with `-display gtk`; headless by default).
 
 **Input:** SSH terminal keystrokes translated to DOOM keycodes.
 
@@ -50,16 +50,14 @@ DOOM runs on Akuma using [doomgeneric](https://github.com/ozkl/doomgeneric), a p
 # Build the DOOM userspace binary
 cd userspace && cargo build --release -p doom
 
-# Copy binary + WAD to disk image
-debugfs -w disk.img -R "write userspace/target/aarch64-unknown-none/release/doom bin/doom"
+# Deploy to disk image (doom is not in build.sh — must be deployed separately)
+cd ..
+debugfs -w -R "rm /bin/doom" disk.img 2>/dev/null
+debugfs -w -R "write userspace/target/aarch64-unknown-none/release/doom /bin/doom" disk.img
 # doom1.wad (shareware) must also be on disk.img at /doom1.wad
 
-# Build the kernel
-cargo build --release
-
-# Run
+# Build the kernel and run (headless, no QEMU window)
 cargo run --release
-# or: bash scripts/run.sh
 ```
 
 ## Running
@@ -78,9 +76,9 @@ ssh -t -o StrictHostKeyChecking=no \
 - `-t` forces PTY allocation, which puts the client terminal in raw mode so keystrokes are sent immediately (not line-buffered). Without this, you'd have to press Enter after every key.
 - `ServerAliveInterval` keeps the connection alive during gameplay.
 
-### Via QEMU window
+### Via QEMU window (optional)
 
-DOOM also renders to the ramfb framebuffer, visible in the QEMU GTK display window. No SSH needed for this — it's always active.
+DOOM also renders to the ramfb framebuffer. To see this, start QEMU with `-display gtk` instead of `-display none` in `.cargo/config.toml` or `scripts/run.sh`.
 
 ## Controls
 
@@ -109,7 +107,8 @@ DOOM's 320×200 framebuffer is rendered as ANSI truecolor half-block art in the 
 - **Frame rate:** ~7 fps (every 5th game tick)
 - **Throttling:** 30ms sleep after each frame write to let the SSH channel drain
 - **Buffer:** 90KB static buffer — no per-frame heap allocation
-- **Alternate screen:** Uses `\x1b[?1049h` (like vim/less) to render on a clean screen separate from init text
+- **Screen management:** First frame sends `\x1b[2J\x1b[3J` (clear display + scrollback), every frame sends `\x1b[?25l\x1b[H` (hide cursor + home) — widely compatible VT100 sequences
+- **Line endings:** `akuma_print` converts bare `\n` to `\r\n` to avoid staircase rendering caused by a raw-mode timing race between the process and shell output handler
 
 ## Key Implementation Details
 
@@ -153,7 +152,8 @@ Long-running processes like DOOM that don't write to stdout cause the SSH socket
 | Extreme slowness during WAD loading | `sys_read` reads entire file on each call; hundreds of lump reads = GBs of redundant I/O | Memory-mapped WAD: load once into `malloc` buffer, `memcpy` on reads |
 | SSH disconnect after ~60s | TCP socket timeout of 60s with no stdout activity | Increased timeout to 3600s |
 | SSH disconnect after ~120s | Server didn't respond to SSH keepalive global requests during exec | Added `SSH_MSG_GLOBAL_REQUEST` → `SSH_MSG_REQUEST_FAILURE` reply in channel message handler |
-| Kernel OOM panic with ANSI rendering | ANSI frames produced faster than SSH could drain; process channel buffer grew unboundedly | Static buffer + frame skip + 200ms drain sleep after each frame |
+| Kernel OOM panic with ANSI rendering | ANSI frames produced faster than SSH could drain; process channel buffer grew unboundedly | Static buffer + frame skip + 30ms drain sleep after each frame |
+| ANSI art scrolls instead of rendering in-place | Shell checks `raw_mode` at read time, but process sets it before shell reads first output batch — all init text gets bare `\n`, causing staircase that pushes cursor off-screen | `akuma_print` now converts `\n`→`\r\n`; Rust prints use `\r\n`; first frame clears display+scrollback (`\x1b[2J\x1b[3J`) |
 
 ## File Layout
 
