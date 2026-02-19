@@ -16,6 +16,8 @@ pub mod syscall {
     pub const EXIT: u64 = 93;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const WRITEV: u64 = 66;
+    pub const IOCTL: u64 = 29;
     pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
@@ -59,6 +61,7 @@ pub mod syscall {
     pub const REATTACH: u64 = 318;
     pub const UPTIME: u64 = 319;
     pub const SET_TID_ADDRESS: u64 = 96;
+    pub const EXIT_GROUP: u64 = 94;
     pub const SET_TPIDR_EL0: u64 = 320;
 }
 

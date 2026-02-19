@@ -14,6 +14,7 @@ pub mod nr {
     pub const EXIT: u64 = 93;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const WRITEV: u64 = 66;
     pub const IOCTL: u64 = 29;
     pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
@@ -36,6 +37,7 @@ pub mod nr {
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
     pub const SET_TID_ADDRESS: u64 = 96;
+    pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     // Custom syscalls (300+)
@@ -95,6 +97,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
+        nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
@@ -137,6 +140,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
+        nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => {
@@ -239,6 +243,26 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         _ => !0u64
     }
+}
+
+#[repr(C)]
+struct IoVec {
+    iov_base: u64,
+    iov_len: usize,
+}
+
+fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    let mut total_written: u64 = 0;
+    for i in 0..iov_cnt {
+        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
+        if written == !0u64 {
+            if total_written == 0 { return !0u64; }
+            break;
+        }
+        total_written += written;
+    }
+    total_written
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
