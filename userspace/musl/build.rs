@@ -95,6 +95,9 @@ fn main() {
     let tar_path = dist_dir.join("musl.tar");
 
     let status = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("--no-xattrs")
+        .arg("--format=ustar")
         .arg("-cf")
         .arg(&tar_path)
         .arg("-C")

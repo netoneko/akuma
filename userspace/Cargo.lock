@@ -986,6 +986,7 @@ version = "0.9.27"
 dependencies = [
  "cc",
  "libakuma",
+ "musl",
 ]
 
 [[package]]

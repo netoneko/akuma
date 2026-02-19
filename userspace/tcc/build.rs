@@ -14,6 +14,11 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap();
+
+    let musl_dist = manifest_dir.join("../musl/dist");
+    if !musl_dist.exists() {
+        panic!("Musl distribution not found at {}. Build musl package first.", musl_dist.display());
+    }
     
     // 1. Build TCC compiler itself
     let mut build = cc::Build::new();
@@ -22,14 +27,14 @@ fn main() {
         .define("ONE_SOURCE", "1")
         .define("CONFIG_TCC_STATIC", "1")
         .define("CONFIG_TCC_SEMLOCK", "0")
-        .define("time_t", "long long")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-nostdinc")
         .flag("-w")
         .include("tinycc")
+        .include("tinycc/include")
         .include("src")
-        .include("include")
+        .include(&musl_dist.join("include"))
         .target(&target)
         .host(&host);
     
@@ -69,14 +74,9 @@ fn main() {
         }
     };
 
-    let musl_dist = manifest_dir.join("../musl/dist");
-    if !musl_dist.exists() {
-        panic!("Musl distribution not found at {}. Build musl package first.", musl_dist.display());
-    }
-
     // 2. Build TCC runtime objects
-    run_cc("tinycc/lib/libtcc1.c", "libtcc1_base.o", &["-I", "tinycc", "-I", "include"]);
-    run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "include"]);
+    run_cc("tinycc/lib/libtcc1.c", "libtcc1_base.o", &["-I", "tinycc", "-I", "tinycc/include", "-I", musl_dist.join("include").to_str().unwrap()]);
+    run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "tinycc/include", "-I", musl_dist.join("include").to_str().unwrap()]);
 
     // Create archives manually
     let find_tool = |name: &str| {
@@ -136,15 +136,14 @@ fn main() {
     fs::create_dir_all(&tcc_include_dir).unwrap();
 
     // Copy Musl artifacts
-    fs::copy(musl_dist.join("lib/libc.a"), lib_dir.join("libc.a")).unwrap();
-    fs::copy(musl_dist.join("lib/crt1.o"), lib_dir.join("crt1.o")).unwrap();
-    fs::copy(musl_dist.join("lib/crti.o"), lib_dir.join("crti.o")).unwrap();
-    fs::copy(musl_dist.join("lib/crtn.o"), lib_dir.join("crtn.o")).unwrap();
+    // Copy all files from musl/dist/lib to usr/lib
+    copy_dir_recursive(&musl_dist.join("lib"), &lib_dir).unwrap();
     
-    // TCC specific runtime
+    // TCC specific runtime (after musl to ensure we might overwrite if needed, 
+    // but usually libtcc1.a is unique to TCC)
     fs::copy(out_dir.join("libtcc1.a"), tcc_dir.join("libtcc1.a")).unwrap();
 
-    // Headers from Musl (Standard POSIX)
+    // Headers from Musl (Standard POSIX) - Copy contents of include
     copy_dir_recursive(&musl_dist.join("include"), &include_dir).unwrap();
     // TCC specific internal headers
     copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
