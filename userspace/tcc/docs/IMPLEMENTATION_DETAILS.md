@@ -4,7 +4,7 @@ This document details the process and solutions implemented to integrate the Tin
 
 ## Overall Goal
 
-To create a new userspace program, the `cc` binary (powered by `tinycc`), for Akuma OS. This compiler must be capable of compiling a basic "Hello World" C program on the target system, leveraging a Rust FFI wrapper and `libakuma` for OS communication. The `tcc` binary should be self-contained regarding its C runtime and header dependencies.
+To create a new userspace program, the `cc` binary (powered by `tinycc`), for Akuma OS. This compiler must be capable of compiling a basic "Hello World" C program on the target system, leveraging a Rust FFI wrapper and `libakuma` for OS communication.
 
 ## Key Challenges and Solutions
 
@@ -38,22 +38,7 @@ To create a new userspace program, the `cc` binary (powered by `tinycc`), for Ak
 
 **Solution:** `CONFIG_TCC_ELFINTERP` in `userspace/tcc/src/config.h` was set to an empty string (`""`). This prevents TCC from embedding a non-existent dynamic linker path into the generated ELF binaries, aligning with Akuma OS's static linking model.
 
-### 5. Self-Contained TCC Runtime Installation (`tcc install` command)
-
-**Problem:** To make `tcc` truly self-hosted on Akuma, it needed a way to provide its own C runtime (`crt0.S`, `libc.c`) and standard headers without relying on external distribution mechanisms or manually copying files to the target filesystem.
-
-**Solution:**
-*   **Embedded Files**: All necessary C headers (from `userspace/tcc/include/`) and library source files (`userspace/tcc/lib/crt0.S`, `userspace/tcc/lib/libc.c`) are embedded directly into the `tcc` Rust binary using `include_str!` macros (defined in `FILES_TO_INSTALL` in `userspace/tcc/src/main.rs`).
-*   **`tcc install` Command**: A new command-line argument handling (`tcc install`) was added to `userspace/tcc/src/main.rs`. When invoked, this command executes `install_tcc_runtime()`.
-*   **Extraction Logic (`install_tcc_runtime`)**: This function iterates through the embedded `FILES_TO_INSTALL`. For each file, it:
-    1.  Constructs the full target path under `/usr/` (e.g., `/usr/include/stdio.h`, `/usr/lib/crt0.S`).
-    2.  Uses `libakuma::mkdir_p` to ensure parent directories exist.
-    3.  Uses `libakuma::open` and `libakuma::write` to write the embedded content to the target path.
-    4.  Utilizes a custom `PathBuf` implementation in `no_std` context for path manipulation.
-*   **`config.h` Paths**: TCC's internal configuration (specifically `CONFIG_TCCDIR`, `CONFIG_TCC_SYSINCLUDE_PATHS`, `CONFIG_TCC_LIBPATHS`, `CONFIG_TCC_CRTPREFIX` in `userspace/tcc/src/config.h`) was updated to point directly to `/usr/include` and `/usr/lib`. This ensures that after `tcc install` is run, `tcc` automatically finds its runtime dependencies in the standard FHS locations.
-*   **Build System Cleanup**: The `cp` commands that previously copied these files into the `bootstrap` directory (for disk image creation) were removed from `userspace/build.sh`, as `tcc` now handles its own runtime installation.
-
-### 6. Stability and Runtime Fixes (2026)
+### 5. Stability and Runtime Fixes (2026)
 
 Several critical issues were resolved to move TCC from a crashing state to a functional compiler producing working binaries.
 

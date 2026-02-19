@@ -9,11 +9,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/libc_stubs.c");
     println!("cargo:rerun-if-changed=src/setjmp.S");
     println!("cargo:rerun-if-changed=src/config.h");
-    println!("cargo:rerun-if-changed=lib/crt0.S");
-    println!("cargo:rerun-if-changed=lib/crti.S");
-    println!("cargo:rerun-if-changed=lib/crtn.S");
-    println!("cargo:rerun-if-changed=lib/libc.c");
 
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap();
@@ -72,10 +69,12 @@ fn main() {
         }
     };
 
-    run_cc("lib/libc.c", "libc.o", &["-I", "include"]);
-    run_cc("lib/crt0.S", "crt1.o", &[]);
-    run_cc("lib/crti.S", "crti.o", &[]);
-    run_cc("lib/crtn.S", "crtn.o", &[]);
+    let musl_dist = manifest_dir.join("../musl/dist");
+    if !musl_dist.exists() {
+        panic!("Musl distribution not found at {}. Build musl package first.", musl_dist.display());
+    }
+
+    // 2. Build TCC runtime objects
     run_cc("tinycc/lib/libtcc1.c", "libtcc1_base.o", &["-I", "tinycc", "-I", "include"]);
     run_cc("tinycc/lib/lib-arm64.c", "lib-arm64.o", &["-I", "tinycc", "-I", "include"]);
 
@@ -118,7 +117,6 @@ fn main() {
         }
     };
 
-    run_ar(&out_dir.join("libc.a"), &[&out_dir.join("libc.o")]);
     run_ar(&out_dir.join("libtcc1.a"), &[&out_dir.join("libtcc1_base.o"), &out_dir.join("lib-arm64.o")]);
 
     // 3. Stage the sysroot
@@ -137,17 +135,18 @@ fn main() {
     fs::create_dir_all(&tcc_dir).unwrap();
     fs::create_dir_all(&tcc_include_dir).unwrap();
 
-    // Standard location for libraries
-    fs::copy(out_dir.join("libc.a"), lib_dir.join("libc.a")).unwrap();
-    fs::copy(out_dir.join("crt1.o"), lib_dir.join("crt1.o")).unwrap();
-    fs::copy(out_dir.join("crti.o"), lib_dir.join("crti.o")).unwrap();
-    fs::copy(out_dir.join("crtn.o"), lib_dir.join("crtn.o")).unwrap();
+    // Copy Musl artifacts
+    fs::copy(musl_dist.join("lib/libc.a"), lib_dir.join("libc.a")).unwrap();
+    fs::copy(musl_dist.join("lib/crt1.o"), lib_dir.join("crt1.o")).unwrap();
+    fs::copy(musl_dist.join("lib/crti.o"), lib_dir.join("crti.o")).unwrap();
+    fs::copy(musl_dist.join("lib/crtn.o"), lib_dir.join("crtn.o")).unwrap();
     
     // TCC specific runtime
     fs::copy(out_dir.join("libtcc1.a"), tcc_dir.join("libtcc1.a")).unwrap();
 
-    // Headers
-    copy_dir_recursive(Path::new("include"), &include_dir).unwrap();
+    // Headers from Musl (Standard POSIX)
+    copy_dir_recursive(&musl_dist.join("include"), &include_dir).unwrap();
+    // TCC specific internal headers
     copy_dir_recursive(Path::new("tinycc/include"), &tcc_include_dir).unwrap();
 
     // 4. Create the archive
