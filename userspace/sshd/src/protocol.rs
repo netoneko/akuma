@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{SigningKey, Signer};
 use embedded_io_async::{Read, Write};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
@@ -23,16 +23,18 @@ use crate::SshStream;
 use libakuma::*;
 use libakuma::net::Error as NetError;
 
+// Use our ported shell
+use crate::shell::{self, CommandRegistry, ShellContext, create_default_registry};
+
 // ============================================================================
 // SSH Constants
 // ============================================================================
 
 const SSH_VERSION: &[u8] = b"SSH-2.0-Akuma_0.1_User\r\n";
 
-// SSH Message Types
 const SSH_MSG_DISCONNECT: u8 = 1;
-const SSH_MSG_IGNORE: u8 = 2;
-const SSH_MSG_DEBUG: u8 = 4;
+// const SSH_MSG_IGNORE: u8 = 2;
+// const SSH_MSG_DEBUG: u8 = 4;
 const SSH_MSG_SERVICE_REQUEST: u8 = 5;
 const SSH_MSG_SERVICE_ACCEPT: u8 = 6;
 const SSH_MSG_KEXINIT: u8 = 20;
@@ -40,9 +42,9 @@ const SSH_MSG_NEWKEYS: u8 = 21;
 const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
-const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
-const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
-const SSH_MSG_REQUEST_FAILURE: u8 = 82;
+// const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
+// const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
+// const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
@@ -51,7 +53,6 @@ const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
 const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
 
-// Algorithm names
 const KEX_ALGO: &str = "curve25519-sha256";
 const HOST_KEY_ALGO: &str = "ssh-ed25519";
 const CIPHER_ALGO: &str = "aes128-ctr";
@@ -59,7 +60,7 @@ const MAC_ALGO: &str = "hmac-sha2-256";
 const COMPRESS_ALGO: &str = "none";
 
 // ============================================================================
-// SSH State Machine
+// SSH Session
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +72,8 @@ enum SshState {
     AwaitingServiceRequest,
     AwaitingUserAuth,
     Authenticated,
-    Disconnected,
+    // Disconnected,
 }
-
-// ============================================================================
-// SSH Session
-// ============================================================================
 
 struct SshSession {
     state: SshState,
@@ -91,8 +88,6 @@ struct SshSession {
     input_buffer: Vec<u8>,
     channel_open: bool,
     client_channel: u32,
-    _channel_data_buffer: Vec<u8>,
-    _channel_eof: bool,
     config: SshdConfig,
 }
 
@@ -111,8 +106,6 @@ impl SshSession {
             input_buffer: Vec::new(),
             channel_open: false,
             client_channel: 0,
-            _channel_data_buffer: Vec::new(),
-            _channel_eof: false,
             config,
         }
     }
@@ -126,15 +119,15 @@ async fn run_shell_session(
     stream: &mut SshStream,
     session: &mut SshSession,
 ) -> Result<(), NetError> {
-    println("[SSH] Starting shell session");
-
-    if let Some(res) = spawn("/bin/paws", None) {
-        println("[SSH] Spawned /bin/paws");
-        bridge_process(stream, session, res.pid, res.stdout_fd).await
-    } else {
-        println("[SSH] /bin/paws not found, falling back to rudimentary shell");
-        run_fallback_shell(stream, session).await
+    if let Some(ref shell_path) = session.config.shell {
+        println(&format!("[SSH] Spawning shell: {}", shell_path));
+        if let Some(res) = spawn(shell_path, None) {
+            return bridge_process(stream, session, res.pid, res.stdout_fd).await;
+        }
+        println(&format!("[SSH] Failed to spawn {}, falling back to built-in", shell_path));
     }
+
+    run_built_in_shell(stream, session).await
 }
 
 async fn bridge_process(
@@ -144,39 +137,20 @@ async fn bridge_process(
     stdout_fd: u32,
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
-    
     loop {
-        if let Some((_, exit_code)) = waitpid(pid) {
-            println(&format!("[SSH] Process exited with code {}", exit_code));
-            break;
-        }
-
-        // Process output from paws to SSH
+        if let Some((_, _exit_code)) = waitpid(pid) { break; }
+        
         let n = read_fd(stdout_fd as i32, &mut buf);
-        if n > 0 {
-            send_channel_data(stream, session, &buf[..n as usize]).await?;
-        }
+        if n > 0 { send_channel_data(stream, session, &buf[..n as usize]).await?; }
 
-        // Process input from SSH to paws
         let mut ssh_buf = [0u8; 512];
-        // Note: Read here is async but TcpStream in libakuma is sync.
-        // We'll use a short sleep to prevent busy looping if no data.
         match stream.read(&mut ssh_buf).await {
             Ok(0) => break,
             Ok(n) => {
                 session.input_buffer.extend_from_slice(&ssh_buf[..n]);
-                while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+                while let Some((msg_type, _payload)) = process_encrypted_packet(session) {
                     if msg_type == SSH_MSG_CHANNEL_DATA {
-                        let mut offset = 0;
-                        let _recipient = read_u32(&payload, &mut offset);
-                        if let Some(data) = read_string(&payload, &mut offset) {
-                            // Forward SSH input to the spawned process
-                            // Since libakuma's spawn uses a shared stdin buffer in the kernel
-                            // accessible via process PID, we'd need a way to write to it.
-                            // In this prototype, we'll assume bidirectional I/O is handled
-                            // via the process's own syscalls or we need a write_to_stdin syscall.
-                            // For now, we'll just acknowledge the data.
-                        }
+                        // Input forwarding placeholder
                     } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
                         return Ok(());
                     }
@@ -184,22 +158,25 @@ async fn bridge_process(
             }
             Err(_) => {}
         }
-
         sleep_ms(10);
     }
     Ok(())
 }
 
-async fn run_fallback_shell(
+async fn run_built_in_shell(
     stream: &mut SshStream,
     session: &mut SshSession,
 ) -> Result<(), NetError> {
-    let welcome = b"\r\nWelcome to Akuma Fallback Shell\r\nType 'help' for commands.\r\n";
+    let welcome = b"\r\nWelcome to Akuma SSH Built-in Shell\r\nType 'help' for commands.\r\n";
     send_channel_data(stream, session, welcome).await?;
     
     let mut line = Vec::new();
+    let mut shell_ctx = ShellContext::new();
+    let registry = create_default_registry();
+
     loop {
-        send_channel_data(stream, session, b"fallback> ").await?;
+        let prompt = format!("akuma:{}> ", shell_ctx.cwd());
+        send_channel_data(stream, session, prompt.as_bytes()).await?;
         
         line.clear();
         'read_loop: loop {
@@ -221,7 +198,7 @@ async fn run_fallback_shell(
                                     line.pop();
                                     send_channel_data(stream, session, b"\x08 \x08").await?;
                                 }
-                            } else {
+                            } else if byte >= 32 {
                                 line.push(byte);
                                 send_channel_data(stream, session, &[byte]).await?;
                             }
@@ -233,37 +210,25 @@ async fn run_fallback_shell(
             }
         }
 
-        let cmd_str = core::str::from_utf8(&line).unwrap_or("");
-        match cmd_str {
-            "help" => {
-                send_channel_data(stream, session, b"Commands: help, exit, echo <msg>\r\n").await?;
-            }
-            "exit" => {
-                send_channel_data(stream, session, b"Goodbye!\r\n").await?;
-                return Ok(());
-            }
-            c if c.starts_with("echo ") => {
-                let msg = &c[5..];
-                send_channel_data(stream, session, msg.as_bytes()).await?;
-                send_channel_data(stream, session, b"\r\n").await?;
-            }
-            "" => {}
-            _ => {
-                send_channel_data(stream, session, b"Unknown command\r\n").await?;
-            }
+        if line.is_empty() { continue; }
+
+        let res = shell::execute_command_chain(&line, &registry, &mut shell_ctx).await;
+        if !res.output.is_empty() {
+            send_channel_data(stream, session, &res.output).await?;
+        }
+        if res.should_exit {
+            send_channel_data(stream, session, b"Goodbye!\r\n").await?;
+            break;
         }
     }
+    Ok(())
 }
 
 // ============================================================================
 // Message Handlers
 // ============================================================================
 
-enum MessageResult {
-    Continue,
-    StartShell,
-    Disconnect,
-}
+enum MessageResult { Continue, StartShell, Disconnect }
 
 async fn handle_message(
     stream: &mut SshStream,
@@ -292,9 +257,7 @@ async fn handle_message(
                 }
             }
         }
-        SSH_MSG_NEWKEYS => {
-            session.state = SshState::AwaitingServiceRequest;
-        }
+        SSH_MSG_NEWKEYS => { session.state = SshState::AwaitingServiceRequest; }
         SSH_MSG_SERVICE_REQUEST => {
             let mut offset = 0;
             if let Some(service) = read_string(payload, &mut offset) {
@@ -307,9 +270,7 @@ async fn handle_message(
         SSH_MSG_USERAUTH_REQUEST => {
             let (result, reply) = auth::handle_userauth_request(payload, &session.session_id, &session.config).await;
             send_packet(stream, &reply, session).await?;
-            if let AuthResult::Success = result {
-                session.state = SshState::Authenticated;
-            }
+            if let AuthResult::Success = result { session.state = SshState::Authenticated; }
         }
         SSH_MSG_CHANNEL_OPEN => {
             let mut offset = 0;
@@ -329,16 +290,12 @@ async fn handle_message(
             let _recipient = read_u32(payload, &mut offset);
             let req_type = read_string(payload, &mut offset).unwrap_or(b"");
             let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
-            
             if want_reply {
                 let mut full_reply = vec![SSH_MSG_CHANNEL_SUCCESS];
                 write_u32(&mut full_reply, session.client_channel);
                 send_packet(stream, &full_reply, session).await?;
             }
-            
-            if req_type == b"shell" {
-                return Ok(MessageResult::StartShell);
-            }
+            if req_type == b"shell" { return Ok(MessageResult::StartShell); }
         }
         SSH_MSG_DISCONNECT => return Ok(MessageResult::Disconnect),
         _ => {}
@@ -496,8 +453,8 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
     Some((msg_type, payload))
 }
 
-pub async fn handle_connection(mut stream: SshStream) {
-    let mut session = SshSession::new(super::config::get_config());
+pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
+    let mut session = SshSession::new(config);
     let _ = stream.write_all(SSH_VERSION).await;
     
     let mut buf = [0u8; 1024];

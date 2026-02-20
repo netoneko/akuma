@@ -16,6 +16,7 @@ mod auth;
 mod keys;
 mod config;
 mod protocol;
+mod shell;
 
 // ============================================================================
 // TcpStream Wrapper for embedded-io-async
