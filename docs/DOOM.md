@@ -51,9 +51,10 @@ DOOM runs on Akuma using [doomgeneric](https://github.com/ozkl/doomgeneric), a p
 cd userspace && cargo build --release -p doom
 
 # Deploy to disk image (doom is not in build.sh — must be deployed separately)
+# Use piped interactive debugfs to ensure atomic rm+write:
 cd ..
-debugfs -w -R "rm /bin/doom" disk.img 2>/dev/null
-debugfs -w -R "write userspace/target/aarch64-unknown-none/release/doom /bin/doom" disk.img
+echo -e "rm /bin/doom\nwrite userspace/target/aarch64-unknown-none/release/doom /bin/doom" \
+  | debugfs -w disk.img
 # doom1.wad (shareware) must also be on disk.img at /doom1.wad
 
 # Build the kernel and run (headless, no QEMU window)
@@ -114,7 +115,7 @@ DOOM's 320×200 framebuffer is rendered as ANSI truecolor half-block art in the 
 
 ### WAD File Loading
 
-The shareware `doom1.wad` (~4MB) is stored on `disk.img` (ext2). Since Akuma's `sys_read` reads the entire file on each call, the WAD is memory-mapped at startup: `W_StdC_OpenFile` allocates a single buffer via `malloc`, loads the full WAD into it, and subsequent `W_StdC_Read` calls use `memcpy` from this buffer.
+The shareware `doom1.wad` (~4MB) is stored on `disk.img` (ext2). Akuma's `sys_read` has a 64KB per-call limit, so the WAD is memory-mapped at startup: `W_StdC_OpenFile` allocates a single buffer via `malloc` and loads the full WAD in 32KB chunks, then subsequent `W_StdC_Read` calls use `memcpy` from this buffer. The `fread` stub also loops internally to handle the kernel's read limit.
 
 See: `userspace/doom/doomgeneric/w_file_stdc.c`
 
@@ -142,6 +143,7 @@ Long-running processes like DOOM that don't write to stdout cause the SSH socket
 
 1. **Socket timeout:** Increased from 60s to 3600s in `src/ssh/server.rs`
 2. **Global request handling:** Added `SSH_MSG_GLOBAL_REQUEST` handler in `SshChannelStream::handle_channel_message` to respond to `keepalive@openssh.com` requests during interactive exec sessions
+3. **Window adjust:** Added `SSH_MSG_CHANNEL_WINDOW_ADJUST` handler to silently consume client flow-control messages (previously logged as "Ignoring message type 93" and flooded the console)
 
 ## Bugs Fixed During Development
 
@@ -154,6 +156,9 @@ Long-running processes like DOOM that don't write to stdout cause the SSH socket
 | SSH disconnect after ~120s | Server didn't respond to SSH keepalive global requests during exec | Added `SSH_MSG_GLOBAL_REQUEST` → `SSH_MSG_REQUEST_FAILURE` reply in channel message handler |
 | Kernel OOM panic with ANSI rendering | ANSI frames produced faster than SSH could drain; process channel buffer grew unboundedly | Static buffer + frame skip + 30ms drain sleep after each frame |
 | ANSI art scrolls instead of rendering in-place | Shell checks `raw_mode` at read time, but process sets it before shell reads first output batch — all init text gets bare `\n`, causing staircase that pushes cursor off-screen | `akuma_print` now converts `\n`→`\r\n`; Rust prints use `\r\n`; first frame clears display+scrollback (`\x1b[2J\x1b[3J`) |
+| Syscall mismatch after merge | Kernel moved to Linux-compatible syscall numbers (WRITE=64) but doom binary was built with old numbers (WRITE=2) | Rebuild doom against updated libakuma; framebuffer syscalls renumbered to 321-323 |
+| `debugfs` deploy not updating binary | Chained `debugfs -w -R "rm ..."; debugfs -w -R "write ..."` didn't reliably replace the file | Use piped interactive `debugfs -w` session with `rm` + `write` in one invocation |
+| SSH log spam during gameplay | `SSH_MSG_CHANNEL_WINDOW_ADJUST` (type 93) not handled in streaming channel handler | Added explicit handler to silently consume window adjust messages |
 
 ## File Layout
 
