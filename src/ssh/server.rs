@@ -16,7 +16,6 @@ use super::protocol;
 // Constants
 // ============================================================================
 
-const SSH_PORT: u16 = 22;
 const MAX_CONNECTIONS: usize = 4;
 
 /// Count of active SSH sessions
@@ -28,7 +27,7 @@ static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Run the SSH server (Blocking - should be spawned on a thread)
 pub fn run() -> ! {
-    log("[SSH Server] Starting SSH server on port 22...\n");
+    log(&format!("[SSH Server] Starting SSH server on port {}...\n", crate::config::SSH_PORT));
     
     // Initialize host keys
     super::init_host_key();
@@ -37,7 +36,7 @@ pub fn run() -> ! {
     let mut listen_handle = match create_listener() {
         Some(h) => h,
         None => {
-            log("[SSH Server] FATAL: Failed to create listener\n");
+            log(&format!("[SSH Server] FATAL: Failed to create listener on port {}\n", crate::config::SSH_PORT));
             loop { crate::threading::yield_now(); }
         }
     };
@@ -99,7 +98,7 @@ fn create_listener() -> Option<SocketHandle> {
     let handle = smoltcp_net::socket_create()?;
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
-        socket.listen(SSH_PORT)
+        socket.listen(crate::config::SSH_PORT)
     });
     
     match res {

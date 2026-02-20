@@ -686,7 +686,8 @@ fn run_async_main() -> ! {
 
     console::print("[Main] Network ready! Running background polling loop.\n");
     console::print(
-        "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
+        &format!("[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
+        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT }),
     );
 
     // Enable IRQs for the main loop

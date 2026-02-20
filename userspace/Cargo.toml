@@ -23,7 +23,8 @@ members = [
     "paws",
     "musl",
     "tcc",
-    "tar"
+    "tar",
+    "dropbear"
 ]
 
 [profile.dev]

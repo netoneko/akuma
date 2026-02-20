@@ -290,3 +290,13 @@ pub const PROC_STDIN_MAX_SIZE: usize = 8 * 1024; // 8KB
 ///
 /// Note: A single write larger than this limit is still accepted in full.
 pub const PROC_STDOUT_MAX_SIZE: usize = 8 * 1024; // 8KB
+
+// ============================================================================
+// SSH Server Configuration
+// ============================================================================
+
+/// Port for the built-in kernel SSH server
+///
+/// Default is 22. Set to a different port (e.g., 2222) if running a userspace
+/// SSH server like Dropbear on port 22.
+pub const SSH_PORT: u16 = 22;
