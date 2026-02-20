@@ -194,6 +194,7 @@ fn sys_exit(code: i32) -> u64 {
 }
 
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     match fd {
@@ -243,6 +244,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 }
 
 fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
@@ -278,12 +280,13 @@ struct IoVec {
 }
 
 fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
     let mut total_written: u64 = 0;
     for i in 0..iov_cnt {
         let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
-        if written == !0u64 {
-            if total_written == 0 { return !0u64; }
+        if (written as i64) < 0 {
+            if total_written == 0 { return written; }
             break;
         }
         total_written += written;
@@ -298,6 +301,7 @@ fn sys_brk(new_brk: usize) -> u64 {
 }
 
 fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u32) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     
     // Validate path existence
@@ -362,6 +366,7 @@ fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 #[repr(C)] #[derive(Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
 
 fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
         if let Ok(meta) = crate::vfs::metadata(&f.path) {
@@ -374,6 +379,8 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
 }
 
 fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _flags: u32) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     
     // Resolve path.
@@ -424,6 +431,7 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _fl
 }
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
     if let Some(proc) = crate::process::current_process() {
         let cwd_bytes = proc.cwd.as_bytes();
         // Check if buffer is large enough (including null terminator)
@@ -453,18 +461,22 @@ fn sys_fcntl(fd: u32, cmd: u32, _arg: u64) -> u64 {
 }
 
 fn sys_mkdirat(_dirfd: i32, path_ptr: u64, path_len: usize, _mode: u32) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     crate::safe_print!(128, "[syscall] mkdirat: {}\n", path);
     if crate::fs::create_dir(path).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_unlinkat(_dirfd: i32, path_ptr: u64, path_len: usize, _flags: u32) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     crate::safe_print!(128, "[syscall] unlinkat: {}\n", path);
     if crate::fs::remove_file(path).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, oldpath_len: usize, _newdirfd: i32, newpath_ptr: u64, newpath_len: usize) -> u64 {
+    if !validate_user_ptr(oldpath_ptr, oldpath_len) { return EFAULT; }
+    if !validate_user_ptr(newpath_ptr, newpath_len) { return EFAULT; }
     let oldpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(oldpath_ptr as *const u8, oldpath_len)).unwrap_or("") };
     let newpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(newpath_ptr as *const u8, newpath_len)).unwrap_or("") };
     crate::safe_print!(128, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
@@ -493,6 +505,7 @@ fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
 
 fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
+    if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
     if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_bind(idx, addr).is_ok() { return 0; } }
     !0u64
@@ -503,7 +516,9 @@ fn sys_listen(fd: u32, backlog: i32) -> u64 {
     !0u64
 }
 
-fn sys_accept(fd: u32, addr_ptr: u64, _len_ptr: u64) -> u64 {
+fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
+    if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
             if let Some(proc) = crate::process::current_process() {
@@ -517,12 +532,14 @@ fn sys_accept(fd: u32, addr_ptr: u64, _len_ptr: u64) -> u64 {
 
 fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
+    if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
     if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_connect(idx, addr).is_ok() { return 0; } }
     !0u64
 }
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -535,6 +552,7 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
 }
 
 fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -587,6 +605,8 @@ fn sys_munmap(addr: usize, _len: usize) -> u64 {
 }
 
 fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
+    if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
+    if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
     let name = unsafe { core::str::from_utf8(core::slice::from_raw_parts(name_ptr as *const u8, name_len)).unwrap_or("unknown") };
     let root = unsafe { core::str::from_utf8(core::slice::from_raw_parts(root_ptr as *const u8, root_len)).unwrap_or("/") };
     let creator_pid = crate::process::read_current_pid().unwrap_or(0);
@@ -604,6 +624,8 @@ fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root
 fn sys_uptime() -> u64 { crate::timer::uptime_us() }
 
 fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if !validate_user_ptr(res_ptr, 4) { return EFAULT; }
     let host = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     match crate::dns::resolve_host_blocking(host) {
         Ok(ipv4) => {
@@ -615,6 +637,7 @@ fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
 }
 
 fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(ptr, size) { return EFAULT; }
     if let Some(proc) = crate::process::current_process() {
         if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
             if let Ok(entries) = crate::fs::list_dir(&f.path) {
@@ -658,6 +681,7 @@ pub struct SpawnOptions {
 /// Helper to parse null-separated strings from userspace into a Vec<&str>
 fn parse_args(ptr: u64, len: usize) -> Vec<String> {
     if ptr == 0 || len == 0 { return Vec::new(); }
+    if !validate_user_ptr(ptr, len) { return Vec::new(); }
     let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
     let mut args = Vec::new();
     let mut start = 0;
@@ -673,6 +697,10 @@ fn parse_args(ptr: u64, len: usize) -> Vec<String> {
 }
 
 fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if args_ptr != 0 && !validate_user_ptr(args_ptr, args_len) { return EFAULT; }
+    if stdin_ptr != 0 && !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
+    
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
     
@@ -691,6 +719,9 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, std
 }
 
 fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
+    
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     
     let options = if options_ptr != 0 {
@@ -759,7 +790,7 @@ fn sys_reattach(pid: u32) -> u64 {
 
 
 fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
-
+    if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
@@ -771,6 +802,7 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 }
 
 fn sys_getrandom(ptr: u64, len: usize) -> u64 {
+    if !validate_user_ptr(ptr, len) { return EFAULT; }
     let mut buf = alloc::vec![0u8; len.min(256)];
     if crate::rng::fill_bytes(&mut buf).is_ok() { unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()); } return buf.len() as u64; }
     !0u64
@@ -779,6 +811,7 @@ fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
 
 fn sys_chdir(ptr: u64, len: usize) -> u64 {
+    if !validate_user_ptr(ptr, len) { return EFAULT; }
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)).unwrap_or("") };
     
     if let Some(proc) = crate::process::current_process() {
@@ -840,6 +873,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
         return (-libc_errno::EINVAL as i64) as u64;
     }
+    if !validate_user_ptr(attr_ptr, 8) { return EFAULT; }
 
     let term_state_lock = match crate::process::current_terminal_state() {
         Some(state) => state,
@@ -900,6 +934,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
         return (-libc_errno::EINVAL as i64) as u64;
     }
+    if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
     if config::SYSCALL_DEBUG_INFO_ENABLED && timeout_us > 0 && timeout_us != u64::MAX {
         // Only print for non-infinite timeouts to avoid noise
@@ -980,6 +1015,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
 }
 
 fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
+    if !validate_user_ptr(ptr, max * core::mem::size_of::<ThreadCpuStat>()) { return EFAULT; }
     let count = max.min(config::MAX_THREADS);
     for i in 0..count {
         let mut stat = ThreadCpuStat {
