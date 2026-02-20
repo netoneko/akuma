@@ -48,6 +48,7 @@ pub mod syscall {
     pub const CHDIR: u64 = 49;
     pub const GETCWD: u64 = 17;
     pub const FCNTL: u64 = 25;
+    pub const PIPE2: u64 = 59;
     pub const FACCESSAT: u64 = 48;
     pub const NEWFSTATAT: u64 = 79;
     pub const CLOCK_GETTIME: u64 = 113;
@@ -896,6 +897,16 @@ pub fn fstatat(dirfd: i32, path: &str, flags: u32) -> Result<Stat, i32> {
     } else {
         Ok(stat)
     }
+}
+
+/// Create a pipe
+pub fn pipe(fds: &mut [i32; 2]) -> i32 {
+    syscall(
+        syscall::PIPE2,
+        fds.as_mut_ptr() as u64,
+        0,
+        0, 0, 0, 0,
+    ) as i32
 }
 
 /// Check file access permissions

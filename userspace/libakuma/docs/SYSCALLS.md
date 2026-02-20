@@ -32,6 +32,7 @@ All pointers passed to syscalls must be within the valid userspace range:
 | `clock_gettime(id, &ts)` | Retrieves the time of the specified clock. |
 | `access(path, mode)` | Checks file access permissions. |
 | `accessat(dirfd, path, mode, flags)` | Checks file access relative to a directory. |
+| `pipe(fds)` | Creates a unidirectional data channel (currently stubbed). |
 | `chdir(path)` | Changes the current working directory. |
 | `mkdir(path)` | Creates a new directory. |
 | `unlink(path)` | Deletes a file. |

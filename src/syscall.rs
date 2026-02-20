@@ -43,6 +43,7 @@ pub mod nr {
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
+    pub const PIPE2: u64 = 59;       // Linux arm64 pipe2
     pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
     pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
     pub const CLOCK_GETTIME: u64 = 113; // Linux arm64 clock_gettime
@@ -148,6 +149,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
+        nr::PIPE2 => sys_pipe2(args[0], args[1] as u32),
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::CLOSE => sys_close(args[0] as u32),
@@ -322,6 +324,33 @@ fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
         total_written += written;
     }
     total_written
+}
+
+fn sys_pipe2(fds_ptr: u64, _flags: u32) -> u64 {
+    if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
+    
+    // Stub implementation using temporary files since we don't have kernel pipes yet.
+    // This allows GNU Make to proceed with subprocess communication.
+    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    
+    // Ensure /tmp exists
+    let _ = crate::fs::create_dir("/tmp");
+    
+    let path_r = "/tmp/pipe_r";
+    let path_w = "/tmp/pipe_w";
+    
+    // Create files if they don't exist
+    let _ = crate::fs::write_file(path_r, &[]);
+    let _ = crate::fs::write_file(path_w, &[]);
+    
+    let fd_r = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_r.into(), 0)));
+    let fd_w = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_w.into(), 1)));
+    
+    unsafe {
+        *(fds_ptr as *mut [i32; 2]) = [fd_r as i32, fd_w as i32];
+    }
+    
+    0
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
