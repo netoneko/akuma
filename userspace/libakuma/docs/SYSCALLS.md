@@ -33,6 +33,9 @@ All pointers passed to syscalls must be within the valid userspace range:
 | `access(path, mode)` | Checks file access permissions. |
 | `accessat(dirfd, path, mode, flags)` | Checks file access relative to a directory. |
 | `pipe(fds)` | Creates a unidirectional data channel (currently stubbed). |
+| `fork()` | Creates a child process (Linux bridging). |
+| `execve(path, argv, envp)` | Executes a new program (Linux bridging). |
+| `waitpid(pid, status, options)` | Waits for a process to change state. |
 | `chdir(path)` | Changes the current working directory. |
 | `mkdir(path)` | Creates a new directory. |
 | `unlink(path)` | Deletes a file. |

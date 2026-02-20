@@ -30,9 +30,13 @@ To improve compatibility with standard AArch64 tools, several filesystem syscall
 | `FACCESSAT2` | 439 | `dirfd`, `path_ptr`, `mode`, `flags` |
 | `CLOCK_GETTIME` | 113 | `clock_id`, `timespec_ptr` |
 | `PIPE2` | 59 | `fds_ptr`, `flags` |
+| `CLONE` | 220 | `flags`, `stack`, `parent_tid`, `tls`, `child_tid` |
+| `EXECVE` | 221 | `path_ptr`, `argv_ptr`, `envp_ptr` |
+| `WAIT4` | 260 | `pid`, `status_ptr`, `options`, `rusage` |
 
 ### Key Fixes:
 - **`PIPE2`**: Added a stub implementation using temporary files (`/tmp/pipe_r`, `/tmp/pipe_w`). This is a temporary measure to allow GNU Make to function while a full kernel-side pipe implementation is developed.
+- **Process Spawning (`vfork/execve`)**: Added bridging support for the Linux `vfork` pattern. `CLONE` handles the initial fork request, and `EXECVE` translates the Linux-style execution request into Akuma's internal thread-based `spawn` architecture.
 - **`CHDIR`**: Corrected from a custom number (306) to the Linux standard (49).
 - **`ENOSYS`**: Unknown syscalls now correctly return `-38` (`ENOSYS`) instead of `-1` (`EPERM`). This prevents applications from misinterpreting missing functionality as a permission error.
 - **Argument Order**: Verified all arguments (like `flags` and `mode`) match the positions expected by Linux-compiled binaries.

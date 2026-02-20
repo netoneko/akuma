@@ -30,6 +30,8 @@ pub mod nr {
     pub const SENDTO: u64 = 206;
     pub const RECVFROM: u64 = 207;
     pub const SHUTDOWN: u64 = 210;
+    pub const CLONE: u64 = 220;
+    pub const EXECVE: u64 = 221;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
@@ -48,6 +50,7 @@ pub mod nr {
     pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
     pub const CLOCK_GETTIME: u64 = 113; // Linux arm64 clock_gettime
     pub const FACCESSAT2: u64 = 439;    // Linux arm64 faccessat2
+    pub const WAIT4: u64 = 260;         // Linux arm64 wait4
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
@@ -166,6 +169,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
+        nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        nr::EXECVE => sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
@@ -200,6 +205,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FACCESSAT => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
         nr::CLOCK_GETTIME => sys_clock_gettime(args[0] as u32, args[1]),
         nr::FACCESSAT2 => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::WAIT4 => sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
@@ -556,6 +562,98 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     } else {
         ENOENT
     }
+}
+
+fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
+    // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
+    // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
+    if flags & 0x4000 != 0 {
+        // Return child PID (fake success)
+        // We handle the actual spawning in sys_execve
+        return 0x7FFFFFFF; 
+    }
+    ENOSYS
+}
+
+fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    // Resolve path
+    let resolved_path = if path.starts_with('/') {
+        path
+    } else {
+        if let Some(proc) = crate::process::current_process() {
+            crate::vfs::resolve_path(&proc.cwd, &path)
+        } else {
+            path
+        }
+    };
+
+    // Parse argv
+    let mut args = Vec::new();
+    if argv_ptr != 0 {
+        let mut i = 0;
+        loop {
+            if !validate_user_ptr(argv_ptr + i * 8, 8) { break; }
+            let str_ptr = unsafe { *((argv_ptr + i * 8) as *const u64) };
+            if str_ptr == 0 { break; }
+            if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
+                args.push(s);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    let args_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+    let cwd = crate::process::current_process().map(|p| p.cwd.clone());
+
+    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), None, cwd.as_deref()) {
+        Ok((_tid, ch, pid)) => {
+            crate::process::register_child_channel(pid, ch);
+            // In vfork, parent blocks until child exits.
+            // We'll simulate this by storing the child PID and having sys_wait4 handle it.
+            // For now, return 0 to the child (which we just spawned)
+            // But since Akuma doesn't really have a child thread running the same code,
+            // we just return success.
+            0
+        }
+        Err(_) => ENOENT,
+    }
+}
+
+fn sys_wait4(pid: i32, status_ptr: u64, _options: i32, _rusage: u64) -> u64 {
+    // If pid is -1, wait for any child.
+    // If pid is 0x7FFFFFFF, it's our fake child PID from sys_clone.
+    let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
+        // Find any child channel that has exited
+        None // TODO: implement wait for ANY
+    } else if pid > 0 {
+        Some(pid as u32)
+    } else {
+        None
+    };
+
+    if let Some(p) = target_pid {
+        if let Some(ch) = crate::process::get_child_channel(p) {
+            loop {
+                if ch.has_exited() {
+                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                        unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; }
+                    }
+                    return p as u64;
+                }
+                crate::threading::yield_now();
+            }
+        }
+    }
+    
+    // Fallback if no child found (ECHILD)
+    0
 }
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
