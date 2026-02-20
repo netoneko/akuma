@@ -8,26 +8,6 @@ use alloc::alloc::Layout;
 use core::ffi::{c_char, c_void, c_int};
 use core::ptr;
 
-// Need a basic PathBuf implementation for install_tcc_runtime in no_std
-struct PathBuf {
-    path: alloc::string::String,
-}
-
-impl PathBuf {
-    fn from(path: &str) -> Self {
-        PathBuf { path: alloc::string::String::from(path) }
-    }
-
-    fn parent(&self) -> Option<PathBuf> {
-        self.path.rfind('/').map(|idx| {
-            PathBuf { path: alloc::string::String::from(&self.path[..idx]) }
-        })
-    }
-
-    fn to_str(&self) -> Option<&str> {
-        Some(&self.path)
-    }
-}
 use libakuma::{
     close as akuma_close, exit as akuma_exit,
     open as akuma_open, open_flags,
@@ -72,36 +52,6 @@ static mut STDOUT_FILE: FILE = FILE { fd: 1, error: 0, eof: 0, ungot: -1 };
 static mut STDERR_FILE: FILE = FILE { fd: 2, error: 0, eof: 0, ungot: -1 };
 
 // ============================================================================
-// Embedded Files for Installation
-// ============================================================================
-
-const FILES_TO_INSTALL: &[(&str, &str)] = &[
-    ("include/assert.h", include_str!("../include/assert.h")),
-    ("include/ctype.h", include_str!("../include/ctype.h")),
-    ("include/dlfcn.h", include_str!("../include/dlfcn.h")),
-    ("include/errno.h", include_str!("../include/errno.h")),
-    ("include/fcntl.h", include_str!("../include/fcntl.h")),
-    ("include/inttypes.h", include_str!("../include/inttypes.h")),
-    ("include/limits.h", include_str!("../include/limits.h")),
-    ("include/math.h", include_str!("../include/math.h")),
-    ("include/setjmp.h", include_str!("../include/setjmp.h")),
-    ("include/stdarg.h", include_str!("../include/stdarg.h")),
-    ("include/stddef.h", include_str!("../include/stddef.h")),
-    ("include/stdint.h", include_str!("../include/stdint.h")),
-    ("include/stdio.h", include_str!("../include/stdio.h")),
-    ("include/stdlib.h", include_str!("../include/stdlib.h")),
-    ("include/string.h", include_str!("../include/string.h")),
-    ("include/time.h", include_str!("../include/time.h")),
-    ("include/unistd.h", include_str!("../include/unistd.h")),
-    ("include/sys/mman.h", include_str!("../include/sys/mman.h")),
-    ("include/sys/stat.h", include_str!("../include/sys/stat.h")),
-    ("include/sys/time.h", include_str!("../include/sys/time.h")),
-    ("include/sys/types.h", include_str!("../include/sys/types.h")),
-    ("lib/crt0.S", include_str!("../lib/crt0.S")),
-    ("lib/libc.c", include_str!("../lib/libc.c")),
-];
-
-// ============================================================================
 // Entry Point
 // ============================================================================
 
@@ -132,12 +82,6 @@ pub extern "C" fn _start() -> ! {
         }
         argv_ptrs.push(ptr::null());
 
-        // Handle 'install' command
-        if actual_args.len() > 1 && actual_args[1] == "install" {
-            install_tcc_runtime();
-            akuma_exit(0); // Use akuma_exit here
-        }
-
         let argc = (argv_ptrs.len() - 1) as c_int;
 
         // Debug: check libraries to be sure
@@ -159,35 +103,6 @@ pub extern "C" fn _start() -> ! {
         let ret = tcc_main(argc, argv_ptrs.as_ptr());
         akuma_exit(ret); // Use akuma_exit here
     }
-}
-
-fn install_tcc_runtime() {
-    for (rel_path, content) in FILES_TO_INSTALL.iter() {
-        let full_path = alloc::format!("/usr/{}", rel_path);
-        
-        // Ensure parent directories exist
-        let parent_dir_path = PathBuf::from(&full_path).parent().unwrap();
-        let parent_dir_str = parent_dir_path.to_str().unwrap();
-        if libakuma::mkdir_p(parent_dir_str) {
-            // Open and write file
-            let fd = libakuma::open(&full_path, open_flags::O_CREAT | open_flags::O_TRUNC | open_flags::O_WRONLY);
-            if fd < 0 {
-                libakuma::eprintln(&alloc::format!("Error: Could not open {} for writing.", full_path));
-                libakuma::exit(1);
-            }
-            let bytes_written = libakuma::write(fd as u64, content.as_bytes());
-            if bytes_written < 0 || bytes_written as usize != content.len() {
-                libakuma::eprintln(&alloc::format!("Error: Could not write to {}.", full_path));
-                libakuma::exit(1);
-            }
-            libakuma::close(fd);
-            libakuma::println(&alloc::format!("Installed: {}", full_path));
-        } else {
-            libakuma::eprintln(&alloc::format!("Error: Could not create parent directory for {}.", full_path));
-            libakuma::exit(1);
-        }
-    }
-    libakuma::println("TCC runtime installed successfully.");
 }
 
 // ============================================================================
@@ -642,15 +557,6 @@ pub unsafe extern "C" fn exit(status: c_int) -> ! {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn time(tloc: *mut TimeT) -> TimeT {
-    let t = (libakuma::time() / 1_000_000) as TimeT; // Akuma returns microseconds, C time() expects seconds
-    if !tloc.is_null() {
-        *tloc = t;
-    }
-    t
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
     ptr::null_mut() // No environment variables supported yet
 }
@@ -784,16 +690,12 @@ pub unsafe extern "C" fn strtoull(nptr: *const c_char, endptr: *mut *mut c_char,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn atoi(nptr: *const c_char) -> c_int {
-    strtol(nptr, ptr::null_mut(), 10) as c_int
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn __clear_cache(_beg: *mut c_void, _end: *mut c_void) {
-    // AArch64 cache invalidation (simplified, might need more for correctness)
-    // For now, a no-op should be fine.
-    // asm volatile ("dsb sy" ::: "memory"); // Data synchronization barrier
-    // asm volatile ("isb sy" ::: "memory"); // Instruction synchronization barrier
+pub unsafe extern "C" fn time(tloc: *mut i64) -> i64 {
+    let t = (libakuma::time() / 1_000_000) as i64;
+    if !tloc.is_null() {
+        *tloc = t;
+    }
+    t
 }
 
 // ============================================================================

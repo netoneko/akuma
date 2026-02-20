@@ -8,3 +8,4 @@ libakuma = { path = "../libakuma" }
 
 [build-dependencies]
 cc = "1.0"
+musl = { path = "../musl" }

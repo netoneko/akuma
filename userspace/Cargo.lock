@@ -660,6 +660,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "musl"
+version = "1.2.4"
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -990,6 +994,7 @@ version = "0.9.27"
 dependencies = [
  "cc",
  "libakuma",
+ "musl",
 ]
 
 [[package]]

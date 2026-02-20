@@ -1,0 +1,9 @@
+[package]
+name = "musl"
+version = "1.2.4"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+# No specific build dependencies needed, just standard library

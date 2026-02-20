@@ -54,32 +54,34 @@ static WOKEN_STATES: [AtomicBool; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
-/// Current running thread - stored in TPIDR_EL0 register
+/// Current running thread - stored in TPIDRRO_EL0 register
 /// Using a CPU register avoids race conditions with global atomics.
-/// TPIDR_EL0 is accessible from EL1 and provides per-CPU thread tracking.
+/// TPIDRRO_EL0 is accessible from EL1 and provides per-CPU thread tracking.
+/// It is read-only from EL0 (user mode), which is fine as userspace shouldn't
+/// need to modify its own thread ID directly.
 
-/// Set the current thread ID in TPIDR_EL0
+/// Set the current thread ID in TPIDRRO_EL0
 #[inline]
 fn set_current_thread_register(tid: usize) {
     unsafe {
-        core::arch::asm!("msr tpidr_el0, {}", in(reg) tid as u64);
+        core::arch::asm!("msr tpidrro_el0, {}", in(reg) tid as u64);
     }
 }
 
-/// Get the current thread ID from TPIDR_EL0
+/// Get the current thread ID from TPIDRRO_EL0
 /// Halts the system if the register contains an invalid value (>= MAX_THREADS)
 /// since this indicates serious corruption that cannot be recovered from.
 #[inline]
 fn get_current_thread_register() -> usize {
     let val: u64;
     unsafe {
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) val);
+        core::arch::asm!("mrs {}, tpidrro_el0", out(reg) val);
     }
     let tid = val as usize;
     // Bounds check - if corrupted, halt immediately
     if tid >= config::MAX_THREADS {
         // Log corruption and halt - we cannot safely continue
-        crate::console::print("[FATAL] TPIDR_EL0 CORRUPT: tid=");
+        crate::console::print("[FATAL] TPIDRRO_EL0 CORRUPT: tid=");
         crate::console::print_hex(val);
         crate::console::print(" >= MAX_THREADS (");
         crate::console::print_dec(config::MAX_THREADS);
@@ -506,6 +508,10 @@ switch_context:
     // (kernel threads use boot TTBR0, user processes use their own)
     mrs x9, ttbr0_el1
     str x9, [x0, #136]
+
+    // Save TPIDR_EL0 (user TLS pointer)
+    mrs x9, tpidr_el0
+    str x9, [x0, #160]
     
     // Ensure all writes to new context memory are visible before loading
     dsb ish
@@ -535,7 +541,7 @@ switch_context:
     // CRITICAL: Do NOT restore DAIF here!
     // 
     // Restoring DAIF could unmask IRQs mid-switch, allowing a nested timer
-    // interrupt. Since TPIDR_EL0 was already updated, the nested handler
+    // interrupt. Since TPIDRRO_EL0 was already updated, the nested handler
     // would save the wrong thread's context, causing corruption.
     //
     // IRQs must stay MASKED throughout switch_context.
@@ -556,7 +562,7 @@ switch_context:
     // ELR=0 is ALWAYS a bug for any thread - there's no valid code at address 0
     cbnz x9, 12f                // ELR != 0, OK
     // ELR is 0! Halt with thread ID in x1
-    mrs x1, tpidr_el0           // Get thread ID for debugging
+    mrs x1, tpidrro_el0         // Get thread ID for debugging
     mov x0, #0xBAD
     movk x0, #0x00E1, lsl #16   // 0x00E10BAD = "bad ELR"
 13: wfi
@@ -580,6 +586,12 @@ switch_context:
     ldr x9, [x1, #136]
     dsb ish                   // Complete pending memory accesses
     msr ttbr0_el1, x9         // Switch TTBR0
+
+    // Restore TPIDR_EL0 (user TLS pointer)
+    ldr x9, [x1, #160]
+    msr tpidr_el0, x9
+    isb
+    
     isb                       // Ensure TTBR0 change visible
     tlbi vmalle1              // Flush all EL1 TLB entries
     dsb ish                   // Wait for TLB flush to complete
@@ -646,9 +658,9 @@ unsafe extern "C" {
 /// Magic value for Context integrity check
 pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
 
-/// Size of the UNIFIED IRQ frame saved on stack (288 bytes)
+/// Size of the UNIFIED IRQ frame saved on stack (304 bytes)
 /// Both EL0 and EL1 IRQ handlers now use this same layout.
-pub const IRQ_FRAME_SIZE: usize = 288;
+pub const IRQ_FRAME_SIZE: usize = 304;
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
@@ -673,7 +685,8 @@ pub const IRQ_FRAME_SIZE: usize = 288;
 ///   [sp+224]: x0, x1
 ///   [sp+240]: ELR, SPSR
 ///   [sp+256]: SP_EL0 + padding
-///   [sp+272]: x10, x11
+///   [sp+272]: TPIDR_EL0 + padding
+///   [sp+288]: x10, x11
 /// 
 /// Returns the SP value pointing to the fake IRQ frame
 pub fn setup_fake_irq_frame(
@@ -720,10 +733,13 @@ pub fn setup_fake_irq_frame(
         
         // [sp+256]: SP_EL0 + padding (user stack pointer, 0 for new threads)
         frame.add(32).write_volatile(0);  // SP_EL0
+
+        // [sp+272]: TPIDR_EL0 + padding (user thread pointer, 0 for new threads)
+        frame.add(34).write_volatile(0);  // TPIDR_EL0
         
-        // [sp+272]: x10, x11
-        frame.add(34).write_volatile(0);  // x10
-        frame.add(35).write_volatile(0);  // x11
+        // [sp+288]: x10, x11
+        frame.add(36).write_volatile(0);  // x10
+        frame.add(37).write_volatile(0);  // x11
     }
     
     frame_base
@@ -766,6 +782,7 @@ pub struct Context {
     // User process fields (unified context architecture)
     pub user_entry: u64,     // User PC for first ERET (0 for kernel threads)
     pub user_sp: u64,        // User SP for first ERET (0 for kernel threads)
+    pub user_tls: u64,       // User TPIDR_EL0 for TLS
     pub is_user_process: u64, // 1 if this is a user process thread, 0 for kernel threads
 }
 
@@ -792,6 +809,7 @@ impl Context {
             ttbr0: 0, // Will be initialized to boot TTBR0
             user_entry: 0,
             user_sp: 0,
+            user_tls: 0,
             is_user_process: 0,
         }
     }
@@ -1412,7 +1430,7 @@ impl ThreadPool {
     ///   - Cooperative threads (thread 0): Only switch after timeout elapses
     ///   - Non-cooperative threads (sessions, user processes): Always preemptible
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
-        // Use TPIDR_EL0 register for current thread ID - more reliable than atomic
+        // Use TPIDRRO_EL0 register for current thread ID - more reliable than atomic
         let current_idx = get_current_thread_register();
         let current = &self.slots[current_idx];
 
@@ -1445,16 +1463,19 @@ impl ThreadPool {
             if self.network_boost_counter >= config::NETWORK_THREAD_RATIO {
                 self.network_boost_counter = 0;
                 let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
-                if thread0_state == thread_state::READY {
-                    if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
-                        THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
+                if thread0_state == thread0_state { // Always true, just to keep structure
+                    let thread0_state_val = THREAD_STATES[0].load(Ordering::SeqCst);
+                    if thread0_state_val == thread_state::READY {
+                        if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
+                            THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
+                        }
+                        THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
+                        let now = crate::timer::uptime_us();
+                        self.slots[0].start_time_us = now;
+                        set_current_thread_register(0);
+                        self.current_idx = 0;
+                        return Some((current_idx, 0));
                     }
-                    THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
-                    let now = crate::timer::uptime_us();
-                    self.slots[0].start_time_us = now;
-                    set_current_thread_register(0);
-                    self.current_idx = 0;
-                    return Some((current_idx, 0));
                 }
             }
         }
@@ -1848,7 +1869,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // Update exception stack BEFORE switching
             crate::exceptions::set_current_exception_stack(new_tpidr);
             
-            // Note: TPIDR_EL0 (thread ID) is already updated by schedule_indices
+            // Note: TPIDRRO_EL0 (thread ID) is already updated by schedule_indices
             
             // Debug: Print context SPs before switch AND actual SP register
             if config::ENABLE_SGI_DEBUG_PRINTS {

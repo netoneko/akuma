@@ -30,7 +30,7 @@ Akuma has two distinct memory systems that are cleaned up differently:
 │           ▼                                                      │
 │  return_to_kernel(exit_code)                                     │
 │           │                                                      │
-│           ├─► cleanup_process_sockets(proc)                      │
+│           ├─► cleanup_process_fds(proc)                      │
 │           │      Close all open sockets/FDs                      │
 │           │                                                      │
 │           ├─► remove_channel(tid)                                │
@@ -141,7 +141,7 @@ kill_process(pid)
     │
     ├─► Set channel.interrupted (allow blocked syscalls to abort)
     ├─► Yield a few times (let process handle interrupt)
-    ├─► cleanup_process_sockets(proc)
+    ├─► cleanup_process_fds(proc)
     ├─► Set proc.exited = true, exit_code = 137 (SIGKILL)
     ├─► unregister_process(pid) → Box dropped → memory freed
     ├─► remove_channel(thread_id)
@@ -162,7 +162,7 @@ kill_process(pid)
 | ASID | `asid` | `UserAddressSpace::drop()` |
 | Kernel heap (Process struct) | Talc allocator | Rust Drop |
 | ProcessChannel buffers | Arc reference | Last Arc dropped |
-| Socket buffers | Socket table | `cleanup_process_sockets()` |
+| Socket buffers | Socket table | `cleanup_process_fds()` |
 
 ## Verification
 

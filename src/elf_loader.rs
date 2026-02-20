@@ -4,10 +4,12 @@
 //! Uses the `elf` crate for parsing.
 
 use elf::ElfBytes;
-use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
+use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use elf::endian::LittleEndian;
 
 use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
+use alloc::vec::Vec;
+use alloc::string::String;
 
 /// Enable debug output for ELF loading
 /// Set to false to reduce boot verbosity
@@ -21,6 +23,41 @@ pub struct LoadedElf {
     pub address_space: UserAddressSpace,
     /// Highest mapped address (for stack placement)
     pub brk: usize,
+    /// Address of program headers in user memory
+    pub phdr_addr: usize,
+    /// Number of program headers
+    pub phnum: usize,
+    /// Size of each program header
+    pub phent: usize,
+}
+
+/// Auxiliary Vector entry types
+pub mod auxv {
+    pub const AT_NULL: u64 = 0;
+    pub const AT_IGNORE: u64 = 1;
+    pub const AT_EXECFD: u64 = 2;
+    pub const AT_PHDR: u64 = 3;
+    pub const AT_PHENT: u64 = 4;
+    pub const AT_PHNUM: u64 = 5;
+    pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
+    pub const AT_FLAGS: u64 = 8;
+    pub const AT_ENTRY: u64 = 9;
+    pub const AT_NOTELF: u64 = 10;
+    pub const AT_UID: u64 = 11;
+    pub const AT_EUID: u64 = 12;
+    pub const AT_GID: u64 = 13;
+    pub const AT_EGID: u64 = 14;
+    pub const AT_RANDOM: u64 = 25;
+    pub const AT_HWCAP: u64 = 16;
+    pub const AT_CLKTCK: u64 = 17;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AuxEntry {
+    pub a_type: u64,
+    pub a_val: u64,
 }
 
 /// Error during ELF loading
@@ -55,6 +92,9 @@ impl core::fmt::Display for ElfError {
 
 use alloc::collections::BTreeMap;
 
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE: u32 = 1027;
 
 /// Load an ELF binary from memory
@@ -88,6 +128,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     // Track highest address for brk
     let mut brk: usize = 0;
 
+    // Track PHDR address
+    let mut phdr_addr: usize = 0;
+
     // Track already-mapped pages (VA -> PA) to avoid double allocation
     let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -95,6 +138,14 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let segments = elf
         .segments()
         .ok_or(ElfError::InvalidFormat("No program headers"))?;
+
+    // Find PT_PHDR if it exists
+    for phdr in segments.iter() {
+        if phdr.p_type == PT_PHDR {
+            phdr_addr = phdr.p_vaddr as usize;
+            break;
+        }
+    }
 
     // Load each PT_LOAD segment
     for phdr in segments.iter() {
@@ -107,6 +158,12 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
+
+        // Fallback for phdr_addr if PT_PHDR segment was missing
+        // Typically phdr is at the very beginning of the first PT_LOAD segment
+        if phdr_addr == 0 && offset == 0 {
+             phdr_addr = vaddr + elf.ehdr.e_phoff as usize;
+        }
 
         if DEBUG_ELF_LOADING {
             crate::safe_print!(128, "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
@@ -178,25 +235,47 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     }
 
     // Apply relocations
-    // For now we only support R_AARCH64_RELATIVE which is common in TCC binaries
     if let Some(shdrs) = elf.section_headers() {
+        // Try to get dynamic symbol table if it exists
+        let dynsyms = elf.dynamic_symbol_table().ok().flatten();
+
         for shdr in shdrs {
             if shdr.sh_type == elf::abi::SHT_RELA {
                 if let Ok(relas) = elf.section_data_as_relas(&shdr) {
                     for rela in relas {
-                        if rela.r_type == R_AARCH64_RELATIVE {
-                            let vaddr = rela.r_offset as usize;
-                            let addend = rela.r_addend as usize;
-                            
-                            // Find physical page for this virtual address
-                            let page_va = vaddr & !(PAGE_SIZE - 1);
-                            if let Some(&pa) = mapped_pages.get(&page_va) {
-                                let offset_in_page = vaddr & (PAGE_SIZE - 1);
-                                unsafe {
-                                    let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
-                                    // R_AARCH64_RELATIVE: *ptr = B + A
-                                    // Since we load at preferred address, B = 0
-                                    *ptr = addend;
+                        let r_type = rela.r_type;
+                        let vaddr = rela.r_offset as usize;
+                        let addend = rela.r_addend as usize;
+                        let sym_idx = rela.r_sym as usize;
+
+                        let mut sym_value = 0;
+                        if sym_idx != 0 {
+                            if let Some(ref syms) = dynsyms {
+                                if let Ok(sym) = syms.0.get(sym_idx) {
+                                    sym_value = sym.st_value as usize;
+                                }
+                            }
+                        }
+
+                        // Find physical page for this virtual address
+                        let page_va = vaddr & !(PAGE_SIZE - 1);
+                        if let Some(&pa) = mapped_pages.get(&page_va) {
+                            let offset_in_page = vaddr & (PAGE_SIZE - 1);
+                            unsafe {
+                                let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
+                                match r_type {
+                                    R_AARCH64_RELATIVE => {
+                                        // *ptr = B + A
+                                        // Since we load at preferred address, B = 0
+                                        *ptr = addend;
+                                    }
+                                    R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
+                                        // *ptr = S + A
+                                        *ptr = sym_value + addend;
+                                    }
+                                    _ => {
+                                        // Unsupported relocation type
+                                    }
                                 }
                             }
                         }
@@ -215,6 +294,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         entry_point,
         address_space,
         brk,
+        phdr_addr,
+        phnum: elf.ehdr.e_phnum as usize,
+        phent: elf.ehdr.e_phentsize as usize,
     })
 }
 
@@ -253,85 +335,148 @@ fn flags_to_user_flags(elf_flags: u32) -> u64 {
 /// Note: Addresses are calculated dynamically based on stack_size parameter.
 pub fn load_elf_with_stack(
     elf_data: &[u8],
+    args: &[String],
     stack_size: usize,
 ) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
 
-    // Place stack at top of first 1GB (user space), after mmap region
-    // Layout: code (0x400000) < mmap (0x10000000-0x3F000000) < stack (0x3F000000-0x40000000)
-    // This keeps everything in the first 1GB where we have fine-grained page table control
-    const STACK_TOP: usize = 0x4000_0000; // Top of first 1GB
+    // Place stack at top of first 1GB (user space)
+    const STACK_TOP: usize = 0x4000_0000;
 
-    // Reserve space for guard page + stack
-    // Guard page is at the bottom (lowest address), unmapped to cause fault on overflow
-    let total_size = stack_size + PAGE_SIZE; // stack + 1 guard page
+    let total_size = stack_size + PAGE_SIZE;
     let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
-    let stack_bottom = guard_page + PAGE_SIZE; // First usable stack page is above guard
-
-    // Ensure stack is page-aligned
-    let stack_bottom_aligned = stack_bottom & !(PAGE_SIZE - 1);
+    let stack_bottom = guard_page + PAGE_SIZE;
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    // Map stack pages (guard page at guard_page is intentionally NOT mapped)
+    let mut stack_frames = Vec::new();
     for i in 0..stack_pages {
-        let page_va = stack_bottom_aligned + i * PAGE_SIZE;
-        loaded
+        let page_va = stack_bottom + i * PAGE_SIZE;
+        let frame = loaded
             .address_space
             .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
             .map_err(|e| ElfError::MappingFailed(e))?;
+        stack_frames.push(frame);
     }
 
-    // Calculate initial SP within mapped region
-    let stack_end = stack_bottom_aligned + stack_pages * PAGE_SIZE;
-    let initial_sp_local = (stack_end - 16) & !0xF;
+    // Initial SP at the very top of mapped stack
+    let mut sp = STACK_TOP;
 
-    if DEBUG_ELF_LOADING {
-        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x} ({} pages), guard=0x{:x}, SP=0x{:x}\n",
-            stack_bottom_aligned, stack_end, stack_pages, guard_page, initial_sp_local);
+    // --- Linux Stack Setup ---
+    // 1. Copy argument strings to the top of the stack
+    let mut argv_addrs = Vec::new();
+    for arg in args.iter().rev() {
+        let bytes = arg.as_bytes();
+        let len = bytes.len() + 1; // + null terminator
+        sp -= len;
+        
+        let frame_idx = (sp - stack_bottom) / PAGE_SIZE;
+        let offset = sp % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+            *(dst.add(bytes.len()) as *mut u8) = 0;
+        }
+        argv_addrs.push(sp);
+    }
+    argv_addrs.reverse();
+
+    // Align SP to 16 bytes AFTER strings
+    sp &= !0xF;
+
+    // 2. Prepare random data for AT_RANDOM (16 bytes)
+    sp -= 16;
+    let random_ptr = sp;
+    let frame_idx = (sp - stack_bottom) / PAGE_SIZE;
+    let offset = sp % PAGE_SIZE;
+    unsafe {
+        let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset) as *mut u64;
+        *dst = 0x123456789abcdef0;
+        *dst.add(1) = 0x0fedcba987654321;
+    }
+
+    // 3. Prepare Auxiliary Vector
+    let auxv = [
+        AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 },
+        AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 },
+        AuxEntry { a_type: auxv::AT_PHENT, a_val: loaded.phent as u64 },
+        AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 },
+        AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 },
+        AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 },
+        AuxEntry { a_type: auxv::AT_HWCAP, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 },
+        AuxEntry { a_type: auxv::AT_UID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_EUID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_GID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_EGID, a_val: 0 },
+        AuxEntry { a_type: auxv::AT_NULL, a_val: 0 },
+    ];
+
+    // 4. Calculate total space for the table
+    // Layout: [argc] [argv...] [NULL] [envp...] [NULL] [auxv...]
+    let argc_size = 8;
+    let argv_size = (args.len() + 1) * 8;
+    let envp_size = 8; // NULL envp
+    let auxv_size = auxv.len() * 16;
+    
+    let total_table_size = argc_size + argv_size + envp_size + auxv_size;
+    
+    // Align total size to 16 bytes so SP stays aligned
+    let total_table_size_aligned = (total_table_size + 15) & !0xF;
+    sp -= total_table_size_aligned;
+
+    let mut current_sp = sp;
+    let write_stack = |addr: usize, val: u64| {
+        let frame_idx = (addr - stack_bottom) / PAGE_SIZE;
+        let offset = addr % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset) as *mut u64;
+            *dst = val;
+        }
+    };
+
+    // Write argc
+    write_stack(current_sp, args.len() as u64);
+    current_sp += 8;
+
+    // Write argv pointers
+    for addr in argv_addrs {
+        write_stack(current_sp, addr as u64);
+        current_sp += 8;
+    }
+    write_stack(current_sp, 0); // argv NULL
+    current_sp += 8;
+
+    // Write envp NULL
+    write_stack(current_sp, 0);
+    current_sp += 8;
+
+    // Write AuxV
+    for entry in auxv {
+        write_stack(current_sp, entry.a_type);
+        write_stack(current_sp + 8, entry.a_val);
+        current_sp += 16;
     }
 
     // Pre-allocate heap pages (64KB = 16 pages, unrolled)
-    // Note: Adding more causes EC=0x0 crashes due to binary size constraints
     let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let f = user_flags::RW_NO_EXEC;
-    let _ = loaded.address_space.alloc_and_map(hs, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x1000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x2000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x3000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x4000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x5000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x6000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x7000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x8000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0x9000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xa000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xb000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xc000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xd000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xe000, f);
-    let _ = loaded.address_space.alloc_and_map(hs + 0xf000, f);
+    for i in 0..16 {
+        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, f);
+    }
 
     if DEBUG_ELF_LOADING {
         crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
+        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
+            stack_bottom, STACK_TOP, sp, args.len());
     }
-
-    // The allocator expects brk(0) to return current brk, then allocates FROM that address.
-    // So we need to set brk to the heap START so allocator uses the pre-mapped pages.
-    // The kernel's sys_brk will update the brk when allocator calls brk(new_value).
-
-    // Stack pointer starts at top of MAPPED region (grows down)
-    // STACK_TOP is the first address ABOVE the stack, so we subtract to get within mapped pages
-    // Align to 16 bytes as required by AArch64 ABI
-    let stack_end = stack_bottom_aligned + stack_pages * PAGE_SIZE;
-    let initial_sp = (stack_end - 16) & !0xF;
 
     // Return: entry, address_space, initial_sp, brk, stack_bottom, stack_top
     Ok((
         loaded.entry_point,
         loaded.address_space,
-        initial_sp,
+        sp, // initial_sp
         hs,
-        stack_bottom_aligned,
-        stack_end,
+        stack_bottom,
+        STACK_TOP,
     ))
 }

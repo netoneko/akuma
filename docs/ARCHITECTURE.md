@@ -283,6 +283,22 @@ struct ScheduledWake {
 
 ---
 
+## Userspace Environment
+
+Akuma OS supports standard C applications through an integrated development environment:
+
+### Standard Library (Musl)
+- **Library**: `musl` libc is the primary C library.
+- **Sysroot**: The system provides a standard sysroot at `/usr/lib` and `/usr/include`.
+- **ABI**: The kernel implements the Linux AArch64 syscall ABI to ensure compatibility with standard Musl builds.
+
+### Compiler (TCC)
+- **Toolchain**: The Tiny C Compiler (TCC) is available as a self-hosted compiler (`/bin/tcc`).
+- **Linkage**: All C programs compiled on Akuma are linked against Musl by default.
+- **Static Linking**: Currently, Akuma targets a fully static execution model.
+
+---
+
 ## See Also
 
 - [CONCURRENCY.md](CONCURRENCY.md) - Detailed synchronization documentation

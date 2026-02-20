@@ -4,6 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -1033,6 +1034,7 @@ pub struct UserContext {
     pub sp: u64,   // Stack pointer (SP_EL0)
     pub pc: u64,   // Program counter (ELR_EL1)
     pub spsr: u64, // Saved program status
+    pub tpidr_el0: u64, // Thread pointer for TLS
 }
 
 impl UserContext {
@@ -1072,6 +1074,7 @@ impl UserContext {
             sp: stack_pointer as u64,
             pc: entry_point as u64,
             spsr: 0, // EL0, interrupts enabled
+            tpidr_el0: 0,
         }
     }
 }
@@ -1239,11 +1242,11 @@ pub struct Process {
 
 impl Process {
     /// Create a new process from ELF data
-    pub fn from_elf(name: &str, elf_data: &[u8]) -> Result<Self, ElfError> {
+    pub fn from_elf(name: &str, args: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack and pre-allocated heap
         // Stack size is configurable via config::USER_STACK_SIZE
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
-            elf_loader::load_elf_with_stack(elf_data, config::USER_STACK_SIZE)?;
+            elf_loader::load_elf_with_stack(elf_data, args, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
@@ -1528,6 +1531,8 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
             // Set SPSR_EL1 (saved program status for EL0)
             // SPSR = 0 means EL0, all interrupts enabled
             "msr spsr_el1, {spsr}",
+            // Set TPIDR_EL0 (thread pointer for TLS)
+            "msr tpidr_el0, {tls}",
             // Clear registers for clean start
             "mov x0, #0",
             "mov x1, #0",
@@ -1565,6 +1570,7 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
             sp = in(reg) ctx.sp,
             pc = in(reg) ctx.pc,
             spsr = in(reg) ctx.spsr,
+            tls = in(reg) ctx.tpidr_el0,
             options(noreturn)
         )
     }
@@ -1659,9 +1665,9 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         if let Some(proc) = current_process() {
             let pid = proc.pid;
             
-            // Clean up all open sockets for this process
+            // Clean up all open FDs for this process (sockets, child channels)
             // This must happen before unregistering the process so we can access fd_table
-            cleanup_process_sockets(proc);
+            cleanup_process_fds(proc);
             
             Some(pid)
         } else {
@@ -1725,30 +1731,32 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
 }
 
-/// Clean up all sockets owned by a process
-///
-/// Called during process exit to close all open sockets and free resources.
-/// This prevents socket/buffer leaks when processes exit without properly closing their sockets.
-fn cleanup_process_sockets(proc: &Process) {
-    // Get all socket FDs from the process's fd_table
-    let socket_fds: alloc::vec::Vec<(u32, usize)> = {
+/// Clean up all file descriptors owned by a process
+fn cleanup_process_fds(proc: &Process) {
+    // 1. Collect all special FDs that need manual cleanup
+    let fds: alloc::vec::Vec<FileDescriptor> = {
         let table = proc.fd_table.lock();
-        table.iter()
-            .filter_map(|(&fd, desc)| {
-                if let FileDescriptor::Socket(idx) = desc {
-                    Some((fd, *idx))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        table.values().cloned().collect()
     };
     
-    // Close each socket
-    for (_fd, socket_idx) in socket_fds {
-        // remove_socket handles smoltcp socket removal
-        crate::socket::remove_socket(socket_idx);
+    // 2. Perform manual cleanup for special FDs
+    for fd in fds {
+        match fd {
+            FileDescriptor::Socket(idx) => {
+                crate::socket::remove_socket(idx);
+            }
+            FileDescriptor::ChildStdout(child_pid) => {
+                crate::process::remove_child_channel(child_pid);
+            }
+            _ => {}
+        }
     }
+    
+    // 3. Clear the FD table. 
+    // This will drop KernelFile and other descriptors, 
+    // which in turn will call their respective cleanup logic (like VFS close).
+    let mut table = proc.fd_table.lock();
+    table.clear();
 }
 
 /// Kill a process by PID
@@ -1786,10 +1794,10 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
         crate::threading::yield_now();
     }
     
-    // Clean up all open sockets for this process
+    // Clean up all open FDs for this process
     // Note: This cleans up sockets in the fd_table, but sockets created inside
     // syscalls (like the TcpSocket in accept()) are handled by the interrupt mechanism.
-    cleanup_process_sockets(proc);
+    cleanup_process_fds(proc);
     
     // Mark process as killed (using signal 9 = SIGKILL)
     proc.exited = true;
@@ -1958,8 +1966,17 @@ pub fn spawn_process_with_channel_ext(
     let elf_data =
         crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
 
+    // Prepare full arguments (argv[0] = path/name)
+    let mut full_args = Vec::new();
+    full_args.push(path.to_string());
+    if let Some(arg_slice) = args {
+        for arg in arg_slice {
+            full_args.push(arg.to_string());
+        }
+    }
+
     // Create the process
-    let mut process = Process::from_elf(path, &elf_data)
+    let mut process = Process::from_elf(path, &full_args, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
     // Create a channel for this process
@@ -1973,10 +1990,12 @@ pub fn spawn_process_with_channel_ext(
     // Set the channel in the process struct (UNIFIED I/O)
     process.channel = Some(channel.clone());
 
-    // Set up arguments if provided
-    if let Some(arg_slice) = args {
-        process.args = arg_slice.iter().map(|s| String::from(*s)).collect();
-    }
+    // Save arguments in process struct for ProcessInfo page
+    process.args = if let Some(arg_slice) = args {
+        arg_slice.iter().map(|s| String::from(*s)).collect()
+    } else {
+        Vec::new()
+    };
 
     // Set up stdin if provided
     if let Some(data) = stdin {

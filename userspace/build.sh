@@ -23,6 +23,7 @@ MEMBERS=(
     "cat"
     "box"
     "paws"
+    "musl"
     "tcc"
     "tar"
 )

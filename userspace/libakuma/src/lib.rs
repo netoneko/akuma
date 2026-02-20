@@ -13,10 +13,12 @@ use core::arch::asm;
 
 /// Syscall numbers
 pub mod syscall {
-    pub const EXIT: u64 = 0;
-    pub const READ: u64 = 1;
-    pub const WRITE: u64 = 2;
-    pub const BRK: u64 = 3;
+    pub const EXIT: u64 = 93;
+    pub const READ: u64 = 63;
+    pub const WRITE: u64 = 64;
+    pub const WRITEV: u64 = 66;
+    pub const IOCTL: u64 = 29;
+    pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const LSEEK: u64 = 62;
@@ -31,18 +33,17 @@ pub mod syscall {
     pub const RECVFROM: u64 = 207;
     pub const SHUTDOWN: u64 = 210;
     pub const MUNMAP: u64 = 215;
-    pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222;
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
     pub const RENAMEAT: u64 = 38;
+    pub const GETRANDOM: u64 = 278;
     // Custom syscalls
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
-    pub const GETRANDOM: u64 = 304;
     pub const TIME: u64 = 305;
     pub const CHDIR: u64 = 306;
     // New Terminal Control Syscalls
@@ -58,10 +59,14 @@ pub mod syscall {
     pub const REGISTER_BOX: u64 = 316;
     pub const KILL_BOX: u64 = 317;
     pub const REATTACH: u64 = 318;
-    // Framebuffer Syscalls
-    pub const FB_INIT: u64 = 319;
-    pub const FB_DRAW: u64 = 320;
-    pub const FB_INFO: u64 = 321;
+    pub const UPTIME: u64 = 319;
+    pub const SET_TID_ADDRESS: u64 = 96;
+    pub const EXIT_GROUP: u64 = 94;
+    pub const SET_TPIDR_EL0: u64 = 320;
+    // Framebuffer Syscalls (321-323)
+    pub const FB_INIT: u64 = 321;
+    pub const FB_DRAW: u64 = 322;
+    pub const FB_INFO: u64 = 323;
 }
 
 /// Thread CPU statistics for top command

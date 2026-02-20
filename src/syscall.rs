@@ -11,10 +11,12 @@ use alloc::vec::Vec;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
-    pub const EXIT: u64 = 0;
-    pub const READ: u64 = 1;
-    pub const WRITE: u64 = 2;
-    pub const BRK: u64 = 3;
+    pub const EXIT: u64 = 93;
+    pub const READ: u64 = 63;
+    pub const WRITE: u64 = 64;
+    pub const WRITEV: u64 = 66;
+    pub const IOCTL: u64 = 29;
+    pub const BRK: u64 = 214;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const LSEEK: u64 = 62;
@@ -29,18 +31,20 @@ pub mod nr {
     pub const RECVFROM: u64 = 207;
     pub const SHUTDOWN: u64 = 210;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
-    pub const UPTIME: u64 = 216;
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
+    pub const SET_TID_ADDRESS: u64 = 96;
+    pub const EXIT_GROUP: u64 = 94;
+    pub const RT_SIGPROCMASK: u64 = 135;
+    pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
-    pub const GETRANDOM: u64 = 304;  // Fill buffer with random bytes from VirtIO RNG
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
     pub const CHDIR: u64 = 306;       // Change current working directory
     // Terminal Syscalls (307-313)
@@ -56,10 +60,12 @@ pub mod nr {
     pub const REGISTER_BOX: u64 = 316;
     pub const KILL_BOX: u64 = 317;
     pub const REATTACH: u64 = 318;
-    // Framebuffer Syscalls (319-321)
-    pub const FB_INIT: u64 = 319;
-    pub const FB_DRAW: u64 = 320;
-    pub const FB_INFO: u64 = 321;
+    pub const UPTIME: u64 = 319;
+    pub const SET_TPIDR_EL0: u64 = 320;
+    // Framebuffer Syscalls (321-323)
+    pub const FB_INIT: u64 = 321;
+    pub const FB_DRAW: u64 = 322;
+    pub const FB_INFO: u64 = 323;
 }
 
 /// Thread CPU statistics for top command
@@ -95,6 +101,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
+        nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
+        nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
         nr::CLOSE => sys_close(args[0] as u32),
@@ -135,11 +143,26 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
+        nr::SET_TID_ADDRESS => 1, // Return dummy TID
+        nr::EXIT_GROUP => sys_exit(args[0] as i32),
+        nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
+        nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         nr::FB_INIT => sys_fb_init(args[0] as u32, args[1] as u32),
         nr::FB_DRAW => sys_fb_draw(args[0], args[1] as usize),
         nr::FB_INFO => sys_fb_info(args[0]),
-        _ => !0 // ENOSYS
+        _ => {
+            crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
+                syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
+            !0 // ENOSYS
+        }
     }
+}
+
+fn sys_set_tpidr_el0(address: u64) -> u64 {
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) address);
+    }
+    0
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -227,6 +250,26 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         _ => !0u64
     }
+}
+
+#[repr(C)]
+struct IoVec {
+    iov_base: u64,
+    iov_len: usize,
+}
+
+fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    let mut total_written: u64 = 0;
+    for i in 0..iov_cnt {
+        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
+        if written == !0u64 {
+            if total_written == 0 { return !0u64; }
+            break;
+        }
+        total_written += written;
+    }
+    total_written
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
@@ -623,7 +666,6 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
             if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; } }
-            crate::process::remove_child_channel(pid);
             return pid as u64;
         }
     }

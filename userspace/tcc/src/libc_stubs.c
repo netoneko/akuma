@@ -3,8 +3,16 @@
 #include "stdio.h"
 #include "ctype.h" // For isdigit, isalpha etc.
 
+/* Forward declarations */
+long strtol(const char *nptr, char **endptr, int base);
+unsigned long strtoul(const char *nptr, char **endptr, int base);
+
 /* errno global */
 int errno = 0;
+
+int *__errno_location(void) {
+    return &errno;
+}
 
 /* Environment */
 char *__environ[] = { NULL };
@@ -16,6 +24,37 @@ extern int fputc(int c, FILE *stream);
 extern void *malloc(size_t size);
 extern void *free(void *ptr);
 extern void *realloc(void *ptr, size_t size);
+
+/* System configuration */
+long sysconf(int name) {
+    // TCC uses this to find page size for memory mapping
+    if (name == 30) return 4096; // _SC_PAGESIZE
+    return -1;
+}
+
+/* Assert */
+void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function) {
+    printf("Assertion failed: %s, file %s, line %d, function %s\n", assertion, file, line, function);
+    while(1);
+}
+
+/* Time */
+struct tm {
+    int tm_sec; int tm_min; int tm_hour; int tm_mday; int tm_mon;
+    int tm_year; int tm_wday; int tm_yday; int tm_isdst;
+};
+struct tm *localtime(const long *timer) {
+    static struct tm t = {0}; // Minimal stub
+    return &t;
+}
+
+/* Math stubs (minimal) */
+long double ldexpl(long double x, int exp) {
+    // Very simplified ldexpl
+    while (exp > 0) { x *= 2.0; exp--; }
+    while (exp < 0) { x /= 2.0; exp++; }
+    return x;
+}
 
 /* Memory functions */
 void *memset(void *s, int c, size_t n) {
@@ -182,13 +221,6 @@ char *strerror(int errnum) {
 }
 
 /* Math stubs (minimal) */
-/* Character functions */
-int isspace(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-int isdigit(int c) { return c >= '0' && c <= '9'; }
-int isalpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-int isalnum(int c) { return isalpha(c) || isdigit(c); }
 
 /* Printf family */
 
@@ -425,3 +457,16 @@ void *dlopen(const char *filename, int flag) { return NULL; }
 char *dlerror(void) { return "Dynamic loading not supported"; }
 void *dlsym(void *handle, const char *symbol) { return NULL; }
 int dlclose(void *handle) { return 0; }
+
+int atoi(const char *nptr) {
+    return (int)strtol(nptr, NULL, 10);
+}
+
+void __arm64_clear_cache(void *beg, void *end) {
+    // Dummy implementation for Akuma OS
+}
+
+void __clear_cache(void *beg, void *end) {
+    // AArch64 cache invalidation (simplified, might need more for correctness)
+    // For now, a no-op should be fine.
+}

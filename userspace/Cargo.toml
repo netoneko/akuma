@@ -22,6 +22,7 @@ members = [
     "allocstress",
     "top",
     "paws",
+    "musl",
     "tcc",
     "tar"
 ]
