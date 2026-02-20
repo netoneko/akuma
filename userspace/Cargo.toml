@@ -5,6 +5,7 @@ members = [
     "libakuma-tls",
     "box",
     "cat",
+    "doom",
     "echo2",
     "elftest",
     "hello",

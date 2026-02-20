@@ -62,6 +62,7 @@ const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
 const SSH_MSG_CHANNEL_EOF: u8 = 96;
 const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
@@ -385,6 +386,21 @@ impl<'a> SshChannelStream<'a> {
                 log("[SSH] Channel close/EOF received\n");
                 self.session.channel_eof = true;
                 return Ok(true);
+            }
+            SSH_MSG_GLOBAL_REQUEST => {
+                // Respond to global requests (e.g. keepalive@openssh.com)
+                // so the SSH client doesn't time out during long-running processes
+                let mut offset = 0;
+                let _req_name = read_string(payload, &mut offset);
+                let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
+                if want_reply {
+                    let reply = alloc::vec![SSH_MSG_REQUEST_FAILURE];
+                    let _ = send_packet(self.stream, &reply, self.session).await;
+                }
+            }
+            SSH_MSG_CHANNEL_WINDOW_ADJUST => {
+                // Client is adjusting its receive window; we don't enforce
+                // flow control, so just silently consume the message.
             }
             SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
             SSH_MSG_DISCONNECT => {
