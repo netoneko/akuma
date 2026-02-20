@@ -9,3 +9,4 @@ chunked-allocator = []
 
 [dependencies]
 talc = "4"
+embedded-io-async = { version = "0.6", default-features = false }

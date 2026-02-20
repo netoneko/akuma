@@ -1,0 +1,21 @@
+[package]
+name = "sshd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes = { version = "0.8", default-features = false }
+ctr = { version = "0.9", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+rand_core = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false }
+spinning_top = "0.3"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

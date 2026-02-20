@@ -78,6 +78,32 @@ impl Error {
     }
 }
 
+impl embedded_io_async::Error for Error {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        match self.kind {
+            ErrorKind::NotFound => embedded_io_async::ErrorKind::NotFound,
+            ErrorKind::PermissionDenied => embedded_io_async::ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused => embedded_io_async::ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset => embedded_io_async::ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted => embedded_io_async::ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected => embedded_io_async::ErrorKind::NotConnected,
+            ErrorKind::AddrInUse => embedded_io_async::ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable => embedded_io_async::ErrorKind::AddrNotAvailable,
+            ErrorKind::BrokenPipe => embedded_io_async::ErrorKind::BrokenPipe,
+            ErrorKind::AlreadyExists => embedded_io_async::ErrorKind::AlreadyExists,
+            ErrorKind::InvalidInput => embedded_io_async::ErrorKind::InvalidInput,
+            ErrorKind::InvalidData => embedded_io_async::ErrorKind::InvalidData,
+            // Map variants not present in embedded-io 0.6.1 to Other
+            ErrorKind::WouldBlock |
+            ErrorKind::TimedOut |
+            ErrorKind::WriteZero |
+            ErrorKind::Interrupted |
+            ErrorKind::UnexpectedEof |
+            ErrorKind::Other => embedded_io_async::ErrorKind::Other,
+        }
+    }
+}
+
 /// A TCP socket server, listening for connections.
 pub struct TcpListener {
     fd: i32,

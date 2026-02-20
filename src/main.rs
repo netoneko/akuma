@@ -679,16 +679,22 @@ fn run_async_main() -> ! {
     // Initialize SSH host key
     ssh::init_host_key();
 
-    console::print("[Main] Spawning SSH server thread...\n");
-    if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
-        console::print("[Main] Failed to spawn SSH server: ");
-        console::print(e);
-        console::print("\n");
+    if !config::ENABLE_USERSPACE_SSHD {
+        console::print("[Main] Spawning built-in SSH server thread...\n");
+        if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
+            console::print("[Main] Failed to spawn SSH server: ");
+            console::print(e);
+            console::print("\n");
+        }
+    } else {
+        console::print("[Main] Built-in SSH server disabled (ENABLE_USERSPACE_SSHD=true)\n");
     }
 
     safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
-    safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
-        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
+    if !config::ENABLE_USERSPACE_SSHD {
+        safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
+            if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
+    }
 
     // Enable IRQs for the main loop
     unsafe {

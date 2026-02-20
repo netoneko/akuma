@@ -300,3 +300,9 @@ pub const PROC_STDOUT_MAX_SIZE: usize = 8 * 1024; // 8KB
 /// Default is 22. Set to a different port (e.g., 2222) if running a userspace
 /// SSH server like Dropbear on port 22.
 pub const SSH_PORT: u16 = 22;
+
+/// Enable userspace SSHD instead of the built-in kernel SSH server.
+///
+/// When enabled, the kernel will not spawn its internal SSH server thread.
+/// The userspace /bin/sshd should be started by /bin/herd instead.
+pub const ENABLE_USERSPACE_SSHD: bool = false;
