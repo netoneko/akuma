@@ -26,9 +26,13 @@ To improve compatibility with standard AArch64 tools, several filesystem syscall
 | `UNLINKAT` | 35 | `dirfd`, `path_ptr`, `flags` |
 | `RENAMEAT` | 38 | `olddirfd`, `oldpath_ptr`, `newdirfd`, `newpath_ptr` |
 | `CHDIR` | 49 | `path_ptr` |
+| `FACCESSAT` | 48 | `dirfd`, `path_ptr`, `mode` |
+| `FACCESSAT2` | 439 | `dirfd`, `path_ptr`, `mode`, `flags` |
+| `CLOCK_GETTIME` | 113 | `clock_id`, `timespec_ptr` |
 
 ### Key Fixes:
 - **`CHDIR`**: Corrected from a custom number (306) to the Linux standard (49).
+- **`ENOSYS`**: Unknown syscalls now correctly return `-38` (`ENOSYS`) instead of `-1` (`EPERM`). This prevents applications from misinterpreting missing functionality as a permission error.
 - **Argument Order**: Verified all arguments (like `flags` and `mode`) match the positions expected by Linux-compiled binaries.
 
 ## 3. Error Handling

@@ -48,7 +48,10 @@ pub mod syscall {
     pub const CHDIR: u64 = 49;
     pub const GETCWD: u64 = 17;
     pub const FCNTL: u64 = 25;
+    pub const FACCESSAT: u64 = 48;
     pub const NEWFSTATAT: u64 = 79;
+    pub const CLOCK_GETTIME: u64 = 113;
+    pub const FACCESSAT2: u64 = 439;
     // New Terminal Control Syscalls
     pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
     pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
@@ -519,6 +522,26 @@ pub fn time() -> u64 {
     syscall(syscall::TIME, 0, 0, 0, 0, 0, 0)
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+pub const CLOCK_REALTIME: u32 = 0;
+pub const CLOCK_MONOTONIC: u32 = 1;
+
+/// Get the time of the specified clock
+pub fn clock_gettime(clock_id: u32, tp: &mut Timespec) -> i32 {
+    syscall(
+        syscall::CLOCK_GETTIME,
+        clock_id as u64,
+        tp as *mut Timespec as u64,
+        0, 0, 0, 0,
+    ) as i32
+}
+
 // ============================================================================
 // Socket Syscalls
 // ============================================================================
@@ -873,6 +896,29 @@ pub fn fstatat(dirfd: i32, path: &str, flags: u32) -> Result<Stat, i32> {
     } else {
         Ok(stat)
     }
+}
+
+/// Check file access permissions
+pub fn access(path: &str, mode: u32) -> i32 {
+    syscall(
+        syscall::FACCESSAT,
+        -100i32 as u64, // AT_FDCWD
+        path.as_ptr() as u64,
+        mode as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Check file access permissions relative to directory
+pub fn accessat(dirfd: i32, path: &str, mode: u32, flags: u32) -> i32 {
+    syscall(
+        syscall::FACCESSAT2,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        mode as u64,
+        flags as u64,
+        0, 0,
+    ) as i32
 }
 
 /// Seek in a file

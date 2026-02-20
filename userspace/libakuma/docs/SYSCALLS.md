@@ -29,6 +29,9 @@ All pointers passed to syscalls must be within the valid userspace range:
 | `write(fd, buf)` | Writes data from a buffer to a file descriptor. |
 | `fstat(fd)` | Retrieves metadata for an open file. |
 | `fstatat(dirfd, path, flags)` | Retrieves metadata for a path relative to a directory. |
+| `clock_gettime(id, &ts)` | Retrieves the time of the specified clock. |
+| `access(path, mode)` | Checks file access permissions. |
+| `accessat(dirfd, path, mode, flags)` | Checks file access relative to a directory. |
 | `chdir(path)` | Changes the current working directory. |
 | `mkdir(path)` | Creates a new directory. |
 | `unlink(path)` | Deletes a file. |

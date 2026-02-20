@@ -44,6 +44,9 @@ pub mod nr {
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
     pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
+    pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
+    pub const CLOCK_GETTIME: u64 = 113; // Linux arm64 clock_gettime
+    pub const FACCESSAT2: u64 = 439;    // Linux arm64 faccessat2
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
@@ -89,6 +92,10 @@ const ENOENT: u64 = (-2i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
 /// Error code for invalid argument
 const EINVAL: u64 = (-22i64) as u64;
+/// Error code for permission denied
+const EACCES: u64 = (-13i64) as u64;
+/// Error code for function not implemented
+const ENOSYS: u64 = (-38i64) as u64;
 
 /// Validate a user pointer for reading/writing
 /// 
@@ -188,11 +195,14 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
+        nr::FACCESSAT => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
+        nr::CLOCK_GETTIME => sys_clock_gettime(args[0] as u32, args[1]),
+        nr::FACCESSAT2 => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
-            !0 // ENOSYS
+            ENOSYS
         }
     }
 }
@@ -452,6 +462,71 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
     }
     
     ENOENT
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn sys_clock_gettime(clock_id: u32, tp_ptr: u64) -> u64 {
+    if !validate_user_ptr(tp_ptr, core::mem::size_of::<Timespec>()) { return EFAULT; }
+    
+    // clock_id: 0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC
+    let (sec, nsec) = match clock_id {
+        0 => {
+            let us = crate::timer::utc_time_us().unwrap_or(0);
+            ((us / 1_000_000) as i64, ((us % 1_000_000) * 1_000) as i64)
+        }
+        1 | _ => {
+            let us = crate::timer::uptime_us();
+            ((us / 1_000_000) as i64, ((us % 1_000_000) * 1_000) as i64)
+        }
+    };
+    
+    unsafe {
+        *(tp_ptr as *mut Timespec) = Timespec { tv_sec: sec, tv_nsec: nsec };
+    }
+    0
+}
+
+fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let resolved_path = if path.starts_with('/') {
+         path
+    } else {
+        let base_path = if dirfd == -100 { // AT_FDCWD
+             if let Some(proc) = crate::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64; // EBADF
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = crate::process::current_process() {
+                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     f.path.clone()
+                 } else {
+                     return !0u64; // EBADF
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64; // EBADF
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+    
+    if crate::fs::exists(&resolved_path) {
+        0
+    } else {
+        ENOENT
+    }
 }
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
