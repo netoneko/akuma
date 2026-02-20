@@ -3,6 +3,7 @@
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::string::String;
 use core::convert::TryInto;
 
 use ed25519_dalek::{SigningKey, Signer};
@@ -33,8 +34,6 @@ use crate::shell::{self, CommandRegistry, ShellContext, create_default_registry}
 const SSH_VERSION: &[u8] = b"SSH-2.0-Akuma_0.1_User\r\n";
 
 const SSH_MSG_DISCONNECT: u8 = 1;
-// const SSH_MSG_IGNORE: u8 = 2;
-// const SSH_MSG_DEBUG: u8 = 4;
 const SSH_MSG_SERVICE_REQUEST: u8 = 5;
 const SSH_MSG_SERVICE_ACCEPT: u8 = 6;
 const SSH_MSG_KEXINIT: u8 = 20;
@@ -42,9 +41,6 @@ const SSH_MSG_NEWKEYS: u8 = 21;
 const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
-// const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
-// const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
-// const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
@@ -72,7 +68,6 @@ enum SshState {
     AwaitingServiceRequest,
     AwaitingUserAuth,
     Authenticated,
-    // Disconnected,
 }
 
 struct SshSession {
@@ -137,20 +132,34 @@ async fn bridge_process(
     stdout_fd: u32,
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
+    let stdin_path = format!("/proc/{}/fd/0", pid);
+    
     loop {
+        // 1. Check for process exit
         if let Some((_, _exit_code)) = waitpid(pid) { break; }
         
+        // 2. Output from process to SSH
         let n = read_fd(stdout_fd as i32, &mut buf);
         if n > 0 { send_channel_data(stream, session, &buf[..n as usize]).await?; }
 
+        // 3. Input from SSH to process
         let mut ssh_buf = [0u8; 512];
         match stream.read(&mut ssh_buf).await {
             Ok(0) => break,
             Ok(n) => {
                 session.input_buffer.extend_from_slice(&ssh_buf[..n]);
-                while let Some((msg_type, _payload)) = process_encrypted_packet(session) {
+                while let Some((msg_type, payload)) = process_encrypted_packet(session) {
                     if msg_type == SSH_MSG_CHANNEL_DATA {
-                        // Input forwarding placeholder
+                        let mut offset = 0;
+                        let _recipient = read_u32(&payload, &mut offset);
+                        if let Some(data) = read_string(&payload, &mut offset) {
+                            // Forward to process stdin via procfs
+                            let fd = open(&stdin_path, open_flags::O_WRONLY);
+                            if fd >= 0 {
+                                write_fd(fd, data);
+                                close(fd);
+                            }
+                        }
                     } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
                         return Ok(());
                     }
