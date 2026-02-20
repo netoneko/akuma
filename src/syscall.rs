@@ -39,7 +39,11 @@ pub mod nr {
     pub const SET_TID_ADDRESS: u64 = 96;
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGACTION: u64 = 134; // Linux arm64 rt_sigaction
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
+    pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
+    pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
+    pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
@@ -142,6 +146,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
         nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
+        nr::RT_SIGACTION => 0,    // Success (do nothing)
+        nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
+        nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
+        nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2] as usize, args[3], args[4] as u32),
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
@@ -345,6 +353,85 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
     }
     !0u64
+}
+
+fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _flags: u32) -> u64 {
+    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+    
+    // Resolve path.
+    // Logic:
+    // 1. If path is absolute, use it directly.
+    // 2. If path is relative:
+    //    a. If dirfd is AT_FDCWD (-100), relative to process CWD.
+    //    b. If dirfd is a valid FD, relative to that FD's path.
+    //    c. Otherwise error.
+
+    let resolved_path = if path.starts_with('/') {
+         String::from(path)
+    } else {
+        let base_path = if dirfd == -100 { // AT_FDCWD
+             if let Some(proc) = crate::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64; // EBADF
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = crate::process::current_process() {
+                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     // Check if it is a directory? For now assume yes if used as dirfd.
+                     f.path.clone()
+                 } else {
+                     return !0u64; // EBADF
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64; // EBADF
+        };
+        crate::vfs::resolve_path(&base_path, path)
+    };
+    
+    if let Ok(meta) = crate::vfs::metadata(&resolved_path) {
+        let stat = Stat { 
+            st_size: meta.size as i64, 
+            st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, 
+            ..Default::default() 
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+    
+    ENOENT
+}
+
+fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let cwd_bytes = proc.cwd.as_bytes();
+        // Check if buffer is large enough (including null terminator)
+        if cwd_bytes.len() + 1 > size {
+            return (-libc_errno::ERANGE as i64) as u64;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf_ptr as *mut u8, cwd_bytes.len());
+            *(buf_ptr as *mut u8).add(cwd_bytes.len()) = 0; // Null terminate
+        }
+        // Return length including null terminator
+        return (cwd_bytes.len() + 1) as u64;
+    }
+    ENOENT
+}
+
+fn sys_fcntl(fd: u32, cmd: u32, _arg: u64) -> u64 {
+    // Basic fcntl stub
+    // F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4
+    match cmd {
+        1 => 0, // F_GETFD: Return 0 (no FD_CLOEXEC set by default)
+        2 => 0, // F_SETFD: Pretend to set flags
+        3 => 0, // F_GETFL: Return 0 (O_RDONLY/default flags)
+        4 => 0, // F_SETFL: Pretend to set flags
+        _ => 0, // Ignore other commands
+    }
 }
 
 fn sys_mkdirat(_dirfd: i32, path_ptr: u64, path_len: usize, _mode: u32) -> u64 {
