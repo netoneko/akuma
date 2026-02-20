@@ -24,7 +24,7 @@ members = [
     "musl",
     "tcc",
     "tar",
-    "dropbear",
+    "sshd",
     "make"
 ]
 

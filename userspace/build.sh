@@ -27,7 +27,7 @@ MEMBERS=(
     "tcc"
     "tar"
     "make"
-#    "dropbear"
+    "sshd"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -72,7 +72,7 @@ BINARIES=(
     "paws"
     "tcc"
     "tar"
-    "dropbear"
+    "sshd"
 )
 
 for bin in "${BINARIES[@]}"; do
