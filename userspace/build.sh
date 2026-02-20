@@ -26,6 +26,7 @@ MEMBERS=(
     "musl"
     "tcc"
     "tar"
+    "dropbear"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -70,6 +71,7 @@ BINARIES=(
     "paws"
     "tcc"
     "tar"
+    "dropbear"
 )
 
 for bin in "${BINARIES[@]}"; do
