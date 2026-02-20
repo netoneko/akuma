@@ -48,7 +48,6 @@ impl Write for SshStream {
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        // TcpStream in libakuma is currently synchronous/immediate
         Ok(())
     }
 }
@@ -66,14 +65,14 @@ pub extern "C" fn _start() -> ! {
 fn main() {
     println("[SSHD] Starting userspace SSH server...");
 
-    // Initialize keys and load config from file
+    // 1. Load config from file first
     block_on(config::load_config());
     block_on(keys::load_or_generate_host_key());
     
     let mut ssh_config = config::get_config();
-    let mut port = 2222;
+    let mut cli_port: Option<u16> = None;
 
-    // Parse CLI arguments
+    // 2. Parse CLI arguments (overrides config file)
     let mut args = args();
     args.next(); // Skip program name
     
@@ -88,7 +87,8 @@ fn main() {
             "--port" => {
                 if let Some(port_str) = args.next() {
                     if let Ok(p) = port_str.parse::<u16>() {
-                        port = p;
+                        cli_port = Some(p);
+                        println(&format!("[SSHD] Port override from CLI: {}", p));
                     }
                 }
             }
@@ -98,7 +98,10 @@ fn main() {
         }
     }
 
-    let addr = format!("0.0.0.0:{}", port);
+    // Determine final port: CLI > Config > Default(2222)
+    let final_port = cli_port.or(ssh_config.port).unwrap_or(2222);
+
+    let addr = format!("0.0.0.0:{}", final_port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -132,7 +135,6 @@ fn handle_connection(stream: TcpStream, config: config::SshdConfig) {
     block_on(protocol::handle_connection(ssh_stream, config));
 }
 
-// Simple block_on for userspace
 fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
     

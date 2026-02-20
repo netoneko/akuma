@@ -27,6 +27,7 @@ static CACHED_CONFIG: Spinlock<Option<SshdConfig>> = Spinlock::new(None);
 pub struct SshdConfig {
     pub disable_key_verification: bool,
     pub shell: Option<String>,
+    pub port: Option<u16>,
 }
 
 impl Default for SshdConfig {
@@ -34,6 +35,7 @@ impl Default for SshdConfig {
         Self {
             disable_key_verification: false,
             shell: None, // Default to built-in shell
+            port: None,  // Default port is handled in main.rs
         }
     }
 }
@@ -59,6 +61,11 @@ impl SshdConfig {
                 }
                 "shell" => {
                     self.shell = Some(String::from(value));
+                }
+                "port" => {
+                    if let Ok(p) = value.parse::<u16>() {
+                        self.port = Some(p);
+                    }
                 }
                 _ => {}
             }
