@@ -13,6 +13,7 @@ mod async_tests;
 mod block;
 mod boot;
 mod config;
+#[macro_use]
 mod console;
 mod dns;
 mod editor;
@@ -49,6 +50,7 @@ mod tls_verifier;
 mod vfs;
 mod virtio_hal;
 
+use alloc::format;
 use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
 
@@ -684,11 +686,9 @@ fn run_async_main() -> ! {
         console::print("\n");
     }
 
-    console::print("[Main] Network ready! Running background polling loop.\n");
-    console::print(
-        &format!("[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
-        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT }),
-    );
+    safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
+    safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
+        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
 
     // Enable IRQs for the main loop
     unsafe {

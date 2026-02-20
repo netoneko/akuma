@@ -24,7 +24,8 @@ members = [
     "musl",
     "tcc",
     "tar",
-    "dropbear"
+    "dropbear",
+    "make"
 ]
 
 [profile.dev]

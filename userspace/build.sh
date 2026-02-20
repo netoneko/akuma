@@ -26,7 +26,8 @@ MEMBERS=(
     "musl"
     "tcc"
     "tar"
-    "dropbear"
+    "make"
+#    "dropbear"
 )
 
 for member in "${MEMBERS[@]}"; do

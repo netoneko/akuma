@@ -154,5 +154,5 @@ fn run_session(handle: SocketHandle) -> ! {
 }
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(256, "{}", msg);
 }

@@ -1596,5 +1596,5 @@ pub async fn handle_connection(mut stream: TcpStream) {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(512, "{}", msg);
 }
