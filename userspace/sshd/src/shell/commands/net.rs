@@ -64,21 +64,17 @@ fn parse_url(url: &str) -> Option<ParsedUrl> {
 // ============================================================================
 
 async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, String> {
-    // Resolve hostname
     let ip = resolve(&url.host).map_err(|e| format!("DNS resolution failed: {:?}", e))?;
     let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], url.port);
 
-    // Connect
     let stream = TcpStream::connect(&addr_str).map_err(|e| format!("TCP connection failed: {:?}", e))?;
 
-    // Send HTTP/1.0 GET request
     let request = format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: akuma-sshd/1.0\r\nConnection: close\r\n\r\n",
         url.path, url.host
     );
     stream.write_all(request.as_bytes()).map_err(|e| format!("Send failed: {:?}", e))?;
 
-    // Read response
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -95,11 +91,16 @@ async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, String> {
         }
     }
 
-    // Parse HTTP response
     let pos = match response.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(p) => p,
         None => return Err(String::from("Malformed HTTP response")),
     };
+
+    // Check status code
+    let header_str = core::str::from_utf8(&response[..pos]).unwrap_or("");
+    if !header_str.contains("200 OK") {
+        return Err(format!("HTTP Error: {}", header_str.lines().next().unwrap_or("Unknown")));
+    }
 
     Ok(response[pos + 4..].to_vec())
 }
@@ -164,20 +165,58 @@ impl Command for PkgCommand {
             if let Some(rest) = args_str.strip_prefix("install") {
                 let pkg = rest.trim();
                 if !pkg.is_empty() {
-                    let _ = stdout.write(format!("Installing {}...\r\n", pkg).as_bytes()).await;
-                    let url_str = format!("http://10.0.2.2:8000/bin/{}", pkg);
-                    if let Some(url) = parse_url(&url_str) {
+                    let server = "10.0.2.2:8000";
+                    
+                    // 1. Try to download as a binary
+                    let bin_url = format!("http://{}/bin/{}", server, pkg);
+                    if let Some(url) = parse_url(&bin_url) {
+                        let _ = stdout.write(format!("pkg: trying binary {}...\r\n", bin_url).as_bytes()).await;
                         match http_get(&url).await {
                             Ok(body) => {
                                 let dest = format!("/bin/{}", pkg);
-                                let fd = open(&dest, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-                                if fd >= 0 {
-                                    write_fd(fd, &body);
-                                    close(fd);
-                                    let _ = stdout.write(b"Successfully installed.\r\n").await;
-                                } else { let _ = stdout.write(b"Failed to open destination file.\r\n").await; }
+                                if save_file(&dest, &body) {
+                                    let _ = stdout.write(b"Successfully installed binary.\r\n").await;
+                                    return Ok(());
+                                }
                             }
-                            Err(e) => { let _ = stdout.write(format!("Download failed: {}\r\n", e).as_bytes()).await; }
+                            Err(_) => {
+                                let _ = stdout.write(b"Binary not found, trying archive fallback...\r\n").await;
+                            }
+                        }
+                    }
+
+                    // 2. Fallback to downloading as an archive
+                    let archive_url_gz = format!("http://{}/archives/{}.tar.gz", server, pkg);
+                    let archive_dest_gz = format!("/tmp/{}.tar.gz", pkg);
+                    
+                    if let Some(url) = parse_url(&archive_url_gz) {
+                        let _ = stdout.write(format!("pkg: trying archive {}...\r\n", archive_url_gz).as_bytes()).await;
+                        match http_get(&url).await {
+                            Ok(body) => {
+                                if save_file(&archive_dest_gz, &body) {
+                                    let _ = stdout.write(b"Downloaded archive, extracting...\r\n").await;
+                                    // spawn tar -xzvf /tmp/pkg.tar.gz -C /
+                                    let tar_args = ["-xzvf", &archive_dest_gz, "-C", "/"];
+                                    if let Some(res) = spawn("/bin/tar", Some(&tar_args)) {
+                                        let mut tar_buf = [0u8; 1024];
+                                        loop {
+                                            let n = read_fd(res.stdout_fd as i32, &mut tar_buf);
+                                            if n > 0 { let _ = stdout.write(&tar_buf[..n as usize]).await; }
+                                            if let Some((_, exit_code)) = waitpid(res.pid) {
+                                                if exit_code == 0 { let _ = stdout.write(b"Successfully extracted.\r\n").await; }
+                                                else { let _ = stdout.write(format!("tar exited with status {}\r\n", exit_code).as_bytes()).await; }
+                                                break;
+                                            }
+                                            sleep_ms(10);
+                                        }
+                                        let _ = unlink(&archive_dest_gz);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = stdout.write(format!("Failed to find package: {}\r\n", e).as_bytes()).await;
+                            }
                         }
                     }
                 } else { let _ = stdout.write(b"Usage: pkg install <name>\r\n").await; }
@@ -186,4 +225,16 @@ impl Command for PkgCommand {
         })
     }
 }
+
+fn save_file(path: &str, data: &[u8]) -> bool {
+    let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd >= 0 {
+        write_fd(fd, data);
+        close(fd);
+        true
+    } else {
+        false
+    }
+}
+
 pub static PKG_CMD: PkgCommand = PkgCommand;

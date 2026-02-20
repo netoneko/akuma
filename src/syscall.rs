@@ -85,6 +85,24 @@ pub struct ThreadCpuStat {
 const EINTR: u64 = (-4i64) as u64;
 /// Error code for no such file or directory
 const ENOENT: u64 = (-2i64) as u64;
+/// Error code for bad address
+const EFAULT: u64 = (-14i64) as u64;
+/// Error code for invalid argument
+const EINVAL: u64 = (-22i64) as u64;
+
+/// Validate a user pointer for reading/writing
+/// 
+/// Pointers must be below the userspace limit (0x40000000)
+/// and above the process info page (0x1000).
+fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    if ptr < 0x1000 { return false; }
+    let end = match ptr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    if end > 0x4000_0000 { return false; }
+    true
+}
 
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {

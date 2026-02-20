@@ -25,7 +25,8 @@ members = [
     "tcc",
     "tar",
     "sshd",
-    "make"
+    "make",
+    "crash_test"
 ]
 
 [profile.dev]

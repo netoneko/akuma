@@ -192,15 +192,6 @@ pub fn parse_public_key_ssh(line: &str) -> Option<VerifyingKey> {
 // Key Loading and Generation
 // ============================================================================
 
-/// Sync wrapper for initialization
-pub fn init_host_key() {
-    let mut rng = SimpleRng::new();
-    let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
-    rng.fill_bytes(&mut key_bytes);
-    let key = SigningKey::from_bytes(&key_bytes);
-    set_host_key(key);
-}
-
 /// Generate a new Ed25519 keypair
 fn generate_keypair() -> SigningKey {
     let mut rng = SimpleRng::new();

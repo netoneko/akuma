@@ -68,7 +68,7 @@ fn main() {
 
     // Initialize keys and load config from file
     block_on(config::load_config());
-    keys::init_host_key();
+    block_on(keys::load_or_generate_host_key());
     
     let mut ssh_config = config::get_config();
     let mut port = 2222;
