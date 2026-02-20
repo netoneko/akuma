@@ -45,7 +45,10 @@ pub mod syscall {
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
     pub const TIME: u64 = 305;
-    pub const CHDIR: u64 = 306;
+    pub const CHDIR: u64 = 49;
+    pub const GETCWD: u64 = 17;
+    pub const FCNTL: u64 = 25;
+    pub const NEWFSTATAT: u64 = 79;
     // New Terminal Control Syscalls
     pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
     pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
@@ -194,7 +197,6 @@ pub fn chdir(path: &str) -> i32 {
             "svc #0",
             in("x8") syscall::CHDIR,
             in("x0") path.as_ptr(),
-            in("x1") path.len(),
             lateout("x0") result,
             options(nostack)
         );
@@ -830,9 +832,9 @@ pub fn open(path: &str, flags: u32) -> i32 {
         syscall::OPENAT,
         -100i32 as u64, // AT_FDCWD
         path.as_ptr() as u64,
-        path.len() as u64,
         flags as u64,
         0o644u64, // mode
+        0,
         0,
     ) as i32
 }
@@ -845,6 +847,25 @@ pub fn fstat(fd: i32) -> Result<Stat, i32> {
         fd as u64,
         &mut stat as *mut _ as u64,
         0, 0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(stat)
+    }
+}
+
+/// Get file status relative to directory
+pub fn fstatat(dirfd: i32, path: &str, flags: u32) -> Result<Stat, i32> {
+    let mut stat = Stat::default();
+    let ret = syscall(
+        syscall::NEWFSTATAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        &mut stat as *mut _ as u64,
+        flags as u64,
+        0, 0,
     ) as i64;
 
     if ret < 0 {
@@ -897,8 +918,8 @@ pub fn mkdir(path: &str) -> i32 {
         syscall::MKDIRAT,
         -100i32 as u64, // AT_FDCWD
         path.as_ptr() as u64,
-        path.len() as u64,
         0o755u64, // mode
+        0,
         0, 0,
     ) as i32
 }
@@ -909,8 +930,8 @@ pub fn unlink(path: &str) -> i32 {
         syscall::UNLINKAT,
         -100i32 as u64, // AT_FDCWD
         path.as_ptr() as u64,
-        path.len() as u64,
         0, // flags
+        0,
         0, 0,
     ) as i32
 }
@@ -921,10 +942,10 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
         syscall::RENAMEAT,
         -100i32 as u64, // AT_FDCWD
         old_path.as_ptr() as u64,
-        old_path.len() as u64,
         -100i32 as u64, // AT_FDCWD
         new_path.as_ptr() as u64,
-        new_path.len() as u64,
+        0,
+        0,
     ) as i32
 }
 

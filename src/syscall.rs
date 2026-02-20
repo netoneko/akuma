@@ -50,7 +50,7 @@ pub mod nr {
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
-    pub const CHDIR: u64 = 306;       // Change current working directory
+    pub const CHDIR: u64 = 49;        // Linux arm64 chdir
     // Terminal Syscalls (307-313)
     pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
     pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
@@ -104,6 +104,26 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     true
 }
 
+/// Copy a null-terminated string from userspace
+fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
+    if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+    let mut len = 0;
+    while len < max_len {
+        let addr = ptr + len as u64;
+        if addr >= 0x4000_0000 { return Err(EFAULT); }
+        let c = unsafe { *(addr as *const u8) };
+        if c == 0 { break; }
+        len += 1;
+    }
+    if len == max_len { return Err(EINVAL); }
+    
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    match core::str::from_utf8(slice) {
+        Ok(s) => Ok(String::from(s)),
+        Err(_) => Err(EINVAL),
+    }
+}
+
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if crate::process::is_current_interrupted() {
@@ -122,7 +142,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
         nr::BRK => sys_brk(args[0] as usize),
-        nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
+        nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::CLOSE => sys_close(args[0] as u32),
         nr::LSEEK => sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => sys_fstat(args[0] as u32, args[1]),
@@ -140,15 +160,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
-        nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
-        nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
-        nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
+        nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
+        nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
+        nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
-        nr::CHDIR => sys_chdir(args[0], args[1] as usize),
+        nr::CHDIR => sys_chdir(args[0]),
         nr::SET_TERMINAL_ATTRIBUTES => sys_set_terminal_attributes(args[0], args[1], args[2]),
         nr::GET_TERMINAL_ATTRIBUTES => sys_get_terminal_attributes(args[0], args[1]),
         nr::SET_CURSOR_POSITION => sys_set_cursor_position(args[0], args[1]),
@@ -167,7 +187,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RT_SIGACTION => 0,    // Success (do nothing)
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
-        nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2] as usize, args[3], args[4] as u32),
+        nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
@@ -300,19 +320,21 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
-fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u32) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_openat(_dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
     // Validate path existence
-    if !crate::fs::exists(path) {
+    if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
             return ENOENT;
         }
         
         // For O_CREAT, check if parent directory exists
-        let (parent, _) = crate::vfs::split_path(path);
+        let (parent, _) = crate::vfs::split_path(&path);
         if !parent.is_empty() && !crate::fs::exists(parent) {
             // Special case: parent might be root
             if parent != "/" && !crate::fs::exists(&alloc::format!("/{}", parent)) {
@@ -325,9 +347,9 @@ fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u3
         // Handle O_TRUNC: truncate existing file to zero length
         if flags & crate::process::open_flags::O_TRUNC != 0 {
             // Only truncate if file exists; ignore errors (file might not exist yet with O_CREAT)
-            let _ = crate::fs::write_file(path, &[]);
+            let _ = crate::fs::write_file(&path, &[]);
         }
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.into(), flags)));
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path, flags)));
         fd as u64
     } else { !0u64 }
 }
@@ -378,10 +400,12 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     !0u64
 }
 
-fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _flags: u32) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     
     // Resolve path.
     // Logic:
@@ -392,7 +416,7 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _fl
     //    c. Otherwise error.
 
     let resolved_path = if path.starts_with('/') {
-         String::from(path)
+         String::from(&path)
     } else {
         let base_path = if dirfd == -100 { // AT_FDCWD
              if let Some(proc) = crate::process::current_process() {
@@ -414,7 +438,7 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, path_len: usize, stat_ptr: u64, _fl
         } else {
             return !0u64; // EBADF
         };
-        crate::vfs::resolve_path(&base_path, path)
+        crate::vfs::resolve_path(&base_path, &path)
     };
     
     if let Ok(meta) = crate::vfs::metadata(&resolved_path) {
@@ -460,27 +484,35 @@ fn sys_fcntl(fd: u32, cmd: u32, _arg: u64) -> u64 {
     }
 }
 
-fn sys_mkdirat(_dirfd: i32, path_ptr: u64, path_len: usize, _mode: u32) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_mkdirat(_dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] mkdirat: {}\n", path);
-    if crate::fs::create_dir(path).is_ok() { 0 } else { !0u64 }
+    if crate::fs::create_dir(&path).is_ok() { 0 } else { !0u64 }
 }
 
-fn sys_unlinkat(_dirfd: i32, path_ptr: u64, path_len: usize, _flags: u32) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_unlinkat(_dirfd: i32, path_ptr: u64, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] unlinkat: {}\n", path);
-    if crate::fs::remove_file(path).is_ok() { 0 } else { !0u64 }
+    if crate::fs::remove_file(&path).is_ok() { 0 } else { !0u64 }
 }
 
-fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, oldpath_len: usize, _newdirfd: i32, newpath_ptr: u64, newpath_len: usize) -> u64 {
-    if !validate_user_ptr(oldpath_ptr, oldpath_len) { return EFAULT; }
-    if !validate_user_ptr(newpath_ptr, newpath_len) { return EFAULT; }
-    let oldpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(oldpath_ptr as *const u8, oldpath_len)).unwrap_or("") };
-    let newpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(newpath_ptr as *const u8, newpath_len)).unwrap_or("") };
+fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64) -> u64 {
+    let oldpath = match copy_from_user_str(oldpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let newpath = match copy_from_user_str(newpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
-    if crate::fs::rename(oldpath, newpath).is_ok() { 0 } else { !0u64 }
+    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
@@ -810,13 +842,15 @@ fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
 
-fn sys_chdir(ptr: u64, len: usize) -> u64 {
-    if !validate_user_ptr(ptr, len) { return EFAULT; }
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)).unwrap_or("") };
+fn sys_chdir(ptr: u64) -> u64 {
+    let path = match copy_from_user_str(ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
     if let Some(proc) = crate::process::current_process() {
         // Resolve path relative to current CWD
-        let new_cwd = crate::vfs::resolve_path(&proc.cwd, path);
+        let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
         
         // Validate that the directory exists
         if crate::fs::exists(&new_cwd) {
