@@ -226,6 +226,19 @@ impl<'a> SshChannelStream<'a> {
         Self { stream, session, current_process_pid: None, current_process_channel: None }
     }
 
+    /// Write data to the channel, translating \n to \r\n
+    pub async fn write_with_crlf(&mut self, data: &[u8]) -> Result<usize, TcpError> {
+        let mut buf = Vec::with_capacity(data.len() + 16);
+        for &byte in data {
+            if byte == b'\n' {
+                buf.extend_from_slice(b"\r\n");
+            } else {
+                buf.push(byte);
+            }
+        }
+        self.write(&buf).await
+    }
+
     /// Read and process SSH packets until we have channel data or an error
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
         let mut buf = [0u8; 512];
