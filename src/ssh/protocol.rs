@@ -226,19 +226,6 @@ impl<'a> SshChannelStream<'a> {
         Self { stream, session, current_process_pid: None, current_process_channel: None }
     }
 
-    /// Write data to the channel, translating \n to \r\n
-    pub async fn write_with_crlf(&mut self, data: &[u8]) -> Result<usize, SshStreamError> {
-        let mut buf = Vec::with_capacity(data.len() + 16);
-        for &byte in data {
-            if byte == b'\n' {
-                buf.extend_from_slice(b"\r\n");
-            } else {
-                buf.push(byte);
-            }
-        }
-        self.write(&buf).await
-    }
-
     /// Read and process SSH packets until we have channel data or an error
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
         let mut buf = [0u8; 512];
@@ -776,6 +763,10 @@ async fn run_shell_session(
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
 
+    // Register the channel for this system thread so sys_write can find it
+    let channel = Arc::new(crate::process::ProcessChannel::new());
+    crate::process::register_system_thread_channel(crate::threading::current_thread_id(), channel.clone());
+
     // Create command registry
     let registry = create_default_registry();
 
@@ -895,7 +886,7 @@ async fn run_shell_session(
 
                                             // Output the result (empty for streamed commands)
                                             if !result.output.is_empty() {
-                                                let _ = channel_stream.write_with_crlf(&result.output).await;
+                                                let _ = channel_stream.write(&result.output).await;
                                             }
 
                                             // Check if we should exit

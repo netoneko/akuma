@@ -39,6 +39,7 @@ pub mod nr {
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
+    pub const PPOLL: u64 = 73;       // Linux arm64 ppoll
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
@@ -165,6 +166,67 @@ fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     }
 }
 
+fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 {
+    if nfds == 0 { return 0; }
+    if !validate_user_ptr(fds_ptr, nfds * 8) { return EFAULT; }
+
+    let infinite = timeout_ptr == 0;
+    let timeout_us = if !infinite {
+        if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
+        let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+        (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
+    } else {
+        0
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ppoll(nfds={}, timeout_us={}{})\n", nfds, timeout_us, if infinite { " [INF]" } else { "" });
+    }
+
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        let mut ready_count = 0;
+        unsafe {
+            let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
+            for fd in fds.iter_mut() {
+                fd.revents = 0;
+                if fd.fd == 0 { // stdin
+                    if let Some(ch) = crate::process::current_channel() {
+                        if ch.has_stdin_data() {
+                            fd.revents |= 1; // POLLIN
+                            ready_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ready_count > 0 {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] ppoll -> ready_count={}\n", ready_count);
+            }
+            return ready_count as u64;
+        }
+
+        if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] ppoll -> timeout\n");
+            }
+            return 0;
+        }
+
+        crate::threading::yield_now();
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if crate::process::is_current_interrupted() {
@@ -181,7 +243,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
-        nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
+        nr::IOCTL => sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
         nr::PIPE2 => sys_pipe2(args[0], args[1] as u32),
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
@@ -204,6 +266,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
+        nr::PPOLL => sys_ppoll(args[0], args[1] as usize, args[2], args[3]),
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
         nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
@@ -261,6 +324,75 @@ fn sys_exit(code: i32) -> u64 {
     code as u64
 }
 
+fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
+    // Command constants from Linux
+    const TCGETS: u32 = 0x5401;
+    const TCSETS: u32 = 0x5402;
+    const TCSETSW: u32 = 0x5403;
+    const TCSETSF: u32 = 0x5404;
+    const TIOCGWINSZ: u32 = 0x5413;
+
+    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    
+    // We only support terminal ioctls on stdin/stdout for now
+    if fd > 2 {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd={:#x}, arg={:#x}) -> ENOTTY\n", fd, cmd, arg);
+        }
+        return (-(25i64)) as u64; // ENOTTY
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd={:#x}, arg={:#x})\n", fd, cmd, arg);
+    }
+
+    match cmd {
+        TCGETS => {
+            if !validate_user_ptr(arg, 36) { return EFAULT; }
+            // Minimal termios structure (musl/linux)
+            // c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[19]
+            unsafe {
+                let ptr = arg as *mut u32;
+                // Just return some reasonable defaults
+                *ptr.add(0) = 0; // iflag
+                *ptr.add(1) = 0; // oflag
+                *ptr.add(2) = 0; // cflag
+                let lflag = if let Some(ch) = crate::process::current_channel() {
+                    if ch.is_raw_mode() { 0 } else { 0x0000000a } // ICANON | ECHO
+                } else { 0x0000000a };
+                *ptr.add(3) = lflag; 
+            }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if !validate_user_ptr(arg, 36) { return EFAULT; }
+            unsafe {
+                let lflag = *((arg + 12) as *const u32);
+                let is_raw = (lflag & 0x0000000a) == 0; // !ICANON & !ECHO
+                if let Some(ch) = crate::process::current_channel() {
+                    ch.set_raw_mode(is_raw);
+                    if cmd == TCSETSF {
+                        ch.flush_stdin();
+                    }
+                }
+            }
+            0
+        }
+        TIOCGWINSZ => {
+            if !validate_user_ptr(arg, 8) { return EFAULT; }
+            unsafe {
+                let ptr = arg as *mut u16;
+                *ptr.add(0) = 25; // rows
+                *ptr.add(1) = 80; // cols
+                *ptr.add(2) = 0;  // xpixel
+                *ptr.add(3) = 0;  // ypixel
+            }
+            0
+        }
+        _ => (-(25i64)) as u64, // ENOTTY
+    }
+}
+
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
@@ -316,23 +448,16 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let first_bytes = if buf.len() > 8 { &buf[..8] } else { buf };
+        crate::safe_print!(128, "[syscall] write(fd={}, len={}) data={:?}\n", fd_num, count, first_bytes);
+    }
+
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
             if let Some(ch) = crate::process::current_channel() {
-                if ch.is_raw_mode() {
-                    ch.write(buf);
-                } else {
-                    // Translate \n to \r\n for cooked mode
-                    let mut translated = Vec::with_capacity(buf.len() + 8);
-                    for &byte in buf {
-                        if byte == b'\n' {
-                            translated.extend_from_slice(b"\r\n");
-                        } else {
-                            translated.push(byte);
-                        }
-                    }
-                    ch.write(&translated);
-                }
+                ch.write(buf);
             }
             proc.write_stdout(buf);
             count as u64
@@ -1179,6 +1304,11 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
     proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+
+    // Handle action: TCSAFLUSH (2) flushes input
+    if action == 2 {
+        proc_channel.flush_stdin();
+    }
 
     if config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n",

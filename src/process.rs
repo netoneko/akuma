@@ -601,6 +601,13 @@ impl ProcessChannel {
         })
     }
 
+    /// Clear all pending data from the stdin buffer
+    pub fn flush_stdin(&self) {
+        crate::irq::with_irqs_disabled(|| {
+            self.stdin_buffer.lock().clear();
+        })
+    }
+
     /// Mark the process as exited with the given exit code
     pub fn set_exited(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
@@ -658,6 +665,13 @@ pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().insert(thread_id, channel);
     })
+}
+
+/// Register a process channel for a system thread (one that doesn't have a Process struct)
+pub fn register_system_thread_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
+    crate::irq::with_irqs_disabled(|| {
+        PROCESS_CHANNELS.lock().insert(thread_id, channel);
+    });
 }
 
 /// Get the process channel for a thread (if any)
