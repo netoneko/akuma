@@ -221,12 +221,13 @@ pub fn getcwd() -> &'static str {
 /// Updates the process's cwd in the kernel and ProcessInfo page.
 /// Returns 0 on success, negative errno on failure.
 pub fn chdir(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     let result: i64;
     unsafe {
         asm!(
             "svc #0",
             in("x8") syscall::CHDIR,
-            in("x0") path.as_ptr(),
+            in("x0") path_c.as_ptr(),
             lateout("x0") result,
             options(nostack)
         );
@@ -923,10 +924,11 @@ pub struct Stat {
 ///
 /// Returns file descriptor on success, negative errno on failure.
 pub fn open(path: &str, flags: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::OPENAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         flags as u64,
         0o644u64, // mode
         0,
@@ -982,10 +984,11 @@ pub fn pipe(fds: &mut [i32; 2]) -> i32 {
 
 /// Check file access permissions
 pub fn access(path: &str, mode: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::FACCESSAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         mode as u64,
         0, 0, 0,
     ) as i32
@@ -993,10 +996,11 @@ pub fn access(path: &str, mode: u32) -> i32 {
 
 /// Check file access permissions relative to directory
 pub fn accessat(dirfd: i32, path: &str, mode: u32, flags: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::FACCESSAT2,
         dirfd as u64,
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         mode as u64,
         flags as u64,
         0, 0,
@@ -1042,10 +1046,11 @@ pub fn write_fd(fd: i32, buf: &[u8]) -> isize {
 ///
 /// Returns 0 on success, negative errno on failure.
 pub fn mkdir(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::MKDIRAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         0o755u64, // mode
         0,
         0, 0,
@@ -1054,10 +1059,11 @@ pub fn mkdir(path: &str) -> i32 {
 
 /// Delete a file
 pub fn unlink(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::UNLINKAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         0, // flags
         0,
         0, 0,
@@ -1066,12 +1072,14 @@ pub fn unlink(path: &str) -> i32 {
 
 /// Rename/move a file or directory
 pub fn rename(old_path: &str, new_path: &str) -> i32 {
+    let old_path_c = alloc::format!("{}\0", old_path);
+    let new_path_c = alloc::format!("{}\0", new_path);
     syscall(
         syscall::RENAMEAT,
         -100i32 as u64, // AT_FDCWD
-        old_path.as_ptr() as u64,
+        old_path_c.as_ptr() as u64,
         -100i32 as u64, // AT_FDCWD
-        new_path.as_ptr() as u64,
+        new_path_c.as_ptr() as u64,
         0,
         0,
     ) as i32

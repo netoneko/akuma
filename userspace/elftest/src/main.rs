@@ -17,11 +17,12 @@ use core::ptr::null;
 
 const CLONE: u64 = 220;
 const EXECVE: u64 = 221;
-const WAIT4: u64 = 260;
 
 const SIGCHLD: u64 = 17;
 const CLONE_VFORK: u64 = 0x00004000;
 const CLONE_VM: u64 = 0x00000100;
+
+const BRIDGE_PID: i32 = 0x7FFFFFFF;
 
 #[no_mangle]
 pub extern "C" fn main() {
@@ -119,8 +120,10 @@ fn test_linux_spawn(path: &str, args: Option<&[&str]>, expected_code: i32) -> bo
         return false;
     }
     
-    if pid == 0 {
-        // Child process: execve
+    let mut real_pid = pid as u32;
+
+    if pid == 0 || pid == BRIDGE_PID {
+        // Prepare arguments for execve
         let path_s = format!("{}\0", path);
         let mut argv = Vec::new();
         argv.push(path_s.as_ptr());
@@ -139,27 +142,37 @@ fn test_linux_spawn(path: &str, args: Option<&[&str]>, expected_code: i32) -> bo
         
         let envp: [*const u8; 1] = [null()];
         
-        syscall(EXECVE, path_s.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, 0, 0, 0);
-        // If execve returns, it failed
-        exit(127);
-    } else {
-        // Parent process: wait
-        print(&format!("elftest: vfork child pid={}\n", pid));
-        for _ in 0..100 {
-            if let Some((w_pid, code)) = waitpid(pid as u32) {
-                if w_pid == pid as u32 {
-                    if code == expected_code || expected_code == 0 {
-                        print(&format!("elftest: [Linux Spawn] {} PASSED (exit code {})\n", path, code));
-                        return true;
-                    } else {
-                        print(&format!("elftest: [Linux Spawn] {} FAILED (wrong exit code {}, expected {})\n", path, code, expected_code));
-                        return false;
-                    }
+        let res = syscall(EXECVE, path_s.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, 0, 0, 0);
+        
+        if pid == BRIDGE_PID {
+            // In bridge mode, execve returns the new PID
+            if (res as i64) < 0 {
+                print(&format!("elftest: [Linux Spawn] execve FAILED with error {}\n", res as i64));
+                return false;
+            }
+            real_pid = res as u32;
+            print(&format!("elftest: bridge spawned pid={}\n", real_pid));
+        } else {
+            // Real child should never return from execve
+            exit(127);
+        }
+    }
+
+    // Parent waits for real_pid
+    for _ in 0..100 {
+        if let Some((w_pid, code)) = waitpid(real_pid) {
+            if w_pid == real_pid {
+                if code == expected_code || expected_code == 0 {
+                    print(&format!("elftest: [Linux Spawn] {} PASSED (exit code {})\n", path, code));
+                    return true;
+                } else {
+                    print(&format!("elftest: [Linux Spawn] {} FAILED (wrong exit code {}, expected {})\n", path, code, expected_code));
+                    return false;
                 }
             }
-            sleep_ms(10);
         }
-        print(&format!("elftest: [Linux Spawn] {} FAILED (timeout)\n", path));
+        sleep_ms(10);
     }
+    print(&format!("elftest: [Linux Spawn] {} FAILED (timeout)\n", path));
     false
 }

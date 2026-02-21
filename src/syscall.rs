@@ -666,7 +666,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), Some(&env), None, cwd.as_deref()) {
         Ok((_tid, ch, pid)) => {
             crate::process::register_child_channel(pid, ch);
-            0
+            pid as u64
         }
         Err(e) => {
             crate::safe_print!(128, "[syscall] execve: spawn failed for {}: {}\n", resolved_path, e);
