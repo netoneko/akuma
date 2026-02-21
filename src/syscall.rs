@@ -8,6 +8,10 @@ use crate::config;
 use crate::terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Flag to bypass pointer validation during kernel-originated syscall tests
+pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -106,6 +110,7 @@ const ENOSYS: u64 = (-38i64) as u64;
 /// Pointers must be below the userspace limit (0x40000000)
 /// and above the process info page (0x1000).
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
     if ptr < 0x1000 { return false; }
     let end = match ptr.checked_add(len as u64) {
         Some(e) => e,
@@ -117,21 +122,31 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 
 /// Copy a null-terminated string from userspace
 fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
-    if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+    if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+        if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+    }
     let mut len = 0;
     while len < max_len {
         let addr = ptr + len as u64;
-        if addr >= 0x4000_0000 { return Err(EFAULT); }
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if addr >= 0x4000_0000 { return Err(EFAULT); }
+        }
         let c = unsafe { *(addr as *const u8) };
         if c == 0 { break; }
         len += 1;
     }
-    if len == max_len { return Err(EINVAL); }
+    if len == max_len {
+        crate::safe_print!(128, "[syscall] copy_from_user_str: not null terminated within {} bytes\n", max_len);
+        return Err(EINVAL);
+    }
     
     let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
     match core::str::from_utf8(slice) {
         Ok(s) => Ok(String::from(s)),
-        Err(_) => Err(EINVAL),
+        Err(_) => {
+            crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+            Err(EINVAL)
+        },
     }
 }
 
