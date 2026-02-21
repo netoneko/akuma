@@ -43,3 +43,27 @@ Eliminate the custom `ProcessInfo` argument passing mechanism and use the standa
 - **Compatibility**: Standard Linux binaries will work without hacks.
 - **Flexibility**: No more 744-byte limit on arguments.
 - **Robustness**: Uses the battle-tested Linux process entry model.
+
+## 6. Challenges and Implementation Lessons (Post-Implementation)
+
+The transition to the unified ABI encountered several critical technical hurdles that required deep debugging:
+
+### A. TTBR0 and ASID Masking
+When implementing stricter user pointer validation (checking if pages are actually mapped), we initially used the raw value of the `TTBR0_EL1` register. 
+- **The Issue**: On AArch64, the top 16 bits of `TTBR0_EL1` contain the Address Space Identifier (ASID). Treating this as a raw physical address caused the kernel to dereference garbage pointers, leading to EL1 synchronization exceptions (Sync from EL1, FAR with high bits set).
+- **The Fix**: All page table walks now explicitly mask the ASID bits (`ttbr0 & 0x0000_FFFF_FFFF_F000`) before treating the value as a physical address.
+
+### B. Mismatched SPAWN Syscall Signatures
+A subtle bug occurred where `libakuma` was updated to pass pointer arrays (`char**`) to the custom `SPAWN` syscall, but the kernel handler was still expecting a flat null-separated buffer.
+- **The Issue**: This caused `sys_spawn` to interpret pointers as character data, leading to "not null terminated" errors and failed process creation (`spawn returned None`).
+- **The Fix**: Unified both `EXECVE` and `SPAWN` to use a shared `parse_argv_array` helper that correctly traverses pointer arrays in userspace memory.
+
+### C. String Visibility and Memory Barriers
+During kernel-side ABI tests (`test_linux_process_abi`), strings written to physical memory via `phys_to_virt` were not always visible to the MMU immediately after mapping.
+- **The Issue**: `copy_from_user_str` would return zeros or stale data because the physical memory writes hadn't fully propagated to the point of coherency before the MMU-based access occurred in the syscall handler.
+- **The Fix**: Inserted explicit memory barriers (`dsb ish`, `isb`) after writing test data to ensure full visibility before simulating syscalls.
+
+### D. ELF Mapping Validation
+The move to 16-byte stack alignment and standard Linux layout required rigorous validation of the `INITIAL_SP`.
+- Any misalignment in the `StackBuilder` would cause immediate crashes in the userspace entry assembly before `main` could even be reached.
+- Implementation of `is_current_user_range_mapped` in the kernel provides a last line of defense against invalid user pointers causing kernel panics, effectively hardening the kernel against accidental or malicious memory access.

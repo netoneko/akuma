@@ -207,7 +207,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
         nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
-        nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
+        nr::SPAWN => sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
@@ -961,38 +961,54 @@ pub struct SpawnOptions {
     pub box_id: u64,
 }
 
-/// Helper to parse null-separated strings from userspace into a Vec<&str>
-fn parse_args(ptr: u64, len: usize) -> Vec<String> {
-    if ptr == 0 || len == 0 { return Vec::new(); }
-    if !validate_user_ptr(ptr, len) { return Vec::new(); }
-    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+/// Helper to parse a NULL-terminated array of string pointers (char** argv)
+fn parse_argv_array(ptr: u64) -> Vec<String> {
+    if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
-    let mut start = 0;
-    for i in 0..len {
-        if slice[i] == 0 {
-            if let Ok(s) = core::str::from_utf8(&slice[start..i]) {
-                args.push(String::from(s));
-            }
-            start = i + 1;
+    let mut i = 0;
+    loop {
+        // Read pointer from the array
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if !validate_user_ptr(ptr + i * 8, 8) { break; }
         }
+        let str_ptr = unsafe { *((ptr + i * 8) as *const u64) };
+        if str_ptr == 0 { break; }
+        
+        // Copy string from the pointer
+        match copy_from_user_str(str_ptr, 1024) {
+            Ok(s) => args.push(s),
+            Err(_) => break,
+        }
+        i += 1;
     }
     args
 }
 
-fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    if args_ptr != 0 && !validate_user_ptr(args_ptr, args_len) { return EFAULT; }
-    if stdin_ptr != 0 && !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
+fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, _a5: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
+    let args_vec = parse_argv_array(argv_ptr);
+    let env_vec = parse_argv_array(envp_ptr);
     
-    // Parse arguments
-    let args_vec = parse_args(args_ptr, args_len);
-    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
-    let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+    let args_refs: Vec<&str> = if args_vec.len() > 1 {
+        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+    } else {
+        Vec::new()
+    };
+    
+    let stdin = if stdin_ptr != 0 {
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
+        }
+        Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) })
+    } else {
+        None
+    };
 
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, args_opt, None) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
@@ -1028,8 +1044,12 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
         None
     };
 
-    let args_vec = parse_args(o.args_ptr, o.args_len);
-    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
+    let args_vec = parse_argv_array(o.args_ptr);
+    let args_refs: Vec<&str> = if args_vec.len() > 1 {
+        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+    } else {
+        args_vec.iter().map(|s| s.as_str()).collect()
+    };
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin = if o.stdin_ptr != 0 {
