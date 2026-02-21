@@ -34,13 +34,12 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (128KB default)
+/// User process stack size (256KB default)
 ///
 /// Stack allocated for user-space ELF processes.
-/// Increased from 64KB due to stack overflow in scratch (git clone)
-/// when using miniz_oxide zlib decompression with deep call stacks.
+/// Increased from 128KB to handle complex workloads like TCC compiling neatvi.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 128 * 1024;
+pub const USER_STACK_SIZE: usize = 256 * 1024;
 
 /// Maximum kernel threads
 ///
@@ -66,12 +65,12 @@ pub const RESERVED_THREADS: usize = 8;
 /// a system thread and needs significant stack space for pinned futures.
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// Stack size for user process threads (128KB)
+/// Stack size for user process threads (256KB)
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
-/// Increased from 64KB due to stack overflow during socket accept.
+/// Increased from 128KB to handle complex syscall chains and nested processing.
 /// User processes have their own user-space stack but kernel syscalls need space.
-pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
+pub const USER_THREAD_STACK_SIZE: usize = 256 * 1024;
 
 /// Enable stack canary checking
 ///

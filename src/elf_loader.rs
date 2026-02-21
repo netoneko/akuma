@@ -297,18 +297,36 @@ impl UserStack {
         let len = bytes.len() + 1;
         self.sp -= len;
         
-        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
-        let offset = self.sp % PAGE_SIZE;
-        unsafe {
-            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
-            *(dst.add(bytes.len()) as *mut u8) = 0;
+        // Copy string byte-by-byte or in chunks to handle page boundaries correctly
+        let mut written = 0;
+        while written < bytes.len() {
+            let va = self.sp + written;
+            let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
+            let offset = va % PAGE_SIZE;
+            let chunk_len = core::cmp::min(bytes.len() - written, PAGE_SIZE - offset);
+            
+            unsafe {
+                let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr().add(written), dst as *mut u8, chunk_len);
+            }
+            written += chunk_len;
         }
+        
+        // Null terminator
+        let va = self.sp + bytes.len();
+        let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
+        let offset = va % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u8;
+            *dst = 0;
+        }
+        
         self.sp
     }
 
     pub fn push_u64(&mut self, val: u64) {
         self.sp -= 8;
+        // Since SP was aligned to 8 or 16, a u64 won't cross a 4KB boundary
         let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
         let offset = self.sp % PAGE_SIZE;
         unsafe {
@@ -319,11 +337,19 @@ impl UserStack {
 
     pub fn push_raw(&mut self, data: &[u8]) -> usize {
         self.sp -= data.len();
-        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
-        let offset = self.sp % PAGE_SIZE;
-        unsafe {
-            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
+        
+        let mut written = 0;
+        while written < data.len() {
+            let va = self.sp + written;
+            let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
+            let offset = va % PAGE_SIZE;
+            let chunk_len = core::cmp::min(data.len() - written, PAGE_SIZE - offset);
+            
+            unsafe {
+                let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(written), dst as *mut u8, chunk_len);
+            }
+            written += chunk_len;
         }
         self.sp
     }
@@ -339,6 +365,21 @@ pub fn setup_linux_stack(
     env: &[String],
     auxv: &[AuxEntry],
 ) -> usize {
+    // Calculate total number of 8-byte words to be pushed
+    // argc: 1
+    // argv: args.len() + 1 (NULL)
+    // envp: env.len() + 1 (NULL)
+    // auxv: 2 * (auxv.len() + 1) (each entry is 2 words, + NULL entry)
+    let total_words = 1 + (args.len() + 1) + (env.len() + 1) + 2 * (auxv.len() + 1);
+    
+    // Standard AArch64 Linux ABI requires SP to be 16-byte aligned.
+    // If total_words is ODD, we need one word of padding at the top (highest address)
+    // to ensure SP (at the lowest address) ends up 16-byte aligned.
+    stack.align_sp(16);
+    if total_words % 2 != 0 {
+        stack.push_u64(0); // Alignment padding
+    }
+
     let mut envp_addrs = Vec::new();
     for e in env.iter().rev() {
         envp_addrs.push(stack.push_str(e));

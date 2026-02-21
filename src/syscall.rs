@@ -411,7 +411,7 @@ fn sys_brk(new_brk: usize) -> u64 {
 }
 
 fn sys_openat(_dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
+    let path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -621,7 +621,7 @@ fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u
 }
 
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
+    let path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => {
             crate::safe_print!(64, "[syscall] execve: path copy failed with {}\n", e as i64);

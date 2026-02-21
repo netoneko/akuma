@@ -296,7 +296,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = ram_size / 4; // 32 MB for 128 MB RAM
+    let heap_size = ram_size / 2; // 64 MB for 128 MB RAM
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
