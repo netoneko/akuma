@@ -227,7 +227,7 @@ impl<'a> SshChannelStream<'a> {
     }
 
     /// Write data to the channel, translating \n to \r\n
-    pub async fn write_with_crlf(&mut self, data: &[u8]) -> Result<usize, TcpError> {
+    pub async fn write_with_crlf(&mut self, data: &[u8]) -> Result<usize, SshStreamError> {
         let mut buf = Vec::with_capacity(data.len() + 16);
         for &byte in data {
             if byte == b'\n' {
@@ -895,7 +895,7 @@ async fn run_shell_session(
 
                                             // Output the result (empty for streamed commands)
                                             if !result.output.is_empty() {
-                                                let _ = channel_stream.write(&result.output).await;
+                                                let _ = channel_stream.write_with_crlf(&result.output).await;
                                             }
 
                                             // Check if we should exit

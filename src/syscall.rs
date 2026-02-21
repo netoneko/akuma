@@ -318,7 +318,22 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
-            if let Some(ch) = crate::process::current_channel() { ch.write(buf); }
+            if let Some(ch) = crate::process::current_channel() {
+                if ch.is_raw_mode() {
+                    ch.write(buf);
+                } else {
+                    // Translate \n to \r\n for cooked mode
+                    let mut translated = Vec::with_capacity(buf.len() + 8);
+                    for &byte in buf {
+                        if byte == b'\n' {
+                            translated.extend_from_slice(b"\r\n");
+                        } else {
+                            translated.push(byte);
+                        }
+                    }
+                    ch.write(&translated);
+                }
+            }
             proc.write_stdout(buf);
             count as u64
         }
