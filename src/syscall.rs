@@ -191,13 +191,31 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
             let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
             for fd in fds.iter_mut() {
                 fd.revents = 0;
-                if fd.fd == 0 { // stdin
-                    if let Some(ch) = crate::process::current_channel() {
-                        if ch.has_stdin_data() {
-                            fd.revents |= 1; // POLLIN
-                            ready_count += 1;
+                
+                // 1. Check for POLLIN (Read)
+                if fd.events & 1 != 0 {
+                    if fd.fd == 0 { // stdin
+                        if let Some(ch) = crate::process::current_channel() {
+                            if ch.has_stdin_data() {
+                                fd.revents |= 1;
+                            }
                         }
+                    } else if fd.fd > 2 {
+                        // For files, always ready to read if not at EOF (simplified)
+                        fd.revents |= 1;
                     }
+                }
+
+                // 2. Check for POLLOUT (Write)
+                if fd.events & 4 != 0 {
+                    if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
+                        // stdout, stderr, and files are always ready to write
+                        fd.revents |= 4;
+                    }
+                }
+
+                if fd.revents != 0 {
+                    ready_count += 1;
                 }
             }
         }
@@ -466,12 +484,13 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        let first_bytes = if buf.len() > 8 { &buf[..8] } else { buf };
-        crate::safe_print!(128, "[syscall] write(fd={}, len={}) data={:?}\n", fd_num, count, first_bytes);
+        // Log the entire buffer for debugging neatvi output issues
+        crate::safe_print!(1024, "[syscall] write(fd={}, len={}) full_data={:?}\n", fd_num, count, buf);
     }
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+            // Write to process channel (for SSH)
             if let Some(ch) = crate::process::current_channel() {
                 let term_state_opt = crate::process::current_terminal_state();
                 let translate = if let Some(ts_lock) = term_state_opt {
@@ -495,7 +514,11 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     ch.write(buf);
                 }
             }
+            
+            // Also write to procfs/kernel log
+            // Note: This function handles STDOUT_TO_KERNEL_LOG_COPY_ENABLED internally
             proc.write_stdout(buf);
+            
             count as u64
         }
         crate::process::FileDescriptor::File(ref f) => {
