@@ -537,27 +537,11 @@ pub async fn execute_external_interactive(
 
         // 1. Drain process stdout and write to SSH
         if let Some(data) = channel.try_read() {
-            // CRITICAL: We MUST translate \n to \r\n here for all process output
-            // going to the SSH stream, because the SSH client expects CRLF for 
-            // new lines regardless of whether the process thinks it is in raw mode.
-            // If the process is doing its own TUI (like vi or meow), it will likely
-            // use explicit \r\n or cursor positioning anyway.
-            let mut translated = Vec::with_capacity(data.len() + 8);
-            for &byte in &data {
-                if byte == b'\n' {
-                    translated.extend_from_slice(b"\r\n");
-                } else {
-                    translated.push(byte);
-                }
-            }
-            let _ = channel_stream.write_all(&translated).await;
-            let _ = channel_stream.flush().await;
-        }
-
-        // 2. Check for process exit
-        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
-            // Drain remaining output
-            while let Some(data) = channel.try_read() {
+            if channel.is_raw_mode() {
+                // Pass through exactly as written by the process (e.g. escape sequences)
+                let _ = channel_stream.write_all(&data).await;
+            } else {
+                // Perform CRLF translation for cooked mode
                 let mut translated = Vec::with_capacity(data.len() + 8);
                 for &byte in &data {
                     if byte == b'\n' {
@@ -567,6 +551,27 @@ pub async fn execute_external_interactive(
                     }
                 }
                 let _ = channel_stream.write_all(&translated).await;
+            }
+            let _ = channel_stream.flush().await;
+        }
+
+        // 2. Check for process exit
+        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+            // Drain remaining output
+            while let Some(data) = channel.try_read() {
+                if channel.is_raw_mode() {
+                    let _ = channel_stream.write_all(&data).await;
+                } else {
+                    let mut translated = Vec::with_capacity(data.len() + 8);
+                    for &byte in &data {
+                        if byte == b'\n' {
+                            translated.extend_from_slice(b"\r\n");
+                        } else {
+                            translated.push(byte);
+                        }
+                    }
+                    let _ = channel_stream.write_all(&translated).await;
+                }
             }
             let _ = channel_stream.flush().await;
             break;
