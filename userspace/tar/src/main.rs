@@ -12,12 +12,7 @@ use miniz_oxide::inflate;
 use tar_no_std::TarArchiveRef;
 
 #[no_mangle]
-fn _start() -> ! {
-    main();
-    exit(0);
-}
-
-fn main() {
+pub extern "C" fn main() {
     let args_iter = args();
     let mut args_vec: Vec<String> = Vec::new();
     for arg in args_iter {

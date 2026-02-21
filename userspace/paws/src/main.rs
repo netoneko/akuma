@@ -15,12 +15,7 @@ use libakuma::net::TcpStream;
 // until we have more stable internet access for documentation.
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    main();
-    exit(0);
-}
-
-fn main() {
+pub extern "C" fn main() {
     let args_iter = args();
     let args_vec: Vec<String> = args_iter.map(|s| String::from(s)).collect();
     

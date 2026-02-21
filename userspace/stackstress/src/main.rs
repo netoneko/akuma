@@ -16,7 +16,7 @@ const DEFAULT_ITERATIONS: u32 = 100;
 const DEFAULT_MODE: u32 = 3;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     let pid = getpid();
     
     // Parse arguments

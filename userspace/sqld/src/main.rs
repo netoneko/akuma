@@ -18,7 +18,7 @@ use libakuma::{arg, argc, exit, print, write, fd};
 use sqld::vfs;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     match run() {
         Ok(_) => exit(0),
         Err(e) => {

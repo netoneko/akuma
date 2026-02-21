@@ -60,7 +60,7 @@ extern "C" {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     unsafe {
         // Initialize standard streams
         stdin = &raw mut STDIN_FILE;
@@ -549,11 +549,6 @@ pub unsafe extern "C" fn freopen(filename: *const c_char, mode: *const c_char, s
 pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
     let path = cstr_to_str(pathname);
     akuma_unlink(path)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn exit(status: c_int) -> ! {
-    akuma_exit(status)
 }
 
 #[no_mangle]

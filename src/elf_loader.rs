@@ -98,12 +98,6 @@ const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE: u32 = 1027;
 
 /// Load an ELF binary from memory
-///
-/// # Arguments
-/// * `elf_data` - Raw ELF file data
-///
-/// # Returns
-/// LoadedElf with entry point and configured address space
 pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     // Parse ELF header
     let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
@@ -160,7 +154,6 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         let flags = phdr.p_flags;
 
         // Fallback for phdr_addr if PT_PHDR segment was missing
-        // Typically phdr is at the very beginning of the first PT_LOAD segment
         if phdr_addr == 0 && offset == 0 {
              phdr_addr = vaddr + elf.ehdr.e_phoff as usize;
         }
@@ -173,29 +166,22 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
                 if flags & PF_X != 0 { "X" } else { "-" });
         }
 
-        // Use appropriate flags based on segment permissions
-        // Note: If segment is writable, use RW_NO_EXEC to handle BSS overlaps
         let page_flags = if (flags & PF_X) != 0 {
-            user_flags::RX // Executable segment
+            user_flags::RX
         } else {
-            user_flags::RW_NO_EXEC // Data/BSS - always RW to handle overlaps
+            user_flags::RW_NO_EXEC
         };
 
-        // Calculate number of pages needed
         let start_page = vaddr & !(PAGE_SIZE - 1);
         let end_page = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let num_pages = (end_page - start_page) / PAGE_SIZE;
 
-        // Allocate and map pages
         for i in 0..num_pages {
             let page_va = start_page + i * PAGE_SIZE;
 
-            // Check if this page is already mapped (from a previous segment)
             let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
-                // Reuse existing mapping (all pages are RW now)
                 pa
             } else {
-                // Allocate a new physical page
                 let frame = address_space
                     .alloc_and_map(page_va, page_flags)
                     .map_err(|e| ElfError::MappingFailed(e))?;
@@ -203,11 +189,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
                 frame.addr
             };
 
-            // Copy data from ELF file if this page contains file data
             let page_start_in_segment = if page_va >= vaddr { page_va - vaddr } else { 0 };
 
             if page_start_in_segment < filesz {
-                // Calculate how much to copy
                 let copy_start = if page_va < vaddr { vaddr - page_va } else { 0 };
                 let file_offset = offset + page_start_in_segment;
                 let copy_len = core::cmp::min(
@@ -217,17 +201,14 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
                 if copy_len > 0 && file_offset + copy_len <= elf_data.len() {
                     unsafe {
-                        // Convert physical address to kernel virtual address for copy
                         let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);
                         let src = elf_data.as_ptr().add(file_offset);
                         core::ptr::copy_nonoverlapping(src, dst, copy_len);
                     }
                 }
             }
-            // Pages beyond filesz are already zeroed by alloc_page_zeroed
         }
 
-        // Update brk
         let segment_end = vaddr + memsz;
         if segment_end > brk {
             brk = segment_end;
@@ -236,7 +217,6 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
     // Apply relocations
     if let Some(shdrs) = elf.section_headers() {
-        // Try to get dynamic symbol table if it exists
         let dynsyms = elf.dynamic_symbol_table().ok().flatten();
 
         for shdr in shdrs {
@@ -257,7 +237,6 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
                             }
                         }
 
-                        // Find physical page for this virtual address
                         let page_va = vaddr & !(PAGE_SIZE - 1);
                         if let Some(&pa) = mapped_pages.get(&page_va) {
                             let offset_in_page = vaddr & (PAGE_SIZE - 1);
@@ -265,17 +244,12 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
                                 let ptr = crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize;
                                 match r_type {
                                     R_AARCH64_RELATIVE => {
-                                        // *ptr = B + A
-                                        // Since we load at preferred address, B = 0
                                         *ptr = addend;
                                     }
                                     R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
-                                        // *ptr = S + A
                                         *ptr = sym_value + addend;
                                     }
-                                    _ => {
-                                        // Unsupported relocation type
-                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -300,49 +274,119 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     })
 }
 
-/// Convert ELF segment flags to user page flags
-fn flags_to_user_flags(elf_flags: u32) -> u64 {
-    let readable = (elf_flags & PF_R) != 0;
-    let writable = (elf_flags & PF_W) != 0;
-    let executable = (elf_flags & PF_X) != 0;
+/// Helper to build a userspace stack according to Linux AArch64 ABI
+pub struct UserStack {
+    pub stack_bottom: usize,
+    pub stack_top: usize,
+    pub sp: usize,
+    pub frames: Vec<crate::pmm::PhysFrame>,
+}
 
-    match (readable, writable, executable) {
-        (_, true, true) => user_flags::RW, // RWX -> treat as RW for safety
-        (_, true, false) => user_flags::RW_NO_EXEC,
-        (true, false, true) => user_flags::RX,
-        (true, false, false) => user_flags::RO,
-        _ => user_flags::RO, // Default to read-only
+impl UserStack {
+    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<crate::pmm::PhysFrame>) -> Self {
+        Self {
+            stack_bottom,
+            stack_top,
+            sp: stack_top,
+            frames,
+        }
+    }
+
+    pub fn push_str(&mut self, s: &str) -> usize {
+        let bytes = s.as_bytes();
+        let len = bytes.len() + 1;
+        self.sp -= len;
+        
+        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
+        let offset = self.sp % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+            *(dst.add(bytes.len()) as *mut u8) = 0;
+        }
+        self.sp
+    }
+
+    pub fn push_u64(&mut self, val: u64) {
+        self.sp -= 8;
+        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
+        let offset = self.sp % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u64;
+            *dst = val;
+        }
+    }
+
+    pub fn push_raw(&mut self, data: &[u8]) -> usize {
+        self.sp -= data.len();
+        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
+        let offset = self.sp % PAGE_SIZE;
+        unsafe {
+            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
+        }
+        self.sp
+    }
+
+    pub fn align_sp(&mut self, alignment: usize) {
+        self.sp &= !(alignment - 1);
     }
 }
 
-/// Load an ELF binary and set up user stack with guard page
-///
-/// # Arguments
-/// * `elf_data` - Raw ELF file data
-/// * `stack_size` - Size of user stack in bytes (default: 128KB from config::USER_STACK_SIZE)
-///
-/// # Returns
-/// (entry_point, address_space, initial_stack_pointer, brk, stack_bottom, stack_top)
-///
-/// # Stack Layout (with default 128KB stack)
-/// ```text
-/// 0x40000000  <- STACK_TOP (unmapped, end of user space)
-/// 0x3FFE0000  <- stack_end (top of mapped stack, 32 pages = 128KB)
-///    ...      <- stack pages (RW)
-/// 0x3FFDF000 + 0x1000 = 0x3FFE0000 <- stack_bottom (first mapped page)
-/// 0x3FFDF000  <- guard_page (UNMAPPED - causes fault on overflow)
-/// ```
-/// Note: Addresses are calculated dynamically based on stack_size parameter.
+pub fn setup_linux_stack(
+    stack: &mut UserStack,
+    args: &[String],
+    env: &[String],
+    auxv: &[AuxEntry],
+) -> usize {
+    let mut envp_addrs = Vec::new();
+    for e in env.iter().rev() {
+        envp_addrs.push(stack.push_str(e));
+    }
+    envp_addrs.reverse();
+
+    let mut argv_addrs = Vec::new();
+    for a in args.iter().rev() {
+        argv_addrs.push(stack.push_str(a));
+    }
+    argv_addrs.reverse();
+
+    stack.align_sp(16);
+
+    // Push Auxiliary Vector
+    stack.push_u64(0); // AT_NULL a_type
+    stack.push_u64(0); // AT_NULL a_val
+    for entry in auxv.iter().rev() {
+        stack.push_u64(entry.a_val);
+        stack.push_u64(entry.a_type);
+    }
+
+    // Push envp NULL and pointers
+    stack.push_u64(0);
+    for addr in envp_addrs.iter().rev() {
+        stack.push_u64(*addr as u64);
+    }
+
+    // Push argv NULL and pointers
+    stack.push_u64(0);
+    for addr in argv_addrs.iter().rev() {
+        stack.push_u64(*addr as u64);
+    }
+
+    // Push argc
+    stack.push_u64(args.len() as u64);
+
+    stack.sp
+}
+
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     args: &[String],
+    env: &[String],
     stack_size: usize,
 ) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
-
-    // Place stack at top of first 1GB (user space)
     const STACK_TOP: usize = 0x4000_0000;
-
     let total_size = stack_size + PAGE_SIZE;
     let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;
@@ -358,43 +402,9 @@ pub fn load_elf_with_stack(
         stack_frames.push(frame);
     }
 
-    // Initial SP at the very top of mapped stack
-    let mut sp = STACK_TOP;
+    let mut stack = UserStack::new(stack_bottom, STACK_TOP, stack_frames);
+    let random_ptr = stack.push_raw(&[0u8; 16]);
 
-    // --- Linux Stack Setup ---
-    // 1. Copy argument strings to the top of the stack
-    let mut argv_addrs = Vec::new();
-    for arg in args.iter().rev() {
-        let bytes = arg.as_bytes();
-        let len = bytes.len() + 1; // + null terminator
-        sp -= len;
-        
-        let frame_idx = (sp - stack_bottom) / PAGE_SIZE;
-        let offset = sp % PAGE_SIZE;
-        unsafe {
-            let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
-            *(dst.add(bytes.len()) as *mut u8) = 0;
-        }
-        argv_addrs.push(sp);
-    }
-    argv_addrs.reverse();
-
-    // Align SP to 16 bytes AFTER strings
-    sp &= !0xF;
-
-    // 2. Prepare random data for AT_RANDOM (16 bytes)
-    sp -= 16;
-    let random_ptr = sp;
-    let frame_idx = (sp - stack_bottom) / PAGE_SIZE;
-    let offset = sp % PAGE_SIZE;
-    unsafe {
-        let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset) as *mut u64;
-        *dst = 0x123456789abcdef0;
-        *dst.add(1) = 0x0fedcba987654321;
-    }
-
-    // 3. Prepare Auxiliary Vector
     let auxv = [
         AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 },
         AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 },
@@ -402,66 +412,18 @@ pub fn load_elf_with_stack(
         AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 },
         AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 },
         AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 },
-        AuxEntry { a_type: auxv::AT_HWCAP, a_val: 0 },
         AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 },
         AuxEntry { a_type: auxv::AT_UID, a_val: 0 },
         AuxEntry { a_type: auxv::AT_EUID, a_val: 0 },
         AuxEntry { a_type: auxv::AT_GID, a_val: 0 },
         AuxEntry { a_type: auxv::AT_EGID, a_val: 0 },
-        AuxEntry { a_type: auxv::AT_NULL, a_val: 0 },
     ];
 
-    // 4. Calculate total space for the table
-    // Layout: [argc] [argv...] [NULL] [envp...] [NULL] [auxv...]
-    let argc_size = 8;
-    let argv_size = (args.len() + 1) * 8;
-    let envp_size = 8; // NULL envp
-    let auxv_size = auxv.len() * 16;
-    
-    let total_table_size = argc_size + argv_size + envp_size + auxv_size;
-    
-    // Align total size to 16 bytes so SP stays aligned
-    let total_table_size_aligned = (total_table_size + 15) & !0xF;
-    sp -= total_table_size_aligned;
+    let sp = setup_linux_stack(&mut stack, args, env, &auxv);
 
-    let mut current_sp = sp;
-    let write_stack = |addr: usize, val: u64| {
-        let frame_idx = (addr - stack_bottom) / PAGE_SIZE;
-        let offset = addr % PAGE_SIZE;
-        unsafe {
-            let dst = crate::mmu::phys_to_virt(stack_frames[frame_idx].addr + offset) as *mut u64;
-            *dst = val;
-        }
-    };
-
-    // Write argc
-    write_stack(current_sp, args.len() as u64);
-    current_sp += 8;
-
-    // Write argv pointers
-    for addr in argv_addrs {
-        write_stack(current_sp, addr as u64);
-        current_sp += 8;
-    }
-    write_stack(current_sp, 0); // argv NULL
-    current_sp += 8;
-
-    // Write envp NULL
-    write_stack(current_sp, 0);
-    current_sp += 8;
-
-    // Write AuxV
-    for entry in auxv {
-        write_stack(current_sp, entry.a_type);
-        write_stack(current_sp + 8, entry.a_val);
-        current_sp += 16;
-    }
-
-    // Pre-allocate heap pages (64KB = 16 pages, unrolled)
     let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let f = user_flags::RW_NO_EXEC;
     for i in 0..16 {
-        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, f);
+        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, user_flags::RW_NO_EXEC);
     }
 
     if DEBUG_ELF_LOADING {
@@ -470,13 +432,5 @@ pub fn load_elf_with_stack(
             stack_bottom, STACK_TOP, sp, args.len());
     }
 
-    // Return: entry, address_space, initial_sp, brk, stack_bottom, stack_top
-    Ok((
-        loaded.entry_point,
-        loaded.address_space,
-        sp, // initial_sp
-        hs,
-        stack_bottom,
-        STACK_TOP,
-    ))
+    Ok((loaded.entry_point, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
 }

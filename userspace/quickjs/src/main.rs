@@ -147,12 +147,7 @@ fn setup_console(rt: &Runtime) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = main();
-    exit(code);
-}
-
-fn main() -> i32 {
+pub extern "C" fn main() {
     debug("qjs: starting\n");
     
     // Check command line arguments
@@ -160,7 +155,7 @@ fn main() -> i32 {
         print("QuickJS for Akuma\n");
         print("Usage: qjs <script.js>\n");
         print("       qjs -e \"<code>\"\n");
-        return 1;
+        exit(1);
     }
 
     debug("qjs: parsing args\n");
@@ -169,7 +164,7 @@ fn main() -> i32 {
         Some(a) => a,
         None => {
             print("Error: Failed to get argument\n");
-            return 1;
+            exit(1);
         }
     };
 
@@ -180,7 +175,7 @@ fn main() -> i32 {
         Some(r) => r,
         None => {
             print("Error: Failed to create JavaScript runtime\n");
-            return 1;
+            exit(1);
         }
     };
     
@@ -192,18 +187,18 @@ fn main() -> i32 {
     debug("qjs: checking args\n");
     
     // Check if we're evaluating inline code or a file
-    if first_arg == "-e" {
+    let code = if first_arg == "-e" {
         // Inline code execution
         if argc() < 3 {
             print("Error: -e requires code argument\n");
-            return 1;
+            exit(1);
         }
 
         let code = match arg(2) {
             Some(c) => c,
             None => {
                 print("Error: Failed to get code argument\n");
-                return 1;
+                exit(1);
             }
         };
 
@@ -242,7 +237,7 @@ fn main() -> i32 {
                 print("Error reading file: ");
                 print(e);
                 print("\n");
-                return 1;
+                exit(1);
             }
         };
         if DEBUG {
@@ -272,5 +267,6 @@ fn main() -> i32 {
                 1
             }
         }
-    }
+    };
+    exit(code);
 }

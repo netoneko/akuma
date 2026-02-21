@@ -6,7 +6,7 @@ use libakuma::{exit, print, println, print_dec, allocation_count};
 use alloc::string::String;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     println("allocstress: starting virtual address exhaustion test");
     
     let mut count = 0;

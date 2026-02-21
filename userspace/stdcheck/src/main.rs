@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use libakuma::{exit, print};
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     print("=== stdcheck: Testing std compatibility ===\n\n");
 
     // Print memory layout for debugging

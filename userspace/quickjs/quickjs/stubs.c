@@ -15,6 +15,9 @@ extern uint64_t akuma_uptime(void);
 /* Exit function - provided by Rust runtime */
 extern void akuma_exit(int code);
 
+/* Abort function - provided by libakuma */
+extern void abort(void);
+
 /* Memory functions */
 void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char *)s;
@@ -1234,23 +1237,6 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex) {
 
 pthread_t pthread_self(void) {
     return 1;
-}
-
-/* abort and exit */
-void abort(void) {
-    akuma_print("ABORT called!\n", 14);
-    akuma_exit(134); /* 128 + SIGABRT(6) */
-    while(1) {} /* Should not reach here */
-}
-
-void exit(int status) {
-    akuma_exit(status);
-    while(1) {} /* Should not reach here */
-}
-
-void _exit(int status) {
-    akuma_exit(status);
-    while(1) {}
 }
 
 /* assert */

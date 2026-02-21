@@ -266,7 +266,7 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-pub const AUTO_START_HERD: bool = true;
+pub const AUTO_START_HERD: bool = false;
 
 // ============================================================================
 // Procfs Buffer Size Limits

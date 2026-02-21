@@ -56,6 +56,8 @@ fn test_linux_process_abi() {
     let test_frame = crate::pmm::alloc_page_zeroed().expect("Failed to alloc test frame");
     let test_user_addr = 0x2000_0000usize; // A safe userspace address
     
+    crate::safe_print!(128, "[Test] test_frame PA={:#x}, mapping to VA={:#x}\n", test_frame.addr, test_user_addr);
+
     unsafe {
         // Map it temporarily in current address space (kernel)
         crate::mmu::map_user_page(test_user_addr, test_frame.addr, crate::mmu::user_flags::RW_NO_EXEC);
@@ -66,6 +68,8 @@ fn test_linux_process_abi() {
         core::ptr::copy_nonoverlapping(path_bytes.as_ptr(), p_virt, path_bytes.len());
         // Null terminator
         *p_virt.add(path_bytes.len()) = 0;
+        
+        crate::safe_print!(128, "[Test] Written path to PA {:#x}: {}\n", test_frame.addr, test_path);
         
         let arg1_str = "1"; // 1 output
         let arg1_offset = 64;
@@ -79,6 +83,25 @@ fn test_linux_process_abi() {
         *argv_ptr = test_user_addr as u64; // arg0 = path
         *argv_ptr.add(1) = (test_user_addr + arg1_offset) as u64; // arg1
         *argv_ptr.add(2) = 0; // null terminator
+
+        // Construct empty envp array at offset 160
+        let envp_offset = 160;
+        let envp_ptr = p_virt.add(envp_offset) as *mut u64;
+        *envp_ptr = 0; // null terminator
+
+        // Ensure writes are visible
+        core::arch::asm!("dsb ish", "isb");
+    }
+
+    // VERIFY: Can we read it back from the virtual address?
+    unsafe {
+        let ptr = test_user_addr as *const u8;
+        if *ptr == 0 {
+            crate::safe_print!(128, "[Test] ERROR: Virtual address {:#x} reads as ZERO even after mapping!\n", test_user_addr);
+            // Try to force it?
+        } else {
+            crate::safe_print!(64, "[Test] Virtual address {:#x} verification OK\n", test_user_addr);
+        }
     }
 
     // 1. Simulate vfork via sys_clone (syscall 220)
@@ -95,8 +118,9 @@ fn test_linux_process_abi() {
     // 2. Simulate execve via sys_execve (syscall 221)
     let path_ptr = test_user_addr as u64;
     let argv_ptr = (test_user_addr + 128) as u64;
+    let envp_ptr = (test_user_addr + 160) as u64;
 
-    let exec_args = [path_ptr, argv_ptr, 0, 0, 0, 0];
+    let exec_args = [path_ptr, argv_ptr, envp_ptr, 0, 0, 0];
     let exec_res = crate::syscall::handle_syscall(crate::syscall::nr::EXECVE, &exec_args);
     
     if (exec_res as i64) < 0 {
@@ -256,7 +280,7 @@ fn test_echo2() {
             );
 
             // Try to create a process from the ELF
-            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &data) {
+            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &[], &data) {
                 Ok(proc) => {
                     crate::safe_print!(96, 
                         "[Test] Process created: PID={}, entry={:#x}\n",

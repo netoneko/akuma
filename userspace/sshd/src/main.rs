@@ -57,12 +57,7 @@ impl Write for SshStream {
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    main();
-    exit(0);
-}
-
-fn main() {
+pub extern "C" fn main() {
     println("[SSHD] Starting userspace SSH server...");
 
     // 1. Load config from file first

@@ -26,12 +26,7 @@ const CGI_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const CGI_TIMEOUT_MS: u32 = 5000;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    main();
-    exit(0);
-}
-
-fn main() {
+pub extern "C" fn main() {
     print("httpd: Starting HTTP server on port 8080\n");
 
     // Bind to all interfaces

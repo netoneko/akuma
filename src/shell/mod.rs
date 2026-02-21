@@ -429,7 +429,7 @@ async fn execute_external(
         crate::process::exec_async_cwd(path, args, stdin, cwd).await
     } else {
         // Synchronous fallback for boot-time tests
-        crate::process::exec_with_io_cwd(path, args, stdin, cwd)
+        crate::process::exec_with_io_cwd(path, args, None, stdin, cwd)
     };
 
     match result {
@@ -512,7 +512,7 @@ pub async fn execute_external_interactive(
     use crate::process::spawn_process_with_channel_cwd;
     
     // Spawn process with channel and cwd
-    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
+    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, None, stdin, cwd) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);

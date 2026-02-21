@@ -41,18 +41,24 @@ const SYSCALL_REGISTER_BOX: u64 = 316;
 const SYSCALL_KILL_BOX: u64 = 317;
 
 fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
-    let mut args_buf = Vec::new();
-    if let Some(args_slice) = args {
-        for arg in args_slice {
-            args_buf.extend_from_slice(arg.as_bytes());
-            args_buf.push(0);
+    let mut argv = Vec::new();
+    let path_terminated = format!("{}\0", path);
+    argv.push(path_terminated.as_ptr());
+    
+    let mut args_terminated = Vec::new();
+    if let Some(slice) = args {
+        for a in slice {
+            let s = format!("{}\0", a);
+            args_terminated.push(s);
         }
     }
-
-    if !args_buf.is_empty() {
-        options.args_ptr = args_buf.as_ptr() as u64;
-        options.args_len = args_buf.len();
+    for s in &args_terminated {
+        argv.push(s.as_ptr());
     }
+    argv.push(core::ptr::null());
+
+    options.args_ptr = argv.as_ptr() as u64;
+    options.args_len = argv.len();
     
     if let Some(s) = stdin {
         options.stdin_ptr = s.as_ptr() as u64;
@@ -61,10 +67,9 @@ fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &
 
     let result = libakuma::syscall(
         SYSCALL_SPAWN_EXT,
-        path.as_ptr() as u64,
-        path.len() as u64,
+        path_terminated.as_ptr() as u64,
         options as *const _ as u64,
-        0, 0, 0,
+        0, 0, 0, 0,
     );
 
     if (result as i64) < 0 { return None; }
@@ -72,7 +77,7 @@ fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     let mut args_iter = args();
     let _prog = args_iter.next();
 

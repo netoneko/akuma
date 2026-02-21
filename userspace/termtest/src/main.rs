@@ -19,7 +19,7 @@ pub mod mode_flags {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     println("Terminal Test Program Started");
 
     // --- 1. Get and store initial terminal attributes ---

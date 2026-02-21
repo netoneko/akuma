@@ -117,6 +117,12 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
         None => return false,
     };
     if end > 0x4000_0000 { return false; }
+    
+    // CRITICAL: Check if the range is actually mapped in the current page tables
+    if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
+        return false;
+    }
+    
     true
 }
 
@@ -124,19 +130,28 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     if !BYPASS_VALIDATION.load(Ordering::Acquire) {
         if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+        if !crate::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
     }
     let mut len = 0;
     while len < max_len {
         let addr = ptr + len as u64;
         if !BYPASS_VALIDATION.load(Ordering::Acquire) {
             if addr >= 0x4000_0000 { return Err(EFAULT); }
+            // Check mapping every page boundary
+            if addr % 4096 == 0 {
+                if !crate::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
+            }
         }
         let c = unsafe { *(addr as *const u8) };
+        if len < 16 {
+            // crate::safe_print!(64, "[syscall] copy_from_user_str: addr={:#x} c={}\n", addr, c as char);
+        }
         if c == 0 { break; }
         len += 1;
     }
     if len == max_len {
-        crate::safe_print!(128, "[syscall] copy_from_user_str: not null terminated within {} bytes\n", max_len);
+        let first_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, 16) };
+        crate::safe_print!(128, "[syscall] copy_from_user_str: not null terminated within {} bytes at {:#x}. First 16 bytes: {:?}\n", max_len, ptr, first_bytes);
         return Err(EINVAL);
     }
     
@@ -590,10 +605,13 @@ fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u
     ENOSYS
 }
 
-fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> u64 {
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => {
+            crate::safe_print!(64, "[syscall] execve: path copy failed with {}\n", e as i64);
+            return e;
+        },
     };
     
     // Resolve path
@@ -618,6 +636,24 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> u64 {
             if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
                 args.push(s);
             } else {
+                crate::safe_print!(64, "[syscall] execve: failed to copy argv[{}]\n", i);
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    // Parse envp
+    let mut env = Vec::new();
+    if envp_ptr != 0 {
+        let mut i = 0;
+        loop {
+            if !validate_user_ptr(envp_ptr + i * 8, 8) { break; }
+            let str_ptr = unsafe { *((envp_ptr + i * 8) as *const u64) };
+            if str_ptr == 0 { break; }
+            if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
+                env.push(s);
+            } else {
                 break;
             }
             i += 1;
@@ -627,17 +663,15 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> u64 {
     let args_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
     let cwd = crate::process::current_process().map(|p| p.cwd.clone());
 
-    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), None, cwd.as_deref()) {
+    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), Some(&env), None, cwd.as_deref()) {
         Ok((_tid, ch, pid)) => {
             crate::process::register_child_channel(pid, ch);
-            // In vfork, parent blocks until child exits.
-            // We'll simulate this by storing the child PID and having sys_wait4 handle it.
-            // For now, return 0 to the child (which we just spawned)
-            // But since Akuma doesn't really have a child thread running the same code,
-            // we just return success.
             0
         }
-        Err(_) => ENOENT,
+        Err(e) => {
+            crate::safe_print!(128, "[syscall] execve: spawn failed for {}: {}\n", resolved_path, e);
+            ENOENT
+        },
     }
 }
 
@@ -958,7 +992,7 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, std
     let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, args_opt, stdin) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, args_opt, None) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
@@ -1005,7 +1039,7 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
     };
 
     // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, stdin, cwd, root_dir, o.box_id) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);

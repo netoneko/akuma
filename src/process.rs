@@ -62,94 +62,29 @@ pub const CWD_DATA_SIZE: usize = 256;
 /// Process info structure shared between kernel and userspace
 ///
 /// The kernel writes this, userspace reads it (read-only mapping).
-/// Kernel reads it during syscalls to prevent PID spoofing.
 ///
-/// WARNING: Must not exceed 1024 bytes!
-/// Layout:
-///   - pid: 4 bytes
-///   - ppid: 4 bytes
-///   - argc: 4 bytes
-///   - argv_len: 4 bytes (total bytes used in argv_data)
-///   - cwd_len: 4 bytes
-///   - _reserved: 4 bytes (alignment padding)
-///   - cwd_data: 256 bytes (current working directory)
-///   - argv_data: 744 bytes (null-separated argument strings)
-/// Total: 24 + 256 + 744 = 1024 bytes
+/// Layout must match libakuma exactly.
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,
     /// Parent process ID
     pub ppid: u32,
-    /// Number of command line arguments
-    pub argc: u32,
-    /// Total bytes used in argv_data
-    pub argv_len: u32,
-    /// Length of cwd string (not including null terminator)
-    pub cwd_len: u32,
-    /// Reserved for alignment
-    pub _reserved: u32,
-    /// Current working directory (null-terminated string)
-    pub cwd_data: [u8; CWD_DATA_SIZE],
-    /// Null-separated argument strings
-    pub argv_data: [u8; ARGV_DATA_SIZE],
+    /// Box ID
+    pub box_id: u64,
+    /// Reserved
+    pub _reserved: [u8; 1008],
 }
 
 impl ProcessInfo {
-    /// Create a new ProcessInfo with no arguments
-    pub const fn new(pid: u32, ppid: u32) -> Self {
+    /// Create a new ProcessInfo
+    pub const fn new(pid: u32, ppid: u32, box_id: u64) -> Self {
         Self {
             pid,
             ppid,
-            argc: 0,
-            argv_len: 0,
-            cwd_len: 0,
-            _reserved: 0,
-            cwd_data: [0u8; CWD_DATA_SIZE],
-            argv_data: [0u8; ARGV_DATA_SIZE],
+            box_id,
+            _reserved: [0u8; 1008],
         }
-    }
-
-    /// Create a new ProcessInfo with command line arguments
-    ///
-    /// Arguments are stored as null-separated strings in argv_data.
-    /// Returns None if arguments don't fit in the available space.
-    pub fn with_args(pid: u32, ppid: u32, args: &[&str]) -> Option<Self> {
-        let mut info = Self::new(pid, ppid);
-        
-        let mut offset = 0;
-        for arg in args {
-            let arg_bytes = arg.as_bytes();
-            let needed = arg_bytes.len() + 1; // +1 for null terminator
-            
-            if offset + needed > ARGV_DATA_SIZE {
-                return None; // Arguments too large
-            }
-            
-            info.argv_data[offset..offset + arg_bytes.len()].copy_from_slice(arg_bytes);
-            info.argv_data[offset + arg_bytes.len()] = 0; // null terminator
-            offset += needed;
-        }
-        
-        info.argc = args.len() as u32;
-        info.argv_len = offset as u32;
-        
-        Some(info)
-    }
-    
-    /// Set the current working directory
-    ///
-    /// Returns false if cwd is too long (max 255 bytes).
-    pub fn set_cwd(&mut self, cwd: &str) -> bool {
-        let cwd_bytes = cwd.as_bytes();
-        if cwd_bytes.len() >= CWD_DATA_SIZE {
-            return false; // Too long
-        }
-        
-        self.cwd_data[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
-        self.cwd_data[cwd_bytes.len()] = 0; // null terminator
-        self.cwd_len = cwd_bytes.len() as u32;
-        true
     }
 }
 
@@ -1242,11 +1177,11 @@ pub struct Process {
 
 impl Process {
     /// Create a new process from ELF data
-    pub fn from_elf(name: &str, args: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
+    pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
         // Load ELF with stack and pre-allocated heap
         // Stack size is configurable via config::USER_STACK_SIZE
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
-            elf_loader::load_elf_with_stack(elf_data, args, config::USER_STACK_SIZE)?;
+            elf_loader::load_elf_with_stack(elf_data, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
@@ -1332,19 +1267,8 @@ impl Process {
     }
     
     /// Set current working directory for this process
-    ///
-    /// The cwd will be passed to the process via the ProcessInfo page.
     pub fn set_cwd(&mut self, cwd: &str) {
         self.cwd = String::from(cwd);
-        
-        // Also update the ProcessInfo page so userspace getcwd() sees it
-        unsafe {
-            let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
-            let mut info = core::ptr::read(info_ptr);
-            if info.set_cwd(cwd) {
-                core::ptr::write(info_ptr, info);
-            }
-        }
     }
 
     /// Start executing this process (enters user mode)
@@ -1374,31 +1298,9 @@ impl Process {
         self.reset_io();
 
         // Write process info to the physical page (before activating address space)
-        // We write directly to physical memory via phys_to_virt since the page
-        // is mapped read-only in the user's address space
         unsafe {
             let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
-            
-            // Build full argv with program name as argv[0] (Unix convention)
-            // self.args contains only the extra arguments, not argv[0]
-            let mut full_args: Vec<&str> = Vec::with_capacity(self.args.len() + 1);
-            full_args.push(self.name.as_str());  // argv[0] = program name/path
-            for arg in &self.args {
-                full_args.push(arg.as_str());
-            }
-            
-            let mut info = ProcessInfo::with_args(self.pid, self.parent_pid, &full_args)
-                .unwrap_or_else(|| {
-                    console::print("[Process] Warning: args too large, truncating\n");
-                    ProcessInfo::new(self.pid, self.parent_pid)
-                });
-            
-            // Set the current working directory
-            if !info.set_cwd(&self.cwd) {
-                console::print("[Process] Warning: cwd too long, using /\n");
-                info.set_cwd("/");
-            }
-            
+            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
             core::ptr::write(info_ptr, info);
         }
     }
@@ -1848,13 +1750,13 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 /// # Returns
 /// Tuple of (exit_code, stdout_data), or error message
 pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    exec_with_io_cwd(path, args, stdin, None)
+    exec_with_io_cwd(path, args, None, stdin, None)
 }
 
 /// exec_with_io with explicit cwd
-pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
     
     // Poll until process exits (blocking)
     loop {
@@ -1926,7 +1828,7 @@ pub fn spawn_process_with_channel(
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    spawn_process_with_channel_cwd(path, args, stdin, None)
+    spawn_process_with_channel_cwd(path, args, None, stdin, None)
 }
 
 /// Spawn a process on a user thread with a channel for I/O and specified cwd
@@ -1942,16 +1844,18 @@ pub fn spawn_process_with_channel(
 pub fn spawn_process_with_channel_cwd(
     path: &str,
     args: Option<&[&str]>,
+    env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    spawn_process_with_channel_ext(path, args, stdin, cwd, None, 0)
+    spawn_process_with_channel_ext(path, args, env, stdin, cwd, None, 0)
 }
 
 /// Extended version of spawn_process_with_channel
 pub fn spawn_process_with_channel_ext(
     path: &str,
     args: Option<&[&str]>,
+    env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     root_dir: Option<&str>,
@@ -1975,8 +1879,10 @@ pub fn spawn_process_with_channel_ext(
         }
     }
 
+    let full_env = env.map(|e| e.to_vec()).unwrap_or_default();
+
     // Create the process
-    let mut process = Process::from_elf(path, &full_args, &elf_data)
+    let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
     // Create a channel for this process
@@ -2125,7 +2031,7 @@ pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
 pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
 
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
 
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
@@ -2191,7 +2097,7 @@ where
     W: embedded_io_async::Write,
 {
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
 
     // Stream output until process exits
     loop {

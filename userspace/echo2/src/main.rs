@@ -9,7 +9,7 @@ use libakuma::{exit, fd, print, read, write};
 
 /// Entry point
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     // Print a greeting
     print("echo2: Ready to echo!\n");
 

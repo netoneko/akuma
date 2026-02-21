@@ -4,10 +4,8 @@
 use core::panic::PanicInfo;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     // This is a dummy main.rs, as the 'make' binary is built from C source.
-    // The build process is handled by build.rs.
-    // In a real no_std application, you would put your entry point logic here.
     loop {}
 }
 
