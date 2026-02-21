@@ -349,31 +349,47 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         TCGETS => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
-            // Minimal termios structure (musl/linux)
-            // c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[19]
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
             unsafe {
                 let ptr = arg as *mut u32;
-                // Just return some reasonable defaults
-                *ptr.add(0) = 0; // iflag
-                *ptr.add(1) = 0; // oflag
-                *ptr.add(2) = 0; // cflag
-                let lflag = if let Some(ch) = crate::process::current_channel() {
-                    if ch.is_raw_mode() { 0 } else { 0x0000000a } // ICANON | ECHO
-                } else { 0x0000000a };
-                *ptr.add(3) = lflag; 
+                *ptr.add(0) = ts.iflag;
+                *ptr.add(1) = ts.oflag;
+                *ptr.add(2) = ts.cflag;
+                *ptr.add(3) = ts.lflag;
+                
+                let cc_ptr = ptr.add(4) as *mut u8;
+                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), cc_ptr, 20);
             }
             0
         }
         TCSETS | TCSETSW | TCSETSF => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let mut ts = term_state_lock.lock();
             unsafe {
-                let lflag = *((arg + 12) as *const u32);
-                let is_raw = (lflag & 0x0000000a) == 0; // !ICANON & !ECHO
-                if let Some(ch) = crate::process::current_channel() {
-                    ch.set_raw_mode(is_raw);
-                    if cmd == TCSETSF {
-                        ch.flush_stdin();
-                    }
+                let ptr = arg as *const u32;
+                ts.iflag = *ptr.add(0);
+                ts.oflag = *ptr.add(1);
+                ts.cflag = *ptr.add(2);
+                ts.lflag = *ptr.add(3);
+                
+                let cc_ptr = ptr.add(4) as *const u8;
+                core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
+            }
+
+            // Sync with process channel
+            if let Some(ch) = crate::process::current_channel() {
+                let is_raw = (ts.lflag & mode_flags::ICANON) == 0;
+                ch.set_raw_mode(is_raw);
+                if cmd == TCSETSF {
+                    ch.flush_stdin();
                 }
             }
             0
@@ -457,7 +473,27 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
             if let Some(ch) = crate::process::current_channel() {
-                ch.write(buf);
+                let term_state_opt = crate::process::current_terminal_state();
+                let translate = if let Some(ts_lock) = term_state_opt {
+                    let ts = ts_lock.lock();
+                    (ts.oflag & mode_flags::ONLCR) != 0
+                } else {
+                    true // Default to translate if no terminal state
+                };
+
+                if translate {
+                    let mut translated = Vec::with_capacity(buf.len() + 8);
+                    for &byte in buf {
+                        if byte == b'\n' {
+                            translated.extend_from_slice(b"\r\n");
+                        } else {
+                            translated.push(byte);
+                        }
+                    }
+                    ch.write(&translated);
+                } else {
+                    ch.write(buf);
+                }
             }
             proc.write_stdout(buf);
             count as u64
@@ -1298,12 +1334,22 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
     let mut term_state = term_state_lock.lock();
     term_state.mode_flags = mode_flags_arg;
 
+    // Standard Linux-style flags for compatibility
+    if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
+        term_state.iflag &= !(0x00000100 | 0x00000040); // IGNBRK | ICRNL
+        term_state.oflag &= !mode_flags::OPOST;
+        term_state.lflag &= !(mode_flags::ECHO | mode_flags::ICANON);
+    } else if (mode_flags_arg & mode_flags::RAW_MODE_DISABLE) != 0 {
+        term_state.oflag |= mode_flags::OPOST | mode_flags::ONLCR;
+        term_state.lflag |= mode_flags::ECHO | mode_flags::ICANON;
+    }
+
     // Propagate raw mode setting to the ProcessChannel
     let proc_channel = match crate::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
-    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+    proc_channel.set_raw_mode((term_state.lflag & mode_flags::ICANON) == 0);
 
     // Handle action: TCSAFLUSH (2) flushes input
     if action == 2 {

@@ -9,14 +9,27 @@ pub mod mode_flags {
     pub const RAW_MODE_ENABLE: u64 = 0x01;
     /// Disable raw mode (restore canonical, echo, ISIG)
     pub const RAW_MODE_DISABLE: u64 = 0x02;
-    // Add other flags as needed, e.g., ECHO, ICANON, ISIG
+    
+    // Linux-compatible constants for ioctl
+    pub const ICANON: u32 = 0x00000002;
+    pub const ECHO: u32   = 0x00000008;
+    pub const OPOST: u32  = 0x00000001;
+    pub const ONLCR: u32  = 0x00000004;
 }
 
 /// Represents the state of a virtual terminal for an SSH session.
 #[derive(Debug)]
 pub struct TerminalState {
-    /// Current terminal mode flags (e.g., RAW_MODE_ENABLE)
+    /// Current terminal mode flags (custom Akuma flags)
     pub mode_flags: u64,
+    
+    // Linux-compatible termios flags
+    pub iflag: u32,
+    pub oflag: u32,
+    pub cflag: u32,
+    pub lflag: u32,
+    pub cc: [u8; 20],
+
     /// Current cursor column (0-indexed)
     pub cursor_col: usize,
     /// Current cursor row (0-indexed)
@@ -31,8 +44,16 @@ pub struct TerminalState {
 
 impl Default for TerminalState {
     fn default() -> Self {
+        let mut cc = [0u8; 20];
+        cc[6] = 1; // VMIN = 1
+        
         TerminalState {
-            mode_flags: 0, // Default to cooked mode
+            mode_flags: 0,
+            iflag: 0,
+            oflag: mode_flags::OPOST | mode_flags::ONLCR, // Enable CRLF translation by default
+            cflag: 0,
+            lflag: mode_flags::ICANON | mode_flags::ECHO,
+            cc,
             cursor_col: 0,
             cursor_row: 0,
             cursor_hidden: false,
