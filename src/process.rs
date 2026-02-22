@@ -190,14 +190,18 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     Ok(())
 }
 
-/// Reattach I/O from the current process to a target PID
-pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
-    let caller_pid = read_current_pid().ok_or("No caller context")?;
-    
+/// Reattach I/O from a caller process (or kernel) to a target PID
+pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
     // 1. Validate hierarchy permissions
-    let (caller_box_id, channel) = {
-        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+    let (caller_box_id, channel) = if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
         (caller.box_id, caller.channel.clone())
+    } else {
+        // Kernel caller (e.g. built-in SSH shell)
+        // System threads use thread-ID based channel lookup
+        let tid = crate::threading::current_thread_id();
+        let ch = get_channel(tid).ok_or("Kernel thread has no channel")?;
+        (0, Some(ch)) // Kernel is Box 0
     };
 
     let target_box_id = {
@@ -207,16 +211,16 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
 
     let mut allowed = false;
     if caller_box_id == 0 {
-        allowed = true; // Host can reattach anything
+        allowed = true; // Host/Kernel can reattach anything
     } else if target_box_id == caller_box_id {
         allowed = true; // Same box
-    } else {
+    } else if let Some(pid) = caller_pid {
         // Check if caller created the target's box (child box)
         let box_info = crate::irq::with_irqs_disabled(|| {
             BOX_REGISTRY.lock().get(&target_box_id).cloned()
         });
         if let Some(info) = box_info {
-            if info.creator_pid == caller_pid {
+            if info.creator_pid == pid {
                 allowed = true;
             }
         }
@@ -227,10 +231,12 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
     }
 
     // 2. Perform the delegation
-    // Current process (e.g. 'box') now points its input to target (e.g. 'paws')
-    {
-        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+    if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
         caller.delegate_pid = Some(target_pid);
+    } else {
+        // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
+        // but we still want to link the channel to the target.
     }
 
     // Target process now uses caller's output channel
@@ -240,10 +246,16 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Reattached PID {} -> PID {}\n", caller_pid, target_pid);
+        crate::safe_print!(128, "[Process] Reattached (caller={:?}) -> PID {}\n", caller_pid, target_pid);
     }
 
     Ok(())
+}
+
+/// Reattach I/O from the current process to a target PID
+pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+    let caller_pid = read_current_pid(); // Can be None for kernel threads
+    reattach_process_ext(caller_pid, target_pid)
 }
 
 /// Kill all processes in a box and unregister it
@@ -470,6 +482,8 @@ pub struct ProcessChannel {
     interrupted: AtomicBool,
     /// Raw mode flag (true if terminal is in raw mode, false for cooked)
     raw_mode: AtomicBool,
+    /// Stdin closed flag (true if no more data will be written to stdin)
+    stdin_closed: AtomicBool,
 }
 
 /// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
@@ -484,8 +498,19 @@ impl ProcessChannel {
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
-            raw_mode: AtomicBool::new(false), // Initialize raw_mode
+            raw_mode: AtomicBool::new(false),
+            stdin_closed: AtomicBool::new(false),
         }
+    }
+
+    /// Mark stdin as closed (no more data will be arriving)
+    pub fn close_stdin(&self) {
+        self.stdin_closed.store(true, Ordering::Release);
+    }
+
+    /// Check if stdin is closed
+    pub fn is_stdin_closed(&self) -> bool {
+        self.stdin_closed.load(Ordering::Acquire)
     }
 
     /// Write data to the channel buffer (stdout from process)
@@ -1768,6 +1793,12 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
     
+    // For non-interactive execution, if no stdin was provided, mark it as closed
+    // so the process doesn't block forever if it tries to read from it.
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
+
     // Poll until process exits (blocking)
     loop {
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
@@ -1901,6 +1932,7 @@ pub fn spawn_process_with_channel_ext(
     // Seed the channel with initial stdin data if provided
     if let Some(data) = stdin {
         channel.write_stdin(data);
+        channel.close_stdin(); // Mark as closed since we've provided all data
     }
 
     // Set the channel in the process struct (UNIFIED I/O)
@@ -2043,6 +2075,11 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
 
+    // For non-interactive execution, if no stdin was provided, mark it as closed
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
+
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
     loop {
@@ -2108,6 +2145,11 @@ where
 {
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+
+    // For non-interactive streaming, if no stdin was provided, mark it as closed
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
 
     // Stream output until process exits
     loop {

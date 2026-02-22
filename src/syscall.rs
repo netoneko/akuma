@@ -429,10 +429,63 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     match fd {
         crate::process::FileDescriptor::Stdin => {
-            let mut temp = alloc::vec![0u8; count];
-            let n = if let Some(ch) = crate::process::current_channel() { ch.read_stdin(&mut temp) } else { proc.read_stdin(&mut temp) };
-            if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
-            n as u64
+            let ch = match crate::process::current_channel() {
+                Some(c) => c,
+                None => {
+                    // Fallback for processes without a channel (unlikely in modern Akuma)
+                    let mut temp = alloc::vec![0u8; count];
+                    let n = proc.read_stdin(&mut temp);
+                    if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                    return n as u64;
+                }
+            };
+
+            let mut kernel_buf = alloc::vec![0u8; count];
+            
+            // Blocking read loop
+            loop {
+                // Check for data first
+                let n = ch.read_stdin(&mut kernel_buf);
+                if n > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
+                    return n as u64;
+                }
+
+                // Check for EOF if channel is closed
+                if ch.is_stdin_closed() {
+                    return 0; // EOF
+                }
+
+                // Check for interrupt
+                if crate::process::is_current_interrupted() {
+                    return EINTR;
+                }
+
+                // Register waker and block
+                let term_state_lock = match crate::process::current_terminal_state() {
+                    Some(state) => state,
+                    None => return 0, // EOF fallback
+                };
+
+                {
+                    crate::threading::disable_preemption();
+                    let mut term_state = term_state_lock.lock();
+                    let thread_id = crate::threading::current_thread_id();
+                    term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
+                    crate::threading::enable_preemption();
+                }
+
+                // Yield until woken by new input
+                crate::threading::schedule_blocking(u64::MAX);
+
+                // Clear waker
+                {
+                    crate::threading::disable_preemption();
+                    let mut term_state = term_state_lock.lock();
+                    term_state.input_waker.lock().take();
+                    crate::threading::enable_preemption();
+                }
+            }
         }
         crate::process::FileDescriptor::File(ref f) => {
             // Memory safety: Limit the amount of memory allocated in the kernel per syscall.
