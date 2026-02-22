@@ -82,6 +82,9 @@ pub mod nr {
     pub const FB_INIT: u64 = 321;
     pub const FB_DRAW: u64 = 322;
     pub const FB_INFO: u64 = 323;
+    pub const GETPID: u64 = 172;
+    pub const GETPPID: u64 = 173;
+    pub const GETEUID: u64 = 175;
 }
 
 /// Thread CPU statistics for top command
@@ -315,6 +318,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FB_INIT => sys_fb_init(args[0] as u32, args[1] as u32),
         nr::FB_DRAW => sys_fb_draw(args[0], args[1] as usize),
         nr::FB_INFO => sys_fb_info(args[0]),
+        nr::GETPID => sys_getpid(),
+        nr::GETPPID => sys_getppid(),
+        nr::GETEUID => sys_geteuid(),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1618,4 +1624,20 @@ fn sys_fb_info(info_ptr: u64) -> u64 {
         }
         None => (-libc_errno::EIO as i64) as u64,
     }
+}
+
+fn sys_getpid() -> u64 {
+    crate::process::read_current_pid().map_or(!0u64, |pid| pid as u64)
+}
+
+fn sys_getppid() -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.parent_pid as u64
+    } else {
+        !0u64 // Return error if no current process
+    }
+}
+
+fn sys_geteuid() -> u64 {
+    0 // Return 0 for root/default user, as Akuma does not have robust user management yet.
 }
