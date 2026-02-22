@@ -7,6 +7,6 @@ rustflags = [
 ]
 
 [env]
-CC_aarch64_unknown_none = "/tmp/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-gcc"
-AR_aarch64_unknown_none = "/tmp/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-ar"
+# CC_aarch64_unknown_none = "/tmp/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-gcc"
+# AR_aarch64_unknown_none = "/tmp/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-ar"
 

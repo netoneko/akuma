@@ -24,7 +24,10 @@ members = [
     "paws",
     "musl",
     "tcc",
-    "tar"
+    "tar",
+    "sshd",
+    "make",
+    "crash_test"
 ]
 
 [profile.dev]

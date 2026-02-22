@@ -19,24 +19,19 @@ use libakuma::net::{TcpStream, resolve};
 use libakuma::{print, exit, arg, argc, open, write_fd, close, open_flags, SocketAddrV4};
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = main();
-    exit(code);
-}
-
-fn main() -> i32 {
+pub extern "C" fn main() {
     // Parse arguments
     if argc() < 2 {
         print("Usage: wget <url> [output_file]\n");
         print("Example: wget http://example.com/file.txt\n");
-        return 1;
+        exit(1);
     }
 
     let url = match arg(1) {
         Some(u) => u,
         None => {
             print("wget: missing URL\n");
-            return 1;
+            exit(1);
         }
     };
 
@@ -46,7 +41,7 @@ fn main() -> i32 {
         None => {
             print("wget: invalid URL format\n");
             print("Expected: http://host[:port]/path\n");
-            return 1;
+            exit(1);
         }
     };
 
@@ -61,7 +56,7 @@ fn main() -> i32 {
         Ok(ip) => ip,
         Err(_) => {
             print("wget: DNS resolution failed\n");
-            return 1;
+            exit(1);
         }
     };
 
@@ -80,7 +75,7 @@ fn main() -> i32 {
         Err(e) => {
             print("wget: Connection failed: ");
             print(&format!("{:?}\n", e));
-            return 1;
+            exit(1);
         }
     };
 
@@ -101,7 +96,7 @@ fn main() -> i32 {
     if let Err(e) = stream.write_all(request.as_bytes()) {
         print("wget: Failed to send request: ");
         print(&format!("{:?}\n", e));
-        return 1;
+        exit(1);
     }
 
     // Read response
@@ -131,11 +126,11 @@ fn main() -> i32 {
     print(" bytes\n");
 
     // Parse HTTP response
-    let (status, headers_end, body) = match parse_response(&response) {
+    let (status, headers_end, _body) = match parse_response(&response) {
         Some(r) => r,
         None => {
             print("wget: Failed to parse HTTP response\n");
-            return 1;
+            exit(1);
         }
     };
 
@@ -145,7 +140,7 @@ fn main() -> i32 {
 
     if status != 200 {
         print("wget: Server returned error\n");
-        return 1;
+        exit(1);
     }
 
     // Determine output filename
@@ -166,7 +161,7 @@ fn main() -> i32 {
     let fd = open(&output_file, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
         print("wget: Failed to create output file\n");
-        return 1;
+        exit(1);
     }
 
     let body_data = &response[headers_end..];
@@ -175,7 +170,7 @@ fn main() -> i32 {
 
     if written < 0 {
         print("wget: Failed to write file\n");
-        return 1;
+        exit(1);
     }
 
     print("wget: Saved ");
@@ -184,7 +179,7 @@ fn main() -> i32 {
     print(&output_file);
     print("\n");
 
-    0
+    exit(0);
 }
 
 struct ParsedUrl<'a> {

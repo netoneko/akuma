@@ -76,26 +76,21 @@ pub fn repo_path(relative: &str) -> String {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = main();
-    exit(code);
-}
-
-fn main() -> i32 {
+pub extern "C" fn main() {
     if argc() < 2 {
         print_usage();
-        return 1;
+        exit(1);
     }
 
     let command = match arg(1) {
         Some(cmd) => cmd,
         None => {
             print("scratch: missing command\n");
-            return 1;
+            exit(1);
         }
     };
 
-    match command {
+    let code = match command {
         "clone" => cmd_clone(),
         "fetch" => cmd_fetch(),
         "pull" => cmd_pull(),
@@ -120,7 +115,8 @@ fn main() -> i32 {
             print_usage();
             1
         }
-    }
+    };
+    exit(code);
 }
 
 /// Get command argument (argument index relative to command)

@@ -34,14 +34,17 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (128KB default)
+/// User process stack size (256KB default)
 ///
 /// Stack allocated for user-space ELF processes.
 /// Increased from 64KB due to stack overflow in scratch (git clone)
 /// when using miniz_oxide zlib decompression with deep call stacks.
 /// Increased to 512KB for DOOM which has deep rendering call stacks.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 512 * 1024;
+// pub const USER_STACK_SIZE: usize = 512 * 1024;
+/// Increased from 128KB to handle complex workloads like TCC compiling neatvi.
+/// A guard page is placed below the stack to detect overflow.
+pub const USER_STACK_SIZE: usize = 256 * 1024;
 
 /// Maximum kernel threads
 ///
@@ -67,12 +70,12 @@ pub const RESERVED_THREADS: usize = 8;
 /// a system thread and needs significant stack space for pinned futures.
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// Stack size for user process threads (128KB)
+/// Stack size for user process threads (256KB)
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
-/// Increased from 64KB due to stack overflow during socket accept.
+/// Increased from 128KB to handle complex syscall chains and nested processing.
 /// User processes have their own user-space stack but kernel syscalls need space.
-pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
+pub const USER_THREAD_STACK_SIZE: usize = 256 * 1024;
 
 /// Enable stack canary checking
 ///
@@ -193,7 +196,7 @@ pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // Option to disable copying stdout to kernel log
-pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
+pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
@@ -267,7 +270,7 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-pub const AUTO_START_HERD: bool = true;
+pub const AUTO_START_HERD: bool = false;
 
 // ============================================================================
 // Procfs Buffer Size Limits
@@ -291,3 +294,19 @@ pub const PROC_STDIN_MAX_SIZE: usize = 8 * 1024; // 8KB
 ///
 /// Note: A single write larger than this limit is still accepted in full.
 pub const PROC_STDOUT_MAX_SIZE: usize = 8 * 1024; // 8KB
+
+// ============================================================================
+// SSH Server Configuration
+// ============================================================================
+
+/// Port for the built-in kernel SSH server
+///
+/// Default is 22. Set to a different port (e.g., 2222) if running a userspace
+/// SSH server like Dropbear on port 22.
+pub const SSH_PORT: u16 = 22;
+
+/// Enable userspace SSHD instead of the built-in kernel SSH server.
+///
+/// When enabled, the kernel will not spawn its internal SSH server thread.
+/// The userspace /bin/sshd should be started by /bin/herd instead.
+pub const ENABLE_USERSPACE_SSHD: bool = false;

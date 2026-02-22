@@ -655,10 +655,10 @@ extern "C" fn rust_default_exception_handler() {
     // Check for dangerous ERET conditions
     let target_el = spsr & 0xF;
     if target_el == 0 {
-        crate::console::print("  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
+        crate::safe_print!(128, "  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
     }
     if elr == 0 {
-        crate::console::print("  WARNING: ELR=0 - ERET would jump to address 0!\n");
+        crate::safe_print!(128, "  WARNING: ELR=0 - ERET would jump to address 0!\n");
     }
     if elr < 0x4000_0000 && target_el != 0 {
         crate::safe_print!(96, "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n", elr);
@@ -666,7 +666,7 @@ extern "C" fn rust_default_exception_handler() {
     
     // If ERET would be dangerous, halt instead of returning
     if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
-        crate::console::print("  HALTING to prevent invalid ERET\n");
+        crate::safe_print!(64, "  HALTING to prevent invalid ERET\n");
         loop {
             unsafe { core::arch::asm!("wfe"); }
         }
@@ -757,15 +757,15 @@ extern "C" fn rust_sync_el1_handler() {
     
     // Check if FAR is in user space (below 0x40000000)
     if far < 0x4000_0000 {
-        crate::console::print("  WARNING: Kernel accessing user-space address!\n");
-        crate::console::print("  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
+        safe_print!(128, "  WARNING: Kernel accessing user-space address!\n");
+        safe_print!(128, "  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
     }
     
     // Check for page table corruption on translation table walk faults
     let dfsc = iss & 0x3F;
     if dfsc == 0x21 || dfsc == 0x22 || dfsc == 0x23 {
         // External abort on translation table walk (level 1/2/3)
-        crate::console::print("  PAGE TABLE WALK FAULT - checking page table integrity:\n");
+        safe_print!(128, "  PAGE TABLE WALK FAULT - checking page table integrity:\n");
         
         // Get expected boot TTBR0
         let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
@@ -775,7 +775,7 @@ extern "C" fn rust_sync_el1_handler() {
         w.flush();
         
         if ttbr0 != boot_ttbr0 {
-            crate::console::print("    WARNING: TTBR0 mismatch!\n");
+            safe_print!(64, "    WARNING: TTBR0 mismatch!\n");
         }
         
         // Read L0[0] entry to check if it points to valid L1
@@ -798,7 +798,7 @@ extern "C" fn rust_sync_el1_handler() {
         w.flush();
         
         if l1_addr != expected_l1 {
-            crate::console::print("    WARNING: L1 address mismatch - page table corrupted!\n");
+            safe_print!(128, "    WARNING: L1 address mismatch - page table corrupted!\n");
         }
         
         // Now read L1[0] to check the device memory block entry
@@ -818,10 +818,10 @@ extern "C" fn rust_sync_el1_handler() {
             
             // L1[0] should point to physical 0 (device memory)
             if !is_l1_valid {
-                crate::console::print("    WARNING: L1[0] is INVALID!\n");
+                safe_print!(64, "    WARNING: L1[0] is INVALID!\n");
             }
             if block_addr != 0 {
-                crate::console::print("    WARNING: L1[0] block address wrong!\n");
+                safe_print!(64, "    WARNING: L1[0] block address wrong!\n");
             }
         }
     }
@@ -893,7 +893,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     use core::fmt::Write;
     let mut w = StaticWriter::new();
     
-    crate::console::print("\n=== Memory Stats at Crash ===\n");
+    safe_print!(64, "\n=== Memory Stats at Crash ===\n");
     
     // Kernel heap stats
     let heap_stats = crate::allocator::stats();
@@ -946,7 +946,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         let _ = write!(w, "    SP={:#x}, used={} bytes\n", kernel_sp, kernel_stack_used);
         w.flush();
         if kernel_sp < stack_info.0 as u64 || kernel_sp > stack_info.1 as u64 {
-            crate::console::print("  WARNING: Kernel SP outside thread's stack bounds!\n");
+            safe_print!(128, "  WARNING: Kernel SP outside thread's stack bounds!\n");
         }
     }
     
@@ -989,15 +989,15 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         w.flush();
         
         if user_sp < mem.stack_bottom as u64 {
-            crate::console::print("    WARNING: User SP below stack bottom - STACK OVERFLOW!\n");
+            safe_print!(128, "    WARNING: User SP below stack bottom - STACK OVERFLOW!\n");
         } else if user_sp >= mem.stack_top as u64 {
-            crate::console::print("    WARNING: User SP above stack top - SP corrupted!\n");
+            safe_print!(128, "    WARNING: User SP above stack top - SP corrupted!\n");
         }
     } else {
-        crate::console::print("  No current user process\n");
+        safe_print!(64, "  No current user process\n");
     }
     
-    crate::console::print("=============================\n");
+    safe_print!(64, "=============================\n");
 }
 
 /// Synchronous exception handler from EL0 (user mode)
@@ -1046,7 +1046,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // Validate exit code - detect corruption (pointer-like values)
                     let exit_code_u32 = exit_code as u32;
                     if exit_code_u32 >= 0x40000000 && exit_code_u32 < 0x50000000 {
-                        crate::console::print("[exception] CORRUPT EXIT CODE DETECTED!\n");
+                        safe_print!(128, "[exception] CORRUPT EXIT CODE DETECTED!\n");
                         crate::safe_print!(128, "  PID={}, exit_code={} (0x{:x}) looks like kernel address\n",
                             proc.pid, exit_code, exit_code_u32);
                         crate::safe_print!(96, "  proc ptr=0x{:x}, &exit_code=0x{:x}\n",
@@ -1066,7 +1066,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             } else {
                 // Only log if we just handled EXIT syscall
                 if syscall_num == 93 {
-                    crate::console::print("[exception] WARNING: EXIT syscall but no current_process!\n");
+                    safe_print!(128, "[exception] WARNING: EXIT syscall but no current_process!\n");
                 }
             }
 
@@ -1118,7 +1118,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Check if this looks like a kernel TTBR0 (boot page tables)
             // Boot TTBR0 is typically around 0x43xxxxxx
             if ttbr0 & 0xFFFF_0000_0000_0000 == 0 && ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
-                crate::console::print("  WARNING: TTBR0 looks like boot page tables, not user process!\n");
+                safe_print!(128, "  WARNING: TTBR0 looks like boot page tables, not user process!\n");
             }
             
             crate::process::return_to_kernel(-1) // never returns

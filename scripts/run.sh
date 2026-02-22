@@ -9,6 +9,13 @@ if [ ! -f "$KERNEL_PATH" ]; then
     exit 1
 fi
 
+EXTRA_ARGS=""
+if [ "$1" == "--test" ]; then
+    EXTRA_ARGS="-append TEST=1"
+    # Ensure no other QEMU is running that might lock the disk
+    pkill -9 qemu-system-aarch64 || true
+fi
+
 qemu-system-aarch64 \
   -semihosting \
   -machine virt \
@@ -25,4 +32,5 @@ qemu-system-aarch64 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
   -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on \
-  -kernel $KERNEL_PATH
+  -kernel $KERNEL_PATH \
+  $EXTRA_ARGS

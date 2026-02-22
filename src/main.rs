@@ -13,6 +13,7 @@ mod async_tests;
 mod block;
 mod boot;
 mod config;
+#[macro_use]
 mod console;
 mod dns;
 mod editor;
@@ -51,6 +52,7 @@ mod tls_verifier;
 mod vfs;
 mod virtio_hal;
 
+use alloc::format;
 use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
 
@@ -296,7 +298,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = ram_size / 4; // 32 MB for 128 MB RAM
+    let heap_size = ram_size / 2; // 64 MB for 128 MB RAM
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
@@ -693,17 +695,22 @@ fn run_async_main() -> ! {
     // Initialize SSH host key
     ssh::init_host_key();
 
-    console::print("[Main] Spawning SSH server thread...\n");
-    if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
-        console::print("[Main] Failed to spawn SSH server: ");
-        console::print(e);
-        console::print("\n");
+    if !config::ENABLE_USERSPACE_SSHD {
+        console::print("[Main] Spawning built-in SSH server thread...\n");
+        if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
+            console::print("[Main] Failed to spawn SSH server: ");
+            console::print(e);
+            console::print("\n");
+        }
+    } else {
+        console::print("[Main] Built-in SSH server disabled (ENABLE_USERSPACE_SSHD=true)\n");
     }
 
-    console::print("[Main] Network ready! Running background polling loop.\n");
-    console::print(
-        "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n",
-    );
+    safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
+    if !config::ENABLE_USERSPACE_SSHD {
+        safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
+            if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
+    }
 
     // Enable IRQs for the main loop
     unsafe {

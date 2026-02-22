@@ -346,5 +346,5 @@ pub async fn load_authorized_keys() -> Vec<VerifyingKey> {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(256, "{}", msg);
 }

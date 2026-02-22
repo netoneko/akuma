@@ -23,7 +23,7 @@ const MICROSECONDS: u64 = 1000;
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     let start_time = libakuma::uptime();
     let pid = getpid();
     

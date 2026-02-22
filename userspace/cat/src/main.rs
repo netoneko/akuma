@@ -10,7 +10,7 @@ extern crate alloc;
 use libakuma::{args, exit, open, read_fd, write_fd, close, fd, open_flags, print};
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     let mut args = args();
     let _prog_name = args.next(); // Skip program name
 

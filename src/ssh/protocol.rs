@@ -779,6 +779,10 @@ async fn run_shell_session(
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
 
+    // Register the channel for this system thread so sys_write can find it
+    let channel = Arc::new(crate::process::ProcessChannel::new());
+    crate::process::register_system_thread_channel(crate::threading::current_thread_id(), channel.clone());
+
     // Create command registry
     let registry = create_default_registry();
 
@@ -1612,5 +1616,5 @@ pub async fn handle_connection(mut stream: TcpStream) {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(512, "{}", msg);
 }

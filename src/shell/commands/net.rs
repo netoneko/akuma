@@ -3,6 +3,7 @@
 //! Commands for network operations: curl, nslookup, pkg
 
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -11,7 +12,7 @@ use core::pin::Pin;
 
 use embedded_io_async::Write;
 
-use crate::shell::{Command, ShellContext, ShellError, VecWriter};
+use crate::shell::{execute_external_streaming, Command, ShellContext, ShellError, VecWriter};
 use crate::smoltcp_net;
 
 // ============================================================================
@@ -66,9 +67,8 @@ fn parse_url(url: &str) -> Option<ParsedUrl> {
 // HTTP GET Helper
 // ============================================================================
 
-/// Perform an HTTP GET request and return the response body.
-/// Resolves DNS, connects via TCP, sends request, reads response.
-async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, &'static str> {
+/// Perform an HTTP GET request and return the HTTP status code and response body.
+async fn http_get(url: &ParsedUrl) -> Result<(u16, Vec<u8>), &'static str> {
     // Resolve hostname
     let ip = smoltcp_net::dns_query(&url.host)
         .map_err(|_| "DNS resolution failed")?;
@@ -79,7 +79,7 @@ async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, &'static str> {
         url.port,
     ).await.map_err(|_| "TCP connection failed")?;
 
-    // Send HTTP/1.0 GET request (HTTP/1.0 closes connection after response)
+    // Send HTTP/1.0 GET request
     let request = format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: akuma/1.0\r\nConnection: close\r\n\r\n",
         url.path, url.host
@@ -87,72 +87,48 @@ async fn http_get(url: &ParsedUrl) -> Result<Vec<u8>, &'static str> {
     let _ = stream.write(request.as_bytes()).await.map_err(|_| "Send failed")?;
     let _ = stream.flush().await;
 
-    // Read the full response.
-    // Poll the network stack between reads to ensure TCP ACKs are sent
-    // promptly. Without this, ACKs are only sent when the receive buffer
-    // is fully drained (Pending), creating a stop-and-go pattern that can
-    // cause connection resets during large transfers through QEMU slirp.
+    // Read the full response
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
-    let mut had_error = false;
     loop {
-        // Drive the network stack so ACKs and window updates are sent
-        // between reads, not just when the buffer is empty
         smoltcp_net::poll();
         match embedded_io_async::Read::read(&mut stream, &mut buf).await {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
             Err(_) => {
-                had_error = true;
-                break;
+                smoltcp_net::socket_close(handle);
+                return Err("TCP read error");
             }
         }
     }
-
     smoltcp_net::socket_close(handle);
 
     if response.is_empty() {
-        return Err(if had_error { "TCP read error" } else { "Empty response" });
+        return Err("Empty response");
     }
 
     // Parse HTTP response: find end of headers (\r\n\r\n)
     let pos = match response.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(p) => p,
-        None => return Err("Malformed HTTP response (no header terminator)"),
+        None => return Err("Malformed HTTP response"),
     };
 
     let header_bytes = &response[..pos];
-    // Check for successful status
-    if let Ok(header_str) = core::str::from_utf8(header_bytes) {
-        if let Some(status_line) = header_str.lines().next() {
-            if !status_line.contains("200") && !status_line.contains("301") && !status_line.contains("302") {
-                return Err("HTTP error response");
-            }
-        }
-    }
-
     let body = response[pos + 4..].to_vec();
 
-    // Verify against Content-Length if present (case-insensitive header match)
-    if let Ok(header_str) = core::str::from_utf8(header_bytes) {
-        for line in header_str.lines() {
-            // HTTP headers are case-insensitive
-            if line.len() > 15 && line.as_bytes()[..15].eq_ignore_ascii_case(b"content-length:") {
-                if let Ok(expected) = line[15..].trim().parse::<usize>() {
-                    if body.len() < expected {
-                        // Download was truncated - don't silently return partial data
-                        return Err("Download incomplete (connection lost)");
-                    }
-                }
-            }
-        }
-    }
+    // Parse status code from "HTTP/1.1 200 OK"
+    let status_code = if let Ok(header_str) = core::str::from_utf8(header_bytes) {
+        header_str
+            .lines()
+            .next()
+            .and_then(|status_line| status_line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    if had_error && body.is_empty() {
-        return Err("TCP read error (no body received)");
-    }
-
-    Ok(body)
+    Ok((status_code, body))
 }
 
 // ============================================================================
@@ -192,7 +168,9 @@ impl Command for CurlCommand {
             let _ = stdout.write(msg.as_bytes()).await;
 
             match http_get(&url).await {
-                Ok(body) => {
+                Ok((status, body)) => {
+                    let msg = format!("HTTP Status: {}\r\n", status);
+                    let _ = stdout.write(msg.as_bytes()).await;
                     let _ = stdout.write(&body).await;
                     if !body.ends_with(b"\n") {
                         let _ = stdout.write(b"\r\n").await;
@@ -260,96 +238,167 @@ pub static NSLOOKUP_CMD: NslookupCommand = NslookupCommand;
 // Pkg Command
 // ============================================================================
 
+const PKG_SERVER: &str = "http://10.0.2.2:8000";
+
 pub struct PkgCommand;
 
 impl PkgCommand {
-    async fn install_package(
+    /// Download a file from the package server.
+    async fn download_file(
+        &self,
+        path: &str,
+        stdout: &mut VecWriter
+    ) -> Result<(u16, Vec<u8>), ShellError> {
+        let url_str = format!("{}{}", PKG_SERVER, path);
+        let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
+
+        let msg = format!("pkg: downloading {}...\r\n", url_str);
+        let _ = stdout.write(msg.as_bytes()).await;
+
+        http_get(&url).await.map_err(|e| {
+            let _ = stdout.write_all(format!("pkg: download error: {}\r\n", e).as_bytes());
+            ShellError::ExecutionFailed("Download failed")
+        })
+    }
+
+    /// Try to install a pre-compiled binary.
+    async fn try_install_binary(
+        &self,
+        package: &str,
+        stdout: &mut VecWriter
+    ) -> Result<bool, ShellError> {
+        let bin_path = format!("/bin/{}", package);
+        match self.download_file(&bin_path, stdout).await {
+            Ok((200, body)) => {
+                if body.is_empty() {
+                    let _ = stdout.write(b"pkg: warning: downloaded binary is empty.\r\n").await;
+                    return Ok(false);
+                }
+                
+                let _ = crate::async_fs::write_file(&bin_path, &body).await;
+                let msg = format!("pkg: installed {} to {}\r\n", package, bin_path);
+                let _ = stdout.write(msg.as_bytes()).await;
+                Ok(true)
+            }
+            Ok((404, _)) => Ok(false), // Not found, try next method
+            Ok((status, _)) => {
+                let msg = format!("pkg: failed to download binary (status: {})\r\n", status);
+                let _ = stdout.write(msg.as_bytes()).await;
+                Err(ShellError::ExecutionFailed("Binary download failed"))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Try to install from a tarball archive.
+    async fn try_install_archive(
+        &self,
         package: &str,
         stdout: &mut VecWriter,
+        ctx: &mut ShellContext,
+    ) -> Result<bool, ShellError> {
+        let archive_path_gz = format!("/archives/{}.tar.gz", package);
+        let archive_path_tar = format!("/archives/{}.tar", package);
+        
+        let extensions = [".tar.gz", ".tar"];
+        let paths = [archive_path_gz.as_str(), archive_path_tar.as_str()];
+
+        for i in 0..2 {
+            let path = paths[i];
+            let ext = extensions[i];
+            
+            match self.download_file(path, stdout).await {
+                Ok((200, body)) => {
+                    if body.is_empty() {
+                        continue; // Try next extension
+                    }
+                    
+                    let tmp_path = format!("/tmp/{}{}", package, ext);
+                    let _ = crate::async_fs::write_file(&tmp_path, &body).await;
+
+                    let success = self.extract_and_cleanup(&tmp_path, stdout, ctx).await?;
+
+                    return Ok(success);
+                }
+                Ok((404, _)) => continue, // Not found, try next
+                Ok((status, _)) => {
+                    let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Err(ShellError::ExecutionFailed("Archive download failed"));
+                }
+                Err(_) => return Err(ShellError::ExecutionFailed("Archive download failed")),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Extract a tarball and clean up the temporary file.
+    async fn extract_and_cleanup(
+        &self,
+        archive_path: &str,
+        stdout: &mut VecWriter,
+        ctx: &mut ShellContext,
+    ) -> Result<bool, ShellError> {
+        // Ensure /bin/tar exists
+        if !crate::async_fs::exists("/bin/tar").await {
+            let _ = stdout.write(b"pkg: 'tar' command not found. Please 'pkg install tar' first.\r\n").await;
+            // Clean up the downloaded archive even if tar is missing
+            let _ = crate::async_fs::remove_file(archive_path).await;
+            return Ok(false);
+        }
+
+        let mut args = vec!["-xvf", archive_path, "-C", "/"];
+        if archive_path.ends_with(".gz") {
+            args[0] = "-xzvf";
+        }
+        
+        let msg = format!("pkg: extracting {} to root...\r\n", archive_path);
+        let _ = stdout.write(msg.as_bytes()).await;
+
+        // Use execute_external_streaming to run tar
+        let result = execute_external_streaming("/bin/tar", Some(&args), None, Some(ctx.cwd()), stdout).await;
+        
+        // Clean up the archive file
+        let _ = crate::async_fs::remove_file(archive_path).await;
+        
+        if result.is_ok() {
+            let _ = stdout.write(b"pkg: extraction complete.\r\n").await;
+            Ok(true)
+        } else {
+            let _ = stdout.write(b"pkg: extraction failed.\r\n").await;
+            Err(ShellError::ExecutionFailed("Extraction failed"))
+        }
+    }
+
+    /// The main package installation logic.
+    async fn install_package(
+        &self,
+        package: &str,
+        stdout: &mut VecWriter,
+        ctx: &mut ShellContext,
     ) -> Result<(), ShellError> {
         if package.is_empty() {
             return Ok(());
         }
 
-        // Download from host HTTP server (10.0.2.2:8000)
-        let url_str = format!(
-            "http://10.0.2.2:8000/target/aarch64-unknown-none/release/{}",
-            package
-        );
-        let url = match parse_url(&url_str) {
-            Some(u) => u,
-            None => {
-                let _ = stdout.write(b"Error: Failed to construct URL\r\n").await;
-                return Ok(());
-            }
-        };
+        // Ensure /bin and /tmp exist
+        let _ = crate::async_fs::create_dir("/bin").await;
+        let _ = crate::async_fs::create_dir("/tmp").await;
 
-        let msg = format!("pkg: downloading {}...\r\n", package);
+        // 1. Try installing from a pre-compiled binary
+        if self.try_install_binary(package, stdout).await? {
+            return Ok(());
+        }
+
+        // 2. If binary fails, try installing from a tarball archive
+        if self.try_install_archive(package, stdout, ctx).await? {
+            return Ok(());
+        }
+
+        // 3. If all methods fail
+        let msg = format!("pkg: unable to find package '{}'\r\n", package);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        match http_get(&url).await {
-            Ok(body) => {
-                if body.is_empty() {
-                    let msg = format!("Error: Empty response for {} (package not found?)\r\n", package);
-                    let _ = stdout.write(msg.as_bytes()).await;
-                    return Ok(());
-                }
-
-                let size_msg = format!("pkg: downloaded {} bytes\r\n", body.len());
-                let _ = stdout.write(size_msg.as_bytes()).await;
-
-                // Check filesystem capacity before writing
-                if let Ok(stats) = crate::fs::stats() {
-                    let free_bytes = stats.free_bytes();
-                    let block_size = stats.cluster_size;
-                    let blocks_needed = (body.len() as u64 + block_size as u64 - 1) / block_size as u64;
-                    let diag = format!(
-                        "pkg: fs: block_size={}, free={} bytes ({} blocks), need ~{} blocks\r\n",
-                        block_size, free_bytes, stats.free_clusters, blocks_needed
-                    );
-                    let _ = stdout.write(diag.as_bytes()).await;
-
-                    if (body.len() as u64) > free_bytes {
-                        let msg = format!("Error: Not enough disk space for {}\r\n", package);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                        return Ok(());
-                    }
-                }
-
-                // Check disk device capacity
-                if let Some(disk_cap) = crate::block::capacity() {
-                    let diag = format!("pkg: disk capacity={} bytes\r\n", disk_cap);
-                    let _ = stdout.write(diag.as_bytes()).await;
-                }
-
-                // Ensure /bin directory exists
-                if crate::fs::create_dir("/bin").is_err() {
-                    // Ignore error - directory may already exist
-                }
-
-                // Write to /bin/<package>
-                let dest = format!("/bin/{}", package);
-                match crate::fs::write_file(&dest, &body) {
-                    Ok(()) => {
-                        let msg = format!(
-                            "pkg: installed {} ({} bytes) -> {}\r\n",
-                            package,
-                            body.len(),
-                            dest
-                        );
-                        let _ = stdout.write(msg.as_bytes()).await;
-                    }
-                    Err(e) => {
-                        let msg = format!("Error: Failed to write {} to /bin/ ({} bytes): {}\r\n", package, body.len(), e);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = format!("Error downloading {}: {}\r\n", package, e);
-                let _ = stdout.write(msg.as_bytes()).await;
-            }
-        }
         Ok(())
     }
 }
@@ -364,24 +413,26 @@ impl Command for PkgCommand {
         args: &'a [u8],
         _stdin: Option<&'a [u8]>,
         stdout: &'a mut VecWriter,
-        _ctx: &'a mut ShellContext,
+        ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
 
-            // Parse "install <package1> <package2> ..."
             if let Some(rest) = args_str.strip_prefix("install") {
                 let packages = rest.trim();
                 if packages.is_empty() {
-                    let _ = stdout.write(b"Error: No package name specified\r\nUsage: pkg install <package1> [package2] ...\r\n").await;
+                    let _ = stdout.write(b"Usage: pkg install <package>\r\n").await;
                     return Ok(());
                 }
 
                 for package in packages.split_whitespace() {
-                    let _ = Self::install_package(package, stdout).await;
+                    if let Err(e) = self.install_package(package, stdout, ctx).await {
+                         let msg = format!("pkg: error installing {}: {:?}\r\n", package, e);
+                         let _ = stdout.write(msg.as_bytes()).await;
+                    }
                 }
             } else {
-                let _ = stdout.write(b"Usage: pkg install <package1> [package2] ...\r\n\r\nExamples:\r\n  pkg install stdcheck\r\n  pkg install echo2 hello\r\n").await;
+                let _ = stdout.write(b"Usage: pkg install <package1> [package2] ...\r\n").await;
             }
 
             Ok(())

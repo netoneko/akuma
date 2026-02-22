@@ -26,6 +26,9 @@ MEMBERS=(
     "musl"
     "tcc"
     "tar"
+    "make"
+    "sshd"
+    "crash_test"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -70,6 +73,8 @@ BINARIES=(
     "paws"
     "tcc"
     "tar"
+    "sshd"
+    "crash_test"
 )
 
 for bin in "${BINARIES[@]}"; do

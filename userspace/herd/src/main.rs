@@ -167,12 +167,7 @@ impl HerdState {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    main();
-    exit(0);
-}
-
-fn main() {
+pub extern "C" fn main() {
     // Ensure required directories exist
     ensure_directories();
 
@@ -190,7 +185,7 @@ fn main() {
             }
             "status" => {
                 cmd_status();
-                return;
+                exit(0);
             }
             "add" => {
                 if let Some(name) = service_name {
@@ -198,7 +193,7 @@ fn main() {
                 } else {
                     print("Usage: herd add <service>\n");
                 }
-                return;
+                exit(0);
             }
             "config" => {
                 if let Some(name) = service_name {
@@ -206,7 +201,7 @@ fn main() {
                 } else {
                     print("Usage: herd config <service>\n");
                 }
-                return;
+                exit(0);
             }
             "enable" => {
                 if let Some(name) = service_name {
@@ -214,7 +209,7 @@ fn main() {
                 } else {
                     print("Usage: herd enable <service>\n");
                 }
-                return;
+                exit(0);
             }
             "disable" => {
                 if let Some(name) = service_name {
@@ -222,7 +217,7 @@ fn main() {
                 } else {
                     print("Usage: herd disable <service>\n");
                 }
-                return;
+                exit(0);
             }
             "log" => {
                 if let Some(name) = service_name {
@@ -230,18 +225,18 @@ fn main() {
                 } else {
                     print("Usage: herd log <service>\n");
                 }
-                return;
+                exit(0);
             }
             "help" | "--help" | "-h" => {
                 print_usage();
-                return;
+                exit(0);
             }
             _ => {
                 print("Unknown command: ");
                 print(subcommand);
                 print("\n");
                 print_usage();
-                return;
+                exit(1);
             }
         }
     }
@@ -258,6 +253,10 @@ fn main() {
     start_stopped_services(&mut state);
 
     // Main supervisor loop
+    supervisor_loop(state);
+}
+
+fn supervisor_loop(mut state: HerdState) {
     loop {
         let now_ms = uptime() / 1000; // uptime() returns microseconds
 

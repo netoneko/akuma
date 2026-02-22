@@ -424,11 +424,6 @@ int puts(const char *s) {
     return ret >= 0 ? 0 : -1;
 }
 
-void abort(void) {
-    printf("abort() called\n");
-    while(1);
-}
-
 int system(const char *command) {
     (void)command;
     return -1; // Not supported

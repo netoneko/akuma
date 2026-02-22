@@ -14,7 +14,7 @@ pub mod mode_flags {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main() {
     let mut once = false;
     for arg in args().skip(1) {
         if arg == "--once" || arg == "-n" || arg == "1" {

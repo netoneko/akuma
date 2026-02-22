@@ -537,15 +537,17 @@ pub fn list_sockets() -> Vec<SocketStat> {
 // ============================================================================
 
 pub mod libc_errno {
+    pub const ENOENT: i32 = 2;
     pub const EINTR: i32 = 4;
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
     pub const EAGAIN: i32 = 11;
     pub const ENOMEM: i32 = 12;
     pub const EINVAL: i32 = 22;
+    pub const EPIPE: i32 = 32;
+    pub const ERANGE: i32 = 34;
     pub const ENETDOWN: i32 = 100;
+    pub const ECONNABORTED: i32 = 103;
     pub const ETIMEDOUT: i32 = 110;
     pub const ECONNREFUSED: i32 = 111;
-    pub const ECONNABORTED: i32 = 103;
-    pub const EPIPE: i32 = 32;
 }

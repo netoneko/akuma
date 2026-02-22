@@ -81,12 +81,8 @@ fn get_current_thread_register() -> usize {
     // Bounds check - if corrupted, halt immediately
     if tid >= config::MAX_THREADS {
         // Log corruption and halt - we cannot safely continue
-        crate::console::print("[FATAL] TPIDRRO_EL0 CORRUPT: tid=");
-        crate::console::print_hex(val);
-        crate::console::print(" >= MAX_THREADS (");
-        crate::console::print_dec(config::MAX_THREADS);
-        crate::console::print(")\n");
-        crate::console::print("System halted - cannot determine current thread\n");
+        safe_print!(256, "[FATAL] TPIDRRO_EL0 CORRUPT: tid=0x{:x} >= MAX_THREADS ({})\nSystem halted - cannot determine current thread\n", 
+            val, config::MAX_THREADS);
         loop {
             unsafe { core::arch::asm!("wfi"); }
         }
@@ -317,11 +313,7 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
             
             // Safe print without heap allocation
-            crate::console::print("[Cleanup] Thread ");
-            crate::console::print_dec(i);
-            crate::console::print(" recycled after ");
-            crate::console::print_u64(cooldown);
-            crate::console::print("us cooldown\n");
+            safe_print!(128, "[Cleanup] Thread {} recycled after {}us cooldown\n", i, cooldown);
             
             count += 1;
         }
@@ -415,9 +407,7 @@ pub fn check_preemption_watchdog() -> Option<u64> {
         if gap > MAX_EXPECTED_CHECK_GAP_US {
             // Time jumped - host probably slept. Log and reset timestamps.
             // Safe print without heap allocation
-            crate::console::print("[WATCHDOG] Time jump detected: ");
-            crate::console::print_u64(gap / 1000);
-            crate::console::print("ms (host sleep/wake)\n");
+            safe_print!(128, "[WATCHDOG] Time jump detected: {}ms (host sleep/wake)\n", gap / 1000);
             
             // Reset timestamp for this thread to avoid false alarm
             let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
@@ -435,16 +425,13 @@ pub fn check_preemption_watchdog() -> Option<u64> {
     
     let duration = now.saturating_sub(disabled_since);
     
-    if duration >= PREEMPTION_WATCHDOG_PANIC_US {
-        // Critical: been disabled way too long - just log and continue
-        // DO NOT use panic! here - we're in IRQ context
-        crate::console::print("[WATCHDOG] Thread ");
-        crate::console::print_dec(tid);
-        crate::console::print(" preemption disabled ");
-        crate::console::print_u64(duration / 1000);
-        crate::console::print("ms (critical)\n");
-        return Some(duration);
-    } else if duration >= PREEMPTION_WATCHDOG_WARN_US {
+        if duration >= PREEMPTION_WATCHDOG_PANIC_US {
+            // Critical: been disabled way too long - just log and continue
+            // DO NOT use panic! here - we're in IRQ context
+            safe_print!(128, "[WATCHDOG] Thread {} preemption disabled {}ms (critical)\n", tid, duration / 1000);
+            return Some(duration);
+        }
+     else if duration >= PREEMPTION_WATCHDOG_WARN_US {
         // Warning: something is slow
         return Some(duration);
     }
@@ -748,7 +735,7 @@ pub fn setup_fake_irq_frame(
 /// Stub for thread exit - threads should never return here
 #[unsafe(no_mangle)]
 extern "C" fn thread_exit_stub() -> ! {
-    crate::console::print("[THREAD] Exit stub reached - marking terminated\n");
+    safe_print!(128, "[THREAD] Exit stub reached - marking terminated\n");
     mark_current_terminated();
     loop {
         yield_now();
@@ -1281,13 +1268,8 @@ impl ThreadPool {
                 );
                 
                 // Safe print without heap allocation
-                crate::console::print("[spawn_system] tid=");
-                crate::console::print_dec(i);
-                crate::console::print(" stack_top=0x");
-                crate::console::print_hex(stack_top);
-                crate::console::print(" irq_frame_sp=0x");
-                crate::console::print_hex(sp);
-                crate::console::print("\n");
+                safe_print!(256, "[spawn_system] tid={} stack_top=0x{:x} irq_frame_sp=0x{:x}\n",
+                    i, stack_top, sp);
 
                 // Write minimal context - only SP and TTBR0 are needed now
                 // All other registers are on the stack in the fake IRQ frame
@@ -1758,11 +1740,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
     if let Some((old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)) = switch_info {
         if config::ENABLE_SGI_DEBUG_PRINTS {
             // Safe print without heap allocation (critical in IRQ context!)
-            crate::console::print("[SGI] switching ");
-            crate::console::print_dec(old_idx);
-            crate::console::print(" -> ");
-            crate::console::print_dec(new_idx);
-            crate::console::print("\n");
+            safe_print!(128, "[SGI] switching {} -> {}\n", old_idx, new_idx);
         }
         
         unsafe {
@@ -1770,10 +1748,10 @@ pub fn sgi_scheduler_handler(irq: u32) {
             if config::ENABLE_STACK_CANARIES {
                 if !check_stack_canary(old_stack_base) {
                     // Don't allocate in IRQ context!
-                    crate::console::print("[CANARY] old thread stack corrupt\n");
+                    safe_print!(128, "[CANARY] old thread stack corrupt\n");
                 }
                 if !check_stack_canary(new_stack_base) {
-                    crate::console::print("[CANARY] new thread stack corrupt\n");
+                    safe_print!(128, "[CANARY] new thread stack corrupt\n");
                 }
             }
             
@@ -1790,11 +1768,8 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // Check old context - if corrupted, we're already in trouble
             let old_ctx = &*old_ptr;
             if !old_ctx.is_valid() {
-                crate::console::print("[SGI CORRUPT] OLD context magic invalid for thread ");
-                crate::console::print_dec(old_idx);
-                crate::console::print(" - magic=0x");
-                crate::console::print_hex(old_ctx.magic);
-                crate::console::print("\n");
+                safe_print!(256, "[SGI CORRUPT] OLD context magic invalid for thread {} - magic=0x{:x}\n", 
+                    old_idx, old_ctx.magic);
             }
             
             // Check new context - if corrupted, try to recover
@@ -1803,9 +1778,8 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // old_idx's CPU state into new_idx's context slot, causing corruption.
             // We MUST always call switch_context after schedule_indices returns Some.
             if !new_ctx.is_valid() {
-                crate::console::print("[SGI CORRUPT] NEW context magic invalid for thread ");
-                crate::console::print_dec(new_idx);
-                crate::console::print(" - recovering\n");
+                safe_print!(256, "[SGI CORRUPT] NEW context magic invalid for thread {} - recovering\n", new_idx);
+                // Try to recover: reinitialize the context with safe values
                 // Try to recover: reinitialize the context with safe values
                 let ctx = &mut *get_context_mut(new_idx);
                 ctx.magic = CONTEXT_MAGIC;
@@ -1875,20 +1849,11 @@ pub fn sgi_scheduler_handler(irq: u32) {
             if config::ENABLE_SGI_DEBUG_PRINTS {
                 let actual_sp: u64;
                 core::arch::asm!("mov {}, sp", out(reg) actual_sp);
-                let old_sp = (*old_ptr).sp;
                 let new_sp = (*new_ptr).sp;
                 let new_elr = (*new_ptr).elr;
-                let new_spsr = (*new_ptr).spsr;
-                crate::console::print("  SP_now=0x");
-                crate::console::print_hex(actual_sp);
-                crate::console::print(" new_ctx.sp=0x");
-                crate::console::print_hex(new_sp);
-                crate::console::print(" new_ctx.elr=0x");
-                crate::console::print_hex(new_elr);
-                if new_elr == 0 && new_idx != 0 {
-                    crate::console::print(" *** ELR=0 BUG! ***");
-                }
-                crate::console::print("\n");
+                safe_print!(256, "  SP_now=0x{:x} new_ctx.sp=0x{:x} new_ctx.elr=0x{:x}{}\n",
+                    actual_sp, new_sp, new_elr,
+                    if new_elr == 0 && new_idx != 0 { " *** ELR=0 BUG! ***" } else { "" });
             }
             
             switch_context(old_ptr, new_ptr);
@@ -1936,17 +1901,8 @@ pub fn sgi_scheduler_handler(irq: u32) {
                     core::arch::asm!("mov {}, x30", out(reg) current_x30);
                     core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
                 }
-                crate::console::print("[SGI] returned to tid=");
-                crate::console::print_dec(old_idx);
-                crate::console::print(" seq=");
-                crate::console::print_u64(seq);
-                crate::console::print(" SP=0x");
-                crate::console::print_hex(current_sp);
-                crate::console::print(" x30=0x");
-                crate::console::print_hex(current_x30);
-                crate::console::print(" ELR=0x");
-                crate::console::print_hex(current_elr);
-                crate::console::print("\n");
+                safe_print!(512, "[SGI] returned to tid={} seq={} SP=0x{:x} x30=0x{:x} ELR=0x{:x}\n",
+                    old_idx, seq, current_sp, current_x30, current_elr);
             }
             
             // Re-enable IRQs before returning from handler

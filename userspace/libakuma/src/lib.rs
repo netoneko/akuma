@@ -10,6 +10,35 @@ extern crate alloc;
 pub mod net;
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+core::arch::global_asm!(
+    r#"
+    .section .text._start
+    .global _start
+    _start:
+        // sp points to argc, followed by argv pointers
+        mov x0, sp
+        bl libakuma_init
+        bl main
+        // If main returns, exit with 0
+        mov x0, 0
+        bl exit
+    "#
+);
+
+/// Initial stack pointer passed from the kernel
+static INITIAL_SP: AtomicUsize = AtomicUsize::new(0);
+
+/// Initialize libakuma with the stack pointer from the kernel
+#[no_mangle]
+pub unsafe extern "C" fn libakuma_init(sp: usize) {
+    INITIAL_SP.store(sp, Ordering::SeqCst);
+}
+
+extern "C" {
+    fn main();
+}
 
 /// Syscall numbers
 pub mod syscall {
@@ -45,7 +74,14 @@ pub mod syscall {
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
     pub const TIME: u64 = 305;
-    pub const CHDIR: u64 = 306;
+    pub const CHDIR: u64 = 49;
+    pub const GETCWD: u64 = 17;
+    pub const FCNTL: u64 = 25;
+    pub const PIPE2: u64 = 59;
+    pub const FACCESSAT: u64 = 48;
+    pub const NEWFSTATAT: u64 = 79;
+    pub const CLOCK_GETTIME: u64 = 113;
+    pub const FACCESSAT2: u64 = 439;
     // New Terminal Control Syscalls
     pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
     pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
@@ -141,18 +177,10 @@ pub struct ProcessInfo {
     pub pid: u32,
     /// Parent process ID  
     pub ppid: u32,
-    /// Number of command line arguments
-    pub argc: u32,
-    /// Total bytes used in argv_data
-    pub argv_len: u32,
-    /// Length of cwd string (not including null terminator)
-    pub cwd_len: u32,
-    /// Reserved for alignment
-    pub _reserved: u32,
-    /// Current working directory (null-terminated string)
-    pub cwd_data: [u8; CWD_DATA_SIZE],
-    /// Null-separated argument strings
-    pub argv_data: [u8; ARGV_DATA_SIZE],
+    /// Box ID
+    pub box_id: u64,
+    /// Reserved for future fields
+    pub _reserved: [u8; 1008],
 }
 
 /// Get the current process ID
@@ -172,17 +200,22 @@ pub fn getppid() -> u32 {
 }
 
 /// Get the current working directory
-///
-/// Reads from the kernel-provided process info page.
-/// Returns "/" if cwd is not set.
 pub fn getcwd() -> &'static str {
+    static mut CWD_BUF: [u8; 256] = [0u8; 256];
+    let result: i64;
     unsafe {
-        let info = &*(PROCESS_INFO_ADDR as *const ProcessInfo);
-        let len = info.cwd_len as usize;
-        if len == 0 {
-            "/"
+        asm!(
+            "svc #0",
+            in("x8") syscall::GETCWD,
+            in("x0") CWD_BUF.as_mut_ptr(),
+            in("x1") CWD_BUF.len(),
+            lateout("x0") result,
+            options(nostack)
+        );
+        if result > 0 {
+            core::str::from_utf8_unchecked(&CWD_BUF[..result as usize - 1])
         } else {
-            core::str::from_utf8_unchecked(&info.cwd_data[..len])
+            "/"
         }
     }
 }
@@ -192,13 +225,13 @@ pub fn getcwd() -> &'static str {
 /// Updates the process's cwd in the kernel and ProcessInfo page.
 /// Returns 0 on success, negative errno on failure.
 pub fn chdir(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     let result: i64;
     unsafe {
         asm!(
             "svc #0",
             in("x8") syscall::CHDIR,
-            in("x0") path.as_ptr(),
-            in("x1") path.len(),
+            in("x0") path_c.as_ptr(),
             lateout("x0") result,
             options(nostack)
         );
@@ -262,94 +295,131 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 }
 
 // ============================================================================
-// Command Line Arguments
+// Command Line Arguments & Environment
 // ============================================================================
 
 /// Get the number of command line arguments
-///
-/// Returns the argc value set by the kernel.
 #[inline]
 pub fn argc() -> u32 {
-    unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).argc }
+    let sp = INITIAL_SP.load(Ordering::Acquire);
+    if sp == 0 { return 0; }
+    unsafe { *(sp as *const u64) as u32 }
 }
 
 /// Get a command line argument by index
-///
-/// Returns `Some(&str)` if the index is valid, `None` otherwise.
-/// Index 0 is conventionally the program name/path.
 pub fn arg(index: u32) -> Option<&'static str> {
-    let info = unsafe { &*(PROCESS_INFO_ADDR as *const ProcessInfo) };
+    let sp = INITIAL_SP.load(Ordering::Acquire);
+    if sp == 0 { return None; }
     
-    if index >= info.argc {
-        return None;
-    }
-    
-    // Parse through null-separated strings to find the requested index
-    let data = &info.argv_data[..info.argv_len as usize];
-    let mut current_index = 0u32;
-    let mut start = 0;
-    
-    for (i, &byte) in data.iter().enumerate() {
-        if byte == 0 {
-            if current_index == index {
-                // Found the argument
-                return core::str::from_utf8(&data[start..i]).ok();
-            }
-            current_index += 1;
-            start = i + 1;
+    unsafe {
+        let argc = *(sp as *const u64);
+        if index as u64 >= argc { return None; }
+        
+        // argv starts at sp + 8
+        let argv = (sp + 8) as *const *const u8;
+        let arg_ptr = *argv.add(index as usize);
+        if arg_ptr.is_null() { return None; }
+        
+        // Calculate length
+        let mut len = 0;
+        while *arg_ptr.add(len) != 0 {
+            len += 1;
         }
+        
+        core::str::from_utf8(core::slice::from_raw_parts(arg_ptr, len)).ok()
     }
-    
-    None
 }
 
 /// Iterator over command line arguments
 pub struct Args {
-    data: &'static [u8],
-    pos: usize,
-    remaining: u32,
+    current: u32,
+    count: u32,
 }
 
 impl Iterator for Args {
     type Item = &'static str;
     
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 || self.pos >= self.data.len() {
+        if self.current >= self.count {
             return None;
         }
-        
-        // Find the next null terminator
-        let start = self.pos;
-        while self.pos < self.data.len() && self.data[self.pos] != 0 {
-            self.pos += 1;
-        }
-        
-        let arg = core::str::from_utf8(&self.data[start..self.pos]).ok();
-        
-        // Skip past the null terminator
-        if self.pos < self.data.len() {
-            self.pos += 1;
-        }
-        
-        self.remaining -= 1;
-        arg
+        let res = arg(self.current);
+        self.current += 1;
+        res
     }
 }
 
 /// Get an iterator over all command line arguments
-///
-/// Returns an iterator that yields each argument as a `&str`.
 pub fn args() -> Args {
-    let info = unsafe { &*(PROCESS_INFO_ADDR as *const ProcessInfo) };
     Args {
-        data: unsafe { 
-            core::slice::from_raw_parts(
-                info.argv_data.as_ptr(),
-                info.argv_len as usize
-            )
-        },
-        pos: 0,
-        remaining: info.argc,
+        current: 0,
+        count: argc(),
+    }
+}
+
+/// Get an environment variable by name
+pub fn env(name: &str) -> Option<&'static str> {
+    let sp = INITIAL_SP.load(Ordering::Acquire);
+    if sp == 0 { return None; }
+    
+    unsafe {
+        let argc = *(sp as *const usize);
+        // argv is [sp+8 ... sp+8+argc*8], followed by a NULL pointer (8 bytes)
+        // envp starts after that NULL
+        let envp_start = sp + 8 + (argc + 1) * 8;
+        let mut envp = envp_start as *const *const u8;
+        
+        while !(*envp).is_null() {
+            let entry_ptr = *envp;
+            let mut len = 0;
+            while *entry_ptr.add(len) != 0 {
+                len += 1;
+            }
+            
+            if let Ok(entry) = core::str::from_utf8(core::slice::from_raw_parts(entry_ptr, len)) {
+                if let Some((k, v)) = entry.split_once('=') {
+                    if k == name {
+                        return Some(v);
+                    }
+                }
+            }
+            envp = envp.add(1);
+        }
+    }
+    None
+}
+
+/// Iterator over environment variables
+pub struct EnvVars {
+    ptr: *const *const u8,
+}
+
+impl Iterator for EnvVars {
+    type Item = &'static str;
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            if self.ptr.is_null() || (*self.ptr).is_null() { return None; }
+            let entry_ptr = *self.ptr;
+            let mut len = 0;
+            while *entry_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let res = core::str::from_utf8(core::slice::from_raw_parts(entry_ptr, len)).ok();
+            self.ptr = self.ptr.add(1);
+            res
+        }
+    }
+}
+
+/// Get an iterator over all environment variables (strings formatted as "KEY=VALUE")
+pub fn env_all() -> EnvVars {
+    let sp = INITIAL_SP.load(Ordering::Acquire);
+    if sp == 0 { return EnvVars { ptr: core::ptr::null() }; }
+    
+    unsafe {
+        let argc = *(sp as *const usize);
+        let envp_start = sp + 8 + (argc + 1) * 8;
+        EnvVars { ptr: envp_start as *const *const u8 }
     }
 }
 
@@ -379,13 +449,21 @@ pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
 }
 
 /// Exit the program with the given status code
+#[no_mangle]
 #[inline(always)]
-pub fn exit(code: i32) -> ! {
+pub extern "C" fn exit(code: i32) -> ! {
     syscall(syscall::EXIT, code as u64, 0, 0, 0, 0, 0);
     // Should not reach here, but just in case
     loop {
         unsafe { asm!("wfi") };
     }
+}
+
+/// Abort the program
+#[no_mangle]
+pub extern "C" fn abort() -> ! {
+    print("ABORT\n");
+    exit(134); // 128 + SIGABRT(6)
 }
 
 /// Read from a file descriptor
@@ -519,6 +597,26 @@ pub fn uptime() -> u64 {
 #[inline(never)]
 pub fn time() -> u64 {
     syscall(syscall::TIME, 0, 0, 0, 0, 0, 0)
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+pub const CLOCK_REALTIME: u32 = 0;
+pub const CLOCK_MONOTONIC: u32 = 1;
+
+/// Get the time of the specified clock
+pub fn clock_gettime(clock_id: u32, tp: &mut Timespec) -> i32 {
+    syscall(
+        syscall::CLOCK_GETTIME,
+        clock_id as u64,
+        tp as *mut Timespec as u64,
+        0, 0, 0, 0,
+    ) as i32
 }
 
 // ============================================================================
@@ -830,13 +928,14 @@ pub struct Stat {
 ///
 /// Returns file descriptor on success, negative errno on failure.
 pub fn open(path: &str, flags: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::OPENAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
-        path.len() as u64,
+        path_c.as_ptr() as u64,
         flags as u64,
         0o644u64, // mode
+        0,
         0,
     ) as i32
 }
@@ -856,6 +955,60 @@ pub fn fstat(fd: i32) -> Result<Stat, i32> {
     } else {
         Ok(stat)
     }
+}
+
+/// Get file status relative to directory
+pub fn fstatat(dirfd: i32, path: &str, flags: u32) -> Result<Stat, i32> {
+    let mut stat = Stat::default();
+    let ret = syscall(
+        syscall::NEWFSTATAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        &mut stat as *mut _ as u64,
+        flags as u64,
+        0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(stat)
+    }
+}
+
+/// Create a pipe
+pub fn pipe(fds: &mut [i32; 2]) -> i32 {
+    syscall(
+        syscall::PIPE2,
+        fds.as_mut_ptr() as u64,
+        0,
+        0, 0, 0, 0,
+    ) as i32
+}
+
+/// Check file access permissions
+pub fn access(path: &str, mode: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
+    syscall(
+        syscall::FACCESSAT,
+        -100i32 as u64, // AT_FDCWD
+        path_c.as_ptr() as u64,
+        mode as u64,
+        0, 0, 0,
+    ) as i32
+}
+
+/// Check file access permissions relative to directory
+pub fn accessat(dirfd: i32, path: &str, mode: u32, flags: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
+    syscall(
+        syscall::FACCESSAT2,
+        dirfd as u64,
+        path_c.as_ptr() as u64,
+        mode as u64,
+        flags as u64,
+        0, 0,
+    ) as i32
 }
 
 /// Seek in a file
@@ -897,38 +1050,42 @@ pub fn write_fd(fd: i32, buf: &[u8]) -> isize {
 ///
 /// Returns 0 on success, negative errno on failure.
 pub fn mkdir(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::MKDIRAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
-        path.len() as u64,
+        path_c.as_ptr() as u64,
         0o755u64, // mode
+        0,
         0, 0,
     ) as i32
 }
 
 /// Delete a file
 pub fn unlink(path: &str) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
     syscall(
         syscall::UNLINKAT,
         -100i32 as u64, // AT_FDCWD
-        path.as_ptr() as u64,
-        path.len() as u64,
+        path_c.as_ptr() as u64,
         0, // flags
+        0,
         0, 0,
     ) as i32
 }
 
 /// Rename/move a file or directory
 pub fn rename(old_path: &str, new_path: &str) -> i32 {
+    let old_path_c = alloc::format!("{}\0", old_path);
+    let new_path_c = alloc::format!("{}\0", new_path);
     syscall(
         syscall::RENAMEAT,
         -100i32 as u64, // AT_FDCWD
-        old_path.as_ptr() as u64,
-        old_path.len() as u64,
+        old_path_c.as_ptr() as u64,
         -100i32 as u64, // AT_FDCWD
-        new_path.as_ptr() as u64,
-        new_path.len() as u64,
+        new_path_c.as_ptr() as u64,
+        0,
+        0,
     ) as i32
 }
 
@@ -1116,29 +1273,40 @@ pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
 /// If stdin is provided, it will be available to the child process
 /// when reading from stdin (fd 0).
 pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Option<SpawnResult> {
-    // Build null-separated args string
-    let mut args_buf = alloc::vec::Vec::new();
-    if let Some(args_slice) = args {
-        for arg in args_slice {
-            args_buf.extend_from_slice(arg.as_bytes());
-            args_buf.push(0);
+    // 1. Build argv array: [path, args..., NULL]
+    let mut argv = alloc::vec::Vec::new();
+    // Use raw pointers to strings. Strings must stay alive during syscall!
+    // In libakuma::spawn, the caller provides &str which usually live long enough.
+    // However, we need null-terminated strings for the kernel.
+    
+    // For simplicity and safety in this wrapper, we'll convert all to String
+    let path_terminated = alloc::format!("{}\0", path);
+    argv.push(path_terminated.as_ptr());
+    
+    let mut args_terminated = alloc::vec::Vec::new();
+    if let Some(slice) = args {
+        for a in slice {
+            let s = alloc::format!("{}\0", a);
+            args_terminated.push(s);
         }
     }
-
-    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
-    let args_len = args_buf.len();
     
+    for s in &args_terminated {
+        argv.push(s.as_ptr());
+    }
+    argv.push(core::ptr::null());
+
     let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
     let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
 
     let result = syscall(
         syscall::SPAWN,
-        path.as_ptr() as u64,
-        path.len() as u64,
-        args_ptr,
-        args_len as u64,
+        path_terminated.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        0, // NULL envp
         stdin_ptr,
         stdin_len,
+        0,
     );
 
     // Check for error (negative value)

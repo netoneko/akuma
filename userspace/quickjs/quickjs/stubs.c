@@ -17,6 +17,8 @@ extern void akuma_exit(int code);
 
 /* Print function - provided by Rust runtime */
 extern void akuma_print(const char *s, size_t len);
+/* Abort function - provided by libakuma */
+extern void abort(void);
 
 /* Memory functions */
 void *memset(void *s, int c, size_t n) {
@@ -1236,23 +1238,6 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex) {
 
 pthread_t pthread_self(void) {
     return 1;
-}
-
-/* abort and exit */
-void abort(void) {
-    akuma_print("ABORT called!\n", 14);
-    akuma_exit(134); /* 128 + SIGABRT(6) */
-    while(1) {} /* Should not reach here */
-}
-
-void exit(int status) {
-    akuma_exit(status);
-    while(1) {} /* Should not reach here */
-}
-
-void _exit(int status) {
-    akuma_exit(status);
-    while(1) {}
 }
 
 /* assert */

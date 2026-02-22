@@ -306,5 +306,5 @@ fn build_pk_ok_response(algorithm: &[u8], key_blob: &[u8]) -> Vec<u8> {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(256, "{}", msg);
 }

@@ -178,5 +178,5 @@ disable_key_verification = false
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    safe_print!(256, "{}", msg);
 }

@@ -429,7 +429,7 @@ async fn execute_external(
         crate::process::exec_async_cwd(path, args, stdin, cwd).await
     } else {
         // Synchronous fallback for boot-time tests
-        crate::process::exec_with_io_cwd(path, args, stdin, cwd)
+        crate::process::exec_with_io_cwd(path, args, None, stdin, cwd)
     };
 
     match result {
@@ -512,7 +512,7 @@ pub async fn execute_external_interactive(
     use crate::process::spawn_process_with_channel_cwd;
     
     // Spawn process with channel and cwd
-    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, stdin, cwd) {
+    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, None, stdin, cwd) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);
@@ -543,17 +543,19 @@ pub async fn execute_external_interactive(
         // 1. Drain process stdout and write to SSH
         if let Some(data) = channel.try_read() {
             if raw_mode {
+                // Pass through exactly as written by the process (e.g. escape sequences)
                 let _ = channel_stream.write_all(&data).await;
             } else {
-                let mut buf = Vec::new();
+                // Perform CRLF translation for cooked mode
+                let mut translated = Vec::with_capacity(data.len() + 8);
                 for &byte in &data {
                     if byte == b'\n' {
-                        buf.extend_from_slice(b"\r\n");
+                        translated.extend_from_slice(b"\r\n");
                     } else {
-                        buf.push(byte);
+                        translated.push(byte);
                     }
                 }
-                let _ = channel_stream.write_all(&buf).await;
+                let _ = channel_stream.write_all(&translated).await;
             }
             let _ = channel_stream.flush().await;
         }
@@ -565,15 +567,15 @@ pub async fn execute_external_interactive(
                 if raw_mode {
                     let _ = channel_stream.write_all(&data).await;
                 } else {
-                    let mut buf = Vec::new();
+                    let mut translated = Vec::with_capacity(data.len() + 8);
                     for &byte in &data {
                         if byte == b'\n' {
-                            buf.extend_from_slice(b"\r\n");
+                            translated.extend_from_slice(b"\r\n");
                         } else {
-                            buf.push(byte);
+                            translated.push(byte);
                         }
                     }
-                    let _ = channel_stream.write_all(&buf).await;
+                    let _ = channel_stream.write_all(&translated).await;
                 }
             }
             let _ = channel_stream.flush().await;

@@ -8,6 +8,10 @@ use crate::config;
 use crate::terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Flag to bypass pointer validation during kernel-originated syscall tests
+pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -30,23 +34,35 @@ pub mod nr {
     pub const SENDTO: u64 = 206;
     pub const RECVFROM: u64 = 207;
     pub const SHUTDOWN: u64 = 210;
+    pub const CLONE: u64 = 220;
+    pub const EXECVE: u64 = 221;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
+    pub const PPOLL: u64 = 73;       // Linux arm64 ppoll
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
     pub const SET_TID_ADDRESS: u64 = 96;
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGACTION: u64 = 134; // Linux arm64 rt_sigaction
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
+    pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
+    pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
+    pub const PIPE2: u64 = 59;       // Linux arm64 pipe2
+    pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
+    pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
+    pub const CLOCK_GETTIME: u64 = 113; // Linux arm64 clock_gettime
+    pub const FACCESSAT2: u64 = 439;    // Linux arm64 faccessat2
+    pub const WAIT4: u64 = 260;         // Linux arm64 wait4
     // Custom syscalls (300+)
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;      // Spawn a child process, returns (pid, stdout_fd)
     pub const KILL: u64 = 302;       // Kill a process by PID
     pub const WAITPID: u64 = 303;    // Wait for child, returns exit status
     pub const TIME: u64 = 305;        // Get current Unix timestamp (seconds since epoch)
-    pub const CHDIR: u64 = 306;       // Change current working directory
+    pub const CHDIR: u64 = 49;        // Linux arm64 chdir
     // Terminal Syscalls (307-313)
     pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
     pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
@@ -85,6 +101,143 @@ pub struct ThreadCpuStat {
 const EINTR: u64 = (-4i64) as u64;
 /// Error code for no such file or directory
 const ENOENT: u64 = (-2i64) as u64;
+/// Error code for bad address
+const EFAULT: u64 = (-14i64) as u64;
+/// Error code for invalid argument
+const EINVAL: u64 = (-22i64) as u64;
+/// Error code for permission denied
+const EACCES: u64 = (-13i64) as u64;
+/// Error code for function not implemented
+const ENOSYS: u64 = (-38i64) as u64;
+
+/// Validate a user pointer for reading/writing
+/// 
+/// Pointers must be below the userspace limit (0x40000000)
+/// and above the process info page (0x1000).
+fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
+    if ptr < 0x1000 { return false; }
+    let end = match ptr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    if end > 0x4000_0000 { return false; }
+    
+    // CRITICAL: Check if the range is actually mapped in the current page tables
+    if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
+        return false;
+    }
+    
+    true
+}
+
+/// Copy a null-terminated string from userspace
+fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
+    if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+        if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+        if !crate::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
+    }
+    let mut len = 0;
+    while len < max_len {
+        let addr = ptr + len as u64;
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if addr >= 0x4000_0000 { return Err(EFAULT); }
+            // Check mapping every page boundary
+            if addr % 4096 == 0 {
+                if !crate::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
+            }
+        }
+        let c = unsafe { *(addr as *const u8) };
+        if len < 16 {
+            // crate::safe_print!(64, "[syscall] copy_from_user_str: addr={:#x} c={}\n", addr, c as char);
+        }
+        if c == 0 { break; }
+        len += 1;
+    }
+    if len == max_len {
+        let first_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, 16) };
+        crate::safe_print!(128, "[syscall] copy_from_user_str: not null terminated within {} bytes at {:#x}. First 16 bytes: {:?}\n", max_len, ptr, first_bytes);
+        return Err(EINVAL);
+    }
+    
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    match core::str::from_utf8(slice) {
+        Ok(s) => Ok(String::from(s)),
+        Err(_) => {
+            crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+            Err(EINVAL)
+        },
+    }
+}
+
+fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 {
+    if nfds == 0 { return 0; }
+    if !validate_user_ptr(fds_ptr, nfds * 8) { return EFAULT; }
+
+    let infinite = timeout_ptr == 0;
+    let timeout_us = if !infinite {
+        if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
+        let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+        (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
+    } else {
+        0
+    };
+
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        let mut ready_count = 0;
+        unsafe {
+            let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
+            for fd in fds.iter_mut() {
+                fd.revents = 0;
+                
+                // 1. Check for POLLIN (Read)
+                if fd.events & 1 != 0 {
+                    if fd.fd == 0 { // stdin
+                        if let Some(ch) = crate::process::current_channel() {
+                            if ch.has_stdin_data() {
+                                fd.revents |= 1;
+                            }
+                        }
+                    } else if fd.fd > 2 {
+                        // For files, always ready to read if not at EOF (simplified)
+                        fd.revents |= 1;
+                    }
+                }
+
+                // 2. Check for POLLOUT (Write)
+                if fd.events & 4 != 0 {
+                    if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
+                        // stdout, stderr, and files are always ready to write
+                        fd.revents |= 4;
+                    }
+                }
+
+                if fd.revents != 0 {
+                    ready_count += 1;
+                }
+            }
+        }
+
+        if ready_count > 0 {
+            return ready_count as u64;
+        }
+
+        if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
+            return 0;
+        }
+
+        crate::threading::yield_now();
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
 
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
@@ -102,9 +255,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
-        nr::IOCTL => !21, // -22 (ENOTTY / EINVAL)
+        nr::IOCTL => sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
+        nr::PIPE2 => sys_pipe2(args[0], args[1] as u32),
         nr::BRK => sys_brk(args[0] as usize),
-        nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as usize, args[3] as u32, args[4] as u32),
+        nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::CLOSE => sys_close(args[0] as u32),
         nr::LSEEK => sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => sys_fstat(args[0] as u32, args[1]),
@@ -119,18 +273,21 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
+        nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        nr::EXECVE => sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
-        nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
-        nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as usize, args[3] as u32),
-        nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
-        nr::SPAWN => sys_spawn(args[0], args[1] as usize, args[2], args[3] as usize, args[4], args[5] as usize),
+        nr::PPOLL => sys_ppoll(args[0], args[1] as usize, args[2], args[3]),
+        nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
+        nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
+        nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
+        nr::SPAWN => sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
         nr::KILL => sys_kill(args[0] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
-        nr::CHDIR => sys_chdir(args[0], args[1] as usize),
+        nr::CHDIR => sys_chdir(args[0]),
         nr::SET_TERMINAL_ATTRIBUTES => sys_set_terminal_attributes(args[0], args[1], args[2]),
         nr::GET_TERMINAL_ATTRIBUTES => sys_get_terminal_attributes(args[0], args[1]),
         nr::SET_CURSOR_POSITION => sys_set_cursor_position(args[0], args[1]),
@@ -146,6 +303,14 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
         nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
+        nr::RT_SIGACTION => 0,    // Success (do nothing)
+        nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
+        nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
+        nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
+        nr::FACCESSAT => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
+        nr::CLOCK_GETTIME => sys_clock_gettime(args[0] as u32, args[1]),
+        nr::FACCESSAT2 => sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::WAIT4 => sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::SET_TPIDR_EL0 => sys_set_tpidr_el0(args[0]),
         nr::FB_INIT => sys_fb_init(args[0] as u32, args[1] as u32),
         nr::FB_DRAW => sys_fb_draw(args[0], args[1] as usize),
@@ -153,7 +318,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
-            !0 // ENOSYS
+            ENOSYS
         }
     }
 }
@@ -174,7 +339,86 @@ fn sys_exit(code: i32) -> u64 {
     code as u64
 }
 
+fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
+    // Command constants from Linux
+    const TCGETS: u32 = 0x5401;
+    const TCSETS: u32 = 0x5402;
+    const TCSETSW: u32 = 0x5403;
+    const TCSETSF: u32 = 0x5404;
+    const TIOCGWINSZ: u32 = 0x5413;
+
+    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    
+    // We only support terminal ioctls on stdin/stdout for now
+    if fd > 2 {
+        return (-(25i64)) as u64; // ENOTTY
+    }
+
+    match cmd {
+        TCGETS => {
+            if !validate_user_ptr(arg, 36) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
+            unsafe {
+                let ptr = arg as *mut u32;
+                *ptr.add(0) = ts.iflag;
+                *ptr.add(1) = ts.oflag;
+                *ptr.add(2) = ts.cflag;
+                *ptr.add(3) = ts.lflag;
+                
+                let cc_ptr = ptr.add(4) as *mut u8;
+                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), cc_ptr, 20);
+            }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if !validate_user_ptr(arg, 36) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let mut ts = term_state_lock.lock();
+            unsafe {
+                let ptr = arg as *const u32;
+                ts.iflag = *ptr.add(0);
+                ts.oflag = *ptr.add(1);
+                ts.cflag = *ptr.add(2);
+                ts.lflag = *ptr.add(3);
+                
+                let cc_ptr = ptr.add(4) as *const u8;
+                core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
+            }
+
+            // Sync with process channel
+            if let Some(ch) = crate::process::current_channel() {
+                let is_raw = (ts.lflag & mode_flags::ICANON) == 0;
+                ch.set_raw_mode(is_raw);
+                if cmd == TCSETSF {
+                    ch.flush_stdin();
+                }
+            }
+            0
+        }
+        TIOCGWINSZ => {
+            if !validate_user_ptr(arg, 8) { return EFAULT; }
+            unsafe {
+                let ptr = arg as *mut u16;
+                *ptr.add(0) = 25; // rows
+                *ptr.add(1) = 80; // cols
+                *ptr.add(2) = 0;  // xpixel
+                *ptr.add(3) = 0;  // ypixel
+            }
+            0
+        }
+        _ => (-(25i64)) as u64, // ENOTTY
+    }
+}
+
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     match fd {
@@ -224,13 +468,42 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 }
 
 fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
-            if let Some(ch) = crate::process::current_channel() { ch.write(buf); }
+            // Write to process channel (for SSH)
+            if let Some(ch) = crate::process::current_channel() {
+                let term_state_opt = crate::process::current_terminal_state();
+                let translate = if let Some(ts_lock) = term_state_opt {
+                    let ts = ts_lock.lock();
+                    (ts.oflag & mode_flags::ONLCR) != 0
+                } else {
+                    true // Default to translate if no terminal state
+                };
+
+                if translate {
+                    let mut translated = Vec::with_capacity(buf.len() + 8);
+                    for &byte in buf {
+                        if byte == b'\n' {
+                            translated.extend_from_slice(b"\r\n");
+                        } else {
+                            translated.push(byte);
+                        }
+                    }
+                    ch.write(&translated);
+                } else {
+                    ch.write(buf);
+                }
+            }
+            
+            // Also write to procfs/kernel log
+            // Note: This function handles STDOUT_TO_KERNEL_LOG_COPY_ENABLED internally
             proc.write_stdout(buf);
+            
             count as u64
         }
         crate::process::FileDescriptor::File(ref f) => {
@@ -259,17 +532,45 @@ struct IoVec {
 }
 
 fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
     let mut total_written: u64 = 0;
     for i in 0..iov_cnt {
         let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
-        if written == !0u64 {
-            if total_written == 0 { return !0u64; }
+        if (written as i64) < 0 {
+            if total_written == 0 { return written; }
             break;
         }
         total_written += written;
     }
     total_written
+}
+
+fn sys_pipe2(fds_ptr: u64, _flags: u32) -> u64 {
+    if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
+    
+    // Stub implementation using temporary files since we don't have kernel pipes yet.
+    // This allows GNU Make to proceed with subprocess communication.
+    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    
+    // Ensure /tmp exists
+    let _ = crate::fs::create_dir("/tmp");
+    
+    let path_r = "/tmp/pipe_r";
+    let path_w = "/tmp/pipe_w";
+    
+    // Create files if they don't exist
+    let _ = crate::fs::write_file(path_r, &[]);
+    let _ = crate::fs::write_file(path_w, &[]);
+    
+    let fd_r = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_r.into(), 0)));
+    let fd_w = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_w.into(), 1)));
+    
+    unsafe {
+        *(fds_ptr as *mut [i32; 2]) = [fd_r as i32, fd_w as i32];
+    }
+    
+    0
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
@@ -278,18 +579,21 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
-fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u32) -> u64 {
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_openat(_dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
     // Validate path existence
-    if !crate::fs::exists(path) {
+    if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
             return ENOENT;
         }
         
         // For O_CREAT, check if parent directory exists
-        let (parent, _) = crate::vfs::split_path(path);
+        let (parent, _) = crate::vfs::split_path(&path);
         if !parent.is_empty() && !crate::fs::exists(parent) {
             // Special case: parent might be root
             if parent != "/" && !crate::fs::exists(&alloc::format!("/{}", parent)) {
@@ -302,9 +606,9 @@ fn sys_openat(_dirfd: i32, path_ptr: u64, path_len: usize, flags: u32, _mode: u3
         // Handle O_TRUNC: truncate existing file to zero length
         if flags & crate::process::open_flags::O_TRUNC != 0 {
             // Only truncate if file exists; ignore errors (file might not exist yet with O_CREAT)
-            let _ = crate::fs::write_file(path, &[]);
+            let _ = crate::fs::write_file(&path, &[]);
         }
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.into(), flags)));
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path, flags)));
         fd as u64
     } else { !0u64 }
 }
@@ -343,6 +647,7 @@ fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 #[repr(C)] #[derive(Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
 
 fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
         if let Ok(meta) = crate::vfs::metadata(&f.path) {
@@ -354,23 +659,295 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     !0u64
 }
 
-fn sys_mkdirat(_dirfd: i32, path_ptr: u64, path_len: usize, _mode: u32) -> u64 {
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+    
+    // Resolve path.
+    // Logic:
+    // 1. If path is absolute, use it directly.
+    // 2. If path is relative:
+    //    a. If dirfd is AT_FDCWD (-100), relative to process CWD.
+    //    b. If dirfd is a valid FD, relative to that FD's path.
+    //    c. Otherwise error.
+
+    let resolved_path = if path.starts_with('/') {
+         String::from(&path)
+    } else {
+        let base_path = if dirfd == -100 { // AT_FDCWD
+             if let Some(proc) = crate::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64; // EBADF
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = crate::process::current_process() {
+                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     // Check if it is a directory? For now assume yes if used as dirfd.
+                     f.path.clone()
+                 } else {
+                     return !0u64; // EBADF
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64; // EBADF
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+    
+    if let Ok(meta) = crate::vfs::metadata(&resolved_path) {
+        let stat = Stat { 
+            st_size: meta.size as i64, 
+            st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, 
+            ..Default::default() 
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+    
+    ENOENT
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn sys_clock_gettime(clock_id: u32, tp_ptr: u64) -> u64 {
+    if !validate_user_ptr(tp_ptr, core::mem::size_of::<Timespec>()) { return EFAULT; }
+    
+    // clock_id: 0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC
+    let (sec, nsec) = match clock_id {
+        0 => {
+            let us = crate::timer::utc_time_us().unwrap_or(0);
+            ((us / 1_000_000) as i64, ((us % 1_000_000) * 1_000) as i64)
+        }
+        1 | _ => {
+            let us = crate::timer::uptime_us();
+            ((us / 1_000_000) as i64, ((us % 1_000_000) * 1_000) as i64)
+        }
+    };
+    
+    unsafe {
+        *(tp_ptr as *mut Timespec) = Timespec { tv_sec: sec, tv_nsec: nsec };
+    }
+    0
+}
+
+fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let resolved_path = if path.starts_with('/') {
+         path
+    } else {
+        let base_path = if dirfd == -100 { // AT_FDCWD
+             if let Some(proc) = crate::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64; // EBADF
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = crate::process::current_process() {
+                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     f.path.clone()
+                 } else {
+                     return !0u64; // EBADF
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64; // EBADF
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+    
+    if crate::fs::exists(&resolved_path) {
+        0
+    } else {
+        ENOENT
+    }
+}
+
+fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
+    // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
+    // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
+    if flags & 0x4000 != 0 {
+        // Return child PID (fake success)
+        // We handle the actual spawning in sys_execve
+        return 0x7FFFFFFF; 
+    }
+    ENOSYS
+}
+
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::safe_print!(64, "[syscall] execve: path copy failed with {}\n", e as i64);
+            return e;
+        },
+    };
+    
+    // Resolve path
+    let resolved_path = if path.starts_with('/') {
+        path
+    } else {
+        if let Some(proc) = crate::process::current_process() {
+            crate::vfs::resolve_path(&proc.cwd, &path)
+        } else {
+            path
+        }
+    };
+
+    // Parse argv
+    let mut args = Vec::new();
+    if argv_ptr != 0 {
+        let mut i = 0;
+        loop {
+            if !validate_user_ptr(argv_ptr + i * 8, 8) { break; }
+            let str_ptr = unsafe { *((argv_ptr + i * 8) as *const u64) };
+            if str_ptr == 0 { break; }
+            if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
+                args.push(s);
+            } else {
+                crate::safe_print!(64, "[syscall] execve: failed to copy argv[{}]\n", i);
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    // Parse envp
+    let mut env = Vec::new();
+    if envp_ptr != 0 {
+        let mut i = 0;
+        loop {
+            if !validate_user_ptr(envp_ptr + i * 8, 8) { break; }
+            let str_ptr = unsafe { *((envp_ptr + i * 8) as *const u64) };
+            if str_ptr == 0 { break; }
+            if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
+                env.push(s);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    let args_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+    let cwd = crate::process::current_process().map(|p| p.cwd.clone());
+
+    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), Some(&env), None, cwd.as_deref()) {
+        Ok((_tid, ch, pid)) => {
+            crate::process::register_child_channel(pid, ch);
+            pid as u64
+        }
+        Err(e) => {
+            crate::safe_print!(128, "[syscall] execve: spawn failed for {}: {}\n", resolved_path, e);
+            ENOENT
+        },
+    }
+}
+
+fn sys_wait4(pid: i32, status_ptr: u64, _options: i32, _rusage: u64) -> u64 {
+    // If pid is -1, wait for any child.
+    // If pid is 0x7FFFFFFF, it's our fake child PID from sys_clone.
+    let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
+        // Find any child channel that has exited
+        None // TODO: implement wait for ANY
+    } else if pid > 0 {
+        Some(pid as u32)
+    } else {
+        None
+    };
+
+    if let Some(p) = target_pid {
+        if let Some(ch) = crate::process::get_child_channel(p) {
+            loop {
+                if ch.has_exited() {
+                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                        unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; }
+                    }
+                    return p as u64;
+                }
+                crate::threading::yield_now();
+            }
+        }
+    }
+    
+    // Fallback if no child found (ECHILD)
+    0
+}
+
+fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
+    if let Some(proc) = crate::process::current_process() {
+        let cwd_bytes = proc.cwd.as_bytes();
+        // Check if buffer is large enough (including null terminator)
+        if cwd_bytes.len() + 1 > size {
+            return (-libc_errno::ERANGE as i64) as u64;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf_ptr as *mut u8, cwd_bytes.len());
+            *(buf_ptr as *mut u8).add(cwd_bytes.len()) = 0; // Null terminate
+        }
+        // Return length including null terminator
+        return (cwd_bytes.len() + 1) as u64;
+    }
+    ENOENT
+}
+
+fn sys_fcntl(fd: u32, cmd: u32, _arg: u64) -> u64 {
+    // Basic fcntl stub
+    // F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4
+    match cmd {
+        1 => 0, // F_GETFD: Return 0 (no FD_CLOEXEC set by default)
+        2 => 0, // F_SETFD: Pretend to set flags
+        3 => 0, // F_GETFL: Return 0 (O_RDONLY/default flags)
+        4 => 0, // F_SETFL: Pretend to set flags
+        _ => 0, // Ignore other commands
+    }
+}
+
+fn sys_mkdirat(_dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] mkdirat: {}\n", path);
-    if crate::fs::create_dir(path).is_ok() { 0 } else { !0u64 }
+    if crate::fs::create_dir(&path).is_ok() { 0 } else { !0u64 }
 }
 
-fn sys_unlinkat(_dirfd: i32, path_ptr: u64, path_len: usize, _flags: u32) -> u64 {
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
+fn sys_unlinkat(_dirfd: i32, path_ptr: u64, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] unlinkat: {}\n", path);
-    if crate::fs::remove_file(path).is_ok() { 0 } else { !0u64 }
+    if crate::fs::remove_file(&path).is_ok() { 0 } else { !0u64 }
 }
 
-fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, oldpath_len: usize, _newdirfd: i32, newpath_ptr: u64, newpath_len: usize) -> u64 {
-    let oldpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(oldpath_ptr as *const u8, oldpath_len)).unwrap_or("") };
-    let newpath = unsafe { core::str::from_utf8(core::slice::from_raw_parts(newpath_ptr as *const u8, newpath_len)).unwrap_or("") };
+fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64) -> u64 {
+    let oldpath = match copy_from_user_str(oldpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let newpath = match copy_from_user_str(newpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     crate::safe_print!(128, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
-    if crate::fs::rename(oldpath, newpath).is_ok() { 0 } else { !0u64 }
+    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
@@ -395,6 +972,7 @@ fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
 
 fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
+    if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
     if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_bind(idx, addr).is_ok() { return 0; } }
     !0u64
@@ -405,7 +983,9 @@ fn sys_listen(fd: u32, backlog: i32) -> u64 {
     !0u64
 }
 
-fn sys_accept(fd: u32, addr_ptr: u64, _len_ptr: u64) -> u64 {
+fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
+    if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
             if let Some(proc) = crate::process::current_process() {
@@ -419,12 +999,14 @@ fn sys_accept(fd: u32, addr_ptr: u64, _len_ptr: u64) -> u64 {
 
 fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
+    if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
     if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_connect(idx, addr).is_ok() { return 0; } }
     !0u64
 }
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -437,6 +1019,7 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
 }
 
 fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+    if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -489,6 +1072,8 @@ fn sys_munmap(addr: usize, _len: usize) -> u64 {
 }
 
 fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
+    if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
+    if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
     let name = unsafe { core::str::from_utf8(core::slice::from_raw_parts(name_ptr as *const u8, name_len)).unwrap_or("unknown") };
     let root = unsafe { core::str::from_utf8(core::slice::from_raw_parts(root_ptr as *const u8, root_len)).unwrap_or("/") };
     let creator_pid = crate::process::read_current_pid().unwrap_or(0);
@@ -506,6 +1091,8 @@ fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root
 fn sys_uptime() -> u64 { crate::timer::uptime_us() }
 
 fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if !validate_user_ptr(res_ptr, 4) { return EFAULT; }
     let host = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     match crate::dns::resolve_host_blocking(host) {
         Ok(ipv4) => {
@@ -517,6 +1104,7 @@ fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
 }
 
 fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(ptr, size) { return EFAULT; }
     if let Some(proc) = crate::process::current_process() {
         if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
             if let Ok(entries) = crate::fs::list_dir(&f.path) {
@@ -557,33 +1145,54 @@ pub struct SpawnOptions {
     pub box_id: u64,
 }
 
-/// Helper to parse null-separated strings from userspace into a Vec<&str>
-fn parse_args(ptr: u64, len: usize) -> Vec<String> {
-    if ptr == 0 || len == 0 { return Vec::new(); }
-    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+/// Helper to parse a NULL-terminated array of string pointers (char** argv)
+fn parse_argv_array(ptr: u64) -> Vec<String> {
+    if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
-    let mut start = 0;
-    for i in 0..len {
-        if slice[i] == 0 {
-            if let Ok(s) = core::str::from_utf8(&slice[start..i]) {
-                args.push(String::from(s));
-            }
-            start = i + 1;
+    let mut i = 0;
+    loop {
+        // Read pointer from the array
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if !validate_user_ptr(ptr + i * 8, 8) { break; }
         }
+        let str_ptr = unsafe { *((ptr + i * 8) as *const u64) };
+        if str_ptr == 0 { break; }
+        
+        // Copy string from the pointer
+        match copy_from_user_str(str_ptr, 1024) {
+            Ok(s) => args.push(s),
+            Err(_) => break,
+        }
+        i += 1;
     }
     args
 }
 
-fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, stdin_ptr: u64, stdin_len: usize) -> u64 {
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    let stdin = if stdin_ptr != 0 { Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) }) } else { None };
+fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, _a5: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
-    // Parse arguments
-    let args_vec = parse_args(args_ptr, args_len);
-    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
-    let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
+    let args_vec = parse_argv_array(argv_ptr);
+    let env_vec = parse_argv_array(envp_ptr);
+    
+    let args_refs: Vec<&str> = if args_vec.len() > 1 {
+        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+    } else {
+        Vec::new()
+    };
+    
+    let stdin = if stdin_ptr != 0 {
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            if !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
+        }
+        Some(unsafe { core::slice::from_raw_parts(stdin_ptr as *const u8, stdin_len) })
+    } else {
+        None
+    };
 
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel(path, args_opt, stdin) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
@@ -593,6 +1202,9 @@ fn sys_spawn(path_ptr: u64, path_len: usize, args_ptr: u64, args_len: usize, std
 }
 
 fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
+    if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
+    
     let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
     
     let options = if options_ptr != 0 {
@@ -616,8 +1228,12 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
         None
     };
 
-    let args_vec = parse_args(o.args_ptr, o.args_len);
-    let args_refs: Vec<&str> = args_vec.iter().map(|s: &String| s.as_str()).collect();
+    let args_vec = parse_argv_array(o.args_ptr);
+    let args_refs: Vec<&str> = if args_vec.len() > 1 {
+        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+    } else {
+        args_vec.iter().map(|s| s.as_str()).collect()
+    };
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin = if o.stdin_ptr != 0 {
@@ -627,7 +1243,7 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
     };
 
     // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, stdin, cwd, root_dir, o.box_id) {
+    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
         crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
@@ -661,7 +1277,7 @@ fn sys_reattach(pid: u32) -> u64 {
 
 
 fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
-
+    if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
@@ -673,6 +1289,7 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 }
 
 fn sys_getrandom(ptr: u64, len: usize) -> u64 {
+    if !validate_user_ptr(ptr, len) { return EFAULT; }
     let mut buf = alloc::vec![0u8; len.min(256)];
     if crate::rng::fill_bytes(&mut buf).is_ok() { unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()); } return buf.len() as u64; }
     !0u64
@@ -680,12 +1297,15 @@ fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
 
-fn sys_chdir(ptr: u64, len: usize) -> u64 {
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)).unwrap_or("") };
+fn sys_chdir(ptr: u64) -> u64 {
+    let path = match copy_from_user_str(ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     
     if let Some(proc) = crate::process::current_process() {
         // Resolve path relative to current CWD
-        let new_cwd = crate::vfs::resolve_path(&proc.cwd, path);
+        let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
         
         // Validate that the directory exists
         if crate::fs::exists(&new_cwd) {
@@ -722,16 +1342,26 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
     let mut term_state = term_state_lock.lock();
     term_state.mode_flags = mode_flags_arg;
 
+    // Standard Linux-style flags for compatibility
+    if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
+        term_state.iflag &= !(0x00000100 | 0x00000040); // IGNBRK | ICRNL
+        term_state.oflag &= !mode_flags::OPOST;
+        term_state.lflag &= !(mode_flags::ECHO | mode_flags::ICANON);
+    } else if (mode_flags_arg & mode_flags::RAW_MODE_DISABLE) != 0 {
+        term_state.oflag |= mode_flags::OPOST | mode_flags::ONLCR;
+        term_state.lflag |= mode_flags::ECHO | mode_flags::ICANON;
+    }
+
     // Propagate raw mode setting to the ProcessChannel
     let proc_channel = match crate::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
-    proc_channel.set_raw_mode((mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0);
+    proc_channel.set_raw_mode((term_state.lflag & mode_flags::ICANON) == 0);
 
-    if config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n",
-            fd, action, mode_flags_arg, term_state.mode_flags);
+    // Handle action: TCSAFLUSH (2) flushes input
+    if action == 2 {
+        proc_channel.flush_stdin();
     }
 
     0
@@ -742,6 +1372,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
         return (-libc_errno::EINVAL as i64) as u64;
     }
+    if !validate_user_ptr(attr_ptr, 8) { return EFAULT; }
 
     let term_state_lock = match crate::process::current_terminal_state() {
         Some(state) => state,
@@ -752,11 +1383,6 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
 
     unsafe {
         *(attr_ptr as *mut u64) = term_state.mode_flags;
-    }
-
-    if config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n",
-            fd, attr_ptr, term_state.mode_flags);
     }
 
     0
@@ -802,6 +1428,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
         return (-libc_errno::EINVAL as i64) as u64;
     }
+    if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
     if config::SYSCALL_DEBUG_INFO_ENABLED && timeout_us > 0 && timeout_us != u64::MAX {
         // Only print for non-infinite timeouts to avoid noise
@@ -882,6 +1509,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
 }
 
 fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
+    if !validate_user_ptr(ptr, max * core::mem::size_of::<ThreadCpuStat>()) { return EFAULT; }
     let count = max.min(config::MAX_THREADS);
     for i in 0..count {
         let mut stat = ThreadCpuStat {
