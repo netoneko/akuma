@@ -84,7 +84,16 @@ pub mod nr {
     pub const FB_INFO: u64 = 323;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
+    pub const GETUID: u64 = 174;
     pub const GETEUID: u64 = 175;
+    pub const GETGID: u64 = 176;
+    pub const GETEGID: u64 = 177;
+    pub const GETTID: u64 = 178;
+    // Linux standard numbers
+    pub const KILL_LINUX: u64 = 129;
+    pub const SETPGID: u64 = 154;
+    pub const GETPGID: u64 = 155;
+    pub const SETSID: u64 = 157;
 }
 
 /// Thread CPU statistics for top command
@@ -286,7 +295,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
         nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::SPAWN => sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
-        nr::KILL => sys_kill(args[0] as u32),
+        nr::KILL => sys_kill(args[0] as u32, args[1] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
@@ -320,7 +329,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FB_INFO => sys_fb_info(args[0]),
         nr::GETPID => sys_getpid(),
         nr::GETPPID => sys_getppid(),
+        nr::GETUID => 0,
         nr::GETEUID => sys_geteuid(),
+        nr::GETGID => 0,
+        nr::GETEGID => 0,
+        nr::GETTID => crate::threading::current_thread_id() as u64,
+        nr::KILL_LINUX => sys_kill(args[0] as u32, args[1] as u32),
+        nr::SETPGID => sys_setpgid(args[0] as u32, args[1] as u32),
+        nr::GETPGID => sys_getpgid(args[0] as u32),
+        nr::SETSID => sys_setsid(),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -334,6 +351,18 @@ fn sys_set_tpidr_el0(address: u64) -> u64 {
         core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) address);
     }
     0
+}
+
+fn sys_setpgid(_pid: u32, _pgid: u32) -> u64 {
+    0 // Success stub
+}
+
+fn sys_getpgid(_pid: u32) -> u64 {
+    1 // Return dummy foreground pgrp
+}
+
+fn sys_setsid() -> u64 {
+    1 // Return dummy SID
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -352,6 +381,12 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCSETSW: u32 = 0x5403;
     const TCSETSF: u32 = 0x5404;
     const TIOCGWINSZ: u32 = 0x5413;
+    const TIOCGPGRP: u32 = 0x540f;
+    const TIOCSPGRP: u32 = 0x5410;
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
+    }
 
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     
@@ -360,7 +395,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         return (-(25i64)) as u64; // ENOTTY
     }
 
-    match cmd {
+    let result = match cmd {
         TCGETS => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
             let term_state_lock = match crate::process::current_terminal_state() {
@@ -419,14 +454,35 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             0
         }
+        TIOCGPGRP => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            unsafe {
+                *(arg as *mut u32) = 1; // Dummy foreground pgrp
+            }
+            0
+        }
+        TIOCSPGRP => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            0
+        }
         _ => (-(25i64)) as u64, // ENOTTY
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ioctl result={}\n", result as i64);
     }
+    result
 }
 
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
+        crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
+    }
+
     match fd {
         crate::process::FileDescriptor::Stdin => {
             let ch = match crate::process::current_channel() {
@@ -436,6 +492,9 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     let mut temp = alloc::vec![0u8; count];
                     let n = proc.read_stdin(&mut temp);
                     if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
+                    }
                     return n as u64;
                 }
             };
@@ -448,11 +507,17 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
                     unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes\n", n);
+                    }
                     return n as u64;
                 }
 
                 // Check for EOF if channel is closed
                 if ch.is_stdin_closed() {
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) returned 0 (EOF)\n");
+                    }
                     return 0; // EOF
                 }
 
@@ -464,7 +529,12 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // Register waker and block
                 let term_state_lock = match crate::process::current_terminal_state() {
                     Some(state) => state,
-                    None => return 0, // EOF fallback
+                    None => {
+                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                            crate::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
+                        }
+                        return 0;
+                    }
                 };
 
                 {
@@ -1311,8 +1381,9 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
     !0u64
 }
 
-fn sys_kill(pid: u32) -> u64 {
+fn sys_kill(pid: u32, _sig: u32) -> u64 {
     // Safety: prevent killing init or Box 0 implicitly if we add box killing logic here
+    if pid == 0 { return 0; } // Success for process group 0 (stub)
     if pid <= 1 { return !0u64; }
     if crate::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
 }
