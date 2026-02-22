@@ -72,9 +72,7 @@ BINARIES=(
     "paws"
     "tcc"
     "tar"
-    "make"
     "sshd"
-    "dash"
 )
 
 for bin in "${BINARIES[@]}"; do
@@ -96,10 +94,10 @@ done
 # Copy hello world example
 cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
 
-# Link sh to paws
-PAWS_BIN="../bootstrap/bin/paws"
-if [ -f "$PAWS_BIN" ]; then
-    cp "$PAWS_BIN" "../bootstrap/bin/sh"
+# Link sh to dash
+DASH_BIN="../bootstrap/bin/dash"
+if [ -f "$DASH_BIN" ]; then
+    cp "$DASH_BIN" "../bootstrap/bin/sh"
 fi
 
 echo "Build process completed."

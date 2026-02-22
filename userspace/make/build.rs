@@ -1,14 +1,14 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let vendor_dir = manifest_dir.join("vendor");
     let make_src_dir = vendor_dir.join("make-4.4");
     let target_bin_dir = manifest_dir.join("../../bootstrap/bin");
+    let gmake_path = "/opt/homebrew/opt/make/libexec/gnubin/make";
 
     // Ensure vendor directory exists
     if !vendor_dir.exists() {
@@ -20,18 +20,13 @@ fn main() {
     if !tarball_path.exists() {
         println!("cargo:warning=Downloading make-4.4.tar.gz using curl...");
         let status = Command::new("curl")
-            .arg("-L") // Follow redirects
+            .arg("-L")
             .arg("https://ftp.gnu.org/gnu/make/make-4.4.tar.gz")
-            .arg("-o") // Output to file
+            .arg("-o")
             .arg(&tarball_path)
             .status()
-            .expect("Failed to execute curl. Is it installed?");
-
-        if !status.success() {
-            panic!("Failed to download make-4.4.tar.gz");
-        }
-    } else {
-        println!("cargo:warning=make-4.4.tar.gz already exists, skipping download.");
+            .expect("Failed to execute curl");
+        if !status.success() { panic!("Failed to download make"); }
     }
 
     // 2. Extract the tarball
@@ -43,36 +38,34 @@ fn main() {
             .arg("-C")
             .arg(&vendor_dir)
             .status()
-            .expect("Failed to execute tar. Is it installed?");
-
-        if !status.success() {
-            panic!("Failed to extract make-4.4.tar.gz");
-        }
-    } else {
-        println!("cargo:warning=make-4.4 directory already exists, skipping extraction.");
+            .expect("Failed to execute tar");
+        if !status.success() { panic!("Failed to extract make"); }
     }
 
     // 3. Configure
     println!("cargo:warning=Configuring make...");
+    let ldflags = "-static -Wl,--entry=_start";
     let status = Command::new("./configure")
         .current_dir(&make_src_dir)
         .env("CC", "aarch64-linux-musl-gcc")
-        .env("LDFLAGS", "-static") // Moved LDFLAGS here as per user instruction
+        .env("LDFLAGS", ldflags)
         .arg("--host=aarch64-linux-musl")
         .status()
-        .expect("Failed to execute configure. Check if aarch64-linux-musl-gcc is in PATH.");
+        .expect("Failed to execute configure");
 
     if !status.success() {
         panic!("Failed to configure make.");
     }
 
-    // 4. Compile
+    // 4. Compile with GNU Make if available
     println!("cargo:warning=Compiling make...");
-    let status = Command::new("make")
+    let make_cmd = if PathBuf::from(gmake_path).exists() { gmake_path } else { "make" };
+    let status = Command::new(make_cmd)
         .current_dir(&make_src_dir)
-        // LDFLAGS="-static" moved to configure step
+        .arg("V=1")
+        .arg(format!("LDFLAGS={}", ldflags))
         .status()
-        .expect("Failed to execute make. Is make installed?");
+        .expect("Failed to execute make");
 
     if !status.success() {
         panic!("Failed to compile make.");
@@ -86,10 +79,9 @@ fn main() {
         fs::create_dir_all(&target_bin_dir).unwrap();
     }
 
-    println!("cargo:warning=Copying make binary to {}...", final_make_path.display());
     fs::copy(&compiled_make_path, &final_make_path)
         .expect(&format!("Failed to copy {} to {}", compiled_make_path.display(), final_make_path.display()));
 
     println!("cargo:warning=Successfully built and installed make to {}", final_make_path.display());
-    println!("cargo:rerun-if-changed=build.rs"); // Rerun build if build script changes
+    println!("cargo:rerun-if-changed=build.rs");
 }
