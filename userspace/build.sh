@@ -28,7 +28,7 @@ MEMBERS=(
     "tar"
     "make"
     "sshd"
-    "crash_test"
+    "dash"
 )
 
 for member in "${MEMBERS[@]}"; do
