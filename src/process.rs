@@ -162,10 +162,6 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
         return write_to_process_stdin(target_pid, data);
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Writing {} bytes to PID {} ({}) stdin\n", data.len(), pid, proc.name);
-    }
-
     // 1. Write to the legacy StdioBuffer (for procfs visibility)
     proc.stdin.lock().write_with_limit(data, crate::config::PROC_STDIN_MAX_SIZE);
     

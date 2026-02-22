@@ -537,9 +537,6 @@ pub async fn execute_external_interactive(
 
         // 1. Drain process stdout and write to SSH
         if let Some(data) = channel.try_read() {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[Shell] Read {} bytes from process output\n", data.len());
-            }
             if channel.is_raw_mode() {
                 // Pass through exactly as written by the process (e.g. escape sequences)
                 let _ = channel_stream.write_all(&data).await;

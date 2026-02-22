@@ -179,10 +179,6 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
         0
     };
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] ppoll(nfds={}, timeout_us={}{})\n", nfds, timeout_us, if infinite { " [INF]" } else { "" });
-    }
-
     let start_time = crate::timer::uptime_us();
 
     loop {
@@ -221,16 +217,10 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
         }
 
         if ready_count > 0 {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] ppoll -> ready_count={}\n", ready_count);
-            }
             return ready_count as u64;
         }
 
         if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] ppoll -> timeout\n");
-            }
             return 0;
         }
 
@@ -354,14 +344,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     
     // We only support terminal ioctls on stdin/stdout for now
     if fd > 2 {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd={:#x}, arg={:#x}) -> ENOTTY\n", fd, cmd, arg);
-        }
         return (-(25i64)) as u64; // ENOTTY
-    }
-
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd={:#x}, arg={:#x})\n", fd, cmd, arg);
     }
 
     match cmd {
@@ -482,11 +465,6 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        // Log the entire buffer for debugging neatvi output issues
-        crate::safe_print!(1024, "[syscall] write(fd={}, len={}) full_data={:?}\n", fd_num, count, buf);
-    }
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
@@ -1379,11 +1357,6 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
         proc_channel.flush_stdin();
     }
 
-    if config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] sys_set_terminal_attributes: fd={}, action={}, mode_flags_arg={} -> new_flags={}\n",
-            fd, action, mode_flags_arg, term_state.mode_flags);
-    }
-
     0
 }
 
@@ -1403,11 +1376,6 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
 
     unsafe {
         *(attr_ptr as *mut u64) = term_state.mode_flags;
-    }
-
-    if config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] sys_get_terminal_attributes: fd={}, attr_ptr={} -> flags={}\n",
-            fd, attr_ptr, term_state.mode_flags);
     }
 
     0
