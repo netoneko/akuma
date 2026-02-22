@@ -65,7 +65,6 @@ BINARIES=(
     "quickjs"
     "scratch"
     "herd"
-    "chainlink"
     "termtest"
     "allocstress"
     "top"
@@ -73,8 +72,9 @@ BINARIES=(
     "paws"
     "tcc"
     "tar"
+    "make"
     "sshd"
-    "crash_test"
+    "dash"
 )
 
 for bin in "${BINARIES[@]}"; do

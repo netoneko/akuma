@@ -86,14 +86,24 @@ fn main() {
     let compiled_dash_path = dash_src_dir.join("src").join("dash");
     let final_dash_path = target_bin_dir.join("dash");
 
+    // Ensure target directory exists
     if !target_bin_dir.exists() {
-        fs::create_dir_all(&target_bin_dir).unwrap();
+        println!("cargo:warning=Creating target directory: {}...", target_bin_dir.display());
+        fs::create_dir_all(&target_bin_dir).expect(&format!("Failed to create directory: {}", target_bin_dir.display()));
     }
 
-    println!("cargo:warning=Copying dash binary to {}...", final_dash_path.display());
-    fs::copy(&compiled_dash_path, &final_dash_path)
-        .expect(&format!("Failed to copy {} to {}", compiled_dash_path.display(), final_dash_path.display()));
+    // Verify source file exists before copying
+    if !compiled_dash_path.exists() {
+        panic!("Compiled dash binary NOT FOUND at expected location: {}", compiled_dash_path.display());
+    } else {
+        println!("cargo:warning=Compiled dash binary FOUND at: {}", compiled_dash_path.display());
+    }
 
-    println!("cargo:warning=Successfully built and installed dash to {}", final_dash_path.display());
+    println!("cargo:warning=Attempting to copy from {} to {}...", compiled_dash_path.display(), final_dash_path.display());
+    match fs::copy(&compiled_dash_path, &final_dash_path) {
+        Ok(_) => println!("cargo:warning=Successfully copied dash binary to {}", final_dash_path.display()),
+        Err(e) => panic!("Failed to copy dash binary from {} to {}: {}", compiled_dash_path.display(), final_dash_path.display(), e),
+    }
+
     println!("cargo:rerun-if-changed=build.rs"); // Rerun build if build script changes
 }
