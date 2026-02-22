@@ -58,6 +58,11 @@ fn main() {
         .env("CC", "aarch64-linux-musl-gcc")
         .env("LDFLAGS", "-static") // Moved LDFLAGS here as per user instruction
         .arg("--host=aarch64-linux-musl")
+        .arg("--enable-static")
+        .arg("--disable-glob")
+        .arg("--disable-test-workaround")
+        .arg("--disable-lineno")
+        .arg("--without-libedit")
         .status()
         .expect("Failed to execute configure. Check if aarch64-linux-musl-gcc is in PATH.");
 
@@ -78,8 +83,8 @@ fn main() {
     }
 
     // 5. Copy the compiled binary to bootstrap/bin
-    let compiled_dash_path = dash_src_dir.join("dash");
-    let final_dash_path = target_bin_dir.join("make");
+    let compiled_dash_path = dash_src_dir.join("src").join("dash");
+    let final_dash_path = target_bin_dir.join("dash");
 
     if !target_bin_dir.exists() {
         fs::create_dir_all(&target_bin_dir).unwrap();
