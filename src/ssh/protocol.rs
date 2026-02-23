@@ -857,6 +857,7 @@ async fn run_shell_session(
 
     // Create shared terminal state for this session
     let terminal_state = Arc::new(Spinlock::new(terminal::TerminalState::default()));
+    log(&format!("[SSH] Created shared terminal state at {:p}\n", Arc::as_ptr(&terminal_state)));
 
     // Register the channel and terminal state for this system thread so syscalls can find them
     let tid = crate::threading::current_thread_id();
@@ -869,8 +870,6 @@ async fn run_shell_session(
         log(&format!("[SSH] Spawning external shell: {}\n", shell_path));
         // Use kernel spawn function directly
         if let Ok((_tid, proc_channel, pid)) = crate::process::spawn_process_with_channel(&shell_path, None, None) {
-            // Set the spawned shell as the foreground process group
-            terminal_state.lock().foreground_pgid = pid;
             return bridge_process(stream, session, pid, proc_channel).await;
         }
         log(&format!("[SSH] Failed to spawn external shell {}, falling back to built-in\n", shell_path));

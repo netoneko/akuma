@@ -1984,7 +1984,19 @@ pub fn spawn_process_with_channel_ext(
 
     // Inherit terminal state from caller if available
     if let Some(shared_state) = get_terminal_state(crate::threading::current_thread_id()) {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[Process] Inheriting shared terminal state at {:p} for PID {}\n", Arc::as_ptr(&shared_state), process.pid);
+        }
         process.terminal_state = shared_state;
+        
+        // Auto-delegate foreground to the new process.
+        // For interactive spawns, the child should start in the foreground.
+        let pid_to_delegate = process.pid;
+        process.terminal_state.lock().foreground_pgid = pid_to_delegate;
+    } else {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[Process] NO shared terminal state found for caller thread {}, using default for PID {}\n", crate::threading::current_thread_id(), process.pid);
+        }
     }
 
     // Save arguments in process struct for ProcessInfo page

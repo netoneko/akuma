@@ -363,6 +363,9 @@ fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
     let target_pgid = if pgid == 0 { target_pid } else { pgid };
 
     if let Some(proc) = crate::process::lookup_process(target_pid) {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, proc.pgid, target_pgid);
+        }
         proc.pgid = target_pgid;
         0
     } else {
@@ -376,7 +379,11 @@ fn sys_getpgid(pid: u32) -> u64 {
             Some(p) => p, 
             None => {
                 // System thread fallback: use TID as PGID
-                return crate::threading::current_thread_id() as u64;
+                let tid = crate::threading::current_thread_id();
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] getpgid(0) kernel fallback: returning TID {}\n", tid);
+                }
+                return tid as u64;
             }
         }
     } else {
@@ -384,9 +391,15 @@ fn sys_getpgid(pid: u32) -> u64 {
     };
 
     if let Some(proc) = crate::process::lookup_process(target_pid) {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
+            crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
+        }
         proc.pgid as u64
     } else {
         // If it's a system thread (not in process table), return its TID
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] getpgid({}) not found: returning TID fallback {}\n", target_pid, target_pid);
+        }
         target_pid as u64
     }
 }
@@ -502,7 +515,11 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             };
             let ts = term_state_lock.lock();
             unsafe {
-                *(arg as *mut u32) = ts.foreground_pgid;
+                let pgid = ts.foreground_pgid;
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
+                }
+                *(arg as *mut u32) = pgid;
             }
             0
         }
