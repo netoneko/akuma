@@ -981,13 +981,36 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     }
 }
 
-fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
+fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
     // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
     // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
-    if flags & 0x4000 != 0 {
-        // Return child PID (fake success)
-        // We handle the actual spawning in sys_execve
-        return 0x7FFFFFFF; 
+    if flags & 0x4000 != 0 || flags & 0x11 == 0x11 {
+        // vfork-like clone: Create a copy of the current process
+        
+        let parent_proc = match crate::process::current_process() {
+            Some(p) => p,
+            None => return !0u64, // ENOSYS
+        };
+        
+        // Allocate new PID for the child
+        let child_pid = crate::process::allocate_pid();
+        
+        // Delegate to process::fork_process which handles:
+        // 1. Deep copy of memory (stack/heap)
+        // 2. Cloning FDs/Channel/Terminal
+        // 3. Spawning the child thread (which returns 0)
+        match crate::process::fork_process(child_pid, stack) {
+            Ok(new_pid) => {
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] clone: forked PID {} -> {}\n", parent_proc.pid, new_pid);
+                }
+                return new_pid as u64;
+            },
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
+                return !0u64; // EAGAIN
+            }
+        }
     }
     ENOSYS
 }
@@ -1047,18 +1070,33 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    let args_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
-    let cwd = crate::process::current_process().map(|p| p.cwd.clone());
-
-    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), Some(&env), None, cwd.as_deref()) {
-        Ok((_tid, ch, pid)) => {
-            crate::process::register_child_channel(pid, ch);
-            pid as u64
+    // Load the ELF binary
+    let elf_data = match crate::fs::read_file(&resolved_path) {
+        Ok(data) => data,
+        Err(_) => {
+            crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+            return ENOENT;
         }
-        Err(e) => {
-            crate::safe_print!(128, "[syscall] execve: spawn failed for {}: {}\n", resolved_path, e);
-            ENOENT
-        },
+    };
+
+    // Perform in-place replacement
+    let mut proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
+    if let Err(e) = proc.replace_image(&elf_data, &args, &env) {
+        crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
+        return !0u64; // EINTERNAL
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
+    }
+
+    // Now jump to the new entry point. This never returns.
+    unsafe {
+        crate::process::enter_user_mode(&proc.context);
     }
 }
 

@@ -767,12 +767,15 @@ async fn bridge_process(
     pid: u32,
     process_channel: Arc<crate::process::ProcessChannel>,
 ) -> Result<(), TcpError> {
+    log(&format!("[SSH] Starting I/O bridge for PID {}\n", pid));
     let mut buf = [0u8; 1024];
-    let stdin_path = format!("/proc/{}/fd/0\0", pid);
     
     loop {
         // 1. Check for process exit
-        if let Some((_, _exit_code)) = crate::process::waitpid(pid) { break; }
+        if let Some((_, _exit_code)) = crate::process::waitpid(pid) { 
+            log(&format!("[SSH] Process PID {} exited, ending bridge\n", pid));
+            break; 
+        }
         
         // 2. Output from process to SSH
         // Read directly from the process channel
@@ -797,16 +800,11 @@ async fn bridge_process(
                         let mut offset = 0;
                         let _recipient = read_u32(&payload, &mut offset);
                         if let Some(data) = read_string(&payload, &mut offset) {
-                            // Forward to process stdin via procfs
-                            // Use handle_syscall to open and write to procfs
-                            let fd_res = crate::syscall::handle_syscall(crate::syscall::nr::OPENAT, &[-100i32 as u64, stdin_path.as_ptr() as u64, crate::process::open_flags::O_WRONLY as u64, 0, 0, 0]);
-                            if (fd_res as i64) >= 0 {
-                                let fd = fd_res as u32;
-                                crate::syscall::handle_syscall(crate::syscall::nr::WRITE, &[fd as u64, data.as_ptr() as u64, data.len() as u64, 0, 0, 0]);
-                                crate::syscall::handle_syscall(crate::syscall::nr::CLOSE, &[fd as u64, 0, 0, 0, 0, 0]);
-                            }
+                            // Forward directly to process stdin
+                            let _ = crate::process::write_to_process_stdin(pid, data);
                         }
                     } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
+                        log("[SSH] Channel closed, ending bridge\n");
                         return Ok(());
                     }
                 }

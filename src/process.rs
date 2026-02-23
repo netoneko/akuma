@@ -39,8 +39,8 @@ use spinning_top::Spinlock;
 use crate::config;
 use crate::console;
 use crate::elf_loader::{self, ElfError};
-use crate::mmu::UserAddressSpace;
-use crate::pmm::PhysFrame;
+use crate::mmu::{self, UserAddressSpace};
+use crate::pmm::{self, PhysFrame};
 use crate::terminal;
 
 /// Fixed address for process info page (read-only from userspace)
@@ -441,7 +441,7 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a process in the table (takes ownership)
-fn register_process(pid: Pid, proc: Box<Process>) {
+pub fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_TABLE.lock().insert(pid, proc);
     })
@@ -564,6 +564,9 @@ impl ProcessChannel {
             let to_read = buf.len().min(buffer.len());
             for (i, byte) in buffer.drain(..to_read).enumerate() {
                 buf[i] = byte;
+            }
+            if to_read > 0 && crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[ProcessChannel] Read {} bytes from stdout\n", to_read);
             }
             to_read
         })
@@ -1036,7 +1039,8 @@ pub struct UserContext {
     pub sp: u64,   // Stack pointer (SP_EL0)
     pub pc: u64,   // Program counter (ELR_EL1)
     pub spsr: u64, // Saved program status
-    pub tpidr_el0: u64, // Thread pointer for TLS
+    pub tpidr: u64, // Thread pointer for TLS
+    pub ttbr0: u64, // User address space base
 }
 
 impl UserContext {
@@ -1075,9 +1079,14 @@ impl UserContext {
             x30: 0,
             sp: stack_pointer as u64,
             pc: entry_point as u64,
-            spsr: 0, // EL0, interrupts enabled
-            tpidr_el0: 0,
+            spsr: 0, // EL0t, interrupts enabled
+            tpidr: 0,
+            ttbr0: 0,
         }
+    }
+    
+    pub fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -1175,6 +1184,8 @@ pub struct Process {
     pub brk: usize,
     /// Initial program break (start of heap, set from ELF loader)
     pub initial_brk: usize,
+    /// Entry point address (start of execution)
+    pub entry_point: usize,
     /// Memory regions tracking
     pub memory: ProcessMemory,
     /// Physical address of the process info page
@@ -1296,6 +1307,7 @@ impl Process {
             parent_pid: 0,
             brk,
             initial_brk: brk,
+            entry_point,
             memory,
             process_info_phys: process_info_frame.addr,
             // Command line arguments - initialized empty
@@ -1327,6 +1339,54 @@ impl Process {
             channel: None,
             delegate_pid: None,
         })
+    }
+
+    /// Replace current process image with a new ELF binary (execve core)
+    pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
+        // Reuse load_elf_with_stack to handle address space creation, ELF loading, and stack setup
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) = 
+            crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
+            .map_err(|_| "Failed to load ELF")?;
+            
+        // Deactivate old address space before dropping it (if it was active)
+        mmu::UserAddressSpace::deactivate();
+        
+        // Replace address space (old one is dropped here, freeing frames)
+        self.address_space = address_space;
+        self.entry_point = entry_point;
+        self.brk = brk;
+        self.initial_brk = brk;
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.args = args.to_vec();
+        
+        // Update context for the next run
+        self.context = UserContext::new(entry_point, sp);
+        
+        // Re-write process info page in the NEW address space
+        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+        
+        self.address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+            )
+            .map_err(|_| "Failed to map process info")?;
+            
+        self.address_space.track_user_frame(process_info_frame);
+        self.process_info_phys = process_info_frame.addr;
+
+        unsafe {
+            let info_ptr = mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+            core::ptr::write(info_ptr, info);
+        }
+
+        // Reset I/O state (but keep FDs and Channel!)
+        self.reset_io();
+        
+        Ok(())
     }
 
     /// Set command line arguments for this process
@@ -1492,7 +1552,7 @@ impl Drop for Process {
 /// Does not return.
 #[inline(never)]
 #[allow(dead_code)]
-unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
+pub(crate) unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     // SAFETY: This inline asm sets up CPU state and ERETs to user mode
     unsafe {
         core::arch::asm!(
@@ -1542,7 +1602,7 @@ unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
             sp = in(reg) ctx.sp,
             pc = in(reg) ctx.pc,
             spsr = in(reg) ctx.spsr,
-            tls = in(reg) ctx.tpidr_el0,
+            tls = in(reg) ctx.tpidr,
             options(noreturn)
         )
     }
@@ -1814,6 +1874,147 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
         }
     }
     None
+}
+
+/// Fork the current process (deep copy)
+/// Returns the new PID to the parent
+pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    let parent = current_process().ok_or("No current process")?;
+    let parent_pid = parent.pid;
+    
+    // 1. Create new address space
+    let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
+    
+    // 2. Allocate process info page
+    let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+    pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, child_pid);
+    
+    new_address_space
+        .map_page(
+            PROCESS_INFO_ADDR,
+            process_info_frame.addr,
+            mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+        )
+        .map_err(|_| "Failed to map process info")?;
+    new_address_space.track_user_frame(process_info_frame);
+
+    // 3. Create Process struct
+    let mut new_proc = Box::new(Process {
+        pid: child_pid,
+        pgid: parent.pgid,
+        name: parent.name.clone(),
+        parent_pid: parent_pid,
+        state: ProcessState::Ready,
+        context: UserContext::default(), // Will be updated below
+        address_space: new_address_space,
+        entry_point: parent.entry_point,
+        brk: parent.brk,
+        initial_brk: parent.initial_brk,
+        memory: parent.memory.clone(),
+        process_info_phys: process_info_frame.addr,
+        args: parent.args.clone(),
+        cwd: parent.cwd.clone(),
+        stdin: Spinlock::new(StdioBuffer::new()),
+        stdout: Spinlock::new(StdioBuffer::new()),
+        exited: false,
+        exit_code: 0,
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: parent.mmap_regions.clone(),
+        fd_table: Spinlock::new(parent.fd_table.lock().clone()),
+        next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
+        thread_id: None,
+        spawner_pid: parent.spawner_pid,
+        terminal_state: parent.terminal_state.clone(),
+        box_id: parent.box_id,
+        root_dir: parent.root_dir.clone(),
+        channel: parent.channel.clone(),
+        delegate_pid: None,
+    });
+    
+    // 4. Perform memory copy
+    let stack_top = 0x40000000;
+    let stack_size = config::USER_STACK_SIZE; 
+    let stack_start = stack_top - stack_size;
+    
+    // Helper to copy a range
+    fn copy_range(src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
+        let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+        for i in 0..pages {
+            let va = src_va + i * mmu::PAGE_SIZE;
+            if mmu::is_current_user_range_mapped(va, 1) {
+                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
+                 unsafe {
+                     let src_ptr = va as *const u8;
+                     let dest_ptr = mmu::phys_to_virt(frame.addr);
+                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
+                 }
+            }
+        }
+        Ok(())
+    }
+    
+    copy_range(stack_start, stack_size, &mut new_proc.address_space)?;
+    
+    if parent.brk > 0x400000 {
+        copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
+    }
+    
+    // 5. Spawn Thread
+    let parent_tid = crate::threading::current_thread_id();
+    let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+    
+    let mut child_ctx = parent_ctx;
+    child_ctx.x0 = 0; // Return 0 to child
+    if stack_ptr != 0 {
+        child_ctx.sp = stack_ptr;
+    }
+
+    let tid = crate::threading::spawn_user_thread(
+        crate::process::entry_point_trampoline as extern "C" fn() -> !, 
+        core::ptr::null_mut(), 
+        false
+    )?;
+    
+    new_proc.thread_id = Some(tid);
+    crate::threading::update_thread_context(tid, &child_ctx);
+    
+    // Register process
+    register_process(child_pid, new_proc);
+    
+    Ok(child_pid)
+}
+
+/// Allocate a new unique PID
+pub fn allocate_pid() -> Pid {
+    static NEXT_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(20);
+    NEXT_PID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Trampoline for new process threads
+/// Called by threading::spawn_user_thread
+pub extern "C" fn entry_point_trampoline() -> ! {
+    let tid = crate::threading::current_thread_id();
+    let mut proc_ptr: *mut Process = core::ptr::null_mut();
+    
+    crate::irq::with_irqs_disabled(|| {
+        let mut processes = PROCESS_TABLE.lock();
+        for proc in processes.values_mut() {
+            if proc.thread_id == Some(tid) {
+                proc_ptr = &mut **proc as *mut Process;
+                break;
+            }
+        }
+    });
+    
+    if proc_ptr.is_null() {
+        crate::safe_print!(128, "[process] FATAL: No process found for thread {}\n", tid);
+        crate::threading::mark_current_terminated();
+        loop { crate::threading::yield_now(); }
+    }
+    
+    unsafe {
+        (*proc_ptr).run();
+    }
 }
 
 /// Execute an ELF binary from the filesystem with per-process I/O (blocking)

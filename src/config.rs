@@ -62,6 +62,9 @@ pub const MAX_THREADS: usize = 32;
 /// User processes can only spawn on threads RESERVED_THREADS through MAX_THREADS-1.
 pub const RESERVED_THREADS: usize = 8;
 
+/// Maximum number of user processes
+pub const MAX_PROCESSES: usize = 64;
+
 /// Stack size for reserved system threads (512KB)
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.

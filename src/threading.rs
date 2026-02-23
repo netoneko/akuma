@@ -1995,6 +1995,47 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     0  // No switch needed
 }
 
+/// Update a thread's context for a new execution (e.g., after execve or fork)
+pub fn update_thread_context(thread_id: usize, user_context: &crate::process::UserContext) {
+    // Disable IRQs to safely access context
+    crate::irq::with_irqs_disabled(|| {
+        unsafe {
+            let ctx = &mut *get_context_mut(thread_id);
+            
+            // Update context fields that are directly in Context struct
+            ctx.elr = user_context.pc;
+            // ctx.sp points to the kernel stack top (where the trap frame is).
+            // We generally don't change ctx.sp for fork(), we want to keep the stack frame.
+            // But for execve(), we might want to reset it?
+            // For fork(), the thread is NEW, so ctx.sp points to the fake frame we just built.
+            // We should NOT change ctx.sp to user_context.sp (which is a user stack pointer!).
+            
+            ctx.spsr = user_context.spsr;
+            ctx.ttbr0 = user_context.ttbr0;
+            
+            ctx.user_entry = user_context.pc;
+            ctx.user_sp = user_context.sp;
+            ctx.user_tls = user_context.tpidr;
+            ctx.is_user_process = 1;
+            
+            // Update registers in the trap frame on the stack
+            // The trap frame is at ctx.sp
+            let frame_ptr = ctx.sp as *mut u64;
+            
+            // Frame layout from setup_fake_irq_frame / IRQ handler:
+            // [sp+224]: x0, x1
+            frame_ptr.add(224/8).write_volatile(user_context.x0);
+            frame_ptr.add(232/8).write_volatile(user_context.x1);
+            
+            // We can update other registers if needed, but for fork() x0=0 is the main one.
+            // The trap frame has 0 for others by default (from setup_fake_irq_frame).
+            // If we want to copy all registers from parent (for full fork), we should do it here.
+            // But UserContext only has x0-x30 if we added them.
+            // For now, updating x0 is sufficient for vfork return value.
+        }
+    });
+}
+
 // ============================================================================
 // Waker Integration
 // ============================================================================
@@ -2498,6 +2539,66 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
         thread_state::TERMINATED => ThreadState::Terminated,
         thread_state::INITIALIZING => ThreadState::Ready, // Treat as ready for display
         _ => ThreadState::Free,
+    })
+}
+
+/// Get the saved user context for a thread
+/// Used by fork() to duplicate the parent's state
+pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
+    if thread_id >= config::MAX_THREADS {
+        return None;
+    }
+    
+    crate::irq::with_irqs_disabled(|| {
+        let ctx_ptr = get_context(thread_id);
+        let ctx = unsafe { &*ctx_ptr };
+        
+        // Only return if it looks like a valid user context
+        if ctx.is_user_process != 0 {
+            Some(crate::process::UserContext {
+                pc: ctx.user_entry,
+                sp: ctx.user_sp,
+                tpidr: ctx.user_tls,
+                spsr: ctx.spsr,
+                ttbr0: ctx.ttbr0,
+                // General purpose registers are not fully tracked in UserContext struct yet
+                // but for fork() we primarily need PC/SP/SPSR/TTBR0.
+                // The trap handler saves GP regs to kernel stack, which we can't easily access here.
+                // However, for the child process returning 0 from fork(), we set x0=0 explicitly.
+                // The other registers will be zeroed/undefined in the new thread unless we copy them.
+                // TODO: For full fork support, we need to copy all GP registers from the trap frame.
+                x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
+                x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
+                x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
+                x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// Spawn a user thread with a specific trampoline and data pointer
+/// Used by fork_process to spawn the child thread
+pub fn spawn_user_thread(
+    trampoline_fn: extern "C" fn() -> !,
+    data_ptr: *mut (), // Passed as x0 to trampoline? No, entry_point_trampoline takes no args
+    cooperative: bool
+) -> Result<usize, &'static str> {
+    // We reuse spawn_user_closure but cast our function
+    // entry_point_trampoline doesn't take args, so data_ptr is ignored by it
+    // but spawn_user_closure expects a function taking *mut ()
+    
+    let trampoline_casted = unsafe {
+        core::mem::transmute::<
+            extern "C" fn() -> !,
+            fn(*mut ()) -> !
+        >(trampoline_fn)
+    };
+    
+    with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_user_closure(trampoline_casted, data_ptr, cooperative)
     })
 }
 
