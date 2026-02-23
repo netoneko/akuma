@@ -141,3 +141,28 @@ To support `dash` over SSH, the built-in shell now performs the following:
 3.  **IO Bridging:** Implemented `bridge_process` in the kernel to forward data between the encrypted SSH stream and the process's standard I/O streams.
 
 These changes allow `dash` to correctly identify its foreground status, enabling echoing and full interactivity without infinite initialization loops.
+
+## 7. Process Output and TTY Interactivity
+
+Several architectural bottlenecks were resolved to ensure that character input reached the shell correctly and that command output (like `ls`) was bridged back to the SSH session without loss.
+
+### 7.1. Proper `execve` and `fork` Semantics
+
+The previous "spawn-as-exec" model caused grandchildren processes to lose their connection to the SSH bridge.
+
+*   **In-Place `execve`**: Implemented `Process::replace_image` to replace a process's memory in-place. This preserves the process ID, file descriptors, and critically, the shared `ProcessChannel` reference used by the SSH bridge.
+*   **Deep-Copy `fork`**: Implemented `fork_process` to create a true copy of the parent process (including stack and heap) and its metadata. The child inherits the same `ProcessChannel`, ensuring its output automatically flows to the bridge reading from the parent's channel.
+
+### 7.2. TTY Line Discipline
+
+To support interactive shell behavior, basic TTY input/output processing was added to the kernel:
+
+*   **ICRNL Mapping**: Implemented `ICRNL` (map carriage return to newline) in `sys_read`. This allows shells to recognize the `Enter` key (sent as `\r` by many clients) as a command terminator (`\n`).
+*   **Kernel-Level ECHO**: Implemented `ECHO` logic in `sys_read`. Characters typed by the user are now echoed back to the terminal (stdout) immediately by the kernel, providing essential visual feedback.
+*   **Default Flags**: Updated `TerminalState` to enable `ICANON | ECHO | ICRNL | ONLCR` by default, matching a standard Linux interactive environment.
+
+### 7.3. Robust Output Draining
+
+The SSH bridge loop was refined to prevent race conditions where fast-running processes (like `ls`) might exit before their output was fully sent.
+
+*   **Aggressive Draining**: The `bridge_process` loop now uses an internal `while` loop to drain all available data from the process channel in every iteration, ensuring no "last bytes" are left behind when a process terminates.

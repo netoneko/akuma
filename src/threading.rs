@@ -190,6 +190,7 @@ impl ThreadPool {
                     ctx.x30 = thread_start_closure as *const () as u64;
                     ctx.elr = thread_start_closure as *const () as u64;
                     ctx.spsr = 0x00000345;
+                    ctx.is_user_process = 1; // Mark as user process thread
                 }
 
                 self.slots[i].cooperative = cooperative;
@@ -1424,6 +1425,7 @@ impl ThreadPool {
                     ctx.x30 = thread_start_closure as *const () as u64;
                     ctx.elr = thread_start_closure as *const () as u64;
                     ctx.spsr = 0x00000345;
+                    ctx.is_user_process = 1; // Mark as user process thread
                 }
 
                 self.slots[i].cooperative = cooperative;
@@ -2629,13 +2631,9 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
                 sp: ctx.user_sp,
                 tpidr: ctx.user_tls,
                 spsr: ctx.spsr,
-                ttbr0: ctx.ttbr0,
+                ttbr0: if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() },
                 // General purpose registers are not fully tracked in UserContext struct yet
                 // but for fork() we primarily need PC/SP/SPSR/TTBR0.
-                // The trap handler saves GP regs to kernel stack, which we can't easily access here.
-                // However, for the child process returning 0 from fork(), we set x0=0 explicitly.
-                // The other registers will be zeroed/undefined in the new thread unless we copy them.
-                // TODO: For full fork support, we need to copy all GP registers from the trap frame.
                 x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
                 x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
                 x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
