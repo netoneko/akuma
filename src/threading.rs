@@ -2558,6 +2558,7 @@ where
             ctx.x30 = thread_start_closure as *const () as u64;
             ctx.elr = thread_start_closure as *const () as u64;
             ctx.spsr = 0x00000345; // EL1h, IRQs enabled
+            ctx.is_user_process = if start_irqs_disabled { 1 } else { 0 };
         }
 
         // Write slot metadata (needs POOL lock)
@@ -2626,6 +2627,9 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
         
         // Only return if it looks like a valid user context
         if ctx.is_user_process != 0 {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: captured context for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
+            }
             Some(crate::process::UserContext {
                 pc: ctx.user_entry,
                 sp: ctx.user_sp,
@@ -2640,6 +2644,10 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
                 x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
             })
         } else {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process (magic={:#x}, is_user={})\n", 
+                    thread_id, ctx.magic, ctx.is_user_process);
+            }
             None
         }
     })
