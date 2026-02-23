@@ -779,8 +779,8 @@ async fn bridge_process(
         
         // 2. Output from process to SSH
         // Read directly from the process channel
-        let n = process_channel.read(&mut buf);
-        if n > 0 {
+        while let n = process_channel.read(&mut buf) {
+            if n == 0 { break; }
             send_channel_data(stream, session, &buf[..n]).await?;
         }
 

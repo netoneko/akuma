@@ -578,11 +578,51 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // Blocking read loop
             loop {
                 // Check for data first
-                let n = ch.read_stdin(&mut kernel_buf);
+                let mut n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
+                    // TTY Line Discipline: Input Processing
+                    let term_state_lock = crate::process::current_terminal_state();
+                    if let Some(ref ts_lock) = term_state_lock {
+                        let mut ts = ts_lock.lock();
+                        
+                        // 1. ICRNL: Map CR to NL on input
+                        if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
+                            for i in 0..n {
+                                if kernel_buf[i] == b'\r' {
+                                    kernel_buf[i] = b'\n';
+                                }
+                            }
+                        }
+
+                        // 2. ECHO: Echo characters back to the user (via stdout channel)
+                        if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
+                            // Map \n to \r\n for echo if ONLCR is set
+                            if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
+                                let mut echo_buf = Vec::with_capacity(n * 2);
+                                for i in 0..n {
+                                    if kernel_buf[i] == b'\n' {
+                                        echo_buf.extend_from_slice(b"\r\n");
+                                    } else {
+                                        echo_buf.push(kernel_buf[i]);
+                                    }
+                                }
+                                ch.write(&echo_buf);
+                            } else {
+                                ch.write(&kernel_buf[..n]);
+                            }
+                        }
+                    }
+
                     unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes\n", n);
+                        let mut snippet = [0u8; 32];
+                        let sn_len = n.min(32);
+                        snippet[..sn_len].copy_from_slice(&kernel_buf[..sn_len]);
+                        for byte in &mut snippet[..sn_len] {
+                            if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                        }
+                        let snippet_str = core::str::from_utf8(&snippet[..sn_len]).unwrap_or("...");
+                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes \"{}\"\n", n, snippet_str);
                     }
                     return n as u64;
                 }
@@ -678,6 +718,19 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                let display_len = count.min(32);
+                let mut snippet = [0u8; 32];
+                let n = display_len.min(snippet.len());
+                snippet[..n].copy_from_slice(&buf[..n]);
+                // Simple printable check
+                for byte in &mut snippet[..n] {
+                    if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                }
+                let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+                crate::safe_print!(128, "[syscall] write(fd={}, count={}) \"{}\"\n", fd_num, count, snippet_str);
+            }
+
             // Write to process channel (for SSH)
             if let Some(ch) = crate::process::current_channel() {
                 let term_state_opt = crate::process::current_terminal_state();
@@ -984,6 +1037,10 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
 fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
     // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
     // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+    }
+
     if flags & 0x4000 != 0 || flags & 0x11 == 0x11 {
         // vfork-like clone: Create a copy of the current process
         
@@ -995,15 +1052,13 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u6
         // Allocate new PID for the child
         let child_pid = crate::process::allocate_pid();
         
-        // Delegate to process::fork_process which handles:
-        // 1. Deep copy of memory (stack/heap)
-        // 2. Cloning FDs/Channel/Terminal
-        // 3. Spawning the child thread (which returns 0)
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
+        }
+
+        // Delegate to process::fork_process
         match crate::process::fork_process(child_pid, stack) {
             Ok(new_pid) => {
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] clone: forked PID {} -> {}\n", parent_proc.pid, new_pid);
-                }
                 return new_pid as u64;
             },
             Err(e) => {
@@ -1011,6 +1066,10 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u6
                 return !0u64; // EAGAIN
             }
         }
+    }
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone: flags not supported, returning ENOSYS\n");
     }
     ENOSYS
 }
@@ -1100,11 +1159,14 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
 }
 
-fn sys_wait4(pid: i32, status_ptr: u64, _options: i32, _rusage: u64) -> u64 {
+fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
+    }
+
     // If pid is -1, wait for any child.
-    // If pid is 0x7FFFFFFF, it's our fake child PID from sys_clone.
+    // If pid is 0x7FFFFFFF, it's our fake child PID from old sys_clone.
     let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
-        // Find any child channel that has exited
         None // TODO: implement wait for ANY
     } else if pid > 0 {
         Some(pid as u32)
@@ -1116,17 +1178,30 @@ fn sys_wait4(pid: i32, status_ptr: u64, _options: i32, _rusage: u64) -> u64 {
         if let Some(ch) = crate::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
+                    let code = ch.exit_code();
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", p, code);
+                    }
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
-                        unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; }
+                        unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
                     }
                     return p as u64;
                 }
+                
+                // WNOHANG = 1
+                if options & 1 != 0 {
+                    return 0; // Return immediately if not exited
+                }
+
                 crate::threading::yield_now();
             }
         }
     }
     
     // Fallback if no child found (ECHILD)
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
+    }
     0
 }
 

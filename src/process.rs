@@ -1359,6 +1359,11 @@ impl Process {
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
         self.args = args.to_vec();
         
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+                self.pid, entry_point, brk, stack_bottom, stack_top, sp);
+        }
+
         // Update context for the next run
         self.context = UserContext::new(entry_point, sp);
         
@@ -1969,7 +1974,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         child_ctx.sp = stack_ptr;
     }
 
-    let tid = crate::threading::spawn_user_thread(
+    // Allocate thread but keep it INITIALIZING
+    let tid = crate::threading::spawn_user_thread_initializing(
         crate::process::entry_point_trampoline as extern "C" fn() -> !, 
         core::ptr::null_mut(), 
         false
@@ -1978,8 +1984,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.thread_id = Some(tid);
     crate::threading::update_thread_context(tid, &child_ctx);
     
-    // Register process
+    // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);
+    
+    // Now safe to start the thread
+    crate::threading::mark_thread_ready(tid);
     
     Ok(child_pid)
 }

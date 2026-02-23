@@ -129,9 +129,78 @@ pub fn mark_thread_terminated(idx: usize) {
 }
 
 /// Mark a thread as ready (lock-free)
-fn mark_thread_ready(idx: usize) {
+pub fn mark_thread_ready(idx: usize) {
     if idx < config::MAX_THREADS {
         THREAD_STATES[idx].store(thread_state::READY, Ordering::SeqCst);
+    }
+}
+
+/// Spawn a user thread but keep it in INITIALIZING state
+pub fn spawn_user_thread_initializing(
+    trampoline_fn: extern "C" fn() -> !,
+    data_ptr: *mut (),
+    cooperative: bool
+) -> Result<usize, &'static str> {
+    let trampoline_casted = unsafe {
+        core::mem::transmute::<extern "C" fn() -> !, fn(*mut ()) -> !>(trampoline_fn)
+    };
+    
+    with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_user_closure_initializing(trampoline_casted, data_ptr, cooperative)
+    })
+}
+
+impl ThreadPool {
+    /// Internal helper to spawn a user closure without marking it READY
+    pub fn spawn_user_closure_initializing(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+        cooperative: bool,
+    ) -> Result<usize, &'static str> {
+        if !self.initialized { return Err("Thread pool not initialized"); }
+
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
+                // Claim the slot atomically
+                if THREAD_STATES[i].compare_exchange(thread_state::FREE, thread_state::INITIALIZING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                    continue;
+                }
+
+                let stack = &self.stacks[i];
+                let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+
+                let sp = setup_fake_irq_frame(
+                    stack_top,
+                    thread_start_closure as *const () as u64,
+                    trampoline_fn as *const () as u64,
+                    closure_ptr as u64,
+                    0,
+                );
+
+                unsafe {
+                    let ctx = &mut *get_context_mut(i);
+                    ctx.magic = CONTEXT_MAGIC;
+                    ctx.sp = sp;
+                    ctx.ttbr0 = boot_ttbr0;
+                    ctx.x19 = trampoline_fn as *const () as u64;
+                    ctx.x20 = closure_ptr as u64;
+                    ctx.x30 = thread_start_closure as *const () as u64;
+                    ctx.elr = thread_start_closure as *const () as u64;
+                    ctx.spsr = 0x00000345;
+                }
+
+                self.slots[i].cooperative = cooperative;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
+
+                // NOTE: We do NOT store READY here. Caller must call mark_thread_ready().
+                return Ok(i);
+            }
+        }
+        Err("No free user thread slots")
     }
 }
 
