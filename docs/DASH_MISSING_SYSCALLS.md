@@ -110,6 +110,34 @@ After implementation, tests will be added to verify the correct functionality of
 *   **Kernel Tests:** Add unit or integration tests within `src/*_tests.rs` to directly call the kernel-side handler functions and assert their behavior.
 *   **Userspace Tests:** Add tests within `userspace/dash` or `userspace/libakuma` to call the new `libakuma` wrapper functions and verify the returned values.
 
-## 5. Validation
+## 6. Job Control and Process Groups
 
-Run the `dash` application in the Akuma OS environment and verify that the "Unknown syscall" errors for 172, 173, and 175 no longer appear, and that `dash` functions as expected.
+Advanced shells like `dash` require functional Job Control to manage foreground and background processes. This necessitated the implementation of several standard Linux AArch64 syscalls and a significant architectural change to how terminal state is managed.
+
+### 6.1. New Job Control Syscalls
+
+The following syscalls were implemented to satisfy `dash`'s initialization and process management logic:
+
+*   **Syscall 155: `getpgid`** - Returns the process group ID. For system threads (like the built-in SSH shell), it falls back to the thread ID.
+*   **Syscall 154: `setpgid`** - Sets the process group ID of a target process.
+*   **Syscall 157: `setsid`** - Creates a new session and sets the calling process as the session leader and process group leader.
+*   **Syscall 129: `kill`** - Standard Linux `kill(pid, sig)` for sending signals to processes.
+
+### 6.2. Shared Terminal State Architecture
+
+Previously, terminal state (`TerminalState`) was isolated within each `Process` struct. This prevented the shell and its children from agreeing on which process group was in the foreground.
+
+*   **The Fix:** Refactored `Process` to use `Arc<Spinlock<terminal::TerminalState>>`. 
+*   **Global Registry:** Implemented a `TERMINAL_STATES` registry in `src/process.rs` mapping thread IDs to these shared states.
+*   **Inheritance:** Modified `spawn_process_with_channel_ext` to automatically inherit the terminal state from the calling thread.
+*   **IOCTL Synchronization:** Updated `TIOCGPGRP` (Get) and `TIOCSPGRP` (Set) to read from and write to the shared `foreground_pgid` field in the `TerminalState`.
+
+### 6.3. Interactive SSH Shell Integration
+
+To support `dash` over SSH, the built-in shell now performs the following:
+
+1.  **Shared State Initialization:** `run_shell_session` creates and registers a shared `TerminalState` for the entire session.
+2.  **Foreground Delegation:** Upon spawning an external shell (configured via `session.config.shell`), the session explicitly sets the new process's PID as the `foreground_pgid`.
+3.  **IO Bridging:** Implemented `bridge_process` in the kernel to forward data between the encrypted SSH stream and the process's standard I/O streams.
+
+These changes allow `dash` to correctly identify its foreground status, enabling echoing and full interactivity without infinite initialization loops.

@@ -14,7 +14,7 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::sync::Arc; // Added
-use core::convert::TryInto;
+use spinning_top::Spinlock;use core::convert::TryInto;
 use core::task::Waker;
 
 use ed25519_dalek::{SECRET_KEY_LENGTH, Signer, SigningKey};
@@ -224,7 +224,16 @@ pub struct SshChannelStream<'a> {
 
 impl<'a> SshChannelStream<'a> {
     fn new(stream: &'a mut TcpStream, session: &'a mut SshSession) -> Self {
-        Self { stream, session, current_process_pid: None, current_process_channel: None }
+        Self {
+            stream,
+            session,
+            current_process_pid: None,
+            current_process_channel: None,
+        }
+    }
+
+    pub fn terminal_state(&self) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+        crate::process::get_terminal_state(crate::threading::current_thread_id())
     }
 
     /// Read and process SSH packets until we have channel data or an error
@@ -752,6 +761,70 @@ async fn send_channel_data(
     send_packet(stream, &payload, session).await
 }
 
+async fn bridge_process(
+    stream: &mut TcpStream,
+    session: &mut SshSession,
+    pid: u32,
+    process_channel: Arc<crate::process::ProcessChannel>,
+) -> Result<(), TcpError> {
+    let mut buf = [0u8; 1024];
+    let stdin_path = format!("/proc/{}/fd/0\0", pid);
+    
+    loop {
+        // 1. Check for process exit
+        if let Some((_, _exit_code)) = crate::process::waitpid(pid) { break; }
+        
+        // 2. Output from process to SSH
+        // Read directly from the process channel
+        let n = process_channel.read(&mut buf);
+        if n > 0 {
+            send_channel_data(stream, session, &buf[..n]).await?;
+        }
+
+        // 3. Input from SSH to process
+        let mut ssh_buf = [0u8; 512];
+        // Use timeout to keep loop responsive
+        let read_res = crate::kernel_timer::with_timeout(
+            crate::kernel_timer::Duration::from_millis(10),
+            stream.read(&mut ssh_buf)
+        ).await;
+
+        match read_res {
+            Ok(Ok(n)) if n > 0 => {
+                session.input_buffer.extend_from_slice(&ssh_buf[..n]);
+                while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+                    if msg_type == SSH_MSG_CHANNEL_DATA {
+                        let mut offset = 0;
+                        let _recipient = read_u32(&payload, &mut offset);
+                        if let Some(data) = read_string(&payload, &mut offset) {
+                            // Forward to process stdin via procfs
+                            // Use handle_syscall to open and write to procfs
+                            let fd_res = crate::syscall::handle_syscall(crate::syscall::nr::OPENAT, &[-100i32 as u64, stdin_path.as_ptr() as u64, crate::process::open_flags::O_WRONLY as u64, 0, 0, 0]);
+                            if (fd_res as i64) >= 0 {
+                                let fd = fd_res as u32;
+                                crate::syscall::handle_syscall(crate::syscall::nr::WRITE, &[fd as u64, data.as_ptr() as u64, data.len() as u64, 0, 0, 0]);
+                                crate::syscall::handle_syscall(crate::syscall::nr::CLOSE, &[fd as u64, 0, 0, 0, 0, 0]);
+                            }
+                        }
+                    } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
+        }
+        
+        // 4. Handle terminal resizing
+        if session.resize_pending {
+            session.resize_pending = false;
+            // TIOCGWINSZ will pick up session.term_width/height next time it's called
+        }
+
+        crate::threading::yield_now();
+    }
+    Ok(())
+}
+
 /// Escape sequence state machine for parsing ANSI escape codes
 #[derive(Clone, Copy, PartialEq)]
 enum EscapeState {
@@ -773,15 +846,35 @@ async fn run_shell_session(
 ) -> Result<(), TcpError> {
     log("[SSH] Starting shell session\n");
 
+    // 0. Get shell config before borrowing session mutably
+    let shell_path_opt = session.config.shell.clone();
+
     // Create per-session shell context (starts at /)
     let mut ctx = ShellContext::new();
 
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
 
-    // Register the channel for this system thread so sys_write can find it
+    // Create shared terminal state for this session
+    let terminal_state = Arc::new(Spinlock::new(terminal::TerminalState::default()));
+
+    // Register the channel and terminal state for this system thread so syscalls can find them
+    let tid = crate::threading::current_thread_id();
     let channel = Arc::new(crate::process::ProcessChannel::new());
-    crate::process::register_system_thread_channel(crate::threading::current_thread_id(), channel.clone());
+    crate::process::register_system_thread_channel(tid, channel.clone());
+    crate::process::register_terminal_state(tid, terminal_state.clone());
+
+    // 1. If an external shell is configured, spawn it and bridge
+    if let Some(shell_path) = shell_path_opt {
+        log(&format!("[SSH] Spawning external shell: {}\n", shell_path));
+        // Use kernel spawn function directly
+        if let Ok((_tid, proc_channel, pid)) = crate::process::spawn_process_with_channel(&shell_path, None, None) {
+            // Set the spawned shell as the foreground process group
+            terminal_state.lock().foreground_pgid = pid;
+            return bridge_process(stream, session, pid, proc_channel).await;
+        }
+        log(&format!("[SSH] Failed to spawn external shell {}, falling back to built-in\n", shell_path));
+    }
 
     // Create command registry
     let registry = create_default_registry();

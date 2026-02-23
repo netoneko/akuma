@@ -681,10 +681,21 @@ impl Default for ProcessChannel {
 static PROCESS_CHANNELS: Spinlock<alloc::collections::BTreeMap<usize, Arc<ProcessChannel>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Global registry mapping thread IDs to their shared terminal states
+static TERMINAL_STATES: Spinlock<alloc::collections::BTreeMap<usize, Arc<Spinlock<terminal::TerminalState>>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 /// Register a process channel for a thread
 pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().insert(thread_id, channel);
+    })
+}
+
+/// Register a terminal state for a thread
+pub fn register_terminal_state(thread_id: usize, state: Arc<Spinlock<terminal::TerminalState>>) {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().insert(thread_id, state);
     })
 }
 
@@ -702,10 +713,24 @@ pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     })
 }
 
+/// Get the terminal state for a thread (if any)
+pub fn get_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().get(&thread_id).cloned()
+    })
+}
+
 /// Remove and return the process channel for a thread
 pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().remove(&thread_id)
+    })
+}
+
+/// Remove and return the terminal state for a thread
+pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().remove(&thread_id)
     })
 }
 
@@ -833,8 +858,15 @@ pub fn current_process() -> Option<&'static mut Process> {
 /// Get the current process's TerminalState (for syscall handlers)
 ///
 /// Returns a mutable reference to the TerminalState if found.
-pub fn current_terminal_state() -> Option<&'static Spinlock<terminal::TerminalState>> {
-    current_process().map(|p| &p.terminal_state)
+pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    // 1. Try thread-ID based lookup (for system threads or overridden processes)
+    let tid = crate::threading::current_thread_id();
+    if let Some(state) = get_terminal_state(tid) {
+        return Some(state);
+    }
+
+    // 2. Fallback to process table
+    current_process().map(|p| p.terminal_state.clone())
 }
 
 /// Allocate mmap region for current process
@@ -1127,6 +1159,8 @@ impl ProcessMemory {
 pub struct Process {
     /// Process ID
     pub pid: Pid,
+    /// Process group ID
+    pub pgid: Pid,
     /// Process name (for debugging)
     pub name: String,
     /// Process state
@@ -1194,7 +1228,7 @@ pub struct Process {
     /// Spawner tracking (for procfs permissions)
     pub spawner_pid: Option<Pid>,
     // ========== Terminal State ==========
-    pub terminal_state: Spinlock<terminal::TerminalState>,
+    pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
 
     // ========== Isolation Context ==========
     /// Box ID (0 = Host, >0 = Isolated Box)
@@ -1254,6 +1288,7 @@ impl Process {
 
         Ok(Self {
             pid,
+            pgid: pid,
             name: String::from(name),
             state: ProcessState::Ready,
             address_space,
@@ -1284,7 +1319,7 @@ impl Process {
             // Spawner PID - set when spawned by another process
             spawner_pid: None,
             // Terminal State - default for new processes
-            terminal_state: Spinlock::new(terminal::TerminalState::default()),
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
 
             // Isolation defaults: Host context (Box 0, root at /)
             box_id: 0,
@@ -1772,6 +1807,15 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 }
 
 
+pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
+    if let Some(ch) = get_child_channel(pid) {
+        if ch.has_exited() {
+            return Some((pid, ch.exit_code()));
+        }
+    }
+    None
+}
+
 /// Execute an ELF binary from the filesystem with per-process I/O (blocking)
 ///
 /// This spawns the process on a user thread and polls for completion.
@@ -1937,6 +1981,11 @@ pub fn spawn_process_with_channel_ext(
 
     // Set the channel in the process struct (UNIFIED I/O)
     process.channel = Some(channel.clone());
+
+    // Inherit terminal state from caller if available
+    if let Some(shared_state) = get_terminal_state(crate::threading::current_thread_id()) {
+        process.terminal_state = shared_state;
+    }
 
     // Save arguments in process struct for ProcessInfo page
     process.args = if let Some(arg_slice) = args {

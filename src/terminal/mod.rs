@@ -30,6 +30,13 @@ pub struct TerminalState {
     pub lflag: u32,
     pub cc: [u8; 20],
 
+    /// Current foreground process group ID
+    pub foreground_pgid: u32,
+
+    /// Terminal dimensions
+    pub term_width: u16,
+    pub term_height: u16,
+
     /// Current cursor column (0-indexed)
     pub cursor_col: usize,
     /// Current cursor row (0-indexed)
@@ -54,6 +61,9 @@ impl Default for TerminalState {
             cflag: 0,
             lflag: mode_flags::ICANON | mode_flags::ECHO,
             cc,
+            foreground_pgid: 1,
+            term_width: 80,
+            term_height: 24,
             cursor_col: 0,
             cursor_row: 0,
             cursor_hidden: false,

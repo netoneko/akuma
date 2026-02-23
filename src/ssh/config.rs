@@ -31,12 +31,15 @@ static CACHED_CONFIG: Spinlock<Option<SshdConfig>> = Spinlock::new(None);
 pub struct SshdConfig {
     /// If true, accept any authentication without verifying keys
     pub disable_key_verification: bool,
+    /// Default shell path
+    pub shell: Option<alloc::string::String>,
 }
 
 impl Default for SshdConfig {
     fn default() -> Self {
         Self {
             disable_key_verification: false,
+            shell: None,
         }
     }
 }
@@ -64,6 +67,9 @@ impl SshdConfig {
             match key.as_str() {
                 "disable_key_verification" => {
                     self.disable_key_verification = parse_bool(value);
+                }
+                "shell" => {
+                    self.shell = Some(alloc::string::String::from(value));
                 }
                 _ => {
                     log(&alloc::format!(

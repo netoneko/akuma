@@ -353,16 +353,51 @@ fn sys_set_tpidr_el0(address: u64) -> u64 {
     0
 }
 
-fn sys_setpgid(_pid: u32, _pgid: u32) -> u64 {
-    0 // Success stub
+fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
+    let target_pid = if pid == 0 {
+        match crate::process::read_current_pid() { Some(p) => p, None => return !0u64 }
+    } else {
+        pid
+    };
+
+    let target_pgid = if pgid == 0 { target_pid } else { pgid };
+
+    if let Some(proc) = crate::process::lookup_process(target_pid) {
+        proc.pgid = target_pgid;
+        0
+    } else {
+        ENOENT
+    }
 }
 
-fn sys_getpgid(_pid: u32) -> u64 {
-    1 // Return dummy foreground pgrp
+fn sys_getpgid(pid: u32) -> u64 {
+    let target_pid = if pid == 0 {
+        match crate::process::read_current_pid() { 
+            Some(p) => p, 
+            None => {
+                // System thread fallback: use TID as PGID
+                return crate::threading::current_thread_id() as u64;
+            }
+        }
+    } else {
+        pid
+    };
+
+    if let Some(proc) = crate::process::lookup_process(target_pid) {
+        proc.pgid as u64
+    } else {
+        // If it's a system thread (not in process table), return its TID
+        target_pid as u64
+    }
 }
 
 fn sys_setsid() -> u64 {
-    1 // Return dummy SID
+    if let Some(proc) = crate::process::current_process() {
+        proc.pgid = proc.pid;
+        proc.pid as u64 // New SID is the PID
+    } else {
+        !0u64
+    }
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -445,10 +480,15 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCGWINSZ => {
             if !validate_user_ptr(arg, 8) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
             unsafe {
                 let ptr = arg as *mut u16;
-                *ptr.add(0) = 25; // rows
-                *ptr.add(1) = 80; // cols
+                *ptr.add(0) = ts.term_height; // rows
+                *ptr.add(1) = ts.term_width;  // cols
                 *ptr.add(2) = 0;  // xpixel
                 *ptr.add(3) = 0;  // ypixel
             }
@@ -456,13 +496,30 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCGPGRP => {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
             unsafe {
-                *(arg as *mut u32) = 1; // Dummy foreground pgrp
+                *(arg as *mut u32) = ts.foreground_pgid;
             }
             0
         }
         TIOCSPGRP => {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let mut ts = term_state_lock.lock();
+            unsafe {
+                let pgid = *(arg as *const u32);
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
+                }
+                ts.foreground_pgid = pgid;
+            }
             0
         }
         _ => (-(25i64)) as u64, // ENOTTY
