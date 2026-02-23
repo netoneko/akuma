@@ -515,9 +515,21 @@ impl ProcessChannel {
 
     /// Write data to the channel buffer (stdout from process)
     pub fn write(&self, data: &[u8]) {
+        if data.is_empty() { return; }
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            let sn_len = data.len().min(32);
+            let mut snippet = [0u8; 32];
+            let n = sn_len.min(snippet.len());
+            snippet[..n].copy_from_slice(&data[..n]);
+            for byte in &mut snippet[..n] {
+                if *byte < 32 || *byte > 126 { *byte = b'.'; }
+            }
+            let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+            crate::safe_print!(128, "[ProcessChannel] Write {} bytes to stdout \"{}\"\n", data.len(), snippet_str);
+        }
+
         // CRITICAL: Disable IRQs while holding the lock!
         // If timer fires while locked, another thread accessing channel = deadlock.
-        // Also, VecDeque operations can trigger heap allocations which need IRQ protection.
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             

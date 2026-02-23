@@ -755,6 +755,20 @@ async fn send_channel_data(
     if !session.channel_open {
         return Ok(());
     }
+    if data.is_empty() { return Ok(()); }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let sn_len = data.len().min(32);
+        let mut snippet = [0u8; 32];
+        let n = sn_len.min(snippet.len());
+        snippet[..n].copy_from_slice(&data[..n]);
+        for byte in &mut snippet[..n] {
+            if *byte < 32 || *byte > 126 { *byte = b'.'; }
+        }
+        let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+        log(&alloc::format!("[SSH] Sending {} bytes channel data \"{}\"\n", data.len(), snippet_str));
+    }
+
     let mut payload = vec![SSH_MSG_CHANNEL_DATA];
     write_u32(&mut payload, session.client_channel);
     write_string(&mut payload, data);
@@ -779,7 +793,8 @@ async fn bridge_process(
         
         // 2. Output from process to SSH
         // Read directly from the process channel
-        while let n = process_channel.read(&mut buf) {
+        loop {
+            let n = process_channel.read(&mut buf);
             if n == 0 { break; }
             send_channel_data(stream, session, &buf[..n]).await?;
         }

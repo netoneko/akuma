@@ -477,6 +477,11 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 ts.cflag = *ptr.add(2);
                 ts.lflag = *ptr.add(3);
                 
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
+                        ts.iflag, ts.oflag, ts.cflag, ts.lflag);
+                }
+                
                 let cc_ptr = ptr.add(4) as *const u8;
                 core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
             }
@@ -606,8 +611,14 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                         echo_buf.push(kernel_buf[i]);
                                     }
                                 }
+                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                                }
                                 ch.write(&echo_buf);
                             } else {
+                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
+                                }
                                 ch.write(&kernel_buf[..n]);
                             }
                         }
