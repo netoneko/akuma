@@ -1958,6 +1958,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     if parent.brk > 0x400000 {
         copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
     }
+
+    // Also copy all mmap'd regions
+    for (va, frames) in &parent.mmap_regions {
+        copy_range(*va, frames.len() * mmu::PAGE_SIZE, &mut new_proc.address_space)?;
+    }
     
     // 5. Write ProcessInfo to child's process info page
     unsafe {

@@ -47,6 +47,7 @@ pub mod nr {
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGACTION: u64 = 134; // Linux arm64 rt_sigaction
+    pub const RT_SIGSUSPEND: u64 = 133;
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
@@ -315,6 +316,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
         nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
+        nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
         nr::RT_SIGACTION => 0,    // Success (do nothing)
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
