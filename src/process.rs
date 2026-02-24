@@ -1989,7 +1989,13 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     
     new_proc.thread_id = Some(tid);
     crate::threading::update_thread_context(tid, &child_ctx);
-    
+
+    // 8. Create a ProcessChannel for exit notification
+    let child_channel = Arc::new(ProcessChannel::new());
+    new_proc.channel = Some(child_channel.clone());
+    register_channel(tid, child_channel.clone());
+    register_child_channel(child_pid, child_channel);
+
     // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);
     
