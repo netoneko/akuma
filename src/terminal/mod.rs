@@ -11,10 +11,21 @@ pub mod mode_flags {
     pub const RAW_MODE_DISABLE: u64 = 0x02;
     
     // Linux-compatible constants for ioctl
-    pub const ICANON: u32 = 0x00000002;
-    pub const ECHO: u32   = 0x00000008;
+    // iflag
+    pub const ICRNL: u32  = 0x00000100;
+    pub const IXON: u32   = 0x00000400;
+    
+    // oflag
     pub const OPOST: u32  = 0x00000001;
     pub const ONLCR: u32  = 0x00000004;
+
+    // lflag
+    pub const ISIG: u32   = 0x00000001;
+    pub const ICANON: u32 = 0x00000002;
+    pub const ECHO: u32   = 0x00000008;
+    pub const ECHOE: u32  = 0x00000010;
+    pub const ECHOK: u32  = 0x00000020;
+    pub const ECHONL: u32 = 0x00000040;
 }
 
 /// Represents the state of a virtual terminal for an SSH session.
@@ -29,6 +40,13 @@ pub struct TerminalState {
     pub cflag: u32,
     pub lflag: u32,
     pub cc: [u8; 20],
+
+    /// Current foreground process group ID
+    pub foreground_pgid: u32,
+
+    /// Terminal dimensions
+    pub term_width: u16,
+    pub term_height: u16,
 
     /// Current cursor column (0-indexed)
     pub cursor_col: usize,
@@ -46,14 +64,18 @@ impl Default for TerminalState {
     fn default() -> Self {
         let mut cc = [0u8; 20];
         cc[6] = 1; // VMIN = 1
+        cc[5] = 0; // VTIME = 0
         
         TerminalState {
             mode_flags: 0,
-            iflag: 0,
+            iflag: mode_flags::ICRNL | mode_flags::IXON,
             oflag: mode_flags::OPOST | mode_flags::ONLCR, // Enable CRLF translation by default
             cflag: 0,
-            lflag: mode_flags::ICANON | mode_flags::ECHO,
+            lflag: mode_flags::ICANON | mode_flags::ECHO | mode_flags::ISIG | mode_flags::ECHOE | mode_flags::ECHOK,
             cc,
+            foreground_pgid: 1,
+            term_width: 80,
+            term_height: 24,
             cursor_col: 0,
             cursor_row: 0,
             cursor_hidden: false,

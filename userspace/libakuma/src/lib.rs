@@ -103,6 +103,7 @@ pub mod syscall {
     pub const FB_INIT: u64 = 321;
     pub const FB_DRAW: u64 = 322;
     pub const FB_INFO: u64 = 323;
+    pub const GETEUID: u64 = 175;
 }
 
 /// Thread CPU statistics for top command
@@ -197,6 +198,14 @@ pub fn getpid() -> u32 {
 #[inline]
 pub fn getppid() -> u32 {
     unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).ppid }
+}
+
+/// Get the effective user ID
+///
+/// Makes a syscall to the kernel.
+#[inline]
+pub fn geteuid() -> u32 {
+    syscall(syscall::GETEUID, 0, 0, 0, 0, 0, 0) as u32
 }
 
 /// Get the current working directory

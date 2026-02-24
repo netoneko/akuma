@@ -1018,6 +1018,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // System call - number in x8, args in x0-x5
             let frame_ref = unsafe { &*frame };
             let syscall_num = frame_ref.x8;
+
+            // Save trap frame pointer so fork/clone can read full register state
+            crate::threading::set_current_trap_frame(frame);
             let args = [
                 frame_ref.x0,
                 frame_ref.x1,
@@ -1070,6 +1073,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            crate::threading::clear_current_trap_frame();
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {

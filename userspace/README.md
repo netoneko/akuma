@@ -158,6 +158,41 @@ fn main() {
 }
 ```
 
+## Advanced C Integration: The "Lib Trick"
+
+When wrapping complex C projects (like `dash` or `make`) that provide their own build systems (Makefiles, configure scripts), `build.rs` should handle the external build process and copy the final binary to the output directory.
+
+**The Issue**: If your package has a `src/main.rs`, Cargo will attempt to build its own Rust binary, which may overwrite the binary produced and copied by your `build.rs`.
+
+**The Solution (The "Lib Trick")**:
+1.  Rename `src/main.rs` to `src/lib.rs`.
+2.  Make `src/lib.rs` empty or just contain `#![no_std]`.
+3.  Cargo now treats the package as a library and won't produce a competing binary, leaving the binary installed by `build.rs` intact.
+
+## Lessons Learned: Linker & Entry Point
+
+Cross-compiling C software for a custom kernel like Akuma requires precision in linker flags.
+
+### 1. Explicit Entry Point
+The `aarch64-linux-musl-gcc` toolchain may produce binaries with an entry point of `0x0` or an incorrect offset if not guided. Always pass an explicit entry point to the linker in your `build.rs`:
+```rust
+let ldflags = "-static -Wl,--entry=_start";
+// Use this in both ./configure and make environment
+```
+
+### 2. GNU Make Compatibility
+Akuma's build scripts prefer GNU Make for better compatibility with complex Makefiles. On macOS, use the Homebrew path:
+```rust
+let gmake_path = "/opt/homebrew/opt/make/libexec/gnubin/make";
+let make_cmd = if std::path::Path::new(gmake_path).exists() { gmake_path } else { "make" };
+```
+
+### 3. Makefile Patching
+Sometimes `configure` scripts or Makefiles stubbornly override `LDFLAGS`. Your `build.rs` may need to manually patch the generated Makefile to ensure flags like `-Tlinker.ld` or `--entry` are preserved.
+
+### 4. Interactive Stdin Forwarding
+For interactive shells (like `dash`), the parent shell (e.g., `paws`) must explicitly delegate stdin to the child process. Use the `reattach(pid)` syscall after spawning to ensure the child receives interactive input.
+
 ## Deployment for Testing
 
 To make your package available for `pkg install`:

@@ -39,8 +39,8 @@ use spinning_top::Spinlock;
 use crate::config;
 use crate::console;
 use crate::elf_loader::{self, ElfError};
-use crate::mmu::UserAddressSpace;
-use crate::pmm::PhysFrame;
+use crate::mmu::{self, UserAddressSpace};
+use crate::pmm::{self, PhysFrame};
 use crate::terminal;
 
 /// Fixed address for process info page (read-only from userspace)
@@ -190,14 +190,18 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     Ok(())
 }
 
-/// Reattach I/O from the current process to a target PID
-pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
-    let caller_pid = read_current_pid().ok_or("No caller context")?;
-    
+/// Reattach I/O from a caller process (or kernel) to a target PID
+pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
     // 1. Validate hierarchy permissions
-    let (caller_box_id, channel) = {
-        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+    let (caller_box_id, channel) = if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
         (caller.box_id, caller.channel.clone())
+    } else {
+        // Kernel caller (e.g. built-in SSH shell)
+        // System threads use thread-ID based channel lookup
+        let tid = crate::threading::current_thread_id();
+        let ch = get_channel(tid).ok_or("Kernel thread has no channel")?;
+        (0, Some(ch)) // Kernel is Box 0
     };
 
     let target_box_id = {
@@ -207,16 +211,16 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
 
     let mut allowed = false;
     if caller_box_id == 0 {
-        allowed = true; // Host can reattach anything
+        allowed = true; // Host/Kernel can reattach anything
     } else if target_box_id == caller_box_id {
         allowed = true; // Same box
-    } else {
+    } else if let Some(pid) = caller_pid {
         // Check if caller created the target's box (child box)
         let box_info = crate::irq::with_irqs_disabled(|| {
             BOX_REGISTRY.lock().get(&target_box_id).cloned()
         });
         if let Some(info) = box_info {
-            if info.creator_pid == caller_pid {
+            if info.creator_pid == pid {
                 allowed = true;
             }
         }
@@ -227,10 +231,12 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
     }
 
     // 2. Perform the delegation
-    // Current process (e.g. 'box') now points its input to target (e.g. 'paws')
-    {
-        let caller = lookup_process(caller_pid).ok_or("Caller not found")?;
+    if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
         caller.delegate_pid = Some(target_pid);
+    } else {
+        // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
+        // but we still want to link the channel to the target.
     }
 
     // Target process now uses caller's output channel
@@ -240,10 +246,16 @@ pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Reattached PID {} -> PID {}\n", caller_pid, target_pid);
+        crate::safe_print!(128, "[Process] Reattached (caller={:?}) -> PID {}\n", caller_pid, target_pid);
     }
 
     Ok(())
+}
+
+/// Reattach I/O from the current process to a target PID
+pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+    let caller_pid = read_current_pid(); // Can be None for kernel threads
+    reattach_process_ext(caller_pid, target_pid)
 }
 
 /// Kill all processes in a box and unregister it
@@ -429,7 +441,7 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a process in the table (takes ownership)
-fn register_process(pid: Pid, proc: Box<Process>) {
+pub fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_TABLE.lock().insert(pid, proc);
     })
@@ -470,6 +482,8 @@ pub struct ProcessChannel {
     interrupted: AtomicBool,
     /// Raw mode flag (true if terminal is in raw mode, false for cooked)
     raw_mode: AtomicBool,
+    /// Stdin closed flag (true if no more data will be written to stdin)
+    stdin_closed: AtomicBool,
 }
 
 /// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
@@ -484,25 +498,53 @@ impl ProcessChannel {
             exit_code: AtomicI32::new(0),
             exited: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
-            raw_mode: AtomicBool::new(false), // Initialize raw_mode
+            raw_mode: AtomicBool::new(false),
+            stdin_closed: AtomicBool::new(false),
         }
+    }
+
+    /// Mark stdin as closed (no more data will be arriving)
+    pub fn close_stdin(&self) {
+        self.stdin_closed.store(true, Ordering::Release);
+    }
+
+    /// Check if stdin is closed
+    pub fn is_stdin_closed(&self) -> bool {
+        self.stdin_closed.load(Ordering::Acquire)
     }
 
     /// Write data to the channel buffer (stdout from process)
     pub fn write(&self, data: &[u8]) {
+        if data.is_empty() { return; }
+
+        // Copy data from userspace BEFORE the critical section
+        // to prevent page faults while holding a spinlock.
+        let mut kernel_copy = Vec::with_capacity(data.len());
+        kernel_copy.extend_from_slice(data);
+
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            let sn_len = kernel_copy.len().min(32);
+            let mut snippet = [0u8; 32];
+            let n = sn_len.min(snippet.len());
+            snippet[..n].copy_from_slice(&kernel_copy[..n]);
+            for byte in &mut snippet[..n] {
+                if *byte < 32 || *byte > 126 { *byte = b'.'; }
+            }
+            let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+            crate::safe_print!(128, "[ProcessChannel] Write {} bytes to stdout \"{}\"\n", kernel_copy.len(), snippet_str);
+        }
+
         // CRITICAL: Disable IRQs while holding the lock!
-        // If timer fires while locked, another thread accessing channel = deadlock.
-        // Also, VecDeque operations can trigger heap allocations which need IRQ protection.
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             
             // Check for buffer overflow
-            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+            if buf.len() + kernel_copy.len() > MAX_BUFFER_SIZE {
                 // If the write itself is larger than the buffer, truncate it
-                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
-                    &data[data.len() - MAX_BUFFER_SIZE..]
+                let data_to_write = if kernel_copy.len() > MAX_BUFFER_SIZE {
+                    &kernel_copy[kernel_copy.len() - MAX_BUFFER_SIZE..]
                 } else {
-                    data
+                    &kernel_copy
                 };
                 
                 // Remove old data to make room
@@ -513,7 +555,7 @@ impl ProcessChannel {
                 }
                 buf.extend(data_to_write);
             } else {
-                buf.extend(data);
+                buf.extend(&kernel_copy);
             }
         })
     }
@@ -539,6 +581,9 @@ impl ProcessChannel {
             let to_read = buf.len().min(buffer.len());
             for (i, byte) in buffer.drain(..to_read).enumerate() {
                 buf[i] = byte;
+            }
+            if to_read > 0 && crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[ProcessChannel] Read {} bytes from stdout\n", to_read);
             }
             to_read
         })
@@ -656,10 +701,21 @@ impl Default for ProcessChannel {
 static PROCESS_CHANNELS: Spinlock<alloc::collections::BTreeMap<usize, Arc<ProcessChannel>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Global registry mapping thread IDs to their shared terminal states
+static TERMINAL_STATES: Spinlock<alloc::collections::BTreeMap<usize, Arc<Spinlock<terminal::TerminalState>>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 /// Register a process channel for a thread
 pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().insert(thread_id, channel);
+    })
+}
+
+/// Register a terminal state for a thread
+pub fn register_terminal_state(thread_id: usize, state: Arc<Spinlock<terminal::TerminalState>>) {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().insert(thread_id, state);
     })
 }
 
@@ -677,6 +733,13 @@ pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     })
 }
 
+/// Get the terminal state for a thread (if any)
+pub fn get_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().get(&thread_id).cloned()
+    })
+}
+
 /// Remove and return the process channel for a thread
 pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
@@ -684,33 +747,61 @@ pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     })
 }
 
+/// Remove and return the terminal state for a thread
+pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    crate::irq::with_irqs_disabled(|| {
+        TERMINAL_STATES.lock().remove(&thread_id)
+    })
+}
+
 // ============================================================================
 // Child Process Registry (for userspace process management)
 // ============================================================================
 
-/// Registry mapping child PIDs to their ProcessChannel
+/// Registry mapping child PIDs to (ProcessChannel, parent_pid)
 /// Used by parent processes to read child stdout via ChildStdout FD
-static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, Arc<ProcessChannel>>> =
+/// and by wait4(-1) to find children of a specific parent.
+static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a child process channel (called when spawning via syscall)
-pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>) {
+pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().insert(child_pid, channel);
+        CHILD_CHANNELS.lock().insert(child_pid, (channel, parent_pid));
     })
 }
 
 /// Get a child process channel by PID
 pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().get(&child_pid).cloned()
+        CHILD_CHANNELS.lock().get(&child_pid).map(|(ch, _)| ch.clone())
     })
 }
 
 /// Remove a child process channel (called when child exits or parent closes FD)
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().remove(&child_pid)
+        CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
+    })
+}
+
+/// Find any exited child of the given parent. Returns (child_pid, channel).
+pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
+    crate::irq::with_irqs_disabled(|| {
+        let channels = CHILD_CHANNELS.lock();
+        for (&child_pid, (ch, ppid)) in channels.iter() {
+            if *ppid == parent_pid && ch.has_exited() {
+                return Some((child_pid, ch.clone()));
+            }
+        }
+        None
+    })
+}
+
+/// Check if the given parent has any children registered.
+pub fn has_children(parent_pid: Pid) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().values().any(|(_, ppid)| *ppid == parent_pid)
     })
 }
 
@@ -808,8 +899,15 @@ pub fn current_process() -> Option<&'static mut Process> {
 /// Get the current process's TerminalState (for syscall handlers)
 ///
 /// Returns a mutable reference to the TerminalState if found.
-pub fn current_terminal_state() -> Option<&'static Spinlock<terminal::TerminalState>> {
-    current_process().map(|p| &p.terminal_state)
+pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>> {
+    // 1. Try thread-ID based lookup (for system threads or overridden processes)
+    let tid = crate::threading::current_thread_id();
+    if let Some(state) = get_terminal_state(tid) {
+        return Some(state);
+    }
+
+    // 2. Fallback to process table
+    current_process().map(|p| p.terminal_state.clone())
 }
 
 /// Allocate mmap region for current process
@@ -979,7 +1077,8 @@ pub struct UserContext {
     pub sp: u64,   // Stack pointer (SP_EL0)
     pub pc: u64,   // Program counter (ELR_EL1)
     pub spsr: u64, // Saved program status
-    pub tpidr_el0: u64, // Thread pointer for TLS
+    pub tpidr: u64, // Thread pointer for TLS
+    pub ttbr0: u64, // User address space base
 }
 
 impl UserContext {
@@ -1018,9 +1117,14 @@ impl UserContext {
             x30: 0,
             sp: stack_pointer as u64,
             pc: entry_point as u64,
-            spsr: 0, // EL0, interrupts enabled
-            tpidr_el0: 0,
+            spsr: 0, // EL0t, interrupts enabled
+            tpidr: 0,
+            ttbr0: 0,
         }
+    }
+    
+    pub fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -1102,6 +1206,8 @@ impl ProcessMemory {
 pub struct Process {
     /// Process ID
     pub pid: Pid,
+    /// Process group ID
+    pub pgid: Pid,
     /// Process name (for debugging)
     pub name: String,
     /// Process state
@@ -1116,6 +1222,8 @@ pub struct Process {
     pub brk: usize,
     /// Initial program break (start of heap, set from ELF loader)
     pub initial_brk: usize,
+    /// Entry point address (start of execution)
+    pub entry_point: usize,
     /// Memory regions tracking
     pub memory: ProcessMemory,
     /// Physical address of the process info page
@@ -1169,7 +1277,7 @@ pub struct Process {
     /// Spawner tracking (for procfs permissions)
     pub spawner_pid: Option<Pid>,
     // ========== Terminal State ==========
-    pub terminal_state: Spinlock<terminal::TerminalState>,
+    pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
 
     // ========== Isolation Context ==========
     /// Box ID (0 = Host, >0 = Isolated Box)
@@ -1229,6 +1337,7 @@ impl Process {
 
         Ok(Self {
             pid,
+            pgid: pid,
             name: String::from(name),
             state: ProcessState::Ready,
             address_space,
@@ -1236,6 +1345,7 @@ impl Process {
             parent_pid: 0,
             brk,
             initial_brk: brk,
+            entry_point,
             memory,
             process_info_phys: process_info_frame.addr,
             // Command line arguments - initialized empty
@@ -1259,7 +1369,7 @@ impl Process {
             // Spawner PID - set when spawned by another process
             spawner_pid: None,
             // Terminal State - default for new processes
-            terminal_state: Spinlock::new(terminal::TerminalState::default()),
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
 
             // Isolation defaults: Host context (Box 0, root at /)
             box_id: 0,
@@ -1267,6 +1377,59 @@ impl Process {
             channel: None,
             delegate_pid: None,
         })
+    }
+
+    /// Replace current process image with a new ELF binary (execve core)
+    pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
+        // Reuse load_elf_with_stack to handle address space creation, ELF loading, and stack setup
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) = 
+            crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
+            .map_err(|_| "Failed to load ELF")?;
+            
+        // Deactivate old address space before dropping it (if it was active)
+        mmu::UserAddressSpace::deactivate();
+        
+        // Replace address space (old one is dropped here, freeing frames)
+        self.address_space = address_space;
+        self.entry_point = entry_point;
+        self.brk = brk;
+        self.initial_brk = brk;
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.args = args.to_vec();
+        
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+                self.pid, entry_point, brk, stack_bottom, stack_top, sp);
+        }
+
+        // Update context for the next run
+        self.context = UserContext::new(entry_point, sp);
+        
+        // Re-write process info page in the NEW address space
+        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+        
+        self.address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+            )
+            .map_err(|_| "Failed to map process info")?;
+            
+        self.address_space.track_user_frame(process_info_frame);
+        self.process_info_phys = process_info_frame.addr;
+
+        unsafe {
+            let info_ptr = mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+            core::ptr::write(info_ptr, info);
+        }
+
+        // Reset I/O state (but keep FDs and Channel!)
+        self.reset_io();
+        
+        Ok(())
     }
 
     /// Set command line arguments for this process
@@ -1432,57 +1595,40 @@ impl Drop for Process {
 /// Does not return.
 #[inline(never)]
 #[allow(dead_code)]
-unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
-    // SAFETY: This inline asm sets up CPU state and ERETs to user mode
+pub(crate) unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
+    // SAFETY: This inline asm sets up CPU state and ERETs to user mode.
+    // x30 is pinned as the context pointer and loaded last to avoid corruption.
     unsafe {
         core::arch::asm!(
-            // Set SP_EL0 (user stack pointer)
-            "msr sp_el0, {sp}",
-            // Set ELR_EL1 (return address = entry point)
+            // Set system registers from named operands (consumed before GP loads)
+            "msr sp_el0, {sp_user}",
             "msr elr_el1, {pc}",
-            // Set SPSR_EL1 (saved program status for EL0)
-            // SPSR = 0 means EL0, all interrupts enabled
             "msr spsr_el1, {spsr}",
-            // Set TPIDR_EL0 (thread pointer for TLS)
             "msr tpidr_el0, {tls}",
-            // Clear registers for clean start
-            "mov x0, #0",
-            "mov x1, #0",
-            "mov x2, #0",
-            "mov x3, #0",
-            "mov x4, #0",
-            "mov x5, #0",
-            "mov x6, #0",
-            "mov x7, #0",
-            "mov x8, #0",
-            "mov x9, #0",
-            "mov x10, #0",
-            "mov x11, #0",
-            "mov x12, #0",
-            "mov x13, #0",
-            "mov x14, #0",
-            "mov x15, #0",
-            "mov x16, #0",
-            "mov x17, #0",
-            "mov x18, #0",
-            "mov x19, #0",
-            "mov x20, #0",
-            "mov x21, #0",
-            "mov x22, #0",
-            "mov x23, #0",
-            "mov x24, #0",
-            "mov x25, #0",
-            "mov x26, #0",
-            "mov x27, #0",
-            "mov x28, #0",
-            "mov x29, #0",
-            "mov x30, #0",
-            // Jump to EL0
+            // Load x0-x29 from context struct (x30 = ctx pointer, stable throughout)
+            "ldp x0, x1, [x30]",
+            "ldp x2, x3, [x30, #16]",
+            "ldp x4, x5, [x30, #32]",
+            "ldp x6, x7, [x30, #48]",
+            "ldp x8, x9, [x30, #64]",
+            "ldp x10, x11, [x30, #80]",
+            "ldp x12, x13, [x30, #96]",
+            "ldp x14, x15, [x30, #112]",
+            "ldp x16, x17, [x30, #128]",
+            "ldp x18, x19, [x30, #144]",
+            "ldp x20, x21, [x30, #160]",
+            "ldp x22, x23, [x30, #176]",
+            "ldp x24, x25, [x30, #192]",
+            "ldp x26, x27, [x30, #208]",
+            "ldp x28, x29, [x30, #224]",
+            // Load x30 last (overwrites ctx pointer, no longer needed)
+            "ldr x30, [x30, #240]",
             "eret",
-            sp = in(reg) ctx.sp,
+            in("x30") ctx as *const UserContext,
+            sp_user = in(reg) ctx.sp,
             pc = in(reg) ctx.pc,
             spsr = in(reg) ctx.spsr,
-            tls = in(reg) ctx.tpidr_el0,
+            tls = in(reg) ctx.tpidr,
             options(noreturn)
         )
     }
@@ -1747,6 +1893,183 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 }
 
 
+pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
+    if let Some(ch) = get_child_channel(pid) {
+        if ch.has_exited() {
+            return Some((pid, ch.exit_code()));
+        }
+    }
+    None
+}
+
+/// Fork the current process (deep copy)
+/// Returns the new PID to the parent
+pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    let parent = current_process().ok_or("No current process")?;
+    let parent_pid = parent.pid;
+    
+    // 1. Create new address space
+    let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
+    
+    // 2. Allocate process info page
+    let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+    pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, child_pid);
+    
+    new_address_space
+        .map_page(
+            PROCESS_INFO_ADDR,
+            process_info_frame.addr,
+            mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+        )
+        .map_err(|_| "Failed to map process info")?;
+    new_address_space.track_user_frame(process_info_frame);
+
+    // 3. Create Process struct
+    let mut new_proc = Box::new(Process {
+        pid: child_pid,
+        pgid: parent.pgid,
+        name: parent.name.clone(),
+        parent_pid: parent_pid,
+        state: ProcessState::Ready,
+        context: UserContext::default(), // Will be updated below
+        address_space: new_address_space,
+        entry_point: parent.entry_point,
+        brk: parent.brk,
+        initial_brk: parent.initial_brk,
+        memory: parent.memory.clone(),
+        process_info_phys: process_info_frame.addr,
+        args: parent.args.clone(),
+        cwd: parent.cwd.clone(),
+        stdin: Spinlock::new(StdioBuffer::new()),
+        stdout: Spinlock::new(StdioBuffer::new()),
+        exited: false,
+        exit_code: 0,
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: parent.mmap_regions.clone(),
+        fd_table: Spinlock::new(parent.fd_table.lock().clone()),
+        next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
+        thread_id: None,
+        spawner_pid: parent.spawner_pid,
+        terminal_state: parent.terminal_state.clone(),
+        box_id: parent.box_id,
+        root_dir: parent.root_dir.clone(),
+        channel: parent.channel.clone(),
+        delegate_pid: None,
+    });
+    
+    // 4. Perform memory copy
+    let stack_top = 0x40000000;
+    let stack_size = config::USER_STACK_SIZE; 
+    let stack_start = stack_top - stack_size;
+    
+    // Helper to copy a range
+    fn copy_range(src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
+        let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+        for i in 0..pages {
+            let va = src_va + i * mmu::PAGE_SIZE;
+            if mmu::is_current_user_range_mapped(va, 1) {
+                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
+                 unsafe {
+                     let src_ptr = va as *const u8;
+                     let dest_ptr = mmu::phys_to_virt(frame.addr);
+                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
+                 }
+            }
+        }
+        Ok(())
+    }
+    
+    copy_range(stack_start, stack_size, &mut new_proc.address_space)?;
+    
+    if parent.brk > 0x400000 {
+        copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
+    }
+
+    // Also copy all mmap'd regions
+    for (va, frames) in &parent.mmap_regions {
+        copy_range(*va, frames.len() * mmu::PAGE_SIZE, &mut new_proc.address_space)?;
+    }
+    
+    // 5. Write ProcessInfo to child's process info page
+    unsafe {
+        let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
+        let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
+        core::ptr::write(info_ptr, info);
+    }
+
+    // 6. Capture parent's user context and create child context
+    let parent_tid = crate::threading::current_thread_id();
+    let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+    
+    let mut child_ctx = parent_ctx;
+    child_ctx.x0 = 0;    // fork returns 0 to child
+    child_ctx.spsr = 0;  // Clean EL0t with interrupts enabled
+    if stack_ptr != 0 {
+        child_ctx.sp = stack_ptr;
+    }
+
+    // Store context in the Process struct (entry_point_trampoline uses proc.context)
+    new_proc.context = child_ctx;
+
+    // 7. Allocate thread but keep it INITIALIZING
+    let tid = crate::threading::spawn_user_thread_initializing(
+        crate::process::entry_point_trampoline as extern "C" fn() -> !, 
+        core::ptr::null_mut(), 
+        false
+    )?;
+    
+    new_proc.thread_id = Some(tid);
+    crate::threading::update_thread_context(tid, &child_ctx);
+
+    // 8. Create a ProcessChannel for exit notification only.
+    // The child keeps parent.channel (set in struct init above) for I/O so its
+    // stdout writes are visible on the same SSH stream as the parent.
+    // The exit-tracking channel is separate to avoid contaminating the I/O channel.
+    let exit_channel = Arc::new(ProcessChannel::new());
+    register_channel(tid, exit_channel.clone());
+    register_child_channel(child_pid, exit_channel, parent_pid);
+
+    // Register process BEFORE marking thread READY
+    register_process(child_pid, new_proc);
+    
+    // Now safe to start the thread
+    crate::threading::mark_thread_ready(tid);
+    
+    Ok(child_pid)
+}
+
+/// Allocate a new unique PID (uses the same global counter as Process::from_elf)
+pub fn allocate_pid() -> Pid {
+    NEXT_PID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Trampoline for new process threads
+/// Called by threading::spawn_user_thread
+pub extern "C" fn entry_point_trampoline() -> ! {
+    let tid = crate::threading::current_thread_id();
+    let mut proc_ptr: *mut Process = core::ptr::null_mut();
+    
+    crate::irq::with_irqs_disabled(|| {
+        let mut processes = PROCESS_TABLE.lock();
+        for proc in processes.values_mut() {
+            if proc.thread_id == Some(tid) {
+                proc_ptr = &mut **proc as *mut Process;
+                break;
+            }
+        }
+    });
+    
+    if proc_ptr.is_null() {
+        crate::safe_print!(128, "[process] FATAL: No process found for thread {}\n", tid);
+        crate::threading::mark_current_terminated();
+        loop { crate::threading::yield_now(); }
+    }
+    
+    unsafe {
+        (*proc_ptr).run();
+    }
+}
+
 /// Execute an ELF binary from the filesystem with per-process I/O (blocking)
 ///
 /// This spawns the process on a user thread and polls for completion.
@@ -1768,6 +2091,12 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
     
+    // For non-interactive execution, if no stdin was provided, mark it as closed
+    // so the process doesn't block forever if it tries to read from it.
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
+
     // Poll until process exits (blocking)
     loop {
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
@@ -1895,16 +2224,36 @@ pub fn spawn_process_with_channel_ext(
     let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
-    // Create a channel for this process
+    // Always create a fresh channel per spawned process.
+    // Reusing the parent's channel would cause the child's set_exited() call
+    // to contaminate the parent's channel, leaking exit codes.
     let channel = Arc::new(ProcessChannel::new());
     
     // Seed the channel with initial stdin data if provided
     if let Some(data) = stdin {
         channel.write_stdin(data);
+        channel.close_stdin(); // Mark as closed since we've provided all data
     }
 
     // Set the channel in the process struct (UNIFIED I/O)
     process.channel = Some(channel.clone());
+
+    // Inherit terminal state from caller if available
+    if let Some(shared_state) = current_terminal_state() {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[Process] Inheriting shared terminal state at {:p} for PID {}\n", Arc::as_ptr(&shared_state), process.pid);
+        }
+        process.terminal_state = shared_state;
+        
+        // Auto-delegate foreground to the new process.
+        // For interactive spawns, the child should start in the foreground.
+        let pid_to_delegate = process.pid;
+        process.terminal_state.lock().foreground_pgid = pid_to_delegate;
+    } else {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[Process] NO shared terminal state found for caller thread {}, using default for PID {}\n", crate::threading::current_thread_id(), process.pid);
+        }
+    }
 
     // Save arguments in process struct for ProcessInfo page
     process.args = if let Some(arg_slice) = args {
@@ -2043,6 +2392,11 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
 
+    // For non-interactive execution, if no stdin was provided, mark it as closed
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
+
     // Wait for process to complete
     // Each iteration yields once (returns Pending) so block_on can yield to scheduler
     loop {
@@ -2108,6 +2462,11 @@ where
 {
     // Spawn process with channel and cwd
     let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+
+    // For non-interactive streaming, if no stdin was provided, mark it as closed
+    if stdin.is_none() {
+        channel.close_stdin();
+    }
 
     // Stream output until process exits
     loop {

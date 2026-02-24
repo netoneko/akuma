@@ -47,6 +47,7 @@ pub mod nr {
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGACTION: u64 = 134; // Linux arm64 rt_sigaction
+    pub const RT_SIGSUSPEND: u64 = 133;
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
@@ -82,6 +83,18 @@ pub mod nr {
     pub const FB_INIT: u64 = 321;
     pub const FB_DRAW: u64 = 322;
     pub const FB_INFO: u64 = 323;
+    pub const GETPID: u64 = 172;
+    pub const GETPPID: u64 = 173;
+    pub const GETUID: u64 = 174;
+    pub const GETEUID: u64 = 175;
+    pub const GETGID: u64 = 176;
+    pub const GETEGID: u64 = 177;
+    pub const GETTID: u64 = 178;
+    // Linux standard numbers
+    pub const KILL_LINUX: u64 = 129;
+    pub const SETPGID: u64 = 154;
+    pub const GETPGID: u64 = 155;
+    pub const SETSID: u64 = 157;
 }
 
 /// Thread CPU statistics for top command
@@ -283,7 +296,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
         nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::SPAWN => sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
-        nr::KILL => sys_kill(args[0] as u32),
+        nr::KILL => sys_kill(args[0] as u32, args[1] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
@@ -303,6 +316,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => 1, // Return dummy TID
         nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
+        nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
         nr::RT_SIGACTION => 0,    // Success (do nothing)
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
@@ -315,6 +329,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FB_INIT => sys_fb_init(args[0] as u32, args[1] as u32),
         nr::FB_DRAW => sys_fb_draw(args[0], args[1] as usize),
         nr::FB_INFO => sys_fb_info(args[0]),
+        nr::GETPID => sys_getpid(),
+        nr::GETPPID => sys_getppid(),
+        nr::GETUID => 0,
+        nr::GETEUID => sys_geteuid(),
+        nr::GETGID => 0,
+        nr::GETEGID => 0,
+        nr::GETTID => crate::threading::current_thread_id() as u64,
+        nr::KILL_LINUX => sys_kill(args[0] as u32, args[1] as u32),
+        nr::SETPGID => sys_setpgid(args[0] as u32, args[1] as u32),
+        nr::GETPGID => sys_getpgid(args[0] as u32),
+        nr::SETSID => sys_setsid(),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -328,6 +353,66 @@ fn sys_set_tpidr_el0(address: u64) -> u64 {
         core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) address);
     }
     0
+}
+
+fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
+    let target_pid = if pid == 0 {
+        match crate::process::read_current_pid() { Some(p) => p, None => return !0u64 }
+    } else {
+        pid
+    };
+
+    let target_pgid = if pgid == 0 { target_pid } else { pgid };
+
+    if let Some(proc) = crate::process::lookup_process(target_pid) {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, proc.pgid, target_pgid);
+        }
+        proc.pgid = target_pgid;
+        0
+    } else {
+        ENOENT
+    }
+}
+
+fn sys_getpgid(pid: u32) -> u64 {
+    let target_pid = if pid == 0 {
+        match crate::process::read_current_pid() { 
+            Some(p) => p, 
+            None => {
+                // System thread fallback: use TID as PGID
+                let tid = crate::threading::current_thread_id();
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] getpgid(0) kernel fallback: returning TID {}\n", tid);
+                }
+                return tid as u64;
+            }
+        }
+    } else {
+        pid
+    };
+
+    if let Some(proc) = crate::process::lookup_process(target_pid) {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
+            crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
+        }
+        proc.pgid as u64
+    } else {
+        // If it's a system thread (not in process table), return its TID
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] getpgid({}) not found: returning TID fallback {}\n", target_pid, target_pid);
+        }
+        target_pid as u64
+    }
+}
+
+fn sys_setsid() -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.pgid = proc.pid;
+        proc.pid as u64 // New SID is the PID
+    } else {
+        !0u64
+    }
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -346,6 +431,12 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCSETSW: u32 = 0x5403;
     const TCSETSF: u32 = 0x5404;
     const TIOCGWINSZ: u32 = 0x5413;
+    const TIOCGPGRP: u32 = 0x540f;
+    const TIOCSPGRP: u32 = 0x5410;
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
+    }
 
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     
@@ -354,7 +445,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         return (-(25i64)) as u64; // ENOTTY
     }
 
-    match cmd {
+    let result = match cmd {
         TCGETS => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
             let term_state_lock = match crate::process::current_terminal_state() {
@@ -388,6 +479,11 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 ts.cflag = *ptr.add(2);
                 ts.lflag = *ptr.add(3);
                 
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
+                        ts.iflag, ts.oflag, ts.cflag, ts.lflag);
+                }
+                
                 let cc_ptr = ptr.add(4) as *const u8;
                 core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
             }
@@ -404,29 +500,189 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCGWINSZ => {
             if !validate_user_ptr(arg, 8) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
             unsafe {
                 let ptr = arg as *mut u16;
-                *ptr.add(0) = 25; // rows
-                *ptr.add(1) = 80; // cols
+                *ptr.add(0) = ts.term_height; // rows
+                *ptr.add(1) = ts.term_width;  // cols
                 *ptr.add(2) = 0;  // xpixel
                 *ptr.add(3) = 0;  // ypixel
             }
             0
         }
+        TIOCGPGRP => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let ts = term_state_lock.lock();
+            unsafe {
+                let pgid = ts.foreground_pgid;
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
+                }
+                *(arg as *mut u32) = pgid;
+            }
+            0
+        }
+        TIOCSPGRP => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let term_state_lock = match crate::process::current_terminal_state() {
+                Some(state) => state,
+                None => return (-(12i64)) as u64, // ENOMEM
+            };
+            let mut ts = term_state_lock.lock();
+            unsafe {
+                let pgid = *(arg as *const u32);
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
+                }
+                ts.foreground_pgid = pgid;
+            }
+            0
+        }
         _ => (-(25i64)) as u64, // ENOTTY
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] ioctl result={}\n", result as i64);
     }
+    result
 }
 
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
+        crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
+    }
+
     match fd {
         crate::process::FileDescriptor::Stdin => {
-            let mut temp = alloc::vec![0u8; count];
-            let n = if let Some(ch) = crate::process::current_channel() { ch.read_stdin(&mut temp) } else { proc.read_stdin(&mut temp) };
-            if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
-            n as u64
+            let ch = match crate::process::current_channel() {
+                Some(c) => c,
+                None => {
+                    // Fallback for processes without a channel (unlikely in modern Akuma)
+                    let mut temp = alloc::vec![0u8; count];
+                    let n = proc.read_stdin(&mut temp);
+                    if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
+                    }
+                    return n as u64;
+                }
+            };
+
+            let mut kernel_buf = alloc::vec![0u8; count];
+            
+            // Blocking read loop
+            loop {
+                // Check for data first
+                let mut n = ch.read_stdin(&mut kernel_buf);
+                if n > 0 {
+                    // TTY Line Discipline: Input Processing
+                    let term_state_lock = crate::process::current_terminal_state();
+                    if let Some(ref ts_lock) = term_state_lock {
+                        let mut ts = ts_lock.lock();
+                        
+                        // 1. ICRNL: Map CR to NL on input
+                        if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
+                            for i in 0..n {
+                                if kernel_buf[i] == b'\r' {
+                                    kernel_buf[i] = b'\n';
+                                }
+                            }
+                        }
+
+                        // 2. ECHO: Echo characters back to the user (via stdout channel)
+                        if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
+                            // Map \n to \r\n for echo if ONLCR is set
+                            if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
+                                let mut echo_buf = Vec::with_capacity(n * 2);
+                                for i in 0..n {
+                                    if kernel_buf[i] == b'\n' {
+                                        echo_buf.extend_from_slice(b"\r\n");
+                                    } else {
+                                        echo_buf.push(kernel_buf[i]);
+                                    }
+                                }
+                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                                }
+                                ch.write(&echo_buf);
+                            } else {
+                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
+                                }
+                                ch.write(&kernel_buf[..n]);
+                            }
+                        }
+                    }
+
+                    unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        let mut snippet = [0u8; 32];
+                        let sn_len = n.min(32);
+                        snippet[..sn_len].copy_from_slice(&kernel_buf[..sn_len]);
+                        for byte in &mut snippet[..sn_len] {
+                            if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                        }
+                        let snippet_str = core::str::from_utf8(&snippet[..sn_len]).unwrap_or("...");
+                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes \"{}\"\n", n, snippet_str);
+                    }
+                    return n as u64;
+                }
+
+                // Check for EOF if channel is closed
+                if ch.is_stdin_closed() {
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) returned 0 (EOF)\n");
+                    }
+                    return 0; // EOF
+                }
+
+                // Check for interrupt
+                if crate::process::is_current_interrupted() {
+                    return EINTR;
+                }
+
+                // Register waker and block
+                let term_state_lock = match crate::process::current_terminal_state() {
+                    Some(state) => state,
+                    None => {
+                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                            crate::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
+                        }
+                        return 0;
+                    }
+                };
+
+                {
+                    crate::threading::disable_preemption();
+                    let mut term_state = term_state_lock.lock();
+                    let thread_id = crate::threading::current_thread_id();
+                    term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
+                    crate::threading::enable_preemption();
+                }
+
+                // Yield until woken by new input
+                crate::threading::schedule_blocking(u64::MAX);
+
+                // Clear waker
+                {
+                    crate::threading::disable_preemption();
+                    let mut term_state = term_state_lock.lock();
+                    term_state.input_waker.lock().take();
+                    crate::threading::enable_preemption();
+                }
+            }
         }
         crate::process::FileDescriptor::File(ref f) => {
             // Memory safety: Limit the amount of memory allocated in the kernel per syscall.
@@ -475,6 +731,19 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                let display_len = count.min(32);
+                let mut snippet = [0u8; 32];
+                let n = display_len.min(snippet.len());
+                snippet[..n].copy_from_slice(&buf[..n]);
+                // Simple printable check
+                for byte in &mut snippet[..n] {
+                    if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                }
+                let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+                crate::safe_print!(128, "[syscall] write(fd={}, count={}) \"{}\"\n", fd_num, count, snippet_str);
+            }
+
             // Write to process channel (for SSH)
             if let Some(ch) = crate::process::current_channel() {
                 let term_state_opt = crate::process::current_terminal_state();
@@ -778,13 +1047,42 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     }
 }
 
-fn sys_clone(flags: u64, _stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
+fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
     // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
     // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
-    if flags & 0x4000 != 0 {
-        // Return child PID (fake success)
-        // We handle the actual spawning in sys_execve
-        return 0x7FFFFFFF; 
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+    }
+
+    if flags & 0x4000 != 0 || flags & 0x11 == 0x11 {
+        // vfork-like clone: Create a copy of the current process
+        
+        let parent_proc = match crate::process::current_process() {
+            Some(p) => p,
+            None => return !0u64, // ENOSYS
+        };
+        
+        // Allocate new PID for the child
+        let child_pid = crate::process::allocate_pid();
+        
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
+        }
+
+        // Delegate to process::fork_process
+        match crate::process::fork_process(child_pid, stack) {
+            Ok(new_pid) => {
+                return new_pid as u64;
+            },
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
+                return !0u64; // EAGAIN
+            }
+        }
+    }
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone: flags not supported, returning ENOSYS\n");
     }
     ENOSYS
 }
@@ -844,49 +1142,108 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    let args_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
-    let cwd = crate::process::current_process().map(|p| p.cwd.clone());
-
-    match crate::process::spawn_process_with_channel_cwd(&resolved_path, Some(&args_refs), Some(&env), None, cwd.as_deref()) {
-        Ok((_tid, ch, pid)) => {
-            crate::process::register_child_channel(pid, ch);
-            pid as u64
+    // Load the ELF binary
+    let elf_data = match crate::fs::read_file(&resolved_path) {
+        Ok(data) => data,
+        Err(_) => {
+            crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+            return ENOENT;
         }
-        Err(e) => {
-            crate::safe_print!(128, "[syscall] execve: spawn failed for {}: {}\n", resolved_path, e);
-            ENOENT
-        },
+    };
+
+    // Perform in-place replacement
+    let mut proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
+    if let Err(e) = proc.replace_image(&elf_data, &args, &env) {
+        crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
+        return !0u64; // EINTERNAL
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
+    }
+
+    // Activate the new address space (replace_image deactivated the old one)
+    proc.address_space.activate();
+
+    // Now jump to the new entry point. This never returns.
+    unsafe {
+        crate::process::enter_user_mode(&proc.context);
     }
 }
 
-fn sys_wait4(pid: i32, status_ptr: u64, _options: i32, _rusage: u64) -> u64 {
-    // If pid is -1, wait for any child.
-    // If pid is 0x7FFFFFFF, it's our fake child PID from sys_clone.
-    let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
-        // Find any child channel that has exited
-        None // TODO: implement wait for ANY
-    } else if pid > 0 {
-        Some(pid as u32)
-    } else {
-        None
+fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
+    }
+
+    let wnohang = options & 1 != 0;
+
+    let current_pid = match crate::process::read_current_pid() {
+        Some(p) => p,
+        None => return (-libc_errno::ECHILD as i64) as u64,
     };
 
-    if let Some(p) = target_pid {
+    if pid > 0 {
+        // Wait for specific child
+        let p = pid as u32;
         if let Some(ch) = crate::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
-                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
-                        unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; }
+                    let code = ch.exit_code();
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", p, code);
                     }
+                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                        unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
+                    }
+                    crate::process::remove_child_channel(p);
                     return p as u64;
+                }
+
+                if wnohang {
+                    return 0;
                 }
                 crate::threading::yield_now();
             }
         }
+    } else if pid == -1 || pid == 0 {
+        // Wait for any child (pid=-1) or any child in same pgid (pid=0, treat same)
+        if !crate::process::has_children(current_pid) {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
+            }
+            return (-libc_errno::ECHILD as i64) as u64;
+        }
+
+        loop {
+            if let Some((child_pid, ch)) = crate::process::find_exited_child(current_pid) {
+                let code = ch.exit_code();
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", child_pid, code);
+                }
+                if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                    unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
+                }
+                crate::process::remove_child_channel(child_pid);
+                return child_pid as u64;
+            }
+
+            if wnohang {
+                return 0;
+            }
+            crate::threading::yield_now();
+        }
     }
-    
-    // Fallback if no child found (ECHILD)
-    0
+
+    // Fallback (ECHILD)
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
+    }
+    (-libc_errno::ECHILD as i64) as u64
 }
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
@@ -1193,8 +1550,8 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_
     };
 
     if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
-        crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
+            crate::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
@@ -1244,16 +1601,17 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
 
     // Call internal helper with extended options
     if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
-        crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
+            crate::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
     !0u64
 }
 
-fn sys_kill(pid: u32) -> u64 {
+fn sys_kill(pid: u32, _sig: u32) -> u64 {
     // Safety: prevent killing init or Box 0 implicitly if we add box killing logic here
+    if pid == 0 { return 0; } // Success for process group 0 (stub)
     if pid <= 1 { return !0u64; }
     if crate::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
 }
@@ -1618,4 +1976,20 @@ fn sys_fb_info(info_ptr: u64) -> u64 {
         }
         None => (-libc_errno::EIO as i64) as u64,
     }
+}
+
+fn sys_getpid() -> u64 {
+    crate::process::read_current_pid().map_or(!0u64, |pid| pid as u64)
+}
+
+fn sys_getppid() -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.parent_pid as u64
+    } else {
+        !0u64 // Return error if no current process
+    }
+}
+
+fn sys_geteuid() -> u64 {
+    0 // Return 0 for root/default user, as Akuma does not have robust user management yet.
 }

@@ -62,6 +62,9 @@ pub const MAX_THREADS: usize = 32;
 /// User processes can only spawn on threads RESERVED_THREADS through MAX_THREADS-1.
 pub const RESERVED_THREADS: usize = 8;
 
+/// Maximum number of user processes
+pub const MAX_PROCESSES: usize = 64;
+
 /// Stack size for reserved system threads (512KB)
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
@@ -196,10 +199,10 @@ pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // Option to disable copying stdout to kernel log
-pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
+pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
 
 /// Option to disable [syscall] debug prints to the kernel log.
-pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
+pub const SYSCALL_DEBUG_INFO_ENABLED: bool = true;
 
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;

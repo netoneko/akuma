@@ -35,6 +35,13 @@ static THREAD_STATES: [AtomicU8; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
+/// Per-thread current trap frame pointer (set during EL0 sync handler)
+/// Used by fork to capture full register state from the parent's trap frame.
+static CURRENT_TRAP_FRAME: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; config::MAX_THREADS]
+};
+
 /// Atomic wake times for WAITING threads - scheduler checks these
 /// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
 static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
@@ -129,9 +136,79 @@ pub fn mark_thread_terminated(idx: usize) {
 }
 
 /// Mark a thread as ready (lock-free)
-fn mark_thread_ready(idx: usize) {
+pub fn mark_thread_ready(idx: usize) {
     if idx < config::MAX_THREADS {
         THREAD_STATES[idx].store(thread_state::READY, Ordering::SeqCst);
+    }
+}
+
+/// Spawn a user thread but keep it in INITIALIZING state
+pub fn spawn_user_thread_initializing(
+    trampoline_fn: extern "C" fn() -> !,
+    data_ptr: *mut (),
+    cooperative: bool
+) -> Result<usize, &'static str> {
+    let trampoline_casted = unsafe {
+        core::mem::transmute::<extern "C" fn() -> !, fn(*mut ()) -> !>(trampoline_fn)
+    };
+    
+    with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_user_closure_initializing(trampoline_casted, data_ptr, cooperative)
+    })
+}
+
+impl ThreadPool {
+    /// Internal helper to spawn a user closure without marking it READY
+    pub fn spawn_user_closure_initializing(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+        cooperative: bool,
+    ) -> Result<usize, &'static str> {
+        if !self.initialized { return Err("Thread pool not initialized"); }
+
+        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
+                // Claim the slot atomically
+                if THREAD_STATES[i].compare_exchange(thread_state::FREE, thread_state::INITIALIZING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                    continue;
+                }
+
+                let stack = &self.stacks[i];
+                let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
+                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+
+                let sp = setup_fake_irq_frame(
+                    stack_top,
+                    thread_start_closure as *const () as u64,
+                    trampoline_fn as *const () as u64,
+                    closure_ptr as u64,
+                    0,
+                );
+
+                unsafe {
+                    let ctx = &mut *get_context_mut(i);
+                    ctx.magic = CONTEXT_MAGIC;
+                    ctx.sp = sp;
+                    ctx.ttbr0 = boot_ttbr0;
+                    ctx.x19 = trampoline_fn as *const () as u64;
+                    ctx.x20 = closure_ptr as u64;
+                    ctx.x30 = thread_start_closure as *const () as u64;
+                    ctx.elr = thread_start_closure as *const () as u64;
+                    ctx.spsr = 0x00000345;
+                    ctx.is_user_process = 1; // Mark as user process thread
+                }
+
+                self.slots[i].cooperative = cooperative;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
+
+                // NOTE: We do NOT store READY here. Caller must call mark_thread_ready().
+                return Ok(i);
+            }
+        }
+        Err("No free user thread slots")
     }
 }
 
@@ -1355,6 +1432,7 @@ impl ThreadPool {
                     ctx.x30 = thread_start_closure as *const () as u64;
                     ctx.elr = thread_start_closure as *const () as u64;
                     ctx.spsr = 0x00000345;
+                    ctx.is_user_process = 1; // Mark as user process thread
                 }
 
                 self.slots[i].cooperative = cooperative;
@@ -1995,6 +2073,47 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     0  // No switch needed
 }
 
+/// Update a thread's context for a new execution (e.g., after execve or fork)
+pub fn update_thread_context(thread_id: usize, user_context: &crate::process::UserContext) {
+    // Disable IRQs to safely access context
+    crate::irq::with_irqs_disabled(|| {
+        unsafe {
+            let ctx = &mut *get_context_mut(thread_id);
+            
+            // Update context fields that are directly in Context struct
+            ctx.elr = user_context.pc;
+            // ctx.sp points to the kernel stack top (where the trap frame is).
+            // We generally don't change ctx.sp for fork(), we want to keep the stack frame.
+            // But for execve(), we might want to reset it?
+            // For fork(), the thread is NEW, so ctx.sp points to the fake frame we just built.
+            // We should NOT change ctx.sp to user_context.sp (which is a user stack pointer!).
+            
+            ctx.spsr = user_context.spsr;
+            ctx.ttbr0 = user_context.ttbr0;
+            
+            ctx.user_entry = user_context.pc;
+            ctx.user_sp = user_context.sp;
+            ctx.user_tls = user_context.tpidr;
+            ctx.is_user_process = 1;
+            
+            // Update registers in the trap frame on the stack
+            // The trap frame is at ctx.sp
+            let frame_ptr = ctx.sp as *mut u64;
+            
+            // Frame layout from setup_fake_irq_frame / IRQ handler:
+            // [sp+224]: x0, x1
+            frame_ptr.add(224/8).write_volatile(user_context.x0);
+            frame_ptr.add(232/8).write_volatile(user_context.x1);
+            
+            // We can update other registers if needed, but for fork() x0=0 is the main one.
+            // The trap frame has 0 for others by default (from setup_fake_irq_frame).
+            // If we want to copy all registers from parent (for full fork), we should do it here.
+            // But UserContext only has x0-x30 if we added them.
+            // For now, updating x0 is sufficient for vfork return value.
+        }
+    });
+}
+
 // ============================================================================
 // Waker Integration
 // ============================================================================
@@ -2446,6 +2565,7 @@ where
             ctx.x30 = thread_start_closure as *const () as u64;
             ctx.elr = thread_start_closure as *const () as u64;
             ctx.spsr = 0x00000345; // EL1h, IRQs enabled
+            ctx.is_user_process = if start_irqs_disabled { 1 } else { 0 };
         }
 
         // Write slot metadata (needs POOL lock)
@@ -2498,6 +2618,113 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
         thread_state::TERMINATED => ThreadState::Terminated,
         thread_state::INITIALIZING => ThreadState::Ready, // Treat as ready for display
         _ => ThreadState::Free,
+    })
+}
+
+/// Save the current trap frame pointer for a thread.
+/// Called at the start of EL0 sync handler so fork can read full register state.
+pub fn set_current_trap_frame(frame: *const crate::exceptions::UserTrapFrame) {
+    let tid = current_thread_id();
+    if tid < config::MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].store(frame as u64, Ordering::Release);
+    }
+}
+
+/// Clear the current trap frame pointer for a thread.
+pub fn clear_current_trap_frame() {
+    let tid = current_thread_id();
+    if tid < config::MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].store(0, Ordering::Release);
+    }
+}
+
+/// Get the saved user context for a thread.
+/// Used by fork() to duplicate the parent's state.
+/// Reads from the live trap frame on the stack when available (captures all registers).
+pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
+    if thread_id >= config::MAX_THREADS {
+        return None;
+    }
+
+    // If this is the current thread and we have a live trap frame, use it for full register state
+    if thread_id == current_thread_id() {
+        let frame_ptr = CURRENT_TRAP_FRAME[thread_id].load(Ordering::Acquire);
+        if frame_ptr != 0 {
+            let frame = unsafe { &*(frame_ptr as *const crate::exceptions::UserTrapFrame) };
+            let ctx = unsafe { &*get_context(thread_id) };
+            let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() };
+
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
+                    thread_id, frame.elr_el1, frame.sp_el0);
+            }
+            return Some(crate::process::UserContext {
+                x0: frame.x0, x1: frame.x1, x2: frame.x2, x3: frame.x3,
+                x4: frame.x4, x5: frame.x5, x6: frame.x6, x7: frame.x7,
+                x8: frame.x8, x9: frame.x9, x10: frame.x10, x11: frame.x11,
+                x12: frame.x12, x13: frame.x13, x14: frame.x14, x15: frame.x15,
+                x16: frame.x16, x17: frame.x17, x18: frame.x18, x19: frame.x19,
+                x20: frame.x20, x21: frame.x21, x22: frame.x22, x23: frame.x23,
+                x24: frame.x24, x25: frame.x25, x26: frame.x26, x27: frame.x27,
+                x28: frame.x28, x29: frame.x29, x30: frame.x30,
+                sp: frame.sp_el0,
+                pc: frame.elr_el1,
+                spsr: 0, // Always clean EL0t for child processes
+                tpidr: frame.tpidr_el0,
+                ttbr0,
+            });
+        }
+    }
+    
+    // Fallback to saved context fields (less accurate, no GP registers)
+    crate::irq::with_irqs_disabled(|| {
+        let ctx = unsafe { &*get_context(thread_id) };
+        
+        if ctx.is_user_process != 0 {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
+            }
+            Some(crate::process::UserContext {
+                pc: ctx.user_entry,
+                sp: ctx.user_sp,
+                tpidr: ctx.user_tls,
+                spsr: 0,
+                ttbr0: if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() },
+                x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
+                x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
+                x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
+                x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+            })
+        } else {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process\n", thread_id);
+            }
+            None
+        }
+    })
+}
+
+/// Spawn a user thread with a specific trampoline and data pointer
+/// Used by fork_process to spawn the child thread
+pub fn spawn_user_thread(
+    trampoline_fn: extern "C" fn() -> !,
+    data_ptr: *mut (), // Passed as x0 to trampoline? No, entry_point_trampoline takes no args
+    cooperative: bool
+) -> Result<usize, &'static str> {
+    // We reuse spawn_user_closure but cast our function
+    // entry_point_trampoline doesn't take args, so data_ptr is ignored by it
+    // but spawn_user_closure expects a function taking *mut ()
+    
+    let trampoline_casted = unsafe {
+        core::mem::transmute::<
+            extern "C" fn() -> !,
+            fn(*mut ()) -> !
+        >(trampoline_fn)
+    };
+    
+    with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_user_closure(trampoline_casted, data_ptr, cooperative)
     })
 }
 

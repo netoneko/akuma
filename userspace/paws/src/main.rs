@@ -114,7 +114,43 @@ fn execute_single_command(line: &str) {
         "find" => cmd_find(&args),
         "grep" => cmd_grep(&args),
         "top" => execute_external(&args), // Use external top if available
+        "dash" | "sh" => execute_external_reattach(&args),
         _ => execute_external(&args),
+    }
+}
+
+fn execute_external_reattach(args: &[String]) {
+    let path = find_bin(&args[0]);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    
+    // Debug: print arguments
+    print("paws: executing (reattach) ");
+    print(&path);
+    for arg in arg_refs.iter().skip(1) {
+        print(" ");
+        print(arg);
+    }
+    println("");
+
+    if let Some(res) = spawn(&path, Some(&arg_refs)) {
+        // Delegate our I/O to the child
+        reattach(res.pid);
+        
+        // Wait for child to exit
+        loop {
+            if let Some((_, exit_code)) = waitpid(res.pid) {
+                print("paws: process ");
+                print(&path);
+                print(" exited with status ");
+                print_dec(exit_code as usize);
+                println("");
+                break;
+            }
+            sleep_ms(10);
+        }
+    } else {
+        print("paws: command not found: ");
+        println(&args[0]);
     }
 }
 
