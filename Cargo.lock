@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "akuma"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes",
  "arm_pl031",
