@@ -516,30 +516,35 @@ impl ProcessChannel {
     /// Write data to the channel buffer (stdout from process)
     pub fn write(&self, data: &[u8]) {
         if data.is_empty() { return; }
+
+        // Copy data from userspace BEFORE the critical section
+        // to prevent page faults while holding a spinlock.
+        let mut kernel_copy = Vec::with_capacity(data.len());
+        kernel_copy.extend_from_slice(data);
+
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            let sn_len = data.len().min(32);
+            let sn_len = kernel_copy.len().min(32);
             let mut snippet = [0u8; 32];
             let n = sn_len.min(snippet.len());
-            snippet[..n].copy_from_slice(&data[..n]);
+            snippet[..n].copy_from_slice(&kernel_copy[..n]);
             for byte in &mut snippet[..n] {
                 if *byte < 32 || *byte > 126 { *byte = b'.'; }
             }
             let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-            crate::safe_print!(128, "[ProcessChannel] Write {} bytes to stdout \"{}\"\n", data.len(), snippet_str);
+            crate::safe_print!(128, "[ProcessChannel] Write {} bytes to stdout \"{}\"\n", kernel_copy.len(), snippet_str);
         }
 
         // CRITICAL: Disable IRQs while holding the lock!
-        // If timer fires while locked, another thread accessing channel = deadlock.
         crate::irq::with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             
             // Check for buffer overflow
-            if buf.len() + data.len() > MAX_BUFFER_SIZE {
+            if buf.len() + kernel_copy.len() > MAX_BUFFER_SIZE {
                 // If the write itself is larger than the buffer, truncate it
-                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
-                    &data[data.len() - MAX_BUFFER_SIZE..]
+                let data_to_write = if kernel_copy.len() > MAX_BUFFER_SIZE {
+                    &kernel_copy[kernel_copy.len() - MAX_BUFFER_SIZE..]
                 } else {
-                    data
+                    &kernel_copy
                 };
                 
                 // Remove old data to make room
@@ -550,7 +555,7 @@ impl ProcessChannel {
                 }
                 buf.extend(data_to_write);
             } else {
-                buf.extend(data);
+                buf.extend(&kernel_copy);
             }
         })
     }
@@ -1995,11 +2000,13 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.thread_id = Some(tid);
     crate::threading::update_thread_context(tid, &child_ctx);
 
-    // 8. Create a ProcessChannel for exit notification
-    let child_channel = Arc::new(ProcessChannel::new());
-    new_proc.channel = Some(child_channel.clone());
-    register_channel(tid, child_channel.clone());
-    register_child_channel(child_pid, child_channel);
+    // 8. Create a ProcessChannel for exit notification only.
+    // The child keeps parent.channel (set in struct init above) for I/O so its
+    // stdout writes are visible on the same SSH stream as the parent.
+    // The exit-tracking channel is separate to avoid contaminating the I/O channel.
+    let exit_channel = Arc::new(ProcessChannel::new());
+    register_channel(tid, exit_channel.clone());
+    register_child_channel(child_pid, exit_channel);
 
     // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);
@@ -2196,7 +2203,9 @@ pub fn spawn_process_with_channel_ext(
     let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
         .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
 
-    // Create a channel for this process
+    // Always create a fresh channel per spawned process.
+    // Reusing the parent's channel would cause the child's set_exited() call
+    // to contaminate the parent's channel, leaking exit codes.
     let channel = Arc::new(ProcessChannel::new());
     
     // Seed the channel with initial stdin data if provided
@@ -2209,7 +2218,7 @@ pub fn spawn_process_with_channel_ext(
     process.channel = Some(channel.clone());
 
     // Inherit terminal state from caller if available
-    if let Some(shared_state) = get_terminal_state(crate::threading::current_thread_id()) {
+    if let Some(shared_state) = current_terminal_state() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[Process] Inheriting shared terminal state at {:p} for PID {}\n", Arc::as_ptr(&shared_state), process.pid);
         }
