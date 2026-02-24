@@ -253,11 +253,78 @@ These counters ran independently and eventually assigned the same PID values to 
 
 **Fix (`src/syscall.rs`):** Added `proc.address_space.activate()` in `sys_execve` after `replace_image` and before `enter_user_mode`.
 
-### 9.7. Summary of Changes
+### 9.7. Bug: Exit Code Contamination via Shared ProcessChannel
+
+**Symptom:** After running `elftest` (which exits with code 42), every subsequent command showed `[exit code: 42]` immediately—even interactive programs like `dash` and `hello`. Programs appeared to exit instantly with stale exit codes from prior runs.
+
+**Root Cause:** `spawn_process_with_channel_ext` reused the calling process's `ProcessChannel` via `current_channel()`:
+
+```rust
+let channel = if let Some(parent_channel) = current_channel() {
+    parent_channel  // shared Arc to the SSH shell's channel
+} else {
+    Arc::new(ProcessChannel::new())
+};
+```
+
+This same `Arc<ProcessChannel>` was:
+1. Set as the child's `proc.channel` (for I/O).
+2. Registered in `PROCESS_CHANNELS[child_tid]` (for exit tracking).
+3. Returned to the caller (SSH `interactive_bridge`).
+
+When the child exited, `return_to_kernel` called `remove_channel(child_tid)` and then `channel.set_exited(42)`. Since this was the *same Arc* as the SSH shell's channel, the shell's channel was permanently marked as exited. Every subsequent spawn inherited this contaminated channel, and the `interactive_bridge` immediately saw `has_exited()=true`.
+
+**Fix (`src/process.rs`):** Changed `spawn_process_with_channel_ext` to always create a fresh `ProcessChannel` per spawn instead of reusing the parent's. Each process now has its own exit-tracking channel that cannot contaminate the parent.
+
+### 9.8. Bug: Forked Child Output Invisible
+
+**Symptom:** After fork+execve, the child process (e.g., `/bin/cat`) wrote to stdout successfully (`[ProcessChannel] Write 84 bytes`), but the output never appeared on the SSH terminal.
+
+**Root Cause:** In `fork_process`, the exit-tracking channel was also assigned as the child's I/O channel:
+
+```rust
+let exit_channel = Arc::new(ProcessChannel::new());
+new_proc.channel = Some(exit_channel.clone());  // overwrites parent's channel
+```
+
+This replaced the parent's channel (which the SSH `interactive_bridge` was polling) with a fresh channel that nobody read from. The child's stdout writes went into this orphaned buffer.
+
+**Fix (`src/process.rs`):** Removed the `new_proc.channel = Some(exit_channel.clone())` line. The child keeps `channel: parent.channel.clone()` from the struct initializer, so its stdout writes go to the same channel the `interactive_bridge` reads. The exit-tracking channel is only registered in `PROCESS_CHANNELS` (for `return_to_kernel` to call `set_exited()`) and `CHILD_CHANNELS` (for the parent's `wait4` to check exit status).
+
+### 9.9. Bug: `wait4(pid=-1)` Not Implemented
+
+**Symptom:** After fork+execve via dash, the child ran and exited successfully, but dash never resumed. No prompt appeared and no further syscalls were logged from the parent.
+
+**Root Cause:** `sys_wait4` had a TODO for the `pid=-1` (wait-for-any-child) case:
+
+```rust
+let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
+    None // TODO: implement wait for ANY
+} else if pid > 0 {
+    Some(pid as u32)
+} else {
+    None
+};
+```
+
+With `target_pid=None`, the function fell through immediately and returned `0`. Dash called `waitpid(-1, WUNTRACED)` (a blocking wait) and received `0`, which it interpreted as an error or no-op. Dash then entered a state where it could not reap its child or return to its prompt.
+
+Additionally, `CHILD_CHANNELS` only stored `BTreeMap<Pid, Arc<ProcessChannel>>` with no record of which parent owned each child, making it impossible to answer "find any exited child of process P."
+
+**Fix (`src/process.rs`, `src/syscall.rs`, `src/socket.rs`):**
+
+1. Extended `CHILD_CHANNELS` from `BTreeMap<Pid, Arc<ProcessChannel>>` to `BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>` where the second `Pid` is the parent. Updated `register_child_channel` to accept a `parent_pid` parameter.
+2. Added `find_exited_child(parent_pid)` — scans `CHILD_CHANNELS` for any entry whose parent matches and whose channel reports `has_exited()`.
+3. Added `has_children(parent_pid)` — checks if any children are registered for the given parent.
+4. Rewrote `sys_wait4` for `pid=-1`: if no children exist, return `-ECHILD`. Otherwise, loop calling `find_exited_child()` with `yield_now()` between iterations (or return `0` immediately if `WNOHANG` is set). On finding an exited child, write the status, call `remove_child_channel`, and return the child PID.
+5. Added `ECHILD=10` to `libc_errno` constants.
+
+### 9.10. Summary of Changes
 
 | File | Change |
 |------|--------|
 | `src/threading.rs` | Added `CURRENT_TRAP_FRAME` per-thread storage, `set_current_trap_frame`, `clear_current_trap_frame`. Rewrote `get_saved_user_context` to read from live trap frame with full register capture. Both paths enforce `spsr = 0`. |
 | `src/exceptions.rs` | In `rust_sync_el0_handler`, save trap frame pointer at SVC entry, clear it before return. |
-| `src/process.rs` | Rewrote `enter_user_mode` to load GP registers from `UserContext` (pinning ctx to x30) instead of zeroing them. In `fork_process`: write `ProcessInfo` to child's info page; set `new_proc.context = child_ctx`; enforce `child_ctx.spsr = 0`. Unified `allocate_pid()` to use the single module-level PID counter. |
-| `src/syscall.rs` | In `sys_execve`: activate new address space after `replace_image` before entering user mode. |
+| `src/process.rs` | Rewrote `enter_user_mode` to load GP registers from `UserContext` instead of zeroing them. In `fork_process`: write `ProcessInfo` to child's info page; set `new_proc.context = child_ctx`; enforce `child_ctx.spsr = 0`; create exit-tracking channel separate from I/O channel. Unified `allocate_pid()` to use the single module-level PID counter. Always create fresh `ProcessChannel` per spawn. Extended `CHILD_CHANNELS` to track parent PID; added `find_exited_child()` and `has_children()`. |
+| `src/syscall.rs` | In `sys_execve`: activate new address space after `replace_image` before entering user mode. Implemented `wait4(pid=-1)` with blocking scan over `CHILD_CHANNELS`. Updated `sys_spawn`/`sys_spawn_ext` to pass parent PID to `register_child_channel`. |
+| `src/socket.rs` | Added `ECHILD=10` to `libc_errno`. |
