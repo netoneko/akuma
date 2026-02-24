@@ -29,6 +29,7 @@ MEMBERS=(
     "make"
     "sshd"
     "dash"
+    "ubase"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -43,6 +44,17 @@ for member in "${MEMBERS[@]}"; do
             echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
         else
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
+        fi
+    fi
+    # Special handling for ubase to copy its package archive
+    if [ "$member" == "ubase" ]; then
+        UBASE_ARCHIVE="ubase/dist/ubase.tar"
+        if [ -f "$UBASE_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$UBASE_ARCHIVE" ../bootstrap/archives/ubase.tar
+            echo "Copied $UBASE_ARCHIVE to ../bootstrap/archives/ubase.tar"
+        else
+            echo "Warning: ubase archive not found at $UBASE_ARCHIVE"
         fi
     fi
 done

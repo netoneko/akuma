@@ -27,7 +27,8 @@ members = [
     "tar",
     "sshd",
     "make",
-    "dash"
+    "dash",
+    "ubase"
 ]
 
 [profile.dev]

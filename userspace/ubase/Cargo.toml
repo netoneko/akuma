@@ -1,0 +1,11 @@
+[package]
+name = "ubase"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+
+[build-dependencies]
+cc = "1.0"
