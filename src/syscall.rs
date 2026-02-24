@@ -1164,6 +1164,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
     }
 
+    // Activate the new address space (replace_image deactivated the old one)
+    proc.address_space.activate();
+
     // Now jump to the new entry point. This never returns.
     unsafe {
         crate::process::enter_user_mode(&proc.context);

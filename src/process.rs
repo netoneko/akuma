@@ -1570,53 +1570,36 @@ impl Drop for Process {
 #[inline(never)]
 #[allow(dead_code)]
 pub(crate) unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
-    // SAFETY: This inline asm sets up CPU state and ERETs to user mode
+    // SAFETY: This inline asm sets up CPU state and ERETs to user mode.
+    // x30 is pinned as the context pointer and loaded last to avoid corruption.
     unsafe {
         core::arch::asm!(
-            // Set SP_EL0 (user stack pointer)
-            "msr sp_el0, {sp}",
-            // Set ELR_EL1 (return address = entry point)
+            // Set system registers from named operands (consumed before GP loads)
+            "msr sp_el0, {sp_user}",
             "msr elr_el1, {pc}",
-            // Set SPSR_EL1 (saved program status for EL0)
-            // SPSR = 0 means EL0, all interrupts enabled
             "msr spsr_el1, {spsr}",
-            // Set TPIDR_EL0 (thread pointer for TLS)
             "msr tpidr_el0, {tls}",
-            // Clear registers for clean start
-            "mov x0, #0",
-            "mov x1, #0",
-            "mov x2, #0",
-            "mov x3, #0",
-            "mov x4, #0",
-            "mov x5, #0",
-            "mov x6, #0",
-            "mov x7, #0",
-            "mov x8, #0",
-            "mov x9, #0",
-            "mov x10, #0",
-            "mov x11, #0",
-            "mov x12, #0",
-            "mov x13, #0",
-            "mov x14, #0",
-            "mov x15, #0",
-            "mov x16, #0",
-            "mov x17, #0",
-            "mov x18, #0",
-            "mov x19, #0",
-            "mov x20, #0",
-            "mov x21, #0",
-            "mov x22, #0",
-            "mov x23, #0",
-            "mov x24, #0",
-            "mov x25, #0",
-            "mov x26, #0",
-            "mov x27, #0",
-            "mov x28, #0",
-            "mov x29, #0",
-            "mov x30, #0",
-            // Jump to EL0
+            // Load x0-x29 from context struct (x30 = ctx pointer, stable throughout)
+            "ldp x0, x1, [x30]",
+            "ldp x2, x3, [x30, #16]",
+            "ldp x4, x5, [x30, #32]",
+            "ldp x6, x7, [x30, #48]",
+            "ldp x8, x9, [x30, #64]",
+            "ldp x10, x11, [x30, #80]",
+            "ldp x12, x13, [x30, #96]",
+            "ldp x14, x15, [x30, #112]",
+            "ldp x16, x17, [x30, #128]",
+            "ldp x18, x19, [x30, #144]",
+            "ldp x20, x21, [x30, #160]",
+            "ldp x22, x23, [x30, #176]",
+            "ldp x24, x25, [x30, #192]",
+            "ldp x26, x27, [x30, #208]",
+            "ldp x28, x29, [x30, #224]",
+            // Load x30 last (overwrites ctx pointer, no longer needed)
+            "ldr x30, [x30, #240]",
             "eret",
-            sp = in(reg) ctx.sp,
+            in("x30") ctx as *const UserContext,
+            sp_user = in(reg) ctx.sp,
             pc = in(reg) ctx.pc,
             spsr = in(reg) ctx.spsr,
             tls = in(reg) ctx.tpidr,
@@ -1976,17 +1959,28 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
     }
     
-    // 5. Spawn Thread
+    // 5. Write ProcessInfo to child's process info page
+    unsafe {
+        let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
+        let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
+        core::ptr::write(info_ptr, info);
+    }
+
+    // 6. Capture parent's user context and create child context
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
     
     let mut child_ctx = parent_ctx;
-    child_ctx.x0 = 0; // Return 0 to child
+    child_ctx.x0 = 0;    // fork returns 0 to child
+    child_ctx.spsr = 0;  // Clean EL0t with interrupts enabled
     if stack_ptr != 0 {
         child_ctx.sp = stack_ptr;
     }
 
-    // Allocate thread but keep it INITIALIZING
+    // Store context in the Process struct (entry_point_trampoline uses proc.context)
+    new_proc.context = child_ctx;
+
+    // 7. Allocate thread but keep it INITIALIZING
     let tid = crate::threading::spawn_user_thread_initializing(
         crate::process::entry_point_trampoline as extern "C" fn() -> !, 
         core::ptr::null_mut(), 
@@ -2005,9 +1999,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     Ok(child_pid)
 }
 
-/// Allocate a new unique PID
+/// Allocate a new unique PID (uses the same global counter as Process::from_elf)
 pub fn allocate_pid() -> Pid {
-    static NEXT_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(20);
     NEXT_PID.fetch_add(1, Ordering::SeqCst)
 }
 

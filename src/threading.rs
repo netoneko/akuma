@@ -35,6 +35,13 @@ static THREAD_STATES: [AtomicU8; config::MAX_THREADS] = {
     [INIT; config::MAX_THREADS]
 };
 
+/// Per-thread current trap frame pointer (set during EL0 sync handler)
+/// Used by fork to capture full register state from the parent's trap frame.
+static CURRENT_TRAP_FRAME: [AtomicU64; config::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; config::MAX_THREADS]
+};
+
 /// Atomic wake times for WAITING threads - scheduler checks these
 /// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
 static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
@@ -2614,30 +2621,75 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
     })
 }
 
-/// Get the saved user context for a thread
-/// Used by fork() to duplicate the parent's state
+/// Save the current trap frame pointer for a thread.
+/// Called at the start of EL0 sync handler so fork can read full register state.
+pub fn set_current_trap_frame(frame: *const crate::exceptions::UserTrapFrame) {
+    let tid = current_thread_id();
+    if tid < config::MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].store(frame as u64, Ordering::Release);
+    }
+}
+
+/// Clear the current trap frame pointer for a thread.
+pub fn clear_current_trap_frame() {
+    let tid = current_thread_id();
+    if tid < config::MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].store(0, Ordering::Release);
+    }
+}
+
+/// Get the saved user context for a thread.
+/// Used by fork() to duplicate the parent's state.
+/// Reads from the live trap frame on the stack when available (captures all registers).
 pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
     if thread_id >= config::MAX_THREADS {
         return None;
     }
+
+    // If this is the current thread and we have a live trap frame, use it for full register state
+    if thread_id == current_thread_id() {
+        let frame_ptr = CURRENT_TRAP_FRAME[thread_id].load(Ordering::Acquire);
+        if frame_ptr != 0 {
+            let frame = unsafe { &*(frame_ptr as *const crate::exceptions::UserTrapFrame) };
+            let ctx = unsafe { &*get_context(thread_id) };
+            let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() };
+
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
+                    thread_id, frame.elr_el1, frame.sp_el0);
+            }
+            return Some(crate::process::UserContext {
+                x0: frame.x0, x1: frame.x1, x2: frame.x2, x3: frame.x3,
+                x4: frame.x4, x5: frame.x5, x6: frame.x6, x7: frame.x7,
+                x8: frame.x8, x9: frame.x9, x10: frame.x10, x11: frame.x11,
+                x12: frame.x12, x13: frame.x13, x14: frame.x14, x15: frame.x15,
+                x16: frame.x16, x17: frame.x17, x18: frame.x18, x19: frame.x19,
+                x20: frame.x20, x21: frame.x21, x22: frame.x22, x23: frame.x23,
+                x24: frame.x24, x25: frame.x25, x26: frame.x26, x27: frame.x27,
+                x28: frame.x28, x29: frame.x29, x30: frame.x30,
+                sp: frame.sp_el0,
+                pc: frame.elr_el1,
+                spsr: 0, // Always clean EL0t for child processes
+                tpidr: frame.tpidr_el0,
+                ttbr0,
+            });
+        }
+    }
     
+    // Fallback to saved context fields (less accurate, no GP registers)
     crate::irq::with_irqs_disabled(|| {
-        let ctx_ptr = get_context(thread_id);
-        let ctx = unsafe { &*ctx_ptr };
+        let ctx = unsafe { &*get_context(thread_id) };
         
-        // Only return if it looks like a valid user context
         if ctx.is_user_process != 0 {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[threading] get_saved_user_context: captured context for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
+                crate::safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
             }
             Some(crate::process::UserContext {
                 pc: ctx.user_entry,
                 sp: ctx.user_sp,
                 tpidr: ctx.user_tls,
-                spsr: ctx.spsr,
+                spsr: 0,
                 ttbr0: if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() },
-                // General purpose registers are not fully tracked in UserContext struct yet
-                // but for fork() we primarily need PC/SP/SPSR/TTBR0.
                 x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
                 x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
                 x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
@@ -2645,8 +2697,7 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
             })
         } else {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process (magic={:#x}, is_user={})\n", 
-                    thread_id, ctx.magic, ctx.is_user_process);
+                crate::safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process\n", thread_id);
             }
             None
         }

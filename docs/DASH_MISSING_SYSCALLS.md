@@ -190,3 +190,74 @@ The core problem was subtly different from an EL mismatch. The child thread, eve
 To resolve this, the `spsr` field in the child's `UserContext` is now explicitly set to `0x0` (representing EL0t with all interrupts enabled) within `get_saved_user_context` in `src/threading.rs`. This guarantees that all forked child processes begin their execution in a clean, predictable state, irrespective of the parent's current `SPSR` during the `clone` syscall.
 
 This ensures that the CPU returns to a proper EL0 context, preventing the `Instruction abort from EL0 at FAR=0x0` error and allowing forked processes to execute their initial instructions successfully.
+
+## 9. Fork Context and Trap Frame Bugs (`elftest` Crashes)
+
+After the initial `execve`/`fork` implementation (sections 7–8), the `elftest` utility's "Linux Spawn" path (vfork+execve via `clone(0x4111)`) continued to crash with `Instruction abort from EL0 at FAR=0x0, ISS=0x7`. Three distinct bugs were identified and fixed.
+
+### 9.1. Bug: Child Process Context Was All Zeros
+
+**Symptom:** The forked child immediately faulted at address `0x0` despite the parent having valid code at its expected PC.
+
+**Root Cause:** `fork_process` created the child `Process` with `context: UserContext::default()` (all fields zero). The child thread's trampoline (`entry_point_trampoline`) calls `proc.run()`, which enters user mode via `enter_user_mode(&self.context)`. Since `self.context.pc` was `0`, the CPU jumped to virtual address `0x0`.
+
+Meanwhile, `update_thread_context(tid, &child_ctx)` updated the *thread pool's* Context struct (used by the scheduler), but the trampoline never reads those fields—it only uses the Process struct's `context`.
+
+**Fix (`src/process.rs`):** Added `new_proc.context = child_ctx` in `fork_process` before calling `register_process`. This ensures the trampoline enters user mode at the correct PC with the correct SP, x0=0, and all other parent registers preserved.
+
+### 9.2. Bug: `get_saved_user_context` Returned Stale PC/SP
+
+**Symptom:** Even with the context stored in the Process struct, the child's PC would be wrong because `get_saved_user_context` returned `ctx.user_entry` which was `0`.
+
+**Root Cause:** The `user_entry` and `user_sp` fields in the thread's `Context` struct were only set during thread creation (to `0` for kernel-spawned closure threads) and by `update_thread_context`. They were *never updated* when a user process trapped to EL1 for a syscall. The actual user PC (ELR_EL1) and SP (SP_EL0) were saved by the assembly exception handler into a `UserTrapFrame` on the kernel stack, but `get_saved_user_context` didn't read from it.
+
+**Fix (`src/threading.rs`, `src/exceptions.rs`):**
+
+1.  Added a per-thread `CURRENT_TRAP_FRAME` array (`[AtomicU64; MAX_THREADS]`) to store the live trap frame pointer.
+2.  In `rust_sync_el0_handler`, the trap frame pointer is saved via `set_current_trap_frame(frame)` at the start of every SVC handler and cleared via `clear_current_trap_frame()` before returning.
+3.  Rewrote `get_saved_user_context` to check `CURRENT_TRAP_FRAME` first. When available (i.e., called from within a syscall on the same thread), it reads **all 31 general-purpose registers** plus PC, SP, SPSR, and TPIDR directly from the live `UserTrapFrame`. This gives fork a complete snapshot of the parent's register state, not just PC/SP.
+
+### 9.3. Bug: Missing ProcessInfo Write for Forked Children
+
+**Symptom:** `read_current_pid()` could return `0` or `None` for the forked child, causing `current_process()` lookups to fail.
+
+**Root Cause:** `fork_process` allocated and mapped a process info page for the child but never wrote the `ProcessInfo` struct (pid, parent_pid, box_id) to it. The page was zeroed from `alloc_page_zeroed`, so the pid field read as `0`.
+
+**Fix (`src/process.rs`):** Added a `ProcessInfo::new()` write to the child's process info page in `fork_process`, immediately after mapping it, before spawning the child thread.
+
+### 9.4. Bug: `enter_user_mode` Zeroed All Registers
+
+**Symptom:** Even with the correct PC and full register capture from the trap frame, the forked child still crashed at `FAR=0x0`. The child's code expected callee-saved registers (x19-x28) and the link register (x30) to hold the parent's values, but they were all zero.
+
+**Root Cause:** `enter_user_mode` unconditionally cleared all 31 GP registers to zero (`mov x0, #0` ... `mov x30, #0`) before ERET. This was correct for fresh process launches (where registers should be clean) but catastrophic for forked children. With `x30 = 0`, any `ret` instruction in the child's code immediately jumped to address `0x0`.
+
+**Fix (`src/process.rs`):** Rewrote `enter_user_mode` to load all GP registers from the `UserContext` struct instead of zeroing them. The context pointer is pinned to `x30` via an explicit register constraint (`in("x30")`), and x0-x29 are loaded first via LDP instructions at struct offsets. x30 is loaded last (`ldr x30, [x30, #240]`), which safely overwrites the context pointer that is no longer needed. For regular spawns, `UserContext::new()` initializes all registers to 0, so the behavior is unchanged.
+
+### 9.5. Bug: Duplicate PID Counters
+
+**Symptom:** Clone reported `forking PID 12 -> 22` but the child process ran as PID 20. The parent waited for PID 22 (the return value from clone) but the child had a different PID, causing `wait4` to timeout.
+
+**Root Cause:** Two independent PID counters existed:
+1.  A module-level `static NEXT_PID: AtomicU32` starting at 1, used by `Process::from_elf()`.
+2.  A function-local `static NEXT_PID: AtomicU32` starting at 20, inside `allocate_pid()`, used by `sys_clone`.
+
+These counters ran independently and eventually assigned the same PID values to different processes, causing lookup failures.
+
+**Fix (`src/process.rs`):** Removed the local `NEXT_PID` from `allocate_pid()` and made it use the single module-level counter, ensuring all PID allocations draw from the same sequence.
+
+### 9.6. Bug: `execve` Did Not Activate New Address Space
+
+**Symptom:** After a successful `replace_image` in `sys_execve`, the child crashed with `Unknown from EL0: EC=0x0, ISS=0x0` at `ELR=0x400000`.
+
+**Root Cause:** `replace_image` called `UserAddressSpace::deactivate()` (resetting TTBR0 to the boot page tables) to safely drop the old address space, then installed the new address space in the Process struct. But neither `replace_image` nor `sys_execve` activated the new address space. When `enter_user_mode` did ERET to EL0, TTBR0 still pointed at the boot page tables. Address `0x400000` in the boot tables maps to QEMU's Flash region, causing the CPU to fetch an invalid instruction encoding (`EC=0x0`).
+
+**Fix (`src/syscall.rs`):** Added `proc.address_space.activate()` in `sys_execve` after `replace_image` and before `enter_user_mode`.
+
+### 9.7. Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/threading.rs` | Added `CURRENT_TRAP_FRAME` per-thread storage, `set_current_trap_frame`, `clear_current_trap_frame`. Rewrote `get_saved_user_context` to read from live trap frame with full register capture. Both paths enforce `spsr = 0`. |
+| `src/exceptions.rs` | In `rust_sync_el0_handler`, save trap frame pointer at SVC entry, clear it before return. |
+| `src/process.rs` | Rewrote `enter_user_mode` to load GP registers from `UserContext` (pinning ctx to x30) instead of zeroing them. In `fork_process`: write `ProcessInfo` to child's info page; set `new_proc.context = child_ctx`; enforce `child_ctx.spsr = 0`. Unified `allocate_pid()` to use the single module-level PID counter. |
+| `src/syscall.rs` | In `sys_execve`: activate new address space after `replace_image` before entering user mode. |
