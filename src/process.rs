@@ -758,29 +758,50 @@ pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::
 // Child Process Registry (for userspace process management)
 // ============================================================================
 
-/// Registry mapping child PIDs to their ProcessChannel
+/// Registry mapping child PIDs to (ProcessChannel, parent_pid)
 /// Used by parent processes to read child stdout via ChildStdout FD
-static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, Arc<ProcessChannel>>> =
+/// and by wait4(-1) to find children of a specific parent.
+static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a child process channel (called when spawning via syscall)
-pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>) {
+pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().insert(child_pid, channel);
+        CHILD_CHANNELS.lock().insert(child_pid, (channel, parent_pid));
     })
 }
 
 /// Get a child process channel by PID
 pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().get(&child_pid).cloned()
+        CHILD_CHANNELS.lock().get(&child_pid).map(|(ch, _)| ch.clone())
     })
 }
 
 /// Remove a child process channel (called when child exits or parent closes FD)
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     crate::irq::with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().remove(&child_pid)
+        CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
+    })
+}
+
+/// Find any exited child of the given parent. Returns (child_pid, channel).
+pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
+    crate::irq::with_irqs_disabled(|| {
+        let channels = CHILD_CHANNELS.lock();
+        for (&child_pid, (ch, ppid)) in channels.iter() {
+            if *ppid == parent_pid && ch.has_exited() {
+                return Some((child_pid, ch.clone()));
+            }
+        }
+        None
+    })
+}
+
+/// Check if the given parent has any children registered.
+pub fn has_children(parent_pid: Pid) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().values().any(|(_, ppid)| *ppid == parent_pid)
     })
 }
 
@@ -2006,7 +2027,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // The exit-tracking channel is separate to avoid contaminating the I/O channel.
     let exit_channel = Arc::new(ProcessChannel::new());
     register_channel(tid, exit_channel.clone());
-    register_child_channel(child_pid, exit_channel);
+    register_child_channel(child_pid, exit_channel, parent_pid);
 
     // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);

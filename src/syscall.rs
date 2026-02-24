@@ -1180,17 +1180,16 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
         crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
     }
 
-    // If pid is -1, wait for any child.
-    // If pid is 0x7FFFFFFF, it's our fake child PID from old sys_clone.
-    let target_pid = if pid == 0x7FFFFFFF || pid == -1 {
-        None // TODO: implement wait for ANY
-    } else if pid > 0 {
-        Some(pid as u32)
-    } else {
-        None
+    let wnohang = options & 1 != 0;
+
+    let current_pid = match crate::process::read_current_pid() {
+        Some(p) => p,
+        None => return (-libc_errno::ECHILD as i64) as u64,
     };
 
-    if let Some(p) = target_pid {
+    if pid > 0 {
+        // Wait for specific child
+        let p = pid as u32;
         if let Some(ch) = crate::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
@@ -1201,24 +1200,50 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                         unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
                     }
+                    crate::process::remove_child_channel(p);
                     return p as u64;
                 }
-                
-                // WNOHANG = 1
-                if options & 1 != 0 {
-                    return 0; // Return immediately if not exited
-                }
 
+                if wnohang {
+                    return 0;
+                }
                 crate::threading::yield_now();
             }
         }
+    } else if pid == -1 || pid == 0 {
+        // Wait for any child (pid=-1) or any child in same pgid (pid=0, treat same)
+        if !crate::process::has_children(current_pid) {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
+            }
+            return (-libc_errno::ECHILD as i64) as u64;
+        }
+
+        loop {
+            if let Some((child_pid, ch)) = crate::process::find_exited_child(current_pid) {
+                let code = ch.exit_code();
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", child_pid, code);
+                }
+                if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                    unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
+                }
+                crate::process::remove_child_channel(child_pid);
+                return child_pid as u64;
+            }
+
+            if wnohang {
+                return 0;
+            }
+            crate::threading::yield_now();
+        }
     }
-    
-    // Fallback if no child found (ECHILD)
+
+    // Fallback (ECHILD)
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
     }
-    0
+    (-libc_errno::ECHILD as i64) as u64
 }
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
@@ -1525,8 +1550,8 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_
     };
 
     if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
-        crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
+            crate::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
@@ -1576,8 +1601,8 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
 
     // Call internal helper with extended options
     if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
-        crate::process::register_child_channel(pid, ch);
         if let Some(proc) = crate::process::current_process() {
+            crate::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
