@@ -166,3 +166,27 @@ To support interactive shell behavior, basic TTY input/output processing was add
 The SSH bridge loop was refined to prevent race conditions where fast-running processes (like `ls`) might exit before their output was fully sent.
 
 *   **Aggressive Draining**: The `bridge_process` loop now uses an internal `while` loop to drain all available data from the process channel in every iteration, ensuring no "last bytes" are left behind when a process terminates.
+
+---
+
+## 8. SPSR and Instruction Aborts in Forked Processes
+
+The `elftest` utility revealed a critical issue where forked child processes would immediately crash with an `Instruction abort from EL0 at FAR=0x0`. This occurred despite the parent's execution context (PC, SP) being correctly captured.
+
+### 8.1. Problem: Incorrect SPSR in Child Process
+
+The root cause was traced to the `UserContext` used for the child process. During the `clone` syscall, the parent's saved `SPSR_EL1` (Program Status Register) was being directly copied to the child's `UserContext`.
+
+When `elftest` (the parent process) invoked `clone`, its `SPSR_EL1` often had the `DAIF` bits set (e.g., `0x80000000`). While these bits signify interrupts being masked, the more crucial aspect for process execution is the exception level mode. The mode bits in this SPSR value correctly indicated `EL0t` (thread state at EL0). However, the child process, when initially started by `enter_user_mode`, inherited this SPSR.
+
+The expectation for a newly forked child process is to always begin execution with interrupts enabled and in `EL0t` mode, which corresponds to an `SPSR` value of `0x0`. The inherited `SPSR` with masked interrupts (0x80000000) was not the primary issue, as EL0t was correct.
+
+### 8.2. Problem: SPSR of Parent vs. Child Expectations
+
+The core problem was subtly different from an EL mismatch. The child thread, even though its `PC` was correctly set to resume execution from the `clone` syscall, would ERET with an SPSR that included the parent's interrupt mask. If the kernel's internal state (such as the scheduler or device drivers) expected interrupts to be enabled upon returning to user space, this mismatch could lead to unexpected behavior or an invalid CPU state that ultimately caused the `FAR=0x0` abort. It's akin to the CPU getting into a state where it cannot properly fetch or interpret the next instruction due to an unexpected privilege or interrupt configuration for the target EL0.
+
+### 8.3. The Fix: Enforcing SPSR=0 for Children
+
+To resolve this, the `spsr` field in the child's `UserContext` is now explicitly set to `0x0` (representing EL0t with all interrupts enabled) within `get_saved_user_context` in `src/threading.rs`. This guarantees that all forked child processes begin their execution in a clean, predictable state, irrespective of the parent's current `SPSR` during the `clone` syscall.
+
+This ensures that the CPU returns to a proper EL0 context, preventing the `Instruction abort from EL0 at FAR=0x0` error and allowing forked processes to execute their initial instructions successfully.
