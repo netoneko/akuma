@@ -29,7 +29,7 @@ members = [
     "sshd",
     "make",
     "dash",
-    "ubase"
+    "sbase"
 ]
 
 [profile.dev]
