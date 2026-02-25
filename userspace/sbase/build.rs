@@ -22,27 +22,57 @@ fn main() {
     let config_content = fs::read_to_string(&config_mk_path).expect("Failed to read config.mk");
     
     let mut new_config = String::new();
+    let mut seen_cc = false;
+    let mut seen_ar = false;
+    let mut seen_ranlib = false;
+    let mut seen_ldflags = false;
+    let mut seen_cppflags = false;
     for line in config_content.lines() {
-        if line.starts_with("CC =") {
-            new_config.push_str("CC = aarch64-linux-musl-gcc\n");
-        } else if line.starts_with("AR =") {
-            new_config.push_str("AR = aarch64-linux-musl-ar\n");
-        } else if line.starts_with("RANLIB =") {
-            new_config.push_str("RANLIB = aarch64-linux-musl-ranlib\n");
+        let trimmed = line.trim_start_matches('#').trim();
+        if line.starts_with("CC =") || trimmed.starts_with("CC =") {
+            if !seen_cc {
+                new_config.push_str("CC = aarch64-linux-musl-gcc\n");
+                seen_cc = true;
+            }
+        } else if line.starts_with("AR =") || trimmed.starts_with("AR =") {
+            if !seen_ar {
+                new_config.push_str("AR = aarch64-linux-musl-ar\n");
+                seen_ar = true;
+            }
+        } else if line.starts_with("RANLIB =") || trimmed.starts_with("RANLIB =") {
+            if !seen_ranlib {
+                new_config.push_str("RANLIB = aarch64-linux-musl-ranlib\n");
+                seen_ranlib = true;
+            }
+        } else if line.starts_with("ARFLAGS =") || trimmed.starts_with("ARFLAGS =") {
+            // skip duplicates, will be added with AR
         } else if line.starts_with("# tools") || line.starts_with("#tools") {
             new_config.push_str(line);
             new_config.push('\n');
-            new_config.push_str("AR = aarch64-linux-musl-ar\n");
-            new_config.push_str("ARFLAGS = rcs\n");
-            new_config.push_str("RANLIB = aarch64-linux-musl-ranlib\n");
-        } else if line.starts_with("CPPFLAGS =") {
-            new_config.push_str(&format!("CPPFLAGS = -D_DEFAULT_SOURCE -D_GNU_SOURCE -I{}\n", musl_dist.join("include").display()));
-        } else if line.starts_with("LDFLAGS =") {
-            new_config.push_str("LDFLAGS = -static -Wl,--entry=_start\n");
+            if !seen_ar {
+                new_config.push_str("AR = aarch64-linux-musl-ar\n");
+                new_config.push_str("ARFLAGS = rcs\n");
+                new_config.push_str("RANLIB = aarch64-linux-musl-ranlib\n");
+                seen_ar = true;
+                seen_ranlib = true;
+            }
+        } else if line.starts_with("CPPFLAGS =") || trimmed.starts_with("CPPFLAGS =") || trimmed.starts_with("CFLAGS =") {
+            if !seen_cppflags {
+                new_config.push_str(&format!("CPPFLAGS = -D_DEFAULT_SOURCE -D_GNU_SOURCE -I{}\n", musl_dist.join("include").display()));
+                seen_cppflags = true;
+            }
+        } else if line.starts_with("LDFLAGS =") || trimmed.starts_with("LDFLAGS =") {
+            if !seen_ldflags {
+                new_config.push_str("LDFLAGS = -static\n");
+                seen_ldflags = true;
+            }
         } else {
             new_config.push_str(line);
             new_config.push('\n');
         }
+    }
+    if !seen_ldflags {
+        new_config.push_str("LDFLAGS = -static\n");
     }
     fs::write(&config_mk_path, new_config).expect("Failed to write patched config.mk");
 
@@ -80,6 +110,7 @@ fn main() {
         .env("CC", "aarch64-linux-musl-gcc")
         .env("AR", "aarch64-linux-musl-ar")
         .env("RANLIB", "aarch64-linux-musl-ranlib")
+        .env("LDFLAGS", "-static")
         .status()
         .expect("Failed to execute make");
     
