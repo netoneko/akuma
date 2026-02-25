@@ -329,13 +329,27 @@ pub fn parse_command_chain(line: &[u8]) -> Vec<ChainedCommand<'_>> {
     commands
 }
 
-/// Check if an executable exists in /bin
+/// Check if an executable exists in common binary locations
 async fn find_executable(name: &str) -> Option<alloc::string::String> {
-    let bin_path = format!("/bin/{}", name);
-    if crate::async_fs::exists(&bin_path).await {
-        // Make sure it's a file, not a directory
-        if crate::async_fs::list_dir(&bin_path).await.is_err() {
-            return Some(bin_path);
+    // If it's an absolute path, check it directly
+    if name.starts_with('/') {
+        if crate::async_fs::exists(name).await {
+            if crate::async_fs::list_dir(name).await.is_err() {
+                return Some(String::from(name));
+            }
+        }
+        return None;
+    }
+
+    // Search in priority order
+    let paths = ["/usr/bin", "/bin"];
+    for path in paths {
+        let bin_path = format!("{}/{}", path, name);
+        if crate::async_fs::exists(&bin_path).await {
+            // Make sure it's a file, not a directory
+            if crate::async_fs::list_dir(&bin_path).await.is_err() {
+                return Some(bin_path);
+            }
         }
     }
     None
@@ -648,7 +662,7 @@ pub enum StreamableCommand {
 /// - No output redirection (> or >>)
 /// - Not a chain (; or &&)
 /// - Not a builtin command
-/// - An existing executable in /bin
+/// - An existing executable in /usr/bin or /bin (or absolute path)
 pub async fn check_streamable_command(
     line: &[u8],
     registry: &CommandRegistry,

@@ -220,11 +220,23 @@ pub fn parse_command_chain(line: &[u8]) -> Vec<ChainedCommand<'_>> {
 }
 
 async fn find_executable(name: &str) -> Option<alloc::string::String> {
-    let bin_path = format!("/bin/{}", name);
-    let fd = open(&bin_path, open_flags::O_RDONLY);
-    if fd >= 0 {
-        close(fd);
-        return Some(bin_path);
+    if name.starts_with('/') {
+        let fd = open(name, open_flags::O_RDONLY);
+        if fd >= 0 {
+            close(fd);
+            return Some(String::from(name));
+        }
+        return None;
+    }
+
+    let paths = ["/usr/bin", "/bin"];
+    for path in paths {
+        let bin_path = format!("{}/{}", path, name);
+        let fd = open(&bin_path, open_flags::O_RDONLY);
+        if fd >= 0 {
+            close(fd);
+            return Some(bin_path);
+        }
     }
     None
 }
