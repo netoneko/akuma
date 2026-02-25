@@ -28,7 +28,7 @@ MEMBERS=(
     "tcc"
     "tar"
     "make"
-    "ubase"
+    "sbase"
     "sshd"
     "dash"
 )
