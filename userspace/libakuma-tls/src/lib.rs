@@ -24,7 +24,7 @@ use alloc::string::String;
 use embedded_tls::blocking::{TlsConfig, TlsConnection, TlsContext};
 use embedded_tls::{Aes128GcmSha256, NoVerify, TlsError};
 
-pub use http::{https_fetch, https_get, https_post, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end};
+pub use http::{download_file, https_fetch, https_get, https_post, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end};
 pub use rng::TlsRng;
 pub use transport::TcpTransport;
 

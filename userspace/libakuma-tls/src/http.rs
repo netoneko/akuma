@@ -127,6 +127,148 @@ pub fn https_fetch(url: &str, _insecure: bool) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Download a file from an HTTP or HTTPS URL and save it to disk.
+///
+/// This function streams the response body directly to a file, which is
+/// memory-efficient for large files.
+///
+/// # Arguments
+/// * `url` - The URL to fetch (http:// or https://)
+/// * `dest_path` - The path on the local filesystem to save the file to.
+///
+/// # Returns
+/// Ok(()) on success, or an error.
+pub fn download_file(url: &str, dest_path: &str) -> Result<(), Error> {
+    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
+
+    // Resolve hostname
+    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
+    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+
+    // Connect TCP
+    let stream = TcpStream::connect(&addr_str)
+        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
+
+    // Open destination file
+    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
+    if fd < 0 {
+        return Err(Error::IoError);
+    }
+
+    let result = if parsed.is_https {
+        // HTTPS - wrap in TLS
+        let transport = TcpTransport::new(stream);
+        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut tls = TlsStream::connect(transport, parsed.host, &mut read_buf, &mut write_buf)?;
+
+        let request = build_http_request(parsed.host, parsed.path);
+        tls.write_all(request.as_bytes())?;
+        tls.flush()?;
+
+        stream_to_file(Streamer::Tls(&mut tls), fd)
+    } else {
+        // Plain HTTP
+        let request = build_http_request(parsed.host, parsed.path);
+        stream.write_all(request.as_bytes()).map_err(|_| Error::IoError)?;
+
+        stream_to_file(Streamer::Tcp(&stream), fd)
+    };
+
+    libakuma::close(fd);
+    result
+}
+
+// Helper enum to abstract over TlsStream and TcpStream for stream_to_file
+enum Streamer<'a> {
+    Tls(&'a mut TlsStream<'a>),
+    Tcp(&'a TcpStream),
+}
+
+// Read from a stream and write to a file descriptor
+fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
+    // First, we need to read and parse headers before streaming the body.
+    // This is a simplified version of read_response_*, but instead of
+    // buffering the body, we write it to the file.
+    let mut response_buf = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut headers_end = None;
+
+    // Read until headers are found
+    while headers_end.is_none() {
+        let read_result = match &mut streamer {
+            Streamer::Tls(s) => s.read(&mut buf),
+            Streamer::Tcp(s) => s.read(&mut buf).map_err(|_| Error::IoError),
+        };
+
+        match read_result {
+            Ok(0) => break,
+            Ok(n) => {
+                response_buf.extend_from_slice(&buf[..n]);
+                headers_end = find_headers_end(&response_buf);
+            }
+            Err(e) => {
+                 match &e {
+                    Error::TlsError(_) => return Err(e),
+                    Error::IoError => {
+                        // For TCP, this could be a timeout. If we have no data, it's an error.
+                        // Otherwise, we might have just reached the end.
+                        if response_buf.is_empty() { return Err(Error::IoError); }
+                        break;
+                    },
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+
+    let end_pos = headers_end.ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
+    
+    // Parse status and check for errors
+    let header_str = core::str::from_utf8(&response_buf[..end_pos]).map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
+    let status: u16 = header_str.lines().next().and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
+        .ok_or_else(|| Error::HttpError(String::from("Invalid status line")))?;
+
+    if status < 200 || status >= 300 {
+        return Err(Error::HttpError(format!("HTTP error: {}", status)));
+    }
+
+    // Write the part of the body we already read
+    let body_chunk = &response_buf[end_pos..];
+    if !body_chunk.is_empty() {
+        if libakuma::write_fd(fd, body_chunk) < 0 {
+            return Err(Error::IoError);
+        }
+    }
+
+    // Stream the rest of the body directly to the file
+    loop {
+         let read_result = match &mut streamer {
+            Streamer::Tls(s) => s.read(&mut buf),
+            Streamer::Tcp(s) => s.read(&mut buf).map_err(|_| Error::IoError),
+        };
+
+        match read_result {
+            Ok(0) => break, // Done
+            Ok(n) => {
+                if libakuma::write_fd(fd, &buf[..n]) < 0 {
+                    return Err(Error::IoError);
+                }
+            }
+            Err(e) => {
+                 match &e {
+                    Error::TlsError(_) => return Err(e),
+                    Error::IoError => break, // Assume EOF on TCP error after getting data
+                    _ => return Err(e),
+                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
 /// Parsed URL components
 struct ParsedUrl<'a> {
     is_https: bool,

@@ -18,7 +18,7 @@ pub use fs::{
     APPEND_CMD, CAT_CMD, CP_CMD, DF_CMD, FIND_CMD, LS_CMD, MKDIR_CMD, MV_CMD, RM_CMD,
     WRITE_CMD,
 };
-pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
+pub use net::PKG_CMD;
 
 const MAX_COMMANDS: usize = 64;
 
@@ -83,8 +83,6 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&DF_CMD);
 
     // Network commands
-    registry.register(&CURL_CMD);
-    registry.register(&NSLOOKUP_CMD);
     registry.register(&PKG_CMD);
 
     // Process execution commands
