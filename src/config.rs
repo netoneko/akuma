@@ -313,3 +313,9 @@ pub const SSH_PORT: u16 = 22;
 /// When enabled, the kernel will not spawn its internal SSH server thread.
 /// The userspace /bin/sshd should be started by /bin/herd instead.
 pub const ENABLE_USERSPACE_SSHD: bool = false;
+
+/// Prioritize built-in shell commands over external binaries in SSH shell.
+///
+/// When false (default), external binaries in /usr/bin and /bin are searched
+/// before trying built-in commands. When true, built-ins take precedence.
+pub const SSH_BUILT_INS_FIRST: bool = false;

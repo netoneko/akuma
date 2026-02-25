@@ -694,12 +694,12 @@ pub async fn check_streamable_command(
     // Parse the command name
     let (cmd_name, _args) = split_first_word(trimmed);
     
-    // Check if it's a builtin
-    if registry.find(cmd_name).is_some() {
+    // If built-ins come first, check them now
+    if crate::config::SSH_BUILT_INS_FIRST && registry.find(cmd_name).is_some() {
         return StreamableCommand::Buffered;
     }
     
-    // Check if it's an external binary in /bin
+    // Check if it's an external binary in /usr/bin or /bin (or absolute path)
     let cmd_name_str = match core::str::from_utf8(cmd_name) {
         Ok(s) => s,
         Err(_) => return StreamableCommand::Buffered,
@@ -708,6 +708,7 @@ pub async fn check_streamable_command(
     if let Some(bin_path) = find_executable(cmd_name_str).await {
         StreamableCommand::External(bin_path)
     } else {
+        // Not an external, fall back to built-in check if we haven't already
         StreamableCommand::Buffered
     }
 }
@@ -795,34 +796,29 @@ async fn execute_pipeline_internal(
         let mut stdout = VecWriter::new();
         let stdin_slice = stdin_data.as_deref();
 
-        // First, try built-in commands
-        if let Some(cmd) = registry.find(cmd_name) {
-            match cmd.execute(args, stdin_slice, &mut stdout, ctx).await {
-                Ok(()) => {
-                    if is_last {
-                        return PipelineResult::Output(stdout.into_inner());
-                    } else {
-                        stdin_data = Some(stdout.into_inner());
+        // 1. Try built-ins if they come first
+        if crate::config::SSH_BUILT_INS_FIRST {
+            if let Some(cmd) = registry.find(cmd_name) {
+                match cmd.execute(args, stdin_slice, &mut stdout, ctx).await {
+                    Ok(()) => {
+                        if is_last {
+                            return PipelineResult::Output(stdout.into_inner());
+                        } else {
+                            stdin_data = Some(stdout.into_inner());
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Err(ShellError::Exit) => {
-                    return PipelineResult::Error(ShellError::Exit, None);
-                }
-                Err(ShellError::ExecutionFailed(msg)) => {
-                    let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
-                    return PipelineResult::Error(
-                        ShellError::ExecutionFailed(msg),
-                        Some(error_msg),
-                    );
-                }
-                Err(e) => {
-                    return PipelineResult::Error(e, None);
+                    Err(ShellError::Exit) => return PipelineResult::Error(ShellError::Exit, None),
+                    Err(ShellError::ExecutionFailed(msg)) => {
+                        let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
+                        return PipelineResult::Error(ShellError::ExecutionFailed(msg), Some(error_msg));
+                    }
+                    Err(e) => return PipelineResult::Error(e, None),
                 }
             }
         }
 
-        // Not a built-in - check /bin for an executable
+        // 2. Try external binaries
         let cmd_name_str = match core::str::from_utf8(cmd_name) {
             Ok(s) => s,
             Err(_) => {
@@ -832,7 +828,7 @@ async fn execute_pipeline_internal(
         };
 
         if let Some(bin_path) = find_executable(cmd_name_str).await {
-            // Found an executable in /bin - run it (kernel adds argv[0] automatically)
+            // Found an executable - run it (kernel adds argv[0] automatically)
             let arg_strings = parse_args(args);
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
@@ -850,12 +846,9 @@ async fn execute_pipeline_internal(
                         }
                         continue;
                     }
-                    Err(e) => {
-                        return PipelineResult::Error(e, None);
-                    }
+                    Err(e) => return PipelineResult::Error(e, None),
                 }
             } else {           
-                // DOES NOT WORK WITH SSH, blocks SSH connections entirely  
                 match execute_external_streaming(&bin_path, args_slice, stdin_slice, cwd, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
@@ -865,9 +858,29 @@ async fn execute_pipeline_internal(
                         }
                         continue;
                     }
-                    Err(e) => {
-                        return PipelineResult::Error(e, None);
+                    Err(e) => return PipelineResult::Error(e, None),
+                }
+            }
+        }
+
+        // 3. Try built-ins if they haven't been tried yet
+        if !crate::config::SSH_BUILT_INS_FIRST {
+            if let Some(cmd) = registry.find(cmd_name) {
+                match cmd.execute(args, stdin_slice, &mut stdout, ctx).await {
+                    Ok(()) => {
+                        if is_last {
+                            return PipelineResult::Output(stdout.into_inner());
+                        } else {
+                            stdin_data = Some(stdout.into_inner());
+                        }
+                        continue;
                     }
+                    Err(ShellError::Exit) => return PipelineResult::Error(ShellError::Exit, None),
+                    Err(ShellError::ExecutionFailed(msg)) => {
+                        let error_msg = format!("Error in stage {}: {}\r\n", i + 1, msg);
+                        return PipelineResult::Error(ShellError::ExecutionFailed(msg), Some(error_msg));
+                    }
+                    Err(e) => return PipelineResult::Error(e, None),
                 }
             }
         }
