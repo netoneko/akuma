@@ -4,7 +4,7 @@
 //! Uses the `elf` crate for parsing.
 
 use elf::ElfBytes;
-use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR};
+use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::endian::LittleEndian;
 
 use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
@@ -69,6 +69,8 @@ pub enum ElfError {
     WrongArchitecture,
     /// Not an executable
     NotExecutable,
+    /// Binary requires a dynamic linker (not statically linked)
+    DynamicallyLinked,
     /// Out of memory
     OutOfMemory,
     /// Address space creation failed
@@ -83,6 +85,7 @@ impl core::fmt::Display for ElfError {
             ElfError::InvalidFormat(msg) => write!(f, "Invalid ELF format: {}", msg),
             ElfError::WrongArchitecture => write!(f, "Not an AArch64 binary"),
             ElfError::NotExecutable => write!(f, "Not an executable"),
+            ElfError::DynamicallyLinked => write!(f, "Dynamically linked binary requires interpreter (recompile with -static)"),
             ElfError::OutOfMemory => write!(f, "Out of memory"),
             ElfError::AddressSpaceFailed => write!(f, "Failed to create address space"),
             ElfError::MappingFailed(msg) => write!(f, "Mapping failed: {}", msg),
@@ -132,6 +135,15 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let segments = elf
         .segments()
         .ok_or(ElfError::InvalidFormat("No program headers"))?;
+
+    // Reject dynamically-linked binaries that require a real interpreter.
+    // Static-PIE binaries may have PT_INTERP with an empty string (1-byte null) — allow those.
+    for phdr in segments.iter() {
+        if phdr.p_type == PT_INTERP && phdr.p_filesz > 1 {
+            crate::safe_print!(96, "[ELF] Error: binary requires dynamic linker, recompile with -static\n");
+            return Err(ElfError::DynamicallyLinked);
+        }
+    }
 
     // Find PT_PHDR if it exists
     for phdr in segments.iter() {
