@@ -1489,6 +1489,7 @@ impl Filesystem for Ext2Filesystem {
         Ok(Metadata {
             is_dir,
             size: inode.size_lower as u64,
+            inode: inode_num as u64,
             created: Some(inode.creation_time as u64),
             modified: Some(inode.modification_time as u64),
             accessed: Some(inode.access_time as u64),

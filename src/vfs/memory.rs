@@ -71,6 +71,15 @@ pub struct MemoryFilesystem {
 }
 
 impl MemoryFilesystem {
+    fn path_inode(path: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in path.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     /// Create a new empty in-memory filesystem
     pub fn new() -> Self {
         Self {
@@ -390,6 +399,7 @@ impl Filesystem for MemoryFilesystem {
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let root = self.root.lock();
         let node = Self::navigate(&root, path)?;
+        let inode = Self::path_inode(path);
 
         match node {
             FsNode::File {
@@ -399,6 +409,7 @@ impl Filesystem for MemoryFilesystem {
             } => Ok(Metadata {
                 is_dir: false,
                 size: data.len() as u64,
+                inode,
                 created: Some(*created),
                 modified: Some(*modified),
                 accessed: None,
@@ -406,6 +417,7 @@ impl Filesystem for MemoryFilesystem {
             FsNode::Directory { created, .. } => Ok(Metadata {
                 is_dir: true,
                 size: 0,
+                inode,
                 created: Some(*created),
                 modified: None,
                 accessed: None,

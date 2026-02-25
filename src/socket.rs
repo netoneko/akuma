@@ -22,9 +22,9 @@ pub const MAX_SOCKETS: usize = 128;
 const MAX_BACKLOG: usize = 8;
 
 /// Ephemeral port range start
-const EPHEMERAL_PORT_START: u16 = 49152;
+pub const EPHEMERAL_PORT_START: u16 = 49152;
 /// Ephemeral port range end
-const EPHEMERAL_PORT_END: u16 = 65535;
+pub const EPHEMERAL_PORT_END: u16 = 65535;
 
 /// Global atomic for ephemeral port allocation
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);

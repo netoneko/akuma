@@ -588,40 +588,46 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let mut n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
                     // TTY Line Discipline: Input Processing
-                    let term_state_lock = crate::process::current_terminal_state();
-                    if let Some(ref ts_lock) = term_state_lock {
-                        let mut ts = ts_lock.lock();
-                        
-                        // 1. ICRNL: Map CR to NL on input
-                        if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
-                            for i in 0..n {
-                                if kernel_buf[i] == b'\r' {
-                                    kernel_buf[i] = b'\n';
-                                }
-                            }
-                        }
-
-                        // 2. ECHO: Echo characters back to the user (via stdout channel)
-                        if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
-                            // Map \n to \r\n for echo if ONLCR is set
-                            if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
-                                let mut echo_buf = Vec::with_capacity(n * 2);
+                    // Skip TTY processing for piped stdin — pipes are not TTYs.
+                    // When stdin is pre-loaded and closed (pipe), ECHO would duplicate
+                    // the piped data into stdout, and ICRNL would corrupt \r\n line endings.
+                    let is_pipe = ch.is_stdin_closed();
+                    if !is_pipe {
+                        let term_state_lock = crate::process::current_terminal_state();
+                        if let Some(ref ts_lock) = term_state_lock {
+                            let mut ts = ts_lock.lock();
+                            
+                            // 1. ICRNL: Map CR to NL on input
+                            if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
                                 for i in 0..n {
-                                    if kernel_buf[i] == b'\n' {
-                                        echo_buf.extend_from_slice(b"\r\n");
-                                    } else {
-                                        echo_buf.push(kernel_buf[i]);
+                                    if kernel_buf[i] == b'\r' {
+                                        kernel_buf[i] = b'\n';
                                     }
                                 }
-                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                            }
+
+                            // 2. ECHO: Echo characters back to the user (via stdout channel)
+                            if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
+                                // Map \n to \r\n for echo if ONLCR is set
+                                if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
+                                    let mut echo_buf = Vec::with_capacity(n * 2);
+                                    for i in 0..n {
+                                        if kernel_buf[i] == b'\n' {
+                                            echo_buf.extend_from_slice(b"\r\n");
+                                        } else {
+                                            echo_buf.push(kernel_buf[i]);
+                                        }
+                                    }
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                                    }
+                                    ch.write(&echo_buf);
+                                } else {
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
+                                    }
+                                    ch.write(&kernel_buf[..n]);
                                 }
-                                ch.write(&echo_buf);
-                            } else {
-                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
-                                }
-                                ch.write(&kernel_buf[..n]);
                             }
                         }
                     }
@@ -746,12 +752,19 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
             // Write to process channel (for SSH)
             if let Some(ch) = crate::process::current_channel() {
-                let term_state_opt = crate::process::current_terminal_state();
-                let translate = if let Some(ts_lock) = term_state_opt {
-                    let ts = ts_lock.lock();
-                    (ts.oflag & mode_flags::ONLCR) != 0
+                // Skip ONLCR for piped processes — the pipeline handler
+                // (execute_external) does its own \n→\r\n translation for the
+                // final stage output. Translating here too would double it.
+                let translate = if ch.is_stdin_closed() {
+                    false
                 } else {
-                    true // Default to translate if no terminal state
+                    let term_state_opt = crate::process::current_terminal_state();
+                    if let Some(ts_lock) = term_state_opt {
+                        let ts = ts_lock.lock();
+                        (ts.oflag & mode_flags::ONLCR) != 0
+                    } else {
+                        true
+                    }
                 };
 
                 if translate {
@@ -770,8 +783,9 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             
             // Also write to procfs/kernel log
-            // Note: This function handles STDOUT_TO_KERNEL_LOG_COPY_ENABLED internally
-            proc.write_stdout(buf);
+            if config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
+                proc.write_stdout(buf);
+            }
             
             count as u64
         }
@@ -920,7 +934,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
     if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
         if let Ok(meta) = crate::vfs::metadata(&f.path) {
-            let stat = Stat { st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, ..Default::default() };
+            let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             return 0;
         }
@@ -971,8 +985,12 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
     
     if let Ok(meta) = crate::vfs::metadata(&resolved_path) {
         let stat = Stat { 
+            st_dev: 1,
+            st_ino: meta.inode,
             st_size: meta.size as i64, 
             st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, 
+            st_nlink: if meta.is_dir { 2 } else { 1 },
+            st_blksize: 4096,
             ..Default::default() 
         };
         unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
@@ -1287,13 +1305,43 @@ fn sys_mkdirat(_dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
     if crate::fs::create_dir(&path).is_ok() { 0 } else { !0u64 }
 }
 
-fn sys_unlinkat(_dirfd: i32, path_ptr: u64, _flags: u32) -> u64 {
+fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    crate::safe_print!(128, "[syscall] unlinkat: {}\n", path);
-    if crate::fs::remove_file(&path).is_ok() { 0 } else { !0u64 }
+
+    let resolved = if path.starts_with('/') {
+        String::from(&path)
+    } else {
+        let base = if dirfd == -100 {
+            if let Some(proc) = crate::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return !0u64;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = crate::process::current_process() {
+                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return !0u64;
+                }
+            } else {
+                return !0u64;
+            }
+        } else {
+            return !0u64;
+        };
+        crate::vfs::resolve_path(&base, &path)
+    };
+
+    const AT_REMOVEDIR: u32 = 0x200;
+    if flags & AT_REMOVEDIR != 0 {
+        if crate::fs::remove_dir(&resolved).is_ok() { 0 } else { !0u64 }
+    } else {
+        if crate::fs::remove_file(&resolved).is_ok() { 0 } else { !0u64 }
+    }
 }
 
 fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64) -> u64 {

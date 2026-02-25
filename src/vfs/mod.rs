@@ -112,6 +112,8 @@ pub struct Metadata {
     pub is_dir: bool,
     /// Size in bytes
     pub size: u64,
+    /// Inode number (unique within filesystem)
+    pub inode: u64,
     /// Creation time (Unix timestamp, if available)
     pub created: Option<u64>,
     /// Last modification time (Unix timestamp, if available)

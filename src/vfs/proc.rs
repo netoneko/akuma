@@ -386,11 +386,20 @@ impl Filesystem for ProcFilesystem {
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let path = path.trim_matches('/');
 
+        let inode = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in path.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
+
         if path.is_empty() {
-            // Root directory
             return Ok(Metadata {
                 is_dir: true,
                 size: 0,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -404,7 +413,8 @@ impl Filesystem for ProcFilesystem {
             }
             return Ok(Metadata {
                 is_dir: false,
-                size: 0, // Dynamic
+                size: 0,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -415,6 +425,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(Metadata {
                 is_dir: true,
                 size: 0,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -425,6 +436,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(Metadata {
                 is_dir: false,
                 size: 0,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -442,6 +454,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(Metadata {
                 is_dir: false,
                 size,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -456,6 +469,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(Metadata {
                 is_dir: true,
                 size: 0,
+                inode,
                 created: None,
                 modified: None,
                 accessed: None,

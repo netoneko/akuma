@@ -437,6 +437,8 @@ async fn execute_external(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     stdout: &mut VecWriter,
+    translate_newlines: bool,
+    add_exit_code: bool,
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
     let result = if is_async_exec_enabled() {
@@ -448,17 +450,21 @@ async fn execute_external(
 
     match result {
         Ok((exit_code, process_output)) => {
-            // Convert \n to \r\n for terminal
-            for &byte in &process_output {
-                if byte == b'\n' {
-                    let _ = embedded_io_async::Write::write_all(stdout, b"\r\n").await;
-                } else {
-                    let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
+            // Only convert \n to \r\n for terminal output
+            if translate_newlines {
+                for &byte in &process_output {
+                    if byte == b'\n' {
+                        let _ = embedded_io_async::Write::write_all(stdout, b"\r\n").await;
+                    } else {
+                        let _ = embedded_io_async::Write::write_all(stdout, &[byte]).await;
+                    }
                 }
+            } else {
+                let _ = embedded_io_async::Write::write_all(stdout, &process_output).await;
             }
 
-            // Only show exit code if non-zero
-            if exit_code != 0 {
+            // Only show exit code if non-zero AND if requested
+            if add_exit_code && exit_code != 0 {
                 let msg = format!("[exit code: {}]\r\n", exit_code);
                 let _ = embedded_io_async::Write::write_all(stdout, msg.as_bytes()).await;
             }
@@ -835,9 +841,11 @@ async fn execute_pipeline_internal(
             
             // Pass shell's cwd to spawned processes
             let cwd = Some(ctx.cwd());
+            let translate_output = is_last; // Only translate newlines for final output
+            let add_exit_code = is_last;    // Only show exit code for final output
             
             if ctx.async_exec {
-                match execute_external(&bin_path, args_slice, stdin_slice, cwd, &mut stdout).await {
+                match execute_external(&bin_path, args_slice, stdin_slice, cwd, &mut stdout, translate_output, add_exit_code).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
