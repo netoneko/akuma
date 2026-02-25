@@ -65,10 +65,10 @@ fn main() {
         .env("LDFLAGS", ldflags)
         .arg("--host=aarch64-linux-musl")
         .arg("--enable-static")
-        .arg("--disable-glob")
+//        .arg("--disable-glob")
         .arg("--disable-test-workaround")
-        .arg("--disable-lineno")
-        .arg("--without-libedit")
+//        .arg("--disable-lineno")
+//        .arg("--without-libedit")
         .status()
         .expect("Failed to execute configure");
     

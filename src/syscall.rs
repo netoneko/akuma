@@ -710,20 +710,45 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             
             // Blocking read loop
             loop {
-                // Check for data first
-                let mut n = ch.read_stdin(&mut kernel_buf);
+                // Skip TTY processing for piped stdin — pipes are not TTYs.
+                let is_pipe = ch.is_stdin_closed() && !ch.has_stdin_data();
+
+                // In canonical mode, check for already-completed lines first
+                if !is_pipe {
+                    let term_state_lock = crate::process::current_terminal_state();
+                    if let Some(ref ts_lock) = term_state_lock {
+                        let mut ts = ts_lock.lock();
+                        if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0
+                            && !ts.canon_ready.is_empty()
+                        {
+                            let to_read = count.min(ts.canon_ready.len());
+                            for i in 0..to_read {
+                                kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
+                            }
+                            drop(ts);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    kernel_buf.as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    to_read,
+                                );
+                            }
+                            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes from canon_ready\n", to_read);
+                            }
+                            return to_read as u64;
+                        }
+                    }
+                }
+
+                let n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
-                    // TTY Line Discipline: Input Processing
-                    // Skip TTY processing for piped stdin — pipes are not TTYs.
-                    // When stdin is pre-loaded and closed (pipe), ECHO would duplicate
-                    // the piped data into stdout, and ICRNL would corrupt \r\n line endings.
-                    let is_pipe = ch.is_stdin_closed();
                     if !is_pipe {
                         let term_state_lock = crate::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
-                            
-                            // 1. ICRNL: Map CR to NL on input
+
+                            // ICRNL: Map CR to NL on input
                             if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
                                 for i in 0..n {
                                     if kernel_buf[i] == b'\r' {
@@ -732,27 +757,100 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                 }
                             }
 
-                            // 2. ECHO: Echo characters back to the user (via stdout channel)
-                            if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
-                                // Map \n to \r\n for echo if ONLCR is set
-                                if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
-                                    let mut echo_buf = Vec::with_capacity(n * 2);
-                                    for i in 0..n {
-                                        if kernel_buf[i] == b'\n' {
-                                            echo_buf.extend_from_slice(b"\r\n");
+                            if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0 {
+                                // Canonical mode: line-buffer input, handle erase/kill
+                                let echo = (ts.lflag & crate::terminal::mode_flags::ECHO) != 0;
+                                let echoe = (ts.lflag & crate::terminal::mode_flags::ECHOE) != 0;
+                                let echonl = (ts.lflag & crate::terminal::mode_flags::ECHONL) != 0;
+                                let onlcr = (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0;
+                                let verase = ts.cc[crate::terminal::cc_index::VERASE];
+                                let veof = ts.cc[crate::terminal::cc_index::VEOF];
+                                let vkill = ts.cc[crate::terminal::cc_index::VKILL];
+
+                                for i in 0..n {
+                                    let byte = kernel_buf[i];
+
+                                    if byte == verase || byte == 0x08 {
+                                        if ts.canon_buffer.pop().is_some() && echoe {
+                                            ch.write(b"\x08 \x08");
+                                        }
+                                    } else if byte == vkill && vkill != 0 {
+                                        let erased = ts.canon_buffer.len();
+                                        ts.canon_buffer.clear();
+                                        if echoe {
+                                            for _ in 0..erased {
+                                                ch.write(b"\x08 \x08");
+                                            }
+                                        }
+                                    } else if byte == veof && veof != 0 {
+                                        if !ts.canon_buffer.is_empty() {
+                                            let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
+                                            ts.canon_ready.extend(line);
                                         } else {
-                                            echo_buf.push(kernel_buf[i]);
+                                            drop(ts);
+                                            return 0; // EOF
+                                        }
+                                    } else if byte == b'\n' {
+                                        ts.canon_buffer.push(byte);
+                                        if echo || echonl {
+                                            if onlcr {
+                                                ch.write(b"\r\n");
+                                            } else {
+                                                ch.write(b"\n");
+                                            }
+                                        }
+                                        let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
+                                        ts.canon_ready.extend(line);
+                                    } else {
+                                        ts.canon_buffer.push(byte);
+                                        if echo {
+                                            ch.write(&[byte]);
                                         }
                                     }
-                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                                }
+
+                                if !ts.canon_ready.is_empty() {
+                                    let to_read = count.min(ts.canon_ready.len());
+                                    for i in 0..to_read {
+                                        kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
                                     }
-                                    ch.write(&echo_buf);
-                                } else {
-                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
+                                    drop(ts);
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            kernel_buf.as_ptr(),
+                                            buf_ptr as *mut u8,
+                                            to_read,
+                                        );
                                     }
-                                    ch.write(&kernel_buf[..n]);
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
+                                    }
+                                    return to_read as u64;
+                                }
+                                // No complete line yet, keep waiting for more input
+                                continue;
+                            } else {
+                                // Non-canonical mode: echo and return immediately
+                                if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
+                                    if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
+                                        let mut echo_buf = Vec::with_capacity(n * 2);
+                                        for i in 0..n {
+                                            if kernel_buf[i] == b'\n' {
+                                                echo_buf.extend_from_slice(b"\r\n");
+                                            } else {
+                                                echo_buf.push(kernel_buf[i]);
+                                            }
+                                        }
+                                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                            crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
+                                        }
+                                        ch.write(&echo_buf);
+                                    } else {
+                                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                            crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
+                                        }
+                                        ch.write(&kernel_buf[..n]);
+                                    }
                                 }
                             }
                         }
@@ -774,6 +872,32 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
                 // Check for EOF if channel is closed
                 if ch.is_stdin_closed() {
+                    // In canonical mode, deliver any partially buffered line before EOF
+                    if !is_pipe {
+                        let term_state_lock = crate::process::current_terminal_state();
+                        if let Some(ref ts_lock) = term_state_lock {
+                            let mut ts = ts_lock.lock();
+                            if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0
+                                && !ts.canon_buffer.is_empty()
+                            {
+                                let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
+                                ts.canon_ready.extend(line);
+                                let to_read = count.min(ts.canon_ready.len());
+                                for i in 0..to_read {
+                                    kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
+                                }
+                                drop(ts);
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        kernel_buf.as_ptr(),
+                                        buf_ptr as *mut u8,
+                                        to_read,
+                                    );
+                                }
+                                return to_read as u64;
+                            }
+                        }
+                    }
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                         crate::safe_print!(128, "[syscall] read(stdin) returned 0 (EOF)\n");
                     }

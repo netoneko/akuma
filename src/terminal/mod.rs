@@ -28,6 +28,18 @@ pub mod mode_flags {
     pub const ECHONL: u32 = 0x00000040;
 }
 
+/// c_cc indices (Linux-compatible)
+pub mod cc_index {
+    pub const VINTR: usize  = 0;
+    pub const VQUIT: usize  = 1;
+    pub const VERASE: usize = 2;
+    pub const VKILL: usize  = 3;
+    pub const VEOF: usize   = 4;
+    pub const VTIME: usize  = 5;
+    pub const VMIN: usize   = 6;
+    pub const VEOL: usize   = 11;
+}
+
 /// Represents the state of a virtual terminal for an SSH session.
 #[derive(Debug)]
 pub struct TerminalState {
@@ -58,13 +70,23 @@ pub struct TerminalState {
     pub input_buffer: Mutex<VecDeque<u8>>,
     /// Waker for tasks waiting on input
     pub input_waker: Mutex<Option<core::task::Waker>>,
+
+    /// Canonical mode line buffer (current line being edited)
+    pub canon_buffer: alloc::vec::Vec<u8>,
+    /// Canonical mode ready buffer (completed lines awaiting read)
+    pub canon_ready: VecDeque<u8>,
 }
 
 impl Default for TerminalState {
     fn default() -> Self {
         let mut cc = [0u8; 20];
-        cc[6] = 1; // VMIN = 1
-        cc[5] = 0; // VTIME = 0
+        cc[cc_index::VMIN] = 1;
+        cc[cc_index::VTIME] = 0;
+        cc[cc_index::VERASE] = 0x7F;
+        cc[cc_index::VEOF] = 0x04; // Ctrl+D
+        cc[cc_index::VINTR] = 0x03; // Ctrl+C
+        cc[cc_index::VQUIT] = 0x1C; // Ctrl+backslash
+        cc[cc_index::VKILL] = 0x15; // Ctrl+U
         
         TerminalState {
             mode_flags: 0,
@@ -81,6 +103,8 @@ impl Default for TerminalState {
             cursor_hidden: false,
             input_buffer: Mutex::new(VecDeque::new()),
             input_waker: Mutex::new(None),
+            canon_buffer: alloc::vec::Vec::new(),
+            canon_ready: VecDeque::new(),
         }
     }
 }

@@ -402,3 +402,51 @@ Dash's pipeline support (`echo hello | sha256sum`) exposed three missing kernel 
 | `src/vfs/ext2.rs` | Set `inode: inode_num` in `metadata()`. |
 | `src/vfs/memory.rs` | Added `path_inode()` FNV-1a helper, set `inode` in `metadata()`. |
 | `src/vfs/proc.rs` | Inline FNV-1a hash for `inode` in `metadata()`. |
+
+## 11. Canonical Mode (ICANON) Line Editing
+
+Backspace did not work in dash. Pressing backspace echoed a raw `0x7F` byte to the terminal instead of erasing the previous character. The kernel had `ICANON` enabled in `lflag` by default but never implemented canonical mode processing — characters were passed through to the process immediately without line buffering or erase handling.
+
+### 11.1. Problem: No Canonical Mode Implementation
+
+The `TerminalState` default flags included `ICANON | ECHO | ECHOE`, matching a standard Linux interactive terminal. However, `sys_read` treated all input identically regardless of `ICANON`:
+
+1. Raw bytes were read from `ProcessChannel::stdin_buffer` and returned to the process immediately (one character at a time).
+2. `ECHO` echoed every byte as-is, including control characters like `0x7F` (DEL/backspace).
+3. No line buffering occurred — the process received each keystroke individually rather than complete lines.
+
+Dash (and other simple shells) rely on the kernel's canonical mode for basic line editing. Without it, backspace, line-kill, and EOF (Ctrl+D) had no effect.
+
+### 11.2. Fix: Kernel TTY Line Discipline
+
+Added canonical mode line buffering to `sys_read` and the supporting data structures to `TerminalState`.
+
+**Terminal state additions (`src/terminal/mod.rs`):**
+
+- Added `cc_index` module with standard c_cc indices: `VINTR`, `VQUIT`, `VERASE`, `VKILL`, `VEOF`, `VTIME`, `VMIN`, `VEOL`.
+- Added `canon_buffer: Vec<u8>` — accumulates the current line being edited.
+- Added `canon_ready: VecDeque<u8>` — holds completed lines waiting to be delivered to the process.
+- Set default c_cc values: `VERASE=0x7F`, `VEOF=0x04` (Ctrl+D), `VINTR=0x03` (Ctrl+C), `VKILL=0x15` (Ctrl+U), `VQUIT=0x1C`.
+
+**Canonical mode processing in `sys_read` (`src/syscall.rs`):**
+
+When `ICANON` is set in `lflag` and stdin is not a pipe, each incoming byte is processed through the line discipline instead of being returned immediately:
+
+- **VERASE (0x7F) / BS (0x08):** Removes the last character from `canon_buffer`. If `ECHOE` is set, echoes `\b \b` (backspace, space, backspace) to visually erase the character on the terminal.
+- **VKILL (Ctrl+U):** Clears the entire `canon_buffer` and echoes the appropriate number of `\b \b` sequences to erase the line visually.
+- **Newline (`\n`):** Appends to `canon_buffer`, echoes `\r\n` (if `ONLCR`) or `\n`, then moves the complete line from `canon_buffer` to `canon_ready` for delivery.
+- **VEOF (Ctrl+D):** If `canon_buffer` has data, delivers it immediately (without the Ctrl+D itself). If `canon_buffer` is empty, returns 0 (EOF).
+- **Other characters:** Appended to `canon_buffer` and echoed individually if `ECHO` is set.
+
+The process's `read()` blocks until `canon_ready` contains data (i.e., a complete line). At the top of each loop iteration, `canon_ready` is checked first so that multi-line pastes and leftover data from previous reads are delivered correctly.
+
+On EOF (stdin closed), any partially buffered line in `canon_buffer` is flushed to `canon_ready` and delivered before returning 0.
+
+Non-canonical mode (raw mode) retains the existing behavior — bytes are echoed and returned immediately without buffering.
+
+### 11.3. Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/terminal/mod.rs` | Added `cc_index` module with standard c_cc index constants. Added `canon_buffer` and `canon_ready` fields to `TerminalState`. Set default VERASE, VEOF, VINTR, VKILL, VQUIT values in c_cc array. |
+| `src/syscall.rs` | Implemented canonical mode processing in `sys_read`: line buffering, VERASE/backspace handling with ECHOE visual erase, VKILL line-kill, VEOF delivery, newline completion. Added `canon_ready` check at loop top for previously completed lines. Flush `canon_buffer` on EOF. |
