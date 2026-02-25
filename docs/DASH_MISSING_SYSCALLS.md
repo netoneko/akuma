@@ -450,3 +450,65 @@ Non-canonical mode (raw mode) retains the existing behavior — bytes are echoed
 |------|--------|
 | `src/terminal/mod.rs` | Added `cc_index` module with standard c_cc index constants. Added `canon_buffer` and `canon_ready` fields to `TerminalState`. Set default VERASE, VEOF, VINTR, VKILL, VQUIT values in c_cc array. |
 | `src/syscall.rs` | Implemented canonical mode processing in `sys_read`: line buffering, VERASE/backspace handling with ECHOE visual erase, VKILL line-kill, VEOF delivery, newline completion. Added `canon_ready` check at loop top for previously completed lines. Flush `canon_buffer` on EOF. |
+
+## 12. Terminal State Not Restored After Meow Exits
+
+After `meow` exited inside a dash session, typed input was no longer visible and commands would not execute.
+
+### 12.1. Architecture: Shared Terminal State
+
+Children inherit their parent's `terminal_state` and `channel` as `Arc` clones (see `fork_process` in `src/process.rs`). Dash and meow therefore operate on the **same** `TerminalState` and `ProcessChannel`. Any modification meow makes to terminal flags is immediately visible to dash.
+
+### 12.2. Bug 1: Raw Mode Not Restored (broken echo)
+
+`meow`'s TUI calls:
+```rust
+get_terminal_attributes(fd::STDIN, &mut old_mode);          // saves mode_flags = 0
+set_terminal_attributes(fd::STDIN, 0, RAW_MODE_ENABLE);     // clears ECHO | ICANON in lflag
+// ... runs TUI ...
+set_terminal_attributes(fd::STDIN, 0, old_mode);            // restores old_mode = 0
+```
+
+`sys_set_terminal_attributes` dispatched on two explicit constants:
+
+```rust
+if mode_flags_arg & RAW_MODE_ENABLE != 0  { /* clear ECHO | ICANON */ }
+else if mode_flags_arg & RAW_MODE_DISABLE != 0 { /* restore */ }
+// mode_flags_arg = 0  →  neither branch taken  →  ECHO stays cleared
+```
+
+Because `old_mode = 0` matched neither constant, `ECHO` and `ICANON` remained cleared after meow exited. Dash received each character but the kernel did not echo it back.
+
+**Partial fix:** changed `else if` to `else`, so any value without `RAW_MODE_ENABLE` restores the flags.
+
+### 12.3. Bug 2: ICRNL Not Restored (commands silently swallowed)
+
+`RAW_MODE_ENABLE` also clears `iflag` bits including `ICRNL`:
+
+```rust
+term_state.iflag &= !(0x00000100 | 0x00000040); // clears ICRNL
+```
+
+The partial fix only restored `lflag` (`ECHO | ICANON`) and `oflag`, but left `iflag` with `ICRNL` cleared. With `ICANON=1` but `ICRNL=0`, the kernel canonical mode never converts the `'\r'` that SSH clients send on Enter into `'\n'`. The canonical buffer accumulated characters forever and `sys_read` never returned a completed line. Dash echoed characters but commands never executed.
+
+### 12.4. Bug 3: Overwrote Dash's Own Terminal Configuration
+
+Dash is an interactive shell that calls `tcsetattr` at startup to enable its own raw-mode line editing (`ICANON=0`, `ECHO=0`). The partial fix blindly set `ICANON=1 | ECHO=1` on restore, which conflicted with what dash had configured. Even if `ICRNL` had been restored, dash would have been confused by the unexpected return to canonical mode.
+
+### 12.5. Fix: Save and Restore Exact Flag State
+
+When `RAW_MODE_ENABLE` is applied, snapshot the current `iflag`, `oflag`, and `lflag` into three new `Option<u32>` fields on `TerminalState`. On restore (any call without `RAW_MODE_ENABLE`), write those exact values back. Because the terminal state is shared, this snapshot captures whatever dash had previously configured via `tcsetattr`.
+
+```
+RAW_MODE_ENABLE  →  saved_{i,o,l}flag = Some(current)  →  apply raw flags
+restore (mode=0) →  {i,o,l}flag = saved_{i,o,l}flag.take()  →  dash state is fully recovered
+```
+
+If no snapshot exists (raw mode was never entered via this syscall), the fallback restores `OPOST | ONLCR` and `ECHO | ICANON`.
+
+### 12.6. Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/terminal/mod.rs` | Added `saved_iflag`, `saved_oflag`, `saved_lflag: Option<u32>` fields to `TerminalState`; initialized to `None` in `Default`. |
+| `src/syscall.rs` | `sys_set_terminal_attributes`: on `RAW_MODE_ENABLE` snapshot all three flag sets before clearing them; on restore take and apply the snapshots, falling back to a sane default if no snapshot exists. |

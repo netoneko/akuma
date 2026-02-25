@@ -2049,12 +2049,32 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
 
     // Standard Linux-style flags for compatibility
     if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
+        // Save the current flags so we can restore them exactly when raw mode ends.
+        term_state.saved_iflag = Some(term_state.iflag);
+        term_state.saved_oflag = Some(term_state.oflag);
+        term_state.saved_lflag = Some(term_state.lflag);
         term_state.iflag &= !(0x00000100 | 0x00000040); // IGNBRK | ICRNL
         term_state.oflag &= !mode_flags::OPOST;
         term_state.lflag &= !(mode_flags::ECHO | mode_flags::ICANON);
-    } else if (mode_flags_arg & mode_flags::RAW_MODE_DISABLE) != 0 {
-        term_state.oflag |= mode_flags::OPOST | mode_flags::ONLCR;
-        term_state.lflag |= mode_flags::ECHO | mode_flags::ICANON;
+    } else {
+        // Restore whatever flags were in place before raw mode was enabled.
+        // This correctly handles the case where the parent (e.g. dash) had already
+        // configured the terminal (raw mode, no echo, etc.) before the child (meow)
+        // temporarily enabled its own raw mode.
+        if let Some(saved) = term_state.saved_iflag.take() {
+            term_state.iflag = saved;
+        }
+        if let Some(saved) = term_state.saved_oflag.take() {
+            term_state.oflag = saved;
+        }
+        if let Some(saved) = term_state.saved_lflag.take() {
+            term_state.lflag = saved;
+        } else {
+            // No saved state (raw mode was never enabled via this syscall).
+            // Fall back to restoring a sane default.
+            term_state.oflag |= mode_flags::OPOST | mode_flags::ONLCR;
+            term_state.lflag |= mode_flags::ECHO | mode_flags::ICANON;
+        }
     }
 
     // Propagate raw mode setting to the ProcessChannel

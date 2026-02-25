@@ -75,6 +75,11 @@ pub struct TerminalState {
     pub canon_buffer: alloc::vec::Vec<u8>,
     /// Canonical mode ready buffer (completed lines awaiting read)
     pub canon_ready: VecDeque<u8>,
+
+    /// Flags saved before the last RAW_MODE_ENABLE call, for exact restoration.
+    pub saved_iflag: Option<u32>,
+    pub saved_oflag: Option<u32>,
+    pub saved_lflag: Option<u32>,
 }
 
 impl Default for TerminalState {
@@ -105,6 +110,9 @@ impl Default for TerminalState {
             input_waker: Mutex::new(None),
             canon_buffer: alloc::vec::Vec::new(),
             canon_ready: VecDeque::new(),
+            saved_iflag: None,
+            saved_oflag: None,
+            saved_lflag: None,
         }
     }
 }
