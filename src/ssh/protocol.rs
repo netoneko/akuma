@@ -780,6 +780,7 @@ async fn bridge_process(
     session: &mut SshSession,
     pid: u32,
     process_channel: Arc<crate::process::ProcessChannel>,
+    terminal_state: Arc<Spinlock<terminal::TerminalState>>,
 ) -> Result<(), TcpError> {
     log(&format!("[SSH] Starting I/O bridge for PID {}\n", pid));
     let mut buf = [0u8; 1024];
@@ -818,6 +819,24 @@ async fn bridge_process(
                             // Forward directly to process stdin
                             let _ = crate::process::write_to_process_stdin(pid, data);
                         }
+                    } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
+                        let mut offset = 0;
+                        let _recipient = read_u32(&payload, &mut offset);
+                        if let Some(req_type) = read_string(&payload, &mut offset) {
+                            if req_type == b"window-change" {
+                                offset += 1; // skip want_reply byte
+                                if let Some(width) = read_u32(&payload, &mut offset) {
+                                    if let Some(height) = read_u32(&payload, &mut offset) {
+                                        session.term_width = width;
+                                        session.term_height = height;
+                                        let mut ts = terminal_state.lock();
+                                        ts.term_width = width as u16;
+                                        ts.term_height = height as u16;
+                                        log(&format!("[SSH] Bridge: terminal resized to {}x{}\n", width, height));
+                                    }
+                                }
+                            }
+                        }
                     } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
                         log("[SSH] Channel closed, ending bridge\n");
                         return Ok(());
@@ -825,12 +844,6 @@ async fn bridge_process(
                 }
             }
             _ => {}
-        }
-        
-        // 4. Handle terminal resizing
-        if session.resize_pending {
-            session.resize_pending = false;
-            // TIOCGWINSZ will pick up session.term_width/height next time it's called
         }
 
         crate::threading::yield_now();
@@ -861,6 +874,9 @@ async fn run_shell_session(
 
     // 0. Get shell config before borrowing session mutably
     let shell_path_opt = session.config.shell.clone();
+    // Capture terminal dimensions from pty-req before borrowing session
+    let initial_width = session.term_width;
+    let initial_height = session.term_height;
 
     // Create per-session shell context (starts at /)
     let mut ctx = ShellContext::new();
@@ -868,8 +884,13 @@ async fn run_shell_session(
     // Create the SSH channel stream adapter
     let mut channel_stream = SshChannelStream::new(stream, session);
 
-    // Create shared terminal state for this session
+    // Create shared terminal state for this session, initialized with actual PTY dimensions
     let terminal_state = Arc::new(Spinlock::new(terminal::TerminalState::default()));
+    {
+        let mut ts = terminal_state.lock();
+        ts.term_width = initial_width as u16;
+        ts.term_height = initial_height as u16;
+    }
     log(&format!("[SSH] Created shared terminal state at {:p}\n", Arc::as_ptr(&terminal_state)));
 
     // Register the channel and terminal state for this system thread so syscalls can find them
@@ -883,7 +904,7 @@ async fn run_shell_session(
         log(&format!("[SSH] Spawning external shell: {}\n", shell_path));
         // Use kernel spawn function directly
         if let Ok((_tid, proc_channel, pid)) = crate::process::spawn_process_with_channel(&shell_path, None, None) {
-            return bridge_process(stream, session, pid, proc_channel).await;
+            return bridge_process(stream, session, pid, proc_channel, terminal_state.clone()).await;
         }
         log(&format!("[SSH] Failed to spawn external shell {}, falling back to built-in\n", shell_path));
     }
