@@ -469,10 +469,21 @@ fn cmd_grep_with_stdin(args: &[String], input: &[u8]) {
 
 fn find_bin(name: &str) -> String {
     if name.starts_with('/') || name.starts_with("./") {
-        String::from(name)
-    } else {
-        format!("/bin/{}", name)
+        return String::from(name);
     }
+
+    let paths = ["/usr/bin", "/bin"];
+    for path in paths {
+        let bin_path = format!("{}/{}", path, name);
+        let fd = open(&bin_path, open_flags::O_RDONLY);
+        if fd >= 0 {
+            close(fd);
+            return bin_path;
+        }
+    }
+    
+    // Default to /bin if not found, let spawn fail later
+    format!("/bin/{}", name)
 }
 
 fn execute_external(args: &[String]) {

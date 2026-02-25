@@ -8,7 +8,7 @@
 //! ```no_run
 //! use libakuma_tls::https_fetch;
 //!
-//! let content = https_fetch("https://example.com/file.txt", true).unwrap();
+//! let content = https_fetch("https://example.com/file.txt", true, None).unwrap(); // None = 20MB default
 //! ```
 
 #![no_std]
@@ -24,7 +24,7 @@ use alloc::string::String;
 use embedded_tls::blocking::{TlsConfig, TlsConnection, TlsContext};
 use embedded_tls::{Aes128GcmSha256, NoVerify, TlsError};
 
-pub use http::{download_file, https_fetch, https_get, https_post, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end};
+pub use http::{download_file, https_fetch, https_get, https_get_with_limit, https_post, https_post_with_limit, HttpHeaders, HttpStream, HttpStreamTls, StreamResult, find_headers_end};
 pub use rng::TlsRng;
 pub use transport::TcpTransport;
 
@@ -45,7 +45,7 @@ pub enum Error {
     /// Invalid URL format
     InvalidUrl,
     /// I/O error during read/write
-    IoError,
+    IoError, // Reverted to generic IoError
 }
 
 impl From<TlsError> for Error {
@@ -105,28 +105,25 @@ impl<'a> TlsStream<'a> {
         // Create RNG for TLS operations
         let mut rng = TlsRng::new();
 
-        // Create TLS connection wrapper
-        let mut conn: TlsConnection<'a, TcpTransport, Aes128GcmSha256> =
-            TlsConnection::new(transport, read_buf, write_buf);
-
         // Create context
         let context = TlsContext::new(&config, &mut rng);
 
         // Perform TLS handshake with NoVerify (Phase 1)
         // Phase 2 would add proper certificate verification
-        conn.open::<TlsRng, NoVerify>(context)?;
+        let mut tls_conn = TlsConnection::new(transport, read_buf, write_buf); // Declare mutable variable
+        tls_conn.open::<TlsRng, NoVerify>(context)?;
 
-        Ok(Self { conn })
+        Ok(Self { conn: tls_conn }) // Use the declared variable
     }
 
     /// Read data from the TLS connection
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        self.conn.read(buf).map_err(|_| Error::IoError)
+        self.conn.read(buf).map_err(|_| Error::IoError) // Reverted to generic IoError
     }
 
     /// Write data to the TLS connection
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.conn.write(buf).map_err(|_| Error::IoError)
+        self.conn.write(buf).map_err(|_| Error::IoError) // Reverted to generic IoError
     }
 
     /// Write all data to the TLS connection
@@ -134,7 +131,7 @@ impl<'a> TlsStream<'a> {
         while !buf.is_empty() {
             let n = self.write(buf)?;
             if n == 0 {
-                return Err(Error::IoError);
+                return Err(Error::IoError); // Reverted to generic IoError
             }
             buf = &buf[n..];
         }
@@ -143,7 +140,7 @@ impl<'a> TlsStream<'a> {
 
     /// Flush the TLS connection
     pub fn flush(&mut self) -> Result<(), Error> {
-        self.conn.flush().map_err(|_| Error::IoError)
+        self.conn.flush().map_err(|_| Error::IoError) // Reverted to generic IoError
     }
 
     /// Close the TLS connection gracefully

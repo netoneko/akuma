@@ -12,8 +12,10 @@ use libakuma::net::{resolve, ErrorKind, TcpStream};
 use crate::transport::TcpTransport;
 use crate::{Error, TlsStream, TLS_RECORD_SIZE};
 
-/// Maximum response size (64KB) for non-streaming requests
-const MAX_RESPONSE_SIZE: usize = 64 * 1024;
+/// Default maximum response size (20MB) for non-streaming requests
+const DEFAULT_MAX_RESPONSE_SIZE: usize = 20 * 1024 * 1024;
+/// Maximum buffer size for HTTP headers before considering them malformed (256KB)
+const MAX_HEADERS_BUFFER_SIZE: usize = 256 * 1024;
 
 /// HTTP headers for requests
 pub struct HttpHeaders {
@@ -65,16 +67,13 @@ impl Default for HttpHeaders {
 ///
 /// # Arguments
 /// * `url` - The URL to fetch (http:// or https://)
-/// * `insecure` - If true, skip TLS certificate verification (like curl -k)
+/// * `_insecure` - If true, skip TLS certificate verification (like curl -k)
+/// * `max_size` - Maximum response body size in bytes (None = 20MB default)
 ///
 /// # Returns
 /// The response body as a byte vector, or an error
-///
-/// # Example
-/// ```no_run
-/// let content = https_fetch("https://raw.githubusercontent.com/user/repo/main/file.txt", true)?;
-/// ```
-pub fn https_fetch(url: &str, _insecure: bool) -> Result<Vec<u8>, Error> {
+pub fn https_fetch(url: &str, _insecure: bool, max_size: Option<usize>) -> Result<Vec<u8>, Error> {
+    let limit = max_size.unwrap_or(DEFAULT_MAX_RESPONSE_SIZE);
     let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
 
     // Resolve hostname
@@ -106,7 +105,7 @@ pub fn https_fetch(url: &str, _insecure: bool) -> Result<Vec<u8>, Error> {
         tls.flush()?;
 
         // Read response
-        let response = read_response_tls(&mut tls)?;
+        let response = read_response_tls(&mut tls, limit)?;
 
         // Close TLS gracefully (ignore errors on close)
         let _ = tls.close();
@@ -120,7 +119,7 @@ pub fn https_fetch(url: &str, _insecure: bool) -> Result<Vec<u8>, Error> {
             .map_err(|_| Error::IoError)?;
 
         // Read response
-        let response = read_response_tcp(&stream)?;
+        let response = read_response_tcp(&stream, limit)?;
 
         // Parse HTTP response
         parse_http_response(&response)
@@ -191,10 +190,11 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
     // This is a simplified version of read_response_*, but instead of
     // buffering the body, we write it to the file.
     let mut response_buf = Vec::new();
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 64 * 1024]; // Increased buffer size
     let mut headers_end = None;
 
     // Read until headers are found
+    let mut header_errors = 0u32;
     while headers_end.is_none() {
         let read_result = match &mut streamer {
             Streamer::Tls(s) => s.read(&mut buf),
@@ -204,17 +204,23 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
         match read_result {
             Ok(0) => break,
             Ok(n) => {
+                header_errors = 0;
                 response_buf.extend_from_slice(&buf[..n]);
+                if response_buf.len() > MAX_HEADERS_BUFFER_SIZE {
+                    return Err(Error::HttpError(String::from("HTTP headers too large or malformed")));
+                }
                 headers_end = find_headers_end(&response_buf);
             }
             Err(e) => {
-                 match &e {
+                 match e {
                     Error::TlsError(_) => return Err(e),
                     Error::IoError => {
-                        // For TCP, this could be a timeout. If we have no data, it's an error.
-                        // Otherwise, we might have just reached the end.
-                        if response_buf.is_empty() { return Err(Error::IoError); }
-                        break;
+                        header_errors += 1;
+                        if header_errors >= 200 {
+                            return Err(Error::IoError);
+                        }
+                        libakuma::sleep_ms(1);
+                        continue;
                     },
                     _ => return Err(e),
                 }
@@ -224,7 +230,7 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
 
     let end_pos = headers_end.ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
     
-    // Parse status and check for errors
+    // Parse status and Content-Length
     let header_str = core::str::from_utf8(&response_buf[..end_pos]).map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
     let status: u16 = header_str.lines().next().and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
         .ok_or_else(|| Error::HttpError(String::from("Invalid status line")))?;
@@ -233,15 +239,35 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
         return Err(Error::HttpError(format!("HTTP error: {}", status)));
     }
 
+    let content_length: Option<usize> = header_str.lines()
+        .find(|line| {
+            let lower: Vec<u8> = line.as_bytes().iter().take(16)
+                .map(|b| b.to_ascii_lowercase()).collect();
+            lower.starts_with(b"content-length:")
+        })
+        .and_then(|line| line.split(':').nth(1)?.trim().parse().ok());
+
     // Write the part of the body we already read
     let body_chunk = &response_buf[end_pos..];
+    let mut body_written: usize = 0;
     if !body_chunk.is_empty() {
         if libakuma::write_fd(fd, body_chunk) < 0 {
             return Err(Error::IoError);
         }
+        body_written += body_chunk.len();
+    }
+
+    // Check if we already have the full body
+    if let Some(cl) = content_length {
+        if body_written >= cl {
+            return Ok(());
+        }
     }
 
     // Stream the rest of the body directly to the file
+    let mut consecutive_errors = 0u32;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 200;
+
     loop {
          let read_result = match &mut streamer {
             Streamer::Tls(s) => s.read(&mut buf),
@@ -249,16 +275,30 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
         };
 
         match read_result {
-            Ok(0) => break, // Done
+            Ok(0) => break,
             Ok(n) => {
+                consecutive_errors = 0;
                 if libakuma::write_fd(fd, &buf[..n]) < 0 {
                     return Err(Error::IoError);
                 }
+                body_written += n;
+                if let Some(cl) = content_length {
+                    if body_written >= cl {
+                        break;
+                    }
+                }
             }
             Err(e) => {
-                 match &e {
+                 match e {
                     Error::TlsError(_) => return Err(e),
-                    Error::IoError => break, // Assume EOF on TCP error after getting data
+                    Error::IoError => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            break;
+                        }
+                        libakuma::sleep_ms(1);
+                        continue;
+                    },
                     _ => return Err(e),
                  }
             }
@@ -370,6 +410,11 @@ fn build_post_request(host: &str, path: &str, body: &str, headers: &HttpHeaders)
 /// let response = https_get("https://api.openai.com/v1/models", &headers)?;
 /// ```
 pub fn https_get(url: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
+    https_get_with_limit(url, headers, DEFAULT_MAX_RESPONSE_SIZE)
+}
+
+/// GET with explicit max response size
+pub fn https_get_with_limit(url: &str, headers: &HttpHeaders, max_size: usize) -> Result<Vec<u8>, Error> {
     let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
 
     // Resolve hostname
@@ -401,7 +446,7 @@ pub fn https_get(url: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
         tls.flush()?;
 
         // Read response
-        let response = read_response_tls(&mut tls)?;
+        let response = read_response_tls(&mut tls, max_size)?;
 
         // Close TLS gracefully (ignore errors on close)
         let _ = tls.close();
@@ -415,7 +460,7 @@ pub fn https_get(url: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
             .map_err(|_| Error::IoError)?;
 
         // Read response
-        let response = read_response_tcp(&stream)?;
+        let response = read_response_tcp(&stream, max_size)?;
 
         // Parse HTTP response
         parse_http_response(&response)
@@ -444,6 +489,11 @@ pub fn https_get(url: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
 /// let response = https_post("https://api.openai.com/v1/chat/completions", body, &headers)?;
 /// ```
 pub fn https_post(url: &str, body: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
+    https_post_with_limit(url, body, headers, DEFAULT_MAX_RESPONSE_SIZE)
+}
+
+/// POST with explicit max response size
+pub fn https_post_with_limit(url: &str, body: &str, headers: &HttpHeaders, max_size: usize) -> Result<Vec<u8>, Error> {
     let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
 
     // Resolve hostname
@@ -475,7 +525,7 @@ pub fn https_post(url: &str, body: &str, headers: &HttpHeaders) -> Result<Vec<u8
         tls.flush()?;
 
         // Read response
-        let response = read_response_tls(&mut tls)?;
+        let response = read_response_tls(&mut tls, max_size)?;
 
         // Close TLS gracefully (ignore errors on close)
         let _ = tls.close();
@@ -489,35 +539,63 @@ pub fn https_post(url: &str, body: &str, headers: &HttpHeaders) -> Result<Vec<u8
             .map_err(|_| Error::IoError)?;
 
         // Read response
-        let response = read_response_tcp(&stream)?;
+        let response = read_response_tcp(&stream, max_size)?;
 
         // Parse HTTP response
         parse_http_response(&response)
     }
 }
 
+/// Parse Content-Length from HTTP headers once we've found the header boundary.
+/// Returns (headers_end_offset, content_length_if_present).
+fn parse_content_length(data: &[u8]) -> Option<(usize, Option<usize>)> {
+    let end = find_headers_end(data)?;
+    let header_str = core::str::from_utf8(&data[..end]).ok()?;
+    let cl = header_str.lines()
+        .find(|line| {
+            let lower_start = line.as_bytes().iter().take(16)
+                .map(|b| b.to_ascii_lowercase())
+                .collect::<Vec<u8>>();
+            lower_start.starts_with(b"content-length:")
+        })
+        .and_then(|line| line.split(':').nth(1)?.trim().parse::<usize>().ok());
+    Some((end, cl))
+}
+
+/// Check if the full HTTP response body has been received based on Content-Length.
+/// Returns true if we should stop reading.
+fn response_complete(data: &[u8], max_size: usize) -> bool {
+    if data.len() >= max_size {
+        return true;
+    }
+    if let Some((headers_end, Some(content_length))) = parse_content_length(data) {
+        let body_received = data.len() - headers_end;
+        body_received >= content_length
+    } else {
+        false
+    }
+}
+
 /// Read HTTP response from TLS stream
-fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<Vec<u8>, Error> {
+fn read_response_tls(tls: &mut TlsStream<'_>, max_size: usize) -> Result<Vec<u8>, Error> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
 
     loop {
         match tls.read(&mut buf) {
-            Ok(0) => break, // Clean EOF
+            Ok(0) => break,
             Ok(n) => {
-                if response.len() + n > MAX_RESPONSE_SIZE {
-                    // Truncate to max size
-                    let remaining = MAX_RESPONSE_SIZE - response.len();
+                if response.len() + n > max_size {
+                    let remaining = max_size - response.len();
                     response.extend_from_slice(&buf[..remaining]);
                     break;
                 }
                 response.extend_from_slice(&buf[..n]);
+                if response_complete(&response, max_size) {
+                    break;
+                }
             }
             Err(_) => {
-                // TLS error (not a clean close_notify).
-                // If we haven't received anything, this is a real failure.
-                // If we have partial data, some servers drop TCP without
-                // close_notify on HTTP/1.0, so let the header parser decide.
                 if response.is_empty() {
                     return Err(Error::IoError);
                 }
@@ -530,37 +608,51 @@ fn read_response_tls(tls: &mut TlsStream<'_>) -> Result<Vec<u8>, Error> {
 }
 
 /// Read HTTP response from TCP stream
-fn read_response_tcp(stream: &TcpStream) -> Result<Vec<u8>, Error> {
+fn read_response_tcp(stream: &TcpStream, max_size: usize) -> Result<Vec<u8>, Error> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut consecutive_errors = 0u32;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 200;
 
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => break, // Clean EOF
+            Ok(0) => break,
             Ok(n) => {
-                if response.len() + n > MAX_RESPONSE_SIZE {
-                    let remaining = MAX_RESPONSE_SIZE - response.len();
+                consecutive_errors = 0;
+                if response.len() + n > max_size {
+                    let remaining = max_size - response.len();
                     response.extend_from_slice(&buf[..remaining]);
                     break;
                 }
                 response.extend_from_slice(&buf[..n]);
+                if response_complete(&response, max_size) {
+                    break;
+                }
             }
             Err(ref e)
                 if e.kind == libakuma::net::ErrorKind::WouldBlock
                     || e.kind == libakuma::net::ErrorKind::TimedOut =>
             {
-                // Kernel recv already blocks up to 30s, so TimedOut here
-                // means no data for a long time.
                 if response.is_empty() {
                     return Err(Error::IoError);
                 }
-                break;
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
+                libakuma::sleep_ms(1);
+                continue;
             }
             Err(_) => {
                 if response.is_empty() {
                     return Err(Error::IoError);
                 }
-                break;
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
+                libakuma::sleep_ms(1);
+                continue;
             }
         }
     }
@@ -679,16 +771,17 @@ impl HttpStream {
     /// Send a POST request (for streaming response)
     ///
     /// After calling this, use `read_chunk()` to read the streaming response.
-    pub fn post(&mut self, path: &str, body: &str, headers: &HttpHeaders) -> Result<(), Error> {
+    pub fn post(&mut self, host: &str, path: &str, body: &str, headers: &HttpHeaders) -> Result<(), Error> {
         match &mut self.conn {
             ConnectionState::Tcp(stream) => {
                 let request = format!(
                     "POST {} HTTP/1.0\r\n\
+                     Host: {}\r\n\
                      {}Content-Length: {}\r\n\
                      Connection: close\r\n\
                      \r\n\
                      {}",
-                    path, headers.format(), body.len(), body
+                    path, host, headers.format(), body.len(), body
                 );
                 stream.write_all(request.as_bytes())
                     .map_err(|_| Error::IoError)?;
@@ -742,11 +835,9 @@ impl HttpStream {
                     ));
                 }
             }
-            // Not enough data for headers yet
             return StreamResult::WouldBlock;
         }
 
-        // Return any pending body data
         if self.pending_data.is_empty() {
             StreamResult::WouldBlock
         } else {
@@ -864,7 +955,7 @@ impl<'a> HttpStreamTls<'a> {
         }
     }
 
-    /// Get the HTTP status code
+    /// Get the HTTP status code (available after headers are parsed)
     pub fn status_code(&self) -> u16 {
         self.status_code
     }
