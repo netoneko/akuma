@@ -8,7 +8,129 @@ use crate::config;
 use crate::terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use spinning_top::Spinlock;
+
+// ============================================================================
+// Kernel Pipe Infrastructure
+// ============================================================================
+
+struct KernelPipe {
+    buffer: Vec<u8>,
+    write_count: u32,
+    read_count: u32,
+    reader_thread: Option<usize>,
+}
+
+static PIPES: Spinlock<BTreeMap<u32, KernelPipe>> = Spinlock::new(BTreeMap::new());
+static NEXT_PIPE_ID: AtomicU32 = AtomicU32::new(1);
+
+fn pipe_create() -> u32 {
+    let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().insert(id, KernelPipe {
+            buffer: Vec::new(),
+            write_count: 1,
+            read_count: 1,
+            reader_thread: None,
+        });
+    });
+    id
+}
+
+/// Increment reference count for a duplicated pipe fd (called by dup3 and fork)
+pub fn pipe_clone_ref(id: u32, is_write: bool) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            if is_write {
+                pipe.write_count += 1;
+            } else {
+                pipe.read_count += 1;
+            }
+        }
+    });
+}
+
+fn pipe_write(id: u32, data: &[u8]) -> usize {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            pipe.buffer.extend_from_slice(data);
+            if let Some(tid) = pipe.reader_thread.take() {
+                crate::threading::get_waker_for_thread(tid).wake();
+            }
+            data.len()
+        } else {
+            0
+        }
+    })
+}
+
+fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            let n = buf.len().min(pipe.buffer.len());
+            if n > 0 {
+                buf[..n].copy_from_slice(&pipe.buffer[..n]);
+                pipe.buffer.drain(..n);
+                (n, false)
+            } else if pipe.write_count == 0 {
+                (0, true) // EOF — all writers closed
+            } else {
+                (0, false) // No data yet, writers still open
+            }
+        } else {
+            (0, true) // Pipe gone, treat as EOF
+        }
+    })
+}
+
+pub fn pipe_close_write(id: u32) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            pipe.write_count = pipe.write_count.saturating_sub(1);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[pipe] close_write pipe={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            }
+            if pipe.write_count == 0 {
+                if let Some(tid) = pipe.reader_thread.take() {
+                    crate::threading::get_waker_for_thread(tid).wake();
+                }
+            }
+            if pipe.write_count == 0 && pipe.read_count == 0 {
+                pipes.remove(&id);
+            }
+        }
+    });
+}
+
+pub fn pipe_close_read(id: u32) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            pipe.read_count = pipe.read_count.saturating_sub(1);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[pipe] close_read pipe={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            }
+            if pipe.write_count == 0 && pipe.read_count == 0 {
+                pipes.remove(&id);
+            }
+        }
+    });
+}
+
+fn pipe_set_reader_thread(id: u32, tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            pipe.reader_thread = Some(tid);
+        }
+    });
+}
 
 /// Flag to bypass pointer validation during kernel-originated syscall tests
 pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
@@ -51,6 +173,7 @@ pub mod nr {
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
+    pub const DUP3: u64 = 24;        // Linux arm64 dup3
     pub const PIPE2: u64 = 59;       // Linux arm64 pipe2
     pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
     pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
@@ -120,6 +243,8 @@ const EFAULT: u64 = (-14i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 /// Error code for permission denied
 const EACCES: u64 = (-13i64) as u64;
+/// Error code for bad file descriptor
+const EBADF: u64 = (-9i64) as u64;
 /// Error code for function not implemented
 const ENOSYS: u64 = (-38i64) as u64;
 
@@ -269,6 +394,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
+        nr::DUP3 => sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIPE2 => sys_pipe2(args[0], args[1] as u32),
         nr::BRK => sys_brk(args[0] as usize),
         nr::OPENAT => sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
@@ -725,6 +851,25 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 !0u64
             }
         }
+        crate::process::FileDescriptor::PipeRead(pipe_id) => {
+            let mut temp = alloc::vec![0u8; count];
+            loop {
+                let (n, eof) = pipe_read(pipe_id, &mut temp);
+                if n > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                    return n as u64;
+                }
+                if eof {
+                    return 0;
+                }
+                if crate::process::is_current_interrupted() {
+                    return EINTR;
+                }
+                let tid = crate::threading::current_thread_id();
+                pipe_set_reader_thread(pipe_id, tid);
+                crate::threading::schedule_blocking(u64::MAX);
+            }
+        }
         _ => !0u64
     }
 }
@@ -804,6 +949,9 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
+        crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+            pipe_write(pipe_id, buf) as u64
+        }
         _ => !0u64
     }
 }
@@ -829,30 +977,50 @@ fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     total_written
 }
 
+fn sys_dup3(oldfd: u32, newfd: u32, _flags: u32) -> u64 {
+    if oldfd == newfd { return EINVAL; }
+    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let entry = match proc.get_fd(oldfd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let pid = proc.pid;
+        crate::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}) PID {}\n", oldfd, newfd, pid);
+    }
+
+    // If newfd was a pipe fd, close it properly before replacing
+    if let Some(old_entry) = proc.get_fd(newfd) {
+        match old_entry {
+            crate::process::FileDescriptor::PipeWrite(id) => pipe_close_write(id),
+            crate::process::FileDescriptor::PipeRead(id) => pipe_close_read(id),
+            _ => {}
+        }
+    }
+
+    // Increment ref count for cloned pipe fds
+    match &entry {
+        crate::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
+        crate::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
+        _ => {}
+    }
+
+    proc.set_fd(newfd, entry);
+    newfd as u64
+}
+
 fn sys_pipe2(fds_ptr: u64, _flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
-    
-    // Stub implementation using temporary files since we don't have kernel pipes yet.
-    // This allows GNU Make to proceed with subprocess communication.
     let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
-    
-    // Ensure /tmp exists
-    let _ = crate::fs::create_dir("/tmp");
-    
-    let path_r = "/tmp/pipe_r";
-    let path_w = "/tmp/pipe_w";
-    
-    // Create files if they don't exist
-    let _ = crate::fs::write_file(path_r, &[]);
-    let _ = crate::fs::write_file(path_w, &[]);
-    
-    let fd_r = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_r.into(), 0)));
-    let fd_w = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path_w.into(), 1)));
-    
+
+    let pipe_id = pipe_create();
+    let fd_r = proc.alloc_fd(crate::process::FileDescriptor::PipeRead(pipe_id));
+    let fd_w = proc.alloc_fd(crate::process::FileDescriptor::PipeWrite(pipe_id));
+
     unsafe {
         *(fds_ptr as *mut [i32; 2]) = [fd_r as i32, fd_w as i32];
     }
-    
     0
 }
 
@@ -902,8 +1070,13 @@ fn sys_close(fd: u32) -> u64 {
             match entry {
                 crate::process::FileDescriptor::Socket(idx) => { crate::socket::remove_socket(idx); }
                 crate::process::FileDescriptor::ChildStdout(child_pid) => {
-                    // Important: Cleanup the child channel to avoid memory leaks if parent closes it
                     crate::process::remove_child_channel(child_pid);
+                }
+                crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+                    pipe_close_write(pipe_id);
+                }
+                crate::process::FileDescriptor::PipeRead(pipe_id) => {
+                    pipe_close_read(pipe_id);
                 }
                 _ => {}
             }

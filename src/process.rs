@@ -390,6 +390,10 @@ pub enum FileDescriptor {
     /// Child process stdout - PID of the child process
     /// Used by parent to read child's stdout via ProcessChannel
     ChildStdout(Pid),
+    /// Read end of a kernel pipe (pipe_id into global PIPES table)
+    PipeRead(u32),
+    /// Write end of a kernel pipe (pipe_id into global PIPES table)
+    PipeWrite(u32),
 }
 
 /// Kernel file handle for open files
@@ -1564,6 +1568,13 @@ impl Process {
         })
     }
 
+    /// Set a file descriptor entry at a specific FD number, replacing any existing entry
+    pub fn set_fd(&self, fd: u32, entry: FileDescriptor) {
+        crate::irq::with_irqs_disabled(|| {
+            self.fd_table.lock().insert(fd, entry);
+        });
+    }
+
     /// Update a file descriptor entry (for file position updates, etc.)
     pub fn update_fd<F>(&self, fd: u32, f: F) -> bool
     where
@@ -1808,6 +1819,12 @@ fn cleanup_process_fds(proc: &Process) {
             FileDescriptor::ChildStdout(child_pid) => {
                 crate::process::remove_child_channel(child_pid);
             }
+            FileDescriptor::PipeWrite(pipe_id) => {
+                crate::syscall::pipe_close_write(pipe_id);
+            }
+            FileDescriptor::PipeRead(pipe_id) => {
+                crate::syscall::pipe_close_read(pipe_id);
+            }
             _ => {}
         }
     }
@@ -1948,7 +1965,17 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
-        fd_table: Spinlock::new(parent.fd_table.lock().clone()),
+        fd_table: {
+            let cloned = parent.fd_table.lock().clone();
+            for entry in cloned.values() {
+                match entry {
+                    FileDescriptor::PipeWrite(id) => crate::syscall::pipe_clone_ref(*id, true),
+                    FileDescriptor::PipeRead(id) => crate::syscall::pipe_clone_ref(*id, false),
+                    _ => {}
+                }
+            }
+            Spinlock::new(cloned)
+        },
         next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
         thread_id: None,
         spawner_pid: parent.spawner_pid,
