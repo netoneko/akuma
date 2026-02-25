@@ -2275,10 +2275,14 @@ pub fn spawn_process_with_channel_ext(
     // to contaminate the parent's channel, leaking exit codes.
     let channel = Arc::new(ProcessChannel::new());
     
-    // Seed the channel with initial stdin data if provided
+    // Seed the channel with initial stdin data if provided.
+    // Empty stdin (Some(b"")) keeps stdin open so sys_write enables ONLCR
+    // translation — use this for subprocesses that need terminal-style output.
     if let Some(data) = stdin {
-        channel.write_stdin(data);
-        channel.close_stdin(); // Mark as closed since we've provided all data
+        if !data.is_empty() {
+            channel.write_stdin(data);
+            channel.close_stdin();
+        }
     }
 
     // Set the channel in the process struct (UNIFIED I/O)
