@@ -1162,6 +1162,8 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         return !0u64; // EINTERNAL
     }
 
+    proc.name = resolved_path.clone();
+
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
     }

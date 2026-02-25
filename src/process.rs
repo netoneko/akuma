@@ -1395,6 +1395,8 @@ impl Process {
         self.brk = brk;
         self.initial_brk = brk;
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.mmap_regions.clear();
+        self.dynamic_page_tables.clear();
         self.args = args.to_vec();
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -1945,7 +1947,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         exited: false,
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
-        mmap_regions: parent.mmap_regions.clone(),
+        mmap_regions: Vec::new(),
         fd_table: Spinlock::new(parent.fd_table.lock().clone()),
         next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
         thread_id: None,
@@ -1985,9 +1987,26 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
     }
 
-    // Also copy all mmap'd regions
+    // Copy mmap'd regions and rebuild mmap_regions with the child's own frames
+    new_proc.mmap_regions.clear();
     for (va, frames) in &parent.mmap_regions {
-        copy_range(*va, frames.len() * mmu::PAGE_SIZE, &mut new_proc.address_space)?;
+        let num_pages = frames.len();
+        let mut child_frames = Vec::new();
+        for i in 0..num_pages {
+            let page_va = *va + i * mmu::PAGE_SIZE;
+            if mmu::is_current_user_range_mapped(page_va, 1) {
+                let frame = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW)?;
+                unsafe {
+                    let src_ptr = page_va as *const u8;
+                    let dest_ptr = mmu::phys_to_virt(frame.addr);
+                    core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
+                }
+                child_frames.push(frame);
+            }
+        }
+        if !child_frames.is_empty() {
+            new_proc.mmap_regions.push((*va, child_frames));
+        }
     }
     
     // 5. Write ProcessInfo to child's process info page

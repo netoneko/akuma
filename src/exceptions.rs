@@ -1084,8 +1084,15 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
+            let frame_ref = unsafe { &*frame };
             crate::safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
+            crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
+                frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
+            crate::safe_print!(128, "[Fault]  x19={:#x} x20={:#x} x29={:#x} x30={:#x}\n",
+                frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
+            crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x}\n",
+                frame_ref.sp_el0, frame_ref.spsr_el1);
             // Terminate process
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
