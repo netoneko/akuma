@@ -126,3 +126,6 @@ For more details, see the [Architecture Document](docs/ARCHITECTURE.md).
 ## License
 
 MIT
+
+If a userspace application is under a license different from MIT (like GPL2 or LGPL2), then the associated userspace programs and the code around them follows their respective license.
+
