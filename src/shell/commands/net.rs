@@ -243,11 +243,10 @@ const PKG_SERVER: &str = "http://10.0.2.2:8000";
 pub struct PkgCommand;
 
 impl PkgCommand {
-    /// Download a file from the package server.
-    async fn download_file(
+    async fn download_file_w<W: embedded_io_async::Write>(
         &self,
         path: &str,
-        stdout: &mut VecWriter
+        stdout: &mut W,
     ) -> Result<(u16, Vec<u8>), ShellError> {
         let url_str = format!("{}{}", PKG_SERVER, path);
         let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
@@ -261,14 +260,13 @@ impl PkgCommand {
         })
     }
 
-    /// Try to install a pre-compiled binary.
-    async fn try_install_binary(
+    async fn try_install_binary_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
-        stdout: &mut VecWriter
+        stdout: &mut W,
     ) -> Result<bool, ShellError> {
         let bin_path = format!("/bin/{}", package);
-        match self.download_file(&bin_path, stdout).await {
+        match self.download_file_w(&bin_path, stdout).await {
             Ok((200, body)) => {
                 if body.is_empty() {
                     let _ = stdout.write(b"pkg: warning: downloaded binary is empty.\r\n").await;
@@ -280,7 +278,7 @@ impl PkgCommand {
                 let _ = stdout.write(msg.as_bytes()).await;
                 Ok(true)
             }
-            Ok((404, _)) => Ok(false), // Not found, try next method
+            Ok((404, _)) => Ok(false),
             Ok((status, _)) => {
                 let msg = format!("pkg: failed to download binary (status: {})\r\n", status);
                 let _ = stdout.write(msg.as_bytes()).await;
@@ -290,11 +288,10 @@ impl PkgCommand {
         }
     }
 
-    /// Try to install from a tarball archive.
-    async fn try_install_archive(
+    async fn try_install_archive_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
-        stdout: &mut VecWriter,
+        stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<bool, ShellError> {
         let archive_path_gz = format!("/archives/{}.tar.gz", package);
@@ -307,20 +304,20 @@ impl PkgCommand {
             let path = paths[i];
             let ext = extensions[i];
             
-            match self.download_file(path, stdout).await {
+            match self.download_file_w(path, stdout).await {
                 Ok((200, body)) => {
                     if body.is_empty() {
-                        continue; // Try next extension
+                        continue;
                     }
                     
                     let tmp_path = format!("/tmp/{}{}", package, ext);
                     let _ = crate::async_fs::write_file(&tmp_path, &body).await;
 
-                    let success = self.extract_and_cleanup(&tmp_path, stdout, ctx).await?;
+                    let success = self.extract_and_cleanup_w(&tmp_path, stdout, ctx).await?;
 
                     return Ok(success);
                 }
-                Ok((404, _)) => continue, // Not found, try next
+                Ok((404, _)) => continue,
                 Ok((status, _)) => {
                     let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
                     let _ = stdout.write(msg.as_bytes()).await;
@@ -332,17 +329,14 @@ impl PkgCommand {
         Ok(false)
     }
 
-    /// Extract a tarball and clean up the temporary file.
-    async fn extract_and_cleanup(
+    async fn extract_and_cleanup_w<W: embedded_io_async::Write>(
         &self,
         archive_path: &str,
-        stdout: &mut VecWriter,
+        stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<bool, ShellError> {
-        // Ensure /bin/tar exists
         if !crate::async_fs::exists("/bin/tar").await {
             let _ = stdout.write(b"pkg: 'tar' command not found. Please 'pkg install tar' first.\r\n").await;
-            // Clean up the downloaded archive even if tar is missing
             let _ = crate::async_fs::remove_file(archive_path).await;
             return Ok(false);
         }
@@ -355,10 +349,8 @@ impl PkgCommand {
         let msg = format!("pkg: extracting {} to root...\r\n", archive_path);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        // Use execute_external_streaming to run tar
-        let result = execute_external_streaming("/bin/tar", Some(&args), None, Some(ctx.cwd()), stdout).await;
+        let result = execute_external_streaming("/bin/tar", Some(&args), Some(b""), Some(ctx.cwd()), stdout).await;
         
-        // Clean up the archive file
         let _ = crate::async_fs::remove_file(archive_path).await;
         
         if result.is_ok() {
@@ -370,32 +362,40 @@ impl PkgCommand {
         }
     }
 
-    /// The main package installation logic.
-    async fn install_package(
+    /// Install packages with streaming output to any writer.
+    pub async fn install_streaming<W: embedded_io_async::Write>(
+        &self,
+        packages: &str,
+        stdout: &mut W,
+        ctx: &mut ShellContext,
+    ) -> Result<(), ShellError> {
+        for package in packages.split_whitespace() {
+            self.install_package_w(package, stdout, ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn install_package_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
-        stdout: &mut VecWriter,
+        stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<(), ShellError> {
         if package.is_empty() {
             return Ok(());
         }
 
-        // Ensure /bin and /tmp exist
         let _ = crate::async_fs::create_dir("/bin").await;
         let _ = crate::async_fs::create_dir("/tmp").await;
 
-        // 1. Try installing from a pre-compiled binary
-        if self.try_install_binary(package, stdout).await? {
+        if self.try_install_binary_w(package, stdout).await? {
             return Ok(());
         }
 
-        // 2. If binary fails, try installing from a tarball archive
-        if self.try_install_archive(package, stdout, ctx).await? {
+        if self.try_install_archive_w(package, stdout, ctx).await? {
             return Ok(());
         }
 
-        // 3. If all methods fail
         let msg = format!("pkg: unable to find package '{}'\r\n", package);
         let _ = stdout.write(msg.as_bytes()).await;
 
@@ -425,12 +425,7 @@ impl Command for PkgCommand {
                     return Ok(());
                 }
 
-                for package in packages.split_whitespace() {
-                    if let Err(e) = self.install_package(package, stdout, ctx).await {
-                         let msg = format!("pkg: error installing {}: {:?}\r\n", package, e);
-                         let _ = stdout.write(msg.as_bytes()).await;
-                    }
-                }
+                self.install_streaming(packages, stdout, ctx).await?;
             } else {
                 let _ = stdout.write(b"Usage: pkg install <package1> [package2] ...\r\n").await;
             }

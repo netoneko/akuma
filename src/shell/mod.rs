@@ -655,6 +655,8 @@ pub async fn execute_external_interactive(
 pub enum StreamableCommand {
     /// Command is a simple external binary that can be streamed
     External(alloc::string::String),
+    /// Built-in pkg install with streaming output
+    PkgInstall(alloc::string::String),
     /// Command is a builtin or complex (pipes, redirects) - use buffered execution
     Buffered,
     /// Command is exit/quit
@@ -700,6 +702,18 @@ pub async fn check_streamable_command(
     // Parse the command name
     let (cmd_name, _args) = split_first_word(trimmed);
     
+    // Stream pkg install directly to SSH channel for real-time output
+    if cmd_name == b"pkg" {
+        let (_cmd, args) = split_first_word(trimmed);
+        let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+        if let Some(packages) = args_str.strip_prefix("install") {
+            let packages = packages.trim();
+            if !packages.is_empty() {
+                return StreamableCommand::PkgInstall(alloc::string::String::from(packages));
+            }
+        }
+    }
+
     // If built-ins come first, check them now
     if crate::config::SSH_BUILT_INS_FIRST && registry.find(cmd_name).is_some() {
         return StreamableCommand::Buffered;
@@ -763,6 +777,17 @@ pub async fn execute_command_streaming(
             let success = execute_external_interactive(&bin_path, args_slice, stdin, Some(ctx.cwd()), channel_stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
+                success,
+                should_exit: false,
+            })
+        }
+        StreamableCommand::PkgInstall(packages) => {
+            let success = commands::net::PKG_CMD
+                .install_streaming(&packages, channel_stream, ctx)
+                .await
+                .is_ok();
+            Some(ChainExecutionResult {
+                output: Vec::new(),
                 success,
                 should_exit: false,
             })
