@@ -328,3 +328,77 @@ Additionally, `CHILD_CHANNELS` only stored `BTreeMap<Pid, Arc<ProcessChannel>>` 
 | `src/process.rs` | Rewrote `enter_user_mode` to load GP registers from `UserContext` instead of zeroing them. In `fork_process`: write `ProcessInfo` to child's info page; set `new_proc.context = child_ctx`; enforce `child_ctx.spsr = 0`; create exit-tracking channel separate from I/O channel. Unified `allocate_pid()` to use the single module-level PID counter. Always create fresh `ProcessChannel` per spawn. Extended `CHILD_CHANNELS` to track parent PID; added `find_exited_child()` and `has_children()`. |
 | `src/syscall.rs` | In `sys_execve`: activate new address space after `replace_image` before entering user mode. Implemented `wait4(pid=-1)` with blocking scan over `CHILD_CHANNELS`. Updated `sys_spawn`/`sys_spawn_ext` to pass parent PID to `register_child_channel`. |
 | `src/socket.rs` | Added `ECHILD=10` to `libc_errno`. |
+
+## 10. Pipe and File Descriptor Duplication Support
+
+Dash's pipeline support (`echo hello | sha256sum`) exposed three missing kernel features: `dup3`, real kernel pipes, and correct `stat` inode reporting. Several related `unlinkat` bugs were also fixed.
+
+### 10.1. `dup3` Syscall (Syscall 24)
+
+**Symptom:** Dash logged `Unknown syscall: 24` when setting up pipes. Pipe fd redirections silently failed, so `echo` wrote to the terminal instead of the pipe, and `sha256sum` read from the terminal (blocking forever).
+
+**Implementation:** `dup3(oldfd, newfd, flags)` clones the file descriptor entry from `oldfd` to `newfd`:
+
+- If `oldfd == newfd`, returns `EINVAL`
+- If `newfd` already points to a pipe fd, properly closes it (decrementing pipe reference counts)
+- If the cloned entry is a pipe fd, increments the pipe's reference count
+- Added `Process::set_fd(fd, entry)` for inserting at a specific fd number
+- Added `EBADF` error constant
+
+### 10.2. Kernel Pipes (Replacing `pipe2` File Stub)
+
+**Symptom:** Even with `dup3`, `echo hello | sha256sum` produced the SHA-256 of an empty string. The old `pipe2` implementation used two separate temp files (`/tmp/pipe_r`, `/tmp/pipe_w`) with no shared buffer — data written to one never appeared in the other.
+
+**Implementation:** Real in-kernel pipe infrastructure:
+
+- `KernelPipe` struct: shared `Vec<u8>` buffer, `write_count`/`read_count` reference counts, optional `reader_thread` for wake-on-data
+- Global `PIPES` table (`BTreeMap<u32, KernelPipe>`) with atomic `NEXT_PIPE_ID` counter
+- New `FileDescriptor::PipeRead(pipe_id)` and `FileDescriptor::PipeWrite(pipe_id)` variants
+- `sys_read` for `PipeRead`: blocking loop — returns data when available, EOF (0) when all write ends are closed
+- `sys_write` for `PipeWrite`: appends to shared buffer, wakes blocked reader thread
+- `sys_close`: `PipeWrite` decrements `write_count` (delivers EOF to reader only when it reaches 0); `PipeRead` decrements `read_count`; pipe is removed from table when both counts reach 0
+
+### 10.3. Pipe Reference Counting Across Fork and Dup
+
+**Symptom:** After the initial pipe implementation, `sha256sum` still hashed empty input. When dash forks two children for a pipeline, all three processes (parent + 2 children) get copies of both `PipeRead` and `PipeWrite` fds. Without reference counting, the first `close()` of any `PipeWrite` copy (e.g., sha256sum closing its inherited write end) prematurely signaled EOF to the reader.
+
+**Implementation:**
+
+- `pipe_create()` initializes `write_count=1, read_count=1`
+- `pipe_clone_ref(id, is_write)` increments the appropriate count — called from:
+  - `fork_process()` when cloning the parent's fd table (iterates all pipe fds)
+  - `sys_dup3()` when duplicating a pipe fd to a new fd number
+- `pipe_close_write()` uses `saturating_sub(1)` and only signals EOF when `write_count` reaches 0
+- `pipe_close_read()` uses `saturating_sub(1)` and only removes the pipe when both counts are 0
+- `cleanup_process_fds()` handles pipe fd cleanup on process exit
+
+### 10.4. `stat` Inode Bug (`st_ino=0` for All Files)
+
+**Symptom:** `rm -rf /usr/bin` printed `"/" may not be removed` — sbase `rm` uses `stat()` to compare the target's `(st_dev, st_ino)` with the root directory's. Since both returned `(0, 0)`, every path looked like `/`.
+
+**Fix:**
+
+- Added `inode: u64` field to `vfs::Metadata`
+- ext2: uses real inode number from `lookup_path()`
+- memfs/procfs: FNV-1a hash of the path
+- `sys_fstat` and `sys_newfstatat` now set `st_dev=1`, `st_ino=meta.inode`, `st_nlink`, `st_blksize=4096`
+
+### 10.5. `unlinkat` Bugs (dirfd and AT_REMOVEDIR)
+
+**Symptom:** After fixing `stat`, `rm -rf` ran without the root check error but files/directories remained on disk.
+
+**Fix:**
+
+- Resolve relative paths using the dirfd's path (or CWD for `AT_FDCWD`), matching `sys_newfstatat` resolution logic
+- Check `flags & AT_REMOVEDIR` (0x200) and call `remove_dir()` for directories, `remove_file()` for regular files
+
+### 10.6. Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/syscall.rs` | Implemented `sys_dup3` (syscall 24) with pipe ref count handling. Added `KernelPipe` infrastructure with reference-counted read/write ends. Rewrote `sys_pipe2` to use kernel pipes. Added `PipeRead`/`PipeWrite` handling in `sys_read`, `sys_write`, `sys_close`. Fixed `sys_unlinkat` dirfd resolution and `AT_REMOVEDIR` flag. Fixed `sys_fstat`/`sys_newfstatat` to populate `st_dev`, `st_ino`, `st_nlink`, `st_blksize`. Added `EBADF` constant. |
+| `src/process.rs` | Added `PipeRead(u32)` and `PipeWrite(u32)` to `FileDescriptor`. Added `set_fd()` method. Pipe ref count increment in `fork_process` fd table clone. Pipe cleanup in `cleanup_process_fds`. |
+| `src/vfs/mod.rs` | Added `inode: u64` to `Metadata` struct. |
+| `src/vfs/ext2.rs` | Set `inode: inode_num` in `metadata()`. |
+| `src/vfs/memory.rs` | Added `path_inode()` FNV-1a helper, set `inode` in `metadata()`. |
+| `src/vfs/proc.rs` | Inline FNV-1a hash for `inode` in `metadata()`. |
