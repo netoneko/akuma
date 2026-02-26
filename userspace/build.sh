@@ -31,6 +31,7 @@ MEMBERS=(
     "sbase"
     "sshd"
     "dash"
+    "xbps"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -45,6 +46,17 @@ for member in "${MEMBERS[@]}"; do
             echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
         else
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
+        fi
+    fi
+    # Special handling for xbps to copy its package archive
+    if [ "$member" == "xbps" ]; then
+        XBPS_ARCHIVE="xbps/dist/xbps.tar"
+        if [ -f "$XBPS_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$XBPS_ARCHIVE" ../bootstrap/archives/xbps.tar
+            echo "Copied $XBPS_ARCHIVE to ../bootstrap/archives/xbps.tar"
+        else
+            echo "Warning: xbps archive not found at $XBPS_ARCHIVE"
         fi
     fi
 done
