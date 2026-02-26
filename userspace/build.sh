@@ -22,7 +22,6 @@ MEMBERS=(
     "top"
     "cat"
     "box"
-    "paws"
     "pkg"
     "musl"
     "tcc"

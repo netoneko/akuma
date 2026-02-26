@@ -21,7 +21,6 @@ members = [
     "termtest",
     "allocstress",
     "top",
-    "paws",
     "pkg",
     "musl",
     "tcc",
