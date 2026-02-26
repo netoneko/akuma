@@ -816,8 +816,10 @@ async fn bridge_process(
                         let mut offset = 0;
                         let _recipient = read_u32(&payload, &mut offset);
                         if let Some(data) = read_string(&payload, &mut offset) {
-                            // Forward directly to process stdin
-                            let _ = crate::process::write_to_process_stdin(pid, data);
+                            // Translate escape sequences before forwarding to process stdin.
+                            // e.g. \x1b[3~ (Delete key) -> \x7f so apps like neatvi handle it.
+                            let translated = translate_input_keys(data);
+                            let _ = crate::process::write_to_process_stdin(pid, &translated);
                         }
                     } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
                         let mut offset = 0;
@@ -851,12 +853,37 @@ async fn bridge_process(
     Ok(())
 }
 
+/// Translate terminal escape sequences from SSH clients to simpler byte equivalents.
+/// SSH clients send raw escape sequences for special keys; apps like neatvi only
+/// understand simple byte codes for some of these (e.g. 0x7f for delete/backspace).
+fn translate_input_keys(data: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut result = alloc::vec::Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        // Delete key: ESC [ 3 ~ -> 0x7f (DEL)
+        if i + 3 < data.len()
+            && data[i] == 0x1b
+            && data[i + 1] == b'['
+            && data[i + 2] == b'3'
+            && data[i + 3] == b'~'
+        {
+            result.push(0x7f);
+            i += 4;
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Escape sequence state machine for parsing ANSI escape codes
 #[derive(Clone, Copy, PartialEq)]
 enum EscapeState {
     Normal,
-    Escape,  // Got ESC (0x1B)
-    Bracket, // Got ESC [
+    Escape,       // Got ESC (0x1B)
+    Bracket,      // Got ESC [
+    BracketNum(u8), // Got ESC [ <digit>, awaiting terminator
 }
 
 /// Generate the shell prompt with current working directory
@@ -951,7 +978,8 @@ async fn run_shell_session(
                     // Raw mode: Pass input directly to the process's stdin buffer
                     // using unified helper (UNIFIED I/O)
                     if let Some(pid) = channel_stream.current_process_pid {
-                        let _ = process::write_to_process_stdin(pid, &read_buf[..n]);
+                        let translated = translate_input_keys(&read_buf[..n]);
+                        let _ = process::write_to_process_stdin(pid, &translated);
                     }
                     // No echo, no line editing in raw mode
                 } else {
@@ -1239,13 +1267,48 @@ async fn run_shell_session(
                                             cursor_pos = line_buffer.len();
                                         }
                                     }
-                                    b'3' => {
-                                        // Might be Delete key (ESC[3~) - need to handle tilde
-                                        // For simplicity, we'll handle this as a special case
-                                        // The next byte should be ~
+                                    b'1'..=b'8' => {
+                                        // Extended escape sequence: ESC [ <digit> ~
+                                        // e.g. ESC[3~ = Delete, ESC[1~ = Home, ESC[4~ = End
+                                        escape_state = EscapeState::BracketNum(byte - b'0');
                                     }
                                     _ => {
                                         // Unknown escape sequence, ignore
+                                    }
+                                }
+                            }
+                            EscapeState::BracketNum(n) => {
+                                escape_state = EscapeState::Normal;
+                                if byte == b'~' {
+                                    match n {
+                                        3 => {
+                                            // Delete key - remove char at cursor position
+                                            if cursor_pos < line_buffer.len() {
+                                                line_buffer.remove(cursor_pos);
+                                                let rest: Vec<u8> = line_buffer[cursor_pos..].to_vec();
+                                                let _ = channel_stream.write(&rest).await;
+                                                let _ = channel_stream.write(b" ").await;
+                                                let moves = rest.len() + 1;
+                                                for _ in 0..moves {
+                                                    let _ = channel_stream.write(b"\x08").await;
+                                                }
+                                            }
+                                        }
+                                        1 => {
+                                            // Home - move to beginning of line
+                                            while cursor_pos > 0 {
+                                                let _ = channel_stream.write(b"\x08").await;
+                                                cursor_pos -= 1;
+                                            }
+                                        }
+                                        4 => {
+                                            // End - move to end of line
+                                            if cursor_pos < line_buffer.len() {
+                                                let _ = channel_stream.write(&line_buffer[cursor_pos..]).await;
+                                                cursor_pos = line_buffer.len();
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }

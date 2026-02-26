@@ -516,6 +516,28 @@ pub trait InteractiveRead: embedded_io_async::Read {
     ) -> impl core::future::Future<Output = Result<usize, Self::Error>>;
 }
 
+/// Translate terminal escape sequences to simpler byte equivalents.
+/// \x1b[3~ (Delete key) -> \x7f so apps like neatvi delete in insert mode.
+fn translate_input_keys(data: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut result = alloc::vec::Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 3 < data.len()
+            && data[i] == 0x1b
+            && data[i + 1] == b'['
+            && data[i + 2] == b'3'
+            && data[i + 3] == b'~'
+        {
+            result.push(0x7f);
+            i += 4;
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Execute an external binary with interactive bidirectional I/O
 ///
 /// This enables truly interactive applications like chat clients that
@@ -618,8 +640,10 @@ pub async fn execute_external_interactive(
                     }
                 }
                 
-                // Forward to process stdin using unified helper (UNIFIED I/O)
-                let _ = process::write_to_process_stdin(pid, input_data);
+                // Forward to process stdin using unified helper (UNIFIED I/O).
+                // Translate escape sequences: \x1b[3~ (Delete key) -> \x7f
+                let translated = translate_input_keys(input_data);
+                let _ = process::write_to_process_stdin(pid, &translated);
             }
             Err(_) => {
                 // Read error - continue
