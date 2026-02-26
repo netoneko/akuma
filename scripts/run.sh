@@ -20,7 +20,7 @@ qemu-system-aarch64 \
   -semihosting \
   -machine virt \
   -cpu max \
-  -m 128M \
+  -m 256M \
   -L qemu-roms \
   -serial mon:stdio \
   -display none \
@@ -31,6 +31,6 @@ qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on \
+  -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on \
   -kernel $KERNEL_PATH \
   $EXTRA_ARGS

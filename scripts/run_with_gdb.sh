@@ -20,7 +20,7 @@ echo ""
 qemu-system-aarch64 \
   -machine virt \
   -cpu max \
-  -m 128M \
+  -m 256M \
   -nographic \
   -serial mon:stdio \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080 \
@@ -29,7 +29,7 @@ qemu-system-aarch64 \
   -drive file=disk.img,if=none,format=raw,id=hd0 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
-  -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on \
+  -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on \
   -s \
   -S \
   -kernel "$KERNEL_PATH"

@@ -144,8 +144,8 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 const DTB_MAGIC: u32 = 0xd00dfeed;
 
 /// Fixed address where we tell QEMU to load the DTB via loader device
-/// Use: -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on
-const DTB_FIXED_ADDR: usize = 0x47f00000;
+/// Use: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on
+const DTB_FIXED_ADDR: usize = 0x4ff00000;
 
 /// Check for DTB at fixed address, or scan if not found
 fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
@@ -161,14 +161,14 @@ fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
     console::print("[DTB] No DTB at fixed address 0x");
     console::print_hex(DTB_FIXED_ADDR as u64);
     console::print("\n");
-    console::print("[DTB] Add to QEMU: -device loader,file=virt.dtb,addr=0x47f00000,force-raw=on\n");
+    console::print("[DTB] Add to QEMU: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on\n");
     0
 }
 
 /// Detect memory from Device Tree Blob
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x40000000;
-    const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024; // Must match QEMU -m setting
+    const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024; // Must match QEMU -m setting
     // Reserve space at end of RAM for QEMU's DTB and other internal data
     // QEMU places the DTB somewhere in RAM but doesn't tell bare-metal ELFs where
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2MB should be plenty
@@ -298,7 +298,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = ram_size / 2; // 64 MB for 128 MB RAM
+    let heap_size = MIN_CODE_AND_STACK; // 32 MB — keep kernel heap small, maximize user pages
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
