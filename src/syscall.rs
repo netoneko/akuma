@@ -155,6 +155,8 @@ pub mod nr {
     pub const CONNECT: u64 = 203;
     pub const SENDTO: u64 = 206;
     pub const RECVFROM: u64 = 207;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const GETPEERNAME: u64 = 205;
     pub const SETSOCKOPT: u64 = 208;
     pub const GETSOCKOPT: u64 = 209;
     pub const SHUTDOWN: u64 = 210;
@@ -454,6 +456,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CONNECT => sys_connect(args[0] as u32, args[1], args[2] as usize),
         nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
+        nr::GETSOCKNAME => sys_getsockname(args[0] as u32, args[1], args[2]),
+        nr::GETPEERNAME => 0, // stub
         nr::SETSOCKOPT => 0, // stub — no socket options to set
         nr::GETSOCKOPT => 0, // stub
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
@@ -1036,9 +1040,9 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::Socket(_) => {
+        crate::process::FileDescriptor::Socket(idx) => {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-            match crate::socket::socket_recv(fd_num as usize, buf) {
+            match crate::socket::socket_recv(idx, buf) {
                 Ok(n) => n as u64,
                 Err(e) => (-(e as i64)) as u64,
             }
@@ -1145,8 +1149,8 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::Socket(_) => {
-            match crate::socket::socket_send(fd_num as usize, buf) {
+        crate::process::FileDescriptor::Socket(idx) => {
+            match crate::socket::socket_send(idx, buf) {
                 Ok(n) => n as u64,
                 Err(e) => (-(e as i64)) as u64,
             }
@@ -1800,8 +1804,44 @@ fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
-    if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_connect(idx, addr).is_ok() { return 0; } }
+    crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
+    if let Some(idx) = get_socket_from_fd(fd) {
+        match socket::socket_connect(idx, addr) {
+            Ok(()) => {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
+                return 0;
+            }
+            Err(e) => {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
+                return (-e as i64) as u64;
+            }
+        }
+    }
     !0u64
+}
+
+fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if addr_ptr == 0 || len_ptr == 0 { return (-libc_errno::EINVAL as i64) as u64; }
+    if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+    let port = socket::with_socket(idx, |s| s.bind_port.unwrap_or(0)).unwrap_or(0);
+    let local_ip = crate::smoltcp_net::get_local_ip();
+    let sa = SockAddrIn {
+        sin_family: 2,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes(local_ip),
+        sin_zero: [0u8; 8],
+    };
+    if validate_user_ptr(addr_ptr, core::mem::size_of::<SockAddrIn>()) {
+        unsafe {
+            core::ptr::write(addr_ptr as *mut SockAddrIn, sa);
+            core::ptr::write(len_ptr as *mut u32, core::mem::size_of::<SockAddrIn>() as u32);
+        }
+    }
+    0
 }
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {

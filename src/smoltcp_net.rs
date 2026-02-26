@@ -774,6 +774,20 @@ pub fn udp_can_send(handle: SocketHandle) -> bool {
     }).unwrap_or(false)
 }
 
+pub fn get_local_ip() -> [u8; 4] {
+    with_network(|net| {
+        for cidr in net.iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                let octets = v4.address().octets();
+                if octets != [127, 0, 0, 1] {
+                    return octets;
+                }
+            }
+        }
+        [10, 0, 2, 15]
+    }).unwrap_or([10, 0, 2, 15])
+}
+
 pub fn udp_socket_close(handle: SocketHandle) {
     with_network(|net| {
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
