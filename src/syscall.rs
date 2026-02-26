@@ -1042,7 +1042,14 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         crate::process::FileDescriptor::Socket(idx) => {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-            match crate::socket::socket_recv(idx, buf) {
+            let result = crate::socket::socket_recv(idx, buf);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                match &result {
+                    Ok(n) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = {}\n", fd_num, count, n),
+                    Err(e) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                }
+            }
+            match result {
                 Ok(n) => n as u64,
                 Err(e) => (-(e as i64)) as u64,
             }
@@ -1150,7 +1157,14 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         crate::process::FileDescriptor::Socket(idx) => {
-            match crate::socket::socket_send(idx, buf) {
+            let result = crate::socket::socket_send(idx, buf);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                match &result {
+                    Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
+                    Err(e) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                }
+            }
+            match result {
                 Ok(n) => n as u64,
                 Err(e) => (-(e as i64)) as u64,
             }

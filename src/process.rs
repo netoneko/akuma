@@ -2264,7 +2264,16 @@ pub fn spawn_process_with_channel_ext(
         }
     }
 
-    let full_env = env.map(|e| e.to_vec()).unwrap_or_default();
+    let full_env = match env {
+        Some(e) if !e.is_empty() => e.to_vec(),
+        _ => alloc::vec![
+            String::from("PATH=/usr/bin:/bin"),
+            String::from("HOME=/"),
+            String::from("TERM=xterm"),
+            String::from("SSL_NO_VERIFY_PEER=1"),
+            String::from("SSL_NO_VERIFY_HOSTNAME=1"),
+        ],
+    };
 
     // Create the process
     let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
