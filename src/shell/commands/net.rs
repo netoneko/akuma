@@ -496,7 +496,7 @@ impl PkgCommand {
         let msg = format!("pkg: extracting {} to root...\r\n", archive_path);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        let result = execute_external_streaming("/bin/tar", Some(&args), Some(b""), Some(ctx.cwd()), stdout).await;
+        let result = execute_external_streaming("/bin/tar", Some(&args), None, Some(b""), Some(ctx.cwd()), stdout).await;
         
         let _ = crate::async_fs::remove_file(archive_path).await;
         

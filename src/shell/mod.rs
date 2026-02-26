@@ -12,6 +12,7 @@
 pub mod commands;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -39,15 +40,26 @@ pub struct ShellContext {
     /// Use interactive execution for external commands (bidirectional I/O)
     /// Enables real-time stdin/stdout for interactive applications
     interactive_exec: bool,
+    /// Environment variables (passed to child processes)
+    env: BTreeMap<String, String>,
 }
 
 impl ShellContext {
     /// Create a new shell context with root as the working directory
     pub fn new() -> Self {
+        let mut env = BTreeMap::new();
+        for entry in crate::process::DEFAULT_ENV {
+            if let Some((k, v)) = entry.split_once('=') {
+                env.insert(String::from(k), String::from(v));
+            }
+        }
+        env.insert(String::from("PWD"), String::from("/"));
+
         Self {
             cwd: String::from("/"),
             async_exec: crate::config::ENABLE_SSH_ASYNC_EXEC,
-            interactive_exec: true, // Enabled by default for interactive apps
+            interactive_exec: true,
+            env,
         }
     }
 
@@ -56,18 +68,42 @@ impl ShellContext {
         &self.cwd
     }
 
-    /// Set the current working directory
+    /// Set the current working directory (also updates PWD env var)
     pub fn set_cwd(&mut self, path: &str) {
         self.cwd = String::from(path);
+        self.env.insert(String::from("PWD"), String::from(path));
+    }
+
+    /// Get all environment variables
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// Get a single environment variable
+    pub fn get_env(&self, key: &str) -> Option<&str> {
+        self.env.get(key).map(|s| s.as_str())
+    }
+
+    /// Set an environment variable
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.env.insert(String::from(key), String::from(value));
+    }
+
+    /// Remove an environment variable
+    pub fn remove_env(&mut self, key: &str) {
+        self.env.remove(key);
+    }
+
+    /// Convert environment to `KEY=VALUE` vec for process spawning
+    pub fn env_as_vec(&self) -> Vec<String> {
+        self.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
     }
 
     /// Resolve a path relative to the current working directory
     pub fn resolve_path(&self, path: &str) -> String {
         if path.starts_with('/') {
-            // Absolute path
             normalize_path(path)
         } else {
-            // Relative path
             let full_path = if self.cwd == "/" {
                 format!("/{}", path)
             } else {
@@ -218,6 +254,104 @@ pub trait Command: Sync {
         stdout: &'a mut VecWriter,
         ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>>;
+}
+
+// ============================================================================
+// Variable Expansion
+// ============================================================================
+
+/// Expand `$VAR`, `${VAR}`, and `~` in a command line byte slice.
+/// Single-quoted regions are not expanded. `$$` produces a literal `$`.
+pub fn expand_variables(line: &[u8], ctx: &ShellContext) -> Vec<u8> {
+    let mut result = Vec::with_capacity(line.len());
+    let mut i = 0;
+    let mut in_single_quote = false;
+
+    while i < line.len() {
+        let b = line[i];
+
+        if b == b'\'' && !in_single_quote {
+            in_single_quote = true;
+            result.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'\'' && in_single_quote {
+            in_single_quote = false;
+            result.push(b);
+            i += 1;
+            continue;
+        }
+        if in_single_quote {
+            result.push(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'~' && (i == 0 || line[i - 1] == b' ' || line[i - 1] == b'=')
+            && (i + 1 >= line.len() || line[i + 1] == b'/' || line[i + 1] == b' ')
+        {
+            if let Some(home) = ctx.get_env("HOME") {
+                result.extend_from_slice(home.as_bytes());
+            } else {
+                result.push(b'~');
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'$' {
+            if i + 1 < line.len() && line[i + 1] == b'$' {
+                result.push(b'$');
+                i += 2;
+                continue;
+            }
+
+            if i + 1 < line.len() && line[i + 1] == b'{' {
+                // ${VAR} form
+                if let Some(close) = line[i + 2..].iter().position(|&c| c == b'}') {
+                    let name = &line[i + 2..i + 2 + close];
+                    if let Ok(name_str) = core::str::from_utf8(name) {
+                        if let Some(val) = ctx.get_env(name_str) {
+                            result.extend_from_slice(val.as_bytes());
+                        }
+                    }
+                    i = i + 2 + close + 1;
+                } else {
+                    result.push(b'$');
+                    i += 1;
+                }
+                continue;
+            }
+
+            // $VAR form
+            let start = i + 1;
+            let mut end = start;
+            while end < line.len()
+                && (line[end].is_ascii_alphanumeric() || line[end] == b'_')
+            {
+                end += 1;
+            }
+            if end > start {
+                let name = &line[start..end];
+                if let Ok(name_str) = core::str::from_utf8(name) {
+                    if let Some(val) = ctx.get_env(name_str) {
+                        result.extend_from_slice(val.as_bytes());
+                    }
+                }
+                i = end;
+            } else {
+                result.push(b'$');
+                i += 1;
+            }
+            continue;
+        }
+
+        result.push(b);
+        i += 1;
+    }
+
+    result
 }
 
 // ============================================================================
@@ -434,6 +568,7 @@ pub fn is_async_exec_enabled() -> bool {
 async fn execute_external(
     path: &str,
     args: Option<&[&str]>,
+    env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     stdout: &mut VecWriter,
@@ -442,10 +577,9 @@ async fn execute_external(
 ) -> Result<(), ShellError> {
     // Use async execution if enabled (SSH context), otherwise sync (test context)
     let result = if is_async_exec_enabled() {
-        crate::process::exec_async_cwd(path, args, stdin, cwd).await
+        crate::process::exec_async_cwd(path, args, env, stdin, cwd).await
     } else {
-        // Synchronous fallback for boot-time tests
-        crate::process::exec_with_io_cwd(path, args, None, stdin, cwd)
+        crate::process::exec_with_io_cwd(path, args, env, stdin, cwd)
     };
 
     match result {
@@ -482,6 +616,7 @@ async fn execute_external(
 pub async fn execute_external_streaming<W>(
     path: &str,
     args: Option<&[&str]>,
+    env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     stdout: &mut W,
@@ -489,7 +624,7 @@ pub async fn execute_external_streaming<W>(
 where
     W: embedded_io_async::Write,
 {
-    match crate::process::exec_streaming_cwd(path, args, stdin, cwd, stdout).await {
+    match crate::process::exec_streaming_cwd(path, args, env, stdin, cwd, stdout).await {
         Ok(exit_code) => {
             if exit_code != 0 {
                 let msg = format!("[exit code: {}]\r\n", exit_code);
@@ -547,6 +682,7 @@ fn translate_input_keys(data: &[u8]) -> alloc::vec::Vec<u8> {
 pub async fn execute_external_interactive(
     path: &str,
     args: Option<&[&str]>,
+    env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     channel_stream: &mut SshChannelStream<'_>,
@@ -554,7 +690,7 @@ pub async fn execute_external_interactive(
     use crate::process::spawn_process_with_channel_cwd;
     
     // Spawn process with channel and cwd
-    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, None, stdin, cwd) {
+    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, env, stdin, cwd) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {}\r\n", e);
@@ -773,6 +909,9 @@ pub async fn execute_command_streaming(
     stdin: Option<&[u8]>,
 ) -> Option<ChainExecutionResult>
 {
+    let expanded = expand_variables(line, ctx);
+    let line = &expanded[..];
+
     // Skip interactive check entirely if not enabled - avoid double filesystem lookups
     if !ctx.interactive_exec {
         // Just check for exit command, skip all filesystem operations
@@ -797,8 +936,9 @@ pub async fn execute_command_streaming(
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
-            // Execute with interactive bidirectional I/O (pass shell's cwd)
-            let success = execute_external_interactive(&bin_path, args_slice, stdin, Some(ctx.cwd()), channel_stream).await.is_ok();
+            // Execute with interactive bidirectional I/O (pass shell's cwd and env)
+            let env_vec = ctx.env_as_vec();
+            let success = execute_external_interactive(&bin_path, args_slice, Some(&env_vec), stdin, Some(ctx.cwd()), channel_stream).await.is_ok();
             Some(ChainExecutionResult {
                 output: Vec::new(), // Output already streamed
                 success,
@@ -888,13 +1028,14 @@ async fn execute_pipeline_internal(
             let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
             
-            // Pass shell's cwd to spawned processes
+            // Pass shell's cwd and env to spawned processes
+            let env_vec = ctx.env_as_vec();
             let cwd = Some(ctx.cwd());
-            let translate_output = is_last; // Only translate newlines for final output
-            let add_exit_code = is_last;    // Only show exit code for final output
+            let translate_output = is_last;
+            let add_exit_code = is_last;
             
             if ctx.async_exec {
-                match execute_external(&bin_path, args_slice, stdin_slice, cwd, &mut stdout, translate_output, add_exit_code).await {
+                match execute_external(&bin_path, args_slice, Some(&env_vec), stdin_slice, cwd, &mut stdout, translate_output, add_exit_code).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
@@ -906,7 +1047,7 @@ async fn execute_pipeline_internal(
                     Err(e) => return PipelineResult::Error(e, None),
                 }
             } else {           
-                match execute_external_streaming(&bin_path, args_slice, stdin_slice, cwd, &mut stdout).await {
+                match execute_external_streaming(&bin_path, args_slice, Some(&env_vec), stdin_slice, cwd, &mut stdout).await {
                     Ok(()) => {
                         if is_last {
                             return PipelineResult::Output(stdout.into_inner());
@@ -1066,7 +1207,8 @@ pub async fn execute_command_chain(
     registry: &CommandRegistry,
     ctx: &mut ShellContext,
 ) -> ChainExecutionResult {
-    let chain = parse_command_chain(line);
+    let expanded = expand_variables(line, ctx);
+    let chain = parse_command_chain(&expanded);
     let mut collected_output = Vec::new();
     let mut last_success = true;
     let mut prev_operator: Option<ChainOperator> = None;

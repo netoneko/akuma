@@ -12,6 +12,13 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+/// Default environment variables for new processes when none are provided.
+pub const DEFAULT_ENV: &[&str] = &[
+    "PATH=/usr/bin:/bin",
+    "HOME=/",
+    "TERM=xterm",
+];
+
 /// A future that yields once then completes
 /// This allows proper async yielding in poll_fn contexts
 pub struct YieldOnce(bool);
@@ -2266,13 +2273,7 @@ pub fn spawn_process_with_channel_ext(
 
     let full_env = match env {
         Some(e) if !e.is_empty() => e.to_vec(),
-        _ => alloc::vec![
-            String::from("PATH=/usr/bin:/bin"),
-            String::from("HOME=/"),
-            String::from("TERM=xterm"),
-            String::from("SSL_NO_VERIFY_PEER=1"),
-            String::from("SSL_NO_VERIFY_HOSTNAME=1"),
-        ],
+        _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
     };
 
     // Create the process
@@ -2442,14 +2443,14 @@ fn run_registered_process(pid: Pid) -> ! {
 /// # Returns
 /// Tuple of (exit_code, stdout_data) or error message
 pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    exec_async_cwd(path, args, stdin, None).await
+    exec_async_cwd(path, args, None, stdin, None).await
 }
 
-/// exec_async with explicit cwd
-pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+/// exec_async with explicit cwd and env
+pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
 
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
 
     // For non-interactive execution, if no stdin was provided, mark it as closed
     if stdin.is_none() {
@@ -2511,16 +2512,16 @@ pub async fn exec_streaming<W>(path: &str, args: Option<&[&str]>, stdin: Option<
 where
     W: embedded_io_async::Write,
 {
-    exec_streaming_cwd(path, args, stdin, None, output).await
+    exec_streaming_cwd(path, args, None, stdin, None, output).await
 }
 
-/// exec_streaming with explicit cwd
-pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
+/// exec_streaming with explicit cwd and env
+pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
 where
     W: embedded_io_async::Write,
 {
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
 
     // For non-interactive streaming, if no stdin was provided, mark it as closed
     if stdin.is_none() {
