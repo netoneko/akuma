@@ -218,6 +218,7 @@ pub mod nr {
     pub const SETPGID: u64 = 154;
     pub const GETPGID: u64 = 155;
     pub const SETSID: u64 = 157;
+    pub const UNAME: u64 = 160;
 }
 
 /// Thread CPU statistics for top command
@@ -466,6 +467,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETPGID => sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => sys_getpgid(args[0] as u32),
         nr::SETSID => sys_setsid(),
+        nr::UNAME => sys_uname(args[0]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -539,6 +541,32 @@ fn sys_setsid() -> u64 {
     } else {
         !0u64
     }
+}
+
+fn sys_uname(buf: u64) -> u64 {
+    const FIELD_LEN: usize = 65;
+
+    fn write_field(base: *mut u8, offset: usize, value: &[u8]) {
+        unsafe {
+            let dst = base.add(offset * FIELD_LEN);
+            let len = value.len().min(FIELD_LEN - 1);
+            core::ptr::copy_nonoverlapping(value.as_ptr(), dst, len);
+            // Ensure null-terminated (buffer was zeroed)
+        }
+    }
+
+    let ptr = buf as *mut u8;
+    // Zero the entire struct (6 fields x 65 bytes)
+    unsafe { core::ptr::write_bytes(ptr, 0, FIELD_LEN * 6); }
+
+    write_field(ptr, 0, b"Akuma");          // sysname
+    write_field(ptr, 1, b"akuma");          // nodename
+    write_field(ptr, 2, b"0.1.0");          // release
+    write_field(ptr, 3, b"Akuma OS");       // version
+    write_field(ptr, 4, b"aarch64");        // machine
+    write_field(ptr, 5, b"(none)");         // domainname
+
+    0
 }
 
 fn sys_exit(code: i32) -> u64 {
