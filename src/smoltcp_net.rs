@@ -13,7 +13,7 @@ use spinning_top::Spinlock;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
 use smoltcp::phy::Device;
-use smoltcp::socket::{tcp, dhcpv4, dns};
+use smoltcp::socket::{tcp, udp, dhcpv4, dns};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -709,6 +709,77 @@ pub fn socket_create() -> Option<SocketHandle> {
         socket.set_ack_delay(None);
         Some(net.sockets.add(socket))
     }).flatten()
+}
+
+// ============================================================================
+// UDP Socket API
+// ============================================================================
+
+const UDP_PACKET_COUNT: usize = 8;
+const UDP_PAYLOAD_SIZE: usize = 512;
+
+pub fn udp_socket_create() -> Option<SocketHandle> {
+    with_network(|net| {
+        if net.sockets.iter().count() >= MAX_SOCKETS {
+            return None;
+        }
+        let rx_meta = udp::PacketMetadata::EMPTY;
+        let tx_meta = udp::PacketMetadata::EMPTY;
+        let rx_buffer = udp::PacketBuffer::new(
+            vec![rx_meta; UDP_PACKET_COUNT],
+            vec![0u8; UDP_PACKET_COUNT * UDP_PAYLOAD_SIZE],
+        );
+        let tx_buffer = udp::PacketBuffer::new(
+            vec![tx_meta; UDP_PACKET_COUNT],
+            vec![0u8; UDP_PACKET_COUNT * UDP_PAYLOAD_SIZE],
+        );
+        let socket = udp::Socket::new(rx_buffer, tx_buffer);
+        Some(net.sockets.add(socket))
+    }).flatten()
+}
+
+pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.bind(port).map_err(|_| ())
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_socket_send(handle: SocketHandle, buf: &[u8], remote: smoltcp::wire::IpEndpoint) -> Result<usize, ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.send_slice(buf, remote).map(|()| buf.len()).map_err(|_| ())
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        match socket.recv_slice(buf) {
+            Ok((len, meta)) => Ok((len, meta.endpoint)),
+            Err(_) => Err(()),
+        }
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_can_recv(handle: SocketHandle) -> bool {
+    with_network(|net| {
+        net.sockets.get::<udp::Socket>(handle).can_recv()
+    }).unwrap_or(false)
+}
+
+pub fn udp_can_send(handle: SocketHandle) -> bool {
+    with_network(|net| {
+        net.sockets.get::<udp::Socket>(handle).can_send()
+    }).unwrap_or(false)
+}
+
+pub fn udp_socket_close(handle: SocketHandle) {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.close();
+        net.sockets.remove(handle);
+    });
 }
 
 pub fn socket_close(handle: SocketHandle) {

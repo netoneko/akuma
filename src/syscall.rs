@@ -155,7 +155,11 @@ pub mod nr {
     pub const CONNECT: u64 = 203;
     pub const SENDTO: u64 = 206;
     pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const GETSOCKOPT: u64 = 209;
     pub const SHUTDOWN: u64 = 210;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
     pub const CLONE: u64 = 220;
     pub const EXECVE: u64 = 221;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
@@ -327,30 +331,68 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
     let start_time = crate::timer::uptime_us();
 
     loop {
+        crate::smoltcp_net::poll();
         let mut ready_count = 0;
         unsafe {
             let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
             for fd in fds.iter_mut() {
                 fd.revents = 0;
-                
+
+                if fd.fd < 0 { continue; }
+
+                // Determine if this fd is a socket
+                let socket_idx = if fd.fd > 2 {
+                    if let Some(proc) = crate::process::current_process() {
+                        if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd.fd as u32) {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // 1. Check for POLLIN (Read)
                 if fd.events & 1 != 0 {
-                    if fd.fd == 0 { // stdin
+                    if fd.fd == 0 {
                         if let Some(ch) = crate::process::current_channel() {
                             if ch.has_stdin_data() {
                                 fd.revents |= 1;
                             }
                         }
+                    } else if let Some(idx) = socket_idx {
+                        if socket::is_udp_socket(idx) {
+                            if let Some(handle) = socket_get_udp_handle(idx) {
+                                if crate::smoltcp_net::udp_can_recv(handle) {
+                                    fd.revents |= 1;
+                                }
+                            }
+                        } else {
+                            if socket_can_recv_tcp(idx) {
+                                fd.revents |= 1;
+                            }
+                        }
                     } else if fd.fd > 2 {
-                        // For files, always ready to read if not at EOF (simplified)
                         fd.revents |= 1;
                     }
                 }
 
                 // 2. Check for POLLOUT (Write)
                 if fd.events & 4 != 0 {
-                    if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
-                        // stdout, stderr, and files are always ready to write
+                    if let Some(idx) = socket_idx {
+                        if socket::is_udp_socket(idx) {
+                            if let Some(handle) = socket_get_udp_handle(idx) {
+                                if crate::smoltcp_net::udp_can_send(handle) {
+                                    fd.revents |= 4;
+                                }
+                            }
+                        } else {
+                            fd.revents |= 4;
+                        }
+                    } else if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
                         fd.revents |= 4;
                     }
                 }
@@ -410,9 +452,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::LISTEN => sys_listen(args[0] as u32, args[1] as i32),
         nr::ACCEPT => sys_accept(args[0] as u32, args[1], args[2]),
         nr::CONNECT => sys_connect(args[0] as u32, args[1], args[2] as usize),
-        nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
-        nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
+        nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
+        nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
+        nr::SETSOCKOPT => 0, // stub — no socket options to set
+        nr::GETSOCKOPT => 0, // stub
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
+        nr::SENDMSG => sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
+        nr::RECVMSG => sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -1699,9 +1745,17 @@ fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
 use crate::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
 
 fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
-    if domain != 2 || sock_type != 1 { return !0u64; }
-    if let Some(idx) = socket::alloc_socket(sock_type) {
-        if let Some(proc) = crate::process::current_process() { return proc.alloc_fd(crate::process::FileDescriptor::Socket(idx)) as u64; }
+    let base_type = sock_type & 0xFF; // mask off SOCK_CLOEXEC (0x80000) and SOCK_NONBLOCK (0x800)
+    if domain != 2 || (base_type != 1 && base_type != 2) {
+        crate::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+        return !0u64;
+    }
+    if let Some(idx) = socket::alloc_socket(base_type) {
+        if let Some(proc) = crate::process::current_process() {
+            let fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(idx)) as u64;
+            crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
+            return fd;
+        }
     }
     !0u64
 }
@@ -1710,7 +1764,16 @@ fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
-    if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_bind(idx, addr).is_ok() { return 0; } }
+    crate::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
+    if let Some(idx) = get_socket_from_fd(fd) {
+        match socket::socket_bind(idx, addr) {
+            Ok(()) => return 0,
+            Err(e) => {
+                crate::safe_print!(64, "[syscall] bind failed: {}\n", e);
+                return !0u64;
+            }
+        }
+    }
     !0u64
 }
 
@@ -1741,37 +1804,203 @@ fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     !0u64
 }
 
-fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
-    match socket::socket_send(idx, buf) {
-        Ok(n) => n as u64,
-        Err(e) => (-e as i64) as u64,
+
+    if socket::is_udp_socket(idx) {
+        let dest = if dest_addr != 0 && addr_len >= 16 {
+            if !validate_user_ptr(dest_addr, addr_len) { return EFAULT; }
+            let a = unsafe { core::ptr::read(dest_addr as *const SockAddrIn) }.to_addr();
+            crate::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
+            a
+        } else {
+            match socket::udp_default_peer(idx) {
+                Some(peer) => peer,
+                None => return (-libc_errno::EINVAL as i64) as u64,
+            }
+        };
+        match socket::socket_send_udp(idx, buf, dest) {
+            Ok(n) => n as u64,
+            Err(e) => (-e as i64) as u64,
+        }
+    } else {
+        match socket::socket_send(idx, buf) {
+            Ok(n) => n as u64,
+            Err(e) => (-e as i64) as u64,
+        }
     }
 }
 
-fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32) -> u64 {
+fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
-    match socket::socket_recv(idx, buf) {
-        Ok(n) => n as u64,
-        Err(e) => (-e as i64) as u64,
+
+    if socket::is_udp_socket(idx) {
+        match socket::socket_recv_udp(idx, buf) {
+            Ok((n, from)) => {
+                if src_addr != 0 && addr_len_ptr != 0 {
+                    if validate_user_ptr(src_addr, core::mem::size_of::<SockAddrIn>())
+                        && validate_user_ptr(addr_len_ptr, core::mem::size_of::<u32>())
+                    {
+                        let sa = SockAddrIn::from_addr(&from);
+                        unsafe { core::ptr::write(src_addr as *mut SockAddrIn, sa); }
+                        unsafe { core::ptr::write(addr_len_ptr as *mut u32, core::mem::size_of::<SockAddrIn>() as u32); }
+                    }
+                }
+                n as u64
+            }
+            Err(e) => (-e as i64) as u64,
+        }
+    } else {
+        match socket::socket_recv(idx, buf) {
+            Ok(n) => n as u64,
+            Err(e) => (-e as i64) as u64,
+        }
     }
 }
 
 fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
+// msghdr layout on aarch64 (LP64 little-endian):
+//   0: *msg_name      (8 bytes)
+//   8: msg_namelen     (4 bytes + 4 padding)
+//  16: *msg_iov        (8 bytes)
+//  24: msg_iovlen      (4 bytes + 4 padding)
+//  32: *msg_control    (8 bytes)
+//  40: msg_controllen  (8 bytes)
+//  48: msg_flags       (4 bytes)
+#[repr(C)]
+struct MsgHdr {
+    msg_name: u64,
+    msg_namelen: u32,
+    _pad1: u32,
+    msg_iov: u64,
+    msg_iovlen: u32,
+    _pad2: u32,
+    msg_control: u64,
+    msg_controllen: u64,
+    msg_flags: i32,
+}
+
+fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+    if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
+    let msg = unsafe { &*(msg_ptr as *const MsgHdr) };
+
+    if msg.msg_iovlen == 0 { return 0; }
+    if !validate_user_ptr(msg.msg_iov, msg.msg_iovlen as usize * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let iovs = unsafe { core::slice::from_raw_parts(msg.msg_iov as *const IoVec, msg.msg_iovlen as usize) };
+
+    let iov = &iovs[0];
+    if iov.iov_len == 0 { return 0; }
+    if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
+    let buf = unsafe { core::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len as usize) };
+
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    if socket::is_udp_socket(idx) {
+        let dest = if msg.msg_name != 0 && msg.msg_namelen >= 16 {
+            if !validate_user_ptr(msg.msg_name, msg.msg_namelen as usize) { return EFAULT; }
+            unsafe { core::ptr::read(msg.msg_name as *const SockAddrIn) }.to_addr()
+        } else {
+            match socket::udp_default_peer(idx) {
+                Some(peer) => peer,
+                None => return (-libc_errno::EINVAL as i64) as u64,
+            }
+        };
+        match socket::socket_send_udp(idx, buf, dest) {
+            Ok(n) => n as u64,
+            Err(e) => (-e as i64) as u64,
+        }
+    } else {
+        match socket::socket_send(idx, buf) {
+            Ok(n) => n as u64,
+            Err(e) => (-e as i64) as u64,
+        }
+    }
+}
+
+fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+    if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
+    let msg = unsafe { &mut *(msg_ptr as *mut MsgHdr) };
+
+    if msg.msg_iovlen == 0 { return 0; }
+    if !validate_user_ptr(msg.msg_iov, msg.msg_iovlen as usize * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let iovs = unsafe { core::slice::from_raw_parts(msg.msg_iov as *const IoVec, msg.msg_iovlen as usize) };
+
+    let iov = &iovs[0];
+    if iov.iov_len == 0 { return 0; }
+    if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
+    let buf = unsafe { core::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len as usize) };
+
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    if socket::is_udp_socket(idx) {
+        match socket::socket_recv_udp(idx, buf) {
+            Ok((n, from)) => {
+                if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32 {
+                    if validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
+                        let sa = SockAddrIn::from_addr(&from);
+                        unsafe { core::ptr::write(msg.msg_name as *mut SockAddrIn, sa); }
+                        msg.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
+                    }
+                }
+                msg.msg_flags = 0;
+                n as u64
+            }
+            Err(e) => (-e as i64) as u64,
+        }
+    } else {
+        match socket::socket_recv(idx, buf) {
+            Ok(n) => {
+                msg.msg_flags = 0;
+                n as u64
+            }
+            Err(e) => (-e as i64) as u64,
+        }
+    }
+}
+
 fn get_socket_from_fd(fd: u32) -> Option<usize> {
     let proc = crate::process::current_process()?;
     if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
+}
+
+fn socket_get_udp_handle(idx: usize) -> Option<crate::smoltcp_net::SocketHandle> {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Datagram { handle, .. } = &sock.inner {
+            Some(*handle)
+        } else {
+            None
+        }
+    }).flatten()
+}
+
+fn socket_can_recv_tcp(idx: usize) -> bool {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Stream(h) = &sock.inner {
+            crate::smoltcp_net::with_network(|net| {
+                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                s.can_recv() || !s.is_active()
+            }).unwrap_or(false)
+        } else {
+            false
+        }
+    }).unwrap_or(false)
 }
 
 fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
