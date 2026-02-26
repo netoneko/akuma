@@ -26,6 +26,17 @@ ERROR: Failed to initialize libxbps: Not supported
 
 The `machine` field is the critical one — xbps uses it to select the correct architecture for package downloads (e.g., `aarch64-repodata`).
 
+### flock (32)
+
+**Symptom:** `xbps-install` fails with:
+```
+ERROR: failed to lock file: /var/db/xbps/lock: Function not implemented
+```
+
+**Cause:** `xbps_pkgdb_lock()` in `lib/pkgdb.c:92` calls `flock(fd, LOCK_EX|LOCK_NB)` to exclusively lock the package database. Akuma had no handler for syscall 32.
+
+**Fix:** Stubbed as no-op returning 0 (success). Akuma is single-user with no concurrent package manager instances, so locking is unnecessary.
+
 ## Already implemented (used by XBPS)
 
 | Syscall | Number | Notes |
