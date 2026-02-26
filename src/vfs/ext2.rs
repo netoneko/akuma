@@ -1475,6 +1475,36 @@ impl Filesystem for Ext2Filesystem {
         Ok(())
     }
 
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        let src_inode_num = self.lookup_path(old_path)?;
+        let (src_parent, src_name) = self.lookup_parent(old_path)?;
+        let (dst_parent, dst_name) = self.lookup_parent(new_path)?;
+
+        let mut state = self.state.lock();
+        let src_inode = Self::read_inode(&state, src_inode_num)?;
+        let ft = if (src_inode.type_perms & 0xF000) == S_IFDIR { FT_DIR } else { FT_REG_FILE };
+
+        // If destination exists, remove it first
+        if let Ok(dst_inode_num) = Self::lookup_path_internal(&state, new_path) {
+            let mut dst_inode = Self::read_inode(&state, dst_inode_num)?;
+            Self::remove_dir_entry(&mut state, dst_parent, &dst_name)?;
+            dst_inode.hard_links = dst_inode.hard_links.saturating_sub(1);
+            if dst_inode.hard_links == 0 {
+                Self::truncate_inode(&mut state, &mut dst_inode)?;
+                dst_inode.deletion_time = current_time();
+                Self::write_inode(&state, dst_inode_num, &dst_inode)?;
+                Self::free_inode(&mut state, dst_inode_num, false)?;
+            } else {
+                Self::write_inode(&state, dst_inode_num, &dst_inode)?;
+            }
+        }
+
+        Self::add_dir_entry(&mut state, dst_parent, &dst_name, src_inode_num, ft)?;
+        Self::remove_dir_entry(&mut state, src_parent, &src_name)?;
+
+        Ok(())
+    }
+
     fn exists(&self, path: &str) -> bool {
         self.lookup_path(path).is_ok()
     }
