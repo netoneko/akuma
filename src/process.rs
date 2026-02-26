@@ -1526,13 +1526,22 @@ impl Process {
         self.brk
     }
 
-    /// Set program break, returns new value
-    /// Will not go below initial_brk
+    /// Set program break, returns new value.
+    /// Maps any new pages between old and new brk.
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
             return self.brk;
         }
-        self.brk = (new_brk + 0xFFF) & !0xFFF; // Page-align
+        let aligned = (new_brk + 0xFFF) & !0xFFF;
+        let old_top = self.brk;
+        if aligned > old_top {
+            let mut page = old_top;
+            while page < aligned {
+                let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                page += 0x1000;
+            }
+        }
+        self.brk = aligned;
         self.brk
     }
 
