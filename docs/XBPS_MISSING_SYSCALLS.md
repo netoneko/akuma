@@ -37,6 +37,14 @@ ERROR: failed to lock file: /var/db/xbps/lock: Function not implemented
 
 **Fix:** Stubbed as no-op returning 0 (success). Akuma is single-user with no concurrent package manager instances, so locking is unnecessary.
 
+### umask (166)
+
+**Symptom:** `[syscall] Unknown syscall: 166` in kernel log during `xbps-install`.
+
+**Cause:** XBPS calls `umask()` to set default file permission masks before creating files during package installation. Without it, newly created files could get overly permissive modes.
+
+**Fix:** Stubbed to always return `0o022` (the standard default mask) and ignore the argument. Akuma doesn't enforce file permissions, so the actual mask value is irrelevant.
+
 ## Already implemented (used by XBPS)
 
 | Syscall | Number | Notes |

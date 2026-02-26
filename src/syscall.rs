@@ -220,6 +220,7 @@ pub mod nr {
     pub const SETSID: u64 = 157;
     pub const UNAME: u64 = 160;
     pub const FLOCK: u64 = 32;
+    pub const UMASK: u64 = 166;
 }
 
 /// Thread CPU statistics for top command
@@ -470,6 +471,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETSID => sys_setsid(),
         nr::UNAME => sys_uname(args[0]),
         nr::FLOCK => 0, // stub — single-user OS, no contention
+        nr::UMASK => 0o022, // stub — return default umask, ignore argument
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
