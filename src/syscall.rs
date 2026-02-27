@@ -2211,6 +2211,8 @@ fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
             Err(e) => fs_error_to_errno(e),
         }
     } else {
+        // Also clean up any legacy in-memory symlink entry
+        crate::vfs::remove_symlink(&resolved);
         match crate::fs::remove_file(&resolved) {
             Ok(()) => 0,
             Err(e) => fs_error_to_errno(e),
