@@ -21,7 +21,6 @@ members = [
     "termtest",
     "allocstress",
     "top",
-    "pkg",
     "musl",
     "tcc",
     "tar",
@@ -29,7 +28,8 @@ members = [
     "make",
     "dash",
     "sbase",
-    "xbps"
+    "xbps",
+    "apk-tools"
 ]
 
 [profile.dev]

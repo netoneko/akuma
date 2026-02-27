@@ -1,0 +1,10 @@
+[package]
+name = "apk-tools"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "apk_tools"
+
+[build-dependencies]
