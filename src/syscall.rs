@@ -1882,8 +1882,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             path
         }
     };
+    let resolved_path = crate::vfs::resolve_symlinks(&resolved_path);
 
-    // Parse argv
+    // Parse argv from user space
     let mut args = Vec::new();
     if argv_ptr != 0 {
         let mut i = 0;
@@ -1894,14 +1895,16 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
                 args.push(s);
             } else {
-                crate::safe_print!(64, "[syscall] execve: failed to copy argv[{}]\n", i);
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(64, "[syscall] execve: failed to copy argv[{}]\n", i);
+                }
                 break;
             }
             i += 1;
         }
     }
 
-    // Parse envp
+    // Parse envp from user space
     let mut env = Vec::new();
     if envp_ptr != 0 {
         let mut i = 0;
@@ -1918,8 +1921,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    // Load the ELF binary
-    let elf_data = match crate::fs::read_file(&resolved_path) {
+    do_execve(resolved_path, args, env)
+}
+
+fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+    // Read the file
+    let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => data,
         Err(_) => {
             crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
@@ -1927,7 +1934,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
-    // Perform in-place replacement
+    // Check for shebang (#!) scripts
+    if file_data.len() >= 2 && file_data[0] == b'#' && file_data[1] == b'!' {
+        return exec_shebang(&resolved_path, &file_data, args, env);
+    }
+
+    // Otherwise treat as ELF binary
     let mut proc = match crate::process::current_process() {
         Some(p) => p,
         None => return !0u64,
@@ -1947,9 +1959,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    if let Err(e) = proc.replace_image(&elf_data, &args, &env) {
+    if let Err(e) = proc.replace_image(&file_data, &args, &env) {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
-        return !0u64; // EINTERNAL
+        return ENOENT;
     }
 
     proc.name = resolved_path.clone();
@@ -1965,6 +1977,56 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     unsafe {
         crate::process::enter_user_mode(&proc.context);
     }
+}
+
+/// Handle shebang (#!) scripts: parse interpreter and re-exec
+fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>, env: Vec<String>) -> u64 {
+    // Find the end of the shebang line
+    let line_end = file_data.iter().position(|&b| b == b'\n').unwrap_or(file_data.len().min(256));
+    let shebang_line = match core::str::from_utf8(&file_data[2..line_end]) {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
+            return ENOENT;
+        }
+    };
+
+    if shebang_line.is_empty() {
+        crate::safe_print!(128, "[syscall] execve: empty shebang in {}\n", script_path);
+        return ENOENT;
+    }
+
+    // Split into interpreter and optional single argument
+    let (interpreter, shebang_arg) = match shebang_line.split_once(char::is_whitespace) {
+        Some((interp, arg)) => (interp.trim(), Some(arg.trim())),
+        None => (shebang_line, None),
+    };
+
+    let interpreter = crate::vfs::resolve_symlinks(interpreter);
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if let Some(arg) = shebang_arg {
+            crate::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interpreter, arg, script_path);
+        } else {
+            crate::safe_print!(128, "[syscall] execve: shebang {} {}\n", interpreter, script_path);
+        }
+    }
+
+    // Build new argv: [interpreter, shebang_arg?, script_path, original_args[1:]...]
+    let mut new_args = Vec::new();
+    new_args.push(interpreter.clone());
+    if let Some(arg) = shebang_arg {
+        if !arg.is_empty() {
+            new_args.push(String::from(arg));
+        }
+    }
+    new_args.push(String::from(script_path));
+    // Append original args after argv[0] (skip the original program name)
+    if original_args.len() > 1 {
+        new_args.extend_from_slice(&original_args[1..]);
+    }
+
+    do_execve(interpreter, new_args, env)
 }
 
 fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {

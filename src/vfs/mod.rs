@@ -701,7 +701,14 @@ pub fn resolve_symlinks(path: &str) -> String {
                     resolved = resolve_path(parent, &t);
                 }
             }
-            None => break,
+            None => {
+                // Built-in fallback: /bin/sh -> /bin/dash if dash exists
+                if resolved == "/bin/sh" && crate::fs::exists("/bin/dash") {
+                    resolved = String::from("/bin/dash");
+                    continue;
+                }
+                break;
+            }
         }
     }
     resolved
