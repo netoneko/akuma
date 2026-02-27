@@ -1,10 +1,15 @@
 # Curl Networking Fixes
 
-Alpine's `curl` (8.17.0, via `apk add curl`) failed to resolve DNS when run on
-Akuma. This document records the root causes found during investigation and the
-fixes applied.
+Alpine's `curl` (8.17.0, via `apk add curl`) required seven kernel fixes
+before it could successfully make HTTP requests. This document records the
+root causes found during investigation and the fixes applied.
+
+curl is now working for HTTP. HTTPS requires TLS which depends on additional
+kernel support not yet implemented.
 
 ## Symptoms
+
+**Phase 1 -- DNS failure:**
 
 ```
 akuma:/> curl -Lv https://ifconfig.me/ip
@@ -12,12 +17,24 @@ akuma:/> curl -Lv https://ifconfig.me/ip
 * shutting down connection #0
 ```
 
-Kernel log showed:
+Kernel log showed unknown syscall 19 (`eventfd2`), IPv6 socket creation
+failing with wrong errno, three UDP sockets opened to the DNS server
+(10.0.2.3:53) all timing out, and c-ares DNS resolution failing after retries.
 
-- Unknown syscall 19 (`eventfd2`)
-- IPv6 socket creation failing with wrong errno
-- Three UDP sockets opened to the DNS server (10.0.2.3:53), all timing out
-- c-ares DNS resolution failing after retries
+**Phase 2 -- DNS resolved but empty reply (after fixes 1-6):**
+
+```
+akuma:/> curl -Lv http://ifconfig.me/ip
+* Host ifconfig.me:80 was resolved.
+*   Trying 34.160.111.145:80...
+* Established connection ...
+* Empty reply from server
+curl: (52) Empty reply from server
+```
+
+Non-blocking `connect()` returned `EINPROGRESS`, but `ppoll` immediately
+reported the socket as writable before the TCP handshake completed, causing
+curl to send the HTTP request into a half-open socket.
 
 ## Root Causes and Fixes
 
@@ -98,7 +115,7 @@ pattern:
 The `Socket(idx)` branch in `sys_read` called `socket_recv()` and in
 `sys_write` called `socket_send()`, both of which only handle TCP
 (`SocketType::Stream`). On a UDP socket these returned `EBADF`. While c-ares
-uses `send()`→`sendto` and `recv()`→`recvfrom` (which handled UDP correctly),
+uses `send()`->`sendto` and `recv()`->`recvfrom` (which handled UDP correctly),
 any code path using `read()`/`write()` on a connected UDP socket would fail.
 
 **Fix:** Both branches now check `socket::is_udp_socket(idx)` and dispatch to
@@ -128,6 +145,24 @@ garbage in `val`, so curl could think a connection had an error when it didn't.
 buffer and sets the length pointer to 4. All socket options currently report
 no error / zero value, which is correct for a kernel with no error queuing.
 
+### 7. `ppoll`/`pselect6` reported TCP sockets as always writable
+
+**Files:** `src/syscall.rs`
+
+Both `sys_ppoll` and `sys_pselect6` unconditionally set `POLLOUT` / write-ready
+for TCP sockets without checking the socket state. After a non-blocking
+`connect()` returns `EINPROGRESS`, curl polls the socket waiting for `POLLOUT`
+to signal that the TCP handshake has completed. Since POLLOUT was always
+reported, curl immediately thought the connection was established and sent
+its HTTP request into a socket still in `SynSent` state. The data was lost
+and the server never saw the request, resulting in "Empty reply from server."
+
+**Fix:** Added `socket_can_send_tcp()` helper that checks smoltcp's
+`tcp::Socket::can_send()`, which only returns true once the socket reaches
+`Established` state and has transmit buffer space. Both `sys_ppoll` and
+`sys_pselect6` now use this check instead of unconditionally reporting TCP
+sockets as writable.
+
 ## Syscall Coverage After Fixes
 
 | Syscall | Number | Status |
@@ -139,3 +174,5 @@ no error / zero value, which is correct for a kernel with no error queuing.
 | `getsockopt` | 209 | Writes zero value to buffer |
 | `setsockopt` | 208 | Stub (returns success) |
 | `recvmsg` | 212 | Zeros `msg_controllen` |
+| `ppoll` | 73 | Checks `can_send()` for TCP POLLOUT |
+| `pselect6` | 72 | Checks `can_send()` for TCP write-ready |
