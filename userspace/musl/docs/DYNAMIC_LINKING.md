@@ -1,158 +1,131 @@
 # Dynamic Linking for Akuma OS
 
-## Goal
+## Status: Working
 
-Enable Akuma to run dynamically linked aarch64-musl binaries. This would
-allow using pre-built packages from Void Linux's `aarch64-musl` repository
-instead of cross-compiling everything with `-static`.
+Akuma can run dynamically linked aarch64-musl binaries. The dynamic linker
+(`ld-musl-aarch64.so.1`) is loaded by the kernel and handles symbol
+resolution, relocations, and transfer to the program's entry point.
 
-## Current state
+## How it works
 
-Akuma currently rejects dynamically linked binaries:
+When the kernel loads an ELF binary with a `PT_INTERP` segment:
 
-```
-src/elf_loader.rs:139-144
-```
-
-```rust
-// Reject dynamically-linked binaries that require a real interpreter.
-for phdr in segments.iter() {
-    if phdr.p_type == PT_INTERP && phdr.p_filesz > 1 {
-        return Err(ElfError::DynamicallyLinked);
-    }
-}
-```
-
-However, much of the groundwork already exists:
-
-- ELF loader already imports `PT_INTERP` and `PT_PHDR` types
-- Auxiliary vector (auxv) is already set up with `AT_PHDR`, `AT_PHNUM`,
-  `AT_PHENT`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` etc.
-- `mmap` and `munmap` syscalls are implemented
-- User address space isolation with MMU is working
-
-## What needs to be built
-
-### 1. mprotect syscall (~50 lines)
-
-**Syscall 226** on aarch64 Linux.
-
-The dynamic linker uses `mprotect` to change page permissions after loading
-library segments (e.g., mark code pages as read-execute, data as read-write).
-
-Akuma's MMU (`src/mmu.rs`) already tracks page mappings. The implementation
-needs to walk the page tables and update permission bits:
+1. The kernel loads the main binary's `PT_LOAD` segments as usual
+2. Reads the interpreter path from `PT_INTERP` (e.g. `/lib/ld-musl-aarch64.so.1`)
+3. Loads the interpreter ELF from the filesystem at base address `0x3000_0000`
+4. Applies relocations to the interpreter (RELATIVE, GLOB_DAT, JUMP_SLOT, ABS64)
+5. Sets up the auxiliary vector with `AT_BASE` pointing to the interpreter
+6. Starts execution at the interpreter's entry point (not the program's)
+7. The interpreter reads `AT_PHDR`/`AT_ENTRY` from auxv, resolves symbols,
+   and jumps to the program's entry point
 
 ```
-mprotect(addr, len, prot) -> 0 on success
-  PROT_READ  = 0x1
-  PROT_WRITE = 0x2
-  PROT_EXEC  = 0x4
+Kernel loads ELF + interpreter
+  → Jump to interpreter entry (0x3000_0000 + e_entry)
+    → Interpreter loads .so files via AT_PHDR
+      → Perform relocations
+        → Jump to AT_ENTRY (program's main)
 ```
 
-The `user_flags` function in `src/mmu.rs` already maps these to aarch64 page
-table bits. `mprotect` just needs to update existing mappings.
-
-### 2. PT_INTERP handling in ELF loader (~150 lines)
-
-Instead of rejecting binaries with `PT_INTERP`, the kernel should:
-
-1. Read the interpreter path from the `PT_INTERP` segment
-   (typically `/lib/ld-musl-aarch64.so.1`)
-2. Load the interpreter ELF into the process address space at a
-   non-conflicting base address (e.g., `0x7000_0000`)
-3. Set `AT_BASE` in auxv to the interpreter's load address
-4. Set `AT_ENTRY` to the *program's* entry point (not the interpreter's)
-5. Start execution at the *interpreter's* entry point
-
-The interpreter then uses AT_PHDR/AT_PHNUM to find the program's headers,
-loads its shared libraries, performs relocations, and jumps to AT_ENTRY.
+## Memory layout (dynamically linked binary)
 
 ```
-Current flow:  kernel loads ELF -> jump to ELF entry
-New flow:      kernel loads ELF + interpreter -> jump to interpreter entry
-                -> interpreter loads .so files -> jump to ELF entry
+0x0000_0000  (unmapped)
+0x0040_0000  ET_EXEC code (traditional static binaries)
+0x1000_0000  PIE binary base (ET_DYN main binaries)
+  ...        heap (brk grows up, ~256MB gap)
+0x2000_0000  mmap region (grows up)
+0x3000_0000  interpreter base (ld-musl-aarch64.so.1, ~700KB)
+0x3fec_0000  guard page
+0x3ffc_0000  stack (grows down)
+0x4000_0000  kernel
 ```
 
-### 3. Cross-compile musl as a shared library (build step)
+## Kernel changes
 
-musl's build system can produce both `libc.a` (static) and `libc.so` (shared).
-The shared library IS the dynamic linker — musl combines them into one file.
+### ELF loader (`src/elf_loader.rs`)
+
+- `PT_INTERP` handling: reads interpreter path, calls `load_interpreter()`
+- `load_interpreter()`: loads interpreter segments at `INTERP_BASE` (0x3000_0000),
+  applies RELA relocations (RELATIVE, GLOB_DAT, JUMP_SLOT, ABS64) using the
+  interpreter's own dynamic symbol table
+- `LoadedElf` struct extended with `interp: Option<InterpInfo>` containing
+  the interpreter's entry point and base address
+- `load_elf_with_stack()` sets `AT_BASE` in auxv and starts execution at the
+  interpreter's entry point when an interpreter is present
+
+### mprotect syscall (`src/syscall.rs`)
+
+Syscall 226. Walks the page tables for `[addr, addr+len)` and updates
+permission bits via `update_page_flags()`. Used by the dynamic linker to
+change page permissions after loading library segments.
+
+### mmap improvements (`src/syscall.rs`)
+
+- **prot flags honored**: `from_prot()` in `src/mmu.rs` converts Linux
+  `PROT_READ`/`PROT_WRITE`/`PROT_EXEC` to AArch64 page table bits.
+  File-backed mmaps are initially mapped RW for data copy, then permissions
+  are applied afterward.
+- **MAP_FIXED**: when `flags & 0x10`, the provided address is used directly
+  instead of allocating from the mmap bump allocator. Existing pages at that
+  range are unmapped first.
+
+### MMU (`src/mmu.rs`)
+
+- `user_flags::from_prot(prot: u32) -> u64`: converts Linux prot bitmask to
+  AArch64 page table descriptor bits
+- `UserAddressSpace::update_page_flags()`: modifies permission bits of an
+  existing L3 page table entry without reallocating the page
+
+### Additional syscall stubs (`src/syscall.rs`)
+
+- **futex** (98): basic WAIT/WAKE with yield-based scheduling
+- **prlimit64** (261): returns stack size and fd limits
+- **getrlimit** (163): delegates to prlimit64
+- **sigaltstack** (132): stub returning 0
+- **set_robust_list** (99): stub returning 0
+
+## Getting the dynamic linker
+
+The dynamic linker comes from Alpine Linux's `musl` package. Install it
+on a running Akuma system:
+
+```
+apk add musl
+```
+
+This places `/lib/ld-musl-aarch64.so.1` on the filesystem. The Alpine
+build (GCC-based) includes `libgcc` builtins for 128-bit float operations
+that aarch64 `long double` requires.
+
+Building musl as a shared library from source with clang on macOS does NOT
+work because Homebrew's LLVM only ships compiler-rt for darwin targets, not
+for `aarch64-linux`. The resulting `.so` would be missing symbols like
+`__floatunsitf`, `__getf2`, `__addtf3`, etc.
+
+## Building dynamically linked binaries
+
+Use the `aarch64-linux-musl-gcc` cross-compiler without `-static`:
 
 ```bash
-cd userspace/musl/musl
-./configure --host=aarch64-linux-musl --prefix=/usr \
-    --syslibdir=/lib --disable-static
-make
-# Produces: lib/ld-musl-aarch64.so.1 (this is also libc.so)
+aarch64-linux-musl-gcc hello.c -o hello
+# produces ET_EXEC with PT_INTERP = /lib/ld-musl-aarch64.so.1
 ```
 
-Install to the Akuma disk image:
-```
-/lib/ld-musl-aarch64.so.1    # dynamic linker + libc
-/usr/lib/libc.so -> /lib/ld-musl-aarch64.so.1
-```
+The resulting binary's `PT_INTERP` points to `/lib/ld-musl-aarch64.so.1`.
+The kernel reads this path and loads the interpreter from the Akuma
+filesystem.
 
-### 4. Verify/fix mmap MAP_FIXED (~small)
+## Static linking is unaffected
 
-The dynamic linker uses `MAP_FIXED` to place library segments at exact
-addresses. Verify that Akuma's `sys_mmap` handles `MAP_FIXED` correctly
-(places mapping at the exact requested address, potentially overwriting
-existing mappings at that range).
+The TCC toolchain and all existing userspace binaries use `musl/dist/lib/libc.a`
+(static library) built by `userspace/musl/build.rs` with `--disable-shared`.
+The dynamic linker is a separate runtime artifact and does not affect static
+builds.
 
-### 5. Additional syscalls (incremental)
+## Verified working
 
-These will be needed as more dynamically linked programs are tested:
-
-| Syscall | Number | Priority | Used by |
-|---------|--------|----------|---------|
-| mprotect | 226 | Required | Dynamic linker (page permissions) |
-| readlinkat | 78 | High | musl init (`/proc/self/exe`) |
-| futex | 98 | High | Thread synchronization, malloc |
-| sigaltstack | 132 | Medium | Signal handling setup |
-| prlimit64 | 261 | Medium | Stack size limits |
-| set_robust_list | 99 | Low | Thread cleanup (can stub as 0) |
-| getrlimit | 163 | Low | Resource limits (can stub) |
-
-## Implementation order
-
-```
-Phase 1: Minimal dynamic linking
-  1. Implement mprotect syscall
-  2. Modify ELF loader to handle PT_INTERP
-  3. Cross-compile musl as shared lib
-  4. Test with a trivial dynamically linked hello world
-
-Phase 2: Real-world packages
-  5. Stub missing syscalls as they surface (readlinkat, futex, etc.)
-  6. Test with busybox from Void Linux aarch64-musl
-  7. Test with coreutils, grep, sed, etc.
-
-Phase 3: Full compatibility
-  8. Implement proper signal handling
-  9. Implement futex for multi-threaded programs
-  10. Test with complex packages (python, git, etc.)
-```
-
-## Effort estimate
-
-| Phase | Work | Time |
-|-------|------|------|
-| Phase 1 | mprotect + PT_INTERP + musl build | 3-5 days |
-| Phase 2 | Incremental syscall stubs | 1-2 weeks |
-| Phase 3 | Proper signal/thread support | 2-4 weeks |
-
-## Payoff
-
-Once Phase 2 is complete, Akuma can use Void Linux's `aarch64-musl`
-package repository (~12,000 packages) via xbps-install. No more
-cross-compiling everything from source.
-
-## References
-
-- musl dynamic linker source: `userspace/musl/musl/ldso/dynlink.c` (~3000 lines)
-- musl startup: `userspace/musl/musl/ldso/dlstart.c`
-- Akuma ELF loader: `src/elf_loader.rs`
-- Akuma MMU: `src/mmu.rs` (page table management, `user_flags`)
-- Akuma process setup: `src/process.rs` (stack setup, auxv)
-- Linux auxv spec: `userspace/musl/musl/include/sys/auxv.h`
+- `hello_dynamic.bin`: trivial `printf("Hello")` compiled without `-static`
+- musl 1.2.5 dynamic linker from Alpine Linux (723 KB)
+- Kernel applies 21 relocations to interpreter, boots in ~10ms
+- Clean exit code 0

@@ -102,3 +102,10 @@ which would cause one to silently overwrite the other's page table entries.
 There is no enforced upper limit on `brk` — it can grow until physical
 memory runs out — but exceeding the 256MB gap would collide with mmap
 allocations.
+
+## Dynamic Linking
+
+The ELF loader also supports dynamically linked binaries (`ET_EXEC` or `ET_DYN`
+with a non-empty `PT_INTERP` segment). The dynamic linker is loaded at
+`0x3000_0000`, between the mmap region and the guard page. See
+`userspace/musl/docs/DYNAMIC_LINKING.md` for full documentation.

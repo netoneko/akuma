@@ -17,7 +17,7 @@ pub const DEBUG_ELF_LOADING: bool = true;
 
 /// Result of loading an ELF binary
 pub struct LoadedElf {
-    /// Entry point virtual address
+    /// Entry point virtual address (program's own entry)
     pub entry_point: usize,
     /// User address space with mapped pages
     pub address_space: UserAddressSpace,
@@ -29,6 +29,16 @@ pub struct LoadedElf {
     pub phnum: usize,
     /// Size of each program header
     pub phent: usize,
+    /// If a dynamic linker was loaded: its entry point and base address
+    pub interp: Option<InterpInfo>,
+}
+
+/// Information about a loaded interpreter (dynamic linker)
+pub struct InterpInfo {
+    /// Entry point of the interpreter (execution starts here)
+    pub entry_point: usize,
+    /// Base address where the interpreter was loaded
+    pub base_addr: usize,
 }
 
 /// Auxiliary Vector entry types
@@ -140,12 +150,20 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         .segments()
         .ok_or(ElfError::InvalidFormat("No program headers"))?;
 
-    // Reject dynamically-linked binaries that require a real interpreter.
-    // Static-PIE binaries may have PT_INTERP with an empty string (1-byte null) — allow those.
+    // Check for PT_INTERP — if present, we need to load the dynamic linker.
+    // Static-PIE binaries may have PT_INTERP with an empty string (1-byte null) — skip those.
+    let mut interp_path: Option<String> = None;
     for phdr in segments.iter() {
         if phdr.p_type == PT_INTERP && phdr.p_filesz > 1 {
-            crate::safe_print!(96, "[ELF] Error: binary requires dynamic linker, recompile with -static\n");
-            return Err(ElfError::DynamicallyLinked);
+            let off = phdr.p_offset as usize;
+            let sz = phdr.p_filesz as usize;
+            if off + sz <= elf_data.len() {
+                let raw = &elf_data[off..off + sz];
+                let path_bytes = if raw.last() == Some(&0) { &raw[..raw.len() - 1] } else { raw };
+                if let Ok(s) = core::str::from_utf8(path_bytes) {
+                    interp_path = Some(String::from(s));
+                }
+            }
         }
     }
 
@@ -283,6 +301,22 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             entry_point, brk, mapped_pages.len());
     }
 
+    let interp = if let Some(ref path) = interp_path {
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(128, "[ELF] Loading interpreter: {}\n", path);
+        }
+        let interp_data = crate::fs::read_file(path)
+            .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+        let interp_info = load_interpreter(&interp_data, &mut address_space)?;
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(128, "[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}\n",
+                interp_info.base_addr, interp_info.entry_point);
+        }
+        Some(interp_info)
+    } else {
+        None
+    };
+
     Ok(LoadedElf {
         entry_point,
         address_space,
@@ -290,7 +324,148 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         phdr_addr,
         phnum: elf.ehdr.e_phnum as usize,
         phent: elf.ehdr.e_phentsize as usize,
+        interp,
     })
+}
+
+const INTERP_BASE: usize = 0x3000_0000;
+
+/// Load the dynamic linker (interpreter) ELF into an existing address space.
+fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
+    let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
+        .map_err(|_| ElfError::InvalidFormat("Interpreter parse failed"))?;
+
+    if elf.ehdr.e_machine != EM_AARCH64 {
+        return Err(ElfError::WrongArchitecture);
+    }
+
+    let base = INTERP_BASE;
+    let entry_point = base + elf.ehdr.e_entry as usize;
+
+    let segments = elf
+        .segments()
+        .ok_or(ElfError::InvalidFormat("Interpreter has no program headers"))?;
+
+    let mut mapped_pages: alloc::collections::BTreeMap<usize, usize> = alloc::collections::BTreeMap::new();
+
+    for phdr in segments.iter() {
+        if phdr.p_type != PT_LOAD { continue; }
+
+        let vaddr = base + phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        let filesz = phdr.p_filesz as usize;
+        let offset = phdr.p_offset as usize;
+        let flags = phdr.p_flags;
+
+        let page_flags = if (flags & PF_X) != 0 {
+            user_flags::RX
+        } else {
+            user_flags::RW_NO_EXEC
+        };
+
+        let start_page = vaddr & !(PAGE_SIZE - 1);
+        let end_page = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let num_pages = (end_page - start_page) / PAGE_SIZE;
+
+        for i in 0..num_pages {
+            let page_va = start_page + i * PAGE_SIZE;
+
+            let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
+                pa
+            } else {
+                let frame = address_space
+                    .alloc_and_map(page_va, page_flags)
+                    .map_err(|e| ElfError::MappingFailed(e))?;
+                mapped_pages.insert(page_va, frame.addr);
+                frame.addr
+            };
+
+            let page_start_in_segment = if page_va >= vaddr { page_va - vaddr } else { 0 };
+
+            if page_start_in_segment < filesz {
+                let copy_start = if page_va < vaddr { vaddr - page_va } else { 0 };
+                let file_offset = offset + page_start_in_segment;
+                let copy_len = core::cmp::min(
+                    PAGE_SIZE - copy_start,
+                    filesz.saturating_sub(page_start_in_segment),
+                );
+
+                if copy_len > 0 && file_offset + copy_len <= elf_data.len() {
+                    unsafe {
+                        let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);
+                        let src = elf_data.as_ptr().add(file_offset);
+                        core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply relocations so the interpreter can self-bootstrap.
+    // Process both .rela.dyn (DT_RELA) and .rela.plt (DT_JMPREL).
+    let dynsyms = elf.dynamic_symbol_table().ok().flatten();
+    if let Some(shdrs) = elf.section_headers() {
+        let mut rela_count = 0usize;
+        for shdr in shdrs {
+            if shdr.sh_type != elf::abi::SHT_RELA { continue; }
+            if let Ok(relas) = elf.section_data_as_relas(&shdr) {
+                for rela in relas {
+                    let r_type = rela.r_type;
+                    let vaddr = base + rela.r_offset as usize;
+                    let addend = rela.r_addend as usize;
+                    let sym_idx = rela.r_sym as usize;
+
+                    let page_va = vaddr & !(PAGE_SIZE - 1);
+                    if let Some(&pa) = mapped_pages.get(&page_va) {
+                        let offset_in_page = vaddr & (PAGE_SIZE - 1);
+                        let ptr = unsafe {
+                            crate::mmu::phys_to_virt(pa + offset_in_page) as *mut usize
+                        };
+
+                        match r_type {
+                            R_AARCH64_RELATIVE => {
+                                unsafe { *ptr = base + addend; }
+                                rela_count += 1;
+                            }
+                            R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
+                                if sym_idx != 0 {
+                                    if let Some(ref syms) = dynsyms {
+                                        if let Ok(sym) = syms.0.get(sym_idx) {
+                                            unsafe { *ptr = base + sym.st_value as usize + addend; }
+                                            rela_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            R_AARCH64_ABS64 => {
+                                if sym_idx != 0 {
+                                    if let Some(ref syms) = dynsyms {
+                                        if let Ok(sym) = syms.0.get(sym_idx) {
+                                            unsafe { *ptr = base + sym.st_value as usize + addend; }
+                                            rela_count += 1;
+                                        }
+                                    }
+                                } else {
+                                    unsafe { *ptr = base + addend; }
+                                    rela_count += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(80, "[ELF] Interpreter: applied {} relocations\n", rela_count);
+        }
+    }
+
+    if DEBUG_ELF_LOADING {
+        crate::safe_print!(80, "[ELF] Interpreter: entry=0x{:x} pages={}\n", entry_point, mapped_pages.len());
+    }
+
+    Ok(InterpInfo { entry_point, base_addr: base })
 }
 
 /// Helper to build a userspace stack according to Linux AArch64 ABI
@@ -465,21 +640,29 @@ pub fn load_elf_with_stack(
     let mut stack = UserStack::new(stack_bottom, STACK_TOP, stack_frames);
     let random_ptr = stack.push_raw(&[0u8; 16]);
 
-    let auxv = [
-        AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 },
-        AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 },
-        AuxEntry { a_type: auxv::AT_PHENT, a_val: loaded.phent as u64 },
-        AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 },
-        AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 },
-        AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 },
-        AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 },
-        AuxEntry { a_type: auxv::AT_UID, a_val: 0 },
-        AuxEntry { a_type: auxv::AT_EUID, a_val: 0 },
-        AuxEntry { a_type: auxv::AT_GID, a_val: 0 },
-        AuxEntry { a_type: auxv::AT_EGID, a_val: 0 },
-    ];
+    let actual_entry = if let Some(ref interp) = loaded.interp {
+        interp.entry_point
+    } else {
+        loaded.entry_point
+    };
 
-    let sp = setup_linux_stack(&mut stack, args, env, &auxv);
+    let mut auxv_vec = Vec::new();
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHENT, a_val: loaded.phent as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_UID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_EUID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_GID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_EGID, a_val: 0 });
+    if let Some(ref interp) = loaded.interp {
+        auxv_vec.push(AuxEntry { a_type: auxv::AT_BASE, a_val: interp.base_addr as u64 });
+    }
+
+    let sp = setup_linux_stack(&mut stack, args, env, &auxv_vec);
 
     let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     for i in 0..16 {
@@ -490,7 +673,11 @@ pub fn load_elf_with_stack(
         crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
         crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
             stack_bottom, STACK_TOP, sp, args.len());
+        if loaded.interp.is_some() {
+            crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
+                actual_entry, loaded.entry_point);
+        }
     }
 
-    Ok((loaded.entry_point, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
 }

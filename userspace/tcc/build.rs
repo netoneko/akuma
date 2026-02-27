@@ -168,13 +168,41 @@ fn main() {
         panic!("tar command failed");
     }
 
-    // 5. Copy to dist directory
+    // 5. Create libtcc1.tar (standalone TCC runtime, installable without full sysroot)
+    let libtcc1_staging = out_dir.join("libtcc1_staging");
+    if libtcc1_staging.exists() {
+        fs::remove_dir_all(&libtcc1_staging).unwrap();
+    }
+    let libtcc1_tcc_dir = libtcc1_staging.join("usr/lib/tcc");
+    fs::create_dir_all(&libtcc1_tcc_dir).unwrap();
+    fs::copy(out_dir.join("libtcc1.a"), libtcc1_tcc_dir.join("libtcc1.a")).unwrap();
+
+    let libtcc1_archive_path = out_dir.join("libtcc1.tar");
+    let status = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("--no-xattrs")
+        .arg("--format=ustar")
+        .arg("-cf")
+        .arg(&libtcc1_archive_path)
+        .arg("-C")
+        .arg(&libtcc1_staging)
+        .arg("usr")
+        .status()
+        .expect("Failed to execute tar");
+
+    if !status.success() {
+        panic!("tar command failed for libtcc1.tar");
+    }
+
+    // 6. Copy to dist directory
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let dist_dir = manifest_dir.join("dist");
     fs::create_dir_all(&dist_dir).unwrap();
     fs::copy(&archive_path, dist_dir.join("libc.tar")).unwrap();
+    fs::copy(&libtcc1_archive_path, dist_dir.join("libtcc1.tar")).unwrap();
 
     println!("cargo:warning=libc archive created at {}", dist_dir.join("libc.tar").display());
+    println!("cargo:warning=libtcc1 archive created at {}", dist_dir.join("libtcc1.tar").display());
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
