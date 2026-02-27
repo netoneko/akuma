@@ -46,6 +46,14 @@ for member in "${MEMBERS[@]}"; do
         else
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
         fi
+        LIBTCC1_ARCHIVE="tcc/dist/libtcc1.tar"
+        if [ -f "$LIBTCC1_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$LIBTCC1_ARCHIVE" ../bootstrap/archives/libtcc1.tar
+            echo "Copied $LIBTCC1_ARCHIVE to ../bootstrap/archives/libtcc1.tar"
+        else
+            echo "Warning: libtcc1 archive not found at $LIBTCC1_ARCHIVE"
+        fi
     fi
     # Special handling for xbps to copy its package archive
     if [ "$member" == "xbps" ]; then
