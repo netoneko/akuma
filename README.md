@@ -1,6 +1,6 @@
 # Akuma OS
 
-**A bare-metal AArch64 operating system written in Rust, featuring a preemptive kernel, userspace applications, a built-in SSH server, and an interactive shell.**
+**A bohemian bare-metal AArch64 operating system written in Rust, featuring a preemptive kernel, userspace applications, a built-in SSH server, an interactive shell, some limited Linux compatibility, and `xbps` and `apk` package managers**
 
 ```
                                              %#%:                +
