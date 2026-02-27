@@ -470,7 +470,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::SENDMSG => sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
         nr::RECVMSG => sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
-        nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32),
+        nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         nr::EXECVE => sys_execve(args[0], args[1], args[2]),
@@ -1035,17 +1035,18 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         crate::process::FileDescriptor::File(ref f) => {
-            // Memory safety: Limit the amount of memory allocated in the kernel per syscall.
-            // Userspace is expected to call read in a loop.
-            let limit = 64 * 1024; // 64KB chunks
+            let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
-            
+
             match crate::fs::read_at(&f.path, f.position, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
                         unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
                         proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    }
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
                     }
                     n as u64
                 }
@@ -1208,6 +1209,9 @@ fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
         total_read += n;
         if (n as usize) < iov.iov_len { break; }
     }
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[syscall] readv(fd={}, cnt={}) = {}\n", fd_num, iov_cnt, total_read);
+    }
     total_read
 }
 
@@ -1308,7 +1312,10 @@ fn sys_openat(_dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
             // Only truncate if file exists; ignore errors (file might not exist yet with O_CREAT)
             let _ = crate::fs::write_file(&path, &[]);
         }
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path, flags)));
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.clone(), flags)));
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+        }
         fd as u64
     } else { !0u64 }
 }
@@ -1358,6 +1365,9 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         if let Ok(meta) = crate::vfs::metadata(&f.path) {
             let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={}\n", fd, &f.path, meta.size);
+            }
             return 0;
         }
     }
@@ -2086,7 +2096,7 @@ fn socket_can_recv_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
-fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
+fn sys_mmap(addr: usize, len: usize, _prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return !0u64; }
     let pages = (len + 4095) / 4096;
     let mmap_addr = crate::process::alloc_mmap(pages * 4096);
@@ -2101,6 +2111,24 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
             } else { return !0u64; }
         }
         crate::process::record_mmap_region(mmap_addr, frames);
+
+        const MAP_ANONYMOUS: u32 = 0x20;
+        if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+            if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
+                let path = f.path.clone();
+                let mut buf = alloc::vec![0u8; len];
+                if let Ok(n) = crate::fs::read_at(&path, offset, &mut buf) {
+                    let copy_len = n.min(len);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
+                    }
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(256, "[syscall] mmap(fd={}, file={}, off={}, len={}) = 0x{:x} (read {} bytes)\n", fd, &path, offset, len, mmap_addr, copy_len);
+                    }
+                }
+            }
+        }
+
         mmap_addr as u64
     } else { !0u64 }
 }
