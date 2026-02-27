@@ -166,6 +166,7 @@ pub mod nr {
     pub const CLONE: u64 = 220;
     pub const EXECVE: u64 = 221;
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
+    pub const MREMAP: u64 = 216;    // Linux arm64 mremap
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
     pub const PSELECT6: u64 = 72;    // Linux arm64 pselect6
@@ -604,6 +605,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::SENDMSG => sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
         nr::RECVMSG => sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
+        nr::MREMAP => sys_mremap(args[0] as usize, args[1] as usize, args[2] as usize, args[3] as u32),
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -2491,6 +2493,53 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, flags: u32, fd: i32, offset: us
         mmap_addr as u64
     } else { !0u64 }
 }
+
+fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
+    if new_size == 0 { return EINVAL; }
+    const MREMAP_MAYMOVE: u32 = 1;
+
+    let old_pages = (old_size + 4095) / 4096;
+    let new_pages = (new_size + 4095) / 4096;
+
+    if new_pages <= old_pages {
+        return old_addr as u64;
+    }
+
+    if flags & MREMAP_MAYMOVE == 0 {
+        return ENOMEM;
+    }
+
+    let new_addr = crate::process::alloc_mmap(new_pages * 4096);
+    if new_addr == 0 { return ENOMEM; }
+
+    if let Some(proc) = crate::process::current_process() {
+        let mut new_frames = alloc::vec::Vec::new();
+        for i in 0..new_pages {
+            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                new_frames.push(frame);
+                unsafe { crate::mmu::map_user_page(new_addr + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC); }
+                proc.address_space.track_user_frame(frame);
+            } else { return ENOMEM; }
+        }
+
+        let copy_len = old_size.min(new_size);
+        unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+
+        crate::process::record_mmap_region(new_addr, new_frames);
+
+        if let Some(old_frames) = crate::process::remove_mmap_region(old_addr) {
+            for (i, frame) in old_frames.into_iter().enumerate() {
+                let _ = proc.address_space.unmap_page(old_addr + i * 4096);
+                proc.address_space.remove_user_frame(frame);
+                crate::pmm::free_page(frame);
+            }
+        }
+
+        new_addr as u64
+    } else { ENOMEM }
+}
+
+const ENOMEM: u64 = (-12i64) as u64;
 
 fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
     const MADV_DONTNEED: i32 = 4;

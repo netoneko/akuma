@@ -550,6 +550,36 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     true
 }
 
+/// Translate a user VA to its physical address using the given L0 page table.
+/// Returns None if the page is not mapped.
+pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    let offset = va & 0xFFF;
+    unsafe {
+        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+        if l0_entry & flags::VALID == 0 { return None; }
+        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+        if l1_entry & flags::VALID == 0 { return None; }
+        if l1_entry & flags::TABLE == 0 {
+            return Some(((l1_entry & 0x0000_FFFF_C000_0000) as usize) | (va & 0x3FFF_FFFF));
+        }
+        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+        if l2_entry & flags::VALID == 0 { return None; }
+        if l2_entry & flags::TABLE == 0 {
+            return Some(((l2_entry & 0x0000_FFFF_FFE0_0000) as usize) | (va & 0x1F_FFFF));
+        }
+        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+        if l3_entry & flags::VALID == 0 { return None; }
+        Some(((l3_entry & 0x0000_FFFF_FFFF_F000) as usize) | offset)
+    }
+}
+
 fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;

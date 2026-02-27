@@ -2009,50 +2009,50 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let stack_size = config::USER_STACK_SIZE; 
     let stack_start = stack_top - stack_size;
     
-    // Helper to copy a range
-    fn copy_range(src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
+    // Snapshot parent's L0 page table pointer so we can translate VAs to
+    // physical addresses without relying on TTBR0 staying valid across
+    // potential context switches during the (long) copy.
+    let parent_l0 = {
+        let ttbr0 = mmu::get_current_ttbr0();
+        let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+        mmu::phys_to_virt(l0_addr) as *const u64
+    };
+
+    fn copy_range_phys(parent_l0: *const u64, src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
         let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
         for i in 0..pages {
             let va = src_va + i * mmu::PAGE_SIZE;
-            if mmu::is_current_user_range_mapped(va, 1) {
-                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
-                 unsafe {
-                     let src_ptr = va as *const u8;
-                     let dest_ptr = mmu::phys_to_virt(frame.addr);
-                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
-                 }
+            if let Some(src_phys) = mmu::translate_user_va(parent_l0, va) {
+                let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
+                unsafe {
+                    let src_ptr = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
+                    let dest_ptr = mmu::phys_to_virt(frame.addr);
+                    core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
+                }
             }
         }
         Ok(())
     }
-    
-    copy_range(stack_start, stack_size, &mut new_proc.address_space)?;
-    
-    if parent.brk > 0x400000 {
-        copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
+
+    copy_range_phys(parent_l0, stack_start, stack_size, &mut new_proc.address_space)?;
+
+    // Copy code+heap range. Use memory.code_end as the start of the loaded
+    // binary (for PIE at 0x10000000, this avoids scanning 250MB of unmapped pages).
+    let code_start = if parent.entry_point >= 0x1000_0000 {
+        parent.entry_point & !0xFFFFF // round down to 1MB boundary
+    } else {
+        0x400000
+    };
+    if parent.brk > code_start {
+        copy_range_phys(parent_l0, code_start, parent.brk - code_start, &mut new_proc.address_space)?;
     }
 
-    // Copy mmap'd regions and rebuild mmap_regions with the child's own frames
+    // Skip copying mmap regions: fork is almost always followed by execve
+    // which replaces the address space. Copying 300+ MB of mmap data would
+    // exhaust physical memory and is never used by the child.
     new_proc.mmap_regions.clear();
-    for (va, frames) in &parent.mmap_regions {
-        let num_pages = frames.len();
-        let mut child_frames = Vec::new();
-        for i in 0..num_pages {
-            let page_va = *va + i * mmu::PAGE_SIZE;
-            if mmu::is_current_user_range_mapped(page_va, 1) {
-                let frame = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW)?;
-                unsafe {
-                    let src_ptr = page_va as *const u8;
-                    let dest_ptr = mmu::phys_to_virt(frame.addr);
-                    core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
-                }
-                child_frames.push(frame);
-            }
-        }
-        if !child_frames.is_empty() {
-            new_proc.mmap_regions.push((*va, child_frames));
-        }
-    }
+    let mmap_base = (new_proc.memory.code_end + 0x1000_0000) & !0xFFFF;
+    new_proc.memory.next_mmap = mmap_base;
     
     // 5. Write ProcessInfo to child's process info page
     unsafe {

@@ -69,26 +69,93 @@ Also added `pselect6` to the syscall debug noise filter alongside `ppoll`.
 | `f_namelen` | 255 | Max filename length |
 | `f_frsize` | 4096 | Fragment size |
 
+### renameat dirfd support (38)
+
+**Symptom:** `WARNING: updating and opening ...: Operation not permitted` — APK downloaded and cached the APKINDEX but couldn't open it after renaming.
+
+**Cause:** `sys_renameat` ignored both `olddirfd` and `newdirfd` arguments. APK opens the cache directory (`/var/cache/apk/`) as a file descriptor and passes it to `renameat`. With dirfds ignored, relative paths like `APKINDEX.f30b41c9.tar.gz.tmp.29` couldn't resolve, so the rename silently failed.
+
+**Fix:** Added `resolve_path_at(dirfd, path)` helper to resolve relative paths against a dirfd's directory (or CWD for `AT_FDCWD`). Updated `sys_renameat` to use it for both old and new paths.
+
+### symlinkat (36)
+
+**Symptom:** `ERROR: musl-1.2.5-r21: failed to extract lib/libc.musl-aarch64.so.1: Function not implemented`
+
+**Cause:** Alpine packages use symlinks extensively (e.g., `lib/libc.musl-aarch64.so.1 -> ld-musl-aarch64.so.1`). Akuma had no symlink support at all.
+
+**Fix:** Added in-memory symlink support:
+- `src/vfs/mod.rs`: Global `SYMLINKS` table (`BTreeMap<String, String>`) with `create_symlink()`, `read_symlink()`, `is_symlink()`, `resolve_symlinks()` (follows chains up to 8 levels)
+- `src/syscall.rs`: `sys_symlinkat` creates entries; `sys_readlinkat` reads targets
+- `sys_openat` calls `resolve_symlinks()` before checking file existence
+- `sys_newfstatat` handles `AT_SYMLINK_NOFOLLOW` and returns `S_IFLNK` mode
+- `sys_faccessat` follows symlinks when checking existence
+
+Note: symlinks are in-memory only (not persisted to ext2). They survive the session but not a reboot.
+
+### readlinkat (78)
+
+Implemented alongside `symlinkat`. Returns the symlink target string from the in-memory table.
+
+### linkat (37)
+
+**Fix:** Simple implementation that copies the source file's content to the destination. Not a true hard link (no shared inode), but sufficient for APK's needs.
+
+### mremap (216)
+
+**Symptom:** ~80 consecutive `Unknown syscall: 216` calls during APKINDEX processing. APK handled the failure but wasted memory by allocating new regions instead of growing existing ones.
+
+**Cause:** APK (via musl's `realloc`) uses `mremap` to resize mmap'd regions in-place. Without it, each failed `mremap` caused a fallback to `mmap` + `memcpy` + `munmap`, inflating mmap usage to 330+ MB.
+
+**Fix:** Implemented `sys_mremap` in `src/syscall.rs`:
+- If shrinking: returns the same address (no-op)
+- If growing with `MREMAP_MAYMOVE`: allocates new region, copies data, frees old region
+- If growing without `MREMAP_MAYMOVE`: returns `ENOMEM` (in-place growth not supported)
+
+## Kernel Fixes (non-syscall)
+
+### fork: physical address copy (stale TTBR0)
+
+**Symptom:** `Sync from EL1: EC=0x25 ... WARNING: Kernel accessing user-space address!` during `clone(flags=0x11)` (fork).
+
+**Cause:** `fork_process` in `src/process.rs` copied parent memory by reading directly from user-space virtual addresses (`va as *const u8`). With 330 MB of mmap regions, the copy took long enough for the scheduler to preempt the thread. After a context switch, TTBR0 pointed to a different process's page tables, and the next user VA read faulted.
+
+**Fix:** Added `translate_user_va()` to `src/mmu.rs` — walks the page table from a saved L0 pointer to translate user VAs to physical addresses. `fork_process` now:
+1. Snapshots the parent's L0 page table pointer at fork start
+2. Translates each user VA to physical address via `translate_user_va()`
+3. Copies through kernel identity-mapped memory (`phys_to_virt`)
+
+This is safe across context switches since it doesn't depend on TTBR0.
+
+### fork: skip mmap region copy (OOM)
+
+**Symptom:** Same crash at FAR=0x8001000 (GIC MMIO region — not RAM) persisted after the TTBR0 fix.
+
+**Cause:** APK had 332 MB of mmap regions but only 140 MB of free RAM. Attempting to duplicate all mmap pages during fork exhausted physical memory. The page allocator returned corrupted/zero frames, producing page table entries pointing to non-RAM physical addresses (0x8001000 = QEMU GIC region), causing bus errors.
+
+**Fix:** Fork now skips mmap region copy entirely. Fork is almost always followed by `execve` (which replaces the entire address space), so the mmap data is never used by the child. The child starts with a fresh mmap allocator.
+
+Also optimized the code range copy for PIE binaries: instead of scanning from 0x400000 to brk (scanning ~64K unmapped pages), starts from the entry point's 1 MB boundary.
+
 ## Already Implemented (used by APK)
 
 Syscalls that were already in place (many from the XBPS work) and reused by APK:
 
 | Syscall | Number | Notes |
 |---------|--------|-------|
-| openat | 56 | File I/O (with dirfd support) |
+| openat | 56 | File I/O (with dirfd support + symlink resolution) |
 | close | 57 | File I/O |
 | read | 63 | File I/O |
 | write | 64 | File I/O |
 | readv | 65 | Scatter-gather read |
 | writev | 66 | Scatter-gather write |
 | fstat | 80 | File metadata |
-| newfstatat | 79 | File metadata with path |
-| faccessat | 48 | File access checks |
+| newfstatat | 79 | File metadata with path (symlink-aware) |
+| faccessat | 48 | File access checks (symlink-aware) |
 | getdents64 | 61 | Directory listing |
 | lseek | 62 | File seek |
 | mkdirat | 34 | Directory creation |
 | unlinkat | 35 | File/dir removal |
-| renameat | 38 | File rename (used to atomically place cached APKINDEX) |
+| renameat | 38 | File rename (dirfd-aware) |
 | getcwd | 17 | Current working directory |
 | brk | 214 | Heap management |
 | mmap/munmap | 222/215 | Memory mapping (anonymous + file-backed) |
@@ -98,6 +165,10 @@ Syscalls that were already in place (many from the XBPS work) and reused by APK:
 | ioctl | 29 | Terminal control |
 | flock | 32 | File locking (stubbed) |
 | ppoll | 73 | I/O multiplexing |
+| clone | 220 | fork (optimized: skip mmap copy) |
+| execve | 221 | Execute program |
+| wait4 | 260 | Wait for child process |
+| pipe2 | 59 | Pipe creation |
 | socket | 198 | TCP and UDP creation |
 | bind | 200 | Socket address binding |
 | connect | 203 | TCP connection, UDP peer association |
@@ -153,20 +224,21 @@ APK attempts to create IPv6 sockets (`domain=10, AF_INET6`) which Akuma doesn't 
 ## Current Status
 
 APK successfully:
-- Resolves DNS and connects to the Alpine repository
-- Downloads and caches APKINDEX files (both `main` and `community`)
-- Calls `dup` and `fstatfs` without errors
+- Resolves DNS and connects to the Alpine CDN
+- Downloads and verifies APKINDEX signatures (both `main` and `community`)
+- Resolves package dependencies (e.g., `bash` pulls in `musl`, `readline`, `ncurses-libs`, `busybox`, `bash`)
+- Downloads package `.apk` archives over HTTP
+- Extracts package contents (files, directories, symlinks)
+- Updates the APK database (`/lib/apk/db/installed`, `/etc/apk/world`)
+- Installs simple packages (e.g., `neatvi`) successfully
 
-Remaining issue: APK reports "Operation not permitted" when trying to open the cached APKINDEX. This may require additional syscalls (signature verification path) or filesystem fixes. Investigation ongoing.
+Remaining issue: packages with post-install trigger scripts (e.g., `busybox`) call `clone` + `execve` to run `/bin/sh` from inside APK. The fork now succeeds (no crash), but the child process hangs during execution of the trigger script. This is likely a `wait4`/`pipe` interaction issue — the parent (APK) waits for the child to exit, but the child may be blocked on I/O or missing a syscall. Needs further debugging.
 
 ## Potential Future Issues
 
 | Syscall | Number | Used by | Risk |
 |---------|--------|---------|------|
-| symlinkat | 36 | Package install (symlinks) | High — Alpine packages use symlinks heavily |
-| readlinkat | 78 | Package verification, symlink handling | High |
 | ftruncate | 46 | Cache file management | Medium |
 | fchmodat | 53 | File permissions during install | Medium |
-| linkat | 37 | Hard links | Low |
 | statfs | 43 | Filesystem queries by path | Low — `fstatfs` covers the fd case |
 | mprotect | 226 | Memory protection changes | Low — may be needed by crypto |
