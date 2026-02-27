@@ -22,8 +22,6 @@ MEMBERS=(
     "top"
     "cat"
     "box"
-    "paws"
-    "pkg"
     "musl"
     "tcc"
     "tar"
@@ -31,6 +29,8 @@ MEMBERS=(
     "sbase"
     "sshd"
     "dash"
+    "xbps"
+    "apk-tools"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -45,6 +45,28 @@ for member in "${MEMBERS[@]}"; do
             echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
         else
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
+        fi
+    fi
+    # Special handling for xbps to copy its package archive
+    if [ "$member" == "xbps" ]; then
+        XBPS_ARCHIVE="xbps/dist/xbps.tar"
+        if [ -f "$XBPS_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$XBPS_ARCHIVE" ../bootstrap/archives/xbps.tar
+            echo "Copied $XBPS_ARCHIVE to ../bootstrap/archives/xbps.tar"
+        else
+            echo "Warning: xbps archive not found at $XBPS_ARCHIVE"
+        fi
+    fi
+    # Special handling for apk-tools to copy its archive
+    if [ "$member" == "apk-tools" ]; then
+        APK_ARCHIVE="apk-tools/dist/apk-tools.tar"
+        if [ -f "$APK_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$APK_ARCHIVE" ../bootstrap/archives/apk-tools.tar
+            echo "Copied $APK_ARCHIVE to ../bootstrap/archives/apk-tools.tar"
+        else
+            echo "Warning: apk-tools archive not found at $APK_ARCHIVE"
         fi
     fi
 done
@@ -71,8 +93,6 @@ BINARIES=(
     "allocstress"
     "top"
     "box"
-    "paws"
-    "pkg"
     "tcc"
     "tar"
     "sshd"

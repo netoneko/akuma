@@ -13,8 +13,9 @@ use super::Command;
 
 // Re-export static command instances
 pub use builtin::{
-    AKUMA_CMD, CD_CMD, CLEAR_CMD, ECHO_CMD, FREE_CMD, GREP_CMD, HELP_CMD, KILL_CMD, KTHREADS_CMD,
-    PMM_CMD, PS_CMD, PWD_CMD, RESET_CMD, STATS_CMD, UPTIME_CMD,
+    AKUMA_CMD, CD_CMD, CLEAR_CMD, ECHO_CMD, ENV_CMD, EXPORT_CMD, FREE_CMD, GREP_CMD, HELP_CMD,
+    KILL_CMD, KTHREADS_CMD, PMM_CMD, PS_CMD, PWD_CMD, RESET_CMD, SET_CMD, STATS_CMD, UNSET_CMD,
+    UPTIME_CMD,
 };
 pub use exec::EXEC_CMD;
 pub use fs::{
@@ -28,7 +29,7 @@ pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
 // ============================================================================
 
 /// Maximum number of commands that can be registered
-const MAX_COMMANDS: usize = 32;
+const MAX_COMMANDS: usize = 40;
 
 /// Registry of available commands
 pub struct CommandRegistry {
@@ -92,6 +93,10 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&PMM_CMD);
     registry.register(&CLEAR_CMD);
     registry.register(&RESET_CMD);
+    registry.register(&EXPORT_CMD);
+    registry.register(&SET_CMD);
+    registry.register(&UNSET_CMD);
+    registry.register(&ENV_CMD);
 
     // Filesystem commands
     registry.register(&LS_CMD);

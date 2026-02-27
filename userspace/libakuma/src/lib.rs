@@ -715,14 +715,14 @@ impl SockAddrIn {
         Self {
             sin_family: 2, // AF_INET
             sin_port: addr.port.to_be(),
-            sin_addr: u32::from_be_bytes(addr.ip),
+            sin_addr: u32::from_ne_bytes(addr.ip),
             sin_zero: [0u8; 8],
         }
     }
 
     pub fn to_addr(&self) -> SocketAddrV4 {
         SocketAddrV4 {
-            ip: self.sin_addr.to_be_bytes(),
+            ip: self.sin_addr.to_ne_bytes(),
             port: u16::from_be(self.sin_port),
         }
     }

@@ -31,14 +31,21 @@ const ROOT_INODE: u32 = 2;
 /// File type constants (from inode type_perms field)
 const S_IFREG: u16 = 0x8000; // Regular file
 const S_IFDIR: u16 = 0x4000; // Directory
+const S_IFLNK: u16 = 0xA000; // Symbolic link
 
 /// Default permissions for new files/directories
 const DEFAULT_FILE_PERMS: u16 = S_IFREG | 0o644;
 const DEFAULT_DIR_PERMS: u16 = S_IFDIR | 0o755;
+const DEFAULT_SYMLINK_PERMS: u16 = S_IFLNK | 0o777;
+
+/// Maximum target length for fast (inline) symlinks.
+/// Stored in direct_blocks[12] + indirect + double_indirect + triple_indirect = 60 bytes.
+const FAST_SYMLINK_MAX: usize = 60;
 
 /// Directory entry file type constants
 const FT_REG_FILE: u8 = 1;
 const FT_DIR: u8 = 2;
+const FT_SYMLINK: u8 = 7;
 
 /// Minimum directory entry size (inode + rec_len + name_len + file_type)
 const DIR_ENTRY_HEADER_SIZE: usize = 8;
@@ -1039,6 +1046,65 @@ impl Ext2Filesystem {
     }
 
     // ========================================================================
+    // Symlink Operations
+    // ========================================================================
+
+    fn create_symlink_internal(state: &mut Ext2State, parent_inode: u32, name: &str, target: &str) -> Result<(), FsError> {
+        let target_bytes = target.as_bytes();
+        let inode_num = Self::allocate_inode(state, false)?;
+
+        let now = current_time();
+        let mut inode = Inode {
+            type_perms: DEFAULT_SYMLINK_PERMS,
+            uid: 0,
+            size_lower: target_bytes.len() as u32,
+            access_time: now,
+            creation_time: now,
+            modification_time: now,
+            hard_links: 1,
+            sectors_used: 0,
+            ..Default::default()
+        };
+
+        if target_bytes.len() <= FAST_SYMLINK_MAX {
+            // Fast symlink: store target directly in the block pointer fields.
+            // Inode is packed, so use addr_of_mut! to avoid misaligned references.
+            let dst_ptr = core::ptr::addr_of_mut!(inode.direct_blocks) as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(target_bytes.as_ptr(), dst_ptr, target_bytes.len());
+            }
+        } else {
+            // Slow symlink: allocate data block(s)
+            Self::write_inode_data(state, inode_num, &mut inode, target_bytes)?;
+        }
+
+        Self::write_inode(state, inode_num, &inode)?;
+        Self::add_dir_entry(state, parent_inode, name, inode_num, FT_SYMLINK)?;
+        Ok(())
+    }
+
+    fn read_symlink_inode(state: &Ext2State, inode_num: u32) -> Result<String, FsError> {
+        let inode = Self::read_inode(state, inode_num)?;
+        if (inode.type_perms & 0xF000) != S_IFLNK {
+            return Err(FsError::NotAFile);
+        }
+        let len = inode.size_lower as usize;
+        if inode.sectors_used == 0 && len <= FAST_SYMLINK_MAX {
+            // Fast symlink: read from block pointer fields.
+            let src_ptr = core::ptr::addr_of!(inode.direct_blocks) as *const u8;
+            let mut buf = [0u8; FAST_SYMLINK_MAX];
+            unsafe { core::ptr::copy_nonoverlapping(src_ptr, buf.as_mut_ptr(), len); }
+            let s = core::str::from_utf8(&buf[..len]).map_err(|_| FsError::IoError)?;
+            Ok(String::from(s))
+        } else {
+            // Slow symlink
+            let data = Self::read_inode_data(state, &inode)?;
+            let s = core::str::from_utf8(&data[..len]).map_err(|_| FsError::IoError)?;
+            Ok(String::from(s))
+        }
+    }
+
+    // ========================================================================
     // Path Resolution
     // ========================================================================
 
@@ -1414,8 +1480,12 @@ impl Filesystem for Ext2Filesystem {
         inode.hard_links = inode.hard_links.saturating_sub(1);
 
         if inode.hard_links == 0 {
-            // Free all blocks
-            Self::truncate_inode(&mut state, &mut inode)?;
+            let is_fast_symlink = (inode.type_perms & 0xF000) == S_IFLNK
+                && inode.sectors_used == 0
+                && (inode.size_lower as usize) <= FAST_SYMLINK_MAX;
+            if !is_fast_symlink {
+                Self::truncate_inode(&mut state, &mut inode)?;
+            }
             inode.deletion_time = current_time();
             Self::write_inode(&state, inode_num, &inode)?;
 
@@ -1471,6 +1541,61 @@ impl Filesystem for Ext2Filesystem {
 
         // Free inode
         Self::free_inode(&mut state, inode_num, true)?;
+
+        Ok(())
+    }
+
+    fn create_symlink(&self, link_path: &str, target: &str) -> Result<(), FsError> {
+        if self.lookup_path(link_path).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+        let (parent_inode, name) = self.lookup_parent(link_path)?;
+        let mut state = self.state.lock();
+        Self::create_symlink_internal(&mut state, parent_inode, &name, target)
+    }
+
+    fn read_symlink(&self, path: &str) -> Result<String, FsError> {
+        let inode_num = self.lookup_path(path)?;
+        let state = self.state.lock();
+        Self::read_symlink_inode(&state, inode_num)
+    }
+
+    fn is_symlink(&self, path: &str) -> bool {
+        if let Ok(inode_num) = self.lookup_path(path) {
+            let state = self.state.lock();
+            if let Ok(inode) = Self::read_inode(&state, inode_num) {
+                return (inode.type_perms & 0xF000) == S_IFLNK;
+            }
+        }
+        false
+    }
+
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        let src_inode_num = self.lookup_path(old_path)?;
+        let (src_parent, src_name) = self.lookup_parent(old_path)?;
+        let (dst_parent, dst_name) = self.lookup_parent(new_path)?;
+
+        let mut state = self.state.lock();
+        let src_inode = Self::read_inode(&state, src_inode_num)?;
+        let ft = if (src_inode.type_perms & 0xF000) == S_IFDIR { FT_DIR } else { FT_REG_FILE };
+
+        // If destination exists, remove it first
+        if let Ok(dst_inode_num) = Self::lookup_path_internal(&state, new_path) {
+            let mut dst_inode = Self::read_inode(&state, dst_inode_num)?;
+            Self::remove_dir_entry(&mut state, dst_parent, &dst_name)?;
+            dst_inode.hard_links = dst_inode.hard_links.saturating_sub(1);
+            if dst_inode.hard_links == 0 {
+                Self::truncate_inode(&mut state, &mut dst_inode)?;
+                dst_inode.deletion_time = current_time();
+                Self::write_inode(&state, dst_inode_num, &dst_inode)?;
+                Self::free_inode(&mut state, dst_inode_num, false)?;
+            } else {
+                Self::write_inode(&state, dst_inode_num, &dst_inode)?;
+            }
+        }
+
+        Self::add_dir_entry(&mut state, dst_parent, &dst_name, src_inode_num, ft)?;
+        Self::remove_dir_entry(&mut state, src_parent, &src_name)?;
 
         Ok(())
     }

@@ -9,6 +9,7 @@ pub mod memory;
 pub mod proc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
@@ -221,6 +222,21 @@ pub trait Filesystem: Send + Sync {
 
     /// Get metadata for a path
     fn metadata(&self, path: &str) -> Result<Metadata, FsError>;
+
+    /// Create a symbolic link at `link_path` pointing to `target`
+    fn create_symlink(&self, _link_path: &str, _target: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Read the target of a symbolic link
+    fn read_symlink(&self, _path: &str) -> Result<String, FsError> {
+        Err(FsError::NotFound)
+    }
+
+    /// Check whether a path is a symlink (without following it)
+    fn is_symlink(&self, _path: &str) -> bool {
+        false
+    }
 
     /// Rename/move a file or directory
     fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
@@ -655,6 +671,84 @@ pub fn list_mounts() -> Result<Vec<MountInfo>, FsError> {
         .collect();
 
     Ok(mounts)
+}
+
+// ============================================================================
+// Symlink Support
+// ============================================================================
+
+/// Legacy in-memory symlink table (fallback for filesystems that don't support symlinks)
+static SYMLINKS: Spinlock<Option<BTreeMap<String, String>>> = Spinlock::new(None);
+
+pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
+    // Try on-disk first via the mounted filesystem
+    match with_fs(link_path, |fs, rel| fs.create_symlink(rel, target)) {
+        Ok(()) => return Ok(()),
+        Err(FsError::NotSupported) => {}
+        Err(e) => return Err(e),
+    }
+    // Fallback to in-memory table
+    let link = canonicalize_path(link_path);
+    let mut table = SYMLINKS.lock();
+    if table.is_none() { *table = Some(BTreeMap::new()); }
+    table.as_mut().unwrap().insert(link, String::from(target));
+    Ok(())
+}
+
+pub fn read_symlink(path: &str) -> Option<String> {
+    // Try on-disk first
+    if let Ok(target) = with_fs(path, |fs, rel| fs.read_symlink(rel)) {
+        return Some(target);
+    }
+    // Fallback to in-memory table
+    let canonical = canonicalize_path(path);
+    let table = SYMLINKS.lock();
+    table.as_ref().and_then(|t| t.get(&canonical).cloned())
+}
+
+pub fn is_symlink(path: &str) -> bool {
+    // Try on-disk first
+    if let Ok(result) = with_fs(path, |fs, rel| Ok(fs.is_symlink(rel))) {
+        if result {
+            return true;
+        }
+    }
+    // Fallback to in-memory table
+    let canonical = canonicalize_path(path);
+    let table = SYMLINKS.lock();
+    table.as_ref().map_or(false, |t| t.contains_key(&canonical))
+}
+
+pub fn remove_symlink(path: &str) -> bool {
+    let canonical = canonicalize_path(path);
+    let mut table = SYMLINKS.lock();
+    table.as_mut().map_or(false, |t| t.remove(&canonical).is_some())
+}
+
+/// Resolve a path, following symlinks (up to 8 levels to prevent loops)
+pub fn resolve_symlinks(path: &str) -> String {
+    let mut resolved = canonicalize_path(path);
+    for _ in 0..8 {
+        let target = read_symlink(&resolved);
+        match target {
+            Some(t) => {
+                if t.starts_with('/') {
+                    resolved = canonicalize_path(&t);
+                } else {
+                    let (parent, _) = split_path(&resolved);
+                    resolved = resolve_path(parent, &t);
+                }
+            }
+            None => {
+                if resolved == "/bin/sh" && crate::fs::exists("/bin/dash") {
+                    resolved = String::from("/bin/dash");
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    resolved
 }
 
 /// Get mount points that are direct children of a directory

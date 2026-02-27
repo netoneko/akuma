@@ -13,7 +13,7 @@ use spinning_top::Spinlock;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
 pub use smoltcp::iface::SocketHandle;
 use smoltcp::phy::Device;
-use smoltcp::socket::{tcp, dhcpv4, dns};
+use smoltcp::socket::{tcp, udp, dhcpv4, dns};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -27,7 +27,7 @@ use crate::virtio_hal::VirtioHal;
 // Constants
 // ============================================================================
 
-const MAX_SOCKETS: usize = 128;
+const MAX_SOCKETS: usize = 256;
 const TCP_RX_BUFFER_SIZE: usize = 65535;
 const TCP_TX_BUFFER_SIZE: usize = 65535;
 const EPHEMERAL_PORT_START: u16 = 49152;
@@ -86,8 +86,8 @@ pub struct NetworkState {
     pub device: LoopbackAwareDevice,
     pub dhcp_handle: Option<SocketHandle>,
     pub dns_handle: SocketHandle,
-    /// Sockets that have been closed by the user but are waiting for the stack to finish
-    pub pending_removal: Vec<SocketHandle>,
+    /// Sockets closed by the user, waiting for TCP teardown. Tuple: (handle, close_timestamp_us).
+    pub pending_removal: Vec<(SocketHandle, u64)>,
 }
 
 /// Global network stack protected by a Spinlock.
@@ -530,12 +530,14 @@ pub fn poll() -> bool {
             net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         }
 
-        // Garbage collect pending removals
+        // Garbage collect pending removals.
+        // Force-abort sockets stuck in non-Closed states for longer than
+        // SOCKET_GC_TIMEOUT_US to prevent slot exhaustion.
+        const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
+        let now_us = crate::timer::uptime_us();
         let mut i = 0;
         while i < net.pending_removal.len() {
-            let handle = net.pending_removal[i];
-            // Skip handles that have been corrupted — remove them from
-            // the pending list without touching the socket set.
+            let (handle, added_at) = net.pending_removal[i];
             if !is_valid_handle(handle) {
                 crate::safe_print!(
                     128,
@@ -545,12 +547,12 @@ pub fn poll() -> bool {
                 net.pending_removal.swap_remove(i);
                 continue;
             }
-            let should_remove = match net.sockets.get::<tcp::Socket>(handle).state() {
-                tcp::State::Closed => true,
-                _ => false,
-            };
-            
-            if should_remove {
+            let state = net.sockets.get::<tcp::Socket>(handle).state();
+            let timed_out = now_us.saturating_sub(added_at) > SOCKET_GC_TIMEOUT_US;
+            if state == tcp::State::Closed || timed_out {
+                if timed_out && state != tcp::State::Closed {
+                    net.sockets.get_mut::<tcp::Socket>(handle).abort();
+                }
                 net.sockets.remove(handle);
                 net.pending_removal.swap_remove(i);
             } else {
@@ -695,19 +697,103 @@ pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, Socke
 
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
+        if net.sockets.iter().count() >= MAX_SOCKETS {
+            return None;
+        }
         let rx_buffer = tcp::SocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
-        // Disable delayed ACK (default is 10ms). With delayed ACK, smoltcp
-        // waits 10ms before sending an ACK, hoping to piggyback it on data.
-        // For receive-heavy workloads (downloads), there's no outgoing data to
-        // piggyback on, so every ACK is delayed by 10ms. This limits throughput
-        // to ~65KB/10ms = 6.5 MB/s theoretical max, and much less in practice
-        // due to scheduler delays. It also slows SSH handshakes under load.
+        // Disable delayed ACK so receive-heavy workloads aren't throttled
+        // to ~65KB/10ms by piggyback waiting.
         socket.set_ack_delay(None);
-        net.sockets.add(socket)
-    })
+        Some(net.sockets.add(socket))
+    }).flatten()
+}
+
+// ============================================================================
+// UDP Socket API
+// ============================================================================
+
+const UDP_PACKET_COUNT: usize = 8;
+const UDP_PAYLOAD_SIZE: usize = 512;
+
+pub fn udp_socket_create() -> Option<SocketHandle> {
+    with_network(|net| {
+        if net.sockets.iter().count() >= MAX_SOCKETS {
+            return None;
+        }
+        let rx_meta = udp::PacketMetadata::EMPTY;
+        let tx_meta = udp::PacketMetadata::EMPTY;
+        let rx_buffer = udp::PacketBuffer::new(
+            vec![rx_meta; UDP_PACKET_COUNT],
+            vec![0u8; UDP_PACKET_COUNT * UDP_PAYLOAD_SIZE],
+        );
+        let tx_buffer = udp::PacketBuffer::new(
+            vec![tx_meta; UDP_PACKET_COUNT],
+            vec![0u8; UDP_PACKET_COUNT * UDP_PAYLOAD_SIZE],
+        );
+        let socket = udp::Socket::new(rx_buffer, tx_buffer);
+        Some(net.sockets.add(socket))
+    }).flatten()
+}
+
+pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.bind(port).map_err(|_| ())
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_socket_send(handle: SocketHandle, buf: &[u8], remote: smoltcp::wire::IpEndpoint) -> Result<usize, ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.send_slice(buf, remote).map(|()| buf.len()).map_err(|_| ())
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), ()> {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        match socket.recv_slice(buf) {
+            Ok((len, meta)) => Ok((len, meta.endpoint)),
+            Err(_) => Err(()),
+        }
+    }).unwrap_or(Err(()))
+}
+
+pub fn udp_can_recv(handle: SocketHandle) -> bool {
+    with_network(|net| {
+        net.sockets.get::<udp::Socket>(handle).can_recv()
+    }).unwrap_or(false)
+}
+
+pub fn udp_can_send(handle: SocketHandle) -> bool {
+    with_network(|net| {
+        net.sockets.get::<udp::Socket>(handle).can_send()
+    }).unwrap_or(false)
+}
+
+pub fn get_local_ip() -> [u8; 4] {
+    with_network(|net| {
+        for cidr in net.iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                let octets = v4.address().octets();
+                if octets != [127, 0, 0, 1] {
+                    return octets;
+                }
+            }
+        }
+        [10, 0, 2, 15]
+    }).unwrap_or([10, 0, 2, 15])
+}
+
+pub fn udp_socket_close(handle: SocketHandle) {
+    with_network(|net| {
+        let socket = net.sockets.get_mut::<udp::Socket>(handle);
+        socket.close();
+        net.sockets.remove(handle);
+    });
 }
 
 pub fn socket_close(handle: SocketHandle) {
@@ -722,7 +808,7 @@ pub fn socket_close(handle: SocketHandle) {
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
-        net.pending_removal.push(handle);
+        net.pending_removal.push((handle, crate::timer::uptime_us()));
     });
 }
 

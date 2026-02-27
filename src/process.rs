@@ -12,6 +12,13 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+/// Default environment variables for new processes when none are provided.
+pub const DEFAULT_ENV: &[&str] = &[
+    "PATH=/usr/bin:/bin",
+    "HOME=/",
+    "TERM=xterm",
+];
+
 /// A future that yields once then completes
 /// This allows proper async yielding in poll_fn contexts
 pub struct YieldOnce(bool);
@@ -426,6 +433,7 @@ pub mod open_flags {
     pub const O_CREAT: u32 = 0o100;
     pub const O_TRUNC: u32 = 0o1000;
     pub const O_APPEND: u32 = 0o2000;
+    pub const O_CLOEXEC: u32 = 0o2000000;
 }
 
 /// Next available PID
@@ -1153,9 +1161,11 @@ pub struct ProcessMemory {
 
 impl ProcessMemory {
     pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize) -> Self {
-        // Mmap region: from 0x10000000 up to (stack_bottom - 1MB buffer)
-        // Stack is at top of first 1GB (0x3FFE0000-0x40000000 for 128KB stack)
-        let mmap_start = 0x1000_0000;
+        // Mmap region starts 256MB above code_end to leave room for heap
+        // growth (brk grows upward from code_end). Must be above code_end
+        // so PIE binaries loaded at 0x1000_0000 don't get their code pages
+        // overwritten by mmap allocations.
+        let mmap_start = (code_end + 0x1000_0000) & !0xFFFF;
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
 
         Self {
@@ -1271,6 +1281,8 @@ pub struct Process {
     /// Per-process file descriptor table
     /// Maps FD numbers to FileDescriptor entries (sockets, files, etc.)
     pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
+    /// FDs marked close-on-exec (closed during execve)
+    pub cloexec_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
     /// Next available file descriptor number
     pub next_fd: AtomicU32,
 
@@ -1367,6 +1379,7 @@ impl Process {
             mmap_regions: Vec::new(),
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
+            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
             // Thread ID - set when spawned
             thread_id: None,
@@ -1519,13 +1532,24 @@ impl Process {
         self.brk
     }
 
-    /// Set program break, returns new value
-    /// Will not go below initial_brk
+    /// Set program break, returns new value.
+    /// Maps any new pages between old and new brk.
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
             return self.brk;
         }
-        self.brk = (new_brk + 0xFFF) & !0xFFF; // Page-align
+        let aligned = (new_brk + 0xFFF) & !0xFFF;
+        // Page-align old_top UP: the partial page containing self.brk is
+        // already mapped by the ELF loader, so only map from the next page.
+        let old_top = (self.brk + 0xFFF) & !0xFFF;
+        if aligned > old_top {
+            let mut page = old_top;
+            while page < aligned {
+                let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                page += 0x1000;
+            }
+        }
+        self.brk = aligned;
         self.brk
     }
 
@@ -1588,6 +1612,40 @@ impl Process {
             } else {
                 false
             }
+        })
+    }
+
+    pub fn set_cloexec(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().insert(fd);
+        });
+    }
+
+    pub fn clear_cloexec(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().remove(&fd);
+        });
+    }
+
+    pub fn is_cloexec(&self, fd: u32) -> bool {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().contains(&fd)
+        })
+    }
+
+    /// Close all FDs marked close-on-exec, returning them for cleanup.
+    pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
+        crate::irq::with_irqs_disabled(|| {
+            let cloexec: Vec<u32> = self.cloexec_fds.lock().iter().copied().collect();
+            let mut closed = Vec::new();
+            let mut table = self.fd_table.lock();
+            for fd in &cloexec {
+                if let Some(entry) = table.remove(fd) {
+                    closed.push((*fd, entry));
+                }
+            }
+            self.cloexec_fds.lock().clear();
+            closed
         })
     }
 }
@@ -1976,6 +2034,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             Spinlock::new(cloned)
         },
+        cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
         next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
         thread_id: None,
         spawner_pid: parent.spawner_pid,
@@ -1991,50 +2050,100 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let stack_size = config::USER_STACK_SIZE; 
     let stack_start = stack_top - stack_size;
     
-    // Helper to copy a range
-    fn copy_range(src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
+    // Snapshot parent's L0 page table pointer so we can translate VAs to
+    // physical addresses without relying on TTBR0 staying valid across
+    // potential context switches during the (long) copy.
+    let parent_l0 = {
+        let ttbr0 = mmu::get_current_ttbr0();
+        let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+        mmu::phys_to_virt(l0_addr) as *const u64
+    };
+
+    fn copy_range_phys(parent_l0: *const u64, src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
         let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+        let mut copied = 0usize;
         for i in 0..pages {
             let va = src_va + i * mmu::PAGE_SIZE;
-            if mmu::is_current_user_range_mapped(va, 1) {
-                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
-                 unsafe {
-                     let src_ptr = va as *const u8;
-                     let dest_ptr = mmu::phys_to_virt(frame.addr);
-                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
-                 }
-            }
-        }
-        Ok(())
-    }
-    
-    copy_range(stack_start, stack_size, &mut new_proc.address_space)?;
-    
-    if parent.brk > 0x400000 {
-        copy_range(0x400000, parent.brk - 0x400000, &mut new_proc.address_space)?;
-    }
-
-    // Copy mmap'd regions and rebuild mmap_regions with the child's own frames
-    new_proc.mmap_regions.clear();
-    for (va, frames) in &parent.mmap_regions {
-        let num_pages = frames.len();
-        let mut child_frames = Vec::new();
-        for i in 0..num_pages {
-            let page_va = *va + i * mmu::PAGE_SIZE;
-            if mmu::is_current_user_range_mapped(page_va, 1) {
-                let frame = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW)?;
+            if let Some(src_phys) = mmu::translate_user_va(parent_l0, va) {
+                let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
                 unsafe {
-                    let src_ptr = page_va as *const u8;
+                    let src_ptr = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
                     let dest_ptr = mmu::phys_to_virt(frame.addr);
                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
                 }
-                child_frames.push(frame);
+                copied += 1;
             }
         }
-        if !child_frames.is_empty() {
-            new_proc.mmap_regions.push((*va, child_frames));
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED && copied < pages {
+            crate::safe_print!(160, "[fork] copy_range WARNING: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)\n",
+                src_va, src_va + len, copied, pages, pages - copied);
+        }
+        Ok(())
+    }
+
+    copy_range_phys(parent_l0, stack_start, stack_size, &mut new_proc.address_space)?;
+
+    // Copy code+heap range. Use memory.code_end as the start of the loaded
+    // binary (for PIE at 0x10000000, this avoids scanning 250MB of unmapped pages).
+    let code_start = if parent.entry_point >= 0x1000_0000 {
+        parent.entry_point & !0xFFFFF // round down to 1MB boundary
+    } else {
+        0x400000
+    };
+    if parent.brk > code_start {
+        copy_range_phys(parent_l0, code_start, parent.brk - code_start, &mut new_proc.address_space)?;
+    }
+
+    // Copy mmap regions so forked children can run built-in applets (e.g.
+    // busybox sh pipes) without crashing on unmapped pages.  We cap total
+    // copied pages to avoid OOM when a parent has huge file mappings.
+    const MAX_FORK_MMAP_PAGES: usize = 2048; // 8 MB cap
+    let mut total_copied_pages: usize = 0;
+    let mut child_mmap_regions: Vec<(usize, Vec<pmm::PhysFrame>)> = Vec::new();
+
+    for (va_start, parent_frames) in &parent.mmap_regions {
+        if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap\n",
+                    va_start, parent_frames.len());
+            }
+            continue;
+        }
+        let mut child_frames: Vec<pmm::PhysFrame> = Vec::new();
+        let mut ok = true;
+        for (i, pf) in parent_frames.iter().enumerate() {
+            let page_va = va_start + i * mmu::PAGE_SIZE;
+            match pmm::alloc_page_zeroed() {
+                Some(frame) => {
+                    pmm::track_frame(frame, pmm::FrameSource::UserData, child_pid);
+                    unsafe {
+                        let src = mmu::phys_to_virt(pf.addr) as *const u8;
+                        let dst = mmu::phys_to_virt(frame.addr);
+                        core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                    }
+                    if new_proc.address_space.map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    new_proc.address_space.track_user_frame(frame);
+                    child_frames.push(frame);
+                }
+                None => { ok = false; break; }
+            }
+        }
+        if ok {
+            total_copied_pages += child_frames.len();
+            child_mmap_regions.push((*va_start, child_frames));
+        } else {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[fork] OOM copying mmap region 0x{:x}, skipping rest\n", va_start);
+            }
+            break;
         }
     }
+
+    new_proc.mmap_regions = child_mmap_regions;
+    new_proc.memory.next_mmap = parent.memory.next_mmap;
     
     // 5. Write ProcessInfo to child's process info page
     unsafe {
@@ -2264,7 +2373,10 @@ pub fn spawn_process_with_channel_ext(
         }
     }
 
-    let full_env = env.map(|e| e.to_vec()).unwrap_or_default();
+    let full_env = match env {
+        Some(e) if !e.is_empty() => e.to_vec(),
+        _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
+    };
 
     // Create the process
     let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
@@ -2433,14 +2545,14 @@ fn run_registered_process(pid: Pid) -> ! {
 /// # Returns
 /// Tuple of (exit_code, stdout_data) or error message
 pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>), String> {
-    exec_async_cwd(path, args, stdin, None).await
+    exec_async_cwd(path, args, None, stdin, None).await
 }
 
-/// exec_async with explicit cwd
-pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+/// exec_async with explicit cwd and env
+pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
 
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
 
     // For non-interactive execution, if no stdin was provided, mark it as closed
     if stdin.is_none() {
@@ -2502,16 +2614,16 @@ pub async fn exec_streaming<W>(path: &str, args: Option<&[&str]>, stdin: Option<
 where
     W: embedded_io_async::Write,
 {
-    exec_streaming_cwd(path, args, stdin, None, output).await
+    exec_streaming_cwd(path, args, None, stdin, None, output).await
 }
 
-/// exec_streaming with explicit cwd
-pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
+/// exec_streaming with explicit cwd and env
+pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
 where
     W: embedded_io_async::Write,
 {
     // Spawn process with channel and cwd
-    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, None, stdin, cwd)?;
+    let (thread_id, channel, _pid) = spawn_process_with_channel_cwd(path, args, env, stdin, cwd)?;
 
     // For non-interactive streaming, if no stdin was provided, mark it as closed
     if stdin.is_none() {

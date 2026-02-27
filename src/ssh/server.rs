@@ -28,7 +28,10 @@ static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// Run the SSH server (Blocking - should be spawned on a thread)
 pub fn run() -> ! {
     log(&format!("[SSH Server] Starting SSH server on port {}...\n", crate::config::SSH_PORT));
-    
+
+    // Enable async process execution for pipeline/buffered commands
+    crate::shell::enable_async_exec();
+
     // Initialize host keys
     super::init_host_key();
 

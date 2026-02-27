@@ -256,6 +256,19 @@ impl Command for HelpCommand {
             let _ = stdout
                 .write(b"  cd [path]             - Change current working directory\r\n")
                 .await;
+            let _ = stdout.write(b"\r\nEnvironment commands:\r\n").await;
+            let _ = stdout
+                .write(b"  export [KEY=VALUE]    - Set or list environment variables\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  set [KEY=VALUE]       - List or set shell variables\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  unset KEY [KEY ...]   - Remove environment variables\r\n")
+                .await;
+            let _ = stdout
+                .write(b"  env                   - Print all environment variables\r\n")
+                .await;
             let _ = stdout.write(b"\r\nFilesystem commands:\r\n").await;
             let _ = stdout
                 .write(b"  ls [path]             - List directory contents\r\n")
@@ -970,3 +983,180 @@ impl Command for ResetCommand {
 
 /// Static instance
 pub static RESET_CMD: ResetCommand = ResetCommand;
+
+// ============================================================================
+// Export Command
+// ============================================================================
+
+pub struct ExportCommand;
+
+impl Command for ExportCommand {
+    fn name(&self) -> &'static str {
+        "export"
+    }
+    fn description(&self) -> &'static str {
+        "Set or list environment variables"
+    }
+    fn usage(&self) -> &'static str {
+        "export [KEY=VALUE ...]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+
+            if args_str.is_empty() {
+                for (k, v) in ctx.env() {
+                    let line = format!("export {}=\"{}\"\r\n", k, v);
+                    let _ = stdout.write(line.as_bytes()).await;
+                }
+                return Ok(());
+            }
+
+            for assignment in args_str.split_whitespace() {
+                if let Some((key, value)) = assignment.split_once('=') {
+                    if !key.is_empty() {
+                        ctx.set_env(key, value);
+                    }
+                }
+                // `export KEY` with no value is a no-op (all vars are exported)
+            }
+            Ok(())
+        })
+    }
+}
+
+pub static EXPORT_CMD: ExportCommand = ExportCommand;
+
+// ============================================================================
+// Set Command
+// ============================================================================
+
+pub struct SetCommand;
+
+impl Command for SetCommand {
+    fn name(&self) -> &'static str {
+        "set"
+    }
+    fn description(&self) -> &'static str {
+        "List or set shell variables"
+    }
+    fn usage(&self) -> &'static str {
+        "set [KEY=VALUE ...]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+
+            if args_str.is_empty() {
+                for (k, v) in ctx.env() {
+                    let line = format!("{}={}\r\n", k, v);
+                    let _ = stdout.write(line.as_bytes()).await;
+                }
+                return Ok(());
+            }
+
+            for assignment in args_str.split_whitespace() {
+                if let Some((key, value)) = assignment.split_once('=') {
+                    if !key.is_empty() {
+                        ctx.set_env(key, value);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+pub static SET_CMD: SetCommand = SetCommand;
+
+// ============================================================================
+// Unset Command
+// ============================================================================
+
+pub struct UnsetCommand;
+
+impl Command for UnsetCommand {
+    fn name(&self) -> &'static str {
+        "unset"
+    }
+    fn description(&self) -> &'static str {
+        "Remove environment variables"
+    }
+    fn usage(&self) -> &'static str {
+        "unset KEY [KEY ...]"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            let args_str = core::str::from_utf8(args).unwrap_or("").trim();
+
+            if args_str.is_empty() {
+                let _ = stdout.write(b"Usage: unset KEY [KEY ...]\r\n").await;
+                return Ok(());
+            }
+
+            for key in args_str.split_whitespace() {
+                ctx.remove_env(key);
+            }
+            Ok(())
+        })
+    }
+}
+
+pub static UNSET_CMD: UnsetCommand = UnsetCommand;
+
+// ============================================================================
+// Env Command
+// ============================================================================
+
+pub struct EnvCommand;
+
+impl Command for EnvCommand {
+    fn name(&self) -> &'static str {
+        "env"
+    }
+    fn description(&self) -> &'static str {
+        "Print environment variables"
+    }
+    fn usage(&self) -> &'static str {
+        "env"
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a [u8],
+        _stdin: Option<&'a [u8]>,
+        stdout: &'a mut VecWriter,
+        ctx: &'a mut ShellContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
+        Box::pin(async move {
+            for (k, v) in ctx.env() {
+                let line = format!("{}={}\r\n", k, v);
+                let _ = stdout.write(line.as_bytes()).await;
+            }
+            Ok(())
+        })
+    }
+}
+
+pub static ENV_CMD: EnvCommand = EnvCommand;

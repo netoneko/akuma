@@ -10,3 +10,6 @@
 [submodule "userspace/sbase/sbase"]
 	path = userspace/sbase/sbase
 	url = https://git.suckless.org/sbase
+[submodule "userspace/xbps/xbps"]
+	path = userspace/xbps/xbps
+	url = https://github.com/void-linux/xbps

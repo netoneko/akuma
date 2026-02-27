@@ -4,7 +4,7 @@
 //! Uses the `elf` crate for parsing.
 
 use elf::ElfBytes;
-use elf::abi::{EM_AARCH64, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
+use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::endian::LittleEndian;
 
 use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
@@ -111,13 +111,17 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         return Err(ElfError::WrongArchitecture);
     }
 
-    // Verify it's an executable (not shared lib or relocatable)
-    if elf.ehdr.e_type != ET_EXEC {
+    // Accept ET_EXEC (normal static) and ET_DYN (static-PIE)
+    let is_pie = elf.ehdr.e_type == ET_DYN;
+    if elf.ehdr.e_type != ET_EXEC && !is_pie {
         return Err(ElfError::NotExecutable);
     }
 
-    // Get entry point
-    let entry_point = elf.ehdr.e_entry as usize;
+    // Static-PIE binaries have p_vaddr starting near 0; load at a fixed base.
+    const PIE_BASE: usize = 0x1000_0000;
+    let base = if is_pie { PIE_BASE } else { 0 };
+
+    let entry_point = base + elf.ehdr.e_entry as usize;
 
     // Create user address space
     let mut address_space = UserAddressSpace::new().ok_or(ElfError::AddressSpaceFailed)?;
@@ -148,7 +152,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     // Find PT_PHDR if it exists
     for phdr in segments.iter() {
         if phdr.p_type == PT_PHDR {
-            phdr_addr = phdr.p_vaddr as usize;
+            phdr_addr = base + phdr.p_vaddr as usize;
             break;
         }
     }
@@ -159,14 +163,14 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             continue;
         }
 
-        let vaddr = phdr.p_vaddr as usize;
+        let vaddr = base + phdr.p_vaddr as usize;
         let memsz = phdr.p_memsz as usize;
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
 
         // Fallback for phdr_addr if PT_PHDR segment was missing
-        if phdr_addr == 0 && offset == 0 {
+        if phdr_addr == 0 && phdr.p_offset == 0 {
              phdr_addr = vaddr + elf.ehdr.e_phoff as usize;
         }
 
@@ -227,7 +231,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         }
     }
 
-    // Apply relocations
+    // Apply relocations for ET_EXEC only.
+    // Static-PIE (ET_DYN) binaries self-relocate at startup via musl's _dlstart_c.
+    if !is_pie {
     if let Some(shdrs) = elf.section_headers() {
         let dynsyms = elf.dynamic_symbol_table().ok().flatten();
 
@@ -270,6 +276,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             }
         }
     }
+    } // !is_pie
 
     if DEBUG_ELF_LOADING {
         crate::safe_print!(80, "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",

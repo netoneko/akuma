@@ -21,15 +21,15 @@ members = [
     "termtest",
     "allocstress",
     "top",
-    "paws",
-    "pkg",
     "musl",
     "tcc",
     "tar",
     "sshd",
     "make",
     "dash",
-    "sbase"
+    "sbase",
+    "xbps",
+    "apk-tools"
 ]
 
 [profile.dev]

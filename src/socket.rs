@@ -57,19 +57,21 @@ pub struct SockAddrIn {
 }
 
 impl SockAddrIn {
-    /// Convert to SocketAddrV4 (handles byte order conversion)
+    /// Convert to SocketAddrV4.
+    /// sin_addr is in network byte order — raw memory bytes ARE the IP octets.
     pub fn to_addr(&self) -> SocketAddrV4 {
-        let ip_bytes = self.sin_addr.to_be_bytes();
+        let ip_bytes = self.sin_addr.to_ne_bytes();
         let port = u16::from_be(self.sin_port);
         SocketAddrV4::new(ip_bytes, port)
     }
 
-    /// Create from SocketAddrV4 (handles byte order conversion)
+    /// Create from SocketAddrV4.
+    /// Store IP octets directly as network byte order in sin_addr.
     pub fn from_addr(addr: &SocketAddrV4) -> Self {
         Self {
             sin_family: 2, // AF_INET
             sin_port: addr.port.to_be(),
-            sin_addr: u32::from_be_bytes(addr.ip),
+            sin_addr: u32::from_ne_bytes(addr.ip),
             sin_zero: [0u8; 8],
         }
     }
@@ -82,6 +84,7 @@ impl SockAddrIn {
 pub mod socket_const {
     pub const AF_INET: i32 = 2;
     pub const SOCK_STREAM: i32 = 1;
+    pub const SOCK_DGRAM: i32 = 2;
 }
 
 // ============================================================================
@@ -95,6 +98,11 @@ pub enum SocketType {
     Listener {
         local_port: u16,
         handles: VecDeque<SocketHandle>,
+    },
+    /// A UDP socket with an optional default peer (set by connect)
+    Datagram {
+        handle: SocketHandle,
+        peer: Option<SocketAddrV4>,
     },
 }
 
@@ -114,6 +122,16 @@ impl KernelSocket {
         let box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
         Some(Self {
             inner: SocketType::Stream(handle),
+            bind_port: None,
+            box_id,
+        })
+    }
+
+    pub fn new_datagram() -> Option<Self> {
+        let handle = smoltcp_net::udp_socket_create()?;
+        let box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+        Some(Self {
+            inner: SocketType::Datagram { handle, peer: None },
             bind_port: None,
             box_id,
         })
@@ -181,11 +199,11 @@ where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R
 
 /// Allocate a socket index
 pub fn alloc_socket(socket_type: i32) -> Option<usize> {
-    if socket_type != socket_const::SOCK_STREAM {
-        return None; // Only TCP supported
-    }
-
-    let socket = KernelSocket::new_stream()?;
+    let socket = match socket_type {
+        socket_const::SOCK_STREAM => KernelSocket::new_stream()?,
+        socket_const::SOCK_DGRAM => KernelSocket::new_datagram()?,
+        _ => return None,
+    };
 
     with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {
@@ -203,6 +221,14 @@ pub fn alloc_socket(socket_type: i32) -> Option<usize> {
     })
 }
 
+pub fn with_socket<F, R>(idx: usize, f: F) -> Option<R>
+where F: FnOnce(&KernelSocket) -> R
+{
+    with_table(|table| {
+        table.get(idx).and_then(|slot| slot.as_ref()).map(f)
+    })
+}
+
 pub fn remove_socket(idx: usize) {
     with_table(|table| {
         if idx < table.len() {
@@ -214,6 +240,7 @@ pub fn remove_socket(idx: usize) {
                             smoltcp_net::socket_close(h);
                         }
                     }
+                    SocketType::Datagram { handle, .. } => smoltcp_net::udp_socket_close(handle),
                 }
             }
         }
@@ -267,7 +294,13 @@ where F: FnMut() -> bool
 pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     with_table(|table| {
         if let Some(Some(sock)) = table.get_mut(idx) {
-            sock.bind_port = Some(addr.port);
+            if let SocketType::Datagram { handle, .. } = &sock.inner {
+                let port = if addr.port == 0 { alloc_ephemeral_port() } else { addr.port };
+                sock.bind_port = Some(port);
+                smoltcp_net::udp_socket_bind(*handle, port).map_err(|_| libc_errno::EINVAL)?;
+            } else {
+                sock.bind_port = Some(addr.port);
+            }
             Ok(())
         } else {
             Err(libc_errno::EBADF)
@@ -359,6 +392,31 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
 }
 
 pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
+    // UDP connect: just store the peer address and auto-bind if needed
+    let is_dgram = with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            matches!(&sock.inner, SocketType::Datagram { .. })
+        } else {
+            false
+        }
+    });
+    if is_dgram {
+        return with_table(|table| {
+            if let Some(Some(sock)) = table.get_mut(idx) {
+                if let SocketType::Datagram { peer, handle } = &mut sock.inner {
+                    *peer = Some(addr);
+                    if sock.bind_port.is_none() {
+                        let port = alloc_ephemeral_port();
+                        sock.bind_port = Some(port);
+                        let _ = smoltcp_net::udp_socket_bind(*handle, port);
+                    }
+                    return Ok(());
+                }
+            }
+            Err(libc_errno::EBADF)
+        });
+    }
+
     let (h, bound_port): (SocketHandle, Option<u16>) = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
             if let SocketType::Stream(handle) = sock.inner {
@@ -467,6 +525,78 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
     }
 }
 
+// ============================================================================
+// UDP Socket Operations
+// ============================================================================
+
+pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usize, i32> {
+    let handle = with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, bind_port, .. })) = table.get_mut(idx) {
+            if bind_port.is_none() {
+                let port = alloc_ephemeral_port();
+                *bind_port = Some(port);
+                let _ = smoltcp_net::udp_socket_bind(*handle, port);
+            }
+            Some(*handle)
+        } else {
+            None
+        }
+    }).ok_or(libc_errno::EBADF)?;
+
+    let endpoint = smoltcp::wire::IpEndpoint {
+        addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(dest.ip)),
+        port: dest.port,
+    };
+
+    smoltcp_net::udp_socket_send(handle, buf, endpoint).map_err(|_| libc_errno::EIO)?;
+    smoltcp_net::poll();
+    Ok(buf.len())
+}
+
+pub fn socket_recv_udp(idx: usize, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), i32> {
+    let handle = with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
+            Some(*handle)
+        } else {
+            None
+        }
+    }).ok_or(libc_errno::EBADF)?;
+
+    wait_until(|| {
+        smoltcp_net::poll();
+        smoltcp_net::udp_can_recv(handle)
+    }, Some(10_000_000))?;
+
+    let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|_| libc_errno::EIO)?;
+    let src = match endpoint.addr {
+        smoltcp::wire::IpAddress::Ipv4(ip) => SocketAddrV4::new(ip.octets(), endpoint.port),
+        _ => SocketAddrV4::new([0; 4], endpoint.port),
+    };
+    Ok((len, src))
+}
+
+/// Check if a socket index refers to a UDP socket
+pub fn is_udp_socket(idx: usize) -> bool {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            matches!(&sock.inner, SocketType::Datagram { .. })
+        } else {
+            false
+        }
+    })
+}
+
+/// Get the default peer for a connected UDP socket
+pub fn udp_default_peer(idx: usize) -> Option<SocketAddrV4> {
+    with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
+            *peer
+        } else {
+            None
+        }
+    })
+}
+
 pub struct SocketStat {
     pub local_port: u16,
     pub remote_ip: [u8; 4],
@@ -523,6 +653,16 @@ pub fn list_sockets() -> Vec<SocketStat> {
                         remote_ip: [0;4],
                         remote_port: 0,
                         state: "LISTEN",
+                        box_id: slot.box_id,
+                    });
+                }
+                SocketType::Datagram { peer, .. } => {
+                    let (ip, port) = peer.map(|p| (p.ip, p.port)).unwrap_or(([0;4], 0));
+                    stats.push(SocketStat {
+                        local_port: slot.bind_port.unwrap_or(0),
+                        remote_ip: ip,
+                        remote_port: port,
+                        state: "UDP",
                         box_id: slot.box_id,
                     });
                 }
