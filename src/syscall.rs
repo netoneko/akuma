@@ -244,6 +244,11 @@ pub mod nr {
     pub const FCHOWNAT: u64 = 54;
     pub const MADVISE: u64 = 233;
     pub const MPROTECT: u64 = 226;
+    pub const FUTEX: u64 = 98;
+    pub const SET_ROBUST_LIST: u64 = 99;
+    pub const SIGALTSTACK: u64 = 132;
+    pub const GETRLIMIT: u64 = 163;
+    pub const PRLIMIT64: u64 = 261;
 }
 
 /// Thread CPU statistics for top command
@@ -279,6 +284,8 @@ const EISDIR: u64 = (-21i64) as u64;
 const ENOTEMPTY: u64 = (-39i64) as u64;
 const EEXIST: u64 = (-17i64) as u64;
 const ENOSPC: u64 = (-28i64) as u64;
+const EAGAIN: u64 = (-11i64) as u64;
+const ENOMEM: u64 = (-12i64) as u64;
 
 /// Encode an exit code into Linux-compatible wait status.
 /// Negative codes are treated as signal kills (e.g. -11 → SIGSEGV).
@@ -693,7 +700,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCHMODAT => 0, // stub — no permission enforcement
         nr::FCHOWNAT => 0, // stub — single-user OS, no ownership
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
-        nr::MPROTECT => 0, // stub — no page protection enforcement
+        nr::MPROTECT => sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
+        nr::FUTEX => sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, args[3], args[4] as usize, args[5] as u32),
+        nr::SET_ROBUST_LIST => 0,
+        nr::SIGALTSTACK => 0,
+        nr::GETRLIMIT => sys_prlimit64(0, args[0] as u32, 0, args[1]),
+        nr::PRLIMIT64 => sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -2599,23 +2611,40 @@ fn socket_can_recv_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
-fn sys_mmap(addr: usize, len: usize, _prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
+fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return !0u64; }
     let pages = (len + 4095) / 4096;
-    let mmap_addr = crate::process::alloc_mmap(pages * 4096);
-    if mmap_addr == 0 { return !0u64; }
+    let page_flags = crate::mmu::user_flags::from_prot(prot);
+
+    const MAP_ANONYMOUS: u32 = 0x20;
+    const MAP_FIXED: u32 = 0x10;
+
+    let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
+        if addr & 0xFFF != 0 { return !0u64; }
+        if let Some(proc) = crate::process::current_process() {
+            for i in 0..pages {
+                let va = addr + i * 4096;
+                let _ = proc.address_space.unmap_page(va);
+            }
+        }
+        addr
+    } else {
+        let a = crate::process::alloc_mmap(pages * 4096);
+        if a == 0 { return !0u64; }
+        a
+    };
+
     if let Some(proc) = crate::process::current_process() {
         let mut frames = alloc::vec::Vec::new();
         for i in 0..pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 frames.push(frame);
-                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC); }
+                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, page_flags); }
                 proc.address_space.track_user_frame(frame);
             } else { return !0u64; }
         }
         crate::process::record_mmap_region(mmap_addr, frames);
 
-        const MAP_ANONYMOUS: u32 = 0x20;
         if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
             if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
                 let path = f.path.clone();
@@ -2681,8 +2710,6 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
     } else { ENOMEM }
 }
 
-const ENOMEM: u64 = (-12i64) as u64;
-
 fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
     const MADV_DONTNEED: i32 = 4;
     if advice == MADV_DONTNEED && len > 0 {
@@ -2696,6 +2723,72 @@ fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         }
     }
     0
+}
+
+fn sys_futex(uaddr: usize, op: i32, val: u32, _timeout: u64, _uaddr2: usize, _val3: u32) -> u64 {
+    const FUTEX_WAIT: i32 = 0;
+    const FUTEX_WAKE: i32 = 1;
+    const FUTEX_PRIVATE_FLAG: i32 = 128;
+
+    let cmd = op & !(FUTEX_PRIVATE_FLAG);
+
+    match cmd {
+        FUTEX_WAIT => {
+            let current = unsafe { (uaddr as *const AtomicU32).as_ref() };
+            if let Some(atomic) = current {
+                if atomic.load(Ordering::SeqCst) != val {
+                    return EAGAIN;
+                }
+            }
+            crate::threading::yield_now();
+            0
+        }
+        FUTEX_WAKE => {
+            crate::threading::yield_now();
+            val as u64
+        }
+        _ => 0,
+    }
+}
+
+fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {
+    if old_rlim != 0 {
+        #[repr(C)]
+        struct Rlimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
+        const RLIM_INFINITY: u64 = !0u64;
+        let (cur, max) = match resource {
+            3 => (crate::config::USER_STACK_SIZE as u64, crate::config::USER_STACK_SIZE as u64), // RLIMIT_STACK
+            7 => (1024, 1024), // RLIMIT_NOFILE
+            _ => (RLIM_INFINITY, RLIM_INFINITY),
+        };
+        let rlim = Rlimit { rlim_cur: cur, rlim_max: max };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &rlim as *const Rlimit as *const u8,
+                old_rlim as *mut u8,
+                core::mem::size_of::<Rlimit>(),
+            );
+        }
+    }
+    0
+}
+
+fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
+    if len == 0 { return 0; }
+    if addr & 0xFFF != 0 { return EINVAL; }
+    let pages = (len + 4095) / 4096;
+    let new_flags = crate::mmu::user_flags::from_prot(prot);
+    if let Some(proc) = crate::process::current_process() {
+        for i in 0..pages {
+            let _ = proc.address_space.update_page_flags(addr + i * 4096, new_flags);
+        }
+        0
+    } else {
+        EINVAL
+    }
 }
 
 fn sys_munmap(addr: usize, _len: usize) -> u64 {

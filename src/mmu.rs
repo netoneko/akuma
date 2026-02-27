@@ -386,6 +386,34 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Update the permission bits of an existing L3 page table entry.
+    /// Preserves the physical address and fixed flags, replaces only user permission bits.
+    pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
+        unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 { return Ok(()); }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 { return Ok(()); }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 { return Ok(()); }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let old_entry = l3_ptr.add(l3_idx).read_volatile();
+            if old_entry & flags::VALID == 0 { return Ok(()); }
+            let entry = (old_entry & !PERM_MASK) | new_flags;
+            l3_ptr.add(l3_idx).write_volatile(entry);
+        }
+        flush_tlb_page(va);
+        Ok(())
+    }
+
     pub fn activate(&self) {
         let ttbr0 = self.ttbr0();
         flush_tlb_all();
@@ -422,6 +450,14 @@ pub mod user_flags {
     pub const EXEC: u64 = flags::AP_RO_ALL;
     pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
     pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
+
+    pub fn from_prot(prot: u32) -> u64 {
+        match (prot & 0x2 != 0, prot & 0x4 != 0) {
+            (true, _)      => RW_NO_EXEC,
+            (false, true)  => RX,
+            (false, false) => RO,
+        }
+    }
 }
 
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
