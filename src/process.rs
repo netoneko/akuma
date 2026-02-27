@@ -433,6 +433,7 @@ pub mod open_flags {
     pub const O_CREAT: u32 = 0o100;
     pub const O_TRUNC: u32 = 0o1000;
     pub const O_APPEND: u32 = 0o2000;
+    pub const O_CLOEXEC: u32 = 0o2000000;
 }
 
 /// Next available PID
@@ -1280,6 +1281,8 @@ pub struct Process {
     /// Per-process file descriptor table
     /// Maps FD numbers to FileDescriptor entries (sockets, files, etc.)
     pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
+    /// FDs marked close-on-exec (closed during execve)
+    pub cloexec_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
     /// Next available file descriptor number
     pub next_fd: AtomicU32,
 
@@ -1376,6 +1379,7 @@ impl Process {
             mmap_regions: Vec::new(),
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
+            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
             // Thread ID - set when spawned
             thread_id: None,
@@ -1606,6 +1610,40 @@ impl Process {
             } else {
                 false
             }
+        })
+    }
+
+    pub fn set_cloexec(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().insert(fd);
+        });
+    }
+
+    pub fn clear_cloexec(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().remove(&fd);
+        });
+    }
+
+    pub fn is_cloexec(&self, fd: u32) -> bool {
+        crate::irq::with_irqs_disabled(|| {
+            self.cloexec_fds.lock().contains(&fd)
+        })
+    }
+
+    /// Close all FDs marked close-on-exec, returning them for cleanup.
+    pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
+        crate::irq::with_irqs_disabled(|| {
+            let cloexec: Vec<u32> = self.cloexec_fds.lock().iter().copied().collect();
+            let mut closed = Vec::new();
+            let mut table = self.fd_table.lock();
+            for fd in &cloexec {
+                if let Some(entry) = table.remove(fd) {
+                    closed.push((*fd, entry));
+                }
+            }
+            self.cloexec_fds.lock().clear();
+            closed
         })
     }
 }
@@ -1994,6 +2032,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             Spinlock::new(cloned)
         },
+        cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
         next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
         thread_id: None,
         spawner_pid: parent.spawner_pid,

@@ -238,6 +238,7 @@ pub mod nr {
     pub const UTIMENSAT: u64 = 88;
     pub const FDATASYNC: u64 = 83;
     pub const FSYNC: u64 = 82;
+    pub const FCHDIR: u64 = 50;
     pub const FCHMOD: u64 = 52;
     pub const FCHOWNAT: u64 = 54;
     pub const MADVISE: u64 = 233;
@@ -627,6 +628,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRANDOM => sys_getrandom(args[0], args[1] as usize),
         nr::TIME => sys_time(),
         nr::CHDIR => sys_chdir(args[0]),
+        nr::FCHDIR => sys_fchdir(args[0] as u32),
         nr::SET_TERMINAL_ATTRIBUTES => sys_set_terminal_attributes(args[0], args[1], args[2]),
         nr::GET_TERMINAL_ATTRIBUTES => sys_get_terminal_attributes(args[0], args[1]),
         nr::SET_CURSOR_POSITION => sys_set_cursor_position(args[0], args[1]),
@@ -1423,13 +1425,15 @@ fn sys_dup(oldfd: u32) -> u64 {
         _ => {}
     }
     let newfd = proc.alloc_fd(entry);
+    // dup() never sets CLOEXEC on the new fd
+    proc.clear_cloexec(newfd);
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
     }
     newfd as u64
 }
 
-fn sys_dup3(oldfd: u32, newfd: u32, _flags: u32) -> u64 {
+fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
@@ -1439,7 +1443,7 @@ fn sys_dup3(oldfd: u32, newfd: u32, _flags: u32) -> u64 {
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         let pid = proc.pid;
-        crate::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}) PID {}\n", oldfd, newfd, pid);
+        crate::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}, flags=0x{:x}) PID {}\n", oldfd, newfd, flags, pid);
     }
 
     // If newfd was a pipe fd, close it properly before replacing
@@ -1459,16 +1463,29 @@ fn sys_dup3(oldfd: u32, newfd: u32, _flags: u32) -> u64 {
     }
 
     proc.set_fd(newfd, entry);
+
+    // dup3 sets CLOEXEC on newfd only if O_CLOEXEC is in flags
+    if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(newfd);
+    } else {
+        proc.clear_cloexec(newfd);
+    }
+
     newfd as u64
 }
 
-fn sys_pipe2(fds_ptr: u64, _flags: u32) -> u64 {
+fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
 
     let pipe_id = pipe_create();
     let fd_r = proc.alloc_fd(crate::process::FileDescriptor::PipeRead(pipe_id));
     let fd_w = proc.alloc_fd(crate::process::FileDescriptor::PipeWrite(pipe_id));
+
+    if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd_r);
+        proc.set_cloexec(fd_w);
+    }
 
     unsafe {
         *(fds_ptr as *mut [i32; 2]) = [fd_r as i32, fd_w as i32];
@@ -1582,6 +1599,9 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
             let _ = crate::fs::write_file(&path, &[]);
         }
         let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.clone(), flags)));
+        if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        }
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
@@ -1592,6 +1612,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
 fn sys_close(fd: u32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
         if let Some(entry) = proc.remove_fd(fd) {
+            proc.clear_cloexec(fd);
             match entry {
                 crate::process::FileDescriptor::Socket(idx) => { crate::socket::remove_socket(idx); }
                 crate::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -1912,6 +1933,20 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => return !0u64,
     };
 
+    // Close all FDs marked close-on-exec before replacing the process image
+    let closed_fds = proc.close_cloexec_fds();
+    for (_fd, entry) in closed_fds {
+        match entry {
+            crate::process::FileDescriptor::PipeWrite(pipe_id) => pipe_close_write(pipe_id),
+            crate::process::FileDescriptor::PipeRead(pipe_id) => pipe_close_read(pipe_id),
+            crate::process::FileDescriptor::Socket(idx) => crate::socket::remove_socket(idx),
+            crate::process::FileDescriptor::ChildStdout(child_pid) => {
+                crate::process::remove_child_channel(child_pid);
+            }
+            _ => {}
+        }
+    }
+
     if let Err(e) = proc.replace_image(&elf_data, &args, &env) {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
         return !0u64; // EINTERNAL
@@ -2021,15 +2056,30 @@ fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     ENOENT
 }
 
-fn sys_fcntl(fd: u32, cmd: u32, _arg: u64) -> u64 {
-    // Basic fcntl stub
-    // F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4
+fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    const F_GETFL: u32 = 3;
+    const F_SETFL: u32 = 4;
+    const FD_CLOEXEC: u64 = 1;
+
+    let proc = match crate::process::current_process() { Some(p) => p, None => return 0 };
+
     match cmd {
-        1 => 0, // F_GETFD: Return 0 (no FD_CLOEXEC set by default)
-        2 => 0, // F_SETFD: Pretend to set flags
-        3 => 0, // F_GETFL: Return 0 (O_RDONLY/default flags)
-        4 => 0, // F_SETFL: Pretend to set flags
-        _ => 0, // Ignore other commands
+        F_GETFD => {
+            if proc.is_cloexec(fd) { FD_CLOEXEC } else { 0 }
+        }
+        F_SETFD => {
+            if arg & FD_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            } else {
+                proc.clear_cloexec(fd);
+            }
+            0
+        }
+        F_GETFL => 0,
+        F_SETFL => 0,
+        _ => 0,
     }
 }
 
@@ -2166,15 +2216,19 @@ use crate::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
 
 fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF; // mask off SOCK_CLOEXEC (0x80000) and SOCK_NONBLOCK (0x800)
+    let cloexec = sock_type & 0x80000 != 0;
     if domain != 2 || (base_type != 1 && base_type != 2) {
         crate::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         return !0u64;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
         if let Some(proc) = crate::process::current_process() {
-            let fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(idx)) as u64;
+            let fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(idx));
+            if cloexec {
+                proc.set_cloexec(fd);
+            }
             crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
-            return fd;
+            return fd as u64;
         }
     }
     !0u64
@@ -2798,6 +2852,28 @@ fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 }
 
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
+
+fn sys_fchdir(fd: u32) -> u64 {
+    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let entry = match proc.get_fd(fd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+    let path = match entry {
+        crate::process::FileDescriptor::File(f) => f.path.clone(),
+        _ => return ENOTDIR,
+    };
+    if let Ok(meta) = crate::vfs::metadata(&path) {
+        if meta.is_dir {
+            proc.set_cwd(&path);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
+            }
+            return 0;
+        }
+    }
+    ENOTDIR
+}
 
 fn sys_chdir(ptr: u64) -> u64 {
     let path = match copy_from_user_str(ptr, 512) {
