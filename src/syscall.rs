@@ -1283,33 +1283,73 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
-fn sys_openat(_dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 1024) {
+fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    
-    // Validate path existence
+
+    let path = if raw_path.starts_with('/') {
+        raw_path
+    } else {
+        let base = if dirfd == -100 { // AT_FDCWD
+            if let Some(proc) = crate::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                String::from("/")
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = crate::process::current_process() {
+                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
+                    }
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            String::from("/")
+        };
+        if raw_path == "." || raw_path.is_empty() {
+            base
+        } else if base == "/" {
+            alloc::format!("/{}", raw_path)
+        } else {
+            alloc::format!("{}/{}", base, raw_path)
+        }
+    };
+
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
+            }
             return ENOENT;
         }
-        
-        // For O_CREAT, check if parent directory exists
-        let (parent, _) = crate::vfs::split_path(&path);
-        if !parent.is_empty() && !crate::fs::exists(parent) {
-            // Special case: parent might be root
-            if parent != "/" && !crate::fs::exists(&alloc::format!("/{}", parent)) {
-                 return ENOENT;
+
+        let (parent_raw, _) = crate::vfs::split_path(&path);
+        if !parent_raw.is_empty() {
+            let parent_path = if parent_raw.starts_with('/') {
+                String::from(parent_raw)
+            } else {
+                alloc::format!("/{}", parent_raw)
+            };
+            if parent_path != "/" && !crate::fs::exists(&parent_path) {
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    crate::safe_print!(256, "[syscall] openat({}) parent {} not found flags=0x{:x}\n", &path, &parent_path, flags);
+                }
+                return ENOENT;
             }
         }
     }
 
     if let Some(proc) = crate::process::current_process() {
-        // Handle O_TRUNC: truncate existing file to zero length
         if flags & crate::process::open_flags::O_TRUNC != 0 {
-            // Only truncate if file exists; ignore errors (file might not exist yet with O_CREAT)
             let _ = crate::fs::write_file(&path, &[]);
         }
         let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.clone(), flags)));

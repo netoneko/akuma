@@ -106,13 +106,46 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 
 **Fix:** Stubbed to return 0. Akuma doesn't enforce file permissions.
 
+### madvise (233)
+
+**Symptom:** `[syscall] Unknown syscall: 233` during RSA signature verification, causing `the RSA signature is not valid!`.
+
+**Cause:** Musl's `mallocng` allocator calls `madvise(addr, len, MADV_DONTNEED)` to release freed pages. On Linux, `MADV_DONTNEED` discards page contents so future accesses fault in zeroed pages. Without it, the allocator reuses pages expecting them to be zeroed, but stale data remains, corrupting LibreSSL's internal state during RSA operations.
+
+**Fix:** Implemented `sys_madvise`. For `MADV_DONTNEED` (advice=4), zeroes the specified page-aligned memory range. All other advice values are accepted and ignored.
+
+### readv (65)
+
+**Symptom:** RSA signature verification failed with `the RSA signature is not valid!` — no unknown syscalls logged.
+
+**Cause:** Musl's `__stdio_read` (the backend for `fread()`) calls `readv` to fill both the user buffer and its internal buffer in one syscall. Without `readv`, every `fread()` returned 0 bytes. XBPS uses `fread()` to read the `.sig2` signature file, so the signature data was empty and `RSA_verify` failed.
+
+**Fix:** Implemented `sys_readv` mirroring `sys_writev` — iterates over the iovec array, calling `sys_read` for each entry, stopping on short reads or errors.
+
+### mmap file-backed mappings (222)
+
+**Symptom:** RSA signature verification failed — public key plist file opened and fstat'd but never read.
+
+**Cause:** XBPS's proplib library uses `mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)` to memory-map plist files (including the repository public key). Akuma's `sys_mmap` only accepted 4 of the 6 Linux mmap arguments — `fd` and `offset` were ignored. All mappings returned zeroed pages regardless of the file descriptor, so proplib parsed zeros and got no valid public key.
+
+**Fix:** Extended `sys_mmap` to accept all 6 arguments. When `MAP_ANONYMOUS` (0x20) is NOT set and a valid file descriptor is provided, the file content is read into the mapped pages after allocation.
+
+### openat dirfd support (56)
+
+**Symptom:** `failed to extract file './usr/bin/busybox.static': Operation not permitted` during package unpack.
+
+**Cause:** `sys_openat` ignored the `dirfd` parameter entirely, resolving all relative paths against CWD. Libarchive (used by XBPS for tar extraction) opens parent directories with `O_PATH|O_DIRECTORY` and then creates files relative to those fds. Without dirfd support, `openat(fd_for_usr, "bin")` opened `/bin` instead of `/usr/bin`, causing extraction to target wrong paths.
+
+**Fix:** `sys_openat` now resolves relative paths using the directory path from the `dirfd` file descriptor. If `dirfd` is `AT_FDCWD` (-100), resolves relative to process CWD (previous behavior). Failed opens are also now logged for debugging.
+
 ## Already implemented (used by XBPS)
 
 | Syscall | Number | Notes |
 |---------|--------|-------|
-| openat | 56 | File I/O |
+| openat | 56 | File I/O (with dirfd support) |
 | close | 57 | File I/O |
 | read | 63 | File I/O |
+| readv | 65 | Scatter-gather read (used by musl fread) |
 | write | 64 | File I/O |
 | writev | 66 | Scatter-gather I/O |
 | fstat | 80 | File metadata |
@@ -139,7 +172,8 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 | fdatasync | 83 | Flush file data (stubbed) |
 | fsync | 82 | Flush file data (stubbed) |
 | fchmod | 52 | File permissions (stubbed) |
-| mmap/munmap | 222/215 | Memory mapping |
+| mmap/munmap | 222/215 | Memory mapping (anonymous + file-backed) |
+| madvise | 233 | Memory advisory (MADV_DONTNEED zeroes pages) |
 | brk | 214 | Heap management |
 | dup3 | 24 | File descriptor duplication |
 | fcntl | 25 | File descriptor control |
