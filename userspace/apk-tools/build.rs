@@ -130,6 +130,7 @@ fn main() {
     .unwrap();
 
     fs::write(apk_etc.join("arch"), "aarch64\n").unwrap();
+    fs::write(apk_etc.join("world"), "").unwrap();
 
     // Copy signing keys into bootstrap
     let staging_keys = staging_dir.join("etc/apk/keys");

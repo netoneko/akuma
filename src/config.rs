@@ -199,13 +199,13 @@ pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
 pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 
 // Option to disable copying stdout to kernel log
-pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = true;
+pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = true;
 
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
-pub const SYSCALL_DEBUG_IO_ENABLED: bool = true;
+pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;

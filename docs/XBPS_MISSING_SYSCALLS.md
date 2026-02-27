@@ -130,19 +130,55 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 
 **Fix:** Extended `sys_mmap` to accept all 6 arguments. When `MAP_ANONYMOUS` (0x20) is NOT set and a valid file descriptor is provided, the file content is read into the mapped pages after allocation.
 
-### openat dirfd support (56)
+### openat dirfd support + path canonicalization (56)
 
 **Symptom:** `failed to extract file './usr/bin/busybox.static': Operation not permitted` during package unpack.
 
-**Cause:** `sys_openat` ignored the `dirfd` parameter entirely, resolving all relative paths against CWD. Libarchive (used by XBPS for tar extraction) opens parent directories with `O_PATH|O_DIRECTORY` and then creates files relative to those fds. Without dirfd support, `openat(fd_for_usr, "bin")` opened `/bin` instead of `/usr/bin`, causing extraction to target wrong paths.
+**Cause (dirfd):** `sys_openat` ignored the `dirfd` parameter entirely, resolving all relative paths against CWD. Libarchive (used by XBPS for tar extraction) opens parent directories with `O_PATH|O_DIRECTORY` and then creates files relative to those fds. Without dirfd support, `openat(fd_for_usr, "bin")` opened `/bin` instead of `/usr/bin`, causing extraction to target wrong paths.
 
-**Fix:** `sys_openat` now resolves relative paths using the directory path from the `dirfd` file descriptor. If `dirfd` is `AT_FDCWD` (-100), resolves relative to process CWD (previous behavior). Failed opens are also now logged for debugging.
+**Cause (canonicalization):** Paths containing `.` or `..` components (e.g. `./usr/bin/busybox.static`) were not normalized. The old code constructed `/./usr/bin/busybox.static` with a raw `format!()`, which the VFS could not resolve, causing parent-directory checks to fail with ENOENT (reported as "Operation not permitted").
+
+**Fix:** `sys_openat` now resolves relative paths using the directory path from the `dirfd` file descriptor. If `dirfd` is `AT_FDCWD` (-100), resolves relative to process CWD. All constructed paths are routed through `vfs::resolve_path` / `vfs::canonicalize_path` to normalize `.` and `..` components. Failed opens are logged for debugging.
+
+### fchownat (54)
+
+**Symptom:** `[SC] nr=54` in catch-all syscall trace during package extraction.
+
+**Cause:** Libarchive calls `fchownat()` to set file ownership when extracting archives as root (`getuid() == 0`), because `ARCHIVE_EXTRACT_OWNER` is automatically enabled.
+
+**Fix:** Stubbed to return 0. Akuma is a single-user OS with no ownership enforcement.
+
+### unlinkat proper error codes (35)
+
+**Symptom 1:** `failed to extract file './usr/bin/busybox.static': Operation not permitted` during package unpack (after dirfd fix).
+
+**Cause:** Libarchive uses `ARCHIVE_EXTRACT_UNLINK` mode, which calls `unlinkat()` to remove existing files before creating new ones. When the target file does not exist (normal case for first install), libarchive expects `ENOENT` (-2) to mean "nothing to remove, proceed with creation." But `sys_unlinkat` returned `!0u64` (-1 = `EPERM`) on any failure, which libarchive treated as a fatal permission error. Additionally, paths with `./` prefixes were not canonicalized.
+
+**Symptom 2:** `busybox-static-1.34.1_12: failed to remove './usr/bin': Operation not permitted` during `xbps-remove`. The directory was still in use by other packages, so the removal correctly failed — but with the wrong error code.
+
+**Cause:** During package removal, XBPS calls `unlinkat(AT_REMOVEDIR)` on each directory that was part of the package. For shared directories like `/usr/bin`, ext2's `remove_dir` correctly returned `FsError::DirectoryNotEmpty`, but `sys_unlinkat` discarded the error variant and returned `!0u64` (-1 = `EPERM`). XBPS treats `EPERM` as a real error and prints an ERROR line, whereas `ENOTEMPTY` is silently ignored since it's expected for shared directories.
+
+**Fix:** `sys_unlinkat` now properly maps `FsError` variants to Linux errno values via a `fs_error_to_errno` helper:
+
+| FsError | errno | Value |
+|---------|-------|-------|
+| `NotFound` | `ENOENT` | 2 |
+| `PermissionDenied` | `EPERM` | 1 |
+| `AlreadyExists` | `EEXIST` | 17 |
+| `NotADirectory` | `ENOTDIR` | 20 |
+| `NotAFile` | `EISDIR` | 21 |
+| `DirectoryNotEmpty` | `ENOTEMPTY` | 39 |
+| `NoSpace` | `ENOSPC` | 28 |
+| `ReadOnly` | `EROFS` | 30 |
+| `InvalidPath` | `EINVAL` | 22 |
+
+Paths are also canonicalized via `vfs::resolve_path`.
 
 ## Already implemented (used by XBPS)
 
 | Syscall | Number | Notes |
 |---------|--------|-------|
-| openat | 56 | File I/O (with dirfd support) |
+| openat | 56 | File I/O (with dirfd support + path canonicalization) |
 | close | 57 | File I/O |
 | read | 63 | File I/O |
 | readv | 65 | Scatter-gather read (used by musl fread) |
@@ -152,7 +188,7 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 | newfstatat | 79 | File metadata with path |
 | faccessat | 48 | File access checks |
 | mkdirat | 34 | Directory creation |
-| unlinkat | 35 | File/dir removal |
+| unlinkat | 35 | File/dir removal (proper errno mapping: ENOENT, ENOTEMPTY, etc.) |
 | getdents64 | 61 | Directory listing |
 | getcwd | 17 | Current working directory |
 | chdir | 49 | Change directory |
@@ -172,6 +208,7 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 | fdatasync | 83 | Flush file data (stubbed) |
 | fsync | 82 | Flush file data (stubbed) |
 | fchmod | 52 | File permissions (stubbed) |
+| fchownat | 54 | File ownership (stubbed) |
 | mmap/munmap | 222/215 | Memory mapping (anonymous + file-backed) |
 | madvise | 233 | Memory advisory (MADV_DONTNEED zeroes pages) |
 | brk | 214 | Heap management |
@@ -217,6 +254,5 @@ Syscalls that XBPS or its dependencies may call but are not yet implemented. The
 | symlinkat | 36 | Package install (symlinks) | High — packages often contain symlinks |
 | readlinkat | 78 | Package verification | Medium |
 | fchmodat | 53 | Setting file permissions | Medium |
-| fchownat | 54 | Setting file ownership | Low (single-user OS) |
 | linkat | 37 | Hard links | Low |
 | pselect6 | 72 | Would be needed if `fetchTimeout` is set | Low — currently 0 |

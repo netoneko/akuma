@@ -168,6 +168,7 @@ pub mod nr {
     pub const MUNMAP: u64 = 215; // Linux arm64 munmap
     pub const MMAP: u64 = 222; // Linux arm64 mmap
     pub const GETDENTS64: u64 = 61; // Linux arm64 getdents64
+    pub const PSELECT6: u64 = 72;    // Linux arm64 pselect6
     pub const PPOLL: u64 = 73;       // Linux arm64 ppoll
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
@@ -180,6 +181,8 @@ pub mod nr {
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
     pub const FCNTL: u64 = 25;       // Linux arm64 fcntl
+    pub const DUP: u64 = 23;         // Linux arm64 dup
+    pub const FSTATFS: u64 = 44;     // Linux arm64 fstatfs
     pub const DUP3: u64 = 24;        // Linux arm64 dup3
     pub const PIPE2: u64 = 59;       // Linux arm64 pipe2
     pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
@@ -263,6 +266,29 @@ const EACCES: u64 = (-13i64) as u64;
 const EBADF: u64 = (-9i64) as u64;
 /// Error code for function not implemented
 const ENOSYS: u64 = (-38i64) as u64;
+const EPERM: u64 = (-1i64) as u64;
+const ENOTDIR: u64 = (-20i64) as u64;
+const EISDIR: u64 = (-21i64) as u64;
+const ENOTEMPTY: u64 = (-39i64) as u64;
+const EEXIST: u64 = (-17i64) as u64;
+const ENOSPC: u64 = (-28i64) as u64;
+const EROFS: u64 = (-30i64) as u64;
+
+fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
+    use crate::vfs::FsError;
+    match e {
+        FsError::NotFound => ENOENT,
+        FsError::PermissionDenied => EPERM,
+        FsError::AlreadyExists => EEXIST,
+        FsError::NotADirectory => ENOTDIR,
+        FsError::NotAFile => EISDIR,
+        FsError::DirectoryNotEmpty => ENOTEMPTY,
+        FsError::NoSpace => ENOSPC,
+        FsError::ReadOnly => EROFS,
+        FsError::InvalidPath => EINVAL,
+        _ => EPERM,
+    }
+}
 
 /// Validate a user pointer for reading/writing
 /// 
@@ -321,6 +347,104 @@ fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
             crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
             Err(EINVAL)
         },
+    }
+}
+
+fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> u64 {
+    if nfds == 0 { return 0; }
+    const MAX_FDS: usize = 1024;
+    if nfds > MAX_FDS { return EINVAL; }
+    let nwords = (nfds + 63) / 64;
+    let fd_set_bytes = nwords * 8;
+
+    let mut orig_read = [0u64; MAX_FDS / 64];
+    let mut orig_write = [0u64; MAX_FDS / 64];
+
+    if readfds_ptr != 0 {
+        if !validate_user_ptr(readfds_ptr, fd_set_bytes) { return EFAULT; }
+        unsafe { core::ptr::copy_nonoverlapping(readfds_ptr as *const u64, orig_read.as_mut_ptr(), nwords); }
+    }
+    if writefds_ptr != 0 {
+        if !validate_user_ptr(writefds_ptr, fd_set_bytes) { return EFAULT; }
+        unsafe { core::ptr::copy_nonoverlapping(writefds_ptr as *const u64, orig_write.as_mut_ptr(), nwords); }
+    }
+
+    let infinite = timeout_ptr == 0;
+    let timeout_us = if !infinite {
+        if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
+        let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+        (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
+    } else {
+        0
+    };
+
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        crate::smoltcp_net::poll();
+        let mut ready_count: u64 = 0;
+        let mut out_read = [0u64; MAX_FDS / 64];
+        let mut out_write = [0u64; MAX_FDS / 64];
+
+        for fd in 0..nfds {
+            let word = fd / 64;
+            let bit = fd % 64;
+            let mask = 1u64 << bit;
+
+            let in_read = orig_read[word] & mask != 0;
+            let in_write = orig_write[word] & mask != 0;
+            if !in_read && !in_write { continue; }
+
+            let socket_idx = if fd > 2 {
+                if let Some(proc) = crate::process::current_process() {
+                    if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
+                        Some(idx)
+                    } else { None }
+                } else { None }
+            } else { None };
+
+            if in_read {
+                let readable = if fd == 0 {
+                    crate::process::current_channel().map_or(false, |ch| ch.has_stdin_data())
+                } else if let Some(idx) = socket_idx {
+                    if socket::is_udp_socket(idx) {
+                        socket_get_udp_handle(idx).map_or(false, |h| crate::smoltcp_net::udp_can_recv(h))
+                    } else {
+                        socket_can_recv_tcp(idx)
+                    }
+                } else {
+                    fd > 2
+                };
+                if readable { out_read[word] |= mask; ready_count += 1; }
+            }
+
+            if in_write {
+                let writable = if let Some(idx) = socket_idx {
+                    if socket::is_udp_socket(idx) {
+                        socket_get_udp_handle(idx).map_or(false, |h| crate::smoltcp_net::udp_can_send(h))
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if writable { out_write[word] |= mask; ready_count += 1; }
+            }
+        }
+
+        if ready_count > 0 {
+            if readfds_ptr != 0 { unsafe { core::ptr::copy_nonoverlapping(out_read.as_ptr(), readfds_ptr as *mut u64, nwords); } }
+            if writefds_ptr != 0 { unsafe { core::ptr::copy_nonoverlapping(out_write.as_ptr(), writefds_ptr as *mut u64, nwords); } }
+            return ready_count;
+        }
+
+        if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
+            if readfds_ptr != 0 { unsafe { core::ptr::write_bytes(readfds_ptr as *mut u8, 0, fd_set_bytes); } }
+            if writefds_ptr != 0 { unsafe { core::ptr::write_bytes(writefds_ptr as *mut u8, 0, fd_set_bytes); } }
+            return 0;
+        }
+
+        crate::threading::yield_now();
     }
 }
 
@@ -442,7 +566,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         return EINTR;
     }
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PPOLL {
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
@@ -453,6 +577,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READV => sys_readv(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
+        nr::DUP => sys_dup(args[0] as u32),
+        nr::FSTATFS => sys_fstatfs(args[0] as u32, args[1]),
         nr::DUP3 => sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIPE2 => sys_pipe2(args[0], args[1] as u32),
         nr::BRK => sys_brk(args[0] as usize),
@@ -482,6 +608,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
         nr::GETDENTS64 => sys_getdents64(args[0] as u32, args[1], args[2] as usize),
+        nr::PSELECT6 => sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5]),
         nr::PPOLL => sys_ppoll(args[0], args[1] as usize, args[2], args[3]),
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
@@ -1236,6 +1363,62 @@ fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     total_written
 }
 
+fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
+    if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
+    if let Some(proc) = crate::process::current_process() {
+        if proc.get_fd(fd).is_none() { return EBADF; }
+    } else { return ENOSYS; }
+    #[repr(C)]
+    struct Statfs {
+        f_type: i64,
+        f_bsize: i64,
+        f_blocks: i64,
+        f_bfree: i64,
+        f_bavail: i64,
+        f_files: i64,
+        f_ffree: i64,
+        f_fsid: [i32; 2],
+        f_namelen: i64,
+        f_frsize: i64,
+        f_flags: i64,
+        f_spare: [i64; 4],
+    }
+    let st = Statfs {
+        f_type: 0xEF53,  // EXT2_SUPER_MAGIC
+        f_bsize: 4096,
+        f_blocks: 65536,
+        f_bfree: 32768,
+        f_bavail: 32768,
+        f_files: 16384,
+        f_ffree: 8192,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    unsafe { core::ptr::copy_nonoverlapping(&st as *const Statfs as *const u8, buf_ptr as *mut u8, core::mem::size_of::<Statfs>()); }
+    0
+}
+
+fn sys_dup(oldfd: u32) -> u64 {
+    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let entry = match proc.get_fd(oldfd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+    match &entry {
+        crate::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
+        crate::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
+        _ => {}
+    }
+    let newfd = proc.alloc_fd(entry);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
+    }
+    newfd as u64
+}
+
 fn sys_dup3(oldfd: u32, newfd: u32, _flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
@@ -1818,11 +2001,15 @@ fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
 
     const AT_REMOVEDIR: u32 = 0x200;
     if flags & AT_REMOVEDIR != 0 {
-        if !crate::fs::exists(&resolved) { return ENOENT; }
-        if crate::fs::remove_dir(&resolved).is_ok() { 0 } else { !0u64 }
+        match crate::fs::remove_dir(&resolved) {
+            Ok(()) => 0,
+            Err(e) => fs_error_to_errno(e),
+        }
     } else {
-        if !crate::fs::exists(&resolved) { return ENOENT; }
-        if crate::fs::remove_file(&resolved).is_ok() { 0 } else { !0u64 }
+        match crate::fs::remove_file(&resolved) {
+            Ok(()) => 0,
+            Err(e) => fs_error_to_errno(e),
+        }
     }
 }
 
