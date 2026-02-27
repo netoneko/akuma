@@ -243,6 +243,7 @@ pub mod nr {
     pub const FCHMODAT: u64 = 53;
     pub const FCHOWNAT: u64 = 54;
     pub const MADVISE: u64 = 233;
+    pub const MPROTECT: u64 = 226;
 }
 
 /// Thread CPU statistics for top command
@@ -692,6 +693,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCHMODAT => 0, // stub — no permission enforcement
         nr::FCHOWNAT => 0, // stub — single-user OS, no ownership
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
+        nr::MPROTECT => 0, // stub — no page protection enforcement
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1917,6 +1919,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             }
             i += 1;
         }
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let pid = crate::process::read_current_pid().unwrap_or(0);
+        crate::safe_print!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
 
     // Parse envp from user space

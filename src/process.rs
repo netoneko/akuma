@@ -2061,6 +2061,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     fn copy_range_phys(parent_l0: *const u64, src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
         let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+        let mut copied = 0usize;
         for i in 0..pages {
             let va = src_va + i * mmu::PAGE_SIZE;
             if let Some(src_phys) = mmu::translate_user_va(parent_l0, va) {
@@ -2070,7 +2071,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     let dest_ptr = mmu::phys_to_virt(frame.addr);
                     core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
                 }
+                copied += 1;
             }
+        }
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED && copied < pages {
+            crate::safe_print!(160, "[fork] copy_range WARNING: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)\n",
+                src_va, src_va + len, copied, pages, pages - copied);
         }
         Ok(())
     }

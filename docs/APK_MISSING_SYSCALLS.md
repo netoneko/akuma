@@ -83,18 +83,20 @@ Also added `pselect6` to the syscall debug noise filter alongside `ppoll`.
 
 **Cause:** Alpine packages use symlinks extensively (e.g., `lib/libc.musl-aarch64.so.1 -> ld-musl-aarch64.so.1`). Akuma had no symlink support at all.
 
-**Fix:** Added in-memory symlink support:
-- `src/vfs/mod.rs`: Global `SYMLINKS` table (`BTreeMap<String, String>`) with `create_symlink()`, `read_symlink()`, `is_symlink()`, `resolve_symlinks()` (follows chains up to 8 levels)
+**Fix (v1 — in-memory, now superseded):** Added in-memory symlink support via a global `SYMLINKS` `BTreeMap`. This was a quick workaround: symlinks survived the session but not a reboot, `unlinkat` couldn't delete them, and directory listings didn't know about them.
+
+**Fix (v2 — ext2 on-disk):** Replaced the in-memory approach with proper ext2 filesystem symlinks. See "ext2 symlink support" under Kernel Fixes below. The VFS layer still has a legacy in-memory fallback for filesystems that don't support symlinks (e.g., memfs, procfs).
+
+Syscall integration:
 - `src/syscall.rs`: `sys_symlinkat` creates entries; `sys_readlinkat` reads targets
 - `sys_openat` calls `resolve_symlinks()` before checking file existence
 - `sys_newfstatat` handles `AT_SYMLINK_NOFOLLOW` and returns `S_IFLNK` mode
 - `sys_faccessat` follows symlinks when checking existence
-
-Note: symlinks are in-memory only (not persisted to ext2). They survive the session but not a reboot.
+- `sys_unlinkat` deletes ext2 symlink inodes via `remove_file` (handles fast symlinks correctly)
 
 ### readlinkat (78)
 
-Implemented alongside `symlinkat`. Returns the symlink target string from the in-memory table.
+Implemented alongside `symlinkat`. Returns the symlink target string. Reads from ext2 on-disk symlinks first, falls back to the legacy in-memory table.
 
 ### linkat (37)
 
@@ -164,6 +166,41 @@ Also resolves symlinks on the original execve path (was previously only done in 
 
 **Fix:** Added built-in fallback in `resolve_symlinks()` (`src/vfs/mod.rs`): when resolving `/bin/sh` and no explicit symlink exists, checks if `/bin/dash` exists on disk and resolves to it. This works for shebangs, direct `execve("/bin/sh", ...)`, and any other path resolution.
 
+### ext2 symlink support
+
+**Symptom:** `apk del busybox` reported "1 error" — APK couldn't delete the symlinks it had created (e.g., `/bin/ls` → `/bin/busybox`) because they existed only in a volatile in-memory table, not on the ext2 filesystem. `unlinkat` called `fs::remove_file` which searched ext2 and found nothing.
+
+**Cause:** The original symlink implementation (v1) stored all symlinks in a global in-memory `BTreeMap<String, String>`. This had several problems:
+1. Symlinks were lost on reboot
+2. `unlinkat` couldn't remove them (ext2 had no record of them)
+3. `getdents64` / directory listings didn't show them
+4. They consumed kernel heap indefinitely
+
+**Fix:** Implemented proper ext2 symlink support in `src/vfs/ext2.rs`:
+
+**On-disk format:**
+- Symlink inodes use `type_perms = S_IFLNK | 0o777` (`0xA1FF`)
+- Directory entries use `file_type = FT_SYMLINK` (7)
+- **Fast symlinks** (target ≤ 60 bytes): target string stored directly in the inode's block pointer fields (`direct_blocks[12]` + `indirect_block` + `double_indirect_block` + `triple_indirect_block` = 60 bytes). No data blocks allocated; `sectors_used = 0`
+- **Slow symlinks** (target > 60 bytes): target stored in data blocks via `write_inode_data`
+
+**Changes:**
+- `src/vfs/ext2.rs`:
+  - Added constants: `S_IFLNK = 0xA000`, `FT_SYMLINK = 7`, `FAST_SYMLINK_MAX = 60`, `DEFAULT_SYMLINK_PERMS`
+  - `create_symlink_internal()`: allocates inode, writes target (fast or slow), adds `FT_SYMLINK` dir entry
+  - `read_symlink_inode()`: reads target from fast (block pointer bytes) or slow (data blocks) storage
+  - `remove_file()`: detects fast symlinks and skips `truncate_inode` (block pointers contain target string, not block numbers)
+  - Implemented `Filesystem` trait methods: `create_symlink()`, `read_symlink()`, `is_symlink()`
+- `src/vfs/mod.rs`:
+  - Added `create_symlink()`, `read_symlink()`, `is_symlink()` to the `Filesystem` trait (with default no-op implementations for memfs/procfs)
+  - Rewired VFS-level `create_symlink()` to delegate to the mounted filesystem first, falling back to in-memory table only if the filesystem returns `NotSupported`
+  - `read_symlink()` and `is_symlink()` check ext2 first, then in-memory table
+  - `resolve_symlinks()` now uses the unified `read_symlink()` which checks ext2
+- `src/syscall.rs`:
+  - `sys_unlinkat`: simplified — ext2's `remove_file` now handles symlink deletion directly; in-memory table cleanup kept as legacy fallback
+
+**Busybox example:** `busybox --install -s /bin` creates ~400 symlinks like `/bin/ls` → `/bin/busybox` (12 bytes, well within the 60-byte fast symlink limit). These are now proper ext2 directory entries with `FT_SYMLINK` type and persist across reboots.
+
 ### fork: physical address copy (stale TTBR0)
 
 **Symptom:** `Sync from EL1: EC=0x25 ... WARNING: Kernel accessing user-space address!` during `clone(flags=0x11)` (fork).
@@ -205,13 +242,14 @@ Syscalls that were already in place (many from the XBPS work) and reused by APK:
 | getdents64 | 61 | Directory listing |
 | lseek | 62 | File seek |
 | mkdirat | 34 | Directory creation |
-| unlinkat | 35 | File/dir removal |
+| unlinkat | 35 | File/dir/symlink removal (handles ext2 fast symlinks) |
 | renameat | 38 | File rename (dirfd-aware) |
 | getcwd | 17 | Current working directory |
 | chdir | 49 | Change working directory |
 | brk | 214 | Heap management |
 | mmap/munmap | 222/215 | Memory mapping (anonymous + file-backed) |
 | madvise | 233 | `MADV_DONTNEED` zeroes pages |
+| mprotect | 226 | Memory protection (stubbed — no page protection) |
 | dup | 23 | FD duplication (clears CLOEXEC on new fd) |
 | dup3 | 24 | FD duplication (honors O_CLOEXEC flag) |
 | fcntl | 25 | FD control (F_GETFD/F_SETFD with FD_CLOEXEC) |
@@ -287,6 +325,8 @@ APK successfully:
 - Resolves package dependencies (e.g., `bash` pulls in `musl`, `readline`, `ncurses-libs`, `busybox`, `bash`)
 - Downloads package `.apk` archives over HTTP
 - Extracts package contents (files, directories, symlinks)
+- Creates persistent ext2 symlinks (e.g., busybox creates ~400 symlinks in `/bin/`)
+- Deletes packages and cleans up symlinks via `unlinkat`
 - Sets file permissions via `fchmodat` (stubbed)
 - Updates the APK database (`/lib/apk/db/installed`, `/etc/apk/world`)
 - Installs simple packages (e.g., `neatvi`) successfully
@@ -294,9 +334,29 @@ APK successfully:
 - Executes shebang scripts (`#!/bin/sh` → resolves to `/bin/dash`)
 - Changes working directory via `fchdir` before script execution
 
-Remaining issues:
+### Stale error recovery
+
+If APK reports errors like `2 errors; 1762 KiB in 3 packages` from previous failed install attempts (before kernel fixes were applied), the errors are recorded in the APK database. To clear them:
+
+```
+rm /lib/apk/db/installed /lib/apk/db/scripts.tar.gz /lib/apk/db/triggers
+```
+
+Then re-run `apk add` to install cleanly with all fixes in place.
+
+### Remaining issues
 - Trigger scripts that depend on specific utilities may fail if those utilities aren't yet available
 - `execve` may fail to copy argv from mmap'd regions in forked children (fork skips mmap copy to avoid OOM — argv strings allocated via mmap by the parent are inaccessible in the child)
+- `getdents64` reports symlinks as `DT_REG` (regular file) instead of `DT_LNK` — the `DirEntry` struct lacks an `is_symlink` field. Most programs use `lstat` to check file type, so this is low-impact
+- ext2 path traversal (`lookup_path_internal`) does not follow symlinks in intermediate path components (e.g., if `/usr/bin` were a symlink to `/bin`, lookups through `/usr/bin/foo` would fail). VFS-level `resolve_symlinks` only resolves the final component. This hasn't been an issue in practice since Alpine packages use flat symlinks
+
+### mprotect (226)
+
+**Symptom:** `[exit code: -11]` (SIGSEGV) — APK crashed with a data abort at `FAR=0x7d` (NULL pointer + struct offset write) during cleanup after `apk info -L`.
+
+**Cause:** musl's `malloc` (mallocng) calls `mprotect(PROT_READ|PROT_WRITE)` when expanding the heap or reusing previously freed pages. Without `mprotect`, the syscall fell through to the unknown handler and returned `ENOSYS` (-38). musl interpreted this as a failed memory expansion and returned `NULL` from `malloc`. APK didn't check for NULL and dereferenced it at struct offset `0x7d` (125 bytes), causing a write fault at address `0x7d`.
+
+**Fix:** Stubbed as success (return 0) — Akuma maps all user pages as RWX and doesn't enforce page-level protection bits.
 
 ## Potential Future Issues
 
@@ -304,4 +364,3 @@ Remaining issues:
 |---------|--------|---------|------|
 | ftruncate | 46 | Cache file management | Medium |
 | statfs | 43 | Filesystem queries by path | Low — `fstatfs` covers the fd case |
-| mprotect | 226 | Memory protection changes | Low — may be needed by crypto |

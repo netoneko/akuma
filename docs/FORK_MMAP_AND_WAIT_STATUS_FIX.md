@@ -88,3 +88,60 @@ With this encoding:
 - Any Linux binary that forks children for built-in commands (no execve)
 - Any process killed by a signal now reports the correct signal to its parent
   via waitpid/wait4
+
+## Bug 3: `set_brk` page mapping starts at non-aligned address
+
+### Problem
+
+When the ELF loader sets the initial `brk`, it uses the exact end of the last
+segment (e.g., `0x4311d0`), which is typically not page-aligned. The `set_brk`
+method used this raw value as the starting VA for its page-mapping loop:
+
+```rust
+let old_top = self.brk;       // e.g. 0x4311d0
+while page < aligned {
+    alloc_and_map(page, ...);  // page = 0x4311d0 — NOT page-aligned!
+    page += 0x1000;            // 0x4321d0, 0x4331d0, ...
+}
+```
+
+`map_page` rejects non-page-aligned VAs (`"Addresses must be page-aligned"`),
+so every `alloc_and_map` call in the first `set_brk` invocation silently failed
+(the error was discarded by `let _ = ...`). No new pages were actually mapped.
+
+This didn't immediately crash because the ELF loader pre-allocates 16 pages
+(64 KB) beyond the last segment, providing a buffer for early heap use. But it
+meant:
+
+1. The first brk extension mapped zero pages (all calls failed silently)
+2. After the first call, `self.brk` became page-aligned, so subsequent calls
+   worked — but they re-mapped the pre-allocated pages (allocating new zeroed
+   frames and overwriting the L3 entries, leaking the original frames)
+
+### Fix
+
+Page-align `old_top` upward before starting the mapping loop:
+
+```rust
+let old_top = (self.brk + 0xFFF) & !0xFFF;
+```
+
+The partial page containing `self.brk` is already mapped by the ELF loader, so
+mapping should start at the next page boundary. When `self.brk` is already
+page-aligned (all calls after the first), this is a no-op.
+
+## Diagnostic: Fork page copy and execve logging
+
+Added diagnostic logging to help trace intermittent issues with pipe commands
+in dash (e.g., `echo hello | grep e` sometimes produces "echo: not found"):
+
+1. **`copy_range_phys` in `fork_process`**: Now counts copied vs. skipped pages
+   and logs a warning when any pages are unmapped (skipped) during the fork
+   copy. This detects address space holes that could cause child crashes.
+
+2. **`sys_execve`**: Now logs the resolved path, arguments, and PID for every
+   `execve` call (when `SYSCALL_DEBUG_INFO_ENABLED` is true). If a child
+   process calls `execve("echo")` instead of running it as a builtin, this
+   log will confirm that dash's `find_command` failed to identify it as a
+   builtin — pointing to a memory corruption or copy issue in the forked
+   child's address space.
