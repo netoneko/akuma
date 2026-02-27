@@ -2086,12 +2086,56 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         copy_range_phys(parent_l0, code_start, parent.brk - code_start, &mut new_proc.address_space)?;
     }
 
-    // Skip copying mmap regions: fork is almost always followed by execve
-    // which replaces the address space. Copying 300+ MB of mmap data would
-    // exhaust physical memory and is never used by the child.
-    new_proc.mmap_regions.clear();
-    let mmap_base = (new_proc.memory.code_end + 0x1000_0000) & !0xFFFF;
-    new_proc.memory.next_mmap = mmap_base;
+    // Copy mmap regions so forked children can run built-in applets (e.g.
+    // busybox sh pipes) without crashing on unmapped pages.  We cap total
+    // copied pages to avoid OOM when a parent has huge file mappings.
+    const MAX_FORK_MMAP_PAGES: usize = 2048; // 8 MB cap
+    let mut total_copied_pages: usize = 0;
+    let mut child_mmap_regions: Vec<(usize, Vec<pmm::PhysFrame>)> = Vec::new();
+
+    for (va_start, parent_frames) in &parent.mmap_regions {
+        if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap\n",
+                    va_start, parent_frames.len());
+            }
+            continue;
+        }
+        let mut child_frames: Vec<pmm::PhysFrame> = Vec::new();
+        let mut ok = true;
+        for (i, pf) in parent_frames.iter().enumerate() {
+            let page_va = va_start + i * mmu::PAGE_SIZE;
+            match pmm::alloc_page_zeroed() {
+                Some(frame) => {
+                    pmm::track_frame(frame, pmm::FrameSource::UserData, child_pid);
+                    unsafe {
+                        let src = mmu::phys_to_virt(pf.addr) as *const u8;
+                        let dst = mmu::phys_to_virt(frame.addr);
+                        core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                    }
+                    if new_proc.address_space.map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    new_proc.address_space.track_user_frame(frame);
+                    child_frames.push(frame);
+                }
+                None => { ok = false; break; }
+            }
+        }
+        if ok {
+            total_copied_pages += child_frames.len();
+            child_mmap_regions.push((*va_start, child_frames));
+        } else {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[fork] OOM copying mmap region 0x{:x}, skipping rest\n", va_start);
+            }
+            break;
+        }
+    }
+
+    new_proc.mmap_regions = child_mmap_regions;
+    new_proc.memory.next_mmap = parent.memory.next_mmap;
     
     // 5. Write ProcessInfo to child's process info page
     unsafe {

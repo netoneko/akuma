@@ -277,6 +277,19 @@ const EISDIR: u64 = (-21i64) as u64;
 const ENOTEMPTY: u64 = (-39i64) as u64;
 const EEXIST: u64 = (-17i64) as u64;
 const ENOSPC: u64 = (-28i64) as u64;
+
+/// Encode an exit code into Linux-compatible wait status.
+/// Negative codes are treated as signal kills (e.g. -11 → SIGSEGV).
+fn encode_wait_status(code: i32) -> u32 {
+    if code < 0 {
+        // Signal death: low 7 bits = signal number (no core dump bit)
+        let sig = (-code) as u32 & 0x7F;
+        sig
+    } else {
+        // Normal exit: (code & 0xFF) << 8
+        ((code as u32) & 0xFF) << 8
+    }
+}
 const EROFS: u64 = (-30i64) as u64;
 
 fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
@@ -2052,7 +2065,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
                         crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", p, code);
                     }
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
-                        unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
+                        unsafe { *(status_ptr as *mut u32) = encode_wait_status(code); }
                     }
                     crate::process::remove_child_channel(p);
                     return p as u64;
@@ -2080,7 +2093,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
                     crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", child_pid, code);
                 }
                 if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
-                    unsafe { *(status_ptr as *mut u32) = (code as u32) << 8; }
+                    unsafe { *(status_ptr as *mut u32) = encode_wait_status(code); }
                 }
                 crate::process::remove_child_channel(child_pid);
                 return child_pid as u64;
@@ -2899,7 +2912,7 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 
     if let Some(ch) = crate::process::get_child_channel(pid) {
         if ch.has_exited() {
-            if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = (ch.exit_code() as u32) << 8; } }
+            if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = encode_wait_status(ch.exit_code()); } }
             return pid as u64;
         }
     }
