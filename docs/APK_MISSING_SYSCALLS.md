@@ -111,7 +111,58 @@ Implemented alongside `symlinkat`. Returns the symlink target string from the in
 - If growing with `MREMAP_MAYMOVE`: allocates new region, copies data, frees old region
 - If growing without `MREMAP_MAYMOVE`: returns `ENOMEM` (in-place growth not supported)
 
+### fchdir (50)
+
+**Symptom:** `Unknown syscall: 50` during trigger script execution. Child process exited with code 127 without ever reaching `execve`.
+
+**Cause:** APK opens the package root directory as an fd, then calls `fchdir(fd)` to change CWD before executing the trigger script. Without `fchdir`, the CWD was wrong and subsequent operations (including execve) failed.
+
+**Fix:** Implemented `sys_fchdir` in `src/syscall.rs`. Looks up the fd in the process's fd_table, extracts the directory path from the `FileDescriptor::File`, validates it's a directory, and calls `proc.set_cwd()`.
+
+### fchmodat (53)
+
+**Symptom:** `Unknown syscall: 53` during package extraction. APK reported errors when installing packages even with `--no-scripts`.
+
+**Cause:** APK calls `fchmodat` to set file permissions (e.g., making binaries executable) after extracting package contents. Without it, APK treated the ENOSYS as an extraction error.
+
+**Fix:** Stubbed as success (return 0) — Akuma doesn't enforce file permissions.
+
 ## Kernel Fixes (non-syscall)
+
+### Close-on-exec (CLOEXEC) support
+
+**Symptom:** APK's trigger script execution hung — the parent process blocked reading from a pipe, waiting for EOF that never arrived.
+
+**Cause:** APK creates pipes with `O_CLOEXEC` (via `pipe2(fds, O_CLOEXEC)`) and expects them to be automatically closed when the child calls `execve`. Without CLOEXEC, the forked child inherited all of APK's pipe file descriptors. After `execve`, the child (now `/bin/sh`) still held write ends of pipes that the parent was reading from, so the parent never saw EOF and blocked forever.
+
+**Fix:** Added per-process `cloexec_fds: BTreeSet<u32>` tracking to `Process` in `src/process.rs`:
+- `pipe2`: honors `O_CLOEXEC` flag, marks both pipe FDs
+- `openat`: honors `O_CLOEXEC` flag on opened files
+- `socket`: honors `SOCK_CLOEXEC` (`0x80000`) flag
+- `dup`: clears CLOEXEC on new fd (per POSIX)
+- `dup3`: sets CLOEXEC on new fd only if `O_CLOEXEC` is in flags
+- `close`: clears CLOEXEC tracking
+- `fcntl`: `F_GETFD` returns `FD_CLOEXEC` if set; `F_SETFD` sets/clears it
+- `execve`: closes all CLOEXEC-marked FDs (with proper pipe/socket cleanup) before loading the new image
+- `fork`: clones the parent's `cloexec_fds` set into the child
+
+### Shebang (`#!`) script support in execve
+
+**Symptom:** `execve: replace_image failed for /lib/apk/exec/busybox-1.37.0-r30.post-install: Failed to load ELF` — APK's trigger scripts are shell scripts, not ELF binaries.
+
+**Cause:** Akuma's `execve` only handled ELF binaries. APK's post-install and trigger scripts start with `#!/bin/sh` and need the kernel to detect the shebang, parse the interpreter, and exec the interpreter with the script path as an argument.
+
+**Fix:** Refactored `sys_execve` into `sys_execve` (parses user-space args) + `do_execve` (performs the exec). `do_execve` checks the first two bytes of the file:
+- If `#!`: calls `exec_shebang()` which parses the interpreter path and optional argument from the first line, resolves symlinks on the interpreter, builds new argv as `[interpreter, shebang_arg?, script_path, original_args[1:]...]`, and recursively calls `do_execve` with the interpreter binary
+- Otherwise: loads as ELF (existing path)
+
+Also resolves symlinks on the original execve path (was previously only done in `openat`).
+
+### `/bin/sh` → `/bin/dash` fallback
+
+**Cause:** Alpine packages use `#!/bin/sh` in scripts, but Akuma ships `dash` as `/bin/dash`. Without a symlink from `/bin/sh`, shebang resolution would fail.
+
+**Fix:** Added built-in fallback in `resolve_symlinks()` (`src/vfs/mod.rs`): when resolving `/bin/sh` and no explicit symlink exists, checks if `/bin/dash` exists on disk and resolves to it. This works for shebangs, direct `execve("/bin/sh", ...)`, and any other path resolution.
 
 ### fork: physical address copy (stale TTBR0)
 
@@ -142,8 +193,8 @@ Syscalls that were already in place (many from the XBPS work) and reused by APK:
 
 | Syscall | Number | Notes |
 |---------|--------|-------|
-| openat | 56 | File I/O (with dirfd support + symlink resolution) |
-| close | 57 | File I/O |
+| openat | 56 | File I/O (with dirfd support + symlink resolution + CLOEXEC) |
+| close | 57 | File I/O (clears CLOEXEC tracking) |
 | read | 63 | File I/O |
 | write | 64 | File I/O |
 | readv | 65 | Scatter-gather read |
@@ -157,19 +208,24 @@ Syscalls that were already in place (many from the XBPS work) and reused by APK:
 | unlinkat | 35 | File/dir removal |
 | renameat | 38 | File rename (dirfd-aware) |
 | getcwd | 17 | Current working directory |
+| chdir | 49 | Change working directory |
 | brk | 214 | Heap management |
 | mmap/munmap | 222/215 | Memory mapping (anonymous + file-backed) |
 | madvise | 233 | `MADV_DONTNEED` zeroes pages |
-| dup3 | 24 | File descriptor duplication |
-| fcntl | 25 | File descriptor control |
+| dup | 23 | FD duplication (clears CLOEXEC on new fd) |
+| dup3 | 24 | FD duplication (honors O_CLOEXEC flag) |
+| fcntl | 25 | FD control (F_GETFD/F_SETFD with FD_CLOEXEC) |
 | ioctl | 29 | Terminal control |
 | flock | 32 | File locking (stubbed) |
+| fchmod | 52 | File permissions (stubbed) |
+| fchmodat | 53 | File permissions by path (stubbed) |
+| fchownat | 54 | File ownership (stubbed) |
 | ppoll | 73 | I/O multiplexing |
-| clone | 220 | fork (optimized: skip mmap copy) |
-| execve | 221 | Execute program |
+| clone | 220 | fork (optimized: skip mmap copy, clones CLOEXEC set) |
+| execve | 221 | Execute program (ELF + shebang scripts, CLOEXEC cleanup) |
 | wait4 | 260 | Wait for child process |
-| pipe2 | 59 | Pipe creation |
-| socket | 198 | TCP and UDP creation |
+| pipe2 | 59 | Pipe creation (honors O_CLOEXEC) |
+| socket | 198 | TCP and UDP creation (honors SOCK_CLOEXEC) |
 | bind | 200 | Socket address binding |
 | connect | 203 | TCP connection, UDP peer association |
 | sendto | 206 | UDP send |
@@ -187,6 +243,8 @@ Syscalls that were already in place (many from the XBPS work) and reused by APK:
 | set_tid_address | 96 | Thread setup |
 | clock_gettime | 113 | Time queries |
 | exit/exit_group | 93/94 | Process exit |
+| uname | 160 | System information |
+| umask | 166 | File creation mask (stubbed) |
 
 ## APK-Specific Configuration
 
@@ -229,16 +287,21 @@ APK successfully:
 - Resolves package dependencies (e.g., `bash` pulls in `musl`, `readline`, `ncurses-libs`, `busybox`, `bash`)
 - Downloads package `.apk` archives over HTTP
 - Extracts package contents (files, directories, symlinks)
+- Sets file permissions via `fchmodat` (stubbed)
 - Updates the APK database (`/lib/apk/db/installed`, `/etc/apk/world`)
 - Installs simple packages (e.g., `neatvi`) successfully
+- Forks child processes for trigger scripts (CLOEXEC ensures proper pipe cleanup)
+- Executes shebang scripts (`#!/bin/sh` → resolves to `/bin/dash`)
+- Changes working directory via `fchdir` before script execution
 
-Remaining issue: packages with post-install trigger scripts (e.g., `busybox`) call `clone` + `execve` to run `/bin/sh` from inside APK. The fork now succeeds (no crash), but the child process hangs during execution of the trigger script. This is likely a `wait4`/`pipe` interaction issue — the parent (APK) waits for the child to exit, but the child may be blocked on I/O or missing a syscall. Needs further debugging.
+Remaining issues:
+- Trigger scripts that depend on specific utilities may fail if those utilities aren't yet available
+- `execve` may fail to copy argv from mmap'd regions in forked children (fork skips mmap copy to avoid OOM — argv strings allocated via mmap by the parent are inaccessible in the child)
 
 ## Potential Future Issues
 
 | Syscall | Number | Used by | Risk |
 |---------|--------|---------|------|
 | ftruncate | 46 | Cache file management | Medium |
-| fchmodat | 53 | File permissions during install | Medium |
 | statfs | 43 | Filesystem queries by path | Low — `fstatfs` covers the fd case |
 | mprotect | 226 | Memory protection changes | Low — may be needed by crypto |

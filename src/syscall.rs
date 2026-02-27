@@ -240,6 +240,7 @@ pub mod nr {
     pub const FSYNC: u64 = 82;
     pub const FCHDIR: u64 = 50;
     pub const FCHMOD: u64 = 52;
+    pub const FCHMODAT: u64 = 53;
     pub const FCHOWNAT: u64 = 54;
     pub const MADVISE: u64 = 233;
 }
@@ -688,6 +689,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FDATASYNC => 0, // stub — single block device, always coherent
         nr::FSYNC => 0, // stub — single block device, always coherent
         nr::FCHMOD => 0, // stub — no permission enforcement
+        nr::FCHMODAT => 0, // stub — no permission enforcement
         nr::FCHOWNAT => 0, // stub — single-user OS, no ownership
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         _ => {
