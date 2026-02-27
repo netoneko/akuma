@@ -1472,6 +1472,36 @@ fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
+fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
+    if raw_path.starts_with('/') {
+        return crate::vfs::canonicalize_path(raw_path);
+    }
+    let base = if dirfd == -100 { // AT_FDCWD
+        if let Some(proc) = crate::process::current_process() {
+            proc.cwd.clone()
+        } else {
+            String::from("/")
+        }
+    } else if dirfd >= 0 {
+        if let Some(proc) = crate::process::current_process() {
+            if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                f.path.clone()
+            } else {
+                String::from("/")
+            }
+        } else {
+            String::from("/")
+        }
+    } else {
+        String::from("/")
+    };
+    if raw_path == "." || raw_path.is_empty() {
+        base
+    } else {
+        crate::vfs::resolve_path(&base, raw_path)
+    }
+}
+
 fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
     let raw_path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
@@ -2013,16 +2043,18 @@ fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
     }
 }
 
-fn sys_renameat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64) -> u64 {
-    let oldpath = match copy_from_user_str(oldpath_ptr, 512) {
+fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> u64 {
+    let raw_old = match copy_from_user_str(oldpath_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let newpath = match copy_from_user_str(newpath_ptr, 512) {
+    let raw_new = match copy_from_user_str(newpath_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    crate::safe_print!(128, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
+    let oldpath = resolve_path_at(olddirfd, &raw_old);
+    let newpath = resolve_path_at(newdirfd, &raw_new);
+    crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
 }
 
