@@ -498,7 +498,7 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
 
     wait_until(|| with_network(|net| {
         let socket = net.sockets.get::<tcp::Socket>(handle);
-        socket.can_recv() || !socket.is_active()
+        socket.can_recv() || !socket.is_active() || !socket.may_recv()
     }).unwrap_or(true), Some(30_000_000))?;
 
     let res = with_network(|net| {
@@ -509,7 +509,7 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
                 buf[..len].copy_from_slice(&data[..len]);
                 (len, len)
             }).map_err(|_| libc_errno::EIO)
-        } else if !socket.is_active() { Ok(0) } else { Err(libc_errno::EAGAIN) }
+        } else if !socket.is_active() || !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
     });
     
     // Poll immediately after recv to send TCP window update ACK.
