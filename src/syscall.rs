@@ -946,7 +946,9 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // Blocking read loop
             loop {
                 // Skip TTY processing for piped stdin — pipes are not TTYs.
-                let is_pipe = ch.is_stdin_closed() && !ch.has_stdin_data();
+                // A closed stdin means data was pre-loaded (pipeline) or absent,
+                // either way it's not an interactive TTY.
+                let is_pipe = ch.is_stdin_closed();
 
                 // In canonical mode, check for already-completed lines first
                 if !is_pipe {
