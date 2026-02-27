@@ -1539,7 +1539,9 @@ impl Process {
             return self.brk;
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;
-        let old_top = self.brk;
+        // Page-align old_top UP: the partial page containing self.brk is
+        // already mapped by the ELF loader, so only map from the next page.
+        let old_top = (self.brk + 0xFFF) & !0xFFF;
         if aligned > old_top {
             let mut page = old_top;
             while page < aligned {
