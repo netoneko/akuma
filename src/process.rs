@@ -401,6 +401,8 @@ pub enum FileDescriptor {
     PipeRead(u32),
     /// Write end of a kernel pipe (pipe_id into global PIPES table)
     PipeWrite(u32),
+    /// Event file descriptor (eventfd_id into global EVENTFDS table)
+    EventFd(u32),
 }
 
 /// Kernel file handle for open files
@@ -1283,6 +1285,8 @@ pub struct Process {
     pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
     /// FDs marked close-on-exec (closed during execve)
     pub cloexec_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
+    /// FDs marked non-blocking (O_NONBLOCK)
+    pub nonblock_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
     /// Next available file descriptor number
     pub next_fd: AtomicU32,
 
@@ -1380,6 +1384,7 @@ impl Process {
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
             cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+            nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
             next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
             // Thread ID - set when spawned
             thread_id: None,
@@ -1633,6 +1638,24 @@ impl Process {
         })
     }
 
+    pub fn set_nonblock(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.nonblock_fds.lock().insert(fd);
+        });
+    }
+
+    pub fn clear_nonblock(&self, fd: u32) {
+        crate::irq::with_irqs_disabled(|| {
+            self.nonblock_fds.lock().remove(&fd);
+        });
+    }
+
+    pub fn is_nonblock(&self, fd: u32) -> bool {
+        crate::irq::with_irqs_disabled(|| {
+            self.nonblock_fds.lock().contains(&fd)
+        })
+    }
+
     /// Close all FDs marked close-on-exec, returning them for cleanup.
     pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
         crate::irq::with_irqs_disabled(|| {
@@ -1883,6 +1906,9 @@ fn cleanup_process_fds(proc: &Process) {
             FileDescriptor::PipeRead(pipe_id) => {
                 crate::syscall::pipe_close_read(pipe_id);
             }
+            FileDescriptor::EventFd(efd_id) => {
+                crate::syscall::eventfd_close(efd_id);
+            }
             _ => {}
         }
     }
@@ -2035,6 +2061,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             Spinlock::new(cloned)
         },
         cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
+        nonblock_fds: Spinlock::new(parent.nonblock_fds.lock().clone()),
         next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
         thread_id: None,
         spawner_pid: parent.spawner_pid,

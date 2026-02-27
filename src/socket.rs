@@ -391,8 +391,7 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
     Ok((new_idx, addr))
 }
 
-pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
-    // UDP connect: just store the peer address and auto-bind if needed
+pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<(), i32> {
     let is_dgram = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
             matches!(&sock.inner, SocketType::Datagram { .. })
@@ -438,10 +437,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
 
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(h);
-        
-        // Single-interface model: loopback is handled by the main interface
         let cx = net.iface.context();
-
         socket.connect(cx, 
             (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
             local_port
@@ -452,6 +448,10 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
         Some(Ok(())) => {},
         Some(Err(_)) => return Err(libc_errno::ECONNREFUSED),
         None => return Err(libc_errno::ENETDOWN),
+    }
+
+    if nonblock {
+        return Err(libc_errno::EINPROGRESS);
     }
 
     wait_until(|| {
@@ -469,12 +469,17 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     if connected { Ok(()) } else { Err(libc_errno::ECONNREFUSED) }
 }
 
-pub fn socket_send(idx: usize, buf: &[u8]) -> Result<usize, i32> {
+pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
     }).ok_or(libc_errno::EBADF)?;
 
-    wait_until(|| with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), Some(5_000_000))?;
+    if nonblock {
+        let can = with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(false);
+        if !can { return Err(libc_errno::EAGAIN); }
+    } else {
+        wait_until(|| with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), Some(5_000_000))?;
+    }
 
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
@@ -482,7 +487,6 @@ pub fn socket_send(idx: usize, buf: &[u8]) -> Result<usize, i32> {
         socket.send_slice(buf).map_err(|_| libc_errno::EIO)
     });
     
-    // Poll immediately to transmit the queued data without waiting for thread 0
     smoltcp_net::poll();
     
     match res {
@@ -491,15 +495,24 @@ pub fn socket_send(idx: usize, buf: &[u8]) -> Result<usize, i32> {
     }
 }
 
-pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
+pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
     }).ok_or(libc_errno::EBADF)?;
 
-    wait_until(|| with_network(|net| {
-        let socket = net.sockets.get::<tcp::Socket>(handle);
-        socket.can_recv() || !socket.is_active() || !socket.may_recv()
-    }).unwrap_or(true), Some(30_000_000))?;
+    if nonblock {
+        smoltcp_net::poll();
+        let ready = with_network(|net| {
+            let socket = net.sockets.get::<tcp::Socket>(handle);
+            socket.can_recv() || !socket.is_active() || !socket.may_recv()
+        }).unwrap_or(true);
+        if !ready { return Err(libc_errno::EAGAIN); }
+    } else {
+        wait_until(|| with_network(|net| {
+            let socket = net.sockets.get::<tcp::Socket>(handle);
+            socket.can_recv() || !socket.is_active() || !socket.may_recv()
+        }).unwrap_or(true), Some(30_000_000))?;
+    }
 
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
@@ -512,11 +525,6 @@ pub fn socket_recv(idx: usize, buf: &mut [u8]) -> Result<usize, i32> {
         } else if !socket.is_active() || !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
     });
     
-    // Poll immediately after recv to send TCP window update ACK.
-    // Reading data frees RX buffer space, but the updated window is only
-    // advertised to the remote when the next ACK goes out. Without this,
-    // the window update waits until thread 0 polls, causing the remote
-    // sender to stall with a shrunken/zero window.
     smoltcp_net::poll();
     
     match res {
@@ -553,7 +561,7 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
     Ok(buf.len())
 }
 
-pub fn socket_recv_udp(idx: usize, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), i32> {
+pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
             Some(*handle)
@@ -562,10 +570,17 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8]) -> Result<(usize, SocketAddrV
         }
     }).ok_or(libc_errno::EBADF)?;
 
-    wait_until(|| {
+    if nonblock {
         smoltcp_net::poll();
-        smoltcp_net::udp_can_recv(handle)
-    }, Some(10_000_000))?;
+        if !smoltcp_net::udp_can_recv(handle) {
+            return Err(libc_errno::EAGAIN);
+        }
+    } else {
+        wait_until(|| {
+            smoltcp_net::poll();
+            smoltcp_net::udp_can_recv(handle)
+        }, Some(10_000_000))?;
+    }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|_| libc_errno::EIO)?;
     let src = match endpoint.addr {
@@ -690,5 +705,7 @@ pub mod libc_errno {
     pub const ENETDOWN: i32 = 100;
     pub const ECONNABORTED: i32 = 103;
     pub const ETIMEDOUT: i32 = 110;
+    pub const EDESTADDRREQ: i32 = 89;
+    pub const EINPROGRESS: i32 = 115;
     pub const ECONNREFUSED: i32 = 111;
 }

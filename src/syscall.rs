@@ -132,6 +132,98 @@ fn pipe_set_reader_thread(id: u32, tid: usize) {
     });
 }
 
+// ============================================================================
+// Kernel EventFd Infrastructure
+// ============================================================================
+
+struct KernelEventFd {
+    counter: u64,
+    flags: u32,
+    reader_thread: Option<usize>,
+}
+
+static EVENTFDS: Spinlock<BTreeMap<u32, KernelEventFd>> = Spinlock::new(BTreeMap::new());
+static NEXT_EVENTFD_ID: AtomicU32 = AtomicU32::new(1);
+
+const EFD_SEMAPHORE: u32 = 1;
+const EFD_NONBLOCK: u32 = 0x800;
+const EFD_CLOEXEC: u32 = 0x80000;
+
+fn eventfd_create(initval: u32, flags: u32) -> u32 {
+    let id = NEXT_EVENTFD_ID.fetch_add(1, Ordering::SeqCst);
+    crate::irq::with_irqs_disabled(|| {
+        EVENTFDS.lock().insert(id, KernelEventFd {
+            counter: initval as u64,
+            flags,
+            reader_thread: None,
+        });
+    });
+    id
+}
+
+fn eventfd_read(id: u32) -> Result<u64, i32> {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = EVENTFDS.lock();
+        if let Some(efd) = table.get_mut(&id) {
+            if efd.counter == 0 {
+                return Err(libc_errno::EAGAIN);
+            }
+            let val = if efd.flags & EFD_SEMAPHORE != 0 {
+                efd.counter -= 1;
+                1
+            } else {
+                let v = efd.counter;
+                efd.counter = 0;
+                v
+            };
+            Ok(val)
+        } else {
+            Err(libc_errno::EBADF)
+        }
+    })
+}
+
+fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = EVENTFDS.lock();
+        if let Some(efd) = table.get_mut(&id) {
+            efd.counter = efd.counter.saturating_add(val);
+            if let Some(tid) = efd.reader_thread.take() {
+                crate::threading::get_waker_for_thread(tid).wake();
+            }
+            Ok(())
+        } else {
+            Err(libc_errno::EBADF)
+        }
+    })
+}
+
+fn eventfd_can_read(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        EVENTFDS.lock().get(&id).map_or(false, |efd| efd.counter > 0)
+    })
+}
+
+fn eventfd_is_nonblock(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        EVENTFDS.lock().get(&id).map_or(false, |efd| efd.flags & EFD_NONBLOCK != 0)
+    })
+}
+
+pub fn eventfd_close(id: u32) {
+    crate::irq::with_irqs_disabled(|| {
+        EVENTFDS.lock().remove(&id);
+    });
+}
+
+fn eventfd_set_reader_thread(id: u32, tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
+            efd.reader_thread = Some(tid);
+        }
+    });
+}
+
 /// Flag to bypass pointer validation during kernel-originated syscall tests
 pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
 
@@ -249,6 +341,7 @@ pub mod nr {
     pub const SIGALTSTACK: u64 = 132;
     pub const GETRLIMIT: u64 = 163;
     pub const PRLIMIT64: u64 = 261;
+    pub const EVENTFD2: u64 = 19;
 }
 
 /// Thread CPU statistics for top command
@@ -286,6 +379,8 @@ const EEXIST: u64 = (-17i64) as u64;
 const ENOSPC: u64 = (-28i64) as u64;
 const EAGAIN: u64 = (-11i64) as u64;
 const ENOMEM: u64 = (-12i64) as u64;
+const EAFNOSUPPORT: u64 = (-97i64) as u64;
+const EINPROGRESS: u64 = (-115i64) as u64;
 
 /// Encode an exit code into Linux-compatible wait status.
 /// Negative codes are treated as signal kills (e.g. -11 → SIGSEGV).
@@ -500,19 +595,19 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
 
                 if fd.fd < 0 { continue; }
 
-                // Determine if this fd is a socket
-                let socket_idx = if fd.fd > 2 {
-                    if let Some(proc) = crate::process::current_process() {
-                        if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd.fd as u32) {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                let fd_entry = if fd.fd > 2 {
+                    crate::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
                 } else {
                     None
+                };
+
+                let socket_idx = match &fd_entry {
+                    Some(crate::process::FileDescriptor::Socket(idx)) => Some(*idx),
+                    _ => None,
+                };
+                let eventfd_id = match &fd_entry {
+                    Some(crate::process::FileDescriptor::EventFd(id)) => Some(*id),
+                    _ => None,
                 };
 
                 // 1. Check for POLLIN (Read)
@@ -522,6 +617,10 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
                             if ch.has_stdin_data() {
                                 fd.revents |= 1;
                             }
+                        }
+                    } else if let Some(efd_id) = eventfd_id {
+                        if eventfd_can_read(efd_id) {
+                            fd.revents |= 1;
                         }
                     } else if let Some(idx) = socket_idx {
                         if socket::is_udp_socket(idx) {
@@ -542,7 +641,9 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
 
                 // 2. Check for POLLOUT (Write)
                 if fd.events & 4 != 0 {
-                    if let Some(idx) = socket_idx {
+                    if eventfd_id.is_some() {
+                        fd.revents |= 4;
+                    } else if let Some(idx) = socket_idx {
                         if socket::is_udp_socket(idx) {
                             if let Some(handle) = socket_get_udp_handle(idx) {
                                 if crate::smoltcp_net::udp_can_send(handle) {
@@ -624,7 +725,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETSOCKNAME => sys_getsockname(args[0] as u32, args[1], args[2]),
         nr::GETPEERNAME => 0, // stub
         nr::SETSOCKOPT => 0, // stub — no socket options to set
-        nr::GETSOCKOPT => 0, // stub
+        nr::GETSOCKOPT => sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
         nr::SENDMSG => sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
         nr::RECVMSG => sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
@@ -706,6 +807,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SIGALTSTACK => 0,
         nr::GETRLIMIT => sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
+        nr::EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1229,7 +1331,12 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         crate::process::FileDescriptor::Socket(idx) => {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-            let result = crate::socket::socket_recv(idx, buf);
+            let nonblock = fd_is_nonblock(fd_num as u32);
+            let result = if socket::is_udp_socket(idx) {
+                socket::socket_recv_udp(idx, buf, nonblock).map(|(n, _)| n)
+            } else {
+                socket::socket_recv(idx, buf, nonblock)
+            };
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 match &result {
                     Ok(n) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = {}\n", fd_num, count, n),
@@ -1268,6 +1375,25 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let tid = crate::threading::current_thread_id();
                 pipe_set_reader_thread(pipe_id, tid);
                 crate::threading::schedule_blocking(u64::MAX);
+            }
+        }
+        crate::process::FileDescriptor::EventFd(efd_id) => {
+            if count < 8 { return EINVAL; }
+            let nonblock = eventfd_is_nonblock(efd_id) || fd_is_nonblock(fd_num as u32);
+            loop {
+                match eventfd_read(efd_id) {
+                    Ok(val) => {
+                        unsafe { core::ptr::write(buf_ptr as *mut u64, val); }
+                        return 8;
+                    }
+                    Err(_) => {
+                        if nonblock { return EAGAIN; }
+                        if crate::process::is_current_interrupted() { return EINTR; }
+                        let tid = crate::threading::current_thread_id();
+                        eventfd_set_reader_thread(efd_id, tid);
+                        crate::threading::schedule_blocking(u64::MAX);
+                    }
+                }
             }
         }
         _ => !0u64
@@ -1344,7 +1470,15 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         crate::process::FileDescriptor::Socket(idx) => {
-            let result = crate::socket::socket_send(idx, buf);
+            let nonblock = fd_is_nonblock(fd_num as u32);
+            let result = if socket::is_udp_socket(idx) {
+                match socket::udp_default_peer(idx) {
+                    Some(peer) => socket::socket_send_udp(idx, buf, peer),
+                    None => Err(libc_errno::EDESTADDRREQ),
+                }
+            } else {
+                socket::socket_send(idx, buf, nonblock)
+            };
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 match &result {
                     Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
@@ -1358,6 +1492,15 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         crate::process::FileDescriptor::PipeWrite(pipe_id) => {
             pipe_write(pipe_id, buf) as u64
+        }
+        crate::process::FileDescriptor::EventFd(efd_id) => {
+            if count < 8 { return EINVAL; }
+            let val = unsafe { core::ptr::read(buf_ptr as *const u64) };
+            if val == u64::MAX { return EINVAL; }
+            match eventfd_write(efd_id, val) {
+                Ok(()) => 8,
+                Err(e) => (-(e as i64)) as u64,
+            }
         }
         _ => !0u64
     }
@@ -1522,6 +1665,20 @@ fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     0
 }
 
+fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
+    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let efd_id = eventfd_create(initval, flags);
+    let fd = proc.alloc_fd(crate::process::FileDescriptor::EventFd(efd_id));
+    if flags & EFD_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    if flags & EFD_NONBLOCK != 0 {
+        proc.set_nonblock(fd);
+    }
+    crate::safe_print!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
+    fd as u64
+}
+
 fn sys_brk(new_brk: usize) -> u64 {
     if let Some(proc) = crate::process::current_process() {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
@@ -1653,8 +1810,12 @@ fn sys_close(fd: u32) -> u64 {
                 crate::process::FileDescriptor::PipeRead(pipe_id) => {
                     pipe_close_read(pipe_id);
                 }
+                crate::process::FileDescriptor::EventFd(efd_id) => {
+                    eventfd_close(efd_id);
+                }
                 _ => {}
             }
+            proc.clear_nonblock(fd);
             0
         } else { !0u64 }
     } else { !0u64 }
@@ -1989,6 +2150,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
             crate::process::FileDescriptor::ChildStdout(child_pid) => {
                 crate::process::remove_child_channel(child_pid);
             }
+            crate::process::FileDescriptor::EventFd(efd_id) => eventfd_close(efd_id),
             _ => {}
         }
     }
@@ -2158,6 +2320,7 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
     const FD_CLOEXEC: u64 = 1;
+    const O_NONBLOCK: u64 = 0x800;
 
     let proc = match crate::process::current_process() { Some(p) => p, None => return 0 };
 
@@ -2173,8 +2336,17 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             0
         }
-        F_GETFL => 0,
-        F_SETFL => 0,
+        F_GETFL => {
+            if proc.is_nonblock(fd) { O_NONBLOCK } else { 0 }
+        }
+        F_SETFL => {
+            if arg & O_NONBLOCK != 0 {
+                proc.set_nonblock(fd);
+            } else {
+                proc.clear_nonblock(fd);
+            }
+            0
+        }
         _ => 0,
     }
 }
@@ -2315,15 +2487,19 @@ use crate::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
 fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF; // mask off SOCK_CLOEXEC (0x80000) and SOCK_NONBLOCK (0x800)
     let cloexec = sock_type & 0x80000 != 0;
+    let nonblock = sock_type & 0x800 != 0;
     if domain != 2 || (base_type != 1 && base_type != 2) {
         crate::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
-        return !0u64;
+        return EAFNOSUPPORT;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
         if let Some(proc) = crate::process::current_process() {
             let fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(idx));
             if cloexec {
                 proc.set_cloexec(fd);
+            }
+            if nonblock {
+                proc.set_nonblock(fd);
             }
             crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
             return fd as u64;
@@ -2374,10 +2550,15 @@ fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     let addr = unsafe { core::ptr::read(addr_ptr as *const SockAddrIn) }.to_addr();
     crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
     if let Some(idx) = get_socket_from_fd(fd) {
-        match socket::socket_connect(idx, addr) {
+        let nonblock = fd_is_nonblock(fd);
+        match socket::socket_connect(idx, addr, nonblock) {
             Ok(()) => {
                 crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
                 return 0;
+            }
+            Err(e) if e == libc_errno::EINPROGRESS => {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
+                return EINPROGRESS;
             }
             Err(e) => {
                 crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
@@ -2437,7 +2618,7 @@ fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, ad
             Err(e) => (-e as i64) as u64,
         }
     } else {
-        match socket::socket_send(idx, buf) {
+        match socket::socket_send(idx, buf, fd_is_nonblock(fd)) {
             Ok(n) => n as u64,
             Err(e) => (-e as i64) as u64,
         }
@@ -2451,9 +2632,10 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, a
         Some(i) => i,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
+    let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
-        match socket::socket_recv_udp(idx, buf) {
+        match socket::socket_recv_udp(idx, buf, nonblock) {
             Ok((n, from)) => {
                 if src_addr != 0 && addr_len_ptr != 0 {
                     if validate_user_ptr(src_addr, core::mem::size_of::<SockAddrIn>())
@@ -2469,7 +2651,7 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, a
             Err(e) => (-e as i64) as u64,
         }
     } else {
-        match socket::socket_recv(idx, buf) {
+        match socket::socket_recv(idx, buf, nonblock) {
             Ok(n) => n as u64,
             Err(e) => (-e as i64) as u64,
         }
@@ -2477,6 +2659,18 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, a
 }
 
 fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
+
+fn sys_getsockopt(_fd: u32, _level: i32, _optname: i32, optval: u64, optlen: u64) -> u64 {
+    if optval != 0 && optlen != 0 {
+        if !validate_user_ptr(optlen, 4) { return EFAULT; }
+        let len = unsafe { core::ptr::read(optlen as *const u32) } as usize;
+        if len >= 4 && validate_user_ptr(optval, 4) {
+            unsafe { core::ptr::write(optval as *mut i32, 0); }
+            unsafe { core::ptr::write(optlen as *mut u32, 4); }
+        }
+    }
+    0
+}
 
 // msghdr layout on aarch64 (LP64 little-endian):
 //   0: *msg_name      (8 bytes)
@@ -2532,7 +2726,7 @@ fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             Err(e) => (-e as i64) as u64,
         }
     } else {
-        match socket::socket_send(idx, buf) {
+        match socket::socket_send(idx, buf, fd_is_nonblock(fd)) {
             Ok(n) => n as u64,
             Err(e) => (-e as i64) as u64,
         }
@@ -2556,9 +2750,10 @@ fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         Some(i) => i,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
+    let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
-        match socket::socket_recv_udp(idx, buf) {
+        match socket::socket_recv_udp(idx, buf, nonblock) {
             Ok((n, from)) => {
                 if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32 {
                     if validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
@@ -2567,14 +2762,16 @@ fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                         msg.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
                     }
                 }
+                msg.msg_controllen = 0;
                 msg.msg_flags = 0;
                 n as u64
             }
             Err(e) => (-e as i64) as u64,
         }
     } else {
-        match socket::socket_recv(idx, buf) {
+        match socket::socket_recv(idx, buf, nonblock) {
             Ok(n) => {
+                msg.msg_controllen = 0;
                 msg.msg_flags = 0;
                 n as u64
             }
@@ -2586,6 +2783,10 @@ fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 fn get_socket_from_fd(fd: u32) -> Option<usize> {
     let proc = crate::process::current_process()?;
     if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
+}
+
+fn fd_is_nonblock(fd: u32) -> bool {
+    crate::process::current_process().map_or(false, |p| p.is_nonblock(fd))
 }
 
 fn socket_get_udp_handle(idx: usize) -> Option<crate::smoltcp_net::SocketHandle> {
