@@ -356,7 +356,19 @@ Then re-run `apk add` to install cleanly with all fixes in place.
 
 **Cause:** musl's `malloc` (mallocng) calls `mprotect(PROT_READ|PROT_WRITE)` when expanding the heap or reusing previously freed pages. Without `mprotect`, the syscall fell through to the unknown handler and returned `ENOSYS` (-38). musl interpreted this as a failed memory expansion and returned `NULL` from `malloc`. APK didn't check for NULL and dereferenced it at struct offset `0x7d` (125 bytes), causing a write fault at address `0x7d`.
 
-**Fix:** Stubbed as success (return 0) — Akuma maps all user pages as RWX and doesn't enforce page-level protection bits.
+**Fix:** Fully implemented. `sys_mprotect` walks the L0→L1→L2→L3 page tables via `update_page_flags()` and updates AArch64 permission bits (AP, UXN, PXN) for each page in `[addr, addr+len)`. The `user_flags::from_prot()` function maps Linux `PROT_*` flags to AArch64 page descriptors. TLB is flushed per page. Also required for dynamic linking (the dynamic linker uses `mprotect` to set correct permissions on library segments after loading).
+
+## Dynamic Linking Support
+
+APK can install dynamically linked packages (e.g., `curl`, `bash` with shared library dependencies). The kernel's ELF loader handles `PT_INTERP` segments by loading the dynamic linker (`ld-musl-aarch64.so.1`) at `0x3000_0000`, applying its relocations, and starting execution at the interpreter's entry point. The interpreter then loads shared libraries, resolves symbols, and jumps to the program's `AT_ENTRY`.
+
+Prerequisites:
+- `musl` package installed (`apk add musl`) — provides `/lib/ld-musl-aarch64.so.1`
+- `mprotect` syscall (226) — interpreter changes page permissions after loading segments
+- `mmap` with `MAP_FIXED` — interpreter places shared libraries at specific addresses
+- `futex` (98), `prlimit64` (261), `sigaltstack` (132), `set_robust_list` (99) — stubs needed by the dynamic linker's initialization
+
+See `userspace/musl/docs/DYNAMIC_LINKING.md` for full details.
 
 ## Potential Future Issues
 

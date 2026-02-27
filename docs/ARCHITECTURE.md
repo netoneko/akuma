@@ -295,7 +295,14 @@ Akuma OS supports standard C applications through an integrated development envi
 ### Compiler (TCC)
 - **Toolchain**: The Tiny C Compiler (TCC) is available as a self-hosted compiler (`/bin/tcc`).
 - **Linkage**: All C programs compiled on Akuma are linked against Musl by default.
-- **Static Linking**: Currently, Akuma targets a fully static execution model.
+- **Static Linking**: TCC produces statically linked binaries using `musl/dist/lib/libc.a`.
+
+### Dynamic Linking
+- **Supported**: The ELF loader handles `PT_INTERP` segments and loads the musl dynamic linker (`ld-musl-aarch64.so.1`) at `0x3000_0000`.
+- **Relocations**: The kernel applies RELATIVE, GLOB_DAT, JUMP_SLOT, and ABS64 relocations to the interpreter before jumping to its entry point.
+- **Runtime**: The interpreter resolves symbols, loads shared libraries via `mmap`/`mprotect`, and transfers control to the program's entry point (passed via `AT_ENTRY` in the auxiliary vector).
+- **Installation**: `apk add musl` provides the dynamic linker. Alpine Linux packages with shared library dependencies work out of the box.
+- **Details**: See `userspace/musl/docs/DYNAMIC_LINKING.md`.
 
 ---
 

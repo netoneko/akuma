@@ -47,7 +47,7 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 - `src/allocator.rs` — Heap (talc), OOM handling
 - `src/pmm.rs` — Physical memory manager
 - `src/mmu.rs` — MMU, userspace address space isolation
-- `src/elf_loader.rs` — ELF parser and loader
+- `src/elf_loader.rs` — ELF parser and loader (static, static-PIE, dynamic)
 - `src/smoltcp_net.rs` — TCP/IP stack (smoltcp)
 - `src/socket.rs` — Socket syscall layer
 - `src/vfs/` — VFS: ext2 (`vfs/ext2.rs`), memfs, procfs
@@ -89,7 +89,8 @@ The kernel is `no_std`. Always:
 | Networking | `src/smoltcp_net.rs` | smoltcp TCP/IP, VirtIO-net |
 | Containers | `userspace/herd/` | Process isolation (herd/box) |
 | JS engine | `userspace/quickjs/` | QuickJS |
-| C compiler | `userspace/tcc/` | TCC + musl |
+| C compiler | `userspace/tcc/` | TCC + musl (static linking) |
+| Dynamic linker | `src/elf_loader.rs` | PT_INTERP + ld-musl-aarch64.so.1 at 0x3000_0000 |
 | Git | `userspace/scratch/` | Git clone; needs 256+ KB stack (zlib) |
 | AI assistant | `userspace/meow/` | meow coding assistant |
 | Shell | `src/shell/` + `userspace/paws/` + `userspace/dash/` | In-kernel shell + POSIX dash |
