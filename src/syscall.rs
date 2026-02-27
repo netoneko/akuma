@@ -172,7 +172,10 @@ pub mod nr {
     pub const PPOLL: u64 = 73;       // Linux arm64 ppoll
     pub const MKDIRAT: u64 = 34;     // Linux arm64 mkdirat
     pub const UNLINKAT: u64 = 35;    // Linux arm64 unlinkat
+    pub const SYMLINKAT: u64 = 36;   // Linux arm64 symlinkat
+    pub const LINKAT: u64 = 37;      // Linux arm64 linkat
     pub const RENAMEAT: u64 = 38;    // Linux arm64 renameat
+    pub const READLINKAT: u64 = 78;  // Linux arm64 readlinkat
     pub const SET_TID_ADDRESS: u64 = 96;
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
@@ -612,7 +615,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PPOLL => sys_ppoll(args[0], args[1] as usize, args[2], args[3]),
         nr::MKDIRAT => sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
         nr::UNLINKAT => sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
+        nr::SYMLINKAT => sys_symlinkat(args[0], args[1] as i32, args[2]),
+        nr::LINKAT => sys_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
         nr::RENAMEAT => sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
+        nr::READLINKAT => sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize),
         nr::SPAWN => sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
         nr::KILL => sys_kill(args[0] as u32, args[1] as u32),
         nr::WAITPID => sys_waitpid(args[0] as u32, args[1]),
@@ -1540,6 +1546,8 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
         }
     };
 
+    let path = crate::vfs::resolve_symlinks(&path);
+
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
@@ -1672,7 +1680,27 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
         crate::vfs::resolve_path(&base_path, &path)
     };
     
-    if let Ok(meta) = crate::vfs::metadata(&resolved_path) {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
+
+    if !follow && crate::vfs::is_symlink(&resolved_path) {
+        let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
+        let stat = Stat {
+            st_dev: 1,
+            st_ino: 1,
+            st_size: target.len() as i64,
+            st_mode: 0o120777, // S_IFLNK | 0777
+            st_nlink: 1,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
+    let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
+
+    if let Ok(meta) = crate::vfs::metadata(&final_path) {
         let stat = Stat { 
             st_dev: 1,
             st_ino: meta.inode,
@@ -1681,6 +1709,21 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
             st_nlink: if meta.is_dir { 2 } else { 1 },
             st_blksize: 4096,
             ..Default::default() 
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
+    if crate::vfs::is_symlink(&final_path) {
+        let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
+        let stat = Stat {
+            st_dev: 1,
+            st_ino: 1,
+            st_size: target.len() as i64,
+            st_mode: 0o120777,
+            st_nlink: 1,
+            st_blksize: 4096,
+            ..Default::default()
         };
         unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
         return 0;
@@ -1747,7 +1790,8 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
         crate::vfs::resolve_path(&base_path, &path)
     };
     
-    if crate::fs::exists(&resolved_path) {
+    let final_path = crate::vfs::resolve_symlinks(&resolved_path);
+    if crate::fs::exists(&final_path) || crate::vfs::is_symlink(&resolved_path) {
         0
     } else {
         ENOENT
@@ -2056,6 +2100,52 @@ fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64
     let newpath = resolve_path_at(newdirfd, &raw_new);
     crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
+}
+
+fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
+    let target = match copy_from_user_str(target_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let raw_link = match copy_from_user_str(linkpath_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let link_path = resolve_path_at(newdirfd, &raw_link);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
+    }
+    match crate::vfs::create_symlink(&link_path, &target) {
+        Ok(_) => 0,
+        Err(_) => !0u64,
+    }
+}
+
+fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> u64 {
+    let oldpath = match copy_from_user_str(oldpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
+    let newpath = match copy_from_user_str(newpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
+    let src = resolve_path_at(_olddirfd, &oldpath);
+    let dst = resolve_path_at(_newdirfd, &newpath);
+    if let Ok(data) = crate::fs::read_file(&src) {
+        if crate::fs::write_file(&dst, &data).is_ok() { return 0; }
+    }
+    !0u64
+}
+
+fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path = resolve_path_at(dirfd, &raw_path);
+    if let Some(target) = crate::vfs::read_symlink(&path) {
+        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        let bytes = target.as_bytes();
+        let copy_len = bytes.len().min(bufsize);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        return copy_len as u64;
+    }
+    EINVAL
 }
 
 fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {

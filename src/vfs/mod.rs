@@ -9,6 +9,7 @@ pub mod memory;
 pub mod proc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
@@ -655,6 +656,55 @@ pub fn list_mounts() -> Result<Vec<MountInfo>, FsError> {
         .collect();
 
     Ok(mounts)
+}
+
+// ============================================================================
+// Symlink Support
+// ============================================================================
+
+static SYMLINKS: Spinlock<Option<BTreeMap<String, String>>> = Spinlock::new(None);
+
+pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
+    let link = canonicalize_path(link_path);
+    let mut table = SYMLINKS.lock();
+    if table.is_none() { *table = Some(BTreeMap::new()); }
+    table.as_mut().unwrap().insert(link, String::from(target));
+    Ok(())
+}
+
+pub fn read_symlink(path: &str) -> Option<String> {
+    let canonical = canonicalize_path(path);
+    let table = SYMLINKS.lock();
+    table.as_ref().and_then(|t| t.get(&canonical).cloned())
+}
+
+pub fn is_symlink(path: &str) -> bool {
+    let canonical = canonicalize_path(path);
+    let table = SYMLINKS.lock();
+    table.as_ref().map_or(false, |t| t.contains_key(&canonical))
+}
+
+/// Resolve a path, following symlinks (up to 8 levels to prevent loops)
+pub fn resolve_symlinks(path: &str) -> String {
+    let mut resolved = canonicalize_path(path);
+    for _ in 0..8 {
+        let target = {
+            let table = SYMLINKS.lock();
+            table.as_ref().and_then(|t| t.get(&resolved).cloned())
+        };
+        match target {
+            Some(t) => {
+                if t.starts_with('/') {
+                    resolved = canonicalize_path(&t);
+                } else {
+                    let (parent, _) = split_path(&resolved);
+                    resolved = resolve_path(parent, &t);
+                }
+            }
+            None => break,
+        }
+    }
+    resolved
 }
 
 /// Get mount points that are direct children of a directory
