@@ -545,7 +545,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
                     if socket::is_udp_socket(idx) {
                         socket_get_udp_handle(idx).map_or(false, |h| crate::smoltcp_net::udp_can_send(h))
                     } else {
-                        true
+                        socket_can_send_tcp(idx)
                     }
                 } else {
                     true
@@ -650,7 +650,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
                                     fd.revents |= 4;
                                 }
                             }
-                        } else {
+                        } else if socket_can_send_tcp(idx) {
                             fd.revents |= 4;
                         }
                     } else if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
@@ -2805,6 +2805,19 @@ fn socket_can_recv_tcp(idx: usize) -> bool {
             crate::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                 s.can_recv() || !s.is_active()
+            }).unwrap_or(false)
+        } else {
+            false
+        }
+    }).unwrap_or(false)
+}
+
+fn socket_can_send_tcp(idx: usize) -> bool {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Stream(h) = &sock.inner {
+            crate::smoltcp_net::with_network(|net| {
+                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                s.can_send()
             }).unwrap_or(false)
         } else {
             false
