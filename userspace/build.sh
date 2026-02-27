@@ -47,17 +47,6 @@ for member in "${MEMBERS[@]}"; do
             echo "Warning: libc archive not found at $LIBC_ARCHIVE"
         fi
     fi
-    # Grab ld-musl-aarch64.so.1 from Alpine (GCC-built, includes libgcc builtins)
-    if [ "$member" == "musl" ]; then
-        mkdir -p ../bootstrap/lib/
-        if ! [ -f ../bootstrap/lib/ld-musl-aarch64.so.1 ]; then
-            echo "Fetching ld-musl-aarch64.so.1 from Alpine..."
-            docker run --rm --platform linux/arm64 \
-                -v "$(cd .. && pwd)/bootstrap/lib:/out" \
-                alpine:latest cp /lib/ld-musl-aarch64.so.1 /out/
-            echo "Installed dynamic linker to ../bootstrap/lib/ld-musl-aarch64.so.1"
-        fi
-    fi
     # Special handling for xbps to copy its package archive
     if [ "$member" == "xbps" ]; then
         XBPS_ARCHIVE="xbps/dist/xbps.tar"

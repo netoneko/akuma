@@ -2635,17 +2635,24 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     };
 
     if let Some(proc) = crate::process::current_process() {
+        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+        let initial_flags = if is_file_backed {
+            crate::mmu::user_flags::RW_NO_EXEC
+        } else {
+            page_flags
+        };
+
         let mut frames = alloc::vec::Vec::new();
         for i in 0..pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 frames.push(frame);
-                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, page_flags); }
+                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
                 proc.address_space.track_user_frame(frame);
             } else { return !0u64; }
         }
         crate::process::record_mmap_region(mmap_addr, frames);
 
-        if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+        if is_file_backed {
             if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
                 let path = f.path.clone();
                 let mut buf = alloc::vec![0u8; len];
@@ -2657,6 +2664,11 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] mmap(fd={}, file={}, off={}, len={}) = 0x{:x} (read {} bytes)\n", fd, &path, offset, len, mmap_addr, copy_len);
                     }
+                }
+            }
+            if page_flags != initial_flags {
+                for i in 0..pages {
+                    let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
                 }
             }
         }
