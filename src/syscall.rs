@@ -232,6 +232,7 @@ pub mod nr {
     pub const FDATASYNC: u64 = 83;
     pub const FSYNC: u64 = 82;
     pub const FCHMOD: u64 = 52;
+    pub const FCHOWNAT: u64 = 54;
     pub const MADVISE: u64 = 233;
 }
 
@@ -537,6 +538,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FDATASYNC => 0, // stub — single block device, always coherent
         nr::FSYNC => 0, // stub — single block device, always coherent
         nr::FCHMOD => 0, // stub — no permission enforcement
+        nr::FCHOWNAT => 0, // stub — single-user OS, no ownership
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
@@ -1294,7 +1296,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
     };
 
     let path = if raw_path.starts_with('/') {
-        raw_path
+        crate::vfs::canonicalize_path(&raw_path)
     } else {
         let base = if dirfd == -100 { // AT_FDCWD
             if let Some(proc) = crate::process::current_process() {
@@ -1320,10 +1322,8 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
         };
         if raw_path == "." || raw_path.is_empty() {
             base
-        } else if base == "/" {
-            alloc::format!("/{}", raw_path)
         } else {
-            alloc::format!("{}/{}", base, raw_path)
+            crate::vfs::resolve_path(&base, &raw_path)
         }
     };
 
@@ -1788,34 +1788,40 @@ fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
     };
 
     let resolved = if path.starts_with('/') {
-        String::from(&path)
+        crate::vfs::canonicalize_path(&path)
     } else {
         let base = if dirfd == -100 {
             if let Some(proc) = crate::process::current_process() {
                 proc.cwd.clone()
             } else {
-                return !0u64;
+                return EBADF;
             }
         } else if dirfd >= 0 {
             if let Some(proc) = crate::process::current_process() {
                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path.clone()
                 } else {
-                    return !0u64;
+                    return EBADF;
                 }
             } else {
-                return !0u64;
+                return EBADF;
             }
         } else {
-            return !0u64;
+            return EBADF;
         };
         crate::vfs::resolve_path(&base, &path)
     };
 
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(256, "[syscall] unlinkat({}) flags=0x{:x}\n", &resolved, flags);
+    }
+
     const AT_REMOVEDIR: u32 = 0x200;
     if flags & AT_REMOVEDIR != 0 {
+        if !crate::fs::exists(&resolved) { return ENOENT; }
         if crate::fs::remove_dir(&resolved).is_ok() { 0 } else { !0u64 }
     } else {
+        if !crate::fs::exists(&resolved) { return ENOENT; }
         if crate::fs::remove_file(&resolved).is_ok() { 0 } else { !0u64 }
     }
 }

@@ -140,12 +140,20 @@ fn main() {
         }
     }
 
-    // .gitkeep for empty dirs
-    for dir in [&apk_cache, &apk_db] {
-        let gitkeep = dir.join(".gitkeep");
-        if !gitkeep.exists() {
-            fs::write(&gitkeep, "").unwrap();
-        }
+    // Seed the APK database so `apk add` works without --initdb
+    let installed = apk_db.join("installed");
+    if !installed.exists() {
+        fs::write(&installed, "").unwrap();
+    }
+    let triggers = apk_db.join("triggers");
+    if !triggers.exists() {
+        fs::write(&triggers, "").unwrap();
+    }
+
+    // .gitkeep for empty cache dir
+    let gitkeep = apk_cache.join(".gitkeep");
+    if !gitkeep.exists() {
+        fs::write(&gitkeep, "").unwrap();
     }
 
     println!("cargo:rerun-if-changed=build.rs");
