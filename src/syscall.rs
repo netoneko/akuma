@@ -140,6 +140,7 @@ pub mod nr {
     pub const EXIT: u64 = 93;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
     pub const IOCTL: u64 = 29;
     pub const BRK: u64 = 214;
@@ -228,6 +229,10 @@ pub mod nr {
     pub const FLOCK: u64 = 32;
     pub const UMASK: u64 = 166;
     pub const UTIMENSAT: u64 = 88;
+    pub const FDATASYNC: u64 = 83;
+    pub const FSYNC: u64 = 82;
+    pub const FCHMOD: u64 = 52;
+    pub const MADVISE: u64 = 233;
 }
 
 /// Thread CPU statistics for top command
@@ -440,6 +445,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
+        nr::READV => sys_readv(args[0], args[1], args[2] as usize),
         nr::WRITEV => sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
         nr::DUP3 => sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
@@ -524,6 +530,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FLOCK => 0, // stub — single-user OS, no contention
         nr::UMASK => 0o022, // stub — return default umask, ignore argument
         nr::UTIMENSAT => 0, // stub — timestamps not critical
+        nr::FDATASYNC => 0, // stub — single block device, always coherent
+        nr::FSYNC => 0, // stub — single block device, always coherent
+        nr::FCHMOD => 0, // stub — no permission enforcement
+        nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1182,6 +1192,23 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 struct IoVec {
     iov_base: u64,
     iov_len: usize,
+}
+
+fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let mut total_read: u64 = 0;
+    for i in 0..iov_cnt {
+        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        if iov.iov_len == 0 { continue; }
+        let n = sys_read(fd_num, iov.iov_base, iov.iov_len);
+        if (n as i64) < 0 {
+            if total_read == 0 { return n; }
+            break;
+        }
+        total_read += n;
+        if (n as usize) < iov.iov_len { break; }
+    }
+    total_read
 }
 
 fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
@@ -2076,6 +2103,21 @@ fn sys_mmap(addr: usize, len: usize, _prot: u32, _flags: u32) -> u64 {
         crate::process::record_mmap_region(mmap_addr, frames);
         mmap_addr as u64
     } else { !0u64 }
+}
+
+fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
+    const MADV_DONTNEED: i32 = 4;
+    if advice == MADV_DONTNEED && len > 0 {
+        let aligned_addr = addr & !0xFFF;
+        let aligned_end = (addr + len + 0xFFF) & !0xFFF;
+        let aligned_len = aligned_end - aligned_addr;
+        if aligned_len <= 128 * 1024 * 1024 {
+            unsafe {
+                core::ptr::write_bytes(aligned_addr as *mut u8, 0, aligned_len);
+            }
+        }
+    }
+    0
 }
 
 fn sys_munmap(addr: usize, _len: usize) -> u64 {

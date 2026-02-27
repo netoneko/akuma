@@ -90,6 +90,22 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 
 **Fix:** Stubbed to return 0. File timestamps are not critical for XBPS operation.
 
+### fdatasync (83) / fsync (82)
+
+**Symptom:** `[syscall] Unknown syscall: 83` after importing a repository public key.
+
+**Cause:** XBPS calls `fdatasync()` to flush the public key file to disk after writing it to `/var/db/xbps/keys/`.
+
+**Fix:** Stubbed to return 0. Akuma uses a single block device with no write-back cache, so data is effectively written immediately.
+
+### fchmod (52)
+
+**Symptom:** `[syscall] Unknown syscall: 52` immediately after `fdatasync`, still during key import.
+
+**Cause:** After writing the public key file, XBPS calls `fchmod(fd, 0644)` to set restrictive permissions on it.
+
+**Fix:** Stubbed to return 0. Akuma doesn't enforce file permissions.
+
 ## Already implemented (used by XBPS)
 
 | Syscall | Number | Notes |
@@ -120,6 +136,9 @@ Also required `/etc/resolv.conf` with `nameserver 10.0.2.3` (QEMU's DNS forwarde
 | setsockopt | 208 | Socket options (stubbed) |
 | getsockopt | 209 | Socket options (stubbed) |
 | ppoll | 73 | I/O multiplexing |
+| fdatasync | 83 | Flush file data (stubbed) |
+| fsync | 82 | Flush file data (stubbed) |
+| fchmod | 52 | File permissions (stubbed) |
 | mmap/munmap | 222/215 | Memory mapping |
 | brk | 214 | Heap management |
 | dup3 | 24 | File descriptor duplication |
