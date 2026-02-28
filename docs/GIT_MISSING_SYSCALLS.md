@@ -181,6 +181,34 @@ Three bugs combined:
    and call `vfs::chmod()`. `fchmodat` handles `AT_FDCWD` and real directory
    fds for proper relative path resolution.
 
+## Issue 4: `O_CREAT` Did Not Create File on Disk
+
+### Symptoms
+
+```
+error: chmod on /meow/.git/config.lock failed: No such file or directory
+fatal: could not set 'core.filemode' to 'true'
+```
+
+### Root Cause
+
+`sys_openat` with `O_CREAT` (without `O_TRUNC`) only allocated a file
+descriptor but never created the file on the ext2 filesystem. The file was
+created lazily on first `write()` (ext2's `write_at` auto-creates missing
+files). Git opens lockfiles with `O_CREAT | O_WRONLY | O_EXCL` (no `O_TRUNC`)
+and calls `fchmod(fd, mode)` before writing any data. Since the file didn't
+exist on disk yet, `fchmod` → `vfs::chmod` → ext2 `lookup_path` returned
+`NotFound`.
+
+### Fix
+
+**File:** `src/syscall.rs`
+
+Changed `sys_openat` to create the file on disk immediately when `O_CREAT` is
+set and the file doesn't exist, rather than waiting for the first write. The
+`O_TRUNC` path was also adjusted to only truncate when the file already
+exists (previously it could create-then-truncate redundantly).
+
 ## Future Work
 
 Other device files that programs commonly expect:

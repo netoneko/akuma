@@ -1797,7 +1797,10 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
     }
 
     if let Some(proc) = crate::process::current_process() {
-        if flags & crate::process::open_flags::O_TRUNC != 0 {
+        let file_existed = crate::fs::exists(&path);
+        if !file_existed && (flags & crate::process::open_flags::O_CREAT != 0) {
+            let _ = crate::fs::write_file(&path, &[]);
+        } else if file_existed && (flags & crate::process::open_flags::O_TRUNC != 0) {
             let _ = crate::fs::write_file(&path, &[]);
         }
         let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.clone(), flags)));
