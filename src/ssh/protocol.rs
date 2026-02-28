@@ -520,25 +520,18 @@ impl Write for SshChannelStream<'_> {
             sent += chunk_size;
         }
 
-        let flush_start = crate::timer::uptime_us();
-        let flush_result = crate::kernel_timer::with_timeout(
-            SSH_INTERACTIVE_READ_TIMEOUT,
-            self.flush()
-        ).await;
-        let flush_us = crate::timer::uptime_us() - flush_start;
-
-        let tx_drops_after = crate::smoltcp_net::tx_drop_count();
-        if tx_drops_after > tx_drops_before {
-            log(&alloc::format!(
-                "[SSH-TX-DROP] {} packets dropped during write ({} bytes), flush took {}us\n",
-                tx_drops_after - tx_drops_before, buf.len(), flush_us
-            ));
-        }
-        if flush_result.is_err() {
-            log(&alloc::format!(
-                "[SSH-FLUSH-TIMEOUT] flush timed out after {}us for {} bytes\n",
-                flush_us, buf.len()
-            ));
+        // For large writes, flush to apply TCP backpressure.
+        // For small interactive writes (echo), skip the flush — the data
+        // is transmitted on the next smoltcp_net::poll() call in block_on's
+        // Pending handler. Waiting for the remote ACK here just blocks the
+        // read loop and adds visible latency to keystroke echo.
+        if buf.len() > 128 {
+            let _ = crate::kernel_timer::with_timeout(
+                SSH_INTERACTIVE_READ_TIMEOUT,
+                self.flush()
+            ).await;
+        } else {
+            crate::smoltcp_net::poll();
         }
 
         Ok(buf.len())
@@ -546,7 +539,6 @@ impl Write for SshChannelStream<'_> {
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
         self.stream.flush().await.map_err(|_| SshStreamError)?;
-        crate::threading::yield_now();
         Ok(())
     }
 }

@@ -289,6 +289,41 @@ caller (e.g., `0755` for executables), matching Linux behavior.
 **Note:** Requires re-populating the disk image so that packages are
 extracted with the fix in place.
 
+## Issue 7: Fork Doesn't Copy Dynamic Linker Pages
+
+### Symptoms
+
+After fixing permissions (issue 6) and clone3 (issue 5), git successfully
+calls `clone(flags=0x11)` to fork a child process. The child immediately
+crashes:
+
+```
+[Fault] Instruction abort from EL0 at FAR=0x3004839c, ISS=0x6
+```
+
+ISS=0x6 is a level-2 translation fault: the page is not mapped.
+
+### Root Cause
+
+The dynamic linker (`ld-musl-aarch64.so.1`) is loaded at `0x3000_0000` by
+`load_interpreter()` in `elf_loader.rs`. These pages are mapped directly
+into the address space but **not tracked in `mmap_regions`**. When
+`fork_process` copies memory, it copies:
+
+1. Stack (`0x3ffc0000–0x40000000`)
+2. Code + heap (`0x10000000` to `brk`)
+3. `mmap_regions` (tracked mmap pages)
+
+The interpreter at `0x3000_0000` falls outside all three ranges.
+
+### Fix
+
+**File:** `src/process.rs`
+
+Added an explicit copy of the interpreter region in `fork_process`, before
+the mmap copy. Scans `0x3000_0000` through `0x3020_0000` (2 MB) using the
+existing `copy_range_phys` helper, which skips unmapped pages automatically.
+
 ## Future Work
 
 Other device files that programs commonly expect:

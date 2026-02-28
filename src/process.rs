@@ -2112,15 +2112,24 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     copy_range_phys(parent_l0, stack_start, stack_size, &mut new_proc.address_space)?;
 
-    // Copy code+heap range. Use memory.code_end as the start of the loaded
-    // binary (for PIE at 0x10000000, this avoids scanning 250MB of unmapped pages).
-    let code_start = if parent.entry_point >= 0x1000_0000 {
-        parent.entry_point & !0xFFFFF // round down to 1MB boundary
+    // Copy code+heap range.  Derive code_start from code_end (which is
+    // always in the main binary's range) rather than entry_point (which
+    // points into the interpreter for dynamically-linked binaries).
+    let code_start = if parent.memory.code_end >= 0x1000_0000 {
+        0x1000_0000 // PIE binary base
     } else {
         0x400000
     };
     if parent.brk > code_start {
         copy_range_phys(parent_l0, code_start, parent.brk - code_start, &mut new_proc.address_space)?;
+    }
+
+    // Copy dynamic linker / interpreter region (0x3000_0000).  These pages
+    // are mapped by the ELF loader but not tracked in mmap_regions.
+    let interp_base = 0x3000_0000usize;
+    let interp_scan_size = 2 * 1024 * 1024; // 2 MB — covers even large musl builds
+    if mmu::translate_user_va(parent_l0, interp_base).is_some() {
+        copy_range_phys(parent_l0, interp_base, interp_scan_size, &mut new_proc.address_space)?;
     }
 
     // Copy mmap regions so forked children can run built-in applets (e.g.
