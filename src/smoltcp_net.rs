@@ -58,8 +58,15 @@ static NETWORK_READY: AtomicBool = AtomicBool::new(false);
 /// Atomic counter incremented when progress is made (e.g. packets processed)
 static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Counter for silently dropped TX packets (VirtIO send failures)
+static TX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 pub fn is_ready() -> bool {
     NETWORK_READY.load(Ordering::Acquire)
+}
+
+pub fn tx_drop_count() -> usize {
+    TX_DROP_COUNT.load(Ordering::Relaxed)
 }
 
 /// Returns true once DHCP has acquired a lease (Configured event was processed).
@@ -205,7 +212,9 @@ impl<'a> smoltcp::phy::TxToken for VirtioTxToken<'a> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let res = f(&mut self.buffer[..len]);
-        let _ = self.inner.send(&self.buffer[..len]);
+        if let Err(_e) = self.inner.send(&self.buffer[..len]) {
+            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         res
     }
 }
@@ -376,8 +385,9 @@ impl<'a> smoltcp::phy::TxToken for LoopbackAwareTxToken<'a> {
             frame.copy_from_slice(&self.virtio_buffer[..len]);
             self.loopback_queue.push_back(frame);
         } else {
-            // External: send through VirtIO
-            let _ = self.virtio_inner.send(&self.virtio_buffer[..len]);
+            if let Err(_e) = self.virtio_inner.send(&self.virtio_buffer[..len]) {
+                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         res

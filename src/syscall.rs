@@ -284,6 +284,7 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 79;  // Linux arm64 newfstatat
     pub const FACCESSAT: u64 = 48;   // Linux arm64 faccessat
     pub const CLOCK_GETTIME: u64 = 113; // Linux arm64 clock_gettime
+    pub const CLONE3: u64 = 435;        // Linux arm64 clone3
     pub const FACCESSAT2: u64 = 439;    // Linux arm64 faccessat2
     pub const WAIT4: u64 = 260;         // Linux arm64 wait4
     // Custom syscalls (300+)
@@ -694,7 +695,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         return EINTR;
     }
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL {
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
@@ -733,6 +734,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MMAP => sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        nr::CLONE3 => sys_clone3(args[0], args[1] as usize),
         nr::EXECVE => sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => sys_uptime(),
         nr::RESOLVE_HOST => sys_resolve_host(args[0], args[1] as usize, args[2]),
@@ -1717,7 +1719,7 @@ fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
     }
 }
 
-fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
+fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
     let raw_path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1800,6 +1802,9 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
         let file_existed = crate::fs::exists(&path);
         if !file_existed && (flags & crate::process::open_flags::O_CREAT != 0) {
             let _ = crate::fs::write_file(&path, &[]);
+            if mode & 0o7777 != 0 {
+                let _ = crate::vfs::chmod(&path, mode & 0o7777);
+            }
         } else if file_existed && (flags & crate::process::open_flags::O_TRUNC != 0) {
             let _ = crate::fs::write_file(&path, &[]);
         }
@@ -1966,6 +1971,9 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
     let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
 
     if let Ok(meta) = crate::vfs::metadata(&final_path) {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
+        }
         let stat = Stat { 
             st_dev: 1,
             st_ino: meta.inode,
@@ -1997,6 +2005,9 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
         return 0;
     }
     
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[syscall] newfstatat: ENOENT {}\n", final_path);
+    }
     ENOENT
 }
 
@@ -2119,6 +2130,9 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     if crate::fs::exists(&final_path) || crate::vfs::is_symlink(&resolved_path) {
         0
     } else {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] faccessat: ENOENT {}\n", final_path);
+        }
         ENOENT
     }
 }
@@ -2161,6 +2175,38 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u6
         crate::safe_print!(128, "[syscall] clone: flags not supported, returning ENOSYS\n");
     }
     ENOSYS
+}
+
+fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
+    #[repr(C)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+    }
+
+    if !validate_user_ptr(cl_args_ptr, size.min(core::mem::size_of::<CloneArgs>())) {
+        return EFAULT;
+    }
+
+    let cl_args = unsafe { &*(cl_args_ptr as *const CloneArgs) };
+    let flags = cl_args.flags | cl_args.exit_signal;
+    let stack = if cl_args.stack != 0 {
+        cl_args.stack + cl_args.stack_size
+    } else {
+        0
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+    }
+
+    sys_clone(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid)
 }
 
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {

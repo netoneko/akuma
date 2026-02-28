@@ -508,7 +508,8 @@ impl Write for SshChannelStream<'_> {
             return Err(SshStreamError);
         }
 
-        // Send data in chunks to avoid packet size issues
+        let tx_drops_before = crate::smoltcp_net::tx_drop_count();
+
         let mut sent = 0;
         while sent < buf.len() {
             let chunk_size = (buf.len() - sent).min(SSH_CHANNEL_MAX_CHUNK);
@@ -519,20 +520,32 @@ impl Write for SshChannelStream<'_> {
             sent += chunk_size;
         }
 
-        // Auto-flush to ensure immediate transmission for interactive sessions
-        // Use a timeout (10ms) to prevent blocking if the network is backed up
-        let _ = crate::kernel_timer::with_timeout(
+        let flush_start = crate::timer::uptime_us();
+        let flush_result = crate::kernel_timer::with_timeout(
             SSH_INTERACTIVE_READ_TIMEOUT,
             self.flush()
         ).await;
-        
+        let flush_us = crate::timer::uptime_us() - flush_start;
+
+        let tx_drops_after = crate::smoltcp_net::tx_drop_count();
+        if tx_drops_after > tx_drops_before {
+            log(&alloc::format!(
+                "[SSH-TX-DROP] {} packets dropped during write ({} bytes), flush took {}us\n",
+                tx_drops_after - tx_drops_before, buf.len(), flush_us
+            ));
+        }
+        if flush_result.is_err() {
+            log(&alloc::format!(
+                "[SSH-FLUSH-TIMEOUT] flush timed out after {}us for {} bytes\n",
+                flush_us, buf.len()
+            ));
+        }
+
         Ok(buf.len())
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        // Flush the underlying TCP stream to push data to network driver
         self.stream.flush().await.map_err(|_| SshStreamError)?;
-        // Yield to give network runner a chance to transmit
         crate::threading::yield_now();
         Ok(())
     }
@@ -958,6 +971,7 @@ async fn run_shell_session(
     let mut history_index: usize = 0;
     let mut saved_line: Vec<u8> = Vec::new(); // Save current line when navigating history
 
+    let mut last_read_time_us: u64 = 0;
     
     loop {
         // Read input
@@ -967,6 +981,18 @@ async fn run_shell_session(
                 break;
             }
             Ok(n) => {
+                let read_time = crate::timer::uptime_us();
+                if last_read_time_us > 0 {
+                    let gap = read_time - last_read_time_us;
+                    if gap < 2_000_000 {
+                        log(&alloc::format!(
+                            "[SSH-ECHO] read gap={}us, {} bytes\n",
+                            gap, n
+                        ));
+                    }
+                }
+                last_read_time_us = read_time;
+
                 // Determine if the current foreground process is in raw mode
                 let is_raw_mode = if let Some(channel) = &channel_stream.current_process_channel {
                     (*channel).is_raw_mode()
@@ -1156,13 +1182,19 @@ async fn run_shell_session(
                                         }
                                     }
                                     _ if byte >= 0x20 && byte < 0x7F => {
-                                        // Printable character - insert at cursor position
                                         line_buffer.insert(cursor_pos, byte);
                                         cursor_pos += 1;
 
-                                        // Write character and rest of line
+                                        let echo_start = crate::timer::uptime_us();
                                         let _ =
                                             channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
+                                        let echo_us = crate::timer::uptime_us() - echo_start;
+                                        if echo_us > 5_000 {
+                                            log(&alloc::format!(
+                                                "[SSH-ECHO-SLOW] echo took {}us for '{}'\n",
+                                                echo_us, byte as char
+                                            ));
+                                        }
                                         // Move cursor back to position
                                         let moves = line_buffer.len() - cursor_pos;
                                         for _ in 0..moves {

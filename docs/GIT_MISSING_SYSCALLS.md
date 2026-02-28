@@ -209,6 +209,86 @@ set and the file doesn't exist, rather than waiting for the first write. The
 `O_TRUNC` path was also adjusted to only truncate when the file already
 exists (previously it could create-then-truncate redundantly).
 
+## Issue 5: `clone3` Syscall Not Implemented
+
+### Symptoms
+
+```
+fatal: unable to find remote helper for 'https'
+```
+
+Kernel log showed pipes being created and immediately destroyed with no
+`[syscall] clone(...)` or `[Process] Spawning ...` output, even though
+`SYSCALL_DEBUG_INFO_ENABLED` was on. Git was unable to fork a child process
+to run `git-remote-https`.
+
+### Root Cause
+
+Musl libc on Alpine (>= 1.2.4) uses `clone3` (syscall 435) in
+`posix_spawn` before falling back to `clone` (syscall 220). The kernel had
+no handler for syscall 435, so it returned `ENOSYS`. Depending on musl
+version, the fallback to `clone` may not work correctly for all
+`posix_spawn` use cases, causing the spawn to fail silently.
+
+### Fix
+
+**File:** `src/syscall.rs`
+
+Added `clone3` support:
+
+- New syscall constant `CLONE3 = 435` and dispatch entry.
+- `sys_clone3` reads the `clone_args` struct from userspace, extracts
+  `flags`, `exit_signal`, `stack`, and `stack_size`, then delegates to
+  the existing `sys_clone` implementation.
+- The `clone_args` struct follows the Linux ABI: flags and exit_signal are
+  combined (clone3 separates them, clone combines them in the low bits),
+  and stack is passed as base + size (clone3 uses base/size, clone uses
+  top-of-stack).
+
+## Issue 6: `O_CREAT` Ignoring `mode` Parameter (File Permissions Lost)
+
+### Symptoms
+
+```
+fatal: unable to find remote helper for 'https'
+```
+
+Syscall tracing revealed that git stat'd `/usr/bin/git` and got
+`mode=0o100644` (no execute bit). Git's `is_executable()` check requires
+`S_IXUSR` and returned false. Without finding itself in PATH, git could
+not derive `GIT_EXEC_PATH` and could not locate `git-remote-https` in
+`/usr/libexec/git-core/`. Git gave up without even attempting fork/exec.
+
+### Root Cause
+
+`sys_openat` with `O_CREAT` created new files via `write_file(&path, &[])`
+which always gives ext2's default permissions (`0644`). The `mode`
+parameter from the syscall (e.g., `0755` for executables) was completely
+ignored (named `_mode`). When `apk` extracted packages, executables were
+created as `0644` instead of `0755`.
+
+### Fix
+
+**File:** `src/syscall.rs`
+
+Changed `sys_openat` to apply the `mode` parameter after creating a new
+file with `O_CREAT`:
+
+```rust
+if !file_existed && (flags & O_CREAT != 0) {
+    let _ = crate::fs::write_file(&path, &[]);
+    if mode & 0o7777 != 0 {
+        let _ = crate::vfs::chmod(&path, mode & 0o7777);
+    }
+}
+```
+
+This ensures newly created files get the permissions specified by the
+caller (e.g., `0755` for executables), matching Linux behavior.
+
+**Note:** Requires re-populating the disk image so that packages are
+extracted with the fix in place.
+
 ## Future Work
 
 Other device files that programs commonly expect:
