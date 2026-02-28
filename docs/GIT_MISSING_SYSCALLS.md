@@ -1,7 +1,8 @@
 # Git (Alpine apk) -- Missing Syscalls and Fixes
 
-Alpine's `git` (via `apk add git`) required two kernel fixes before it
-could run. This document records the root causes and fixes applied.
+Alpine's `git` (via `apk add git`) required twelve kernel fixes before
+`git clone https://...` worked end-to-end. This document records the
+root causes and fixes applied.
 
 ## Issue 1: No `/dev/null` Device
 
@@ -423,6 +424,103 @@ fork paths. Delegates to `clone_thread()`.
 **5. `membarrier` stub (syscall.rs)**
 
 Added syscall 283 as a no-op returning 0. Safe on a single-CPU system.
+
+## Issue 10: `pread64` Not Implemented (index-pack fails)
+
+### Symptoms
+
+```
+fatal: cannot pread pack file: Function not implemented
+fatal: fetch-pack: invalid index-pack output
+```
+
+Git successfully received all 991 objects, but `index-pack` failed when
+trying to read individual objects from the downloaded pack file.
+
+### Root Cause
+
+Syscall 67 (`pread64`) was not implemented. `pread64` reads from a file
+at a specific offset without changing the file descriptor's position —
+essential for random access into pack files. Syscall 103 (`setitimer`)
+was also missing; git uses it for progress display timing.
+
+### Fix
+
+**File:** `src/syscall.rs`
+
+- **`sys_pread64`** — reads from a file at a caller-specified offset via
+  `crate::fs::read_at()`, without modifying the fd position. Handles
+  `DevNull` (returns 0/EOF).
+- **`sys_pwrite64`** — write counterpart, added for completeness.
+- **`setitimer`** — stubbed as no-op returning 0.
+
+## Issue 11: `CLONE_CHILD_CLEARTID` Not Implemented (pthread_join hangs)
+
+### Symptoms
+
+```
+Resolving deltas: 100% (637/637), done.
+```
+
+Git completed the clone (100% objects, 100% deltas) but never returned
+control to the shell. The kernel heartbeat showed `wait=1` — one thread
+blocked forever.
+
+### Root Cause
+
+After the async thread (PID 32, created via `CLONE_THREAD` in issue 9)
+exited, `pthread_join` in the main git process looped on
+`futex_wait(&thread->tid, tid_value)`. Linux's `CLONE_CHILD_CLEARTID`
+contract requires the kernel to:
+
+1. Write 0 to `*clear_child_tid` when the thread exits
+2. Wake the futex at that address
+
+Neither step was implemented. The TID address still contained the
+child's PID, so `futex_wait` never saw a value change.
+
+### Fix
+
+**Files:** `src/process.rs`, `src/syscall.rs`
+
+**1. Added `clear_child_tid: u64` to `Process` struct**
+
+Stores the userspace address where the kernel must write 0 on exit. Set
+by `clone_thread()` (from the `child_tid` argument) and by the
+`set_tid_address` syscall (which musl calls during thread init).
+
+**2. `set_tid_address` syscall now functional**
+
+Previously returned a hardcoded 1. Now stores the pointer in
+`proc.clear_child_tid` and returns the process PID.
+
+**3. `return_to_kernel()` clears TID and wakes futex**
+
+Before deactivating the user address space (while pages are still
+mapped), writes 0 to `clear_child_tid` and calls `futex_wake()`. This
+unblocks any `pthread_join` waiter.
+
+**4. Added `pub fn futex_wake()`**
+
+Public wrapper in `syscall.rs` callable from `process.rs`.
+
+## Summary
+
+With all 11 fixes, `git clone https://...` works end-to-end on Akuma:
+
+| Issue | Error | Root Cause |
+|-------|-------|------------|
+| 1 | `could not open '/dev/null'` | No `/dev/null` device |
+| 2 | `Operation not permitted` | `mkdirat` returned wrong errno |
+| 3 | Permissions always 644 | `chmod`/`stat` not wired to ext2 |
+| 4 | `chmod on config.lock failed` | `O_CREAT` lazy file creation |
+| 5 | `unable to find remote helper` | `clone3` syscall missing |
+| 6 | `unable to find remote helper` | `O_CREAT` ignoring `mode` |
+| 7 | Child crash at `0x3004XXXX` | Fork missing interpreter pages |
+| 8 | Child crash at `0x101bXXXX` | Fork missing main binary pages |
+| 9 | `cannot create async thread` | `CLONE_THREAD` not implemented |
+| 10 | `cannot pread pack file` | `pread64` not implemented |
+| 11 | Hangs after "done" | `CLONE_CHILD_CLEARTID` missing |
 
 ## Future Work
 

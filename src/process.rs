@@ -1325,6 +1325,9 @@ pub struct Process {
 
     /// PID to which this process has delegated its I/O (for reattach)
     pub delegate_pid: Option<Pid>,
+
+    /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID)
+    pub clear_child_tid: u64,
 }
 
 
@@ -1413,6 +1416,7 @@ impl Process {
             root_dir: String::from("/"),
             channel: None,
             delegate_pid: None,
+            clear_child_tid: 0,
         })
     }
 
@@ -1856,6 +1860,18 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         THREAD_PID_MAP.lock().remove(&tid);
     });
 
+    // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake futex.
+    // Must happen while user address space is still active.
+    if !already_terminated {
+        if let Some(proc) = lookup_process(pid.unwrap_or(0)) {
+            let tid_addr = proc.clear_child_tid;
+            if tid_addr != 0 {
+                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+                crate::syscall::futex_wake(tid_addr as usize, i32::MAX);
+            }
+        }
+    }
+
     // Deactivate user address space - restore boot TTBR0
     // CRITICAL: This must happen BEFORE we drop the Process (via unregister_process)
     // because Drop frees the page tables. If we drop first, TTBR0 would point to
@@ -2090,6 +2106,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         root_dir: parent.root_dir.clone(),
         channel: parent.channel.clone(),
         delegate_pid: None,
+        clear_child_tid: 0,
     });
     
     // 4. Perform memory copy
@@ -2302,6 +2319,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         root_dir: parent.root_dir.clone(),
         channel: parent.channel.clone(),
         delegate_pid: None,
+        clear_child_tid: child_tid_ptr,
     });
 
     let parent_tid = crate::threading::current_thread_id();

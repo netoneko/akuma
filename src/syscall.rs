@@ -343,6 +343,9 @@ pub mod nr {
     pub const GETRLIMIT: u64 = 163;
     pub const PRLIMIT64: u64 = 261;
     pub const EVENTFD2: u64 = 19;
+    pub const PREAD64: u64 = 67;         // Linux arm64 pread64
+    pub const PWRITE64: u64 = 68;        // Linux arm64 pwrite64
+    pub const SETITIMER: u64 = 103;      // Linux arm64 setitimer
     pub const MEMBARRIER: u64 = 283;     // Linux arm64 membarrier
 }
 
@@ -767,7 +770,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
-        nr::SET_TID_ADDRESS => 1, // Return dummy TID
+        nr::SET_TID_ADDRESS => sys_set_tid_address(args[0]),
         nr::EXIT_GROUP => sys_exit(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
@@ -811,6 +814,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRLIMIT => sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         nr::EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
+        nr::PREAD64 => sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
+        nr::PWRITE64 => sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
+        nr::SETITIMER => 0,
         nr::MEMBARRIER => 0,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
@@ -911,6 +917,14 @@ fn sys_uname(buf: u64) -> u64 {
     write_field(ptr, 5, b"(none)");         // domainname
 
     0
+}
+
+fn sys_set_tid_address(tidptr: u64) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.clear_child_tid = tidptr;
+        return proc.pid as u64;
+    }
+    1
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -1402,6 +1416,54 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         crate::process::FileDescriptor::DevNull => 0,
         _ => !0u64
+    }
+}
+
+fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+    if offset < 0 { return EINVAL; }
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+
+    match fd {
+        crate::process::FileDescriptor::File(ref f) => {
+            let limit = 64 * 1024;
+            let to_read = count.min(limit);
+            let mut temp = alloc::vec![0u8; to_read];
+            match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
+                Ok(n) => {
+                    if n > 0 {
+                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                    }
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
+                    }
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
+        }
+        crate::process::FileDescriptor::DevNull => 0,
+        _ => EBADF
+    }
+}
+
+fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+    if offset < 0 { return EINVAL; }
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+
+    match fd {
+        crate::process::FileDescriptor::File(ref f) => {
+            let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+            match crate::fs::write_at(&f.path, offset as usize, buf) {
+                Ok(n) => n as u64,
+                Err(_) => !0u64
+            }
+        }
+        crate::process::FileDescriptor::DevNull => count as u64,
+        _ => EBADF
     }
 }
 
@@ -3148,6 +3210,11 @@ fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         }
     }
     0
+}
+
+/// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)
+pub fn futex_wake(_uaddr: usize, _max_wake: i32) {
+    crate::threading::yield_now();
 }
 
 fn sys_futex(uaddr: usize, op: i32, val: u32, _timeout: u64, _uaddr2: usize, _val3: u32) -> u64 {
