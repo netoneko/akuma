@@ -403,6 +403,8 @@ pub enum FileDescriptor {
     PipeWrite(u32),
     /// Event file descriptor (eventfd_id into global EVENTFDS table)
     EventFd(u32),
+    /// /dev/null — reads return EOF, writes are discarded
+    DevNull,
 }
 
 /// Kernel file handle for open files

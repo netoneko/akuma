@@ -1396,6 +1396,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
         }
+        crate::process::FileDescriptor::DevNull => 0,
         _ => !0u64
     }
 }
@@ -1502,6 +1503,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
+        crate::process::FileDescriptor::DevNull => count as u64,
         _ => !0u64
     }
 }
@@ -1755,6 +1757,20 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, _mode: u32) -> u64 {
 
     let path = crate::vfs::resolve_symlinks(&path);
 
+    if path == "/dev/null" {
+        if let Some(proc) = crate::process::current_process() {
+            let fd = proc.alloc_fd(crate::process::FileDescriptor::DevNull);
+            if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat(/dev/null) = fd {} flags=0x{:x}\n", fd, flags);
+            }
+            return fd as u64;
+        }
+        return !0u64;
+    }
+
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
@@ -1823,6 +1839,9 @@ fn sys_close(fd: u32) -> u64 {
 
 fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
+        if let Some(crate::process::FileDescriptor::DevNull) = proc.get_fd(fd) {
+            return 0;
+        }
         let mut new_pos = 0i64;
         let mut success = false;
         proc.update_fd(fd, |entry| {
@@ -1838,20 +1857,42 @@ fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 
 #[repr(C)] #[derive(Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
 
+const fn makedev(major: u64, minor: u64) -> u64 {
+    (major << 8) | minor
+}
+
 fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
     let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
-    if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
-        if let Ok(meta) = crate::vfs::metadata(&f.path) {
-            let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={}\n", fd, &f.path, meta.size);
+    match proc.get_fd(fd) {
+        Some(crate::process::FileDescriptor::File(f)) => {
+            if let Ok(meta) = crate::vfs::metadata(&f.path) {
+                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, ..Default::default() };
+                unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={}\n", fd, &f.path, meta.size);
+                }
+                return 0;
             }
-            return 0;
+            !0u64
         }
+        Some(crate::process::FileDescriptor::DevNull) => {
+            let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::Stdin) | Some(crate::process::FileDescriptor::Stdout) | Some(crate::process::FileDescriptor::Stderr) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::PipeRead(_)) | Some(crate::process::FileDescriptor::PipeWrite(_)) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        _ => !0u64,
     }
-    !0u64
 }
 
 fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
@@ -1895,6 +1936,12 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
         crate::vfs::resolve_path(&base_path, &path)
     };
     
+    if resolved_path == "/dev/null" {
+        let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
     const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
     let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
 
