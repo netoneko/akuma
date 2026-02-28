@@ -1,9 +1,11 @@
 # Git (Alpine apk) -- Missing Syscalls and Fixes
 
-Alpine's `git` (via `apk add git`) failed to start with a fatal error
-about `/dev/null`. This document records the root cause and the fix applied.
+Alpine's `git` (via `apk add git`) required two kernel fixes before it
+could run. This document records the root causes and fixes applied.
 
-## Symptoms
+## Issue 1: No `/dev/null` Device
+
+### Symptoms
 
 ```
 [syscall] write(fd=2, count=85) "fatal: could not open '/dev/null"
@@ -14,13 +16,13 @@ Git opens `/dev/null` very early in startup (for redirecting unwanted output
 and as a safe fallback fd). When `openat("/dev/null", ...)` returned `ENOENT`,
 git printed the fatal error and exited with code 128.
 
-## Root Cause
+### Root Cause
 
 Akuma had no `/dev` filesystem or virtual device support. The VFS only
 mounted ext2 at `/` and procfs at `/proc`. Any access to `/dev/null`,
 `/dev/zero`, `/dev/urandom`, etc. failed with `ENOENT`.
 
-## Fix: Virtual `/dev/null` Device
+### Fix: Virtual `/dev/null` Device
 
 Rather than implementing a full devfs, `/dev/null` is handled as a special
 `FileDescriptor` variant (`DevNull`) in the process fd table. This avoids
@@ -73,6 +75,57 @@ Seeking on `/dev/null` returns 0 (success), matching Linux behavior.
 - `dup`/`dup3`: Clone the `DevNull` variant via the existing `Clone` derive.
 - `fcntl`: Operates on generic per-fd flags (cloexec, nonblock), no fd-type dispatch.
 - `ioctl`: Returns `ENOTTY` for fd > 2, correct for `/dev/null`.
+
+## Issue 2: `mkdirat` Returns Wrong Errno
+
+### Symptoms
+
+```
+git clone https://github.com/netoneko/meow
+Cloning into 'meow'...
+/meow/.git/: Operation not permitted
+[exit code: 1]
+```
+
+Kernel log showed two `mkdirat` calls for the `.git` directory:
+
+```
+[syscall] mkdirat: /meow/.git
+[syscall] mkdirat: /meow/.git/
+[syscall] write(fd=2, count=11) "/meow/.git/"
+[syscall] write(fd=2, count=23) "Operation not permitted"
+```
+
+### Root Cause
+
+`sys_mkdirat` had two bugs:
+
+1. **Wrong errno for all errors.** It returned `!0u64` (`-1` = `-EPERM`) for
+   every failure, regardless of the actual filesystem error. When git called
+   `mkdir("/meow/.git/")` (trailing slash) after `/meow/.git` already existed,
+   ext2 returned `AlreadyExists` but the syscall returned `EPERM` instead of
+   `EEXIST`. Git handles `EEXIST` gracefully (the directory is already there)
+   but treats `EPERM` as a fatal permissions error.
+
+2. **Ignored `dirfd` parameter.** The `dirfd` argument was prefixed with `_`
+   and never used. Relative paths were always resolved against the process CWD
+   instead of the directory referenced by `dirfd`. This could cause wrong
+   directory creation when programs use `mkdirat(fd, "subdir", mode)`.
+
+### Fix
+
+**File:** `src/syscall.rs`
+
+Rewrote `sys_mkdirat` to match the pattern used by `sys_unlinkat`:
+
+- **Proper path resolution:** If the path is absolute, canonicalize it
+  directly. If relative, resolve it against `dirfd` (or CWD when
+  `dirfd == AT_FDCWD`). Handles `AT_FDCWD` (-100) and real directory fds.
+
+- **Proper errno return:** Uses `fs_error_to_errno()` to map filesystem
+  errors to Linux errno values (`AlreadyExists` → `EEXIST`,
+  `NotFound` → `ENOENT`, `NoSpace` → `ENOSPC`, etc.) instead of
+  returning `-EPERM` for everything.
 
 ## Future Work
 

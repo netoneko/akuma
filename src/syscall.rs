@@ -2398,13 +2398,45 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 }
 
-fn sys_mkdirat(_dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
+fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    crate::safe_print!(128, "[syscall] mkdirat: {}\n", path);
-    if crate::fs::create_dir(&path).is_ok() { 0 } else { !0u64 }
+
+    let path = if raw_path.starts_with('/') {
+        crate::vfs::canonicalize_path(&raw_path)
+    } else {
+        let base = if dirfd == -100 { // AT_FDCWD
+            if let Some(proc) = crate::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = crate::process::current_process() {
+                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        };
+        crate::vfs::resolve_path(&base, &raw_path)
+    };
+
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(256, "[syscall] mkdirat({}) dirfd={}\n", &path, dirfd);
+    }
+
+    match crate::fs::create_dir(&path) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
 }
 
 fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
