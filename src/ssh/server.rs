@@ -135,8 +135,13 @@ fn block_on<F: Future>(mut future: F) -> F::Output {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
             Poll::Pending => {
-                smoltcp_net::poll();
-                crate::threading::yield_now();
+                // Re-poll the future immediately if the network made progress,
+                // since the incoming packet may have satisfied our pending read.
+                // Only yield when idle. The preemptive 10ms timer ensures other
+                // threads still get CPU time.
+                if !smoltcp_net::poll() {
+                    crate::threading::yield_now();
+                }
             }
         }
     }

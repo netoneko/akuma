@@ -324,6 +324,106 @@ Added an explicit copy of the interpreter region in `fork_process`, before
 the mmap copy. Scans `0x3000_0000` through `0x3020_0000` (2 MB) using the
 existing `copy_range_phys` helper, which skips unmapped pages automatically.
 
+## Issue 8: Fork Doesn't Copy Main Binary Code Pages (Dynamic Binaries)
+
+### Symptoms
+
+After fixing the interpreter copy (issue 7), the child still crashes:
+
+```
+[Fault] Instruction abort from EL0 at FAR=0x101b7924, ISS=0x6
+```
+
+The fault address is in the main binary's code region (`0x10000000` range),
+not the interpreter.
+
+### Root Cause
+
+`fork_process` derived `code_start` from `parent.entry_point`. For
+dynamically linked binaries, `entry_point` points to the **interpreter's**
+entry (e.g., `0x3006XXXX`), not the main binary's start (`0x10000000`).
+This caused `code_start` to be computed as `0x30000000`, and since `brk`
+(`~0x10326000`) was less than that, the entire code + heap copy was skipped.
+
+### Fix
+
+**File:** `src/process.rs`
+
+Changed `fork_process` to derive `code_start` from `parent.memory.code_end`
+(which is always in the main binary's range) instead of `parent.entry_point`:
+
+```rust
+let code_start = if parent.memory.code_end >= 0x1000_0000 {
+    0x1000_0000  // PIE binary base
+} else {
+    0x400000     // non-PIE binary base
+};
+```
+
+## Issue 9: `CLONE_THREAD` Not Implemented (pthread_create fails)
+
+### Symptoms
+
+```
+[syscall] clone(flags=0x7d0f00, stack=0x20443af0)
+[syscall] clone: flags not supported, returning ENOSYS
+error: cannot create async thread
+fatal: fetch-pack: unable to fork
+```
+
+Git's fetch-pack creates an async thread via `pthread_create` for sideband
+filtering. musl's `pthread_create` calls `clone` with thread-creation flags.
+
+### Root Cause
+
+`sys_clone` only handled two flag patterns:
+- `CLONE_VFORK` (0x4000) — vfork-like clone
+- `SIGCHLD` (flags & 0x11 == 0x11) — regular fork
+
+Thread creation flags `0x7d0f00` (CLONE_VM | CLONE_FS | CLONE_FILES |
+CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS |
+CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID) matched neither pattern.
+
+Additionally, syscall 283 (`membarrier`) was unhandled. musl calls
+`membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)` during
+`pthread_create`, causing a spurious "Unknown syscall" warning.
+
+### Fix
+
+**Files:** `src/process.rs`, `src/syscall.rs`, `src/mmu.rs`
+
+**1. `UserAddressSpace::new_shared()` (mmu.rs)**
+
+Added a constructor that creates an address space view sharing the parent's
+L0 page table. Uses its own ASID but points at the same physical page
+tables. The `shared` flag prevents `Drop` from freeing the parent's pages.
+
+**2. `clone_thread()` (process.rs)**
+
+New function for `CLONE_THREAD | CLONE_VM`. Creates a child Process that
+shares the parent's address space (not a copy). The child thread gets:
+- Same page tables as parent (shared memory via `UserAddressSpace::new_shared`)
+- Its own kernel thread with a separate stack pointer
+- TLS set via `CLONE_SETTLS` (stored in `UserContext.tpidr`)
+- Clone returns 0 to child, child PID to parent
+
+**3. `THREAD_PID_MAP` (process.rs)**
+
+Thread clones share the parent's ProcessInfo page (at `0x1000`), so
+`read_current_pid()` would return the parent's PID for child thread
+syscalls. A `THREAD_PID_MAP` (thread_id → PID) is checked first in
+`current_process()` to correctly route syscalls to the child's Process.
+Entries are cleaned up in `return_to_kernel()`.
+
+**4. `sys_clone` dispatch (syscall.rs)**
+
+Added detection of `CLONE_THREAD | CLONE_VM` flags before the existing
+fork paths. Delegates to `clone_thread()`.
+
+**5. `membarrier` stub (syscall.rs)**
+
+Added syscall 283 as a no-op returning 0. Safe on a single-CPU system.
+
 ## Future Work
 
 Other device files that programs commonly expect:

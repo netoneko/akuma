@@ -213,6 +213,7 @@ pub struct UserAddressSpace {
     page_table_frames: Vec<PhysFrame>,
     user_frames: Vec<PhysFrame>,
     asid: u16,
+    shared: bool,
 }
 
 impl UserAddressSpace {
@@ -225,9 +226,23 @@ impl UserAddressSpace {
             page_table_frames: Vec::new(),
             user_frames: Vec::new(),
             asid,
+            shared: false,
         };
         addr_space.add_kernel_mappings().ok()?;
         Some(addr_space)
+    }
+
+    /// Create a shared view of an existing address space (for CLONE_THREAD).
+    /// Uses the same L0 page table; Drop will NOT free the pages.
+    pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
+        let asid = crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        Some(Self {
+            l0_frame: PhysFrame { addr: parent_l0_phys },
+            page_table_frames: Vec::new(),
+            user_frames: Vec::new(),
+            asid,
+            shared: true,
+        })
     }
 
     fn add_kernel_mappings(&mut self) -> Result<(), &'static str> {
@@ -435,9 +450,11 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
-        for frame in &self.user_frames { pmm::free_page(*frame); }
-        for frame in &self.page_table_frames { pmm::free_page(*frame); }
-        pmm::free_page(self.l0_frame);
+        if !self.shared {
+            for frame in &self.user_frames { pmm::free_page(*frame); }
+            for frame in &self.page_table_frames { pmm::free_page(*frame); }
+            pmm::free_page(self.l0_frame);
+        }
         crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
         flush_tlb_asid(self.asid);
     }

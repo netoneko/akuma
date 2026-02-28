@@ -343,6 +343,7 @@ pub mod nr {
     pub const GETRLIMIT: u64 = 163;
     pub const PRLIMIT64: u64 = 261;
     pub const EVENTFD2: u64 = 19;
+    pub const MEMBARRIER: u64 = 283;     // Linux arm64 membarrier
 }
 
 /// Thread CPU statistics for top command
@@ -810,6 +811,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRLIMIT => sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         nr::EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
+        nr::MEMBARRIER => 0,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -2137,36 +2139,45 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     }
 }
 
-fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, _tls: u64, _child_tid: u64) -> u64 {
-    // Basic vfork support: CLONE_VM (0x100) | CLONE_VFORK (0x4000)
-    // make uses 0x4111 (SIGCHLD | CLONE_VM | CLONE_VFORK | CLONE_CHILD_SETTID)
+fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_THREAD: u64 = 0x10000;
+    const CLONE_VFORK: u64 = 0x4000;
+
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
-    if flags & 0x4000 != 0 || flags & 0x11 == 0x11 {
-        // vfork-like clone: Create a copy of the current process
-        
+    // CLONE_THREAD | CLONE_VM — pthread_create
+    if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
+        match crate::process::clone_thread(stack, tls, parent_tid, child_tid) {
+            Ok(tid) => return tid as u64,
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
+                return EAGAIN;
+            }
+        }
+    }
+
+    if flags & CLONE_VFORK != 0 || flags & 0x11 == 0x11 {
         let parent_proc = match crate::process::current_process() {
             Some(p) => p,
-            None => return !0u64, // ENOSYS
+            None => return !0u64,
         };
         
-        // Allocate new PID for the child
         let child_pid = crate::process::allocate_pid();
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
         }
 
-        // Delegate to process::fork_process
         match crate::process::fork_process(child_pid, stack) {
             Ok(new_pid) => {
                 return new_pid as u64;
             },
             Err(e) => {
                 crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
-                return !0u64; // EAGAIN
+                return !0u64;
             }
         }
     }

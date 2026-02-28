@@ -456,6 +456,12 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Maps kernel thread IDs to PIDs for CLONE_THREAD children.
+/// Needed because thread clones share the parent's ProcessInfo page, so
+/// read_current_pid() would return the parent's PID.
+static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 /// Register a process in the table (takes ownership)
 pub fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
@@ -905,9 +911,16 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
 
 /// Get the current process (for syscall handlers)
 ///
-/// Reads PID from the process info page and looks up in process table.
-/// Returns None if no process is currently executing.
+/// For CLONE_THREAD children, uses the thread-to-PID map since they share
+/// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
 pub fn current_process() -> Option<&'static mut Process> {
+    let tid = crate::threading::current_thread_id();
+    let thread_pid = crate::irq::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().get(&tid).copied()
+    });
+    if let Some(pid) = thread_pid {
+        return lookup_process(pid);
+    }
     let pid = read_current_pid()?;
     lookup_process(pid)
 }
@@ -1838,6 +1851,11 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         channel.set_exited(exit_code);
     }
     
+    // Clean up THREAD_PID_MAP entry for thread clones
+    crate::irq::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().remove(&tid);
+    });
+
     // Deactivate user address space - restore boot TTBR0
     // CRITICAL: This must happen BEFORE we drop the Process (via unregister_process)
     // because Drop frees the page tables. If we drop first, TTBR0 would point to
@@ -2228,6 +2246,110 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // Now safe to start the thread
     crate::threading::mark_thread_ready(tid);
     
+    Ok(child_pid)
+}
+
+/// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
+/// The child shares the parent's address space and file descriptors.
+pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
+    let parent = current_process().ok_or("No current process")?;
+    let parent_pid = parent.pid;
+    let child_pid = allocate_pid();
+
+    let parent_l0_phys = parent.address_space.ttbr0() & 0x0000_FFFF_FFFF_F000;
+    let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
+        .ok_or("Failed to create shared address space")?;
+
+    let mut new_proc = Box::new(Process {
+        pid: child_pid,
+        pgid: parent.pgid,
+        name: parent.name.clone(),
+        parent_pid: parent_pid,
+        state: ProcessState::Ready,
+        context: UserContext::default(),
+        address_space: shared_as,
+        entry_point: parent.entry_point,
+        brk: parent.brk,
+        initial_brk: parent.initial_brk,
+        memory: parent.memory.clone(),
+        process_info_phys: parent.process_info_phys,
+        args: parent.args.clone(),
+        cwd: parent.cwd.clone(),
+        stdin: Spinlock::new(StdioBuffer::new()),
+        stdout: Spinlock::new(StdioBuffer::new()),
+        exited: false,
+        exit_code: 0,
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: Vec::new(),
+        fd_table: {
+            let cloned = parent.fd_table.lock().clone();
+            for entry in cloned.values() {
+                match entry {
+                    FileDescriptor::PipeWrite(id) => crate::syscall::pipe_clone_ref(*id, true),
+                    FileDescriptor::PipeRead(id) => crate::syscall::pipe_clone_ref(*id, false),
+                    _ => {}
+                }
+            }
+            Spinlock::new(cloned)
+        },
+        cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
+        nonblock_fds: Spinlock::new(parent.nonblock_fds.lock().clone()),
+        next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
+        thread_id: None,
+        spawner_pid: parent.spawner_pid,
+        terminal_state: parent.terminal_state.clone(),
+        box_id: parent.box_id,
+        root_dir: parent.root_dir.clone(),
+        channel: parent.channel.clone(),
+        delegate_pid: None,
+    });
+
+    let parent_tid = crate::threading::current_thread_id();
+    let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+
+    let mut child_ctx = parent_ctx;
+    child_ctx.x0 = 0;
+    child_ctx.sp = stack;
+    child_ctx.tpidr = tls;
+    child_ctx.spsr = 0;
+
+    new_proc.context = child_ctx;
+
+    let tid = crate::threading::spawn_user_thread_initializing(
+        entry_point_trampoline as extern "C" fn() -> !,
+        core::ptr::null_mut(),
+        false
+    )?;
+
+    new_proc.thread_id = Some(tid);
+    crate::threading::update_thread_context(tid, &child_ctx);
+
+    let exit_channel = Arc::new(ProcessChannel::new());
+    register_channel(tid, exit_channel.clone());
+    register_child_channel(child_pid, exit_channel, parent_pid);
+
+    // Register in THREAD_PID_MAP so current_process() works for this thread
+    crate::irq::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(tid, child_pid);
+    });
+
+    register_process(child_pid, new_proc);
+
+    // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID)
+    if parent_tid_ptr != 0 {
+        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_pid); }
+    }
+    // Write child TID/PID to child_tid_ptr (CLONE_CHILD_CLEARTID)
+    if child_tid_ptr != 0 {
+        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_pid); }
+    }
+
+    crate::threading::mark_thread_ready(tid);
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone_thread: PID {} -> thread PID {} (tid {})\n", parent_pid, child_pid, tid);
+    }
+
     Ok(child_pid)
 }
 
