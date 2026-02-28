@@ -127,6 +127,60 @@ Rewrote `sys_mkdirat` to match the pattern used by `sys_unlinkat`:
   `NotFound` → `ENOENT`, `NoSpace` → `ENOSPC`, etc.) instead of
   returning `-EPERM` for everything.
 
+## Issue 3: `chmod` / `stat` Permissions Not Working
+
+### Symptoms
+
+```
+ls -al /usr/libexec/git-core/git-remote-http
+-rw-r--r--    1 0        0            800784 Jan 01  1970 /usr/libexec/git-core/git-remote-http
+```
+
+All files showed `644` (`-rw-r--r--`) permissions regardless of actual ext2
+inode permissions. `chmod +x` appeared to succeed (returned 0) but had no
+effect — the permission bits were never read from or written to the ext2 inode.
+
+### Root Cause
+
+Three bugs combined:
+
+1. **`st_mode` hardcoded in stat syscalls.** Both `sys_fstat` and
+   `sys_newfstatat` returned `0o100644` for all files and `0o40755` for all
+   directories, ignoring the actual `type_perms` field stored in the ext2
+   inode.
+
+2. **`fchmod`/`fchmodat` were no-op stubs.** Both syscalls returned 0 without
+   modifying anything. Programs like `chmod` and `install` thought they
+   succeeded, but the inode was never updated.
+
+3. **VFS `Metadata` lacked a `mode` field.** The struct only had `is_dir`,
+   `size`, `inode`, and timestamps — no way to propagate the actual
+   permissions from the filesystem to the syscall layer.
+
+### Fix
+
+**Files:** `src/vfs/mod.rs`, `src/vfs/ext2.rs`, `src/vfs/memory.rs`,
+`src/vfs/proc.rs`, `src/syscall.rs`
+
+1. **Added `mode: u32` to `Metadata`** — carries the full file type +
+   permission bits (e.g., `0o100755` for an executable file).
+
+2. **ext2 returns actual inode permissions** — `metadata()` now reads
+   `inode.type_perms` and stores it in `meta.mode`. memfs and procfs return
+   appropriate defaults (`0o40555` for procfs dirs, etc.).
+
+3. **stat syscalls use `meta.mode`** — `sys_fstat` and `sys_newfstatat` use
+   `meta.mode` directly instead of hardcoded values. Also added timestamps
+   (`st_atime`, `st_mtime`, `st_ctime`) from metadata.
+
+4. **Added `chmod()` to `Filesystem` trait** — default returns `NotSupported`,
+   ext2 implementation updates `inode.type_perms` preserving the file type
+   nibble and writing the updated inode to disk.
+
+5. **Implemented `sys_fchmod` and `sys_fchmodat`** — both resolve the path
+   and call `vfs::chmod()`. `fchmodat` handles `AT_FDCWD` and real directory
+   fds for proper relative path resolution.
+
 ## Future Work
 
 Other device files that programs commonly expect:

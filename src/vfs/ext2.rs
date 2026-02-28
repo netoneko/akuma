@@ -1615,10 +1615,21 @@ impl Filesystem for Ext2Filesystem {
             is_dir,
             size: inode.size_lower as u64,
             inode: inode_num as u64,
+            mode: inode.type_perms as u32,
             created: Some(inode.creation_time as u64),
             modified: Some(inode.modification_time as u64),
             accessed: Some(inode.access_time as u64),
         })
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        let inode_num = self.lookup_path(path)?;
+        let state = self.state.lock();
+        let mut inode = Self::read_inode(&state, inode_num)?;
+        inode.type_perms = (inode.type_perms & 0xF000) | (mode as u16 & 0o7777);
+        inode.modification_time = current_time();
+        Self::write_inode(&state, inode_num, &inode)?;
+        Ok(())
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {

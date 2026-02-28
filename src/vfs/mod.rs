@@ -115,6 +115,8 @@ pub struct Metadata {
     pub size: u64,
     /// Inode number (unique within filesystem)
     pub inode: u64,
+    /// File mode (type + permissions), e.g. 0o100755 for executable file
+    pub mode: u32,
     /// Creation time (Unix timestamp, if available)
     pub created: Option<u64>,
     /// Last modification time (Unix timestamp, if available)
@@ -236,6 +238,11 @@ pub trait Filesystem: Send + Sync {
     /// Check whether a path is a symlink (without following it)
     fn is_symlink(&self, _path: &str) -> bool {
         false
+    }
+
+    /// Change file permissions (mode bits only, not file type)
+    fn chmod(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
     }
 
     /// Rename/move a file or directory
@@ -578,6 +585,11 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
 /// Get metadata for a path
 pub fn metadata(path: &str) -> Result<Metadata, FsError> {
     with_fs(path, |fs, rel| fs.metadata(rel))
+}
+
+/// Change file permissions
+pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
+    with_fs(path, |fs, rel| fs.chmod(rel, mode))
 }
 
 /// Rename/move a file or directory

@@ -797,8 +797,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UTIMENSAT => 0, // stub — timestamps not critical
         nr::FDATASYNC => 0, // stub — single block device, always coherent
         nr::FSYNC => 0, // stub — single block device, always coherent
-        nr::FCHMOD => 0, // stub — no permission enforcement
-        nr::FCHMODAT => 0, // stub — no permission enforcement
+        nr::FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
+        nr::FCHMODAT => sys_fchmodat(args[0] as i32, args[1], args[2] as u32),
         nr::FCHOWNAT => 0, // stub — single-user OS, no ownership
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         nr::MPROTECT => sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
@@ -1867,10 +1867,10 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     match proc.get_fd(fd) {
         Some(crate::process::FileDescriptor::File(f)) => {
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
-                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, ..Default::default() };
+                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                    crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={}\n", fd, &f.path, meta.size);
+                    crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
                 return 0;
             }
@@ -1967,9 +1967,12 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
             st_dev: 1,
             st_ino: meta.inode,
             st_size: meta.size as i64, 
-            st_mode: if meta.is_dir { 0o40755 } else { 0o100644 }, 
+            st_mode: meta.mode, 
             st_nlink: if meta.is_dir { 2 } else { 1 },
             st_blksize: 4096,
+            st_atime: meta.accessed.unwrap_or(0) as i64,
+            st_mtime: meta.modified.unwrap_or(0) as i64,
+            st_ctime: meta.created.unwrap_or(0) as i64,
             ..Default::default() 
         };
         unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
@@ -1992,6 +1995,63 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
     }
     
     ENOENT
+}
+
+fn sys_fchmod(fd: u32, mode: u32) -> u64 {
+    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        Some(crate::process::FileDescriptor::File(f)) => {
+            match crate::vfs::chmod(&f.path, mode) {
+                Ok(()) => 0,
+                Err(e) => fs_error_to_errno(e),
+            }
+        }
+        Some(crate::process::FileDescriptor::DevNull) => 0,
+        _ => 0, // silently succeed for stdin/stdout/pipes
+    }
+}
+
+fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let path = if raw_path.starts_with('/') {
+        crate::vfs::canonicalize_path(&raw_path)
+    } else {
+        let base = if dirfd == -100 { // AT_FDCWD
+            if let Some(proc) = crate::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = crate::process::current_process() {
+                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        };
+        crate::vfs::resolve_path(&base, &raw_path)
+    };
+
+    let path = crate::vfs::resolve_symlinks(&path);
+
+    if path == "/dev/null" {
+        return 0;
+    }
+
+    match crate::vfs::chmod(&path, mode) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
 }
 
 #[repr(C)]
