@@ -1151,8 +1151,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let op2 = (iss >> 17) & 0x7;
 
             if direction == 1 && rt < 31 {
+                // MRS (read) — emulate system register reads
                 let value = if op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 1 {
-                    // CTR_EL0 — return real cache type register
+                    // CTR_EL0
                     let ctr: u64;
                     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
                     ctr
@@ -1162,6 +1163,23 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 unsafe {
                     let regs = frame as *mut u64;
                     core::ptr::write_volatile(regs.add(rt), value);
+                }
+            } else if direction == 0 {
+                // MSR/DC/IC (write) — perform cache maintenance on behalf of user
+                let addr = if rt < 31 {
+                    unsafe { core::ptr::read_volatile((frame as *const u64).add(rt)) }
+                } else {
+                    0
+                };
+                if op0 == 1 && crn == 7 {
+                    // Cache maintenance instruction (DC or IC).
+                    // DC CVAU: op1=3, crm=11, op2=1
+                    // IC IVAU: op1=3, crm=5, op2=1
+                    if op1 == 3 && crm == 11 && op2 == 1 {
+                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr); }
+                    } else if op1 == 3 && crm == 5 && op2 == 1 {
+                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr); }
+                    }
                 }
             }
             // Advance past the trapped instruction (always 4 bytes on AArch64)

@@ -2899,8 +2899,21 @@ fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u6
     EINVAL
 }
 
-fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
-    let total_us = seconds.saturating_mul(1_000_000).saturating_add(nanoseconds / 1_000);
+fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
+    // Support two ABIs:
+    // - Linux/musl: a0 = pointer to struct timespec {tv_sec, tv_nsec}
+    // - libakuma:   a0 = seconds (raw), a1 = nanoseconds (raw)
+    // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
+    let (sec, nsec) = if a0 >= 4096 && validate_user_ptr(a0, 16) {
+        unsafe {
+            let p = a0 as *const u64;
+            (core::ptr::read(p), core::ptr::read(p.add(1)))
+        }
+    } else {
+        (a0, a1)
+    };
+    let total_us = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
+    if total_us == 0 { return 0; }
     let deadline = crate::timer::uptime_us().saturating_add(total_us);
     loop {
         if crate::timer::uptime_us() >= deadline { return 0; }
@@ -3568,17 +3581,39 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if addr & 0xFFF != 0 { return EINVAL; }
     let pages = (len + 4095) / 4096;
     let new_flags = crate::mmu::user_flags::from_prot(prot);
+    let adding_exec = prot & 0x4 != 0; // PROT_EXEC
     if let Some(proc) = crate::process::current_process() {
         for i in 0..pages {
             let va = addr + i * 4096;
             if proc.address_space.update_page_flags(va, new_flags).is_err() || !proc.address_space.is_mapped(va) {
-                // Page not mapped yet (lazy PROT_NONE region) — allocate on demand
                 if prot != 0 {
                     if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                         unsafe { crate::mmu::map_user_page(va, frame.addr, new_flags); }
                         proc.address_space.track_user_frame(frame);
                     }
                 }
+            }
+        }
+        if adding_exec {
+            // Flush data cache and invalidate instruction cache for JIT code.
+            // AArch64 has non-coherent I/D caches; without this, the CPU may
+            // execute stale instructions from before the code was written.
+            for i in 0..pages {
+                let va = addr + i * 4096;
+                unsafe {
+                    // Clean each cache line in the page (64-byte lines typical)
+                    let mut off = 0usize;
+                    while off < 4096 {
+                        let line = (va + off) as u64;
+                        core::arch::asm!("dc cvau, {}", in(reg) line);
+                        core::arch::asm!("ic ivau, {}", in(reg) line);
+                        off += 64;
+                    }
+                }
+            }
+            unsafe {
+                core::arch::asm!("dsb ish");
+                core::arch::asm!("isb");
             }
         }
         0

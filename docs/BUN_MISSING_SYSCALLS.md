@@ -160,7 +160,16 @@ descriptor. See `docs/DEV_RANDOM.md`.
 
 Changed to a no-op (returns 0). Previously attempted to honor `MADV_DONTNEED`
 by unmapping pages, but this crashed the kernel when applied to lazy-mapped
-pages with no backing physical frame.
+pages with no backing physical frame. Bun calls `madvise` with
+`MADV_POPULATE_READ` (14) to pre-fault pages, which our no-op silently ignores;
+demand paging handles the actual faults later.
+
+### `mprotect` cache maintenance (NR 226)
+
+When `mprotect` adds `PROT_EXEC` permission, the kernel now flushes the data
+cache (`DC CVAU`) and invalidates the instruction cache (`IC IVAU`) for every
+cache line in the affected region, followed by `DSB ISH` + `ISB`. This ensures
+JIT code written through the data cache is visible to the instruction fetcher.
 
 ### `mremap` hardening
 
@@ -168,6 +177,47 @@ pages with no backing physical frame.
 the source buffer with `validate_user_ptr` before copying. Without this, bun's
 attempts to mremap could pass kernel-space addresses, causing data aborts from
 EL1.
+
+---
+
+## Process / Thread Management
+
+### `exit_group` (NR 94)
+
+Previously mapped to `sys_exit` which only marked the calling thread as
+exited, leaving CLONE_VM sibling threads running with potentially freed
+page tables. Now calls `sys_exit_group` which invokes `kill_thread_group()`
+to terminate all threads sharing the same address space before the page
+tables are freed.
+
+### `tkill` (NR 130) — fix
+
+Previously called `return_to_kernel(-sig)` on the *calling* thread,
+completely ignoring the target TID. This meant any `tkill` call would kill
+the caller. Changed to a no-op stub (returns 0) since signal delivery is
+not implemented.
+
+### `nanosleep` (NR 101) — fix
+
+Previously treated `x0` and `x1` as raw seconds/nanoseconds values instead
+of pointers to `struct timespec`. Fixed to read the timespec from the user
+pointer in `x0`. Validates the pointer and returns `EFAULT` for NULL.
+
+---
+
+## JIT Support (SCTLR_EL1 configuration)
+
+Bun's JavaScriptCore JIT requires user-space cache maintenance instructions
+(`DC CVAU`, `IC IVAU`) and `CTR_EL0` access. These are controlled by
+`SCTLR_EL1` bits:
+
+- **UCI (bit 26):** Allows EL0 `DC CVAU` and `IC IVAU` without trapping
+- **UCT (bit 15):** Allows EL0 `MRS CTR_EL0` without trapping
+
+Both bits are now set in `src/boot.rs`. Without UCI, these instructions
+trapped to EL1 where the handler silently skipped them, causing the CPU to
+execute stale instruction cache contents (garbage instructions, corrupted
+syscall numbers).
 
 ---
 
@@ -195,6 +245,6 @@ requests or run timers.
 
 1. **epoll** — Real I/O multiplexing over socket/pipe/timerfd descriptors
 2. **timerfd** — Timer expiration with epoll integration
-3. **eventfd** — ✅ Already functional (atomic counter with blocking read)
+3. **eventfd** — Already functional (atomic counter with blocking read)
 4. **clone/futex** — Thread creation and synchronization (partially implemented)
 5. **signal handling** — `rt_sigaction`, `rt_sigprocmask` with proper delivery

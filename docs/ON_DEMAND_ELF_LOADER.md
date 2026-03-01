@@ -409,10 +409,14 @@ reaches the epilogue.
 ### MSR/MRS trap (EC=0x18)
 
 bun reads `CTR_EL0` (Cache Type Register) to determine cache line sizes for
-JIT code generation. On AArch64, `CTR_EL0` access from EL0 traps to EL1 if
-`SCTLR_EL1.UCT` is not set. The handler in `src/exceptions.rs` decodes the
-trapped `MRS` instruction, reads the actual `CTR_EL0` hardware value, writes
-it into the destination register in the trap frame, and advances PC by 4.
+JIT code generation. The handler in `src/exceptions.rs` emulates system
+register reads and cache maintenance instructions:
+
+- **MRS (read):** Returns the actual `CTR_EL0` hardware value; returns 0 for
+  other unrecognized system registers.
+- **DC CVAU / IC IVAU (write):** Performs cache maintenance on behalf of user
+  code. This is a fallback — with `SCTLR_EL1.UCI = 1` (set in `src/boot.rs`),
+  these instructions normally execute in EL0 without trapping.
 
 ### BRK instruction (EC=0x3C)
 
@@ -422,14 +426,85 @@ instead of printing an unhandled exception error.
 
 ---
 
+## JIT Cache Coherency
+
+### Problem
+
+bun's JavaScriptCore JIT writes executable code into demand-paged mmap
+regions. On AArch64, instruction and data caches are not coherent — writing
+code through the data cache and then executing it requires explicit cache
+maintenance:
+
+1. `DC CVAU` — clean data cache by VA to point of unification
+2. `DSB ISH` — ensure clean completes
+3. `IC IVAU` — invalidate instruction cache by VA
+4. `DSB ISH` + `ISB` — synchronize
+
+Without `SCTLR_EL1.UCI = 1`, `DC CVAU` and `IC IVAU` from EL0 trap to EL1.
+The original kernel did not set UCI, so these instructions trapped. The trap
+handler (EC=0x18) only handled `MRS CTR_EL0` reads and silently skipped all
+other system instructions — advancing PC without performing the cache
+operation. The CPU then executed stale instruction cache contents, producing
+garbage instructions (e.g., x8 loaded with an mmap address instead of a
+syscall number, causing "Unknown syscall: 1349652480").
+
+### Fix
+
+1. **`src/boot.rs`:** Set `SCTLR_EL1.UCI = 1` and `SCTLR_EL1.UCT = 1` so
+   `DC CVAU`, `IC IVAU`, and `MRS CTR_EL0` execute directly from EL0 without
+   trapping.
+2. **`src/exceptions.rs`:** EC_MSR_MRS_TRAP handler now emulates `DC CVAU`
+   and `IC IVAU` for robustness (fallback if UCI alone isn't sufficient).
+3. **`src/syscall.rs`:** `sys_mprotect` flushes data cache and invalidates
+   instruction cache when adding `PROT_EXEC` permission, ensuring the kernel-
+   side permission change also guarantees cache coherency.
+
+---
+
+## CLONE_VM Thread Group Cleanup
+
+### Problem
+
+When a CLONE_VM thread group's main thread exits (e.g., SIGSEGV), it drops
+its `UserAddressSpace` which has `shared == false`, freeing ALL page tables
+and user pages. But sibling threads (created via `clone_thread`) have
+`shared == true` address spaces pointing to the same L0 page table. When
+the scheduler gives them CPU time, TTBR0 points to freed memory, causing
+EL1 data aborts. The EL1 handler enters a `wfe` loop with IRQs disabled,
+halting the entire system.
+
+### Fix
+
+1. **`src/process.rs`:** Added `kill_thread_group(my_pid, l0_phys)` which
+   finds all processes sharing the same L0 page table address (via
+   `UserAddressSpace::l0_phys()`), cleans up their file descriptors, lazy
+   regions, channels, and thread state, then unregisters them. Called from
+   `return_to_kernel` before dropping the address-space owner.
+
+2. **`src/syscall.rs`:** `exit_group` (NR 94) now calls `sys_exit_group`
+   which invokes `kill_thread_group` to terminate all sibling threads, not
+   just the calling thread.
+
+3. **`src/mmu.rs`:** Added `l0_phys()` and `is_shared()` accessors to
+   `UserAddressSpace`.
+
+### tkill fix
+
+`tkill` (NR 130) previously called `return_to_kernel(-sig)` on the calling
+thread, ignoring the target TID entirely. Any `tkill` call would kill the
+caller. Changed to a no-op stub since signal delivery is not implemented.
+
+---
+
 ## Files Modified
 
 | File | Changes |
 |------|---------|
+| `src/boot.rs` | Set SCTLR_EL1.UCI and UCT for EL0 cache maintenance |
 | `src/elf_loader.rs` | On-demand ELF loader, `compute_stack_top()`, 4GB VA space |
-| `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening, `track_page_table_frame` |
-| `src/process.rs` | `LAZY_REGION_TABLE`, `munmap_lazy_region`, `clone_lazy_regions`, `EpollFd`/`TimerFd`/`EventFd` variants, `alloc_mmap` kernel VA skip |
-| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging, `/dev/urandom`, `/proc/self/exe`, `mremap` hardening, ~20 new syscall stubs, partial munmap, CLONE_VM PID keying |
-| `src/exceptions.rs` | Demand paging fault handler, x0 preservation fix, MSR/MRS trap, BRK handler, TPIDR_EL0 in fault dump |
+| `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening, `track_page_table_frame`, `l0_phys()`, `is_shared()` |
+| `src/process.rs` | `LAZY_REGION_TABLE`, `munmap_lazy_region`, `clone_lazy_regions`, `kill_thread_group`, `EpollFd`/`TimerFd`/`EventFd` variants, `alloc_mmap` kernel VA skip |
+| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging, `/dev/urandom`, `/proc/self/exe`, `mremap` hardening, ~20 new syscall stubs, partial munmap, CLONE_VM PID keying, mprotect cache flush, `sys_exit_group`, nanosleep ABI fix |
+| `src/exceptions.rs` | Demand paging fault handler, x0 preservation fix, MSR/MRS+DC/IC trap handler, BRK handler, TPIDR_EL0 in fault dump |
 | `src/config.rs` | `USER_STACK_SIZE = 2MB` |
 | `bootstrap/lib/` | `libc.musl-aarch64.so.1 → ld-musl-aarch64.so.1` symlink |

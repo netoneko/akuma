@@ -74,6 +74,8 @@ _boot:
     orr     x0, x0, #1              // M bit = MMU enable
     orr     x0, x0, #(1 << 2)       // C bit = data cache
     orr     x0, x0, #(1 << 12)      // I bit = instruction cache
+    orr     x0, x0, #(1 << 15)      // UCT = EL0 access to CTR_EL0
+    orr     x0, x0, #(1 << 26)      // UCI = EL0 cache maintenance (DC CVAU, IC IVAU)
     msr     sctlr_el1, x0
     isb
     
