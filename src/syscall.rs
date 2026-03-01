@@ -351,6 +351,10 @@ pub mod nr {
     pub const GETRUSAGE: u64 = 165;      // Linux arm64 getrusage
     pub const MSYNC: u64 = 227;          // Linux arm64 msync
     pub const PROCESS_VM_READV: u64 = 270; // Linux arm64 process_vm_readv
+    pub const SCHED_SETAFFINITY: u64 = 122; // Linux arm64 sched_setaffinity
+    pub const SCHED_GETAFFINITY: u64 = 123; // Linux arm64 sched_getaffinity
+    pub const TKILL: u64 = 130;          // Linux arm64 tkill
+    pub const CLOSE_RANGE: u64 = 436;    // Linux arm64 close_range
 }
 
 /// Thread CPU statistics for top command
@@ -833,6 +837,24 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => 0,
         nr::PROCESS_VM_READV => ENOSYS,
+        nr::SCHED_SETAFFINITY => 0,
+        nr::SCHED_GETAFFINITY => {
+            // Return a single-CPU affinity mask
+            let mask_ptr = args[2] as usize;
+            let cpusetsize = args[1] as usize;
+            if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
+                unsafe {
+                    core::ptr::write_bytes(mask_ptr as *mut u8, 0, cpusetsize);
+                    core::ptr::write(mask_ptr as *mut u64, 1); // CPU 0
+                }
+            }
+            0
+        }
+        nr::TKILL => {
+            let sig = args[1] as i32;
+            crate::process::return_to_kernel(-(sig as i32))
+        }
+        nr::CLOSE_RANGE => 0,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1873,6 +1895,17 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
         }
         return !0u64;
     }
+
+    // /proc/self/exe → redirect to the process's own binary path
+    let path = if path == "/proc/self/exe" {
+        if let Some(proc) = crate::process::current_process() {
+            proc.name.clone()
+        } else {
+            return ENOENT;
+        }
+    } else {
+        path
+    };
 
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
@@ -3321,18 +3354,11 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
     } else { ENOMEM }
 }
 
-fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
-    const MADV_DONTNEED: i32 = 4;
-    if advice == MADV_DONTNEED && len > 0 {
-        let aligned_addr = addr & !0xFFF;
-        let aligned_end = (addr + len + 0xFFF) & !0xFFF;
-        let aligned_len = aligned_end - aligned_addr;
-        if aligned_len <= 128 * 1024 * 1024 {
-            unsafe {
-                core::ptr::write_bytes(aligned_addr as *mut u8, 0, aligned_len);
-            }
-        }
-    }
+fn sys_madvise(_addr: usize, _len: usize, _advice: i32) -> u64 {
+    // No-op: MADV_DONTNEED/MADV_FREE/etc. are hints only.
+    // We cannot safely zero pages here because lazy-mapped regions
+    // may not have physical pages yet (causes EL1 data abort).
+    // Demand paging provides fresh zero pages on first access anyway.
     0
 }
 

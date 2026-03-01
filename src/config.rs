@@ -41,10 +41,9 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// when using miniz_oxide zlib decompression with deep call stacks.
 /// Increased to 512KB for DOOM which has deep rendering call stacks.
 /// A guard page is placed below the stack to detect overflow.
-// pub const USER_STACK_SIZE: usize = 512 * 1024;
-/// Increased from 128KB to handle complex workloads like TCC compiling neatvi.
+/// Stack size for user processes. 2MB handles heavy workloads like bun/JSC.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 256 * 1024;
+pub const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum kernel threads
 ///

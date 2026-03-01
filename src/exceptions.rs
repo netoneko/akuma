@@ -604,6 +604,7 @@ mod esr {
     pub const EC_SVC64: u64 = 0b010101; // SVC instruction from AArch64
     pub const EC_DATA_ABORT_LOWER: u64 = 0b100100; // Data abort from lower EL
     pub const EC_INST_ABORT_LOWER: u64 = 0b100000; // Instruction abort from lower EL
+    pub const EC_MSR_MRS_TRAP: u64 = 0b011000; // Trapped MSR/MRS/System instruction from EL0
 }
 
 /// Install exception vector table
@@ -1134,6 +1135,38 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} ELR={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.elr_el1, frame_ref.spsr_el1);
             crate::process::return_to_kernel(-11) // never returns
+        }
+        esr::EC_MSR_MRS_TRAP => {
+            // Trapped MSR/MRS/System instruction from EL0.
+            let direction = iss & 1; // 1 = MRS (read), 0 = MSR (write)
+            let rt = ((iss >> 5) & 0x1F) as usize;
+            let op0 = (iss >> 20) & 0x3;
+            let op1 = (iss >> 14) & 0x7;
+            let crn = (iss >> 10) & 0xF;
+            let crm = (iss >> 1) & 0xF;
+            let op2 = (iss >> 17) & 0x7;
+
+            if direction == 1 && rt < 31 {
+                let value = if op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 1 {
+                    // CTR_EL0 — return real cache type register
+                    let ctr: u64;
+                    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
+                    ctr
+                } else {
+                    0
+                };
+                unsafe {
+                    let regs = frame as *mut u64;
+                    core::ptr::write_volatile(regs.add(rt), value);
+                }
+            }
+            // Advance past the trapped instruction (always 4 bytes on AArch64)
+            unsafe {
+                let elr_ptr = &mut (*frame).elr_el1 as *mut u64;
+                let elr = core::ptr::read_volatile(elr_ptr);
+                core::ptr::write_volatile(elr_ptr, elr + 4);
+            }
+            return unsafe { (*frame).x0 };
         }
         _ => {
             // Capture additional state for debugging

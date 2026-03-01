@@ -623,12 +623,12 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
     const DEFAULT: usize = 0x4000_0000; // 1GB — original default
 
     if !has_interp && brk < 0x400_0000 {
-        // Small static binary (< 64MB code): keep the original 1GB layout.
         return DEFAULT;
     }
 
     const INTERP_END: usize = 0x3010_0000;
-    const MIN_MMAP_SPACE: usize = 0x8000_0000; // 2GB for large/dynamic binaries
+    const MIN_MMAP_SPACE: usize = 0xC000_0000; // 3GB for large/dynamic binaries (JIT needs 512MB+)
+    const MAX_STACK_TOP: usize = 0x1_0000_0000; // 4GB — MMU supports up to 48-bit VA
 
     let base_mmap = (brk + 0x1000_0000) & !0xFFFF; // brk + 256MB gap
     let mmap_start = if has_interp {
@@ -639,8 +639,8 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
 
     let needed = mmap_start + MIN_MMAP_SPACE;
     let raw = core::cmp::max(DEFAULT, needed);
-    // Round up to 256MB boundary
-    (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF
+    let aligned = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    core::cmp::min(aligned, MAX_STACK_TOP)
 }
 
 pub fn load_elf_with_stack(
