@@ -1090,7 +1090,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             if is_translation_fault {
                 if let Some(flags) = crate::process::lazy_region_flags(far as usize) {
                     let page_va = (far as usize) & !(0xFFF);
-                    // Use stored flags; fall back to RW if non-zero, or RW_NO_EXEC for PROT_NONE
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
                     if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
                         unsafe {
@@ -1099,7 +1098,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         if let Some(proc) = crate::process::current_process() {
                             proc.address_space.track_user_frame(page_frame);
                         }
-                        return 0;
+                        // The sync_el0_handler epilogue loads x0 from the return
+                        // value (designed for syscalls). For demand paging we must
+                        // preserve the user's original x0 so the faulting
+                        // instruction retries with all registers intact.
+                        return unsafe { (*frame).x0 };
                     }
                 }
             }
@@ -1111,8 +1114,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
             crate::safe_print!(128, "[Fault]  x19={:#x} x20={:#x} x29={:#x} x30={:#x}\n",
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
-            crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x}\n",
-                frame_ref.sp_el0, frame_ref.spsr_el1);
+            crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
+                frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {

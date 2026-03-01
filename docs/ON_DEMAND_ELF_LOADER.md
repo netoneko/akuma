@@ -1,4 +1,4 @@
-# On-Demand ELF Loader for Large Binaries
+# On-Demand ELF Loader & Large Binary Support
 
 ## Problem
 
@@ -101,32 +101,115 @@ VA space:
 
 ### Solution: `compute_stack_top()`
 
-`src/elf_loader.rs` now dynamically computes `STACK_TOP` based on binary layout:
+`src/elf_loader.rs` dynamically computes `STACK_TOP` based on binary layout:
 
-- **Small static binaries** (code < 64MB, no interpreter): keep default 1GB layout
+- **Small static binaries** (code < 64MB, no interpreter): keep default 1GB
+  layout (STACK_TOP = 0x40000000)
 - **Large or dynamic binaries**: expand to provide ~2GB mmap space, with
-  `STACK_TOP` up to 3GB (0xC0000000)
+  `STACK_TOP` up to 3GB (0xC0000000), rounded to 256MB boundary
 
-The mmap region sits between the interpreter end (0x30100000) and the stack
-bottom, giving large binaries ~2.3GB of mmap space.
+The mmap region sits between the code end and the stack bottom. For bun, the
+layout is:
 
-### User page table fix (L1 BLOCK descriptor bug)
+```
+0x00200000–0x05C6D418  ELF segments (code + data)
+0x05C6E000             brk (heap start)
+0x30000000–0x30100000  musl dynamic linker
+0x30100000–0x303F6000  libstdc++.so.6 + libgcc_s.so.1
+0x50000000–0xBFEC0000  mmap region (~1.75GB usable)
+0xBFFC0000–0xC0000000  stack (256KB)
+```
 
-`add_kernel_mappings()` in `src/mmu.rs` created a 1GB BLOCK descriptor at
-L1\[2\] mapping VA 2–3GB → PA 0x80000000. With only 256MB RAM (PA
-0x40000000–0x4FFFFFFF), PA 0x80000000 does not exist.
+Note: VA 0x40000000–0x4FFFFFFF is reserved for kernel identity-mapped RAM
+(see "Kernel RAM Mapping" below).
+
+---
+
+## User Page Table Fixes
+
+### L1 BLOCK descriptor bug
+
+`add_kernel_mappings()` in `src/mmu.rs` originally created a 1GB BLOCK
+descriptor at L1[2] mapping VA 2–3GB → PA 0x80000000. With only 256MB RAM
+(PA 0x40000000–0x4FFFFFFF), PA 0x80000000 does not exist.
 
 When `map_page` tried to map the user stack at VA ~0xBFFC0000 (in the 2–3GB
-range), `get_or_create_table` saw L1\[2\] had `VALID` set and treated the
-BLOCK descriptor as a TABLE descriptor — extracting PA 0x80000000 as a page
-table pointer. Accessing `phys_to_virt(0x80000000)` = 0x80000000 (identity-
-mapped but no RAM) caused a synchronous external abort (EC=0x25, ISS=0x10,
+range), `get_or_create_table` saw L1[2] had `VALID` set and treated the BLOCK
+descriptor as a TABLE descriptor — extracting PA 0x80000000 as a page table
+pointer. Accessing `phys_to_virt(0x80000000)` = 0x80000000 (identity-mapped
+but no RAM) caused a synchronous external abort (EC=0x25, ISS=0x10,
 FAR=0x80000FF8).
 
-**Fix:** Removed the bogus L1\[2\] block mapping and hardened
-`get_or_create_table` to distinguish BLOCK (bit\[1\]=0) from TABLE
-(bit\[1\]=1) descriptors. If a BLOCK is encountered where a TABLE is needed,
-it is replaced with a fresh zeroed page table.
+**Fix:** Removed the bogus L1[2] block mapping and hardened
+`get_or_create_table` and `get_or_create_table_raw` to distinguish BLOCK
+(bit[1]=0) from TABLE (bit[1]=1) descriptors. If a BLOCK is encountered where
+a TABLE is needed, it is replaced with a fresh zeroed page table.
+
+### Kernel RAM mapping (L1[1] optimization)
+
+The original 1GB L1 BLOCK at L1[1] mapped VA 0x40000000–0x7FFFFFFF → PA
+0x40000000–0x7FFFFFFF. This wasted 768MB of user VA space since only 256MB
+of physical RAM exists (PA 0x40000000–0x4FFFFFFF).
+
+**Fix:** Replaced the 1GB L1 BLOCK with an L2 TABLE containing 128 × 2MB
+blocks, mapping only the actual 256MB of RAM. L2 entries [128..511] are left
+zeroed, making VA 0x50000000–0x7FFFFFFF available for user mmap. This creates
+a large contiguous mmap region that bun's 1GB arena can fit into.
+
+Constants in `src/process.rs`:
+```rust
+const KERNEL_VA_START: usize = 0x4000_0000;
+const KERNEL_VA_END: usize   = 0x5000_0000;
+```
+
+`alloc_mmap()` skips this range: if `next_mmap` would enter the kernel VA
+hole, it jumps to `KERNEL_VA_END` (0x50000000).
+
+---
+
+## Demand Paging (Lazy mmap)
+
+### Problem
+
+bun's mimalloc allocator reserves a 1GB contiguous VA region via mmap
+(`MAP_ANONYMOUS`, `PROT_READ|PROT_WRITE`). Eagerly allocating 262,144 physical
+pages for this exhausts the PMM (only ~65K pages total, ~48K free).
+
+### Solution
+
+`sys_mmap` in `src/syscall.rs` uses lazy (demand-paged) allocation when any of
+these conditions hold:
+
+1. `prot == PROT_NONE` (classic lazy reservation)
+2. `flags & MAP_NORESERVE` (caller doesn't expect physical backing)
+3. Anonymous region > 1MB (256 pages) — too expensive to eagerly back
+
+Lazy regions are recorded in `ProcessMemory::lazy_regions` as
+`Vec<(usize, usize, u64)>` — `(start_va, size, page_flags)`. No physical pages
+are allocated at mmap time.
+
+### Page fault handler
+
+When user code accesses a lazy region, a translation fault fires (EL0 data
+abort). The handler in `src/exceptions.rs`:
+
+1. Checks DFSC (bits [5:2] of ISS) for translation fault codes (0x04, 0x08,
+   0x0C for L1/L2/L3 faults)
+2. Calls `lazy_region_flags(far)` to check if the faulting address is in a
+   lazy region
+3. If matched: allocates a zeroed physical page, maps it with the stored
+   permissions (or `RW_NO_EXEC` default for `PROT_NONE` regions), tracks the
+   frame in the process address space, and returns to retry the instruction
+4. If not matched or OOM: falls through to the fault reporter (SIGSEGV)
+
+### mprotect integration
+
+`sys_mprotect` handles lazy regions that transition from `PROT_NONE` to a real
+protection. When `prot != 0` and the page isn't mapped yet, it allocates a
+physical page and maps it with the new permissions — effectively materializing
+the lazy allocation on demand.
+
+---
 
 ## Pointer Validation Fix
 
@@ -141,7 +224,111 @@ libraries or print diagnostics, so it called `_exit(127)`.
 
 ### Fix
 
-Both functions now call `user_va_limit()` which reads `stack_top` from the
-current process's `ProcessMemory`, falling back to 0x40000000 when no process
-is active. This makes the validation limit match the actual address space layout
-of each process.
+`user_va_limit()` reads `stack_top` from the current process's `ProcessMemory`,
+falling back to 0x40000000 when no process is active. Both `validate_user_ptr`
+and `copy_from_user_str` use this dynamic limit instead of the hardcoded 1GB.
+
+---
+
+## New Syscall Stubs
+
+Three syscalls that bun invokes were unknown to the kernel:
+
+| Syscall | Number | Implementation |
+|---------|--------|----------------|
+| `getrusage` | 165 | Zero-fills a 144-byte `rusage` struct (no real tracking) |
+| `msync` | 227 | Returns 0 (no-op; no swap or persistent mmap) |
+| `process_vm_readv` | 270 | Returns `ENOSYS` (cross-process memory read not supported) |
+
+---
+
+## Diagnostic Improvements
+
+### Verbose mmap logging
+
+When `SYSCALL_DEBUG_IO_ENABLED = true` in `src/config.rs`, all mmap variants
+log with PID:
+
+```
+[mmap] pid=29 len=0x40000000 prot=0x3 flags=0x22 = 0x50000000 (lazy)
+[mmap] pid=29 len=0x1000 prot=0x3 flags=0x22 = 0x90000000 (eager)
+[mmap] pid=29 fd=3 file=/usr/lib/libstdc++.so.6.0.34 off=0 len=2904064 = 0x30100000 (read 2820600 bytes)
+[mmap] pid=29 len=0x1000 FAIL OOM at page 0/1
+[mmap] pid=29 len=0x1000 alloc_mmap FAILED
+```
+
+Previously, eager anonymous mmaps were completely silent (excluded from both
+the syscall dispatcher filter and the handler-specific logs). This made it
+impossible to diagnose failed small allocations.
+
+### TPIDR_EL0 in fault dump
+
+The EL0 data abort fault handler now prints `TPIDR_EL0` alongside the existing
+register dump:
+
+```
+[Fault] Data abort from EL0 at FAR=0x10, ELR=0x3f21f94, ISS=0x7
+[Fault]  x0=0x0 x1=0x20 x2=0x80 x3=0x5afe860
+[Fault]  x19=0x5aff410 x20=0x5afeec0 x29=0xbffffbc0 x30=0x3f22184
+[Fault]  SP_EL0=0xbffffbc0 SPSR=0x20000000 TPIDR_EL0=0x...
+```
+
+This helps diagnose TLS-related crashes: if `TPIDR_EL0 = 0`, the crash is
+likely a thread-local storage access before musl's `__init_tls()` ran, since
+AArch64 TLS accesses use `mrs x0, tpidr_el0; ldr reg, [x0, #offset]`.
+
+---
+
+## Demand Paging x0 Clobber Bug
+
+### Problem
+
+The `sync_el0_handler` assembly epilogue always loads x0 from a "return value"
+slot (offset 280 in the trap frame), designed for syscalls where x0 should
+contain the syscall result. But when a data abort triggers successful demand
+paging, the handler returned 0, and the epilogue placed 0 into x0 — clobbering
+the user's original x0.
+
+The faulting instruction would be retried with x0 = 0 instead of the original
+value. If the faulting instruction was inside a loop (e.g., mimalloc's free-list
+initialization), x0 would be silently zeroed. After the loop, a subsequent
+`ldr reg, [x0, #offset]` would crash with FAR = offset, appearing as a NULL
+pointer dereference.
+
+### Diagnosis
+
+Disassembly of the crash site (bun at ELR=0x3f21f94) showed:
+
+```asm
+ldrh w11, [x0, #0xa]     ; succeeds — x0 valid at function entry
+ldr  x10, [x0, #0x30]    ; succeeds
+; ... loop writes to demand-paged memory, triggers fault ...
+; ... x0 clobbered to 0 by exception return ...
+ldr  x10, [x0, #0x10]    ; CRASH: x0 = 0, FAR = 0x10
+```
+
+TPIDR_EL0 was valid (0x303f60e8), ruling out TLS. The x0 clobber was confirmed
+by tracing the exception handler's register restore path.
+
+### Fix
+
+Changed the demand paging success return from `return 0` to
+`return (*frame).x0`, preserving the user's original x0 through the epilogue.
+
+This bug only affected demand-paged data aborts. Syscalls (EC_SVC64) correctly
+use the return value as x0. Fatal faults call `return_to_kernel()` which never
+reaches the epilogue.
+
+---
+
+## Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/elf_loader.rs` | On-demand ELF loader, `compute_stack_top()` |
+| `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening in `get_or_create_table[_raw]` |
+| `src/process.rs` | `lazy_regions` with flags, `alloc_mmap` kernel VA skip, `KERNEL_VA_END = 0x5000_0000` |
+| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging with PID, `getrusage`/`msync`/`process_vm_readv` stubs |
+| `src/exceptions.rs` | Demand paging fault handler with stored flags, x0 preservation fix, TPIDR_EL0 in fault dump |
+| `src/config.rs` | `SYSCALL_DEBUG_IO_ENABLED = true` (temporary for debugging) |
+| `bootstrap/lib/` | `libc.musl-aarch64.so.1 → ld-musl-aarch64.so.1` symlink |

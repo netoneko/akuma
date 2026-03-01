@@ -710,7 +710,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         return EINTR;
     }
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK {
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
@@ -3141,7 +3141,13 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
         addr
     } else {
         let a = crate::process::alloc_mmap(pages * 4096);
-        if a == 0 { return !0u64; }
+        if a == 0 {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                let pid = crate::process::read_current_pid().unwrap_or(0);
+                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} alloc_mmap FAILED\n", pid, len);
+            }
+            return !0u64;
+        }
         a
     };
 
@@ -3161,8 +3167,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
         if use_lazy {
             crate::process::record_lazy_region(mmap_addr, pages * 4096, page_flags);
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::safe_print!(128, "[syscall] mmap(len=0x{:x}, prot=0x{:x}) = 0x{:x} (lazy)\n",
-                    len, prot, mmap_addr);
+                let pid = crate::process::read_current_pid().unwrap_or(0);
+                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy)\n",
+                    pid, len, prot, flags, mmap_addr);
             }
             return mmap_addr as u64;
         }
@@ -3179,9 +3186,22 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
                 frames.push(frame);
                 unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
                 proc.address_space.track_user_frame(frame);
-            } else { return !0u64; }
+            } else {
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    let pid = crate::process::read_current_pid().unwrap_or(0);
+                    crate::safe_print!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
+                        pid, len, i, pages);
+                }
+                return !0u64;
+            }
         }
         crate::process::record_mmap_region(mmap_addr, frames);
+
+        if !is_file_backed && crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            let pid = crate::process::read_current_pid().unwrap_or(0);
+            crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+                pid, len, prot, flags, mmap_addr);
+        }
 
         if is_file_backed {
             if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
@@ -3193,7 +3213,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
                         core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                        crate::safe_print!(256, "[syscall] mmap(fd={}, file={}, off={}, len={}) = 0x{:x} (read {} bytes)\n", fd, &path, offset, len, mmap_addr, copy_len);
+                        let pid = crate::process::read_current_pid().unwrap_or(0);
+                        crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n", pid, fd, &path, offset, len, mmap_addr, copy_len);
                     }
                 }
             }
@@ -3210,7 +3231,11 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
 fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
     if new_size == 0 { return EINVAL; }
+    if old_addr & 0xFFF != 0 { return EINVAL; }
     const MREMAP_MAYMOVE: u32 = 1;
+
+    let va_limit = user_va_limit() as usize;
+    if old_addr >= va_limit { return EFAULT; }
 
     let old_pages = (old_size + 4095) / 4096;
     let new_pages = (new_size + 4095) / 4096;
@@ -3237,7 +3262,9 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         }
 
         let copy_len = old_size.min(new_size);
-        unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+        if validate_user_ptr(old_addr as u64, copy_len) {
+            unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+        }
 
         crate::process::record_mmap_region(new_addr, new_frames);
 
