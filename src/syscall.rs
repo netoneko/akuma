@@ -418,10 +418,16 @@ fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     }
 }
 
-/// Validate a user pointer for reading/writing
-/// 
-/// Pointers must be below the userspace limit (0x40000000)
-/// and above the process info page (0x1000).
+/// Validate a user pointer for reading/writing.
+/// Upper bound is the current process's stack_top (dynamic per binary).
+fn user_va_limit() -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.memory.stack_top as u64
+    } else {
+        0x4000_0000
+    }
+}
+
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
     if ptr < 0x1000 { return false; }
@@ -429,7 +435,7 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
-    if end > 0x4000_0000 { return false; }
+    if end > user_va_limit() { return false; }
     
     // CRITICAL: Check if the range is actually mapped in the current page tables
     if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
@@ -441,15 +447,16 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 
 /// Copy a null-terminated string from userspace
 fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
+    let limit = user_va_limit();
     if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-        if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+        if ptr < 0x1000 || ptr >= limit { return Err(EFAULT); }
         if !crate::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
     }
     let mut len = 0;
     while len < max_len {
         let addr = ptr + len as u64;
         if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            if addr >= 0x4000_0000 { return Err(EFAULT); }
+            if addr >= limit { return Err(EFAULT); }
             // Check mapping every page boundary
             if addr % 4096 == 0 {
                 if !crate::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
