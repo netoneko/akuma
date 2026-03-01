@@ -347,6 +347,7 @@ pub mod nr {
     pub const PWRITE64: u64 = 68;        // Linux arm64 pwrite64
     pub const SETITIMER: u64 = 103;      // Linux arm64 setitimer
     pub const MEMBARRIER: u64 = 283;     // Linux arm64 membarrier
+    pub const PRCTL: u64 = 167;          // Linux arm64 prctl
 }
 
 /// Thread CPU statistics for top command
@@ -818,6 +819,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PWRITE64 => sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::SETITIMER => 0,
         nr::MEMBARRIER => 0,
+        nr::PRCTL => 0, // stub — no MTE or tagged addressing support
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -3110,6 +3112,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
+    const MAP_NORESERVE: u32 = 0x4000;
+    const PROT_NONE: u32 = 0;
+
+    let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
 
     let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
@@ -3127,6 +3133,18 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     };
 
     if let Some(proc) = crate::process::current_process() {
+        if is_lazy {
+            // PROT_NONE: just reserve the VA range, no physical pages.
+            // Pages will be allocated on demand when mprotect upgrades permissions
+            // or on page fault.
+            crate::process::record_lazy_region(mmap_addr, pages * 4096);
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(128, "[syscall] mmap(PROT_NONE, len=0x{:x}) = 0x{:x} (lazy)\n",
+                    len, mmap_addr);
+            }
+            return mmap_addr as u64;
+        }
+
         let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
         let initial_flags = if is_file_backed {
             crate::mmu::user_flags::RW_NO_EXEC
@@ -3292,7 +3310,16 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let new_flags = crate::mmu::user_flags::from_prot(prot);
     if let Some(proc) = crate::process::current_process() {
         for i in 0..pages {
-            let _ = proc.address_space.update_page_flags(addr + i * 4096, new_flags);
+            let va = addr + i * 4096;
+            if proc.address_space.update_page_flags(va, new_flags).is_err() || !proc.address_space.is_mapped(va) {
+                // Page not mapped yet (lazy PROT_NONE region) — allocate on demand
+                if prot != 0 {
+                    if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                        unsafe { crate::mmu::map_user_page(va, frame.addr, new_flags); }
+                        proc.address_space.track_user_frame(frame);
+                    }
+                }
+            }
         }
         0
     } else {
@@ -3300,7 +3327,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     }
 }
 
-fn sys_munmap(addr: usize, _len: usize) -> u64 {
+fn sys_munmap(addr: usize, len: usize) -> u64 {
+    // Try normal (eagerly-mapped) region first
     if let Some(frames) = crate::process::remove_mmap_region(addr) {
         if let Some(proc) = crate::process::current_process() {
             for (i, frame) in frames.into_iter().enumerate() {
@@ -3310,6 +3338,27 @@ fn sys_munmap(addr: usize, _len: usize) -> u64 {
             }
             return 0;
         }
+    }
+
+    // Try lazy region: unmap any demand-allocated pages within the range
+    if let Some(proc) = crate::process::current_process() {
+        let pages = if len > 0 { (len + 4095) / 4096 } else { 1 };
+        let removed = proc.lazy_regions.iter().position(|&(start, _)| start == addr);
+        if let Some(idx) = removed {
+            let (_, region_size) = proc.lazy_regions.remove(idx);
+            let region_pages = region_size / 4096;
+            for i in 0..region_pages {
+                let va = addr + i * 4096;
+                let _ = proc.address_space.unmap_page(va);
+            }
+            proc.memory.free_regions.push((addr, region_size));
+            return 0;
+        }
+        // Partial unmap within a lazy region — just unmap the requested pages
+        for i in 0..pages {
+            let _ = proc.address_space.unmap_page(addr + i * 4096);
+        }
+        return 0;
     }
     !0u64
 }

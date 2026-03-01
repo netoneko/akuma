@@ -1077,13 +1077,34 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
-            // Data abort from user - terminate with error
             let far: u64;
             let elr: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
+
+            // Translation fault (ISS bits [5:2] = 0b01xx) — try demand paging
+            let fault_type = iss & 0x3C; // DFSC[5:2]
+            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08 || fault_type == 0x0C;
+            if is_translation_fault && crate::process::is_in_lazy_region(far as usize) {
+                let page_va = (far as usize) & !(0xFFF);
+                if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                    unsafe {
+                        crate::mmu::map_user_page(
+                            page_va,
+                            page_frame.addr,
+                            crate::mmu::user_flags::RW_NO_EXEC,
+                        );
+                    }
+                    if let Some(proc) = crate::process::current_process() {
+                        proc.address_space.track_user_frame(page_frame);
+                    }
+                    // Resume the faulting instruction
+                    return 0;
+                }
+            }
+
             let frame_ref = unsafe { &*frame };
             crate::safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
@@ -1093,7 +1114,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1);
-            // Terminate process
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {

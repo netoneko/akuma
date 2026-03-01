@@ -614,16 +614,47 @@ pub fn setup_linux_stack(
     stack.sp
 }
 
+/// Compute user stack top address dynamically based on binary layout.
+///
+/// Small static binaries get the default 1GB address space.
+/// Large binaries or dynamically-linked ones (with interpreter) get expanded
+/// space to accommodate arena allocators that reserve GBs of VA upfront.
+fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
+    const DEFAULT: usize = 0x4000_0000; // 1GB — original default
+
+    if !has_interp && brk < 0x400_0000 {
+        // Small static binary (< 64MB code): keep the original 1GB layout.
+        return DEFAULT;
+    }
+
+    const INTERP_END: usize = 0x3010_0000;
+    const MIN_MMAP_SPACE: usize = 0x8000_0000; // 2GB for large/dynamic binaries
+
+    let base_mmap = (brk + 0x1000_0000) & !0xFFFF; // brk + 256MB gap
+    let mmap_start = if has_interp {
+        core::cmp::max(base_mmap, INTERP_END)
+    } else {
+        base_mmap
+    };
+
+    let needed = mmap_start + MIN_MMAP_SPACE;
+    let raw = core::cmp::max(DEFAULT, needed);
+    // Round up to 256MB boundary
+    (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF
+}
+
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize), ElfError> {
     let mut loaded = load_elf(elf_data)?;
-    const STACK_TOP: usize = 0x4000_0000;
+    let has_interp = loaded.interp.is_some();
+    let stack_top = compute_stack_top(loaded.brk, has_interp);
+    let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
     let total_size = stack_size + PAGE_SIZE;
-    let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
+    let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -637,7 +668,7 @@ pub fn load_elf_with_stack(
         stack_frames.push(frame);
     }
 
-    let mut stack = UserStack::new(stack_bottom, STACK_TOP, stack_frames);
+    let mut stack = UserStack::new(stack_bottom, stack_top, stack_frames);
     let random_ptr = stack.push_raw(&[0u8; 16]);
 
     let actual_entry = if let Some(ref interp) = loaded.interp {
@@ -672,14 +703,14 @@ pub fn load_elf_with_stack(
     if DEBUG_ELF_LOADING {
         crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
         crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
-            stack_bottom, STACK_TOP, sp, args.len());
+            stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
             crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
                 actual_entry, loaded.entry_point);
         }
     }
 
-    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor))
 }
 
 // ============================================================================
@@ -943,11 +974,13 @@ pub fn load_elf_with_stack_from_path(
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize), ElfError> {
     let mut loaded = load_elf_from_path(path, file_size)?;
-    const STACK_TOP: usize = 0x4000_0000;
+    let has_interp = loaded.interp.is_some();
+    let stack_top = compute_stack_top(loaded.brk, has_interp);
+    let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
     let total_size = stack_size + PAGE_SIZE;
-    let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
+    let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -961,7 +994,7 @@ pub fn load_elf_with_stack_from_path(
         stack_frames.push(frame);
     }
 
-    let mut stack = UserStack::new(stack_bottom, STACK_TOP, stack_frames);
+    let mut stack = UserStack::new(stack_bottom, stack_top, stack_frames);
     let random_ptr = stack.push_raw(&[0u8; 16]);
 
     let actual_entry = if let Some(ref interp) = loaded.interp {
@@ -996,12 +1029,12 @@ pub fn load_elf_with_stack_from_path(
     if DEBUG_ELF_LOADING {
         crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
         crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
-            stack_bottom, STACK_TOP, sp, args.len());
+            stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
             crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
                 actual_entry, loaded.entry_point);
         }
     }
 
-    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor))
 }

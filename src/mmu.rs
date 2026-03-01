@@ -276,8 +276,10 @@ impl UserAddressSpace {
 
         let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
         unsafe {
+            // L1[1]: identity-map 1GB-2GB → PA 0x40000000 (256MB kernel RAM)
             core::ptr::write_volatile(l1_ptr.add(1), 0x4000_0000u64 | kernel_ram_flags);
-            core::ptr::write_volatile(l1_ptr.add(2), 0x8000_0000u64 | kernel_ram_flags);
+            // L1[2] intentionally left unmapped — PA 0x80000000 doesn't exist with 256MB RAM.
+            // User stack/mmap pages in the 2-3GB VA range are mapped via L2/L3 tables.
         }
         Ok(())
     }
@@ -312,7 +314,19 @@ impl UserAddressSpace {
         unsafe {
             let entry = table_ptr.add(idx).read_volatile();
             if entry & flags::VALID != 0 {
-                Ok(PhysFrame::new((entry & 0x0000_FFFF_FFFF_F000) as usize))
+                if entry & flags::TABLE == 0 {
+                    // BLOCK descriptor occupies this slot — replace with a table.
+                    // The block mapped nonexistent or kernel-only memory that we
+                    // now need to carve into per-page mappings for user space.
+                    let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
+                    pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
+                    self.page_table_frames.push(frame);
+                    let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+                    table_ptr.add(idx).write_volatile(new_entry);
+                    Ok(frame)
+                } else {
+                    Ok(PhysFrame::new((entry & 0x0000_FFFF_FFFF_F000) as usize))
+                }
             } else {
                 let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
                 pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
@@ -427,6 +441,12 @@ impl UserAddressSpace {
         }
         flush_tlb_page(va);
         Ok(())
+    }
+
+    /// Check whether a virtual address has a valid page table entry (public).
+    pub fn is_mapped(&self, va: usize) -> bool {
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *const u64;
+        self.is_page_mapped(l0_ptr, va)
     }
 
     pub fn activate(&self) {

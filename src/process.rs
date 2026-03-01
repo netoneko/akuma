@@ -970,6 +970,26 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     }
 }
 
+/// Record a lazy (PROT_NONE) mmap region — VA reserved, no physical pages.
+pub fn record_lazy_region(start_va: usize, size: usize) {
+    if let Some(proc) = current_process() {
+        proc.lazy_regions.push((start_va, size));
+    }
+}
+
+/// Check if a virtual address falls within any lazy region of the current process.
+/// Returns true if found (and the page should be demand-allocated).
+pub fn is_in_lazy_region(va: usize) -> bool {
+    if let Some(proc) = current_process() {
+        for &(start, size) in &proc.lazy_regions {
+            if va >= start && va < start + size {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Remove and return mmap region starting at the given VA
 ///
 /// Called by sys_munmap to find frames to free.
@@ -1177,12 +1197,14 @@ pub struct ProcessMemory {
 }
 
 impl ProcessMemory {
-    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize) -> Self {
+    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) -> Self {
         // Mmap region starts 256MB above code_end to leave room for heap
         // growth (brk grows upward from code_end). Must be above code_end
         // so PIE binaries loaded at 0x1000_0000 don't get their code pages
         // overwritten by mmap allocations.
-        let mmap_start = (code_end + 0x1000_0000) & !0xFFFF;
+        // Also must be above mmap_floor (e.g. above the interpreter region).
+        let base = (code_end + 0x1000_0000) & !0xFFFF;
+        let mmap_start = core::cmp::max(base, mmap_floor);
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
 
         Self {
@@ -1293,6 +1315,10 @@ pub struct Process {
     /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
     /// Used by munmap to find and free the correct frames.
     pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
+    /// Lazy (PROT_NONE) mmap regions: (start_va, size).
+    /// These have VA reserved but no physical pages allocated.
+    /// Pages are allocated on demand via mprotect or page fault.
+    pub lazy_regions: Vec<(usize, usize)>,
 
     // ========== File Descriptor Table ==========
     /// Per-process file descriptor table
@@ -1334,22 +1360,14 @@ pub struct Process {
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
-        // Load ELF with stack and pre-allocated heap
-        // Stack size is configurable via config::USER_STACK_SIZE
-        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor) =
             elf_loader::load_elf_with_stack(elf_data, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
-        // Allocate and map the process info page (read-only for userspace)
-        // The kernel will write to this page before entering userspace
         let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
-        // Track as user data for this process
         crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
 
-        // Map as read-only at the fixed address
-        // user_flags::RO = AP_RO_ALL, meaning read-only for both EL1 and EL0
-        // But we use phys_to_virt to write, bypassing page tables
         address_space
             .map_page(
                 PROCESS_INFO_ADDR,
@@ -1358,11 +1376,9 @@ impl Process {
             )
             .map_err(|_| ElfError::MappingFailed("process info page"))?;
 
-        // Track the frame so it's freed when the address space is dropped
         address_space.track_user_frame(process_info_frame);
 
-        // Initialize per-process memory tracking
-        let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
         crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
@@ -1399,6 +1415,7 @@ impl Process {
             dynamic_page_tables: Vec::new(),
             // Mmap regions - for tracking VA->frames mapping (used by munmap)
             mmap_regions: Vec::new(),
+            lazy_regions: Vec::new(),
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
             cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
@@ -1422,7 +1439,7 @@ impl Process {
 
     /// Create a process from a large ELF file on disk, loading segments on demand.
     pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
-        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor) =
             elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
@@ -1440,7 +1457,7 @@ impl Process {
 
         address_space.track_user_frame(process_info_frame);
 
-        let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
         crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
@@ -1471,6 +1488,7 @@ impl Process {
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
             mmap_regions: Vec::new(),
+            lazy_regions: Vec::new(),
             fd_table: Spinlock::new(fd_map),
             cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
             nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
@@ -1488,21 +1506,19 @@ impl Process {
 
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
-        // Reuse load_elf_with_stack to handle address space creation, ELF loading, and stack setup
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) = 
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor) = 
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
             .map_err(|_| "Failed to load ELF")?;
             
-        // Deactivate old address space before dropping it (if it was active)
         mmu::UserAddressSpace::deactivate();
         
-        // Replace address space (old one is dropped here, freeing frames)
         self.address_space = address_space;
         self.entry_point = entry_point;
         self.brk = brk;
         self.initial_brk = brk;
-        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
+        self.lazy_regions.clear();
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
         
@@ -1543,7 +1559,7 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) =
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, crate::config::USER_STACK_SIZE)
             .map_err(|_| "Failed to load ELF")?;
 
@@ -1553,8 +1569,9 @@ impl Process {
         self.entry_point = entry_point;
         self.brk = brk;
         self.initial_brk = brk;
-        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
+        self.lazy_regions.clear();
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
 
@@ -2200,6 +2217,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(),
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
@@ -2331,6 +2349,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     }
 
     new_proc.mmap_regions = child_mmap_regions;
+    new_proc.lazy_regions = parent.lazy_regions.clone();
     new_proc.memory.next_mmap = parent.memory.next_mmap;
     
     // 5. Write ProcessInfo to child's process info page
@@ -2413,6 +2432,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(),
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
