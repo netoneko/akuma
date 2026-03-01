@@ -67,6 +67,8 @@ The kernel is responsible for:
 
 ## Userspace Address Space Layout
 
+### Small binaries (code < ~128MB)
+
 ```
 0x00000000 ┌─────────────────────────┐
            │ (unmapped)              │
@@ -74,12 +76,15 @@ The kernel is responsible for:
            │ Code (.text)            │  ← ELF loaded here
            │ Data (.data, .bss)      │
            ├─────────────────────────┤
-           │ Heap (brk-based)        │  ← Grows upward
+           │ Heap (brk-based)        │  ← Grows upward (64MB lazy region)
            │         ↓               │
+0x0A000000 ├─────────────────────────┤
+           │ VirtIO device pages     │  ← Kernel device MMIO (L3 entries)
+           ├─────────────────────────┤
+           │                         │
 0x10000000 ├─────────────────────────┤
            │ mmap region             │  ← mmap allocations
            │         ↓               │
-           │                         │
            │         ↑               │
 0x3FFF0000 ├─────────────────────────┤
            │ Stack                   │  ← Grows downward
@@ -88,6 +93,32 @@ The kernel is responsible for:
            │ (kernel memory - not    │  ← User cannot access
            │  accessible from EL0)   │
            └─────────────────────────┘
+```
+
+### Large binaries (e.g., bun at 93MB)
+
+Large binaries push brk into the 0x05-0x09 range. GIC (0x0800_0000), UART
+(0x0900_0000), and fw_cfg (0x0902_0000) are NOT mapped in user page tables
+to avoid collision with the heap. The kernel accesses them via a temporary
+TTBR0 swap to boot page tables. See `docs/DEVICE_MMIO_VA_CONFLICT.md`.
+
+```
+0x00200000 ├─────────────────────────┤
+           │ Bun code + data         │  93MB
+0x05C6E000 ├─────────────────────────┤
+           │ Heap (brk-based)        │  64MB lazy region
+           │         ↓               │
+0x09C6E000 ├─────────────────────────┤  heap end
+0x0A000000 ├─────────────────────────┤
+           │ VirtIO device pages     │
+           ├─────────────────────────┤
+0x30000000 ├─────────────────────────┤
+           │ Dynamic linker          │  ld-musl-aarch64.so.1
+0x30100000 ├─────────────────────────┤
+           │ mmap region             │  → 0xFFD00000
+0xFFE00000 ├─────────────────────────┤
+           │ Stack (2MB)             │
+0xFFFFFFFF └─────────────────────────┘
 ```
 
 ## Cache Coherency
@@ -155,5 +186,6 @@ If you see unexpected behavior in userspace memory:
 
 - `docs/IDENTITY_MAPPING_DEPENDENCIES.md` - Kernel address translation
 - `docs/MEMORY_LAYOUT.md` - Overall memory layout
+- `docs/DEVICE_MMIO_VA_CONFLICT.md` - Device MMIO VA conflict and fix
 - `docs/HEAP_CORRUPTION_ANALYSIS.md` - Allocator debugging
 

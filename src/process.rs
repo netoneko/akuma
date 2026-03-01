@@ -1632,11 +1632,7 @@ impl Process {
         fd_map.insert(2, FileDescriptor::Stderr);
 
         const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        let heap_limit = crate::mmu::DEVICE_MMIO_START.saturating_sub(brk);
-        let heap_size = HEAP_LAZY_SIZE.min(heap_limit);
-        if heap_size > 0 {
-            push_lazy_region(pid, brk, heap_size, crate::mmu::user_flags::RW_NO_EXEC);
-        }
+        push_lazy_region(pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
 
         Ok(Self {
             pid,
@@ -1695,11 +1691,7 @@ impl Process {
         self.args = args.to_vec();
 
         const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        let heap_limit = crate::mmu::DEVICE_MMIO_START.saturating_sub(brk);
-        let heap_size = HEAP_LAZY_SIZE.min(heap_limit);
-        if heap_size > 0 {
-            push_lazy_region(self.pid, brk, heap_size, crate::mmu::user_flags::RW_NO_EXEC);
-        }
+        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1756,11 +1748,7 @@ impl Process {
         self.args = args.to_vec();
 
         const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        let heap_limit = crate::mmu::DEVICE_MMIO_START.saturating_sub(brk);
-        let heap_size = HEAP_LAZY_SIZE.min(heap_limit);
-        if heap_size > 0 {
-            push_lazy_region(self.pid, brk, heap_size, crate::mmu::user_flags::RW_NO_EXEC);
-        }
+        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
 
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1880,9 +1868,6 @@ impl Process {
     /// Returns the exact requested value (matching Linux brk ABI).
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
-            return self.brk;
-        }
-        if new_brk >= crate::mmu::DEVICE_MMIO_START {
             return self.brk;
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;

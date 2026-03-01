@@ -60,6 +60,7 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 - Kernel heap: ~120 MB (talc allocator)
 - Per-process: user stack 2 MB with guard page (configurable in `src/config.rs`)
 - User VA space: up to 4 GB (dynamically sized based on binary requirements)
+- Device MMIO (GIC, UART, fw_cfg) is NOT in user page tables — accessed via `with_boot_ttbr0()` swap. VirtIO (0x0a00_0000) remains in user tables. See `docs/DEVICE_MMIO_VA_CONFLICT.md`.
 
 ## no_std Rules
 

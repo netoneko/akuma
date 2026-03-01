@@ -227,8 +227,9 @@ regions for both push and lookup.
 When user code accesses a lazy region, a translation fault fires (EL0 data
 abort). The handler in `src/exceptions.rs`:
 
-1. Checks DFSC (bits [5:2] of ISS) for translation fault codes (0x04, 0x08,
-   0x0C for L1/L2/L3 faults)
+1. Checks DFSC (bits [5:2] of ISS) for translation fault (0x04) and access
+   flag fault (0x08) codes. Permission faults (0x0C) are NOT eligible for
+   demand paging — see `docs/DEVICE_MMIO_VA_CONFLICT.md`
 2. Calls `lazy_region_flags(far)` to check if the faulting address is in a
    lazy region
 3. If matched: allocates a zeroed physical page, maps it with the stored

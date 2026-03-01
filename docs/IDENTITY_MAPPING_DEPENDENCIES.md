@@ -146,6 +146,18 @@ d.addr = crate::mmu::virt_to_phys(self.buffer as usize) as u64;  // ✅
 
 ---
 
+## Device MMIO and User Page Tables
+
+The boot page tables identity-map all device MMIO via a 1GB L1 block (L1[0]).
+User page tables do NOT map most device MMIO — only VirtIO at 0x0a00_0000
+is retained because it does not conflict with user heap addresses.
+
+The kernel accesses GIC (0x0800_0000), UART (0x0900_0000), and fw_cfg
+(0x0902_0000) by temporarily swapping TTBR0 to boot page tables via
+`mmu::with_boot_ttbr0()`. This was necessary because large binaries like bun
+(93MB, brk at 0x05C6_E000) have heap regions that overlap with these device
+addresses. See `docs/DEVICE_MMIO_VA_CONFLICT.md` for the full analysis.
+
 ## Future Changes
 
 If the kernel is ever moved to a non-identity-mapped configuration:
@@ -159,6 +171,7 @@ If the kernel is ever moved to a non-identity-mapped configuration:
 ## Related Documentation
 
 - `docs/MEMORY_LAYOUT.md` - Kernel memory regions
+- `docs/DEVICE_MMIO_VA_CONFLICT.md` - Device MMIO VA conflict and fix
 - `docs/HEAP_CORRUPTION_ANALYSIS.md` - Previous memory bugs
 - `docs/USERSPACE_MEMORY_MODEL.md` - Userspace address handling
 - `src/boot.rs` - Boot page table setup

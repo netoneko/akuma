@@ -24,11 +24,12 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 /// Virtual address bits per level
 pub const BITS_PER_LEVEL: usize = 9;
 
-/// Device MMIO range mapped in user page tables (QEMU virt L2 indices 64..96).
-/// Demand paging must NEVER remap addresses in this range — doing so would
-/// destroy the kernel's UART mapping and kill serial output.
-pub const DEVICE_MMIO_START: usize = 0x0800_0000; // L2 idx 64
-pub const DEVICE_MMIO_END: usize = 0x0C00_0000;   // L2 idx 96
+/// Device MMIO pages mapped as individual L3 entries in user page tables.
+/// Since devices are mapped at page granularity (not 2MB blocks), demand
+/// paging for surrounding addresses works normally — map_user_page skips
+/// any L3 slot that already contains a valid entry.
+pub const DEVICE_MMIO_START: usize = 0x0800_0000;
+pub const DEVICE_MMIO_END: usize = 0x0C00_0000;
 
 /// Memory attribute indices (configured in MAIR_EL1)
 pub const MAIR_DEVICE_NGNRNE: u64 = 0; // Device memory, non-Gathering, non-Reordering, non-Early Write Acknowledgement
@@ -273,11 +274,36 @@ impl UserAddressSpace {
         }
 
         let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
-        let device_block_flags = flags::VALID | flags::BLOCK | flags::AF | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
+        let device_page_flags: u64 = flags::VALID | flags::TABLE | flags::AF
+            | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
 
-        for i in 64..96 {
-            let pa = (i as u64) * 0x200000;
-            unsafe { core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags); }
+        // Map only the specific device pages needed, using L3 tables instead of
+        // L2 2MB blocks. This frees the rest of the 0x0800_0000-0x0C00_0000 VA
+        // range for user memory (heap, mmap).
+        //
+        // Device pages:  GIC distributor 0x0800_0000, GIC CPU 0x0801_0000,
+        //                UART 0x0900_0000, fw_cfg 0x0902_0000,
+        //                VirtIO 0x0a00_0000
+        const DEVICE_PAGES: &[(usize, &[usize])] = &[
+            (64, &[0x0800_0000, 0x0801_0000]),           // L2[64]: GIC
+            (72, &[0x0900_0000, 0x0902_0000]),           // L2[72]: UART, fw_cfg
+            (80, &[0x0a00_0000]),                         // L2[80]: VirtIO
+        ];
+
+        for &(l2_idx, pages) in DEVICE_PAGES {
+            let l3_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate device L3 table")?;
+            pmm::track_frame(l3_frame, pmm::FrameSource::UserPageTable, 0);
+            self.page_table_frames.push(l3_frame);
+
+            let l3_entry = (l3_frame.addr as u64) | flags::VALID | flags::TABLE;
+            unsafe { core::ptr::write_volatile(l2_ptr.add(l2_idx), l3_entry); }
+
+            let l3_ptr = phys_to_virt(l3_frame.addr) as *mut u64;
+            let l2_base_va = (l2_idx as usize) * 0x20_0000;
+            for &pa in pages {
+                let l3_idx = (pa - l2_base_va) / PAGE_SIZE;
+                unsafe { core::ptr::write_volatile(l3_ptr.add(l3_idx), (pa as u64) | device_page_flags); }
+            }
         }
 
         // L1[1]: kernel RAM. Use an L2 table with 2MB blocks for only the
@@ -542,6 +568,10 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     let (l3_addr, l3_frame) = get_or_create_table_raw(l2_ptr, l2_idx);
     if let Some(frame) = l3_frame { allocated_tables.push(frame); }
     let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
+    let existing = l3_ptr.add(l3_idx).read_volatile();
+    if existing & flags::VALID != 0 {
+        return allocated_tables;
+    }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
     l3_ptr.add(l3_idx).write_volatile(entry);
     core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
