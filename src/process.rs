@@ -1420,6 +1420,72 @@ impl Process {
         })
     }
 
+    /// Create a process from a large ELF file on disk, loading segments on demand.
+    pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
+            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
+
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
+        crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
+
+        address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+            )
+            .map_err(|_| ElfError::MappingFailed("process info page"))?;
+
+        address_space.track_user_frame(process_info_frame);
+
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+
+        crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
+
+        let mut fd_map = alloc::collections::BTreeMap::new();
+        fd_map.insert(0, FileDescriptor::Stdin);
+        fd_map.insert(1, FileDescriptor::Stdout);
+        fd_map.insert(2, FileDescriptor::Stderr);
+
+        Ok(Self {
+            pid,
+            pgid: pid,
+            name: String::from(name),
+            state: ProcessState::Ready,
+            address_space,
+            context: UserContext::new(entry_point, stack_pointer),
+            parent_pid: 0,
+            brk,
+            initial_brk: brk,
+            entry_point,
+            memory,
+            process_info_phys: process_info_frame.addr,
+            args: Vec::new(),
+            cwd: String::from("/"),
+            stdin: Spinlock::new(StdioBuffer::new()),
+            stdout: Spinlock::new(StdioBuffer::new()),
+            exited: false,
+            exit_code: 0,
+            dynamic_page_tables: Vec::new(),
+            mmap_regions: Vec::new(),
+            fd_table: Spinlock::new(fd_map),
+            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+            nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+            next_fd: AtomicU32::new(3),
+            thread_id: None,
+            spawner_pid: None,
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
+            box_id: 0,
+            root_dir: String::from("/"),
+            channel: None,
+            delegate_pid: None,
+            clear_child_tid: 0,
+        })
+    }
+
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
         // Reuse load_elf_with_stack to handle address space creation, ELF loading, and stack setup
@@ -1472,6 +1538,55 @@ impl Process {
         // Reset I/O state (but keep FDs and Channel!)
         self.reset_io();
         
+        Ok(())
+    }
+
+    /// Replace current process image using on-demand loading from a file path.
+    pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) =
+            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, crate::config::USER_STACK_SIZE)
+            .map_err(|_| "Failed to load ELF")?;
+
+        mmu::UserAddressSpace::deactivate();
+
+        self.address_space = address_space;
+        self.entry_point = entry_point;
+        self.brk = brk;
+        self.initial_brk = brk;
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.mmap_regions.clear();
+        self.dynamic_page_tables.clear();
+        self.args = args.to_vec();
+
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+                self.pid, entry_point, brk, stack_bottom, stack_top, sp);
+        }
+
+        self.context = UserContext::new(entry_point, sp);
+
+        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+
+        self.address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+            )
+            .map_err(|_| "Failed to map process info")?;
+
+        self.address_space.track_user_frame(process_info_frame);
+        self.process_info_phys = process_info_frame.addr;
+
+        unsafe {
+            let info_ptr = mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+            core::ptr::write(info_ptr, info);
+        }
+
+        self.reset_io();
+
         Ok(())
     }
 
@@ -2538,10 +2653,6 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
-    // Read the ELF file
-    let elf_data =
-        crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
-
     // Prepare full arguments (argv[0] = path/name)
     let mut full_args = Vec::new();
     full_args.push(path.to_string());
@@ -2556,9 +2667,20 @@ pub fn spawn_process_with_channel_ext(
         _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
     };
 
-    // Create the process
-    let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
-        .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+    // Try to read the ELF file; for large files that exceed the in-memory
+    // limit, fall back to on-demand loading via read_at().
+    let mut process = match crate::fs::read_file(path) {
+        Ok(elf_data) => {
+            Process::from_elf(path, &full_args, &full_env, &elf_data)
+                .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
+        }
+        Err(_) => {
+            let file_size = crate::vfs::file_size(path)
+                .map_err(|e| alloc::format!("Failed to stat {}: {}", path, e))? as usize;
+            Process::from_elf_path(path, path, file_size, &full_args, &full_env)
+                .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
+        }
+    };
 
     // Always create a fresh channel per spawned process.
     // Reusing the parent's channel would cause the child's set_exited() call

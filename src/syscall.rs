@@ -2350,18 +2350,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
-    // Read the file
+    // Try to read the file; for large files fall back to on-demand loading.
     let file_data = match crate::fs::read_file(&resolved_path) {
-        Ok(data) => data,
+        Ok(data) => Some(data),
+        Err(crate::vfs::FsError::Internal) => None,
         Err(_) => {
             crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
             return ENOENT;
         }
     };
 
-    // Check for shebang (#!) scripts
-    if file_data.len() >= 2 && file_data[0] == b'#' && file_data[1] == b'!' {
-        return exec_shebang(&resolved_path, &file_data, args, env);
+    // Check for shebang (#!) scripts (only possible if we could read the file)
+    if let Some(ref data) = file_data {
+        if data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
+            return exec_shebang(&resolved_path, data, args, env);
+        }
     }
 
     // Otherwise treat as ELF binary
@@ -2385,7 +2388,20 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         }
     }
 
-    if let Err(e) = proc.replace_image(&file_data, &args, &env) {
+    let replace_result = if let Some(ref data) = file_data {
+        proc.replace_image(data, &args, &env)
+    } else {
+        let file_size = match crate::vfs::file_size(&resolved_path) {
+            Ok(sz) => sz as usize,
+            Err(_) => {
+                crate::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
+                return ENOENT;
+            }
+        };
+        proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
+    };
+
+    if let Err(e) = replace_result {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
         return ENOENT;
     }
