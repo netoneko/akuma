@@ -2118,6 +2118,46 @@ pub extern "C" fn check_process_exit() -> bool {
 /// context system (THREAD_CONTEXTS vs KernelContext) that was a source of bugs.
 /// 
 /// The thread is marked as terminated and the scheduler will reclaim it.
+/// Kill all threads sharing the same address space (L0 page table).
+/// Used by exit_group and when the address-space owner exits to prevent
+/// sibling threads from running with freed page tables.
+pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
+    let siblings: Vec<(Pid, Option<usize>)> = crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(pid, proc)| **pid != my_pid && proc.address_space.l0_phys() == l0_phys)
+            .map(|(pid, proc)| (*pid, proc.thread_id))
+            .collect()
+    });
+
+    for (sib_pid, sib_tid) in &siblings {
+        if let Some(proc) = lookup_process(*sib_pid) {
+            cleanup_process_fds(proc);
+        }
+        clear_lazy_regions(*sib_pid);
+
+        if let Some(tid) = sib_tid {
+            crate::irq::with_irqs_disabled(|| {
+                THREAD_PID_MAP.lock().remove(tid);
+            });
+            if let Some(channel) = remove_channel(*tid) {
+                channel.set_exited(137);
+            }
+        }
+
+        let _dropped = unregister_process(*sib_pid);
+
+        if let Some(tid) = sib_tid {
+            crate::threading::mark_thread_terminated(*tid);
+        }
+    }
+
+    if !siblings.is_empty() {
+        crate::safe_print!(128, "[Process] Killed {} sibling thread(s) for PID {}\n",
+            siblings.len(), my_pid);
+    }
+}
+
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
@@ -2196,6 +2236,16 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // kill_box handles unregistering the box and killing remaining PIDs
             if let Err(e) = kill_box(bid) {
                 crate::safe_print!(128, "[Process] Error: Failed to kill box {:08x}: {}\n", bid, e);
+            }
+        }
+
+        // If this process owns the address space (not shared), kill all
+        // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
+        // all page tables; siblings still using them would cause EL1 faults.
+        if let Some(proc) = lookup_process(pid) {
+            if !proc.address_space.is_shared() {
+                let l0_phys = proc.address_space.l0_phys();
+                kill_thread_group(pid, l0_phys);
             }
         }
 

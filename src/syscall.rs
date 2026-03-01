@@ -794,7 +794,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => sys_set_tid_address(args[0]),
-        nr::EXIT_GROUP => sys_exit(args[0] as i32),
+        nr::EXIT_GROUP => sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
         nr::RT_SIGACTION => 0,    // Success (do nothing)
@@ -873,8 +873,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => {
-            let sig = args[1] as i32;
-            crate::process::return_to_kernel(-(sig as i32))
+            // Stub: signal delivery not implemented.
+            // Previously this killed the calling thread — must not do that.
+            0
         }
         nr::CLOSE_RANGE => 0,
         nr::SYSINFO => sys_sysinfo(args[0] as usize),
@@ -1005,6 +1006,17 @@ fn sys_exit(code: i32) -> u64 {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
+    }
+    code as u64
+}
+
+fn sys_exit_group(code: i32) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let l0_phys = proc.address_space.l0_phys();
+        proc.exited = true;
+        proc.exit_code = code;
+        proc.state = crate::process::ProcessState::Zombie(code);
+        crate::process::kill_thread_group(proc.pid, l0_phys);
     }
     code as u64
 }

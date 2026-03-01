@@ -303,6 +303,10 @@ impl UserAddressSpace {
         ((self.asid as u64) << 48) | (self.l0_frame.addr as u64)
     }
 
+    pub fn l0_phys(&self) -> usize { self.l0_frame.addr }
+
+    pub fn is_shared(&self) -> bool { self.shared }
+
     pub fn asid(&self) -> u16 { self.asid }
 
     pub fn map_page(&mut self, va: usize, pa: usize, user_flags: u64) -> Result<(), &'static str> {
