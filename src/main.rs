@@ -814,12 +814,12 @@ fn run_async_main() -> ! {
         }
         
         GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
-        // Only yield when idle. During active network transfers, keep running
-        // to process packets as fast as possible. The preemptive scheduler
-        // (10ms timer) still ensures other threads get CPU time.
-        if !net_progress {
-            threading::yield_now();
-        }
+        // Yield after every iteration so threads waiting on network I/O
+        // (e.g. SSH sessions) can run promptly when data arrives. The
+        // polling loop above already drains bursts (up to 64 packets),
+        // so yielding here doesn't hurt bulk throughput — it just lets
+        // consumer threads process the data between bursts.
+        threading::yield_now();
     }
 }
 
