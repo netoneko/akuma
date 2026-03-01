@@ -274,12 +274,27 @@ impl UserAddressSpace {
             unsafe { core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags); }
         }
 
-        let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
+        // L1[1]: kernel RAM. Use an L2 table with 2MB blocks for only the
+        // actual 256MB of RAM (128 blocks) instead of a 1GB L1 block.
+        // This leaves VA 0x50000000-0x7FFFFFFF available for user mmap.
+        let l2_ram_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate kernel RAM L2 table")?;
+        pmm::track_frame(l2_ram_frame, pmm::FrameSource::UserPageTable, 0);
+        self.page_table_frames.push(l2_ram_frame);
+
         unsafe {
-            // L1[1]: identity-map 1GB-2GB → PA 0x40000000 (256MB kernel RAM)
-            core::ptr::write_volatile(l1_ptr.add(1), 0x4000_0000u64 | kernel_ram_flags);
-            // L1[2] intentionally left unmapped — PA 0x80000000 doesn't exist with 256MB RAM.
-            // User stack/mmap pages in the 2-3GB VA range are mapped via L2/L3 tables.
+            let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
+            core::ptr::write_volatile(l1_ptr.add(1), l2_ram_entry);
+
+            let l2_ram_ptr = phys_to_virt(l2_ram_frame.addr) as *mut u64;
+            let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
+                | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
+
+            // 256MB = 128 × 2MB blocks: VA 0x40000000-0x4FFFFFFF → PA 0x40000000-0x4FFFFFFF
+            for i in 0..128u64 {
+                let pa = 0x4000_0000 + i * 0x20_0000;
+                core::ptr::write_volatile(l2_ram_ptr.add(i as usize), pa | kernel_ram_flags);
+            }
+            // L2[128..511] left zeroed — VA 0x50000000-0x7FFFFFFF available for user pages
         }
         Ok(())
     }

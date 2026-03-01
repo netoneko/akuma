@@ -1232,10 +1232,10 @@ impl ProcessMemory {
         addr < self.stack_top && end > self.stack_bottom
     }
 
-    /// Kernel identity-maps VA 0x40000000-0x7FFFFFFF (L1[1] block) for RAM access.
+    /// Kernel identity-maps VA 0x40000000-0x4FFFFFFF (256MB RAM via 2MB blocks).
     /// User mmap regions must not overlap this range.
     const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END: usize   = 0x8000_0000;
+    const KERNEL_VA_END: usize   = 0x5000_0000;
 
     /// Allocate mmap region, returns None if would overlap stack
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
