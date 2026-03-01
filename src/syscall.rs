@@ -846,6 +846,20 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MSYNC => 0,
         nr::PROCESS_VM_READV => ENOSYS,
         nr::SCHED_SETAFFINITY => 0,
+        118 => { // sched_setparam — stub
+            0
+        }
+        119 => { // sched_getparam — return default (priority 0)
+            let param_ptr = args[1] as usize;
+            if param_ptr != 0 && validate_user_ptr(param_ptr as u64, 4) {
+                unsafe { core::ptr::write(param_ptr as *mut i32, 0); }
+            }
+            0
+        }
+        124 => { // sched_yield
+            crate::threading::yield_now();
+            0
+        }
         nr::SCHED_GETAFFINITY => {
             // Return a single-CPU affinity mask
             let mask_ptr = args[2] as usize;
@@ -3238,103 +3252,100 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
     let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
 
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
     let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
-        if let Some(proc) = crate::process::current_process() {
-            for i in 0..pages {
-                let va = addr + i * 4096;
-                let _ = proc.address_space.unmap_page(va);
-            }
+        for i in 0..pages {
+            let va = addr + i * 4096;
+            let _ = proc.address_space.unmap_page(va);
         }
         addr
     } else {
-        let a = crate::process::alloc_mmap(pages * 4096);
-        if a == 0 {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                let pid = crate::process::read_current_pid().unwrap_or(0);
-                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} alloc_mmap FAILED\n", pid, len);
-            }
-            return !0u64;
-        }
-        a
-    };
-
-    if let Some(proc) = crate::process::current_process() {
-        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
-
-        // Demand-page anonymous mappings when:
-        //   - PROT_NONE (classic lazy)
-        //   - MAP_NORESERVE (caller doesn't expect physical backing)
-        //   - Region is large (> 256 pages / 1MB) — too expensive to eagerly back
-        let use_lazy = !is_file_backed && (
-            is_lazy ||
-            (flags & MAP_NORESERVE != 0) ||
-            pages > 256
-        );
-
-        if use_lazy {
-            crate::process::record_lazy_region(mmap_addr, pages * 4096, page_flags);
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                let pid = crate::process::read_current_pid().unwrap_or(0);
-                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy)\n",
-                    pid, len, prot, flags, mmap_addr);
-            }
-            return mmap_addr as u64;
-        }
-
-        let initial_flags = if is_file_backed {
-            crate::mmu::user_flags::RW_NO_EXEC
-        } else {
-            page_flags
-        };
-
-        let mut frames = alloc::vec::Vec::new();
-        for i in 0..pages {
-            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-                frames.push(frame);
-                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
-                proc.address_space.track_user_frame(frame);
-            } else {
+        match proc.memory.alloc_mmap(pages * 4096) {
+            Some(a) => a,
+            None => {
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                    let pid = crate::process::read_current_pid().unwrap_or(0);
-                    crate::safe_print!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
-                        pid, len, i, pages);
+                    crate::safe_print!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                        proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
                 }
                 return !0u64;
             }
         }
-        crate::process::record_mmap_region(mmap_addr, frames);
+    };
 
-        if !is_file_backed && crate::config::SYSCALL_DEBUG_IO_ENABLED {
-            let pid = crate::process::read_current_pid().unwrap_or(0);
-            crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
-                pid, len, prot, flags, mmap_addr);
+    let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+
+    let use_lazy = !is_file_backed && (
+        is_lazy ||
+        (flags & MAP_NORESERVE != 0) ||
+        pages > 256
+    );
+
+    if use_lazy {
+        // Use address-space owner PID so all CLONE_VM threads share lazy regions
+        let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+        let count = crate::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
+                proc.pid, len, prot, flags, mmap_addr, count);
         }
+        return mmap_addr as u64;
+    }
 
-        if is_file_backed {
-            if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
-                let path = f.path.clone();
-                let mut buf = alloc::vec![0u8; len];
-                if let Ok(n) = crate::fs::read_at(&path, offset, &mut buf) {
-                    let copy_len = n.min(len);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
-                    }
-                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                        let pid = crate::process::read_current_pid().unwrap_or(0);
-                        crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n", pid, fd, &path, offset, len, mmap_addr, copy_len);
-                    }
+    let initial_flags = if is_file_backed {
+        crate::mmu::user_flags::RW_NO_EXEC
+    } else {
+        page_flags
+    };
+
+    let mut frames = alloc::vec::Vec::new();
+    for i in 0..pages {
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            frames.push(frame);
+            unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
+            proc.address_space.track_user_frame(frame);
+        } else {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
+                    proc.pid, len, i, pages);
+            }
+            return !0u64;
+        }
+    }
+    proc.mmap_regions.push((mmap_addr, frames));
+
+    if !is_file_backed && crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+            proc.pid, len, prot, flags, mmap_addr);
+    }
+
+    if is_file_backed {
+        if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
+            let path = f.path.clone();
+            let mut buf = alloc::vec![0u8; len];
+            if let Ok(n) = crate::fs::read_at(&path, offset, &mut buf) {
+                let copy_len = n.min(len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
+                }
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
+                        proc.pid, fd, &path, offset, len, mmap_addr, copy_len);
                 }
             }
-            if page_flags != initial_flags {
-                for i in 0..pages {
-                    let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
-                }
+        }
+        if page_flags != initial_flags {
+            for i in 0..pages {
+                let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
             }
         }
+    }
 
-        mmap_addr as u64
-    } else { !0u64 }
+    mmap_addr as u64
 }
 
 fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
@@ -3565,39 +3576,42 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 }
 
 fn sys_munmap(addr: usize, len: usize) -> u64 {
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
+    let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
+    let unmap_end = addr + unmap_len;
+
     // Try normal (eagerly-mapped) region first
-    if let Some(frames) = crate::process::remove_mmap_region(addr) {
-        if let Some(proc) = crate::process::current_process() {
-            for (i, frame) in frames.into_iter().enumerate() {
-                let _ = proc.address_space.unmap_page(addr + i * 4096);
-                proc.address_space.remove_user_frame(frame);
-                crate::pmm::free_page(frame);
-            }
-            return 0;
+    if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
+        let (_, frames) = proc.mmap_regions.remove(idx);
+        for (i, frame) in frames.into_iter().enumerate() {
+            let _ = proc.address_space.unmap_page(addr + i * 4096);
+            proc.address_space.remove_user_frame(frame);
+            crate::pmm::free_page(frame);
         }
+        return 0;
     }
 
-    // Try lazy region: unmap any demand-allocated pages within the range
-    if let Some(proc) = crate::process::current_process() {
-        let pages = if len > 0 { (len + 4095) / 4096 } else { 1 };
-        let removed = proc.lazy_regions.iter().position(|&(start, _, _)| start == addr);
-        if let Some(idx) = removed {
-            let (_, region_size, _) = proc.lazy_regions.remove(idx);
-            let region_pages = region_size / 4096;
-            for i in 0..region_pages {
-                let va = addr + i * 4096;
-                let _ = proc.address_space.unmap_page(va);
-            }
-            proc.memory.free_regions.push((addr, region_size));
-            return 0;
-        }
-        // Partial unmap within a lazy region — just unmap the requested pages
-        for i in 0..pages {
+    // Try lazy region — handle partial unmaps (prefix, suffix, middle split)
+    // Use address-space owner PID for CLONE_VM consistency
+    let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+    if let Some(result) = crate::process::munmap_lazy_region(as_pid, addr, unmap_len) {
+        let (_, actual_pages) = result;
+        for i in 0..actual_pages {
             let _ = proc.address_space.unmap_page(addr + i * 4096);
         }
         return 0;
     }
-    !0u64
+
+    // Partial unmap — just unmap the requested pages
+    let pages = unmap_len / 4096;
+    for i in 0..pages {
+        let _ = proc.address_space.unmap_page(addr + i * 4096);
+    }
+    0
 }
 
 fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {

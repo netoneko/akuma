@@ -1106,6 +1106,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         return unsafe { (*frame).x0 };
                     }
                 } else {
+                    crate::process::lazy_region_debug(far as usize);
                     let pid = crate::process::read_current_pid().unwrap_or(0);
                     crate::safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }

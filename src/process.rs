@@ -468,6 +468,12 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
 static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Global lazy region table, keyed by PID.
+/// Stored separately from Process to avoid aliasing/corruption issues
+/// with &mut Process references from current_process().
+static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<(usize, usize, u64)>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 /// Register a process in the table (takes ownership)
 pub fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
@@ -989,14 +995,149 @@ pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
 /// Returns (true, page_flags) if found; page_flags are the permissions to apply
 /// when demand-allocating the page.
 pub fn lazy_region_flags(va: usize) -> Option<u64> {
-    if let Some(proc) = current_process() {
-        for &(start, size, flags) in &proc.lazy_regions {
-            if va >= start && va < start + size {
-                return Some(flags);
+    // Use the process info page PID so all threads sharing an address space
+    // (CLONE_VM) use the same lazy region set.
+    let pid = read_current_pid()?;
+    crate::irq::with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&pid) {
+            for &(start, size, flags) in regions {
+                if va >= start && va < start + size {
+                    return Some(flags);
+                }
             }
         }
+        None
+    })
+}
+
+pub fn lazy_region_debug(va: usize) {
+    let pid = read_current_pid().unwrap_or(0);
+    crate::irq::with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&pid) {
+            crate::safe_print!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
+                pid, va, regions.len());
+            for (i, &(start, size, _)) in regions.iter().enumerate() {
+                if i > 0 { crate::safe_print!(8, ","); }
+                crate::safe_print!(64, "{:#x}-{:#x}", start, start + size);
+            }
+            crate::safe_print!(8, "]\n");
+        } else {
+            crate::safe_print!(64, "[DP] lazy miss: pid={} va={:#x} no entry in table\n", pid, va);
+        }
+    });
+}
+
+pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64) -> usize {
+    let len = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let regions = table.entry(pid).or_insert_with(Vec::new);
+        regions.push((start_va, size, page_flags));
+        regions.len()
+    });
+    if pid == 29 {
+        crate::safe_print!(128, "[LR+] pid={} {:#x}+{:#x} -> {} regions\n", pid, start_va, size, len);
     }
-    None
+    len
+}
+
+pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<(usize, usize, u64)> {
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get_mut(&pid) {
+            if let Some(idx) = regions.iter().position(|&(start, _, _)| start == start_va) {
+                let removed = regions.remove(idx);
+                return Some((removed, regions.len()));
+            }
+        }
+        None
+    });
+    if let Some((removed, remaining)) = result {
+        if pid == 29 {
+            crate::safe_print!(128, "[LR-] pid={} {:#x} -> {} regions\n", pid, start_va, remaining);
+        }
+        Some(removed)
+    } else {
+        None
+    }
+}
+
+/// Handle munmap for lazy regions with proper partial unmap support.
+/// Returns Some((freed_start, freed_pages)) if a region was found and modified.
+pub fn munmap_lazy_region(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Option<(usize, usize)> {
+    let unmap_end = unmap_addr + unmap_len;
+    let unmap_pages = unmap_len / 4096;
+
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let regions = table.get_mut(&pid)?;
+
+        let idx = regions.iter().position(|&(start, size, _)| {
+            let end = start + size;
+            unmap_addr >= start && unmap_addr < end
+        })?;
+
+        let (reg_start, reg_size, reg_flags) = regions[idx];
+        let reg_end = reg_start + reg_size;
+
+        if unmap_addr == reg_start && unmap_end >= reg_end {
+            // Full removal
+            regions.remove(idx);
+            Some(('F', reg_start, reg_size / 4096))
+        } else if unmap_addr == reg_start {
+            // Prefix removal: shrink from start
+            let new_start = unmap_end;
+            let new_size = reg_end - new_start;
+            regions[idx] = (new_start, new_size, reg_flags);
+            Some(('P', unmap_addr, unmap_pages))
+        } else if unmap_end >= reg_end {
+            // Suffix removal: shrink from end
+            let new_size = unmap_addr - reg_start;
+            regions[idx] = (reg_start, new_size, reg_flags);
+            Some(('S', unmap_addr, unmap_pages))
+        } else {
+            // Middle split: create two regions
+            let left_size = unmap_addr - reg_start;
+            let right_start = unmap_end;
+            let right_size = reg_end - right_start;
+            regions[idx] = (reg_start, left_size, reg_flags);
+            regions.push((right_start, right_size, reg_flags));
+            Some(('M', unmap_addr, unmap_pages))
+        }
+    });
+
+    if let Some((op, freed_start, freed_pages)) = result {
+        crate::safe_print!(128, "[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)\n",
+            op as char, pid, freed_start, freed_pages * 4096, freed_pages);
+        Some((freed_start, freed_pages))
+    } else {
+        None
+    }
+}
+
+pub fn clear_lazy_regions(pid: Pid) {
+    let count = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let count = table.get(&pid).map_or(0, |r| r.len());
+        table.remove(&pid);
+        count
+    });
+    if count > 0 {
+        crate::safe_print!(64, "[LR!] clear pid={} ({} regions)\n", pid, count);
+    }
+}
+
+pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&from_pid) {
+            let cloned = regions.clone();
+            let len = cloned.len();
+            table.insert(to_pid, cloned);
+            crate::safe_print!(64, "[LR] clone pid={}->{} ({} regions)\n", from_pid, to_pid, len);
+        }
+    });
 }
 
 /// Check if a virtual address falls within any lazy region.
@@ -1542,6 +1683,7 @@ impl Process {
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
         self.lazy_regions.clear();
+        clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
         
@@ -1595,6 +1737,7 @@ impl Process {
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
         self.lazy_regions.clear();
+        clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
 
@@ -2056,8 +2199,8 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
+        clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
-        // _dropped_process goes out of scope here and is dropped, freeing all memory
         crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
     } else {
         crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
@@ -2372,7 +2515,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     }
 
     new_proc.mmap_regions = child_mmap_regions;
-    new_proc.lazy_regions = parent.lazy_regions.clone();
+    new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap = parent.memory.next_mmap;
     
     // 5. Write ProcessInfo to child's process info page
@@ -2416,6 +2559,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);
+    clone_lazy_regions(parent_pid, child_pid);
     
     // Now safe to start the thread
     crate::threading::mark_thread_ready(tid);
@@ -2455,7 +2599,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
-        lazy_regions: parent.lazy_regions.clone(),
+        lazy_regions: Vec::new(), // managed via LAZY_REGION_TABLE
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
@@ -2510,6 +2654,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     });
 
     register_process(child_pid, new_proc);
+    clone_lazy_regions(parent_pid, child_pid);
 
     // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID)
     if parent_tid_ptr != 0 {
