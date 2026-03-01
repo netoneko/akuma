@@ -954,7 +954,8 @@ pub fn alloc_mmap(size: usize) -> usize {
     match proc.memory.alloc_mmap(size) {
         Some(addr) => addr,
         None => {
-            crate::safe_print!(64, "[mmap] REJECT: size 0x{:x} exceeds limit\n", size);
+            crate::safe_print!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                proc.pid, size, proc.memory.next_mmap, proc.memory.mmap_limit);
             0
         }
     }
@@ -970,24 +971,31 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     }
 }
 
-/// Record a lazy (PROT_NONE) mmap region — VA reserved, no physical pages.
-pub fn record_lazy_region(start_va: usize, size: usize) {
+/// Record a lazy mmap region — VA reserved, no physical pages.
+/// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
+pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
     if let Some(proc) = current_process() {
-        proc.lazy_regions.push((start_va, size));
+        proc.lazy_regions.push((start_va, size, page_flags));
     }
 }
 
 /// Check if a virtual address falls within any lazy region of the current process.
-/// Returns true if found (and the page should be demand-allocated).
-pub fn is_in_lazy_region(va: usize) -> bool {
+/// Returns (true, page_flags) if found; page_flags are the permissions to apply
+/// when demand-allocating the page.
+pub fn lazy_region_flags(va: usize) -> Option<u64> {
     if let Some(proc) = current_process() {
-        for &(start, size) in &proc.lazy_regions {
+        for &(start, size, flags) in &proc.lazy_regions {
             if va >= start && va < start + size {
-                return true;
+                return Some(flags);
             }
         }
     }
-    false
+    None
+}
+
+/// Check if a virtual address falls within any lazy region.
+pub fn is_in_lazy_region(va: usize) -> bool {
+    lazy_region_flags(va).is_some()
 }
 
 /// Remove and return mmap region starting at the given VA
@@ -1224,30 +1232,37 @@ impl ProcessMemory {
         addr < self.stack_top && end > self.stack_bottom
     }
 
+    /// Kernel identity-maps VA 0x40000000-0x7FFFFFFF (L1[1] block) for RAM access.
+    /// User mmap regions must not overlap this range.
+    const KERNEL_VA_START: usize = 0x4000_0000;
+    const KERNEL_VA_END: usize   = 0x8000_0000;
+
     /// Allocate mmap region, returns None if would overlap stack
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
         // 1. Try to find a hole in free_regions (first-fit)
         for i in 0..self.free_regions.len() {
             let (start, f_size) = self.free_regions[i];
             if f_size >= size {
-                // Found a suitable hole
                 self.free_regions.remove(i);
-                
-                // If the hole is larger than requested, add the remainder back
                 if f_size > size {
                     self.free_regions.push((start + size, f_size - size));
                 }
-                
                 return Some(start);
             }
         }
 
-        // 2. Fall back to bump allocator
-        let addr = self.next_mmap;
+        // 2. Fall back to bump allocator — skip the kernel identity-mapped VA range
+        let mut addr = self.next_mmap;
+
+        // If we're about to enter the kernel VA hole, jump past it
+        if addr < Self::KERNEL_VA_END && addr + size > Self::KERNEL_VA_START {
+            addr = Self::KERNEL_VA_END;
+        }
+
         let end = addr.checked_add(size)?;
 
         if end > self.mmap_limit {
-            return None; // Would get too close to stack
+            return None;
         }
 
         self.next_mmap = end;
@@ -1315,10 +1330,12 @@ pub struct Process {
     /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
     /// Used by munmap to find and free the correct frames.
     pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
-    /// Lazy (PROT_NONE) mmap regions: (start_va, size).
-    /// These have VA reserved but no physical pages allocated.
-    /// Pages are allocated on demand via mprotect or page fault.
-    pub lazy_regions: Vec<(usize, usize)>,
+    /// Lazy mmap regions: (start_va, size, page_flags).
+    /// VA is reserved but physical pages are allocated on demand via
+    /// mprotect or page fault. page_flags=0 means PROT_NONE (needs
+    /// mprotect before access); non-zero means demand-paged with those
+    /// permissions on first touch.
+    pub lazy_regions: Vec<(usize, usize, u64)>,
 
     // ========== File Descriptor Table ==========
     /// Per-process file descriptor table

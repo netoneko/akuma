@@ -84,3 +84,64 @@ manual parser reads:
 
 The on-demand loader allocates user-space pages through the PMM (physical memory
 manager), which draws from the user pages pool — separate from the kernel heap.
+
+---
+
+## Dynamic Virtual Address Space
+
+### Problem
+
+The original kernel used a fixed 1GB user address space (STACK_TOP = 0x40000000).
+Large binaries like bun (93MB code) with a dynamic linker need significantly more
+VA space:
+
+- ELF segments span 0x200000–0x5C6D418 (~92MB)
+- Interpreter loaded at 0x30000000
+- bun's arena allocator reserves 1GB+ contiguous VA regions via mmap
+
+### Solution: `compute_stack_top()`
+
+`src/elf_loader.rs` now dynamically computes `STACK_TOP` based on binary layout:
+
+- **Small static binaries** (code < 64MB, no interpreter): keep default 1GB layout
+- **Large or dynamic binaries**: expand to provide ~2GB mmap space, with
+  `STACK_TOP` up to 3GB (0xC0000000)
+
+The mmap region sits between the interpreter end (0x30100000) and the stack
+bottom, giving large binaries ~2.3GB of mmap space.
+
+### User page table fix (L1 BLOCK descriptor bug)
+
+`add_kernel_mappings()` in `src/mmu.rs` created a 1GB BLOCK descriptor at
+L1\[2\] mapping VA 2–3GB → PA 0x80000000. With only 256MB RAM (PA
+0x40000000–0x4FFFFFFF), PA 0x80000000 does not exist.
+
+When `map_page` tried to map the user stack at VA ~0xBFFC0000 (in the 2–3GB
+range), `get_or_create_table` saw L1\[2\] had `VALID` set and treated the
+BLOCK descriptor as a TABLE descriptor — extracting PA 0x80000000 as a page
+table pointer. Accessing `phys_to_virt(0x80000000)` = 0x80000000 (identity-
+mapped but no RAM) caused a synchronous external abort (EC=0x25, ISS=0x10,
+FAR=0x80000FF8).
+
+**Fix:** Removed the bogus L1\[2\] block mapping and hardened
+`get_or_create_table` to distinguish BLOCK (bit\[1\]=0) from TABLE
+(bit\[1\]=1) descriptors. If a BLOCK is encountered where a TABLE is needed,
+it is replaced with a fresh zeroed page table.
+
+## Pointer Validation Fix
+
+### Problem
+
+`validate_user_ptr()` and `copy_from_user_str()` in `src/syscall.rs` rejected
+any user pointer above 0x40000000 (the old 1GB limit). With the dynamic address
+space, bun's stack lives at 0xBFFC0000–0xC0000000. Every syscall the dynamic
+linker made — `openat` with a filename on the stack, `writev` for error
+messages — was silently rejected with EFAULT. The linker couldn't search for
+libraries or print diagnostics, so it called `_exit(127)`.
+
+### Fix
+
+Both functions now call `user_va_limit()` which reads `stack_top` from the
+current process's `ProcessMemory`, falling back to 0x40000000 when no process
+is active. This makes the validation limit match the actual address space layout
+of each process.

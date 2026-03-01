@@ -348,6 +348,9 @@ pub mod nr {
     pub const SETITIMER: u64 = 103;      // Linux arm64 setitimer
     pub const MEMBARRIER: u64 = 283;     // Linux arm64 membarrier
     pub const PRCTL: u64 = 167;          // Linux arm64 prctl
+    pub const GETRUSAGE: u64 = 165;      // Linux arm64 getrusage
+    pub const MSYNC: u64 = 227;          // Linux arm64 msync
+    pub const PROCESS_VM_READV: u64 = 270; // Linux arm64 process_vm_readv
 }
 
 /// Thread CPU statistics for top command
@@ -826,7 +829,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PWRITE64 => sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::SETITIMER => 0,
         nr::MEMBARRIER => 0,
-        nr::PRCTL => 0, // stub — no MTE or tagged addressing support
+        nr::PRCTL => 0,
+        nr::GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as usize),
+        nr::MSYNC => 0,
+        nr::PROCESS_VM_READV => ENOSYS,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -3140,19 +3146,27 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     };
 
     if let Some(proc) = crate::process::current_process() {
-        if is_lazy {
-            // PROT_NONE: just reserve the VA range, no physical pages.
-            // Pages will be allocated on demand when mprotect upgrades permissions
-            // or on page fault.
-            crate::process::record_lazy_region(mmap_addr, pages * 4096);
+        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+
+        // Demand-page anonymous mappings when:
+        //   - PROT_NONE (classic lazy)
+        //   - MAP_NORESERVE (caller doesn't expect physical backing)
+        //   - Region is large (> 256 pages / 1MB) — too expensive to eagerly back
+        let use_lazy = !is_file_backed && (
+            is_lazy ||
+            (flags & MAP_NORESERVE != 0) ||
+            pages > 256
+        );
+
+        if use_lazy {
+            crate::process::record_lazy_region(mmap_addr, pages * 4096, page_flags);
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::safe_print!(128, "[syscall] mmap(PROT_NONE, len=0x{:x}) = 0x{:x} (lazy)\n",
-                    len, mmap_addr);
+                crate::safe_print!(128, "[syscall] mmap(len=0x{:x}, prot=0x{:x}) = 0x{:x} (lazy)\n",
+                    len, prot, mmap_addr);
             }
             return mmap_addr as u64;
         }
 
-        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
         let initial_flags = if is_file_backed {
             crate::mmu::user_flags::RW_NO_EXEC
         } else {
@@ -3310,6 +3324,16 @@ fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64
     0
 }
 
+fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
+    // struct rusage is 144 bytes on aarch64 (18 × 8-byte fields)
+    const RUSAGE_SIZE: usize = 144;
+    if !validate_user_ptr(usage_ptr as u64, RUSAGE_SIZE) { return EFAULT; }
+    // Zero-fill: we don't track per-process resource usage yet
+    unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, RUSAGE_SIZE); }
+    let _ = who;
+    0
+}
+
 fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
@@ -3350,9 +3374,9 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     // Try lazy region: unmap any demand-allocated pages within the range
     if let Some(proc) = crate::process::current_process() {
         let pages = if len > 0 { (len + 4095) / 4096 } else { 1 };
-        let removed = proc.lazy_regions.iter().position(|&(start, _)| start == addr);
+        let removed = proc.lazy_regions.iter().position(|&(start, _, _)| start == addr);
         if let Some(idx) = removed {
-            let (_, region_size) = proc.lazy_regions.remove(idx);
+            let (_, region_size, _) = proc.lazy_regions.remove(idx);
             let region_pages = region_size / 4096;
             for i in 0..region_pages {
                 let va = addr + i * 4096;

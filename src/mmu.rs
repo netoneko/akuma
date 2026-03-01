@@ -525,6 +525,15 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
 unsafe fn get_or_create_table_raw(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
     let entry = table_ptr.add(idx).read_volatile();
     if entry & flags::VALID != 0 {
+        if entry & flags::TABLE == 0 {
+            // BLOCK descriptor — replace with a table so we can map individual pages
+            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+                table_ptr.add(idx).write_volatile(new_entry);
+                return (frame.addr, Some(frame));
+            }
+            return (0, None);
+        }
         ((entry & 0x0000_FFFF_FFFF_F000) as usize, None)
     } else if let Some(frame) = crate::pmm::alloc_page_zeroed() {
         let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
