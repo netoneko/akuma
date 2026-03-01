@@ -65,6 +65,21 @@ manual parser reads:
   program header offset/count/size
 - Program headers (56 bytes each): type, flags, offset, vaddr, filesz, memsz
 
+### Inter-segment gap filling
+
+Large ELF binaries typically have gaps between PT_LOAD segments (e.g., between
+read-only data and executable code). On Linux, the kernel creates one contiguous
+mapping spanning all segments, so gap pages are anonymous zero-filled memory.
+
+The on-demand loader now fills these gaps after loading all segments. It sorts
+PT_LOAD segments by virtual address and maps zero-filled pages for any unmapped
+ranges between consecutive segments. For bun, this fills a 15-page (60KB) gap
+between the read-only data segment (ends at 0x2A2E4D4) and the code segment
+(starts at 0x2A3E500).
+
+Without gap filling, bun crashes with a translation fault when it accesses
+addresses in the gap (e.g., FAR=0x2a2f000).
+
 ### Limitations
 
 - **No kernel-side relocations for large ET_EXEC binaries.** The `elf` crate is

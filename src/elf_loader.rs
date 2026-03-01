@@ -936,6 +936,42 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
     }
 
+    // Fill gaps between PT_LOAD segments with zero-filled pages.
+    // Linux maps the entire span contiguously; gaps between segments are
+    // anonymous zero-filled memory. Without this, accesses to gap addresses
+    // (e.g., between read-only data and code segments) cause translation faults.
+    let mut load_segments: Vec<(usize, usize)> = phdrs.iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .map(|p| {
+            let va = base + p.p_vaddr as usize;
+            let end = va + p.p_memsz as usize;
+            let page_start = va & !(PAGE_SIZE - 1);
+            let page_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            (page_start, page_end)
+        })
+        .collect();
+    load_segments.sort_by_key(|&(start, _)| start);
+
+    for w in load_segments.windows(2) {
+        let prev_end = w[0].1;
+        let next_start = w[1].0;
+        if prev_end < next_start {
+            let gap_pages = (next_start - prev_end) / PAGE_SIZE;
+            for i in 0..gap_pages {
+                let gap_va = prev_end + i * PAGE_SIZE;
+                if !mapped_pages.contains_key(&gap_va) {
+                    if let Ok(frame) = address_space.alloc_and_map(gap_va, user_flags::RW_NO_EXEC) {
+                        mapped_pages.insert(gap_va, frame.addr);
+                    }
+                }
+            }
+            if DEBUG_ELF_LOADING && gap_pages > 0 {
+                crate::safe_print!(128, "[ELF] Filled gap: 0x{:08x}-0x{:08x} ({} pages)\n",
+                    prev_end, next_start, gap_pages);
+            }
+        }
+    }
+
     if DEBUG_ELF_LOADING {
         crate::safe_print!(80, "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
             entry_point, brk, mapped_pages.len());
