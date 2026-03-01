@@ -63,11 +63,15 @@ static UART: Uart = Uart::new(0x0900_0000);
 // Public API - Safe wrappers around UART operations
 // ============================================================================
 
-/// Print a string to the console
+/// Print a string to the console.
+/// Disables IRQs to prevent timer preemption from interleaving output
+/// of two threads mid-message.
 pub fn print(s: &str) {
-    for c in s.bytes() {
-        UART.write(c);
-    }
+    crate::irq::with_irqs_disabled(|| {
+        for c in s.bytes() {
+            UART.write(c);
+        }
+    });
 }
 
 /// Print a single character

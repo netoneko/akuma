@@ -24,6 +24,12 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 /// Virtual address bits per level
 pub const BITS_PER_LEVEL: usize = 9;
 
+/// Device MMIO range mapped in user page tables (QEMU virt L2 indices 64..96).
+/// Demand paging must NEVER remap addresses in this range — doing so would
+/// destroy the kernel's UART mapping and kill serial output.
+pub const DEVICE_MMIO_START: usize = 0x0800_0000; // L2 idx 64
+pub const DEVICE_MMIO_END: usize = 0x0C00_0000;   // L2 idx 96
+
 /// Memory attribute indices (configured in MAIR_EL1)
 pub const MAIR_DEVICE_NGNRNE: u64 = 0; // Device memory, non-Gathering, non-Reordering, non-Early Write Acknowledgement
 pub const MAIR_NORMAL_NC: u64 = 1; // Normal memory, non-cacheable

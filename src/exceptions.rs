@@ -1117,12 +1117,18 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
 
-            // Translation fault (ISS bits [5:2] = 0b01xx) — try demand paging
+            let pid = crate::process::read_current_pid().unwrap_or(0);
+            crate::safe_print!(128, "[DA] pid={} far={:#x} elr={:#x} iss={:#x}\n", pid, far, elr, iss);
+
+            // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08 || fault_type == 0x0C;
-            if is_translation_fault {
-                if let Some(flags) = crate::process::lazy_region_flags(far as usize) {
-                    let page_va = (far as usize) & !(0xFFF);
+            let far_usize = far as usize;
+            let in_device_mmio = far_usize >= crate::mmu::DEVICE_MMIO_START
+                && far_usize < crate::mmu::DEVICE_MMIO_END;
+            if is_translation_fault && !in_device_mmio {
+                if let Some(flags) = crate::process::lazy_region_flags(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
                     if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
                         let table_frames = unsafe {
@@ -1137,7 +1143,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         return unsafe { (*frame).x0 };
                     }
                 } else {
-                    crate::process::lazy_region_debug(far as usize);
+                    crate::process::lazy_region_debug(far_usize);
                     let pid = crate::process::read_current_pid().unwrap_or(0);
                     crate::safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }
@@ -1155,11 +1161,12 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
-            // Instruction abort from user - terminate
             let far: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
+            let pid = crate::process::read_current_pid().unwrap_or(0);
+            crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             let frame_ref = unsafe { &*frame };
             crate::safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);
