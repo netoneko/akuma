@@ -355,6 +355,14 @@ pub mod nr {
     pub const SCHED_GETAFFINITY: u64 = 123; // Linux arm64 sched_getaffinity
     pub const TKILL: u64 = 130;          // Linux arm64 tkill
     pub const CLOSE_RANGE: u64 = 436;    // Linux arm64 close_range
+    pub const SYSINFO: u64 = 179;        // Linux arm64 sysinfo
+    pub const CLOCK_GETRES: u64 = 114;   // Linux arm64 clock_getres
+    pub const EPOLL_CREATE1: u64 = 20;   // Linux arm64 epoll_create1
+    pub const EPOLL_CTL: u64 = 21;       // Linux arm64 epoll_ctl
+    pub const EPOLL_PWAIT: u64 = 22;     // Linux arm64 epoll_pwait
+    pub const TIMERFD_CREATE: u64 = 85;  // Linux arm64 timerfd_create
+    pub const TIMERFD_SETTIME: u64 = 86; // Linux arm64 timerfd_settime
+    pub const TIMERFD_GETTIME: u64 = 87; // Linux arm64 timerfd_gettime
 }
 
 /// Thread CPU statistics for top command
@@ -855,6 +863,20 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             crate::process::return_to_kernel(-(sig as i32))
         }
         nr::CLOSE_RANGE => 0,
+        nr::SYSINFO => sys_sysinfo(args[0] as usize),
+        nr::CLOCK_GETRES => sys_clock_getres(args[0] as u32, args[1] as usize),
+        nr::EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
+        nr::EPOLL_CTL => sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
+        nr::EPOLL_PWAIT => sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32),
+        nr::TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
+        nr::TIMERFD_SETTIME => sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
+        nr::TIMERFD_GETTIME => {
+            // Return zeros in the output itimerspec
+            if args[1] != 0 && validate_user_ptr(args[1] as u64, 32) {
+                unsafe { core::ptr::write_bytes(args[1] as *mut u8, 0, 32); }
+            }
+            0
+        }
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1456,6 +1478,11 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
+        crate::process::FileDescriptor::TimerFd => {
+            // Non-blocking: return EAGAIN (timer hasn't fired)
+            EAGAIN
+        }
+        crate::process::FileDescriptor::EpollFd => EINVAL,
         _ => !0u64
     }
 }
@@ -1489,6 +1516,8 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
+        crate::process::FileDescriptor::TimerFd => EAGAIN,
+        crate::process::FileDescriptor::EpollFd => EINVAL,
         _ => EBADF
     }
 }
@@ -2025,6 +2054,11 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
         Some(crate::process::FileDescriptor::DevUrandom) => {
             let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::TimerFd) | Some(crate::process::FileDescriptor::EpollFd) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
@@ -3359,6 +3393,84 @@ fn sys_madvise(_addr: usize, _len: usize, _advice: i32) -> u64 {
     // We cannot safely zero pages here because lazy-mapped regions
     // may not have physical pages yet (causes EL1 data abort).
     // Demand paging provides fresh zero pages on first access anyway.
+    0
+}
+
+fn sys_sysinfo(info_ptr: usize) -> u64 {
+    if !validate_user_ptr(info_ptr as u64, 112) { return EFAULT; }
+    unsafe { core::ptr::write_bytes(info_ptr as *mut u8, 0, 112); }
+    let free_pages = crate::pmm::free_count() as u64;
+    // struct sysinfo on arm64: all fields are u64 except procs(u16) and mem_unit(u32)
+    unsafe {
+        let ptr = info_ptr as *mut u64;
+        core::ptr::write(ptr.add(0), 3600);                  // uptime
+        // loads[3] at offsets 1,2,3 — left as 0
+        core::ptr::write(ptr.add(4), 256 * 1024 * 1024);     // totalram
+        core::ptr::write(ptr.add(5), free_pages * 4096);      // freeram
+        // sharedram, bufferram, totalswap, freeswap at 6,7,8,9 — 0
+        // procs (u16) at byte offset 80
+        let procs_ptr = (info_ptr + 80) as *mut u16;
+        core::ptr::write(procs_ptr, 1);
+        // mem_unit (u32) at byte offset 100 (after totalhigh, freehigh)
+        let memunit_ptr = (info_ptr + 100) as *mut u32;
+        core::ptr::write(memunit_ptr, 1);
+    }
+    0
+}
+
+fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
+    let _ = clock_id;
+    if res_ptr != 0 && validate_user_ptr(res_ptr as u64, 16) {
+        // 1 nanosecond resolution
+        unsafe {
+            let ptr = res_ptr as *mut u64;
+            core::ptr::write(ptr, 0);  // tv_sec
+            core::ptr::write(ptr.add(1), 1); // tv_nsec = 1
+        }
+    }
+    0
+}
+
+fn sys_epoll_create1(_flags: u32) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd);
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(64, "[syscall] epoll_create1() = fd {}\n", fd);
+        }
+        fd as u64
+    } else {
+        EBADF
+    }
+}
+
+fn sys_epoll_ctl(_epfd: u32, _op: i32, _fd: u32, _event: usize) -> u64 {
+    0
+}
+
+fn sys_epoll_pwait(_epfd: u32, _events: usize, _maxevents: i32, timeout: i32) -> u64 {
+    if timeout != 0 {
+        crate::threading::yield_now();
+    }
+    0 // no events ready
+}
+
+fn sys_timerfd_create(_clockid: i32, _flags: i32) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::TimerFd);
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(64, "[syscall] timerfd_create() = fd {}\n", fd);
+        }
+        fd as u64
+    } else {
+        EBADF
+    }
+}
+
+fn sys_timerfd_settime(_fd: u32, _flags: i32, new_value: usize, old_value: usize) -> u64 {
+    if old_value != 0 && validate_user_ptr(old_value as u64, 32) {
+        unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
+    }
+    let _ = new_value;
     0
 }
 

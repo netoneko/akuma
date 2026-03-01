@@ -407,6 +407,10 @@ pub enum FileDescriptor {
     DevNull,
     /// /dev/urandom — reads return random bytes
     DevUrandom,
+    /// timerfd — reads return 8-byte expiration count
+    TimerFd,
+    /// epoll instance
+    EpollFd,
 }
 
 /// Kernel file handle for open files
@@ -2451,7 +2455,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
-        lazy_regions: Vec::new(),
+        lazy_regions: parent.lazy_regions.clone(),
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {

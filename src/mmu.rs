@@ -404,6 +404,7 @@ impl UserAddressSpace {
     }
 
     pub fn track_user_frame(&mut self, frame: PhysFrame) { self.user_frames.push(frame); }
+    pub fn track_page_table_frame(&mut self, frame: PhysFrame) { self.page_table_frames.push(frame); }
     pub fn remove_user_frame(&mut self, frame: PhysFrame) {
         if let Some(idx) = self.user_frames.iter().position(|f| f.addr == frame.addr) { self.user_frames.swap_remove(idx); }
     }

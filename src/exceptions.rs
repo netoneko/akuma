@@ -605,6 +605,7 @@ mod esr {
     pub const EC_DATA_ABORT_LOWER: u64 = 0b100100; // Data abort from lower EL
     pub const EC_INST_ABORT_LOWER: u64 = 0b100000; // Instruction abort from lower EL
     pub const EC_MSR_MRS_TRAP: u64 = 0b011000; // Trapped MSR/MRS/System instruction from EL0
+    pub const EC_BRK_AARCH64: u64 = 0b111100; // BRK instruction from AArch64
 }
 
 /// Install exception vector table
@@ -1093,18 +1094,20 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let page_va = (far as usize) & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
                     if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                        unsafe {
-                            crate::mmu::map_user_page(page_va, page_frame.addr, map_flags);
-                        }
+                        let table_frames = unsafe {
+                            crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                        };
                         if let Some(proc) = crate::process::current_process() {
                             proc.address_space.track_user_frame(page_frame);
+                            for tf in table_frames {
+                                proc.address_space.track_page_table_frame(tf);
+                            }
                         }
-                        // The sync_el0_handler epilogue loads x0 from the return
-                        // value (designed for syscalls). For demand paging we must
-                        // preserve the user's original x0 so the faulting
-                        // instruction retries with all registers intact.
                         return unsafe { (*frame).x0 };
                     }
+                } else {
+                    let pid = crate::process::read_current_pid().unwrap_or(0);
+                    crate::safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }
             }
 
@@ -1167,6 +1170,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::ptr::write_volatile(elr_ptr, elr + 4);
             }
             return unsafe { (*frame).x0 };
+        }
+        esr::EC_BRK_AARCH64 => {
+            // BRK instruction — intentional trap/abort from user code
+            crate::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
             // Capture additional state for debugging
