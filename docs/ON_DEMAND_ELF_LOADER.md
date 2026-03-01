@@ -230,15 +230,33 @@ and `copy_from_user_str` use this dynamic limit instead of the hardcoded 1GB.
 
 ---
 
-## New Syscall Stubs
+## New Syscalls and Stubs
 
-Three syscalls that bun invokes were unknown to the kernel:
+Syscalls added or stubbed to support bun:
 
 | Syscall | Number | Implementation |
 |---------|--------|----------------|
 | `getrusage` | 165 | Zero-fills a 144-byte `rusage` struct (no real tracking) |
 | `msync` | 227 | Returns 0 (no-op; no swap or persistent mmap) |
 | `process_vm_readv` | 270 | Returns `ENOSYS` (cross-process memory read not supported) |
+
+### `/dev/urandom` and `/dev/random`
+
+bun requires `/dev/urandom` for cryptographic randomization and intentionally
+crashes (`FAR=0xBBADBEEF`) if it cannot be opened. Implemented as a virtual
+device file descriptor (`DevUrandom`). See `docs/DEV_RANDOM.md` for details.
+
+### `/proc/self/exe`
+
+bun calls `readlinkat(AT_FDCWD, "/proc/self/exe", ...)` to find its own
+executable path. `sys_readlinkat` now intercepts this path and returns the
+current process's name (e.g., `/bin/bun`).
+
+### `mremap` hardening
+
+`sys_mremap` now validates `old_addr` against `user_va_limit()` and checks
+the source buffer with `validate_user_ptr` before copying, preventing kernel
+crashes from invalid addresses.
 
 ---
 
@@ -327,8 +345,8 @@ reaches the epilogue.
 |------|---------|
 | `src/elf_loader.rs` | On-demand ELF loader, `compute_stack_top()` |
 | `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening in `get_or_create_table[_raw]` |
-| `src/process.rs` | `lazy_regions` with flags, `alloc_mmap` kernel VA skip, `KERNEL_VA_END = 0x5000_0000` |
-| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging with PID, `getrusage`/`msync`/`process_vm_readv` stubs |
+| `src/process.rs` | `lazy_regions` with flags, `alloc_mmap` kernel VA skip, `KERNEL_VA_END = 0x5000_0000`, `DevUrandom` variant |
+| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging, `/dev/urandom`, `/proc/self/exe`, `mremap` hardening, syscall stubs |
 | `src/exceptions.rs` | Demand paging fault handler with stored flags, x0 preservation fix, TPIDR_EL0 in fault dump |
 | `src/config.rs` | `SYSCALL_DEBUG_IO_ENABLED = true` (temporary for debugging) |
 | `bootstrap/lib/` | `libc.musl-aarch64.so.1 → ld-musl-aarch64.so.1` symlink |

@@ -1430,6 +1430,10 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         crate::process::FileDescriptor::DevNull => 0,
+        crate::process::FileDescriptor::DevUrandom => {
+            fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
         _ => !0u64
     }
 }
@@ -1459,6 +1463,10 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
             }
         }
         crate::process::FileDescriptor::DevNull => 0,
+        crate::process::FileDescriptor::DevUrandom => {
+            fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
         _ => EBADF
     }
 }
@@ -1477,7 +1485,7 @@ fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::DevNull => count as u64,
+        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
         _ => EBADF
     }
 }
@@ -1584,7 +1592,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
-        crate::process::FileDescriptor::DevNull => count as u64,
+        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
         _ => !0u64
     }
 }
@@ -1852,6 +1860,20 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
         return !0u64;
     }
 
+    if path == "/dev/urandom" || path == "/dev/random" {
+        if let Some(proc) = crate::process::current_process() {
+            let fd = proc.alloc_fd(crate::process::FileDescriptor::DevUrandom);
+            if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return fd as u64;
+        }
+        return !0u64;
+    }
+
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
@@ -1965,6 +1987,11 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
         Some(crate::process::FileDescriptor::DevNull) => {
             let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::DevUrandom) => {
+            let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
@@ -2755,6 +2782,20 @@ fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u6
         Err(e) => return e,
     };
     let path = resolve_path_at(dirfd, &raw_path);
+
+    if path == "/proc/self/exe" {
+        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        let exe = if let Some(proc) = crate::process::current_process() {
+            proc.name.clone()
+        } else {
+            String::from("/bin/unknown")
+        };
+        let bytes = exe.as_bytes();
+        let copy_len = bytes.len().min(bufsize);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        return copy_len as u64;
+    }
+
     if let Some(target) = crate::vfs::read_symlink(&path) {
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
         let bytes = target.as_bytes();
@@ -3639,11 +3680,24 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     0
 }
 
+fn fill_random_bytes(ptr: *mut u8, len: usize) {
+    let mut remaining = len;
+    let mut dst = ptr;
+    while remaining > 0 {
+        let chunk = remaining.min(256);
+        let mut buf = alloc::vec![0u8; chunk];
+        if crate::rng::fill_bytes(&mut buf).is_ok() {
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, chunk); }
+        }
+        remaining -= chunk;
+        dst = unsafe { dst.add(chunk) };
+    }
+}
+
 fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(ptr, len) { return EFAULT; }
-    let mut buf = alloc::vec![0u8; len.min(256)];
-    if crate::rng::fill_bytes(&mut buf).is_ok() { unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()); } return buf.len() as u64; }
-    !0u64
+    fill_random_bytes(ptr as *mut u8, len);
+    len as u64
 }
 
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }

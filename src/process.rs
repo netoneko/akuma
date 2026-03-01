@@ -405,6 +405,8 @@ pub enum FileDescriptor {
     EventFd(u32),
     /// /dev/null — reads return EOF, writes are discarded
     DevNull,
+    /// /dev/urandom — reads return random bytes
+    DevUrandom,
 }
 
 /// Kernel file handle for open files
