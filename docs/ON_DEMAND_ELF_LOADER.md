@@ -105,8 +105,9 @@ VA space:
 
 - **Small static binaries** (code < 64MB, no interpreter): keep default 1GB
   layout (STACK_TOP = 0x40000000)
-- **Large or dynamic binaries**: expand to provide ~2GB mmap space, with
-  `STACK_TOP` up to 3GB (0xC0000000), rounded to 256MB boundary
+- **Large or dynamic binaries**: expand to provide ~3GB mmap space, with
+  `STACK_TOP` up to 4GB (`MAX_STACK_TOP = 0x1_0000_0000`), and
+  `MIN_MMAP_SPACE` = 3GB to ensure large JIT allocators have room
 
 The mmap region sits between the code end and the stack bottom. For bun, the
 layout is:
@@ -116,8 +117,8 @@ layout is:
 0x05C6E000             brk (heap start)
 0x30000000–0x30100000  musl dynamic linker
 0x30100000–0x303F6000  libstdc++.so.6 + libgcc_s.so.1
-0x50000000–0xBFEC0000  mmap region (~1.75GB usable)
-0xBFFC0000–0xC0000000  stack (256KB)
+0x50000000–0xFFE00000  mmap region (~2.75GB usable)
+0xFFE00000–0x100000000 stack (2MB)
 ```
 
 Note: VA 0x40000000–0x4FFFFFFF is reserved for kernel identity-mapped RAM
@@ -184,9 +185,27 @@ these conditions hold:
 2. `flags & MAP_NORESERVE` (caller doesn't expect physical backing)
 3. Anonymous region > 1MB (256 pages) — too expensive to eagerly back
 
-Lazy regions are recorded in `ProcessMemory::lazy_regions` as
-`Vec<(usize, usize, u64)>` — `(start_va, size, page_flags)`. No physical pages
-are allocated at mmap time.
+Lazy regions are stored in a global `LAZY_REGION_TABLE` in `src/process.rs` —
+a `Spinlock<BTreeMap<Pid, Vec<(usize, usize, u64)>>>` mapping PID to a list of
+`(start_va, size, page_flags)` tuples. No physical pages are allocated at mmap
+time.
+
+#### Why a global table instead of per-Process fields?
+
+Early implementations stored `lazy_regions` as a `Vec` directly on the `Process`
+struct. This caused silent data loss due to aliasing `&mut Process` references:
+multiple `current_process()` calls within `sys_mmap` (via `alloc_mmap` and the
+outer handler) could produce references that the compiler assumed didn't alias,
+leading to optimized-out writes. Moving to a separate Spinlock-protected table
+eliminates all aliasing issues.
+
+#### CLONE_VM PID keying
+
+With `CLONE_THREAD | CLONE_VM`, multiple PIDs share the same address space.
+Lazy regions must be keyed by the address-space owner PID (read from the
+process info page via `read_current_pid()`) — NOT the per-thread PID from
+`THREAD_PID_MAP`. This ensures all threads in a thread group see the same lazy
+regions for both push and lookup.
 
 ### Page fault handler
 
@@ -201,6 +220,26 @@ abort). The handler in `src/exceptions.rs`:
    permissions (or `RW_NO_EXEC` default for `PROT_NONE` regions), tracks the
    frame in the process address space, and returns to retry the instruction
 4. If not matched or OOM: falls through to the fault reporter (SIGSEGV)
+
+### Partial munmap
+
+JIT allocators (bun/JSC) use a pattern where they mmap a large region, then
+munmap the prefix and suffix to produce an aligned sub-range:
+
+```
+mmap(NULL, 1GB)      → addr
+munmap(addr, prefix)  → trim start to alignment boundary
+munmap(aligned+needed, suffix) → trim end
+```
+
+`munmap_lazy_region()` in `src/process.rs` handles four cases:
+- **Full removal** — unmap covers entire region
+- **Prefix removal** — advance region start, shrink size
+- **Suffix removal** — shrink size from the end
+- **Middle split** — split into two regions
+
+Without this, `sys_munmap` would delete the entire 1GB region when only the
+prefix was unmapped, causing the JIT to fault on the aligned sub-range.
 
 ### mprotect integration
 
@@ -232,13 +271,32 @@ and `copy_from_user_str` use this dynamic limit instead of the hardcoded 1GB.
 
 ## New Syscalls and Stubs
 
-Syscalls added or stubbed to support bun:
+Syscalls added or stubbed to support bun. See also `docs/BUN_MISSING_SYSCALLS.md`
+for the full list with implementation details.
 
 | Syscall | Number | Implementation |
 |---------|--------|----------------|
 | `getrusage` | 165 | Zero-fills a 144-byte `rusage` struct (no real tracking) |
 | `msync` | 227 | Returns 0 (no-op; no swap or persistent mmap) |
 | `process_vm_readv` | 270 | Returns `ENOSYS` (cross-process memory read not supported) |
+| `eventfd2` | 19 | Returns a virtual `EventFd` file descriptor |
+| `epoll_create1` | 20 | Returns a virtual `EpollFd` file descriptor |
+| `epoll_ctl` | 21 | No-op stub (returns 0) |
+| `epoll_pwait` | 22 | Returns 0 events immediately |
+| `timerfd_create` | 85 | Returns a virtual `TimerFd` file descriptor |
+| `timerfd_settime` | 86 | No-op stub (returns 0) |
+| `timerfd_gettime` | 87 | Returns zeroed `itimerspec` |
+| `clock_getres` | 114 | Returns 1ns resolution |
+| `sched_setparam` | 118 | No-op stub (returns 0) |
+| `sched_getparam` | 119 | Returns zeroed `sched_param` |
+| `sched_setaffinity` | 122 | No-op stub (returns 0) |
+| `sched_getaffinity` | 123 | Returns single-CPU affinity mask |
+| `sched_yield` | 124 | Calls `threading::yield_now()` |
+| `tkill` | 130 | No-op stub (returns 0) |
+| `uname` | 160 | Returns "Akuma" sysname, "aarch64" machine |
+| `sysinfo` | 179 | Returns real free/total memory from PMM |
+| `membarrier` | 319 | Returns supported commands bitmask |
+| `close_range` | 436 | Closes file descriptors in the given range |
 
 ### `/dev/urandom` and `/dev/random`
 
@@ -248,15 +306,22 @@ device file descriptor (`DevUrandom`). See `docs/DEV_RANDOM.md` for details.
 
 ### `/proc/self/exe`
 
-bun calls `readlinkat(AT_FDCWD, "/proc/self/exe", ...)` to find its own
-executable path. `sys_readlinkat` now intercepts this path and returns the
-current process's name (e.g., `/bin/bun`).
+bun calls `readlinkat(AT_FDCWD, "/proc/self/exe", ...)` and
+`openat(AT_FDCWD, "/proc/self/exe", ...)` to find its own executable path.
+Both `sys_readlinkat` and `sys_openat` intercept this path and redirect to the
+current process's binary name (e.g., `/bin/bun`).
 
 ### `mremap` hardening
 
 `sys_mremap` now validates `old_addr` against `user_va_limit()` and checks
 the source buffer with `validate_user_ptr` before copying, preventing kernel
 crashes from invalid addresses.
+
+### `madvise` no-op
+
+`sys_madvise` is a no-op (returns 0). Previously it attempted to honor
+`MADV_DONTNEED` by unmapping pages, which crashed the kernel when applied to
+lazy-mapped pages that had no backing physical page.
 
 ---
 
@@ -339,14 +404,32 @@ reaches the epilogue.
 
 ---
 
+## Exception Handling Additions
+
+### MSR/MRS trap (EC=0x18)
+
+bun reads `CTR_EL0` (Cache Type Register) to determine cache line sizes for
+JIT code generation. On AArch64, `CTR_EL0` access from EL0 traps to EL1 if
+`SCTLR_EL1.UCT` is not set. The handler in `src/exceptions.rs` decodes the
+trapped `MRS` instruction, reads the actual `CTR_EL0` hardware value, writes
+it into the destination register in the trap frame, and advances PC by 4.
+
+### BRK instruction (EC=0x3C)
+
+bun's JSC and libc use `BRK` instructions for assertion failures and
+deliberate panics. The handler terminates the process cleanly with `SIGTRAP`
+instead of printing an unhandled exception error.
+
+---
+
 ## Files Modified
 
 | File | Changes |
 |------|---------|
-| `src/elf_loader.rs` | On-demand ELF loader, `compute_stack_top()` |
-| `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening in `get_or_create_table[_raw]` |
-| `src/process.rs` | `lazy_regions` with flags, `alloc_mmap` kernel VA skip, `KERNEL_VA_END = 0x5000_0000`, `DevUrandom` variant |
-| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging, `/dev/urandom`, `/proc/self/exe`, `mremap` hardening, syscall stubs |
-| `src/exceptions.rs` | Demand paging fault handler with stored flags, x0 preservation fix, TPIDR_EL0 in fault dump |
-| `src/config.rs` | `SYSCALL_DEBUG_IO_ENABLED = true` (temporary for debugging) |
+| `src/elf_loader.rs` | On-demand ELF loader, `compute_stack_top()`, 4GB VA space |
+| `src/mmu.rs` | L2 kernel RAM table, BLOCK-vs-TABLE hardening, `track_page_table_frame` |
+| `src/process.rs` | `LAZY_REGION_TABLE`, `munmap_lazy_region`, `clone_lazy_regions`, `EpollFd`/`TimerFd`/`EventFd` variants, `alloc_mmap` kernel VA skip |
+| `src/syscall.rs` | `user_va_limit()`, demand-paged mmap, mmap logging, `/dev/urandom`, `/proc/self/exe`, `mremap` hardening, ~20 new syscall stubs, partial munmap, CLONE_VM PID keying |
+| `src/exceptions.rs` | Demand paging fault handler, x0 preservation fix, MSR/MRS trap, BRK handler, TPIDR_EL0 in fault dump |
+| `src/config.rs` | `USER_STACK_SIZE = 2MB` |
 | `bootstrap/lib/` | `libc.musl-aarch64.so.1 → ld-musl-aarch64.so.1` symlink |

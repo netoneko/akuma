@@ -42,7 +42,7 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 - `src/main.rs` — Entry point and kernel init
 - `src/threading.rs` — Thread pool, scheduler, context switch
 - `src/process.rs` — Process/PCB management, ELF execution
-- `src/syscall.rs` — Linux AArch64 ABI syscall interface (~40 syscalls)
+- `src/syscall.rs` — Linux AArch64 ABI syscall interface (~50 syscalls)
 - `src/exceptions.rs` — Exception vectors, IRQ handling
 - `src/allocator.rs` — Heap (talc), OOM handling
 - `src/pmm.rs` — Physical memory manager
@@ -58,7 +58,8 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 **Memory layout:**
 - `0x4000_0000` — Kernel code/data
 - Kernel heap: ~120 MB (talc allocator)
-- Per-process: user stack 256 KB with guard page
+- Per-process: user stack 2 MB with guard page (configurable in `src/config.rs`)
+- User VA space: up to 4 GB (dynamically sized based on binary requirements)
 
 ## no_std Rules
 
@@ -68,12 +69,21 @@ The kernel is `no_std`. Always:
 - Watch for OOM; the allocator can fail
 - Avoid recursion in kernel code
 
+## Memory Management
+
+**Demand paging:** Large anonymous mmaps are lazily backed — VA is reserved but physical pages are allocated on first access via page fault. Lazy regions are tracked in a global `LAZY_REGION_TABLE` (Spinlock-protected BTreeMap keyed by PID). With `CLONE_VM` threads, all threads sharing an address space use the address-space owner's PID (from the process info page) so they share the same lazy region set.
+
+**Partial munmap:** `sys_munmap` supports prefix, suffix, middle-split, and full removal of lazy regions. This is required for JIT allocators (e.g., bun/JSC) that mmap a large region and then trim it to an aligned sub-range.
+
+**Key rule:** Never create aliasing `&mut Process` references via multiple `current_process()` calls within the same function scope. Use a single `current_process()` call and pass the reference through.
+
 ## Concurrency
 
 - Use spinlocks / interrupt-disabling mutexes for shared state
 - Prefer atomics for simple flags
 - Context switching is in `src/threading.rs`
 - SSH and HTTP services each run in dedicated threads
+- `CLONE_VM` threads share address space but have separate `Process` structs; lazy regions, however, are keyed by the address-space owner PID to ensure consistency
 
 ## Userspace ↔ Kernel
 
@@ -95,6 +105,13 @@ The kernel is `no_std`. Always:
 | AI assistant | `userspace/meow/` | meow coding assistant |
 | Shell | `src/shell/` + `userspace/paws/` + `userspace/dash/` | In-kernel shell + POSIX dash |
 | VFS | `src/vfs/` | ext2, memfs, procfs |
+
+## Exception Handling
+
+The kernel handles several AArch64 exception classes from EL0:
+- **Translation faults** — demand paging for lazy mmap regions
+- **EC=0x18 (MSR/MRS trap)** — emulates `CTR_EL0` reads for userspace
+- **EC=0x3C (BRK)** — graceful process termination with SIGTRAP
 
 ## Testing
 
