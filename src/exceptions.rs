@@ -1026,23 +1026,30 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // CPU (or QEMU's TB cache) still has old translations.
             // IC IALLU from EL1 flushes the entire I-cache; on QEMU TCG this
             // calls tb_flush() which clears all translated blocks.
-            // We then replay the faulting instruction.
-            if syscall_num > 500 {
-                use core::sync::atomic::{AtomicU64, Ordering};
-                static LAST_JIT_RETRY_ELR: AtomicU64 = AtomicU64::new(0);
-                let elr = frame_ref.elr_el1;
-                let last = LAST_JIT_RETRY_ELR.load(Ordering::Relaxed);
-                if last != elr {
-                    LAST_JIT_RETRY_ELR.store(elr, Ordering::Relaxed);
-                    unsafe {
-                        core::arch::asm!("ic iallu");
-                        core::arch::asm!("dsb ish");
-                        core::arch::asm!("isb");
-                        (*frame).elr_el1 = elr.wrapping_sub(4);
+            // Counter-based: allow up to 16 consecutive retries before giving up.
+            {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static JIT_RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
+                if syscall_num > 500 {
+                    let count = JIT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count < 16 {
+                        let elr = frame_ref.elr_el1;
+                        crate::safe_print!(128, "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x}\n",
+                            count + 1, syscall_num, elr);
+                        unsafe {
+                            core::arch::asm!("ic iallu");
+                            core::arch::asm!("dsb ish");
+                            core::arch::asm!("isb");
+                            (*frame).elr_el1 = elr.wrapping_sub(4);
+                        }
+                        return frame_ref.x0;
                     }
-                    return frame_ref.x0;
+                    crate::safe_print!(128, "[JIT] giving up after {} retries, nr={}\n",
+                        count + 1, syscall_num);
+                    JIT_RETRY_COUNT.store(0, Ordering::Relaxed);
+                } else {
+                    JIT_RETRY_COUNT.store(0, Ordering::Relaxed);
                 }
-                LAST_JIT_RETRY_ELR.store(0, Ordering::Relaxed);
             }
 
             // Save trap frame pointer so fork/clone can read full register state
