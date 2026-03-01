@@ -1631,6 +1631,9 @@ impl Process {
         fd_map.insert(1, FileDescriptor::Stdout);
         fd_map.insert(2, FileDescriptor::Stderr);
 
+        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
+        push_lazy_region(pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
+
         Ok(Self {
             pid,
             pgid: pid,
@@ -1686,6 +1689,9 @@ impl Process {
         clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+
+        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
+        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1740,6 +1746,9 @@ impl Process {
         clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+
+        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
+        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
 
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1856,22 +1865,23 @@ impl Process {
 
     /// Set program break, returns new value.
     /// Maps any new pages between old and new brk.
+    /// Returns the exact requested value (matching Linux brk ABI).
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
             return self.brk;
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;
-        // Page-align old_top UP: the partial page containing self.brk is
-        // already mapped by the ELF loader, so only map from the next page.
         let old_top = (self.brk + 0xFFF) & !0xFFF;
         if aligned > old_top {
             let mut page = old_top;
             while page < aligned {
-                let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                if !self.address_space.is_range_mapped(page, 0x1000) {
+                    let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                }
                 page += 0x1000;
             }
         }
-        self.brk = aligned;
+        self.brk = new_brk;
         self.brk
     }
 

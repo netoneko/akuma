@@ -1021,6 +1021,30 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let frame_ref = unsafe { &*frame };
             let syscall_num = frame_ref.x8;
 
+            // JIT cache coherency workaround: bogus syscall numbers (> 500)
+            // indicate stale instruction cache — JIT wrote new code but the
+            // CPU (or QEMU's TB cache) still has old translations.
+            // IC IALLU from EL1 flushes the entire I-cache; on QEMU TCG this
+            // calls tb_flush() which clears all translated blocks.
+            // We then replay the faulting instruction.
+            if syscall_num > 500 {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static LAST_JIT_RETRY_ELR: AtomicU64 = AtomicU64::new(0);
+                let elr = frame_ref.elr_el1;
+                let last = LAST_JIT_RETRY_ELR.load(Ordering::Relaxed);
+                if last != elr {
+                    LAST_JIT_RETRY_ELR.store(elr, Ordering::Relaxed);
+                    unsafe {
+                        core::arch::asm!("ic iallu");
+                        core::arch::asm!("dsb ish");
+                        core::arch::asm!("isb");
+                        (*frame).elr_el1 = elr.wrapping_sub(4);
+                    }
+                    return frame_ref.x0;
+                }
+                LAST_JIT_RETRY_ELR.store(0, Ordering::Relaxed);
+            }
+
             // Save trap frame pointer so fork/clone can read full register state
             crate::threading::set_current_trap_frame(frame);
             let args = [
