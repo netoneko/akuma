@@ -1939,7 +1939,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     match proc.get_fd(fd) {
         Some(crate::process::FileDescriptor::File(f)) => {
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
-                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
@@ -2045,6 +2045,7 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
             st_mode: meta.mode, 
             st_nlink: if meta.is_dir { 2 } else { 1 },
             st_blksize: 4096,
+            st_blocks: ((meta.size as i64) + 511) / 512,
             st_atime: meta.accessed.unwrap_or(0) as i64,
             st_mtime: meta.modified.unwrap_or(0) as i64,
             st_ctime: meta.created.unwrap_or(0) as i64,
