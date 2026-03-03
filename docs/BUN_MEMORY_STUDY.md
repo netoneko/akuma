@@ -265,6 +265,84 @@ For bun's 93MB binary on a 256MB system:
 
 ---
 
+## 7. Unaligned Segment Page Placement
+
+### Symptom
+
+After implementing the demand-paged ELF loader, bun crashed immediately
+during interpreter startup:
+
+```
+[IA-DP] pid=29 va=0x2a3e000 foff=0x282e500 seg_va=0x2a3e500 first=0xd280001d
+[DA] pid=29 far=0xfffffffffffffff8 elr=0x2a3e500 iss=0x44
+[Fault] Data abort from EL0 at FAR=0xfffffffffffffff8, ELR=0x2a3e500, ISS=0x44
+```
+
+FAR=0xfffffffffffffff8 is address -8 -- a null pointer dereference with
+a negative offset. The code at `ELR=0x2a3e500` was executing garbage
+instructions.
+
+### Root Cause
+
+Bun's second PT_LOAD segment starts at `p_vaddr=0x2a3e500`, which is
+**not page-aligned** (0x500 bytes into a 4KB page). The demand paging
+handler registered a lazy region starting at the page-aligned address
+`0x2a3e000`, with `segment_va=0x2a3e500`.
+
+When the page at `0x2a3e000` was faulted in, the handler computed:
+
+```
+offset_in_seg = page_va.saturating_sub(segment_va)
+              = 0x2a3e000 - 0x2a3e500
+              = 0                          (saturating)
+file_pos      = file_offset + 0
+```
+
+It then read 4096 bytes of file data and placed them at **byte 0** of
+the page. But the segment data should start at byte `0x500` within the
+page (the first `0x500` bytes belong to the gap/previous segment's tail
+and should be zero). The result: every byte in the page was shifted
+`0x500` bytes earlier than its correct position. The instruction at VA
+`0x2a3e500` (byte `0x500` of the page) was actually executing data from
+`0x500` bytes into the segment -- completely wrong code.
+
+```
+Page at 0x2a3e000:
+  WRONG:  [seg_data[0..0x1000] ................]  <- data starts at byte 0
+  RIGHT:  [00 00 ... 00 | seg_data[0..0xB00] ..]  <- data starts at byte 0x500
+                         ^
+                    0x2a3e500 (segment_va)
+```
+
+The old eager loader handled this correctly with a `copy_start`
+variable that offset the destination within the page.
+
+### Fix
+
+Added `copy_start` calculation to both the `EC_DATA_ABORT_LOWER` and
+`EC_INST_ABORT_LOWER` demand paging handlers in `src/exceptions.rs`:
+
+```rust
+let copy_start = if page_va < segment_va { segment_va - page_va } else { 0 };
+// ...
+let dst = (page_ptr as *mut u8).add(copy_start);
+let buf = core::slice::from_raw_parts_mut(dst, read_len);
+let read_len = min(PAGE_SIZE - copy_start, filesz - offset_in_seg);
+```
+
+When `page_va < segment_va`, file data is placed at offset `copy_start`
+within the page. The leading bytes remain zero (from `alloc_page_zeroed`).
+For pages entirely within the segment (`page_va >= segment_va`),
+`copy_start = 0` and behavior is unchanged.
+
+A companion fix ensures cache maintenance (`DC CVAU` + `IC IVAU`) is
+performed in the data abort handler when demand-paging executable
+(non-UXN) file-backed pages, since a code page may be first accessed
+via a data read by the dynamic linker before the CPU fetches
+instructions from it.
+
+---
+
 ## Device VA Map (final state)
 
 All device MMIO is mapped via L0[1] (`0x80_0000_0000`+), shared across

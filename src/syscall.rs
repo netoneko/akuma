@@ -722,7 +722,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         return EINTR;
     }
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK {
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK && syscall_num != nr::NANOSLEEP && syscall_num != nr::WAITPID && syscall_num != nr::UPTIME && syscall_num != nr::FUTEX && syscall_num != nr::MEMBARRIER && syscall_num != nr::RT_SIGACTION && syscall_num != nr::SCHED_SETAFFINITY && syscall_num != nr::SCHED_GETAFFINITY {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
