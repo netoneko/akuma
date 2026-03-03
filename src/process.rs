@@ -468,10 +468,33 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
 static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Source of data for a lazy region page.
+#[derive(Clone)]
+pub enum LazySource {
+    /// Zero-filled on demand (anonymous mapping).
+    Zero,
+    /// Backed by file data; pages beyond `filesz` are zero-filled (BSS).
+    File {
+        path: String,
+        file_offset: usize,
+        filesz: usize,
+        segment_va: usize,
+    },
+}
+
+/// A lazily-backed virtual memory region.
+#[derive(Clone)]
+pub struct LazyRegion {
+    pub start_va: usize,
+    pub size: usize,
+    pub flags: u64,
+    pub source: LazySource,
+}
+
 /// Global lazy region table, keyed by PID.
 /// Stored separately from Process to avoid aliasing/corruption issues
 /// with &mut Process references from current_process().
-static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<(usize, usize, u64)>>> =
+static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<LazyRegion>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a process in the table (takes ownership)
@@ -987,23 +1010,21 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
 /// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
 pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
     if let Some(proc) = current_process() {
-        proc.lazy_regions.push((start_va, size, page_flags));
+        proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
     }
 }
 
 /// Check if a virtual address falls within any lazy region of the current process.
-/// Returns (true, page_flags) if found; page_flags are the permissions to apply
-/// when demand-allocating the page.
-pub fn lazy_region_flags(va: usize) -> Option<u64> {
-    // Use the process info page PID so all threads sharing an address space
-    // (CLONE_VM) use the same lazy region set.
+/// Returns `(flags, source)` if found. The source is cloned so the caller can
+/// release the table lock before performing I/O.
+pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource)> {
     let pid = read_current_pid()?;
     crate::irq::with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            for &(start, size, flags) in regions {
-                if va >= start && va < start + size {
-                    return Some(flags);
+            for r in regions {
+                if va >= r.start_va && va < r.start_va + r.size {
+                    return Some((r.flags, r.source.clone()));
                 }
             }
         }
@@ -1018,9 +1039,9 @@ pub fn lazy_region_debug(va: usize) {
         if let Some(regions) = table.get(&pid) {
             crate::safe_print!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
                 pid, va, regions.len());
-            for (i, &(start, size, _)) in regions.iter().enumerate() {
+            for (i, r) in regions.iter().enumerate() {
                 if i > 0 { crate::safe_print!(8, ","); }
-                crate::safe_print!(64, "{:#x}-{:#x}", start, start + size);
+                crate::safe_print!(64, "{:#x}-{:#x}", r.start_va, r.start_va + r.size);
             }
             crate::safe_print!(8, "]\n");
         } else {
@@ -1030,33 +1051,31 @@ pub fn lazy_region_debug(va: usize) {
 }
 
 pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64) -> usize {
+    push_lazy_region_with_source(pid, start_va, size, page_flags, LazySource::Zero)
+}
+
+pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
     let len = crate::irq::with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.entry(pid).or_insert_with(Vec::new);
-        regions.push((start_va, size, page_flags));
+        regions.push(LazyRegion { start_va, size, flags: page_flags, source });
         regions.len()
     });
-    if pid == 29 {
-        crate::safe_print!(128, "[LR+] pid={} {:#x}+{:#x} -> {} regions\n", pid, start_va, size, len);
-    }
     len
 }
 
-pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<(usize, usize, u64)> {
+pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
     let result = crate::irq::with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
-            if let Some(idx) = regions.iter().position(|&(start, _, _)| start == start_va) {
+            if let Some(idx) = regions.iter().position(|r| r.start_va == start_va) {
                 let removed = regions.remove(idx);
                 return Some((removed, regions.len()));
             }
         }
         None
     });
-    if let Some((removed, remaining)) = result {
-        if pid == 29 {
-            crate::safe_print!(128, "[LR-] pid={} {:#x} -> {} regions\n", pid, start_va, remaining);
-        }
+    if let Some((removed, _remaining)) = result {
         Some(removed)
     } else {
         None
@@ -1073,36 +1092,40 @@ pub fn munmap_lazy_region(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Opti
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.get_mut(&pid)?;
 
-        let idx = regions.iter().position(|&(start, size, _)| {
-            let end = start + size;
-            unmap_addr >= start && unmap_addr < end
+        let idx = regions.iter().position(|r| {
+            let end = r.start_va + r.size;
+            unmap_addr >= r.start_va && unmap_addr < end
         })?;
 
-        let (reg_start, reg_size, reg_flags) = regions[idx];
+        let reg_start = regions[idx].start_va;
+        let reg_size = regions[idx].size;
         let reg_end = reg_start + reg_size;
 
         if unmap_addr == reg_start && unmap_end >= reg_end {
-            // Full removal
             regions.remove(idx);
             Some(('F', reg_start, reg_size / 4096))
         } else if unmap_addr == reg_start {
-            // Prefix removal: shrink from start
             let new_start = unmap_end;
             let new_size = reg_end - new_start;
-            regions[idx] = (new_start, new_size, reg_flags);
+            regions[idx].start_va = new_start;
+            regions[idx].size = new_size;
             Some(('P', unmap_addr, unmap_pages))
         } else if unmap_end >= reg_end {
-            // Suffix removal: shrink from end
             let new_size = unmap_addr - reg_start;
-            regions[idx] = (reg_start, new_size, reg_flags);
+            regions[idx].size = new_size;
             Some(('S', unmap_addr, unmap_pages))
         } else {
-            // Middle split: create two regions
             let left_size = unmap_addr - reg_start;
             let right_start = unmap_end;
             let right_size = reg_end - right_start;
-            regions[idx] = (reg_start, left_size, reg_flags);
-            regions.push((right_start, right_size, reg_flags));
+            let right = LazyRegion {
+                start_va: right_start,
+                size: right_size,
+                flags: regions[idx].flags,
+                source: regions[idx].source.clone(),
+            };
+            regions[idx].size = left_size;
+            regions.push(right);
             Some(('M', unmap_addr, unmap_pages))
         }
     });
@@ -1142,7 +1165,7 @@ pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
 
 /// Check if a virtual address falls within any lazy region.
 pub fn is_in_lazy_region(va: usize) -> bool {
-    lazy_region_flags(va).is_some()
+    lazy_region_lookup(va).is_some()
 }
 
 /// Remove and return mmap region starting at the given VA
@@ -1477,12 +1500,11 @@ pub struct Process {
     /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
     /// Used by munmap to find and free the correct frames.
     pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
-    /// Lazy mmap regions: (start_va, size, page_flags).
-    /// VA is reserved but physical pages are allocated on demand via
-    /// mprotect or page fault. page_flags=0 means PROT_NONE (needs
-    /// mprotect before access); non-zero means demand-paged with those
-    /// permissions on first touch.
-    pub lazy_regions: Vec<(usize, usize, u64)>,
+    /// Lazy mmap regions. VA is reserved but physical pages are allocated
+    /// on demand via page fault. flags=0 means PROT_NONE (needs mprotect
+    /// before access); non-zero means demand-paged with those permissions
+    /// on first touch.
+    pub lazy_regions: Vec<LazyRegion>,
 
     // ========== File Descriptor Table ==========
     /// Per-process file descriptor table
@@ -1535,7 +1557,7 @@ fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
-        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
             elf_loader::load_elf_with_stack(elf_data, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
@@ -1614,10 +1636,23 @@ impl Process {
 
     /// Create a process from a large ELF file on disk, loading segments on demand.
     pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
-        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        for seg in &deferred_segments {
+            let source = match &seg.file_source {
+                Some(fs) => LazySource::File {
+                    path: fs.path.clone(),
+                    file_offset: fs.file_offset,
+                    filesz: fs.filesz,
+                    segment_va: fs.segment_va,
+                },
+                None => LazySource::Zero,
+            };
+            push_lazy_region_with_source(pid, seg.start_va, seg.size, seg.page_flags, source);
+        }
 
         let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
         crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
@@ -1684,7 +1719,7 @@ impl Process {
 
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor) = 
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) = 
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
             .map_err(|_| "Failed to load ELF")?;
             
@@ -1741,7 +1776,7 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor) =
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, crate::config::USER_STACK_SIZE)
             .map_err(|_| "Failed to load ELF")?;
 
@@ -1757,6 +1792,19 @@ impl Process {
         clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+
+        for seg in &deferred_segments {
+            let source = match &seg.file_source {
+                Some(fs) => LazySource::File {
+                    path: fs.path.clone(),
+                    file_offset: fs.file_offset,
+                    filesz: fs.filesz,
+                    segment_va: fs.segment_va,
+                },
+                None => LazySource::Zero,
+            };
+            push_lazy_region_with_source(self.pid, seg.start_va, seg.size, seg.page_flags, source);
+        }
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);

@@ -15,6 +15,22 @@ use alloc::string::String;
 /// Set to false to reduce boot verbosity
 pub const DEBUG_ELF_LOADING: bool = true;
 
+/// File-backed source for a deferred lazy segment.
+pub struct FileSegmentSource {
+    pub path: String,
+    pub file_offset: usize,
+    pub filesz: usize,
+    pub segment_va: usize,
+}
+
+/// Segment whose pages will be allocated on first access (demand paging).
+pub struct DeferredLazySegment {
+    pub start_va: usize,
+    pub size: usize,
+    pub page_flags: u64,
+    pub file_source: Option<FileSegmentSource>,
+}
+
 /// Result of loading an ELF binary
 pub struct LoadedElf {
     /// Entry point virtual address (program's own entry)
@@ -31,6 +47,8 @@ pub struct LoadedElf {
     pub phent: usize,
     /// If a dynamic linker was loaded: its entry point and base address
     pub interp: Option<InterpInfo>,
+    /// Segments to register as lazy regions after PID allocation
+    pub deferred_segments: Vec<DeferredLazySegment>,
 }
 
 /// Information about a loaded interpreter (dynamic linker)
@@ -325,6 +343,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         phnum: elf.ehdr.e_phnum as usize,
         phent: elf.ehdr.e_phentsize as usize,
         interp,
+        deferred_segments: Vec::new(),
     })
 }
 
@@ -648,7 +667,7 @@ pub fn load_elf_with_stack(
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
     let mut loaded = load_elf(elf_data)?;
     let has_interp = loaded.interp.is_some();
     let stack_top = compute_stack_top(loaded.brk, has_interp);
@@ -710,7 +729,7 @@ pub fn load_elf_with_stack(
         }
     }
 
-    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor, Vec::new()))
 }
 
 // ============================================================================
@@ -824,8 +843,8 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
     let mut address_space = UserAddressSpace::new().ok_or(ElfError::AddressSpaceFailed)?;
     let mut brk: usize = 0;
     let mut phdr_addr: usize = 0;
-    let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
     let mut interp_path: Option<String> = None;
+    let mut deferred_segments: Vec<DeferredLazySegment> = Vec::new();
 
     let phdr_table_size = ehdr.e_phnum as usize * ehdr.e_phentsize as usize;
     let phdr_buf = file_read_exact(path, ehdr.e_phoff as usize, phdr_table_size)?;
@@ -858,8 +877,6 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
             file_size, file_size / 1024 / 1024, is_pie);
     }
 
-    let mut page_buf = alloc::vec![0u8; PAGE_SIZE];
-
     for phdr in &phdrs {
         if phdr.p_type != PT_LOAD {
             continue;
@@ -876,7 +893,7 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
 
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+            crate::safe_print!(128, "[ELF] Segment (deferred): VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
                 vaddr, filesz, memsz,
                 if flags & PF_R != 0 { "R" } else { "-" },
                 if flags & PF_W != 0 { "W" } else { "-" },
@@ -891,44 +908,19 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
 
         let start_page = vaddr & !(PAGE_SIZE - 1);
         let end_page = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let num_pages = (end_page - start_page) / PAGE_SIZE;
+        let seg_size = end_page - start_page;
 
-        for i in 0..num_pages {
-            let page_va = start_page + i * PAGE_SIZE;
-
-            let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
-                pa
-            } else {
-                let frame = address_space
-                    .alloc_and_map(page_va, page_flags)
-                    .map_err(|e| ElfError::MappingFailed(e))?;
-                mapped_pages.insert(page_va, frame.addr);
-                frame.addr
-            };
-
-            let page_start_in_segment = if page_va >= vaddr { page_va - vaddr } else { 0 };
-
-            if page_start_in_segment < filesz {
-                let copy_start = if page_va < vaddr { vaddr - page_va } else { 0 };
-                let file_offset = offset + page_start_in_segment;
-                let copy_len = core::cmp::min(
-                    PAGE_SIZE - copy_start,
-                    filesz.saturating_sub(page_start_in_segment),
-                );
-
-                if copy_len > 0 && file_offset + copy_len <= file_size {
-                    page_buf[..copy_len].fill(0);
-                    let n = crate::vfs::read_at(path, file_offset, &mut page_buf[..copy_len])
-                        .map_err(|_| ElfError::InvalidFormat("Segment read failed"))?;
-                    if n > 0 {
-                        unsafe {
-                            let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);
-                            core::ptr::copy_nonoverlapping(page_buf.as_ptr(), dst, n);
-                        }
-                    }
-                }
-            }
-        }
+        deferred_segments.push(DeferredLazySegment {
+            start_va: start_page,
+            size: seg_size,
+            page_flags,
+            file_source: Some(FileSegmentSource {
+                path: String::from(path),
+                file_offset: offset,
+                filesz,
+                segment_va: vaddr,
+            }),
+        });
 
         let segment_end = vaddr + memsz;
         if segment_end > brk {
@@ -936,10 +928,7 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
     }
 
-    // Fill gaps between PT_LOAD segments with zero-filled pages.
-    // Linux maps the entire span contiguously; gaps between segments are
-    // anonymous zero-filled memory. Without this, accesses to gap addresses
-    // (e.g., between read-only data and code segments) cause translation faults.
+    // Register gap regions between PT_LOAD segments as zero-fill lazy regions.
     let mut load_segments: Vec<(usize, usize)> = phdrs.iter()
         .filter(|p| p.p_type == PT_LOAD)
         .map(|p| {
@@ -956,25 +945,23 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         let prev_end = w[0].1;
         let next_start = w[1].0;
         if prev_end < next_start {
-            let gap_pages = (next_start - prev_end) / PAGE_SIZE;
-            for i in 0..gap_pages {
-                let gap_va = prev_end + i * PAGE_SIZE;
-                if !mapped_pages.contains_key(&gap_va) {
-                    if let Ok(frame) = address_space.alloc_and_map(gap_va, user_flags::RW_NO_EXEC) {
-                        mapped_pages.insert(gap_va, frame.addr);
-                    }
-                }
-            }
-            if DEBUG_ELF_LOADING && gap_pages > 0 {
-                crate::safe_print!(128, "[ELF] Filled gap: 0x{:08x}-0x{:08x} ({} pages)\n",
-                    prev_end, next_start, gap_pages);
+            let gap_size = next_start - prev_end;
+            deferred_segments.push(DeferredLazySegment {
+                start_va: prev_end,
+                size: gap_size,
+                page_flags: user_flags::RW_NO_EXEC,
+                file_source: None,
+            });
+            if DEBUG_ELF_LOADING {
+                crate::safe_print!(128, "[ELF] Gap region (deferred): 0x{:08x}-0x{:08x} ({} pages)\n",
+                    prev_end, next_start, gap_size / PAGE_SIZE);
             }
         }
     }
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(80, "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
-            entry_point, brk, mapped_pages.len());
+        crate::safe_print!(80, "[ELF] Deferred: entry=0x{:x} brk=0x{:x} segments={}\n",
+            entry_point, brk, deferred_segments.len());
     }
 
     let interp = if let Some(ref ipath) = interp_path {
@@ -1001,6 +988,7 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         phnum: ehdr.e_phnum as usize,
         phent: ehdr.e_phentsize as usize,
         interp,
+        deferred_segments,
     })
 }
 
@@ -1010,7 +998,7 @@ pub fn load_elf_with_stack_from_path(
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
     let mut loaded = load_elf_from_path(path, file_size)?;
     let has_interp = loaded.interp.is_some();
     let stack_top = compute_stack_top(loaded.brk, has_interp);
@@ -1070,7 +1058,9 @@ pub fn load_elf_with_stack_from_path(
             crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
                 actual_entry, loaded.entry_point);
         }
+        crate::safe_print!(128, "[ELF] {} deferred lazy segments for demand paging\n",
+            loaded.deferred_segments.len());
     }
 
-    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor, loaded.deferred_segments))
 }

@@ -1125,10 +1125,20 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
             let far_usize = far as usize;
             if is_translation_fault {
-                if let Some(flags) = crate::process::lazy_region_flags(far_usize) {
+                if let Some((flags, source)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
                     if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        if let crate::process::LazySource::File { ref path, file_offset, filesz, segment_va } = source {
+                            let offset_in_seg = page_va.saturating_sub(segment_va);
+                            if offset_in_seg < filesz {
+                                let file_pos = file_offset + offset_in_seg;
+                                let read_len = core::cmp::min(0x1000, filesz - offset_in_seg);
+                                let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
+                                let buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, read_len) };
+                                let _ = crate::vfs::read_at(path, file_pos, buf);
+                            }
+                        }
                         let table_frames = unsafe {
                             crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                         };
@@ -1164,6 +1174,56 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
             let pid = crate::process::read_current_pid().unwrap_or(0);
+
+            let fault_type = iss & 0x3C;
+            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
+            let far_usize = far as usize;
+
+            if is_translation_fault {
+                if let Some((flags, source)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RX };
+                    if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        if let crate::process::LazySource::File { ref path, file_offset, filesz, segment_va } = source {
+                            let offset_in_seg = page_va.saturating_sub(segment_va);
+                            if offset_in_seg < filesz {
+                                let file_pos = file_offset + offset_in_seg;
+                                let read_len = core::cmp::min(0x1000, filesz - offset_in_seg);
+                                let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
+                                let buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, read_len) };
+                                let _ = crate::vfs::read_at(path, file_pos, buf);
+                            }
+                        }
+
+                        let kva = crate::mmu::phys_to_virt(page_frame.addr) as usize;
+                        for off in (0..0x1000_usize).step_by(64) {
+                            unsafe {
+                                core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                            }
+                        }
+                        unsafe {
+                            core::arch::asm!("dsb ish");
+                            core::arch::asm!("isb");
+                        }
+
+                        let table_frames = unsafe {
+                            crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                        };
+                        if let Some(proc) = crate::process::current_process() {
+                            proc.address_space.track_user_frame(page_frame);
+                            for tf in table_frames {
+                                proc.address_space.track_page_table_frame(tf);
+                            }
+                        }
+                        return unsafe { (*frame).x0 };
+                    }
+                } else {
+                    crate::process::lazy_region_debug(far_usize);
+                    crate::safe_print!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
+                }
+            }
+
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             let frame_ref = unsafe { &*frame };
             crate::safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",

@@ -204,6 +204,67 @@ layout.
 
 ---
 
+## 6. Eager ELF Loading Exhausts Physical Memory
+
+### Symptom
+
+After all prior fixes, bun ran significantly longer during initialization
+but eventually crashed when the heap exhausted its lazy region:
+
+```
+[DA] pid=29 far=0xa350000 elr=0x4141d48 iss=0x7
+[DP] no lazy region for FAR=0xa350000 pid=29
+[Fault] Data abort from EL0 at FAR=0xa350000, ELR=0x4141d48, ISS=0x7
+```
+
+The heap lazy region was only ~71MB despite dynamic sizing. On a 256MB
+system, far more should have been available.
+
+### Root Cause
+
+`load_elf_from_path` in `src/elf_loader.rs` eagerly allocated and loaded
+every page of every PT_LOAD segment. For bun's 93MB binary, this consumed
+~23,800 physical pages (~93MB) upfront before the process even started
+running. With kernel overhead, only ~71MB of free physical pages remained
+for the dynamically-computed heap lazy region.
+
+The function was ironically named "on-demand" but loaded all data eagerly
+into pre-allocated physical pages.
+
+### Fix
+
+Converted `load_elf_from_path` to a truly demand-paged loader:
+
+1. **Extended lazy region model** (`src/process.rs`): replaced the
+   tuple-based `(start_va, size, flags)` with a `LazyRegion` struct
+   containing a `LazySource` enum (`Zero` for anonymous, `File` for
+   file-backed regions with path/offset/filesz/segment_va metadata).
+
+2. **Deferred segment loading** (`src/elf_loader.rs`): instead of
+   allocating and mapping pages for each PT_LOAD segment, the loader now
+   collects `DeferredLazySegment` descriptors and returns them to the
+   caller. After PID allocation, the segments are registered as
+   file-backed lazy regions. Gap regions between segments are registered
+   as zero-fill lazy regions. The 16-page heap pre-allocation and eager
+   interpreter loading (~1MB) are preserved.
+
+3. **File-backed page faults** (`src/exceptions.rs`): both
+   `EC_DATA_ABORT_LOWER` and `EC_INST_ABORT_LOWER` handlers now check the
+   `LazySource` on fault. For `LazySource::File`, the handler reads the
+   page data from disk via `vfs::read_at()` before mapping. For
+   instruction faults on code pages, cache maintenance (`DC CVAU` + `IC
+   IVAU` + `DSB ISH` + `ISB`) is performed after loading to ensure
+   instruction cache coherency.
+
+### Memory Savings
+
+For bun's 93MB binary on a 256MB system:
+- **Before**: ~93MB consumed at load, ~71MB left for heap
+- **After**: ~1MB consumed at load (interpreter only + 16 heap pages),
+  ~163MB available for heap, pages loaded from disk on demand
+
+---
+
 ## Device VA Map (final state)
 
 All device MMIO is mapped via L0[1] (`0x80_0000_0000`+), shared across
