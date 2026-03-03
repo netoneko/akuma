@@ -32,6 +32,7 @@ pub const DEV_GIC_DIST_VA: usize = 0x80_0000_0000;
 pub const DEV_GIC_CPU_VA: usize  = 0x80_0000_1000;
 pub const DEV_UART_VA: usize     = 0x80_0000_2000;
 pub const DEV_FW_CFG_VA: usize   = 0x80_0000_3000;
+pub const DEV_VIRTIO_VA: usize   = 0x80_0000_4000;
 
 /// Memory attribute indices (configured in MAIR_EL1)
 pub const MAIR_DEVICE_NGNRNE: u64 = 0; // Device memory, non-Gathering, non-Reordering, non-Early Write Acknowledgement
@@ -118,6 +119,7 @@ const DEV_PAGES: &[(usize, usize)] = &[
     (1, 0x0801_0000), // L3[1]: GIC CPU interface
     (2, 0x0900_0000), // L3[2]: UART PL011
     (3, 0x0902_0000), // L3[3]: fw_cfg
+    (4, 0x0A00_0000), // L3[4]: VirtIO MMIO
 ];
 
 /// Allocate the shared L1/L2/L3 device page tables that every user address
@@ -318,26 +320,9 @@ impl UserAddressSpace {
         }
 
         let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
-        let device_page_flags: u64 = flags::VALID | flags::TABLE | flags::AF
-            | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
+        let _ = l2_ptr; // L1[0]'s L2 is now empty; all devices are under L0[1].
 
-        // VirtIO stays identity-mapped at 0x0A00_0000 (no heap conflict,
-        // and DMA relies on virt_to_phys() identity for buffer addresses).
-        // GIC, UART, fw_cfg are accessed via remapped VAs under L0[1].
-        {
-            let l3_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate VirtIO L3 table")?;
-            pmm::track_frame(l3_frame, pmm::FrameSource::UserPageTable, 0);
-            self.page_table_frames.push(l3_frame);
-
-            let l3_entry = (l3_frame.addr as u64) | flags::VALID | flags::TABLE;
-            unsafe { core::ptr::write_volatile(l2_ptr.add(80), l3_entry); } // L2[80]
-
-            let l3_ptr = phys_to_virt(l3_frame.addr) as *mut u64;
-            let l3_idx = (0x0a00_0000 - 80 * 0x20_0000) / PAGE_SIZE;
-            unsafe { core::ptr::write_volatile(l3_ptr.add(l3_idx), (0x0a00_0000u64) | device_page_flags); }
-        }
-
-        // L0[1] -> shared device L1 table (GIC, UART, fw_cfg at VA 0x80_0000_0000+).
+        // L0[1] -> shared device L1 table (all devices at VA 0x80_0000_0000+).
         // These pages are shared across all user address spaces and must NOT be
         // pushed to page_table_frames (they are never freed).
         let dev_l1_phys = SHARED_DEV_L1_PHYS.load(Ordering::Acquire);

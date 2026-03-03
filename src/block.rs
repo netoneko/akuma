@@ -19,9 +19,16 @@ use crate::virtio_hal::VirtioHal;
 /// Sector size in bytes (standard for VirtIO block devices)
 pub const SECTOR_SIZE: usize = 512;
 
-/// QEMU virt machine virtio MMIO addresses
+/// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
+    crate::mmu::DEV_VIRTIO_VA,
+    crate::mmu::DEV_VIRTIO_VA + 0x200,
+    crate::mmu::DEV_VIRTIO_VA + 0x400,
+    crate::mmu::DEV_VIRTIO_VA + 0x600,
+    crate::mmu::DEV_VIRTIO_VA + 0x800,
+    crate::mmu::DEV_VIRTIO_VA + 0xa00,
+    crate::mmu::DEV_VIRTIO_VA + 0xc00,
+    crate::mmu::DEV_VIRTIO_VA + 0xe00,
 ];
 
 /// VirtIO device ID for block devices

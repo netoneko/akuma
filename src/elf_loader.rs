@@ -627,8 +627,8 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
     }
 
     const INTERP_END: usize = 0x3010_0000;
-    const MIN_MMAP_SPACE: usize = 0xC000_0000; // 3GB for large/dynamic binaries (JIT needs 512MB+)
-    const MAX_STACK_TOP: usize = 0x1_0000_0000; // 4GB — MMU supports up to 48-bit VA
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128GB for large/dynamic binaries (JSC gigacage needs 128GB)
+    const MAX_STACK_TOP: usize = 0x40_0000_0000; // 256GB — well within 48-bit VA (T0SZ=16)
 
     let base_mmap = (brk + 0x1000_0000) & !0xFFFF; // brk + 256MB gap
     let mmap_start = if has_interp {

@@ -2483,7 +2483,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     });
     
     // 4. Perform memory copy
-    let stack_top = 0x40000000;
+    let stack_top = parent.memory.stack_top;
     let stack_size = config::USER_STACK_SIZE; 
     let stack_start = stack_top - stack_size;
     

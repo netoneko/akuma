@@ -104,7 +104,7 @@ in L0[1] can never conflict with user heap, mmap, or stack.
 
 ### Remapped device virtual addresses
 
-All 4 device pages fit in one L3 table under L0[1] -> L1[0] -> L2[0]:
+All 5 device pages fit in one L3 table under L0[1] -> L1[0] -> L2[0]:
 
 | L3 slot | Virtual Address      | Physical Address | Device           |
 |---------|---------------------|-----------------|------------------|
@@ -112,9 +112,15 @@ All 4 device pages fit in one L3 table under L0[1] -> L1[0] -> L2[0]:
 | 1       | `0x80_0000_1000`    | `0x0801_0000`   | GIC CPU interface|
 | 2       | `0x80_0000_2000`    | `0x0900_0000`   | UART PL011       |
 | 3       | `0x80_0000_3000`    | `0x0902_0000`   | fw_cfg           |
+| 4       | `0x80_0000_4000`    | `0x0A00_0000`   | VirtIO MMIO      |
 
-VirtIO at 0x0a00_0000 stays identity-mapped (no heap conflict, and DMA
-relies on `virt_to_phys()` identity for buffer addresses).
+VirtIO was initially left identity-mapped under the assumption that the
+64MB heap would not reach `0x0A00_0000`. After switching to dynamic heap
+sizing (based on available physical memory), the heap grew past VirtIO's
+address, causing a permission fault (ISS=0xf). VirtIO was therefore moved
+to L0[1] alongside the other devices. DMA is unaffected because
+`virt_to_phys()` in `virtio_hal.rs` only translates DMA buffer addresses
+(allocated from kernel heap at 0x4000_0000+), not MMIO register addresses.
 
 ### Boot page table changes
 
@@ -133,14 +139,16 @@ freed, so per-process overhead is zero.
 
 ### User page table changes
 
-`add_kernel_mappings()` in `src/mmu.rs` no longer creates L3 device page
-entries for L2[64] (GIC) or L2[72] (UART/fw_cfg) in L1[0]'s L2 table.
-Only L2[80] (VirtIO) retains its identity-mapped device L3 table.
+`add_kernel_mappings()` in `src/mmu.rs` no longer creates any L3 device page
+entries in L1[0]'s L2 table. All devices (GIC, UART, fw_cfg, VirtIO) are
+accessed exclusively through the shared L0[1] mapping.
 
 ### Driver constant changes
 
 Device drivers reference the remapped VAs via constants in `src/mmu.rs`
-(`DEV_GIC_DIST_VA`, `DEV_GIC_CPU_VA`, `DEV_UART_VA`, `DEV_FW_CFG_VA`).
+(`DEV_GIC_DIST_VA`, `DEV_GIC_CPU_VA`, `DEV_UART_VA`, `DEV_FW_CFG_VA`,
+`DEV_VIRTIO_VA`). VirtIO drivers (`smoltcp_net.rs`, `block.rs`, `rng.rs`)
+use `DEV_VIRTIO_VA`-based offsets for their MMIO slot addresses.
 No runtime TTBR0 swaps or function wrapping is needed.
 
 ### Heap uncapped
