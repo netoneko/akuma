@@ -1122,7 +1122,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
-            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08 || fault_type == 0x0C;
+            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
             let far_usize = far as usize;
             if is_translation_fault {
                 if let Some(flags) = crate::process::lazy_region_flags(far_usize) {

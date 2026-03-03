@@ -364,6 +364,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize MMU with identity mapping for kernel
     console::print("Initializing MMU...\n");
     mmu::init(ram_base, ram_size);
+    mmu::init_shared_device_tables();
     console::print("MMU enabled with identity mapping\n");
 
     // Log kernel section boundaries (for future read-only protection)

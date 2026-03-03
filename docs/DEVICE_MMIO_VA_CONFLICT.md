@@ -95,59 +95,58 @@ spans across the page boundary into 0x8000000.
 On Linux this would not crash because brk is not capped at 0x8000000 and the
 page at that address would be normal heap memory.
 
-## Solution: Remove device MMIO from user page tables
+## Solution: Remap device MMIO to non-conflicting VAs via L0[1]
 
-The fix removes conflicting device pages (GIC, UART, fw_cfg) from user page
-tables entirely. Device access from exception/syscall handlers is handled by a
-lightweight TTBR0 swap to boot page tables.
+The fix remaps conflicting device pages (GIC, UART, fw_cfg) to virtual
+addresses under L0[1] (`0x80_0000_0000`+). With T0SZ=16 (48-bit VA space),
+L0 has 512 entries. User processes only use L0[0] (first 512GB), so devices
+in L0[1] can never conflict with user heap, mmap, or stack.
 
-### `with_boot_ttbr0()` helper
+### Remapped device virtual addresses
 
-A new function in `src/mmu.rs` temporarily switches TTBR0 to boot page tables
-(which have the full 1GB device identity mapping), executes a closure, then
-restores the original TTBR0:
+All 4 device pages fit in one L3 table under L0[1] -> L1[0] -> L2[0]:
 
-```rust
-pub fn with_boot_ttbr0<R>(f: impl FnOnce() -> R) -> R {
-    let boot = get_boot_ttbr0();
-    let saved: u64;
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) saved); }
-    if already_on_boot(saved, boot) { return f(); }
-    unsafe { core::arch::asm!("dsb ish", "msr ttbr0_el1, {}", "isb", in(reg) boot); }
-    let result = f();
-    unsafe { core::arch::asm!("dsb ish", "msr ttbr0_el1, {}", "isb", in(reg) saved); }
-    result
-}
-```
+| L3 slot | Virtual Address      | Physical Address | Device           |
+|---------|---------------------|-----------------|------------------|
+| 0       | `0x80_0000_0000`    | `0x0800_0000`   | GIC distributor  |
+| 1       | `0x80_0000_1000`    | `0x0801_0000`   | GIC CPU interface|
+| 2       | `0x80_0000_2000`    | `0x0900_0000`   | UART PL011       |
+| 3       | `0x80_0000_3000`    | `0x0902_0000`   | fw_cfg           |
 
-Since boot TTBR0 uses ASID 0 and user TTBR0 uses non-zero ASIDs, TLB entries
-are tagged and **no TLB flush is needed**. Overhead is ~50 cycles per swap
-direction (DSB + MSR + ISB).
+VirtIO at 0x0a00_0000 stays identity-mapped (no heap conflict, and DMA
+relies on `virt_to_phys()` identity for buffer addresses).
 
-When running on kernel threads (already on boot TTBR0), the helper short-circuits
-and adds zero overhead.
+### Boot page table changes
 
-### Wrapped modules
+`src/boot.rs` expands the BSS page table area from 3 to 6 pages. The
+additional 3 pages (L1, L2, L3) form the L0[1] device mapping chain,
+set up in assembly before MMU enable. This means the remapped VAs work
+from the very first Rust instruction.
 
-| Module | Device | Wrapped functions |
-|--------|--------|-------------------|
-| `src/console.rs` | UART 0x0900_0000 | `print`, `print_char`, `print_hex`, `print_dec`, `print_u64`, `has_char`, `getchar` |
-| `src/gic.rs` | GIC 0x0800_0000 | `init`, `enable_irq`, `disable_irq`, `acknowledge_irq`, `end_of_interrupt`, `trigger_sgi`, `set_priority` |
-| `src/fw_cfg.rs` | fw_cfg 0x0902_0000 | `select`, `find_file` |
+### Shared user page tables
 
-VirtIO at 0x0a00_0000 is kept in user page tables because the 64MB heap
-(ending at 0x09C6_E000) does not reach it.
+During kernel init, `mmu::init_shared_device_tables()` allocates 3 pages
+(L1, L2, L3) with the same device entries. Every user address space's
+`add_kernel_mappings()` sets L0[1] to point to this shared L1 page.
+The shared pages are never tracked in `page_table_frames` and are never
+freed, so per-process overhead is zero.
 
 ### User page table changes
 
-`add_kernel_mappings()` in `src/mmu.rs` no longer creates L3 device page entries
-for L2[64] (GIC) or L2[72] (UART/fw_cfg). Only L2[80] (VirtIO) retains its
-device L3 table.
+`add_kernel_mappings()` in `src/mmu.rs` no longer creates L3 device page
+entries for L2[64] (GIC) or L2[72] (UART/fw_cfg) in L1[0]'s L2 table.
+Only L2[80] (VirtIO) retains its identity-mapped device L3 table.
+
+### Driver constant changes
+
+Device drivers reference the remapped VAs via constants in `src/mmu.rs`
+(`DEV_GIC_DIST_VA`, `DEV_GIC_CPU_VA`, `DEV_UART_VA`, `DEV_FW_CFG_VA`).
+No runtime TTBR0 swaps or function wrapping is needed.
 
 ### Heap uncapped
 
-With conflicting devices removed from user tables, the heap lazy region uses
-the full 64MB `HEAP_LAZY_SIZE` without any cap at `DEVICE_MMIO_START`.
+With conflicting devices removed from L0[0], the heap lazy region uses
+the full 64MB `HEAP_LAZY_SIZE` without any cap.
 `set_brk()` no longer rejects addresses past 0x0800_0000.
 
 ## Additional bug: `is_translation_fault` classification
