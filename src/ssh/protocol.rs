@@ -12,6 +12,7 @@
 
 use alloc::format;
 use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc; // Added
 use spinning_top::Spinlock;use core::convert::TryInto;
@@ -946,8 +947,14 @@ async fn run_shell_session(
 
     // Send welcome message
     {
-        let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\n";
-        let _ = channel_stream.write(welcome).await;
+        const BANNER_ART: &str = include_str!("../akuma_40.txt");
+        let mut welcome = String::from("\r\n");
+        for line in BANNER_ART.lines() {
+            welcome.push_str(line);
+            welcome.push_str("\r\n");
+        }
+        welcome.push_str("\r\n========================================\r\n      Welcome to Akuma SSH Server\r\n========================================\r\n\r\nType 'help' for available commands.\r\n\r\n");
+        let _ = channel_stream.write(welcome.as_bytes()).await;
         let prompt = generate_prompt(&ctx);
         let _ = channel_stream.write(prompt.as_bytes()).await;
     }
