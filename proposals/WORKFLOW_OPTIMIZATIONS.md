@@ -202,6 +202,41 @@ Retroactively add resolutions to the ~15 investigation docs. Going forward, star
 
 ---
 
+## 7. Doc Consolidation
+
+**Problem:** The `docs/` folder has 100+ files with significant overlap and no clear organization. Multiple docs cover the same subsystem from different debugging sessions without cross-referencing each other. Some are fully obsolete (the bug is fixed, the plan is implemented, the migration is complete). When these are fed as AI context or read by a human, the volume obscures the signal.
+
+Examples of overlap:
+
+- **Heap corruption:** `HEAP_CORRUPTION_ANALYSIS`, `HEAP_CORRUPTION_INVESTIGATION`, `FAR_0x5_AND_HEAP_CORRUPTION_FIX` — three docs covering overlapping aspects of the same problem area, written at different times, with no cross-references.
+- **Networking migration:** `STRATEGY_B_SMOLTCP_MIGRATION`, `SMOLTCP_MIGRATION_CHALLENGES`, `SMOLTCP_MIGRATION_SUMMARY`, `NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS`, `NETWORKING_DEADLOCK_INVESTIGATION` — five docs for one migration. The summary exists but doesn't supersede the others.
+- **SSH fixes:** `SSH_PERFORMANCE_FIX_2026`, `SSH_ECHO_LATENCY_FIX`, `SSH_TERMINAL_SIZE_FIX`, `SSH_TERMINAL_KEY_TRANSLATION_FIX`, `SSH_THREADING_BUG`, `SSH_STREAMING_ARCHITECTURE` — six docs that could be sections in one SSH troubleshooting reference.
+- **Missing syscalls:** `BUN_MISSING_SYSCALLS`, `XBPS_MISSING_SYSCALLS`, `APK_MISSING_SYSCALLS`, `CURL_MISSING_SYSCALLS`, `GIT_MISSING_SYSCALLS` — five docs with identical structure that could be a single table.
+
+**Proposal:** A one-time consolidation pass, then a lightweight convention going forward.
+
+**One-time pass:**
+
+1. **Merge related docs** into per-subsystem references. For example:
+   - `docs/SSH.md` absorbs the six SSH fix docs as dated subsections.
+   - `docs/SMOLTCP_MIGRATION_SUMMARY.md` absorbs the migration challenges/strategy/deadlock docs.
+   - A single `docs/MISSING_SYSCALLS.md` table replaces the five per-binary files.
+   - `docs/HEAP_AND_ALLOCATOR.md` merges the heap corruption and allocator docs.
+
+2. **Mark obsolete docs.** Add `**Status: Resolved**` at the top of docs whose plans are fully implemented (e.g., `CONTAINERS_STAGE_1_PLAN` if stage 1 is done, `EMBASSY_REMOVAL` after embassy is gone). Don't delete — just mark, so they're skippable.
+
+3. **Add a `docs/INDEX.md`** that groups docs by subsystem with one-line descriptions. This becomes the entry point for both humans and AI context selection. Instead of dumping all 100 docs into a chat, pick the relevant section from the index.
+
+**Going forward convention:**
+
+- Investigation logs go in `docs/investigations/` — they're not reference material, they're debugging journals. The resolution header (#5 above) bridges the two.
+- Reference docs live in `docs/` and are organized by subsystem, not by date or bug ID.
+- When a fix doc is written, check if the relevant reference doc exists and add a section there instead of creating a new top-level file.
+
+**Effort:** Medium — the one-time pass is a few hours. The convention is free.
+
+---
+
 ## Summary
 
 | # | Change | Impact | Effort |
@@ -212,5 +247,6 @@ Retroactively add resolutions to the ~15 investigation docs. Going forward, star
 | 4 | Debug assertions | Catches invariant violations at the source | Medium |
 | 5 | Investigation doc resolutions | Faster context loading for humans and AI | Small |
 | 6 | Disk image scripts | Cleaner repo, reproducible snapshots | Trivial |
+| 7 | Doc consolidation | Reduces noise in AI context and human reading | Medium |
 
-Recommendations 1-3 can be done in an afternoon and have immediate payoff. Recommendation 4 is an ongoing investment. Recommendations 5-6 are housekeeping.
+Recommendations 1-3 can be done in an afternoon and have immediate payoff. Recommendation 4 is an ongoing investment. Recommendations 5-7 are housekeeping that compounds over time.
