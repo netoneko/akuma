@@ -1521,6 +1521,17 @@ pub struct Process {
 }
 
 
+fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
+    const MIN_HEAP: usize = 16 * 1024 * 1024;
+    const RESERVE_PAGES: usize = 2048; // 8MB
+
+    let (_, _, free) = crate::pmm::stats();
+    let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
+    let va_cap = memory.next_mmap.saturating_sub(brk);
+
+    core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
+}
+
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
@@ -1631,8 +1642,8 @@ impl Process {
         fd_map.insert(1, FileDescriptor::Stdout);
         fd_map.insert(2, FileDescriptor::Stderr);
 
-        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        push_lazy_region(pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
+        let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
+        push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
 
         Ok(Self {
             pid,
@@ -1690,8 +1701,8 @@ impl Process {
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
 
-        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
+        let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
+        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1747,8 +1758,8 @@ impl Process {
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
 
-        const HEAP_LAZY_SIZE: usize = 64 * 1024 * 1024;
-        push_lazy_region(self.pid, brk, HEAP_LAZY_SIZE, crate::mmu::user_flags::RW_NO_EXEC);
+        let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
+        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
 
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
