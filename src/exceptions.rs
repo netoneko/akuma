@@ -1129,7 +1129,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
                     if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        let mut is_file_backed = false;
                         if let crate::process::LazySource::File { ref path, file_offset, filesz, segment_va } = source {
+                            is_file_backed = true;
                             let offset_in_seg = page_va.saturating_sub(segment_va);
                             if offset_in_seg < filesz {
                                 let file_pos = file_offset + offset_in_seg;
@@ -1137,6 +1139,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
                                 let buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, read_len) };
                                 let _ = crate::vfs::read_at(path, file_pos, buf);
+                            }
+                        }
+                        // Cache maintenance for executable pages loaded via data abort:
+                        // the instruction cache won't see data written through the data cache
+                        // unless we explicitly clean D-cache and invalidate I-cache.
+                        if is_file_backed && (map_flags & crate::mmu::flags::UXN) == 0 {
+                            let kva = crate::mmu::phys_to_virt(page_frame.addr) as usize;
+                            for off in (0..0x1000_usize).step_by(64) {
+                                unsafe {
+                                    core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                    core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                                }
+                            }
+                            unsafe {
+                                core::arch::asm!("dsb ish");
+                                core::arch::asm!("isb");
                             }
                         }
                         let table_frames = unsafe {
