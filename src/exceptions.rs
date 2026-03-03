@@ -1138,7 +1138,17 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 let read_len = core::cmp::min(0x1000, filesz - offset_in_seg);
                                 let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
                                 let buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, read_len) };
-                                let _ = crate::vfs::read_at(path, file_pos, buf);
+                                match crate::vfs::read_at(path, file_pos, buf) {
+                                    Ok(n) if n < read_len => {
+                                        crate::safe_print!(128, "[DP] short read: va={:#x} foff={:#x} want={} got={}\n",
+                                            page_va, file_pos, read_len, n);
+                                    }
+                                    Err(_) => {
+                                        crate::safe_print!(128, "[DP] read_at FAILED: va={:#x} foff={:#x} len={}\n",
+                                            page_va, file_pos, read_len);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         // Cache maintenance for executable pages loaded via data abort:
@@ -1209,8 +1219,24 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 let read_len = core::cmp::min(0x1000, filesz - offset_in_seg);
                                 let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
                                 let buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, read_len) };
-                                let _ = crate::vfs::read_at(path, file_pos, buf);
+                                match crate::vfs::read_at(path, file_pos, buf) {
+                                    Ok(n) if n < read_len => {
+                                        crate::safe_print!(128, "[IA-DP] short read: va={:#x} foff={:#x} want={} got={}\n",
+                                            page_va, file_pos, read_len, n);
+                                    }
+                                    Err(_) => {
+                                        crate::safe_print!(128, "[IA-DP] read_at FAILED: va={:#x} foff={:#x} len={}\n",
+                                            page_va, file_pos, read_len);
+                                    }
+                                    _ => {}
+                                }
                             }
+                            let first_word = unsafe {
+                                let p = crate::mmu::phys_to_virt(page_frame.addr) as *const u32;
+                                core::ptr::read_volatile(p)
+                            };
+                            crate::safe_print!(128, "[IA-DP] pid={} va={:#x} foff={:#x} seg_va={:#x} first={:#010x}\n",
+                                pid, page_va, file_offset + offset_in_seg, segment_va, first_word);
                         }
 
                         let kva = crate::mmu::phys_to_virt(page_frame.addr) as usize;
