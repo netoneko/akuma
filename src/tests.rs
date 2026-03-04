@@ -93,6 +93,11 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
     run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
 
+    // Bug 10: partial munmap of eager regions
+    run_test!(test_eager_munmap_prefix_preserves_suffix, "eager_munmap_prefix_preserves_suffix");
+    run_test!(test_eager_munmap_suffix_preserves_prefix, "eager_munmap_suffix_preserves_prefix");
+    run_test!(test_eager_munmap_full_removes_all, "eager_munmap_full_removes_all");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -3657,6 +3662,223 @@ fn test_map_interleaved_regions_same_l3() -> bool {
                     idx, va, got, exp);
             }
         }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 10: Partial munmap of eager mmap regions
+//
+// sys_munmap removes the ENTIRE eager region when the start address matches,
+// ignoring the requested unmap length. Node.js/V8/jemalloc frequently mmap a
+// large region then trim prefix/suffix via munmap to get alignment.
+// ============================================================================
+
+/// Helper: replicates the FIXED sys_munmap eager-region logic.
+/// Supports partial prefix unmap: when len < region_size, only the first
+/// `len/4096` pages are freed and the remainder is re-inserted.
+fn simulate_sys_munmap_eager(
+    mmap_regions: &mut Vec<(usize, Vec<crate::pmm::PhysFrame>)>,
+    addr: usize,
+    len: usize,
+) -> (Option<usize>, usize) {
+    let unmap_pages = len / 4096;
+
+    // Exact start match
+    if let Some(idx) = mmap_regions.iter().position(|(start, _)| *start == addr) {
+        let region_pages = mmap_regions[idx].1.len();
+        if unmap_pages >= region_pages {
+            let (_, frames) = mmap_regions.remove(idx);
+            let freed = frames.len();
+            for f in frames { crate::pmm::free_page(f); }
+            return (Some(idx), freed);
+        }
+        // Partial prefix unmap
+        let (old_start, old_frames) = mmap_regions.remove(idx);
+        let mut iter = old_frames.into_iter();
+        let mut freed = 0usize;
+        for _ in 0..unmap_pages {
+            if let Some(f) = iter.next() {
+                crate::pmm::free_page(f);
+                freed += 1;
+            }
+        }
+        let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
+        if !remaining.is_empty() {
+            let new_start = old_start + unmap_pages * 4096;
+            mmap_regions.push((new_start, remaining));
+        }
+        return (Some(idx), freed);
+    }
+
+    // Sub-range match (addr inside a region but not at start)
+    if let Some(idx) = mmap_regions.iter().position(|(start, frames)| {
+        addr > *start && addr < *start + frames.len() * 4096
+    }) {
+        let (region_start, old_frames) = mmap_regions.remove(idx);
+        let offset_pages = (addr - region_start) / 4096;
+        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
+        let mut prefix = Vec::new();
+        let mut suffix = Vec::new();
+        let mut freed = 0usize;
+        for (i, f) in old_frames.into_iter().enumerate() {
+            if i < offset_pages {
+                prefix.push(f);
+            } else if i < end {
+                crate::pmm::free_page(f);
+                freed += 1;
+            } else {
+                suffix.push(f);
+            }
+        }
+        if !prefix.is_empty() {
+            mmap_regions.push((region_start, prefix));
+        }
+        if !suffix.is_empty() {
+            mmap_regions.push((region_start + end * 4096, suffix));
+        }
+        return (Some(idx), freed);
+    }
+
+    (None, 0)
+}
+
+/// Prefix munmap of an eager region MUST preserve the suffix.
+///
+/// Scenario matching the Node.js crash:
+///   1. mmap(NULL, 127*4096) → base_addr  (eager, 127 pages)
+///   2. munmap(base_addr, 4*4096)          (trim prefix — only 4 pages)
+///   3. Access page 35 → should still be mapped
+///
+/// Expected: after step 2, only 4 pages are freed and pages 4–126 survive.
+/// BUG: sys_munmap removes ALL 127 pages because it ignores `len`.
+fn test_eager_munmap_prefix_preserves_suffix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap prefix of eager region preserves suffix\n");
+
+    let pages = 127usize;
+    let unmap_pages = 4usize;
+    let base: usize = 0xA000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    // Simulate munmap(base, 4*4096) — should free only first 4 pages
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, unmap_pages * 4096,
+    );
+
+    // CORRECT behavior assertions:
+    // 1. The munmap should match (start == addr)
+    let did_match = matched.is_some();
+    // 2. Only 4 pages should be freed, not 127
+    let freed_correct = freed_count == unmap_pages;
+    // 3. A region for the suffix (pages 4–126) should remain
+    let suffix_addr = base + unmap_pages * 4096;
+    let suffix_remaining = mmap_regions.iter().any(|(start, fr)| {
+        *start == suffix_addr && fr.len() == pages - unmap_pages
+    });
+
+    // Cleanup remaining regions
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = did_match && freed_correct && suffix_remaining;
+    if !pass {
+        crate::safe_print!(256,
+            "  matched={} freed={} (expected {}) suffix_present={}\n",
+            did_match, freed_count, unmap_pages, suffix_remaining);
+        crate::safe_print!(128,
+            "  BUG: sys_munmap freed ALL {} pages instead of {} — suffix destroyed\n",
+            freed_count, unmap_pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Suffix munmap of an eager region: addr != start, so current code is a no-op.
+/// Documents the behavior (no crash, but leaked pages).
+fn test_eager_munmap_suffix_preserves_prefix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap suffix — current code is no-op (safe leak)\n");
+
+    let pages = 127usize;
+    let keep = 100usize;
+    let trim = pages - keep;
+    let base: usize = 0xB000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    let suffix_addr = base + keep * 4096;
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, suffix_addr, trim * 4096,
+    );
+
+    let no_match = matched.is_none();
+    let original_intact = mmap_regions.iter().any(|(start, fr)| {
+        *start == base && fr.len() == pages
+    });
+
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = no_match && original_intact;
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} original_intact={}\n",
+            matched, freed_count, original_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Full munmap correctly removes the entire region.
+fn test_eager_munmap_full_removes_all() -> bool {
+    console::print("\n[TEST] munmap: full-length eager region removal\n");
+
+    let pages = 127usize;
+    let base: usize = 0xC000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, pages * 4096,
+    );
+
+    let pass = matched.is_some() && freed_count == pages && mmap_regions.is_empty();
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} regions_left={}\n",
+            matched, freed_count, mmap_regions.len());
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

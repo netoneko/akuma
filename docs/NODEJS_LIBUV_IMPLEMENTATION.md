@@ -590,11 +590,46 @@ via `lookup_process(read_current_pid())` instead of `current_process()`:
 | `remove_mmap_region` | `src/process.rs` | `lookup_process(read_current_pid())` |
 | `record_lazy_region` | `src/process.rs` | `lookup_process(read_current_pid())` |
 
+### Bug 10: sys_munmap Ignores Length for Eager Regions (Partial Unmap Destroys Entire Region)
+
+**Symptom:** Persistent `FAR=0x680c0000` crash. The `[MMU] WARN` diagnostic
+confirmed `map_user_page` successfully created all 127 PTEs (no "already mapped"
+warnings for the crash VA). The eager fallback in the exception handler failed
+to find the region in `mmap_regions` — the region had been removed entirely.
+
+**Root cause:** `sys_munmap` matched eager `mmap_regions` by exact start address
+but ignored the requested `len` argument. When `addr == region_start`, it removed
+the **entire** region and freed **all** frames, regardless of how many pages the
+caller actually wanted to unmap.
+
+V8/jemalloc/libuv commonly mmap a large region, then trim prefix/suffix via
+`munmap(base, small_len)` to achieve alignment. The kernel destroyed the entire
+allocation instead of trimming it.
+
+**Example crash sequence:**
+1. `mmap(NULL, 0x7f000, RW, ANON)` → `0x6809d000` (127 pages, eager)
+2. `munmap(0x6809d000, 0x4000)` → kernel frees ALL 127 pages, removes region
+3. Access page 35 (`0x680c0000`) → translation fault
+4. Eager fallback: `mmap_regions` is empty → no recovery → SIGBUS
+
+**Fix:** `sys_munmap` now handles three cases for eager regions:
+- **Full unmap** (`len ≥ region_size`): remove entire region (existing behavior)
+- **Prefix unmap** (`addr == start, len < region_size`): free first N pages,
+  re-insert remainder with adjusted start address
+- **Mid-region unmap** (`addr > start, addr < end`): split into prefix + suffix
+  regions, freeing only the pages in the unmapped range
+
+**Files changed:** `src/syscall.rs`
+
+**Diagnostics added:**
+- `sys_munmap` now logs every eager-region unmap with type (full/prefix/mid)
+- Exception handler eager fallback dumps all `mmap_regions` when recovery fails
+
 ### Kernel Tests
 
 **File:** `src/tests.rs`
 
-Added 12 mmap subsystem tests to `run_memory_tests()` to catch
+Added 18 mmap subsystem tests to `run_memory_tests()` to catch
 regressions in the exact scenarios that caused the Node.js crashes:
 
 - `alloc_mmap_non_overlapping` — multiple allocations return disjoint VA ranges
@@ -609,3 +644,9 @@ regressions in the exact scenarios that caused the Node.js crashes:
 - `eager_mmap_subrange_munmap` — sub-range munmap doesn't match any tracked region
 - `clone_vm_mmap_regions_on_owner` — CLONE_VM child has empty `mmap_regions`; parent has the entries
 - `clone_vm_eager_fallback_finds_region` — fault-handler recovery finds region via owner PID, not via worker PID
+- `map_127_pages_all_ptes_exist` — maps 127 pages, verifies every L3 PTE exists
+- `map_pages_survive_subsequent_allocs` — 127 mapped PTEs survive 64 subsequent page allocations
+- `map_interleaved_regions_same_l3` — 1+3+5+127 pages in same 2MB range, all PTEs correct
+- `eager_munmap_prefix_preserves_suffix` — **Bug 10**: partial prefix munmap frees only N pages, suffix survives
+- `eager_munmap_suffix_preserves_prefix` — suffix munmap (addr != start) doesn't destroy prefix
+- `eager_munmap_full_removes_all` — full-length munmap correctly removes entire region

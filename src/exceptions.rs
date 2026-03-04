@@ -1253,6 +1253,19 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     if recovered {
                         return unsafe { (*frame).x0 };
                     }
+                    // Dump mmap_regions for debugging: shows what the eager fallback searched
+                    if let Some(dbg_proc) = crate::process::lookup_process(pid) {
+                        let n = dbg_proc.mmap_regions.len();
+                        crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
+                            pid, far_usize, n);
+                        for (i, (start, fr)) in dbg_proc.mmap_regions.iter().enumerate() {
+                            if i >= 10 { crate::safe_print!(32, "  ...\n"); break; }
+                            crate::safe_print!(128, "  [{}] 0x{:x}-0x{:x} ({} pages)\n",
+                                i, start, start + fr.len() * 4096, fr.len());
+                        }
+                    } else {
+                        crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
+                    }
                     crate::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }

@@ -4549,17 +4549,82 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     };
 
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
+    let unmap_pages = unmap_len / 4096;
 
     // Try normal (eagerly-mapped) region first
     if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
-        let (_, frames) = proc.mmap_regions.remove(idx);
-        let freed_size = frames.len() * 4096;
-        for (i, frame) in frames.into_iter().enumerate() {
-            let _ = proc.address_space.unmap_page(addr + i * 4096);
-            proc.address_space.remove_user_frame(frame);
-            crate::pmm::free_page(frame);
+        let region_pages = proc.mmap_regions[idx].1.len();
+        if unmap_pages >= region_pages {
+            // Full unmap — remove entire region
+            let (_, frames) = proc.mmap_regions.remove(idx);
+            let freed_size = frames.len() * 4096;
+            crate::tprint!(128, "[munmap] pid={} addr=0x{:x} full ({} pages)\n",
+                proc.pid, addr, frames.len());
+            for (i, frame) in frames.into_iter().enumerate() {
+                let _ = proc.address_space.unmap_page(addr + i * 4096);
+                proc.address_space.remove_user_frame(frame);
+                crate::pmm::free_page(frame);
+            }
+            proc.memory.free_regions.push((addr, freed_size));
+        } else {
+            // Partial prefix unmap — split: free first `unmap_pages`, keep the rest
+            let (old_start, old_frames) = proc.mmap_regions.remove(idx);
+            crate::tprint!(192, "[munmap] pid={} addr=0x{:x} partial prefix {}/{} pages\n",
+                proc.pid, addr, unmap_pages, old_frames.len());
+            let mut iter = old_frames.into_iter();
+            for i in 0..unmap_pages {
+                if let Some(frame) = iter.next() {
+                    let _ = proc.address_space.unmap_page(old_start + i * 4096);
+                    proc.address_space.remove_user_frame(frame);
+                    crate::pmm::free_page(frame);
+                }
+            }
+            let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
+            if !remaining.is_empty() {
+                let new_start = old_start + unmap_pages * 4096;
+                proc.mmap_regions.push((new_start, remaining));
+            }
+            proc.memory.free_regions.push((addr, unmap_pages * 4096));
         }
-        proc.memory.free_regions.push((addr, freed_size));
+        return 0;
+    }
+
+    // Check for sub-range munmap inside an eager region (addr != start but within range)
+    let sub_range_match = proc.mmap_regions.iter().position(|(start, frames)| {
+        addr > *start && addr < *start + frames.len() * 4096
+    });
+    if let Some(idx) = sub_range_match {
+        let (region_start, old_frames) = proc.mmap_regions.remove(idx);
+        let region_size = old_frames.len() * 4096;
+        let offset = addr - region_start;
+        let offset_pages = offset / 4096;
+        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
+        crate::tprint!(192, "[munmap] pid={} addr=0x{:x} mid-region start=0x{:x} pages {}-{}/{}\n",
+            proc.pid, addr, region_start, offset_pages, end, old_frames.len());
+
+        let mut old_iter = old_frames.into_iter().enumerate();
+        let mut prefix_frames = Vec::new();
+        let mut suffix_frames = Vec::new();
+
+        for (i, frame) in &mut old_iter {
+            if i < offset_pages {
+                prefix_frames.push(frame);
+            } else if i < end {
+                let _ = proc.address_space.unmap_page(region_start + i * 4096);
+                proc.address_space.remove_user_frame(frame);
+                crate::pmm::free_page(frame);
+            } else {
+                suffix_frames.push(frame);
+            }
+        }
+
+        if !prefix_frames.is_empty() {
+            proc.mmap_regions.push((region_start, prefix_frames));
+        }
+        if !suffix_frames.is_empty() {
+            proc.mmap_regions.push((region_start + end * 4096, suffix_frames));
+        }
+        proc.memory.free_regions.push((addr, (end - offset_pages) * 4096));
         return 0;
     }
 
