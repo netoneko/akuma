@@ -1084,51 +1084,65 @@ pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
     }
 }
 
-/// Handle munmap for lazy regions with proper partial unmap support.
-/// Returns Some((freed_start, freed_pages)) if a region was found and modified.
-pub fn munmap_lazy_region(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Option<(usize, usize)> {
+/// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
+/// Returns a Vec of (freed_start, freed_pages) for each affected region.
+pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> alloc::vec::Vec<(usize, usize)> {
     let unmap_end = unmap_addr + unmap_len;
-    let unmap_pages = unmap_len / 4096;
+    let mut results = alloc::vec::Vec::new();
 
+    loop {
+        if let Some(result) = munmap_lazy_region_overlapping(pid, unmap_addr, unmap_end) {
+            results.push(result);
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+/// Find and modify a single lazy region that overlaps with [range_start, range_end).
+/// Uses overlap check rather than containment check, so it finds regions that
+/// start within the range even if range_start is in a gap between regions.
+fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
     let result = crate::irq::with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.get_mut(&pid)?;
 
         let idx = regions.iter().position(|r| {
-            let end = r.start_va + r.size;
-            unmap_addr >= r.start_va && unmap_addr < end
+            let reg_end = r.start_va + r.size;
+            r.start_va < range_end && reg_end > range_start
         })?;
 
         let reg_start = regions[idx].start_va;
         let reg_size = regions[idx].size;
         let reg_end = reg_start + reg_size;
 
-        if unmap_addr == reg_start && unmap_end >= reg_end {
+        let clip_start = if range_start > reg_start { range_start } else { reg_start };
+        let clip_end = if range_end < reg_end { range_end } else { reg_end };
+
+        if clip_start == reg_start && clip_end == reg_end {
             regions.remove(idx);
             Some(('F', reg_start, reg_size / 4096))
-        } else if unmap_addr == reg_start {
-            let new_start = unmap_end;
-            let new_size = reg_end - new_start;
-            regions[idx].start_va = new_start;
-            regions[idx].size = new_size;
-            Some(('P', unmap_addr, unmap_pages))
-        } else if unmap_end >= reg_end {
-            let new_size = unmap_addr - reg_start;
-            regions[idx].size = new_size;
-            Some(('S', unmap_addr, unmap_pages))
+        } else if clip_start == reg_start {
+            regions[idx].start_va = clip_end;
+            regions[idx].size = reg_end - clip_end;
+            let freed = (clip_end - clip_start) / 4096;
+            Some(('P', clip_start, freed))
+        } else if clip_end == reg_end {
+            regions[idx].size = clip_start - reg_start;
+            let freed = (reg_end - clip_start) / 4096;
+            Some(('S', clip_start, freed))
         } else {
-            let left_size = unmap_addr - reg_start;
-            let right_start = unmap_end;
-            let right_size = reg_end - right_start;
             let right = LazyRegion {
-                start_va: right_start,
-                size: right_size,
+                start_va: clip_end,
+                size: reg_end - clip_end,
                 flags: regions[idx].flags,
                 source: regions[idx].source.clone(),
             };
-            regions[idx].size = left_size;
+            regions[idx].size = clip_start - reg_start;
             regions.push(right);
-            Some(('M', unmap_addr, unmap_pages))
+            let freed = (clip_end - clip_start) / 4096;
+            Some(('M', clip_start, freed))
         }
     });
 
@@ -1577,6 +1591,9 @@ pub struct Process {
 
     /// Per-process signal action table (sigaction storage)
     pub signal_actions: [SignalAction; MAX_SIGNALS],
+
+    /// Monotonic timestamp (us) when the process was created
+    pub start_time_us: u64,
 }
 
 
@@ -1669,6 +1686,7 @@ impl Process {
             delegate_pid: None,
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            start_time_us: crate::timer::uptime_us(),
         })
     }
 
@@ -1761,6 +1779,7 @@ impl Process {
             delegate_pid: None,
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            start_time_us: crate::timer::uptime_us(),
         })
     }
 
@@ -2369,9 +2388,13 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
+        let start_us = lookup_process(pid).map(|p| p.start_time_us).unwrap_or(0);
+        let elapsed_us = crate::timer::uptime_us().saturating_sub(start_us);
+        let elapsed_ms = elapsed_us / 1000;
+
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
-        crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
+        crate::safe_print!(128, "[Process] PID {} thread {} exited ({}) [{}ms]\n", pid, tid, exit_code, elapsed_ms);
     } else {
         crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
     }
@@ -2577,6 +2600,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         delegate_pid: None,
         clear_child_tid: 0,
         signal_actions: parent.signal_actions,
+        start_time_us: crate::timer::uptime_us(),
     });
     
     // 4. Perform memory copy
@@ -2794,6 +2818,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
         signal_actions: parent.signal_actions,
+        start_time_us: crate::timer::uptime_us(),
     });
 
     let parent_tid = crate::threading::current_thread_id();

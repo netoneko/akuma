@@ -3681,6 +3681,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
     let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
+        // MAP_FIXED overwrites any existing mappings in the range.
+        // Remove overlapping lazy regions so they don't shadow the new mapping.
+        let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+        let _ = crate::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
         for i in 0..pages {
             let va = addr + i * 4096;
             let _ = proc.address_space.unmap_page(va);
@@ -4474,7 +4478,6 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     };
 
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
-    let unmap_end = addr + unmap_len;
 
     // Try normal (eagerly-mapped) region first
     if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
@@ -4490,26 +4493,16 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     }
 
     // Try lazy region(s) — the unmap range may span multiple lazy regions.
-    // Loop until no more lazy regions overlap the remaining unmap range.
     let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-    let mut cursor = addr;
-    let mut found_any = false;
-    while cursor < unmap_end {
-        let remaining = unmap_end - cursor;
-        if let Some((freed_start, freed_pages)) = crate::process::munmap_lazy_region(as_pid, cursor, remaining) {
-            found_any = true;
+    let results = crate::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
+    if !results.is_empty() {
+        for &(freed_start, freed_pages) in &results {
             for i in 0..freed_pages {
                 let _ = proc.address_space.unmap_page(freed_start + i * 4096);
             }
             proc.memory.free_regions.push((freed_start, freed_pages * 4096));
-            let freed_end = freed_start + freed_pages * 4096;
-            cursor = if freed_end > cursor { freed_end } else { cursor + 4096 };
-        } else {
-            break;
         }
-    }
-    if found_any {
-        // Also unmap any pages in gaps between lazy regions within the range
+        // Also unmap any eagerly-mapped pages in gaps within the range
         let total_pages = unmap_len / 4096;
         for i in 0..total_pages {
             let _ = proc.address_space.unmap_page(addr + i * 4096);
