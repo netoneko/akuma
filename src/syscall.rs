@@ -13,6 +13,36 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 // ============================================================================
+// TimerFd State Tracking
+// ============================================================================
+
+struct TimerFdState {
+    armed_at_us: u64,
+    initial_us: u64,
+    interval_us: u64,
+    expirations_consumed: u64,
+}
+
+static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTreeMap::new());
+static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn timespec_to_us(ptr: usize) -> u64 {
+    if ptr == 0 { return 0; }
+    let sec = unsafe { core::ptr::read(ptr as *const u64) };
+    let nsec = unsafe { core::ptr::read((ptr + 8) as *const u64) };
+    sec * 1_000_000 + nsec / 1_000
+}
+
+fn us_to_timespec(us: u64, ptr: usize) {
+    let sec = us / 1_000_000;
+    let nsec = (us % 1_000_000) * 1_000;
+    unsafe {
+        core::ptr::write(ptr as *mut u64, sec);
+        core::ptr::write((ptr + 8) as *mut u64, nsec);
+    }
+}
+
+// ============================================================================
 // Kernel Pipe Infrastructure
 // ============================================================================
 
@@ -752,7 +782,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
         nr::GETSOCKNAME => sys_getsockname(args[0] as u32, args[1], args[2]),
-        nr::GETPEERNAME => 0, // stub
+        nr::GETPEERNAME => {
+            crate::safe_print!(96, "[stub] getpeername(fd={})\n", args[0]);
+            0
+        }
         nr::SETSOCKOPT => 0, // stub — no socket options to set
         nr::GETSOCKOPT => sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
@@ -798,7 +831,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT_GROUP => sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
-        nr::RT_SIGACTION => 0,    // Success (do nothing)
+        nr::RT_SIGACTION => {
+            crate::safe_print!(96, "[stub] rt_sigaction(sig={}, act={:#x})\n", args[0], args[1]);
+            0
+        }
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
@@ -874,8 +910,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => {
-            // Stub: signal delivery not implemented.
-            // Previously this killed the calling thread — must not do that.
+            crate::safe_print!(96, "[stub] tkill(tid={}, sig={})\n", args[0], args[1]);
             0
         }
         nr::PIDFD_OPEN => {
@@ -885,7 +920,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             }
             ENOSYS
         }
-        nr::CLOSE_RANGE => 0,
+        nr::CLOSE_RANGE => {
+            crate::safe_print!(96, "[stub] close_range(lo={}, hi={}, flags={})\n", args[0], args[1], args[2]);
+            0
+        }
         nr::SYSINFO => sys_sysinfo(args[0] as usize),
         nr::CLOCK_GETRES => sys_clock_getres(args[0] as u32, args[1] as usize),
         nr::EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
@@ -894,9 +932,22 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
         nr::TIMERFD_SETTIME => sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
         nr::TIMERFD_GETTIME => {
-            // Return zeros in the output itimerspec
-            if args[1] != 0 && validate_user_ptr(args[1] as u64, 32) {
-                unsafe { core::ptr::write_bytes(args[1] as *mut u8, 0, 32); }
+            let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(args[0] as u32)) {
+                Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+                _ => return EBADF,
+            };
+            let out = args[1] as usize;
+            if out != 0 && validate_user_ptr(args[1] as u64, 32) {
+                let table = TIMERFD_TABLE.lock();
+                if let Some(state) = table.get(&timer_id) {
+                    let now = crate::timer::uptime_us();
+                    let elapsed = now.saturating_sub(state.armed_at_us);
+                    let remaining = state.initial_us.saturating_sub(elapsed);
+                    us_to_timespec(state.interval_us, out);
+                    us_to_timespec(remaining, out + 16);
+                } else {
+                    unsafe { core::ptr::write_bytes(out as *mut u8, 0, 32); }
+                }
             }
             0
         }
@@ -1512,9 +1563,13 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
-        crate::process::FileDescriptor::TimerFd => {
-            // Non-blocking: return EAGAIN (timer hasn't fired)
-            EAGAIN
+        crate::process::FileDescriptor::TimerFd(timer_id) => {
+            let result = timerfd_read(timer_id);
+            if result == EAGAIN { return EAGAIN; }
+            if count >= 8 && validate_user_ptr(buf_ptr, 8) {
+                unsafe { core::ptr::write(buf_ptr as *mut u64, result); }
+                8
+            } else { EINVAL }
         }
         crate::process::FileDescriptor::EpollFd => EINVAL,
         _ => !0u64
@@ -1550,7 +1605,7 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
-        crate::process::FileDescriptor::TimerFd => EAGAIN,
+        crate::process::FileDescriptor::TimerFd(_) => EAGAIN,
         crate::process::FileDescriptor::EpollFd => EINVAL,
         _ => EBADF
     }
@@ -2091,7 +2146,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::TimerFd) | Some(crate::process::FileDescriptor::EpollFd) => {
+        Some(crate::process::FileDescriptor::TimerFd(_)) | Some(crate::process::FileDescriptor::EpollFd) => {
             let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
@@ -3478,44 +3533,111 @@ fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
 fn sys_epoll_create1(_flags: u32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
         let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd);
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-            crate::safe_print!(64, "[syscall] epoll_create1() = fd {}\n", fd);
-        }
+        crate::safe_print!(96, "[stub] epoll_create1() = fd {}\n", fd);
         fd as u64
     } else {
         EBADF
     }
 }
 
-fn sys_epoll_ctl(_epfd: u32, _op: i32, _fd: u32, _event: usize) -> u64 {
+fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, _event: usize) -> u64 {
+    crate::safe_print!(96, "[stub] epoll_ctl(epfd={}, op={}, fd={})\n", epfd, op, fd);
     0
 }
 
-fn sys_epoll_pwait(_epfd: u32, _events: usize, _maxevents: i32, timeout: i32) -> u64 {
+fn sys_epoll_pwait(epfd: u32, _events: usize, maxevents: i32, timeout: i32) -> u64 {
+    crate::safe_print!(96, "[stub] epoll_pwait(epfd={}, max={}, timeout={})\n", epfd, maxevents, timeout);
     if timeout != 0 {
         crate::threading::yield_now();
     }
-    0 // no events ready
+    0
 }
 
-fn sys_timerfd_create(_clockid: i32, _flags: i32) -> u64 {
+fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
+    let timer_id = TIMERFD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(proc) = crate::process::current_process() {
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::TimerFd);
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-            crate::safe_print!(64, "[syscall] timerfd_create() = fd {}\n", fd);
-        }
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::TimerFd(timer_id));
+        crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
         fd as u64
     } else {
         EBADF
     }
 }
 
-fn sys_timerfd_settime(_fd: u32, _flags: i32, new_value: usize, old_value: usize) -> u64 {
+fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> u64 {
+    let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(fd_num)) {
+        Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let mut table = TIMERFD_TABLE.lock();
+
     if old_value != 0 && validate_user_ptr(old_value as u64, 32) {
-        unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
+        if let Some(state) = table.get(&timer_id) {
+            let now = crate::timer::uptime_us();
+            let elapsed = now.saturating_sub(state.armed_at_us);
+            let remaining = state.initial_us.saturating_sub(elapsed);
+            us_to_timespec(remaining, old_value);
+            us_to_timespec(state.interval_us, old_value + 16);
+        } else {
+            unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
+        }
     }
-    let _ = new_value;
+
+    if !validate_user_ptr(new_value as u64, 32) { return EFAULT; }
+
+    let initial_us = timespec_to_us(new_value + 16);
+    let interval_us = timespec_to_us(new_value);
+
+    const TFD_TIMER_ABSTIME: i32 = 1;
+    let now = crate::timer::uptime_us();
+    let effective_initial = if flags & TFD_TIMER_ABSTIME != 0 {
+        initial_us.saturating_sub(now)
+    } else {
+        initial_us
+    };
+
+    crate::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
+        timer_id, effective_initial, interval_us);
+
+    if initial_us == 0 && interval_us == 0 {
+        table.remove(&timer_id);
+    } else {
+        table.insert(timer_id, TimerFdState {
+            armed_at_us: now,
+            initial_us: effective_initial,
+            interval_us,
+            expirations_consumed: 0,
+        });
+    }
+
     0
+}
+
+fn timerfd_read(timer_id: u32) -> u64 {
+    let now = crate::timer::uptime_us();
+    let mut table = TIMERFD_TABLE.lock();
+    let state = match table.get_mut(&timer_id) {
+        Some(s) => s,
+        None => return EAGAIN,
+    };
+
+    if state.initial_us == 0 { return EAGAIN; }
+
+    let elapsed = now.saturating_sub(state.armed_at_us);
+    if elapsed < state.initial_us { return EAGAIN; }
+
+    let total_expirations = if state.interval_us > 0 {
+        1 + (elapsed - state.initial_us) / state.interval_us
+    } else {
+        1
+    };
+
+    let new_expirations = total_expirations.saturating_sub(state.expirations_consumed);
+    if new_expirations == 0 { return EAGAIN; }
+
+    state.expirations_consumed = total_expirations;
+    new_expirations
 }
 
 /// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)

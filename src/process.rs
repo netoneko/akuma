@@ -408,7 +408,7 @@ pub enum FileDescriptor {
     /// /dev/urandom — reads return random bytes
     DevUrandom,
     /// timerfd — reads return 8-byte expiration count
-    TimerFd,
+    TimerFd(u32),
     /// epoll instance
     EpollFd,
 }

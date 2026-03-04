@@ -29,16 +29,26 @@ first to avoid busy-spinning.
 
 ### `timerfd_create` (NR 85)
 
-Creates a virtual `TimerFd` file descriptor. No timer is actually armed.
+Creates a `TimerFd(id)` file descriptor backed by a global `TIMERFD_TABLE`.
+Each timer gets a unique ID.
 
 ### `timerfd_settime` (NR 86)
 
-No-op stub. If `old_value` is non-NULL, zeroes the output `itimerspec`.
-Returns 0.
+Now functional. Stores the initial expiration and interval in
+`TIMERFD_TABLE`. Supports `TFD_TIMER_ABSTIME`. If `old_value` is non-NULL,
+writes the previous timer's remaining time. Disarms the timer if both
+`it_value` and `it_interval` are zero.
 
 ### `timerfd_gettime` (NR 87)
 
-Zeroes the output `itimerspec` (indicating no armed timer). Returns 0.
+Returns the remaining time until next expiration and the interval from
+`TIMERFD_TABLE`. Returns zeroes if the timer is disarmed.
+
+### `timerfd read()` (via `sys_read`)
+
+Calculates the number of expirations since the timer was armed. Returns an
+8-byte `uint64_t` expiration count. Returns `EAGAIN` if the timer has not
+yet fired (non-blocking behavior).
 
 ### `eventfd2` (NR 19)
 
@@ -245,17 +255,96 @@ for child process status collection.
 
 ---
 
+## `bun run` Crash Analysis (March 2026)
+
+### Observed behavior
+
+`bun --version` completes successfully (exit 0). `bun run <script>` crashes
+with SIGSEGV (-11) during JS engine initialization. The crash occurs after
+bun's event loop setup (epoll, timerfd, eventfd created) and after it spawns
+worker threads via clone.
+
+### Startup syscall sequence (from instrumented run)
+
+```
+rt_sigaction × 10   (SIGPIPE, SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGXFSZ, SIGTERM, SIGINT, SIGUSR1)
+close_range(4, UINT32_MAX, CLOSE_RANGE_CLOEXEC)
+clone pid 17→18     (child exits 0 — likely a pre-fork helper)
+clone pid 17→19     (child exits 0)
+epoll_create1()     → fd 13
+timerfd_create × 3  → fd 14, 16, 17
+timerfd_settime(id=3, 1s initial, 1s interval)
+epoll_ctl(ADD fd 15 eventfd, ADD fd 17 timerfd)
+munmap 0xbd0ae000 + 1.07GB   (mimalloc arena trim)
+munmap 0x200000000 + 3.0GB   (mimalloc arena trim)
+clone pid 17→20     (worker thread)
+CRASH: FAR=0x2346b2ad68  ELR=0x4416d74  ISS=0x45
+```
+
+### Crash details
+
+The faulting address `0x2346b2ad68` falls inside a region that was
+munmapped during mimalloc's arena trimming (`munmap 0x200000000+3GB`).
+The address is between the munmapped region and the remaining lazy region
+at `0x2bd0ae000`. This suggests either:
+
+1. The partial munmap implementation has a bug for these giant regions,
+   leaving stale page table entries or failing to properly split lazy regions
+2. A pointer calculated before the munmap points into the now-unmapped
+   trimmed portion
+
+Previous runs showed a different crash at `FAR=0x5` (near-null
+dereference). The instability suggests the root cause may be
+nondeterministic — timing-dependent or address-layout-dependent.
+
+### Options for moving forward
+
+**Option A — Investigate munmap for giant regions (most likely culprit).**
+The crash address falls squarely in a munmapped region. The partial munmap
+implementation (`munmap_lazy_region` in `process.rs`) handles prefix,
+suffix, and middle-split cases but may have an edge case with multi-GB
+regions or regions that span multiple lazy entries. If the lazy region
+table isn't properly updated, a subsequent page fault in the trimmed
+area won't find a backing region and will SIGSEGV.
+
+**Option B — Implement `close_range` with `CLOSE_RANGE_CLOEXEC`.**
+Bun calls `close_range(4, UINT32_MAX, 4)` where flag 4 =
+`CLOSE_RANGE_CLOEXEC`. The stub returns success without marking any fds.
+After clone, child processes may inherit fds they shouldn't. Low risk for
+this specific crash but could cause subtle issues.
+
+**Option C — Make epoll aware of timerfd expirations.**
+Bun adds a 1-second timerfd to epoll and expects `epoll_pwait` to return
+an event when it fires. Our stub always returns 0 events. If bun's event
+loop logic makes decisions based on timer events (e.g., triggering GC or
+initialization phases), the missing events could leave data structures
+uninitialized.
+
+**Option D — Add a syscall ring buffer for crash forensics.**
+Log the last N syscalls (number, args, return value) in a fixed-size ring
+buffer. On SIGSEGV, dump the buffer. This gives the exact sequence leading
+to the crash without the cost of logging every syscall to serial.
+
+### Recommendation
+
+Start with **Option A**. The crash address is in a munmapped region,
+which is the strongest signal. Verify that `sys_munmap` correctly handles
+partial unmaps of regions larger than 4GB and that the lazy region table
+is consistent after the trim. If munmap is correct, proceed to **Option D**
+to capture the exact syscall that produces the bad pointer.
+
+---
+
 ## Implementation Status
 
-Most of the event loop syscalls (epoll, timerfd) are stubs that return success
-without doing real work. This allows bun to complete its initialization
-sequence, but the event loop is non-functional — bun cannot actually serve
-requests or run timers.
+timerfd is now functional (timer state tracking, expiration counting,
+read support). epoll and signal handling remain stubs.
 
-**To make bun fully functional, these need real implementations:**
+**To make bun fully functional, these still need real implementations:**
 
 1. **epoll** — Real I/O multiplexing over socket/pipe/timerfd descriptors
-2. **timerfd** — Timer expiration with epoll integration
+2. **epoll + timerfd integration** — epoll_pwait should return events when timerfds expire
 3. **eventfd** — Already functional (atomic counter with blocking read)
 4. **clone/futex** — Thread creation and synchronization (partially implemented)
 5. **signal handling** — `rt_sigaction`, `rt_sigprocmask` with proper delivery
+6. **close_range** — Proper implementation with `CLOSE_RANGE_CLOEXEC` flag support
