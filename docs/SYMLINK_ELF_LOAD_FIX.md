@@ -61,6 +61,93 @@ All other spawn functions (`spawn_process`, `spawn_process_with_channel`,
 `spawn_process_with_channel_cwd`) delegate to `spawn_process_with_channel_ext`,
 so the fix covers every kernel-side spawn call site.
 
+---
+
+# Busybox --install "Operation not permitted"
+
+## Problem
+
+`busybox --install` reported "Operation not permitted" for every symlink it
+tried to create:
+
+```
+busybox: /usr/bin/cpio: Operation not permitted
+busybox: /bin/date: Operation not permitted
+```
+
+## Root Cause
+
+`sys_symlinkat` in `src/syscall.rs` returned `!0u64` (= `-1` = `-EPERM`) for
+**all** errors from `create_symlink`, regardless of the actual failure reason:
+
+```rust
+Err(_) => !0u64,
+```
+
+The real errors were most likely `FsError::NotFound` (parent directory like
+`/usr/bin` or `/usr/sbin` does not exist) or `FsError::AlreadyExists` (symlink
+was already created on a previous boot), but userspace always saw EPERM
+because the errno was hardcoded.
+
+## Fix
+
+Replaced the blanket `!0u64` with the existing `fs_error_to_errno` helper,
+which maps each `FsError` variant to the correct Linux errno:
+
+```rust
+Err(e) => fs_error_to_errno(e),
+```
+
+Now busybox will see the real error (`ENOENT` for missing directories,
+`EEXIST` for duplicate symlinks, etc.) and can react accordingly.
+
+---
+
+# Ext2 Corruption on Repeated busybox --install
+
+## Problem
+
+Running `busybox --install` a second time corrupts the ext2 filesystem,
+destroying files like `/etc/sshd/authorized_keys` and making SSH auth
+impossible. The disk becomes unusable and must be recreated.
+
+`busybox --install` creates hundreds of symlinks across `/bin`, `/sbin`,
+`/usr/bin`, and `/usr/sbin`. On the second invocation most of these paths
+already exist, and the resulting error-handling paths likely trigger
+corruption in the ext2 metadata.
+
+## Possible Causes
+
+1. **Inode allocation leak on partial failure.** `create_symlink_internal`
+   allocates an inode before writing the directory entry. If the directory
+   write fails (e.g. out of space in the directory block), the inode is
+   consumed but never referenced, corrupting the free-inode count and
+   potentially the block group descriptor.
+
+2. **Unlink path corrupts metadata.** When busybox receives `EEXIST` it may
+   attempt to `unlink` the existing symlink before recreating it. The ext2
+   `delete` implementation must update the directory entry chain, decrement
+   `hard_links`, free the inode, and for slow symlinks free the data block.
+   A bug in any of those steps (e.g. writing a stale inode back, double-free
+   of a block, or incorrect bitmap update) would corrupt the filesystem.
+
+3. **Block group descriptor drift.** The superblock and block group
+   descriptors track free inode/block counts. If these aren't updated
+   atomically with the bitmap changes, bulk operations (hundreds of symlink
+   creates/deletes) can cause the counts to drift, leading to double
+   allocation of inodes or blocks.
+
+## Status
+
+Not yet investigated in detail. Workaround: only run `busybox --install`
+once on a fresh disk. If the disk is corrupted, recreate it with
+`scripts/create_disk.sh` and `scripts/populate_disk.sh`.
+
+---
+
 ## Files Changed
 
-- `src/process.rs` — `spawn_process_with_channel_ext`
+- `src/process.rs` — `spawn_process_with_channel_ext`: resolve symlinks
+  before ELF load
+- `src/syscall.rs` — `sys_symlinkat`: return proper errno instead of
+  hardcoded EPERM

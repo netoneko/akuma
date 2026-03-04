@@ -17,15 +17,17 @@ Linux. This avoids the entire cross-compilation dependency chain.
 
 1. Downloads `apk-tools-static-3.0.5-r0.apk` from Alpine CDN (cached in `vendor/`)
 2. Downloads `alpine-keys-2.6-r0.apk` (signing keys for package verification)
-3. Extracts `sbin/apk.static`, renames to `bin/apk`
-4. Extracts signing keys from `etc/apk/keys/` and `usr/share/apk/keys/`
-5. Creates `dist/apk-tools.tar` containing `bin/`, `etc/`, `usr/`
-6. Copies the archive to `bootstrap/archives/apk-tools.tar`
-7. Copies `apk` binary directly to `bootstrap/bin/apk`
-8. Creates APK config in `bootstrap/`:
-   - `etc/apk/repositories` — Alpine main + community repos
+3. Downloads Mozilla CA certificate bundle from `curl.se/ca/cacert.pem` (for HTTPS)
+4. Extracts `sbin/apk.static`, renames to `bin/apk`
+5. Extracts signing keys from `etc/apk/keys/` and `usr/share/apk/keys/`
+6. Creates `dist/apk-tools.tar` containing `bin/`, `etc/`, `usr/`
+7. Copies the archive to `bootstrap/archives/apk-tools.tar`
+8. Copies `apk` binary directly to `bootstrap/bin/apk`
+9. Creates APK config in `bootstrap/`:
+   - `etc/apk/repositories` — Alpine main + community repos (HTTPS)
    - `etc/apk/arch` — `aarch64`
    - `etc/apk/keys/` — Alpine signing keys
+   - `etc/ssl/certs/ca-certificates.crt` — Mozilla CA bundle for TLS
    - `var/cache/apk/` — package download cache (empty)
    - `lib/apk/db/` — package database (empty)
 
@@ -62,12 +64,15 @@ After build, the following APK-related paths exist in `bootstrap/`:
 ```
 bootstrap/
 ├── bin/apk                          # the apk binary
-├── etc/apk/
-│   ├── arch                         # "aarch64"
-│   ├── keys/                        # Alpine signing keys
-│   │   ├── alpine-devel@...58199dcc.rsa.pub
-│   │   └── alpine-devel@...616ae350.rsa.pub
-│   └── repositories                 # repo URLs
+├── etc/
+│   ├── apk/
+│   │   ├── arch                     # "aarch64"
+│   │   ├── keys/                    # Alpine signing keys
+│   │   │   ├── alpine-devel@...58199dcc.rsa.pub
+│   │   │   └── alpine-devel@...616ae350.rsa.pub
+│   │   └── repositories             # repo URLs (HTTPS)
+│   └── ssl/certs/
+│       └── ca-certificates.crt      # Mozilla CA bundle
 ├── lib/apk/db/                      # package database (empty)
 ├── var/cache/apk/                   # download cache (empty)
 └── archives/apk-tools.tar           # installable archive
@@ -76,11 +81,15 @@ bootstrap/
 ## Repository Configuration
 
 ```
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/community
 ```
 
 Architecture: `aarch64` (Alpine's native aarch64 musl repo).
+
+**Note:** Alpine's CDN switched to HTTPS-only in early 2026 — plain HTTP
+returns 403 Forbidden. The `ca-certificates.crt` bundle is required on
+the disk image for `apk` to verify TLS connections.
 
 ## Potential Syscall Requirements
 

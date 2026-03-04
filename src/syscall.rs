@@ -2917,7 +2917,7 @@ fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
     }
     match crate::vfs::create_symlink(&link_path, &target) {
         Ok(_) => 0,
-        Err(_) => !0u64,
+        Err(e) => fs_error_to_errno(e),
     }
 }
 
