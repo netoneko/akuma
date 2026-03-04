@@ -473,6 +473,7 @@ impl UserAddressSpace {
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
+        let _irq_guard = crate::irq::IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -497,6 +498,7 @@ impl UserAddressSpace {
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+        let _irq_guard = crate::irq::IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -577,6 +579,11 @@ pub mod user_flags {
 }
 
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
+    // Disable IRQs for the entire page table walk+write to prevent preemption
+    // races. Without this, a timer IRQ mid-walk can context-switch to another
+    // thread that creates a competing page table entry (see Bug 7 in docs).
+    // The CAS in get_or_create_table_atomic is defense-in-depth for multi-core.
+    let _irq_guard = crate::irq::IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
     core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
@@ -586,43 +593,71 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
     let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
-    let (l1_addr, l1_frame) = get_or_create_table_raw(l0_ptr, l0_idx);
+    let (l1_addr, l1_frame) = get_or_create_table_atomic(l0_ptr, l0_idx);
     if let Some(frame) = l1_frame { allocated_tables.push(frame); }
     let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
-    let (l2_addr, l2_frame) = get_or_create_table_raw(l1_ptr, l1_idx);
+    let (l2_addr, l2_frame) = get_or_create_table_atomic(l1_ptr, l1_idx);
     if let Some(frame) = l2_frame { allocated_tables.push(frame); }
     let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
-    let (l3_addr, l3_frame) = get_or_create_table_raw(l2_ptr, l2_idx);
+    let (l3_addr, l3_frame) = get_or_create_table_atomic(l2_ptr, l2_idx);
     if let Some(frame) = l3_frame { allocated_tables.push(frame); }
     let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
-    let existing = l3_ptr.add(l3_idx).read_volatile();
+    let pte_atomic = &*((l3_ptr.add(l3_idx)) as *const core::sync::atomic::AtomicU64);
+    let existing = pte_atomic.load(core::sync::atomic::Ordering::Acquire);
     if existing & flags::VALID != 0 {
         return allocated_tables;
     }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
-    l3_ptr.add(l3_idx).write_volatile(entry);
+    let _ = pte_atomic.compare_exchange(existing, entry,
+        core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
     allocated_tables
 }}
 
-unsafe fn get_or_create_table_raw(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
-    let entry = table_ptr.add(idx).read_volatile();
-    if entry & flags::VALID != 0 {
-        if entry & flags::TABLE == 0 {
-            // BLOCK descriptor — replace with a table so we can map individual pages
-            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-                let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
-                table_ptr.add(idx).write_volatile(new_entry);
-                return (frame.addr, Some(frame));
+/// Atomically get or create a page table at `table_ptr[idx]`.
+///
+/// Uses compare_exchange to prevent the race where two concurrent paths
+/// (e.g. mmap syscall preempted by a demand-paging fault handler) both
+/// see the entry as invalid, both allocate a new table, and the second
+/// write overwrites the first — orphaning all PTEs in the lost table.
+unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let atomic = &*((table_ptr.add(idx)) as *const AtomicU64);
+
+    loop {
+        let entry = atomic.load(Ordering::Acquire);
+
+        if entry & flags::VALID != 0 {
+            if entry & flags::TABLE == 0 {
+                // BLOCK descriptor — replace with a table so we can map individual pages
+                if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                    let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+                    match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => return (frame.addr, Some(frame)),
+                        Err(_) => {
+                            crate::pmm::free_page(frame);
+                            continue;
+                        }
+                    }
+                }
+                return (0, None);
             }
+            return ((entry & 0x0000_FFFF_FFFF_F000) as usize, None);
+        }
+
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+            match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return (frame.addr, Some(frame)),
+                Err(_) => {
+                    crate::pmm::free_page(frame);
+                    continue;
+                }
+            }
+        } else {
             return (0, None);
         }
-        ((entry & 0x0000_FFFF_FFFF_F000) as usize, None)
-    } else if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-        let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
-        table_ptr.add(idx).write_volatile(new_entry);
-        (frame.addr, Some(frame))
-    } else { (0, None) }
+    }
 }}
 
 pub fn protect_kernel_code() {

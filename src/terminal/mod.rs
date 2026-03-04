@@ -1,5 +1,5 @@
 use alloc::collections::VecDeque;
-use crate::std_compat::sync::Mutex;
+use spinning_top::Spinlock;
 use alloc::sync::Arc;
 use core::task::Waker;
 
@@ -67,9 +67,9 @@ pub struct TerminalState {
     /// Is the cursor hidden?
     pub cursor_hidden: bool,
     /// Input buffer for events (e.g., key presses)
-    pub input_buffer: Mutex<VecDeque<u8>>,
+    pub input_buffer: Spinlock<VecDeque<u8>>,
     /// Waker for tasks waiting on input
-    pub input_waker: Mutex<Option<core::task::Waker>>,
+    pub input_waker: Spinlock<Option<core::task::Waker>>,
 
     /// Canonical mode line buffer (current line being edited)
     pub canon_buffer: alloc::vec::Vec<u8>,
@@ -106,8 +106,8 @@ impl Default for TerminalState {
             cursor_col: 0,
             cursor_row: 0,
             cursor_hidden: false,
-            input_buffer: Mutex::new(VecDeque::new()),
-            input_waker: Mutex::new(None),
+            input_buffer: Spinlock::new(VecDeque::new()),
+            input_waker: Spinlock::new(None),
             canon_buffer: alloc::vec::Vec::new(),
             canon_ready: VecDeque::new(),
             saved_iflag: None,

@@ -495,7 +495,7 @@ pub struct LazyRegion {
 /// Global lazy region table, keyed by PID.
 /// Stored separately from Process to avoid aliasing/corruption issues
 /// with &mut Process references from current_process().
-static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<LazyRegion>>> =
+pub static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<LazyRegion>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
 /// Register a process in the table (takes ownership)

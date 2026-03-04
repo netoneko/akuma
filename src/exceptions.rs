@@ -1226,8 +1226,29 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
                     }
                 } else {
+                    // Fallback: check eager mmap regions — the PTE may have been lost
+                    let page_va = far_usize & !0xFFF;
+                    let mut recovered = false;
+                    if let Some(proc) = crate::process::current_process() {
+                        for (start, frames) in &proc.mmap_regions {
+                            let region_end = *start + frames.len() * 4096;
+                            if page_va >= *start && page_va < region_end {
+                                let page_idx = (page_va - *start) / 4096;
+                                let phys = frames[page_idx];
+                                crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
+                                    pid, page_va, phys.addr);
+                                unsafe {
+                                    crate::mmu::map_user_page(page_va, phys.addr, crate::mmu::user_flags::RW_NO_EXEC);
+                                }
+                                recovered = true;
+                                break;
+                            }
+                        }
+                    }
+                    if recovered {
+                        return unsafe { (*frame).x0 };
+                    }
                     crate::process::lazy_region_debug(far_usize);
-                    let pid = crate::process::read_current_pid().unwrap_or(0);
                     crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }
             }

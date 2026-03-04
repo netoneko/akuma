@@ -418,3 +418,112 @@ This handles both anonymous (zero-fill) and file-backed lazy regions,
 reusing the same demand paging logic as the exception handler. If a page
 is neither mapped nor in a lazy region, validation still fails with
 `EFAULT`.
+
+### Bug 5: `sys_munmap` Blindly Unmapped Eagerly-Mapped Pages
+
+**File:** `src/syscall.rs`
+
+V8/Node.js allocates memory via `mmap` and later calls `munmap` on
+sub-ranges within those allocations (e.g., to punch holes or trim
+regions). The kernel tracked eager mmap regions by their start address,
+so `sys_munmap` only matched exact start addresses. When V8 unmapped a
+sub-range (e.g., `munmap(0x680c0000, 0x1000)` within an allocation
+starting at `0x6809d000`), no eager region matched.
+
+The code had two paths that blindly unmapped pages without checking
+whether they belonged to tracked eager allocations:
+
+1. **"Gaps" cleanup** — after processing lazy region unmaps, a second
+   loop called `unmap_page` for ALL pages in the munmap range, including
+   pages from adjacent eager allocations.
+
+2. **"Partial unmap" fallback** — when neither eager (by start address)
+   nor lazy regions matched, the code still unmapped the requested pages.
+
+Both paths could destroy PTEs for pages that were part of eagerly-mapped
+regions. V8 would then access a page it believed was mapped, trigger a
+translation fault, and crash with SIGSEGV.
+
+**Fix:** Removed both blind-unmap paths. When no tracked region matches,
+`sys_munmap` returns 0 (success) without touching the page table — matching
+Linux behavior where `munmap` on a range not backed by any VMA is a no-op.
+
+### Bug 6: Exception Handler Had No Fallback for Eager Mmap Regions
+
+**File:** `src/exceptions.rs`
+
+When a translation fault occurs from EL0, the demand paging handler only
+checked lazy regions. If a page was part of an eager mmap allocation but
+its PTE was missing (due to any cause — race condition, table corruption,
+or the munmap bug above), the handler had no way to recover. It logged
+"no lazy region" and killed the process with SIGSEGV.
+
+On real Linux, the kernel maintains a unified VMA (Virtual Memory Area)
+list that covers both lazily and eagerly mapped regions. A page fault on
+any valid VMA can be resolved. Our kernel lacked this for eager regions.
+
+**Fix:** Added an eager mmap region fallback in the translation fault
+handler. After the lazy region check fails, the handler iterates
+`mmap_regions` to find if the faulting address is within a tracked eager
+allocation. If found, it re-establishes the PTE using the original
+physical frame (already allocated and tracked). A diagnostic log line
+`[DP-eager]` is emitted when this path fires, providing visibility into
+any underlying PTE-loss issues.
+
+### Bug 7: Non-Atomic Page Table Entry Creation (Race Condition)
+
+**File:** `src/mmu.rs`
+
+The helper `get_or_create_table_raw` used a non-atomic read-check-write
+sequence to create intermediate page table entries (L1→L2→L3 tables).
+The syscall exception handler explicitly unmasks IRQs during syscall
+handling (`msr daifclr, #2` in `sync_el0_handler`) to allow preemptive
+scheduling. This made the following race possible:
+
+1. Thread A (mmap syscall): reads L2[idx] → invalid
+2. Thread A calls `alloc_page_zeroed()` (acquires PMM lock, zeros 4KB)
+3. **Timer IRQ fires** — scheduler preempts Thread A
+4. Thread B (same process, shared address space): page fault in same
+   2MB range → exception handler calls `map_user_page`
+5. Thread B reads L2[idx] → **still invalid** (Thread A hasn't written)
+6. Thread B allocates L3_B, writes it to L2[idx], maps its PTE
+7. Thread A resumes, allocates L3_A, **overwrites** L2[idx]
+8. L3_B and all its PTEs are orphaned — those pages are now unmapped
+
+This deterministically caused the `FAR=0x680c0000` crash: the 127-page
+eager mmap at `0x6809d000` and a concurrent demand-paging fault competed
+for the same L2 entry, and the loser's L3 table was silently destroyed.
+
+**Fix (two layers):**
+
+1. **IRQ guard:** `map_user_page`, `unmap_page`, and `update_page_flags`
+   now wrap their page table walks in `IrqGuard` (RAII, saves/restores
+   DAIF). This prevents preemption during the critical section. On a
+   single-core system this eliminates the race entirely. Per-page IRQ-
+   disabled time is ~1–5μs vs the 10ms timer — negligible latency impact.
+
+2. **Atomic CAS (defense-in-depth):** `get_or_create_table_raw` was
+   renamed to `get_or_create_table_atomic` and now uses
+   `AtomicU64::compare_exchange` for the entry write. If two paths race
+   (on a future multi-core configuration), the CAS loser frees its
+   redundant allocation and retries using the winner's table. The leaf
+   PTE write in `map_user_page` also uses CAS. This is the standard
+   lockless page table insertion pattern used by Linux (`cmpxchg`).
+
+### Kernel Tests
+
+**File:** `src/tests.rs`
+
+Added 10 mmap subsystem tests to `run_memory_tests()` to catch
+regressions in the exact scenarios that caused the Node.js crashes:
+
+- `alloc_mmap_non_overlapping` — multiple allocations return disjoint VA ranges
+- `alloc_mmap_free_region_recycling` — freed VA ranges are reused; split remainders available
+- `lazy_region_push_lookup` — region found inside, not found outside
+- `lazy_region_munmap_full` — full removal leaves zero regions
+- `lazy_region_munmap_prefix` — prefix trim adjusts start and size
+- `lazy_region_munmap_suffix` — suffix trim adjusts size only
+- `lazy_region_munmap_middle` — middle punch splits into two regions
+- `lazy_region_munmap_multi` — range spanning two regions trims both
+- `map_user_page_roundtrip` — map → is_mapped=true → clear PTE → is_mapped=false
+- `eager_mmap_subrange_munmap` — sub-range munmap doesn't match any tracked region
