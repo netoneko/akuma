@@ -509,7 +509,7 @@ pub fn register_process(pid: Pid, proc: Box<Process>) {
 ///
 /// Returns the owned Process so it can be dropped, freeing all memory
 /// including the UserAddressSpace and all its physical pages.
-fn unregister_process(pid: Pid) -> Option<Box<Process>> {
+pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_TABLE.lock().remove(&pid)
     })

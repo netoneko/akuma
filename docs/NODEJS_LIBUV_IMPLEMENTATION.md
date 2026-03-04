@@ -510,11 +510,51 @@ for the same L2 entry, and the loser's L3 table was silently destroyed.
    PTE write in `map_user_page` also uses CAS. This is the standard
    lockless page table insertion pattern used by Linux (`cmpxchg`).
 
+### Bug 8: Exception Handler Used Wrong Process for CLONE_VM Threads
+
+**Crash:** `FAR=0x680c0000`, `ISS=0x47` (translation fault level 3) — same
+address and symptom as Bug 7, but persisted after the atomic CAS / IRQ guard
+fix.
+
+**Root cause:** The exception handler used `current_process()` to look up
+`mmap_regions` for the eager-mmap fallback recovery, and to track demand-paged
+frames via `address_space.track_user_frame()`.
+
+`current_process()` first checks `THREAD_PID_MAP` using the current kernel
+thread ID.  For `CLONE_VM` worker threads (PIDs 16–20), this returns the
+*worker's* `Process` struct — **not** the address-space owner (PID 15).
+
+All `mmap` syscalls were issued on PID 15's thread, so `mmap_regions` entries
+(including the 127-page eager mmap at `0x6809d000`) were stored on PID 15's
+`Process`.  When a worker thread faulted at `0x680c0000`:
+
+1. `read_current_pid()` correctly returned PID 15 (reads the process info page,
+   which stores the address-space owner for `CLONE_VM`)
+2. Lazy region lookup correctly used PID 15 → no match (address is in eager
+   mmap, not lazy)
+3. Eager mmap fallback called `current_process()` → returned PID 16's Process
+4. PID 16's `mmap_regions` was empty → recovery failed → SIGSEGV
+
+The same bug caused a secondary issue: demand-paged frames tracked on worker
+`AddressSpace` structs (where `shared = true`) were never freed on process exit,
+leaking physical pages.
+
+**Fix:** Replaced all `current_process()` calls in both the data-abort and
+instruction-abort handlers with `lookup_process(pid)`, where `pid` comes from
+`read_current_pid()` (the address-space owner).  This affects:
+
+- Eager mmap fallback (the crash fix)
+- Permission fault handlers (`update_page_flags`)
+- Frame tracking after demand paging (`track_user_frame`, `track_page_table_frame`)
+
+**File:** `src/exceptions.rs` — 6 call sites changed from `current_process()`
+to `lookup_process(pid)`.
+
 ### Kernel Tests
 
 **File:** `src/tests.rs`
 
-Added 10 mmap subsystem tests to `run_memory_tests()` to catch
+Added 12 mmap subsystem tests to `run_memory_tests()` to catch
 regressions in the exact scenarios that caused the Node.js crashes:
 
 - `alloc_mmap_non_overlapping` — multiple allocations return disjoint VA ranges
@@ -527,3 +567,5 @@ regressions in the exact scenarios that caused the Node.js crashes:
 - `lazy_region_munmap_multi` — range spanning two regions trims both
 - `map_user_page_roundtrip` — map → is_mapped=true → clear PTE → is_mapped=false
 - `eager_mmap_subrange_munmap` — sub-range munmap doesn't match any tracked region
+- `clone_vm_mmap_regions_on_owner` — CLONE_VM child has empty `mmap_regions`; parent has the entries
+- `clone_vm_eager_fallback_finds_region` — fault-handler recovery finds region via owner PID, not via worker PID

@@ -85,6 +85,8 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_lazy_region_munmap_multi, "lazy_region_munmap_multi");
     run_test!(test_map_user_page_roundtrip, "map_user_page_roundtrip");
     run_test!(test_eager_mmap_pages_survive_subrange_munmap, "eager_mmap_subrange_munmap");
+    run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
+    run_test!(test_clone_vm_eager_fallback_finds_region, "clone_vm_eager_fallback_finds_region");
 
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
@@ -3219,6 +3221,201 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     if !pass {
         crate::safe_print!(128, "  exact={:?} lazy={} frames_intact={}\n",
             exact, lazy_results.len(), frames_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Helper: create a minimal test Process and box it for PROCESS_TABLE registration.
+fn make_test_process(
+    pid: u32,
+    ppid: u32,
+    addr_space: crate::mmu::UserAddressSpace,
+    info_phys: usize,
+) -> alloc::boxed::Box<crate::process::Process> {
+    use spinning_top::Spinlock;
+    let mem = crate::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+    alloc::boxed::Box::new(crate::process::Process {
+        pid, pgid: pid, name: String::from("test"),
+        state: crate::process::ProcessState::Ready,
+        address_space: addr_space,
+        context: crate::process::UserContext::new(0, 0),
+        parent_pid: ppid, brk: 0x1000_0000, initial_brk: 0x1000_0000,
+        entry_point: 0, memory: mem, process_info_phys: info_phys,
+        args: Vec::new(), cwd: String::from("/"),
+        stdin: Spinlock::new(crate::process::StdioBuffer::new()),
+        stdout: Spinlock::new(crate::process::StdioBuffer::new()),
+        exited: false, exit_code: 0,
+        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(),
+        fd_table: Spinlock::new(alloc::collections::BTreeMap::new()),
+        cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+        nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+        next_fd: core::sync::atomic::AtomicU32::new(3),
+        thread_id: None, spawner_pid: None,
+        terminal_state: alloc::sync::Arc::new(Spinlock::new(
+            crate::terminal::TerminalState::default(),
+        )),
+        box_id: 0, root_dir: String::from("/"),
+        channel: None, delegate_pid: None, clear_child_tid: 0,
+        signal_actions: [crate::process::SignalAction::default(); crate::process::MAX_SIGNALS],
+        start_time_us: 0,
+    })
+}
+
+/// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.
+///
+/// Registers a parent and a CLONE_VM child in PROCESS_TABLE. Adds mmap_regions
+/// to the parent. Verifies lookup_process(parent) sees the regions while
+/// lookup_process(child) sees none.
+fn test_clone_vm_mmap_regions_on_owner() -> bool {
+    console::print("\n[TEST] CLONE_VM: mmap_regions only on address-space owner\n");
+
+    let parent_pid = crate::process::allocate_pid();
+    let child_pid = crate::process::allocate_pid();
+
+    let parent_as = match crate::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (parent AS)\n"); return false; }
+    };
+    let l0 = parent_as.l0_phys();
+    let child_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+        Some(a) => a,
+        None => { console::print("  OOM (child AS)\n"); return false; }
+    };
+    let info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let mut parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
+
+    // Simulate an eager mmap on the parent
+    let test_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    parent_proc.mmap_regions.push((0x6809_d000, vec![test_frame]));
+
+    let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
+
+    crate::process::register_process(parent_pid, parent_proc);
+    crate::process::register_process(child_pid, child_proc);
+
+    let parent_regions = crate::process::lookup_process(parent_pid)
+        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+    let child_regions = crate::process::lookup_process(child_pid)
+        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+
+    // Cleanup
+    let _ = crate::process::unregister_process(child_pid);
+    let mut pp = crate::process::unregister_process(parent_pid);
+    if let Some(ref mut p) = pp {
+        for (_, frames) in p.mmap_regions.drain(..) {
+            for f in frames { crate::pmm::free_page(f); }
+        }
+    }
+    drop(pp);
+    crate::pmm::free_page(info);
+
+    let pass = parent_regions == 1 && child_regions == 0;
+    if !pass {
+        crate::safe_print!(128, "  parent_regions={} child_regions={}\n",
+            parent_regions, child_regions);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 8: Eager mmap fallback must search owner's mmap_regions, not worker's.
+///
+/// Simulates the fault-handler recovery logic: given a fault VA inside an
+/// eager mmap tracked on the owner, verify that searching owner.mmap_regions
+/// finds it while searching worker.mmap_regions does not.
+fn test_clone_vm_eager_fallback_finds_region() -> bool {
+    console::print("\n[TEST] CLONE_VM: eager fallback lookup by owner PID\n");
+
+    let owner_pid = crate::process::allocate_pid();
+    let worker_pid = crate::process::allocate_pid();
+
+    let owner_as = match crate::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let l0 = owner_as.l0_phys();
+    let worker_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let mut owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
+    let worker_proc = make_test_process(worker_pid, owner_pid, worker_as, info.addr);
+
+    // 127-page eager mmap tracked on the owner
+    let region_base: usize = 0x6809_d000;
+    let pages = 127usize;
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM (frames)\n");
+                return false;
+            }
+        }
+    }
+    owner_proc.mmap_regions.push((region_base, frames));
+
+    crate::process::register_process(owner_pid, owner_proc);
+    crate::process::register_process(worker_pid, worker_proc);
+
+    // Fault at 0x680c0000 — page 35 inside the region
+    let fault_va: usize = 0x680c_0000;
+    let page_va = fault_va & !0xFFF;
+
+    // Search via owner PID (correct path after fix)
+    let found_via_owner = crate::process::lookup_process(owner_pid).and_then(|p| {
+        for (start, fr) in &p.mmap_regions {
+            let end = *start + fr.len() * 4096;
+            if page_va >= *start && page_va < end {
+                return Some((*start, fr.len()));
+            }
+        }
+        None
+    });
+
+    // Search via worker PID (broken path before fix)
+    let found_via_worker = crate::process::lookup_process(worker_pid).and_then(|p| {
+        for (start, fr) in &p.mmap_regions {
+            let end = *start + fr.len() * 4096;
+            if page_va >= *start && page_va < end {
+                return Some((*start, fr.len()));
+            }
+        }
+        None
+    });
+
+    // Cleanup
+    let _ = crate::process::unregister_process(worker_pid);
+    let mut op = crate::process::unregister_process(owner_pid);
+    if let Some(ref mut p) = op {
+        for (_, frs) in p.mmap_regions.drain(..) {
+            for f in frs { crate::pmm::free_page(f); }
+        }
+    }
+    drop(op);
+    crate::pmm::free_page(info);
+
+    let pass = found_via_owner == Some((region_base, pages)) && found_via_worker.is_none();
+    if !pass {
+        crate::safe_print!(128, "  owner={:?} worker={:?}\n", found_via_owner, found_via_worker);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

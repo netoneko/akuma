@@ -1128,8 +1128,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             if is_permission_fault {
                 if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    if let Some(proc) = crate::process::current_process() {
-                        let _ = proc.address_space.update_page_flags(page_va, crate::mmu::user_flags::RW_NO_EXEC);
+                    if let Some(owner) = crate::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RW_NO_EXEC);
                         return unsafe { (*frame).x0 };
                     }
                 }
@@ -1186,10 +1186,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 let table_frames = unsafe {
                                     crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(proc) = crate::process::current_process() {
-                                    proc.address_space.track_user_frame(pf);
+                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(pf);
                                     for tf in table_frames {
-                                        proc.address_space.track_page_table_frame(tf);
+                                        owner.address_space.track_page_table_frame(tf);
                                     }
                                 }
                                 any_mapped = true;
@@ -1216,20 +1216,25 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             let table_frames = unsafe {
                                 crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(proc) = crate::process::current_process() {
-                                proc.address_space.track_user_frame(page_frame);
+                            if let Some(owner) = crate::process::lookup_process(pid) {
+                                owner.address_space.track_user_frame(page_frame);
                                 for tf in table_frames {
-                                    proc.address_space.track_page_table_frame(tf);
+                                    owner.address_space.track_page_table_frame(tf);
                                 }
                             }
                             return unsafe { (*frame).x0 };
                         }
                     }
                 } else {
-                    // Fallback: check eager mmap regions — the PTE may have been lost
+                    // Fallback: check eager mmap regions — the PTE may have been lost.
+                    // Use lookup_process(pid) where pid = address-space owner (from
+                    // read_current_pid / process info page).  current_process() goes
+                    // through THREAD_PID_MAP and returns the *worker* thread's Process
+                    // for CLONE_VM threads — that Process has empty mmap_regions because
+                    // all mmaps were performed on the parent.
                     let page_va = far_usize & !0xFFF;
                     let mut recovered = false;
-                    if let Some(proc) = crate::process::current_process() {
+                    if let Some(proc) = crate::process::lookup_process(pid) {
                         for (start, frames) in &proc.mmap_regions {
                             let region_end = *start + frames.len() * 4096;
                             if page_va >= *start && page_va < region_end {
@@ -1279,8 +1284,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             if is_permission_fault {
                 if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    if let Some(proc) = crate::process::current_process() {
-                        let _ = proc.address_space.update_page_flags(page_va, crate::mmu::user_flags::RX);
+                    if let Some(owner) = crate::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RX);
                         return unsafe { (*frame).x0 };
                     }
                 }
@@ -1334,10 +1339,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 let table_frames = unsafe {
                                     crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(proc) = crate::process::current_process() {
-                                    proc.address_space.track_user_frame(pf);
+                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(pf);
                                     for tf in table_frames {
-                                        proc.address_space.track_page_table_frame(tf);
+                                        owner.address_space.track_page_table_frame(tf);
                                     }
                                 }
                                 any_mapped = true;
@@ -1362,10 +1367,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             let table_frames = unsafe {
                                 crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(proc) = crate::process::current_process() {
-                                proc.address_space.track_user_frame(page_frame);
+                            if let Some(owner) = crate::process::lookup_process(pid) {
+                                owner.address_space.track_user_frame(page_frame);
                                 for tf in table_frames {
-                                    proc.address_space.track_page_table_frame(tf);
+                                    owner.address_space.track_page_table_frame(tf);
                                 }
                             }
                             return unsafe { (*frame).x0 };
