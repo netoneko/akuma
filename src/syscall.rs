@@ -394,6 +394,7 @@ pub mod nr {
     pub const TIMERFD_CREATE: u64 = 85;  // Linux arm64 timerfd_create
     pub const TIMERFD_SETTIME: u64 = 86; // Linux arm64 timerfd_settime
     pub const TIMERFD_GETTIME: u64 = 87; // Linux arm64 timerfd_gettime
+    pub const CAPGET: u64 = 90;           // Linux arm64 capget
 }
 
 /// Thread CPU statistics for top command
@@ -922,6 +923,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::CLOSE_RANGE => {
             crate::safe_print!(96, "[stub] close_range(lo={}, hi={}, flags={})\n", args[0], args[1], args[2]);
+            0
+        }
+        nr::CAPGET => {
+            let data_ptr = args[1] as usize;
+            if data_ptr != 0 && validate_user_ptr(args[1], 24) {
+                unsafe { core::ptr::write_bytes(data_ptr as *mut u8, 0, 24); }
+            }
             0
         }
         nr::SYSINFO => sys_sysinfo(args[0] as usize),
@@ -3404,26 +3412,28 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
             return !0u64;
         }
     }
-    proc.mmap_regions.push((mmap_addr, frames));
-
-    if !is_file_backed && crate::config::SYSCALL_DEBUG_IO_ENABLED {
-        crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
-            proc.pid, len, prot, flags, mmap_addr);
-    }
-
     if is_file_backed {
         if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
-            let mut buf = alloc::vec![0u8; len];
-            if let Ok(n) = crate::fs::read_at(&path, offset, &mut buf) {
-                let copy_len = n.min(len);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
+            let mut file_off = offset;
+            let mut bytes_read = 0usize;
+            for i in 0..pages {
+                let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
+                if chunk == 0 { break; }
+                let page_kva = crate::mmu::phys_to_virt(frames[i].addr);
+                let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
+                match crate::fs::read_at(&path, file_off, page_buf) {
+                    Ok(n) => {
+                        bytes_read += n;
+                        file_off += n;
+                        if n < chunk { break; }
+                    }
+                    Err(_) => break,
                 }
-                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                    crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
-                        proc.pid, fd, &path, offset, len, mmap_addr, copy_len);
-                }
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
+                    proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
         if page_flags != initial_flags {
@@ -3431,7 +3441,12 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
                 let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
             }
         }
+    } else if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+            proc.pid, len, prot, flags, mmap_addr);
     }
+
+    proc.mmap_regions.push((mmap_addr, frames));
 
     mmap_addr as u64
 }

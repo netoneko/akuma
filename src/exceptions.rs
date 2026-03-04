@@ -1134,38 +1134,24 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
-                        let data_va_start = core::cmp::max(page_va, segment_va);
-                        let data_va_end = core::cmp::min(ra_end, segment_va + filesz);
-
-                        let mut big_buf = alloc::vec::Vec::new();
-                        if data_va_start < data_va_end {
-                            let data_file_start = file_offset + (data_va_start - segment_va);
-                            let data_len = data_va_end - data_va_start;
-                            big_buf = alloc::vec![0u8; data_len];
-                            if inode != 0 {
-                                let _ = crate::vfs::read_at_by_inode(path, inode, data_file_start, &mut big_buf);
-                            } else {
-                                let _ = crate::vfs::read_at(path, data_file_start, &mut big_buf);
-                            }
-                        }
-
                         let mut any_mapped = false;
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if let Some(pf) = crate::pmm::alloc_page_zeroed() {
-                                let pg_data_start = core::cmp::max(cur_va, data_va_start);
-                                let pg_data_end = core::cmp::min(cur_va + 0x1000, data_va_end);
+                                let pg_data_start = core::cmp::max(cur_va, segment_va);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
                                 if pg_data_start < pg_data_end {
                                     let dst_off = pg_data_start - cur_va;
-                                    let src_off = pg_data_start - data_va_start;
+                                    let file_off = file_offset + (pg_data_start - segment_va);
                                     let len = pg_data_end - pg_data_start;
                                     let page_ptr = crate::mmu::phys_to_virt(pf.addr);
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            big_buf.as_ptr().add(src_off),
-                                            (page_ptr as *mut u8).add(dst_off),
-                                            len,
-                                        );
+                                    let page_buf = unsafe {
+                                        core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
+                                    };
+                                    if inode != 0 {
+                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                                    } else {
+                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
                                     }
                                 }
 
@@ -1258,38 +1244,24 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
-                        let data_va_start = core::cmp::max(page_va, segment_va);
-                        let data_va_end = core::cmp::min(ra_end, segment_va + filesz);
-
-                        let mut big_buf = alloc::vec::Vec::new();
-                        if data_va_start < data_va_end {
-                            let data_file_start = file_offset + (data_va_start - segment_va);
-                            let data_len = data_va_end - data_va_start;
-                            big_buf = alloc::vec![0u8; data_len];
-                            if inode != 0 {
-                                let _ = crate::vfs::read_at_by_inode(path, inode, data_file_start, &mut big_buf);
-                            } else {
-                                let _ = crate::vfs::read_at(path, data_file_start, &mut big_buf);
-                            }
-                        }
-
                         let mut any_mapped = false;
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if let Some(pf) = crate::pmm::alloc_page_zeroed() {
-                                let pg_data_start = core::cmp::max(cur_va, data_va_start);
-                                let pg_data_end = core::cmp::min(cur_va + 0x1000, data_va_end);
+                                let pg_data_start = core::cmp::max(cur_va, segment_va);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
                                 if pg_data_start < pg_data_end {
                                     let dst_off = pg_data_start - cur_va;
-                                    let src_off = pg_data_start - data_va_start;
+                                    let file_off = file_offset + (pg_data_start - segment_va);
                                     let len = pg_data_end - pg_data_start;
                                     let page_ptr = crate::mmu::phys_to_virt(pf.addr);
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            big_buf.as_ptr().add(src_off),
-                                            (page_ptr as *mut u8).add(dst_off),
-                                            len,
-                                        );
+                                    let page_buf = unsafe {
+                                        core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
+                                    };
+                                    if inode != 0 {
+                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                                    } else {
+                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
                                     }
                                 }
 

@@ -1637,6 +1637,13 @@ impl Process {
 
     /// Create a process from a large ELF file on disk, loading segments on demand.
     pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
+        {
+            let stats = crate::allocator::stats();
+            crate::safe_print!(192, "[Process] heap before ELF load: {}MB / {}MB ({}%), allocs={}\n",
+                stats.allocated / 1024 / 1024, stats.heap_size / 1024 / 1024,
+                if stats.heap_size > 0 { stats.allocated * 100 / stats.heap_size } else { 0 },
+                stats.allocation_count);
+        }
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
 
