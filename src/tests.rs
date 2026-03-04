@@ -2900,7 +2900,7 @@ fn test_alloc_mmap_free_region_recycling() -> bool {
     console::print("\n[TEST] alloc_mmap: free region recycling\n");
 
     let mut mem = crate::process::ProcessMemory::new(
-        0x1000_0000, 0x2000_0000, 0x2010_0000, 0x1100_0000,
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
     let a1 = mem.alloc_mmap(0x4000).unwrap();
@@ -3176,7 +3176,7 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     console::print("\n[TEST] munmap: sub-range of eager alloc is no-op\n");
 
     let mut mem = crate::process::ProcessMemory::new(
-        0x1000_0000, 0x2000_0000, 0x2010_0000, 0x1100_0000,
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
     let base = mem.alloc_mmap(0x7F000).unwrap();
