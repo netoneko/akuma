@@ -9,6 +9,7 @@ use crate::terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
@@ -2047,7 +2048,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
             let parent_path = if parent_raw.starts_with('/') {
                 String::from(parent_raw)
             } else {
-                alloc::format!("/{}", parent_raw)
+                format!("/{}", parent_raw)
             };
             if parent_path != "/" && !crate::fs::exists(&parent_path) {
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -4187,7 +4188,7 @@ fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     // VT100/ANSI escape sequence: ESC[{row};{col}H (1-indexed)
     let row_1 = row + 1;
     let col_1 = col + 1;
-    let sequence = alloc::format!("\x1b[{};{}H", row_1, col_1);
+    let sequence = format!("\x1b[{};{}H", row_1, col_1);
     write_to_process_channel(sequence.as_bytes())
 }
 

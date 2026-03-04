@@ -14,6 +14,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::format;
 use core::marker::PhantomData;
 
 use der::Decode;
@@ -179,7 +180,7 @@ fn verify_hostname(cert: &X509Certificate, hostname: &str) -> bool {
                             GeneralName::IpAddress(ip_bytes) => {
                                 if ip_bytes.as_bytes().len() == 4 {
                                     let bytes = ip_bytes.as_bytes();
-                                    let ip_str = alloc::format!(
+                                    let ip_str = format!(
                                         "{}.{}.{}.{}",
                                         bytes[0],
                                         bytes[1],

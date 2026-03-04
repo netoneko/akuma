@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::format;
 use arm_pl031::Rtc;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -350,7 +351,7 @@ impl DateTime {
 
     // Format as ISO 8601: YYYY-MM-DDTHH:MM:SS.ssssssZ
     pub fn to_iso8601(&self) -> String {
-        alloc::format!(
+        format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
             self.year,
             self.month,
@@ -364,7 +365,7 @@ impl DateTime {
 
     // Format as ISO 8601 without microseconds: YYYY-MM-DDTHH:MM:SSZ
     pub fn to_iso8601_simple(&self) -> String {
-        alloc::format!(
+        format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
             self.year,
             self.month,

@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::format;
 use spinning_top::Spinlock;
 
 // ============================================================================
@@ -413,9 +414,9 @@ pub fn resolve_path(base_cwd: &str, path: &str) -> String {
     } else {
         // Relative path
         let full_path = if base_cwd == "/" {
-            alloc::format!("/{}", path)
+            format!("/{}", path)
         } else {
-            alloc::format!("{}/{}", base_cwd, path)
+            format!("{}/{}", base_cwd, path)
         };
         canonicalize_path(&full_path)
     }
@@ -427,7 +428,7 @@ fn normalize_path_owned(path: &str) -> String {
     if trimmed.is_empty() {
         String::from("/")
     } else if !trimmed.starts_with('/') {
-        alloc::format!("/{}", trimmed)
+        format!("/{}", trimmed)
     } else {
         String::from(trimmed)
     }
@@ -499,9 +500,9 @@ where
             // Join root_dir and absolute path
             // e.g. root_dir="/box1", absolute="/etc" -> "/box1/etc"
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &absolute[1..])
+                format!("{}{}", proc.root_dir, &absolute[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, absolute)
+                format!("{}{}", proc.root_dir, absolute)
             }
         } else {
             absolute
@@ -620,9 +621,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
         let abs = resolve_path(&proc.cwd, old_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+                format!("{}{}", proc.root_dir, &abs[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, abs)
+                format!("{}{}", proc.root_dir, abs)
             }
         } else {
             abs
@@ -635,9 +636,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
         let abs = resolve_path(&proc.cwd, new_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+                format!("{}{}", proc.root_dir, &abs[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, abs)
+                format!("{}{}", proc.root_dir, abs)
             }
         } else {
             abs
@@ -820,7 +821,7 @@ fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
             }
         } else {
             // Direct children of non-root: /foo -> /foo/bar
-            let prefix = alloc::format!("{}/", parent);
+            let prefix = format!("{}/", parent);
             if mount_path.starts_with(&prefix) {
                 let rest = &mount_path[prefix.len()..];
                 // Only direct children (no more slashes)

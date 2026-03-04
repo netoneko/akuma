@@ -238,7 +238,7 @@ pub const TX_QUEUE_SLOTS: usize = 8;
 pub const TX_PACKET_BUFFER_SIZE: usize = 2048;
 
 // Debug prints
-// WARNING: SGI debug prints use alloc::format! which can deadlock if the
+// WARNING: SGI debug prints use format! which can deadlock if the
 // allocator lock is held when timer fires. Keep disabled unless debugging.
 pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
 pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;

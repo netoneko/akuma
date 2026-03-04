@@ -7,6 +7,7 @@ use crate::console;
 use crate::fs;
 use crate::process;
 use alloc::string::ToString;
+use alloc::format;
 
 /// Run all process tests
 pub fn run_all_tests() {
@@ -271,7 +272,7 @@ fn test_procfs_stdio() {
     }
 
     // 4. Read echo2's stdin via procfs: /proc/<echo2_pid>/fd/0
-    let stdin_path = alloc::format!("/proc/{}/fd/0", echo2_pid);
+    let stdin_path = format!("/proc/{}/fd/0", echo2_pid);
     match fs::read_file(&stdin_path) {
         Ok(data) => {
             if data == stdin_data {
@@ -291,7 +292,7 @@ fn test_procfs_stdio() {
     }
 
     // 5. Read hello's stdout via procfs: /proc/<hello_pid>/fd/1
-    let stdout_path = alloc::format!("/proc/{}/fd/1", hello_pid);
+    let stdout_path = format!("/proc/{}/fd/1", hello_pid);
     match fs::read_file(&stdout_path) {
         Ok(data) => {
             // Verify stdout contains expected content

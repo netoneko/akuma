@@ -7,6 +7,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::format;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
 use crate::config::{PROC_STDIN_MAX_SIZE, PROC_STDOUT_MAX_SIZE};
@@ -92,7 +93,7 @@ impl Filesystem for ProcFilesystem {
                     }
                 })
                 .map(|p| DirEntry {
-                    name: alloc::format!("{}", p.pid),
+                    name: format!("{}", p.pid),
                     is_dir: true,
                     size: 0,
                 })
@@ -233,7 +234,7 @@ impl Filesystem for ProcFilesystem {
             }
             let mut out = String::from("ID,NAME,ROOT,CREATOR,PRIMARY\n");
             for b in boxes {
-                out.push_str(&alloc::format!("{},{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid, b.primary_pid));
+                out.push_str(&format!("{},{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid, b.primary_pid));
             }
             return Ok(out.into_bytes());
         }
@@ -242,9 +243,9 @@ impl Filesystem for ProcFilesystem {
             let sockets = crate::socket::list_sockets();
             let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
             for s in sockets {
-                out.push_str(&alloc::format!("{},{}:{},{},{}\n", 
+                out.push_str(&format!("{},{}:{},{},{}\n", 
                     s.local_port, 
-                    alloc::format!("{}.{}.{}.{}", s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3]),
+                    format!("{}.{}.{}.{}", s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3]),
                     s.remote_port,
                     s.state,
                     s.box_id));

@@ -521,6 +521,7 @@ fn unregister_process(pid: Pid) -> Option<Box<Process>> {
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32};
 
 /// Channel for streaming process output between threads
@@ -2996,13 +2997,13 @@ pub fn spawn_process_with_channel_ext(
     let mut process = match crate::fs::read_file(elf_path) {
         Ok(elf_data) => {
             Process::from_elf(elf_path, &full_args, &full_env, &elf_data)
-                .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
+                .map_err(|e| format!("Failed to load ELF: {}", e))?
         }
         Err(_) => {
             let file_size = crate::vfs::file_size(elf_path)
-                .map_err(|e| alloc::format!("Failed to stat {}: {}", elf_path, e))? as usize;
+                .map_err(|e| format!("Failed to stat {}: {}", elf_path, e))? as usize;
             Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env)
-                .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
+                .map_err(|e| format!("Failed to load ELF: {}", e))?
         }
     };
 
@@ -3126,7 +3127,7 @@ pub fn spawn_process_with_channel_ext(
             loop { crate::threading::yield_now(); }
         }
     })
-    .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
+    .map_err(|e| format!("Failed to spawn thread: {}", e))?;
 
     // Set the thread ID in the process table entry for the parent to see immediately
     if let Some(p) = lookup_process(pid) {

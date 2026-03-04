@@ -7,6 +7,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
+use crate::safe_print;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
@@ -518,7 +519,7 @@ pub fn poll() -> bool {
                             let _ = net.iface.routes_mut().add_default_ipv4_route(router);
                         }
                         
-                        log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
+                        safe_print!(256, "[SmolNet] IP: {}\n", config.address);
                         DHCP_CONFIGURED.store(true, Ordering::Release);
                         dhcp_changed = true;
                     }

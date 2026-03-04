@@ -64,12 +64,12 @@ pub async fn handle_userauth_request(
         None => return (AuthResult::Failure, build_failure_response()),
     };
 
-    log(&alloc::format!(
+    safe_print!(256, 
         "[SSH Auth] Auth request: user={:?}, service={:?}, method={:?}\n",
         core::str::from_utf8(username),
         core::str::from_utf8(service),
         core::str::from_utf8(method)
-    ));
+    );
 
     let disable_key_verification = config.disable_key_verification;
     // let disable_key_verification = true;
@@ -94,10 +94,10 @@ pub async fn handle_userauth_request(
             (AuthResult::Failure, build_failure_response())
         }
         _ => {
-            log(&alloc::format!(
+            safe_print!(256, 
                 "[SSH Auth] Unknown auth method: {:?}\n",
                 core::str::from_utf8(method)
-            ));
+            );
             (AuthResult::Failure, build_failure_response())
         }
     }
@@ -129,11 +129,11 @@ async fn handle_publickey_auth(
         None => return (AuthResult::Failure, build_failure_response()),
     };
 
-    log(&alloc::format!(
+    safe_print!(256, 
         "[SSH Auth] Publickey: alg={:?}, has_sig={}\n",
         core::str::from_utf8(algorithm),
         has_signature
-    ));
+    );
 
     // Only support ssh-ed25519
     if algorithm != b"ssh-ed25519" {
@@ -197,10 +197,10 @@ async fn handle_publickey_auth(
             (AuthResult::Success, build_success_response())
         }
         Err(e) => {
-            log(&alloc::format!(
+            safe_print!(256, 
                 "[SSH Auth] Signature verification failed: {:?}\n",
                 e
-            ));
+            );
             (AuthResult::Failure, build_failure_response())
         }
     }
