@@ -1198,24 +1198,65 @@ impl Ext2Filesystem {
 
         let block_size = state.block_size;
         let end = core::cmp::min(offset + buf.len(), file_size);
+        let first_logical = (offset / block_size) as u32;
+        let last_logical = ((end - 1) / block_size) as u32;
+        let num_blocks = (last_logical - first_logical + 1) as usize;
+
+        // Resolve all logical->physical block mappings upfront
+        let mut phys_blocks = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            phys_blocks.push(Self::get_block_num(&state, &inode, first_logical + i as u32)?);
+        }
+
         let mut total_read = 0usize;
         let mut pos = offset;
+        let mut block_idx = 0usize;
 
-        while pos < end {
-            let logical_block = (pos / block_size) as u32;
+        while block_idx < num_blocks {
             let offset_in_block = pos % block_size;
-            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
 
-            if let Some(phys_block) = Self::get_block_num(&state, &inode, logical_block)? {
-                let block_data = Self::read_block(&state, phys_block)?;
-                buf[total_read..total_read + chunk]
-                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
-            } else {
+            if phys_blocks[block_idx].is_none() {
+                let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
                 buf[total_read..total_read + chunk].fill(0);
+                pos += chunk;
+                total_read += chunk;
+                block_idx += 1;
+                continue;
             }
 
-            pos += chunk;
-            total_read += chunk;
+            let run_start_phys = phys_blocks[block_idx].unwrap();
+
+            // Find contiguous run of physical blocks
+            let mut run_len = 1usize;
+            while block_idx + run_len < num_blocks {
+                if let Some(next_phys) = phys_blocks[block_idx + run_len] {
+                    if next_phys == run_start_phys + run_len as u32 {
+                        run_len += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Single disk read for the entire contiguous run
+            let disk_offset = run_start_phys as u64 * block_size as u64;
+            let run_bytes = run_len * block_size;
+            let mut run_buf = alloc::vec![0u8; run_bytes];
+            block::read_bytes(disk_offset, &mut run_buf).map_err(|_| FsError::IoError)?;
+
+            // Copy relevant data from the run into output
+            let mut run_pos = 0usize;
+            for _ in 0..run_len {
+                let off = if run_pos == 0 { offset_in_block } else { 0 };
+                let chunk = core::cmp::min(block_size - off, end - pos);
+                buf[total_read..total_read + chunk]
+                    .copy_from_slice(&run_buf[run_pos + off..run_pos + off + chunk]);
+                pos += chunk;
+                total_read += chunk;
+                run_pos += block_size;
+            }
+
+            block_idx += run_len;
         }
 
         Ok(total_read)

@@ -131,15 +131,10 @@ impl VirtioBlockDevice {
 
         let inner = self.inner_mut();
 
-        // VirtIOBlk::read_blocks reads one sector at a time
-        for i in 0..num_sectors {
-            let offset = i * SECTOR_SIZE;
-            let sector_buf = &mut buf[offset..offset + SECTOR_SIZE];
-            if let Err(e) = inner.read_blocks(sector as usize + i, sector_buf) {
-                crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, err={:?}\n",
-                    sector as usize + i, e);
-                return Err(BlockError::ReadError);
-            }
+        if let Err(e) = inner.read_blocks(sector as usize, buf) {
+            crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
+                sector, buf.len(), e);
+            return Err(BlockError::ReadError);
         }
 
         Ok(())
@@ -165,15 +160,10 @@ impl VirtioBlockDevice {
 
         let inner = self.inner_mut();
 
-        // VirtIOBlk::write_blocks writes one sector at a time
-        for i in 0..num_sectors {
-            let offset = i * SECTOR_SIZE;
-            let sector_buf = &buf[offset..offset + SECTOR_SIZE];
-            if let Err(e) = inner.write_blocks(sector as usize + i, sector_buf) {
-                crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, err={:?}\n",
-                    sector as usize + i, e);
-                return Err(BlockError::WriteError);
-            }
+        if let Err(e) = inner.write_blocks(sector as usize, buf) {
+            crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
+                sector, buf.len(), e);
+            return Err(BlockError::WriteError);
         }
 
         Ok(())
