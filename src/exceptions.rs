@@ -1122,11 +1122,28 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
+            let is_permission_fault = fault_type == 0x0C;
             let far_usize = far as usize;
+
+            if is_permission_fault {
+                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    if let Some(proc) = crate::process::current_process() {
+                        let _ = proc.address_space.update_page_flags(page_va, crate::mmu::user_flags::RW_NO_EXEC);
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
+
             if is_translation_fault {
                 if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
+                    let map_flags = match source {
+                        crate::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                        }
+                        _ => crate::mmu::user_flags::RW_NO_EXEC,
+                    };
                     let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
@@ -1235,12 +1252,28 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             let fault_type = iss & 0x3C;
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
+            let is_permission_fault = fault_type == 0x0C;
             let far_usize = far as usize;
+
+            if is_permission_fault {
+                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    if let Some(proc) = crate::process::current_process() {
+                        let _ = proc.address_space.update_page_flags(page_va, crate::mmu::user_flags::RX);
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
 
             if is_translation_fault {
                 if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RX };
+                    let map_flags = match source {
+                        crate::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { crate::mmu::user_flags::RX }
+                        }
+                        _ => crate::mmu::user_flags::RX,
+                    };
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         const READAHEAD_PAGES: usize = 256;
