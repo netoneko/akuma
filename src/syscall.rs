@@ -2873,9 +2873,17 @@ fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>,
     do_execve(interpreter, new_args, env)
 }
 
-fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
+fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
+    }
+
+    // Zero-fill the rusage struct if provided. We don't track per-process CPU
+    // time yet, so returning zeroes is correct rather than leaving the caller's
+    // stack uninitialized (which produced nonsense user/sys output in busybox time).
+    const RUSAGE_SIZE: usize = 144; // struct rusage on aarch64: 18 × 8-byte fields
+    if rusage_ptr != 0 && validate_user_ptr(rusage_ptr, RUSAGE_SIZE) {
+        unsafe { core::ptr::write_bytes(rusage_ptr as *mut u8, 0, RUSAGE_SIZE); }
     }
 
     let wnohang = options & 1 != 0;
@@ -4471,20 +4479,39 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     // Try normal (eagerly-mapped) region first
     if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
         let (_, frames) = proc.mmap_regions.remove(idx);
+        let freed_size = frames.len() * 4096;
         for (i, frame) in frames.into_iter().enumerate() {
             let _ = proc.address_space.unmap_page(addr + i * 4096);
             proc.address_space.remove_user_frame(frame);
             crate::pmm::free_page(frame);
         }
+        proc.memory.free_regions.push((addr, freed_size));
         return 0;
     }
 
-    // Try lazy region — handle partial unmaps (prefix, suffix, middle split)
-    // Use address-space owner PID for CLONE_VM consistency
+    // Try lazy region(s) — the unmap range may span multiple lazy regions.
+    // Loop until no more lazy regions overlap the remaining unmap range.
     let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-    if let Some(result) = crate::process::munmap_lazy_region(as_pid, addr, unmap_len) {
-        let (_, actual_pages) = result;
-        for i in 0..actual_pages {
+    let mut cursor = addr;
+    let mut found_any = false;
+    while cursor < unmap_end {
+        let remaining = unmap_end - cursor;
+        if let Some((freed_start, freed_pages)) = crate::process::munmap_lazy_region(as_pid, cursor, remaining) {
+            found_any = true;
+            for i in 0..freed_pages {
+                let _ = proc.address_space.unmap_page(freed_start + i * 4096);
+            }
+            proc.memory.free_regions.push((freed_start, freed_pages * 4096));
+            let freed_end = freed_start + freed_pages * 4096;
+            cursor = if freed_end > cursor { freed_end } else { cursor + 4096 };
+        } else {
+            break;
+        }
+    }
+    if found_any {
+        // Also unmap any pages in gaps between lazy regions within the range
+        let total_pages = unmap_len / 4096;
+        for i in 0..total_pages {
             let _ = proc.address_space.unmap_page(addr + i * 4096);
         }
         return 0;
