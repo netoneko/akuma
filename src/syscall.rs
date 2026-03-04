@@ -10,8 +10,109 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+
+pub static CURRENT_SYSCALL_NR: AtomicU64 = AtomicU64::new(9999);
+pub fn current_syscall_nr() -> u64 { CURRENT_SYSCALL_NR.load(Ordering::Relaxed) }
+
+// Syscall counters for diagnosing kernel heap usage
+pub mod syscall_counters {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
+    static MUNMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static BRK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static READ_COUNT: AtomicU64 = AtomicU64::new(0);
+    static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static OPENAT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLOSE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MPROTECT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FUTEX_COUNT: AtomicU64 = AtomicU64::new(0);
+    static SIGPROCMASK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static SIGACTION_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static IOCTL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FSTAT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MADVISE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MREMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static LSEEK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static GETRANDOM_COUNT: AtomicU64 = AtomicU64::new(0);
+    static GETPID_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FCNTL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static PAGEFAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static PAGEFAULT_PAGES: AtomicU64 = AtomicU64::new(0);
+    static OTHER_LAST_NR: AtomicU64 = AtomicU64::new(0);
+    static OTHER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn inc_mmap(pages: usize) { MMAP_COUNT.fetch_add(1, Ordering::Relaxed); MMAP_PAGES.fetch_add(pages as u64, Ordering::Relaxed); }
+    pub fn inc_munmap() { MUNMAP_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_brk() { BRK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_read() { READ_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_write() { WRITE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_openat() { OPENAT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_close() { CLOSE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_mprotect() { MPROTECT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_futex() { FUTEX_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_sigprocmask() { SIGPROCMASK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_sigaction() { SIGACTION_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_clock() { CLOCK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_ioctl() { IOCTL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_fstat() { FSTAT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_yield() { YIELD_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_madvise() { MADVISE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_mremap() { MREMAP_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_lseek() { LSEEK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_getrandom() { GETRANDOM_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_getpid() { GETPID_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_fcntl() { FCNTL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_other(nr: u64) { OTHER_COUNT.fetch_add(1, Ordering::Relaxed); OTHER_LAST_NR.store(nr, Ordering::Relaxed); }
+    pub fn inc_total() { TOTAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_pagefault(pages_mapped: u64) { PAGEFAULT_COUNT.fetch_add(1, Ordering::Relaxed); PAGEFAULT_PAGES.fetch_add(pages_mapped, Ordering::Relaxed); }
+
+    pub fn dump() {
+        let total = TOTAL_COUNT.load(Ordering::Relaxed);
+        let other = OTHER_COUNT.load(Ordering::Relaxed);
+        let last_nr = OTHER_LAST_NR.load(Ordering::Relaxed);
+        crate::safe_print!(512,
+            "[SC-STATS] total={} madvise={} mremap={} lseek={} rnd={} pid={} fcntl={} other={}(last_nr={})\n",
+            total,
+            MADVISE_COUNT.load(Ordering::Relaxed),
+            MREMAP_COUNT.load(Ordering::Relaxed),
+            LSEEK_COUNT.load(Ordering::Relaxed),
+            GETRANDOM_COUNT.load(Ordering::Relaxed),
+            GETPID_COUNT.load(Ordering::Relaxed),
+            FCNTL_COUNT.load(Ordering::Relaxed),
+            other, last_nr,
+        );
+        crate::safe_print!(512,
+            "[SC-STATS] futex={} sigmask={} sigact={} clk={} ioctl={} fstat={} yield={}\n",
+            FUTEX_COUNT.load(Ordering::Relaxed),
+            SIGPROCMASK_COUNT.load(Ordering::Relaxed),
+            SIGACTION_COUNT.load(Ordering::Relaxed),
+            CLOCK_COUNT.load(Ordering::Relaxed),
+            IOCTL_COUNT.load(Ordering::Relaxed),
+            FSTAT_COUNT.load(Ordering::Relaxed),
+            YIELD_COUNT.load(Ordering::Relaxed),
+        );
+        crate::safe_print!(384,
+            "[SC-STATS] mmap={}({}pg) munmap={} brk={} read={} write={} open={} close={} mprot={} pgfault={}({}pg)\n",
+            MMAP_COUNT.load(Ordering::Relaxed),
+            MMAP_PAGES.load(Ordering::Relaxed),
+            MUNMAP_COUNT.load(Ordering::Relaxed),
+            BRK_COUNT.load(Ordering::Relaxed),
+            READ_COUNT.load(Ordering::Relaxed),
+            WRITE_COUNT.load(Ordering::Relaxed),
+            OPENAT_COUNT.load(Ordering::Relaxed),
+            CLOSE_COUNT.load(Ordering::Relaxed),
+            MPROTECT_COUNT.load(Ordering::Relaxed),
+            PAGEFAULT_COUNT.load(Ordering::Relaxed),
+            PAGEFAULT_PAGES.load(Ordering::Relaxed),
+        );
+    }
+}
 
 // ============================================================================
 // TimerFd State Tracking
@@ -746,6 +847,9 @@ struct PollFd {
 
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
+    CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
+
+    let pre_bytes = crate::allocator::allocated_bytes();
     if crate::process::is_current_interrupted() {
         if let Some(proc) = crate::process::current_process() {
             proc.exited = true;
@@ -759,7 +863,33 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
+    syscall_counters::inc_total();
     match syscall_num {
+        nr::MMAP => { syscall_counters::inc_mmap(((args[1] as usize) + 4095) / 4096); }
+        nr::MUNMAP => { syscall_counters::inc_munmap(); }
+        nr::BRK => { syscall_counters::inc_brk(); }
+        nr::READ | nr::READV | nr::PREAD64 => { syscall_counters::inc_read(); }
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 => { syscall_counters::inc_write(); }
+        nr::OPENAT => { syscall_counters::inc_openat(); }
+        nr::CLOSE => { syscall_counters::inc_close(); }
+        nr::MPROTECT => { syscall_counters::inc_mprotect(); }
+        nr::FUTEX => { syscall_counters::inc_futex(); }
+        nr::RT_SIGPROCMASK => { syscall_counters::inc_sigprocmask(); }
+        nr::RT_SIGACTION => { syscall_counters::inc_sigaction(); }
+        nr::CLOCK_GETTIME => { syscall_counters::inc_clock(); }
+        nr::IOCTL => { syscall_counters::inc_ioctl(); }
+        nr::FSTAT | nr::NEWFSTATAT => { syscall_counters::inc_fstat(); }
+        124 => { syscall_counters::inc_yield(); }
+        nr::MADVISE => { syscall_counters::inc_madvise(); }
+        nr::MREMAP => { syscall_counters::inc_mremap(); }
+        nr::LSEEK => { syscall_counters::inc_lseek(); }
+        nr::GETRANDOM => { syscall_counters::inc_getrandom(); }
+        nr::GETPID => { syscall_counters::inc_getpid(); }
+        nr::FCNTL => { syscall_counters::inc_fcntl(); }
+        _ => { syscall_counters::inc_other(syscall_num); }
+    }
+
+    let result = match syscall_num {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
@@ -965,7 +1095,23 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
             ENOSYS
         }
+    };
+
+    let post_bytes = crate::allocator::allocated_bytes();
+    if post_bytes > pre_bytes {
+        static SC_LEAK_TOTAL: AtomicU64 = AtomicU64::new(0);
+        static SC_LEAK_CALLS: AtomicU64 = AtomicU64::new(0);
+        let delta = (post_bytes - pre_bytes) as u64;
+        let total = SC_LEAK_TOTAL.fetch_add(delta, Ordering::Relaxed) + delta;
+        let calls = SC_LEAK_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls <= 5 || (calls <= 100 && calls % 20 == 0) || calls % 100000 == 0 {
+            crate::safe_print!(256, "[SC-LEAK] nr={} +{} bytes (fd={} cmd={} heap={}MB cum={}KB calls={})\n",
+                syscall_num, delta, args[0], args[1],
+                post_bytes / 1024 / 1024, total / 1024, calls);
+        }
     }
+
+    result
 }
 
 fn sys_set_tpidr_el0(address: u64) -> u64 {
@@ -2775,7 +2921,11 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
-    let proc = match crate::process::current_process() { Some(p) => p, None => return 0 };
+    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+
+    if proc.get_fd(fd).is_none() {
+        return EBADF;
+    }
 
     match cmd {
         F_GETFD => {

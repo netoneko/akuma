@@ -68,6 +68,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_mmap_vec_capacity_doubling, "mmap_vec_capacity_doubling");
     run_test!(test_mmap_interleaved_strings, "mmap_interleaved_strings");
 
+    // Allocator leak detection tests
+    run_test!(test_alloc_free_no_leak, "alloc_free_no_leak");
+    run_test!(test_btreemap_churn_no_leak, "btreemap_churn_no_leak");
+    run_test!(test_vec_growth_no_leak, "vec_growth_no_leak");
+    run_test!(test_high_volume_small_allocs_no_leak, "high_volume_small_allocs_no_leak");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -2685,6 +2691,149 @@ pub fn test_block_on_noop_waker() -> bool {
     crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
     
     let ok = result == Some(5) && poll_count == 5;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Allocator leak detection tests
+//
+// These verify that repeated alloc/dealloc cycles don't leak kernel heap.
+// Modeled after the pattern that caused Node.js OOM: 4M+ fcntl syscalls
+// leaking ~11 bytes each via BTreeMap/Vec operations.
+// ============================================================================
+
+fn heap_used() -> usize {
+    crate::allocator::allocated_bytes()
+}
+
+/// Basic alloc/free cycle leak test: 100K rounds of 56-byte and 152-byte
+/// allocations (the exact sizes observed in the Node.js OOM).
+fn test_alloc_free_no_leak() -> bool {
+    console::print("\n[TEST] Alloc/free leak detection (100K cycles, 56+152 bytes)\n");
+    use alloc::alloc::{alloc, dealloc, Layout};
+
+    let before = heap_used();
+    let iterations = 100_000usize;
+
+    for _ in 0..iterations {
+        unsafe {
+            let layout56 = Layout::from_size_align(56, 8).unwrap();
+            let p1 = alloc(layout56);
+            if !p1.is_null() {
+                core::ptr::write_bytes(p1, 0xAB, 56);
+                dealloc(p1, layout56);
+            }
+
+            let layout152 = Layout::from_size_align(152, 8).unwrap();
+            let p2 = alloc(layout152);
+            if !p2.is_null() {
+                core::ptr::write_bytes(p2, 0xCD, 152);
+                dealloc(p2, layout152);
+            }
+        }
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// BTreeMap churn: insert + lookup + remove on 1000-entry maps, repeated 100
+/// times.  BTreeMap node allocation/deallocation is the most likely source of
+/// the per-syscall leak since BTreeSet is used for cloexec_fds/nonblock_fds
+/// and BTreeMap for fd_table, THREAD_PID_MAP, etc.
+fn test_btreemap_churn_no_leak() -> bool {
+    console::print("\n[TEST] BTreeMap churn leak detection\n");
+    use alloc::collections::BTreeMap;
+
+    let before = heap_used();
+
+    for round in 0..100u32 {
+        let mut map: BTreeMap<u32, u64> = BTreeMap::new();
+        for i in 0..1000u32 {
+            map.insert(i + round * 1000, i as u64);
+        }
+        for i in 0..1000u32 {
+            let _ = map.get(&(i + round * 1000));
+        }
+        for i in 0..1000u32 {
+            map.remove(&(i + round * 1000));
+        }
+        drop(map);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Vec growth pattern: repeatedly grow a Vec (triggering realloc), drain it,
+/// and drop.  Tests the realloc path for leaks since Vec capacity doubling
+/// goes through GlobalAlloc::realloc.
+fn test_vec_growth_no_leak() -> bool {
+    console::print("\n[TEST] Vec growth/shrink leak detection\n");
+
+    let before = heap_used();
+
+    for _ in 0..200u32 {
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..2000u64 {
+            v.push(i);
+        }
+        v.clear();
+        v.shrink_to_fit();
+        drop(v);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// High-volume small allocations: 500K alloc+free of sizes 8-256 bytes,
+/// simulating the syscall dispatch path where temporary Strings, Vecs, and
+/// BTreeMap nodes are created and destroyed.  At 4M+ calls this is where
+/// even a 1-byte-per-call leak becomes fatal.
+fn test_high_volume_small_allocs_no_leak() -> bool {
+    console::print("\n[TEST] High-volume small allocs leak detection (500K cycles)\n");
+    use alloc::collections::BTreeSet;
+
+    let before = heap_used();
+
+    let mut set: BTreeSet<u32> = BTreeSet::new();
+    for i in 0..500_000u32 {
+        set.insert(i % 64);
+        set.remove(&(i % 64));
+
+        if i % 10000 == 0 {
+            let s = format!("iter_{}", i);
+            drop(s);
+        }
+    }
+    drop(set);
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
