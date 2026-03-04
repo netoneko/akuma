@@ -1130,7 +1130,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        const READAHEAD_PAGES: usize = 32;
+                        const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
@@ -1254,7 +1254,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RX };
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        const READAHEAD_PAGES: usize = 32;
+                        const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
