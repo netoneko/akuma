@@ -715,6 +715,14 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     true
 }
 
+pub fn is_current_user_page_mapped(va: usize) -> bool {
+    let ttbr0 = get_current_ttbr0();
+    if ttbr0 == 0 { return false; }
+    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_ptr = phys_to_virt(l0_addr) as *const u64;
+    is_page_mapped_ptr(l0_ptr, va & !(PAGE_SIZE - 1))
+}
+
 /// Translate a user VA to its physical address using the given L0 page table.
 /// Returns None if the page is not mapped.
 pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {

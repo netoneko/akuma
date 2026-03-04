@@ -264,75 +264,18 @@ to polling-based file watching.
 
 ---
 
-## 6. V8 Heap Cage Crash Fix
+## 6. Memory Management Fixes for V8/Node.js
 
-**Files:** `src/syscall.rs`, `src/process.rs`
+**Files:** `src/syscall.rs`, `src/process.rs`, `src/exceptions.rs`
 
-### Root Cause
+Three interconnected bugs caused V8/Node.js crashes. All stem from the
+kernel's handling of PROT_NONE lazy regions and the mismatch between
+Akuma's eager allocation model and Linux's lazy demand-paging model.
 
-V8's pointer-compression heap cage size is derived from `sysinfo.totalram`.
-With 256MB reported, V8 made two PROT_NONE reservations:
+### Bug 1: mprotect Eager Allocation Exhausting Physical Memory
 
-| Region | Requested | After alignment trim | Usable |
-|--------|-----------|---------------------|--------|
-| A (code/old-space) | 256MB + 60KB | `0x50000000-0x60000000` | 256MB |
-| B (new-space/large) | 128MB + 60KB | `0x60010000-0x68010000` | 128MB |
-| **Total** | ~384MB | | **384MB** |
-
-V8's internal metadata needed ~384.75MB — the access at `FAR=0x680c0000`
-was 704KB past the end of region B (`0x68010000`). A translation fault
-killed the process.
-
-### Fix: Report 1GB in sysinfo
-
-Changed `sys_sysinfo` to report `totalram = 1GB` instead of 256MB. This
-makes V8 reserve a proportionally larger heap cage with ample headroom.
-Since the reservations are `PROT_NONE` (lazy, demand-paged), no extra
-physical memory is consumed — only virtual address space, of which the
-kernel provides ~131GB per process.
-
-### Additional Fixes
-
-**Removed unsafe mmap hint handling.** Non-fixed mmaps with a non-zero
-`addr` hint were being honored blindly without checking for overlap with
-existing lazy regions or eager allocations. On real Linux, the kernel
-validates hints against its VMA tree and falls back to the regular
-allocator on conflict. The hint code was removed; non-fixed mmaps now
-always go through the bump allocator, which guarantees conflict-free
-sequential addresses.
-
-**`munmap_lazy_regions_in_range`.** Replaced the old single-region
-`munmap_lazy_region` with a loop that processes all overlapping lazy
-regions when an unmap range spans multiple regions. V8/musl frequently
-does large unmap calls that cross region boundaries.
-
-**`munmap_lazy_region_overlapping` suffix fix.** The old suffix-removal
-path returned the *requested* page count rather than the *actual* pages
-freed from the lazy region, causing over-unmapping of adjacent memory.
-
-**VA recycling in `sys_munmap`.** Freed lazy-region VA ranges are now
-pushed to `proc.memory.free_regions` so `alloc_mmap` can reuse them
-instead of advancing the bump pointer past the gap.
-
-**`MAP_FIXED` cleanup.** `sys_mmap` with `MAP_FIXED` now calls
-`munmap_lazy_regions_in_range` to remove overlapping lazy regions before
-placing the new mapping, matching Linux semantics.
-
-**`MAP_FIXED_NOREPLACE` (0x100000).** Recognized as a distinct flag that
-places the mapping at the exact address without overwriting existing
-mappings (unlike `MAP_FIXED` which overwrites).
-
----
-
-## 7. mprotect Eager Allocation Fix
-
-**File:** `src/syscall.rs`
-
-### Root Cause
-
-The V8 heap cage crash persisted after the sysinfo fix (Section 6)
-because `sys_mprotect` was **eagerly allocating a physical page for every
-unmapped page** in the requested range. V8's startup pattern:
+`sys_mprotect` was **eagerly allocating a physical page for every
+unmapped page** in the requested range. V8/musl's pattern:
 
 1. `mmap(PROT_NONE, 128MB)` — reserves 32,768 pages of VA (lazy, no
    physical pages)
@@ -342,44 +285,136 @@ On Linux, step 2 only updates VMA permission flags. No physical pages
 are allocated; they are demand-paged on first access. On Akuma, step 2
 iterated over all 32,768 pages and called `alloc_page_zeroed()` for each
 unmapped one. On a 256MB system with ~50MB of free physical pages, OOM
-occurred around page 12,000. The remaining pages were silently skipped
-(`alloc_page_zeroed()` returned `None`), but `mprotect` still returned 0
-(success). V8 assumed all pages were committed and later crashed
-accessing an unallocated page at `FAR=0x680c0000`.
+occurred around page 12,000. The remaining pages were silently skipped,
+but `mprotect` returned 0 (success). This had two consequences:
 
-### Timeline from kernel logs
+- **Starved subsequent allocations**: V8's later eager mmaps (for
+  metadata, code objects, etc.) failed due to OOM, leaving gaps in the
+  address space that V8 later crashed accessing (`FAR=0x680c0000`).
+- **Wrong page permissions**: Pages that *were* allocated by mprotect
+  got correct RW flags, but pages demand-paged *after* OOM got the
+  wrong flags (see Bug 2).
 
-```
-[T12.37] mmap 128MB PROT_NONE reservation → 0x60010000-0x68010000
-[T12.37] mprotect commits region → eagerly allocates ~12K pages, OOM skips rest
-[T12.43] V8 continues initialization (epoll, eventfd, threads)
-[T75.23] V8 accesses 0x680c0000 (page 32,944 from base) → translation fault
-         [DP] no lazy region for FAR=0x680c0000 → process killed with SIGSEGV
-```
-
-### Fix
-
-Changed `mprotect` to only update flags for already-mapped pages:
+**Fix:** `mprotect` now only updates flags for already-mapped pages.
+Unmapped pages are left alone — demand paging allocates them on first
+access:
 
 ```rust
-// Before (eager allocation — wrong):
+// Before (eager — exhausts physical memory):
 if update_page_flags(va, flags).is_err() || !is_mapped(va) {
     if prot != 0 {
-        if let Some(frame) = alloc_page_zeroed() {  // OOM here → silent skip
-            map_user_page(va, frame.addr, flags);
-        }
+        if let Some(frame) = alloc_page_zeroed() { ... }
     }
 }
 
-// After (demand-paging — matches Linux):
+// After (matches Linux semantics):
 if is_mapped(va) {
     update_page_flags(va, flags);
 }
-// Unmapped pages left alone — demand paging allocates on first access
 ```
 
-This matches Linux semantics: `mprotect` is a metadata operation on the
-VMA, not a physical page allocator. Physical pages are allocated one at a
-time by the demand paging fault handler when V8 actually touches each
-page, spreading memory cost across V8's real access pattern instead of
-pre-allocating everything at once.
+### Bug 2: Demand Paging Mapped Anonymous Pages Read-Only
+
+`from_prot(0)` (PROT_NONE) returned `RO` (read-only), not zero. The
+demand paging handler used these stored flags:
+
+```rust
+let map_flags = if flags != 0 { flags } else { RW_NO_EXEC };
+```
+
+Since `RO != 0`, the fallback to `RW_NO_EXEC` never triggered. Pages in
+PROT_NONE lazy regions were demand-paged as **read-only**. When musl's
+thread setup wrote to the stack (which was mmap'd PROT_NONE then
+mprotect'd to PROT_RW), the write hit a read-only page.
+
+**Fix:** Anonymous demand paging (`LazySource::Zero`) now always uses
+`RW_NO_EXEC`, regardless of stored flags. File-backed segments (ELF
+code/data) keep their stored flags to preserve correct permissions (RX
+for code, RW for data):
+
+```rust
+let map_flags = match source {
+    LazySource::File { .. } => if flags != 0 { flags } else { RW_NO_EXEC },
+    _ => RW_NO_EXEC,  // anonymous always RW
+};
+```
+
+### Bug 3: Exception Handler Ignored Permission Faults
+
+The demand paging handler only checked for **translation faults**
+(DFSC 0x04, 0x08 — page not present). **Permission faults** (DFSC 0x0C
+— page present but wrong access rights) were not handled:
+
+```
+[Fault] Data abort from EL0 at FAR=0x31a47be8, ISS=0x4f
+```
+
+ISS=0x4f → DFSC=0x0F → permission fault level 3. The page existed in
+the page table (mapped read-only by Bug 2) but the write was denied.
+This crash affected both Node.js and Bun — both use musl's thread
+creation which does `mmap(PROT_NONE)` + `mprotect(PROT_RW)` + clone.
+
+**Fix:** Added permission fault handling in both the data abort and
+instruction abort handlers. When a permission fault occurs on a page
+within a lazy region, the handler upgrades permissions to `RW_NO_EXEC`
+(data) or `RX` (instruction) via `update_page_flags()`, which includes
+TLB invalidation:
+
+```rust
+if is_permission_fault {
+    if let Some(_) = lazy_region_lookup(far) {
+        proc.address_space.update_page_flags(page_va, RW_NO_EXEC);
+        return;  // retry the faulting instruction
+    }
+}
+```
+
+### Additional Memory Fixes
+
+**Removed unsafe mmap hint handling.** Non-fixed mmaps with a non-zero
+`addr` hint were being honored blindly without checking for overlap with
+existing lazy regions. The hint code was removed; non-fixed mmaps now
+always go through the bump allocator.
+
+**`munmap_lazy_regions_in_range`.** Replaced the old single-region
+`munmap_lazy_region` with a loop that processes all overlapping lazy
+regions when an unmap range spans multiple regions.
+
+**`munmap_lazy_region_overlapping` suffix fix.** The old suffix-removal
+path returned the *requested* page count rather than the *actual* pages
+freed from the lazy region.
+
+**VA recycling in `sys_munmap`.** Freed lazy-region VA ranges are now
+pushed to `proc.memory.free_regions` for reuse.
+
+**`MAP_FIXED` cleanup.** `sys_mmap` with `MAP_FIXED` now calls
+`munmap_lazy_regions_in_range` to remove overlapping lazy regions.
+
+**`MAP_FIXED_NOREPLACE` (0x100000).** Recognized as a distinct flag.
+
+### Bug 4: Kernel-Side Pointer Validation Rejected Lazy Pages
+
+**File:** `src/syscall.rs`, `src/mmu.rs`
+
+`validate_user_ptr` checked `is_current_user_range_mapped` to ensure
+userspace pointers were backed by page table entries. With the mprotect
+fix (Bug 1), pages in lazy regions were no longer pre-allocated. When
+a syscall like `epoll_pwait` validated its output buffer — which might
+reside on a thread stack page not yet demand-paged — the check failed
+and the syscall returned `EFAULT`.
+
+libuv's event loop hit this immediately:
+
+```
+Assertion failed: errno == EINTR (../../deps/uv/src/unix/linux.c: uv__io_poll: 1474)
+```
+
+`epoll_pwait` returned -1 with errno=EFAULT (not EINTR). libuv aborted.
+
+**Fix:** Added `ensure_user_pages_mapped` — when a page in the
+requested range is not mapped, the function checks if it falls within
+a lazy region and demand-pages it from kernel context before proceeding.
+This handles both anonymous (zero-fill) and file-backed lazy regions,
+reusing the same demand paging logic as the exception handler. If a page
+is neither mapped nor in a lazy region, validation still fails with
+`EFAULT`.

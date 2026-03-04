@@ -654,12 +654,68 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
         None => return false,
     };
     if end > user_va_limit() { return false; }
-    
-    // CRITICAL: Check if the range is actually mapped in the current page tables
+
     if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
-        return false;
+        if !ensure_user_pages_mapped(ptr as usize, len) {
+            return false;
+        }
     }
-    
+
+    true
+}
+
+/// Demand-page unmapped user pages that fall within lazy regions.
+/// Returns false if any page in the range is neither mapped nor in a lazy region.
+fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
+    let page_start = start & !0xFFF;
+    let page_end = (start + len + 0xFFF) & !0xFFF;
+    let mut va = page_start;
+    while va < page_end {
+        if !crate::mmu::is_current_user_page_mapped(va) {
+            if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(va) {
+                let map_flags = match &source {
+                    crate::process::LazySource::File { .. } => {
+                        if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                    }
+                    _ => crate::mmu::user_flags::RW_NO_EXEC,
+                };
+                if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        let pg_data_start = core::cmp::max(va, segment_va);
+                        let pg_data_end = core::cmp::min(va + 0x1000, segment_va + filesz);
+                        if pg_data_start < pg_data_end {
+                            let dst_off = pg_data_start - va;
+                            let file_off = file_offset + (pg_data_start - segment_va);
+                            let read_len = pg_data_end - pg_data_start;
+                            let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
+                            let page_buf = unsafe {
+                                core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), read_len)
+                            };
+                            if inode != 0 {
+                                let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                            } else {
+                                let _ = crate::vfs::read_at(path, file_off, page_buf);
+                            }
+                        }
+                    }
+                    let table_frames = unsafe {
+                        crate::mmu::map_user_page(va, page_frame.addr, map_flags)
+                    };
+                    if let Some(proc) = crate::process::current_process() {
+                        proc.address_space.track_user_frame(page_frame);
+                        for tf in table_frames {
+                            proc.address_space.track_page_table_frame(tf);
+                        }
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        va += 4096;
+    }
     true
 }
 
@@ -3850,7 +3906,7 @@ fn sys_sysinfo(info_ptr: usize) -> u64 {
         let ptr = info_ptr as *mut u64;
         core::ptr::write(ptr.add(0), 3600);                  // uptime
         // loads[3] at offsets 1,2,3 — left as 0
-        core::ptr::write(ptr.add(4), 1024 * 1024 * 1024u64);  // totalram — report 1GB so V8 reserves a large enough heap cage
+        core::ptr::write(ptr.add(4), 256 * 1024 * 1024);     // totalram
         core::ptr::write(ptr.add(5), free_pages * 4096);      // freeram
         // sharedram, bufferram, totalswap, freeswap at 6,7,8,9 — 0
         // procs (u16) at byte offset 80
@@ -4501,19 +4557,13 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
             }
             proc.memory.free_regions.push((freed_start, freed_pages * 4096));
         }
-        // Also unmap any eagerly-mapped pages in gaps within the range
-        let total_pages = unmap_len / 4096;
-        for i in 0..total_pages {
-            let _ = proc.address_space.unmap_page(addr + i * 4096);
-        }
         return 0;
     }
 
-    // Partial unmap — just unmap the requested pages
-    let pages = unmap_len / 4096;
-    for i in 0..pages {
-        let _ = proc.address_space.unmap_page(addr + i * 4096);
-    }
+    // No tracked region matched — return success without unmapping.
+    // On Linux, munmap on a range not backed by any VMA is a no-op.
+    // Blindly unmapping here would destroy pages belonging to tracked
+    // eager mmap regions when V8 does sub-range munmaps.
     0
 }
 
