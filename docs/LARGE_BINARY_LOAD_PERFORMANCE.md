@@ -105,13 +105,43 @@ The current 16 MB limit in `read_file()` forces large binaries into the slow pag
 
 ## Recommended Implementation Order
 
-| Priority | Fix | Effort | Estimated Speedup |
-|----------|-----|--------|-------------------|
-| 1 | Block cache | 2–3 hours | ~2–3× |
-| 2 | 4096-byte ext2 blocks | 15 min | ~2–4× |
-| 3 | Larger ELF read chunks | 2–3 hours | ~2× |
-| 4 | Batch VirtIO sectors | 1–2 hours | ~1.5–2× |
-| 5 | Cached inode in read_at | 1–2 hours | ~1.3× |
-| 6 | Raise file size limit | 15 min | large but risky |
+| Priority | Fix | Effort | Estimated Speedup | Status |
+|----------|-----|--------|-------------------|--------|
+| 1 | Block cache | 2–3 hours | ~2–3× | **DONE** |
+| 2 | 4096-byte ext2 blocks | 15 min | ~2–4× | **DONE** |
+| 3 | Larger ELF read chunks | 2–3 hours | ~2× | **DONE** (32-page readahead) |
+| 4 | Batch VirtIO sectors | 1–2 hours | ~1.5–2× | Not yet |
+| 5 | Cached inode in read_at | 1–2 hours | ~1.3× | **DONE** |
+| 6 | Raise file size limit | 15 min | large but risky | Not needed |
 
-Fixes 1–4 together should reduce bun's load time by roughly **10–20×**. The total effort is approximately 6–8 hours.
+## Implementation Details
+
+### Block cache (implemented)
+
+A 512-entry `BTreeMap<u32, Vec<u8>>` global block cache in `src/vfs/ext2.rs`.
+`read_block()` checks the cache before going to disk; `write_block()` invalidates
+the entry. This eliminates virtually all redundant indirect/double-indirect block
+reads — the dominant cost for large file access.
+
+### 4096-byte ext2 blocks (implemented)
+
+`scripts/create_disk.sh` now passes `-b 4096` to `mkfs.ext2`. This reduces block
+operations by 4× and makes single-indirect blocks cover 4 MB instead of 256 KB,
+so most of bun's data falls within single-indirect range.
+
+### 32-page readahead (implemented)
+
+On each page fault for a file-backed lazy region, the handler loads 32 pages
+(128 KB) in a single `read_at_by_inode()` call and maps them all at once. This
+reduces page faults from ~12,800 to ~400 for bun's 89 MB binary.
+
+### Cached inode (implemented)
+
+`LazySource::File` stores a pre-resolved ext2 inode number. The ELF loader calls
+`vfs::resolve_inode()` once at load time. Page fault handlers call
+`vfs::read_at_by_inode()` which bypasses the directory walk entirely.
+
+### Result
+
+With fixes 1–3 and 5 combined, bun's 89 MB binary loads in under 1 second
+(previously took minutes).
