@@ -255,7 +255,18 @@ pub trait Filesystem: Send + Sync {
 
     /// Sync/flush any cached data to disk
     fn sync(&self) -> Result<(), FsError> {
-        Ok(()) // Default: no-op for filesystems that don't cache
+        Ok(())
+    }
+
+    /// Resolve a path to an opaque inode number for later use with read_at_by_inode.
+    fn resolve_inode(&self, _path: &str) -> Result<u32, FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Read from a file identified by inode number (returned by resolve_inode),
+    /// bypassing path lookup. Falls back to NotSupported if unimplemented.
+    fn read_at_by_inode(&self, _inode: u32, _offset: usize, _buf: &mut [u8]) -> Result<usize, FsError> {
+        Err(FsError::NotSupported)
     }
 }
 
@@ -550,6 +561,16 @@ pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 /// Read data from a specific offset within a file
 pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     with_fs(path, |fs, rel| fs.read_at(rel, offset, buf))
+}
+
+/// Resolve a file path to an inode number for use with read_at_by_inode.
+pub fn resolve_inode(path: &str) -> Result<u32, FsError> {
+    with_fs(path, |fs, rel| fs.resolve_inode(rel))
+}
+
+/// Read from a file by inode number, bypassing path lookup.
+pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
 }
 
 /// Write data at a specific offset within a file

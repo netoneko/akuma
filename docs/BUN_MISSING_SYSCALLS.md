@@ -221,6 +221,17 @@ syscall numbers).
 
 ---
 
+## Process Monitoring
+
+### `pidfd_open` (NR 434)
+
+Returns `ENOSYS`. Bun calls `pidfd_open(child_pid, 0)` after `clone3` to
+obtain a pollable file descriptor for the child process. Since Akuma does
+not implement pidfds, the call fails and bun falls back to `wait4` (NR 260)
+for child process status collection.
+
+---
+
 ## Other Stubs (pre-existing, also used by bun)
 
 | Syscall | NR | Notes |

@@ -18,6 +18,7 @@ pub const DEBUG_ELF_LOADING: bool = true;
 /// File-backed source for a deferred lazy segment.
 pub struct FileSegmentSource {
     pub path: String,
+    pub inode: u32,
     pub file_offset: usize,
     pub filesz: usize,
     pub segment_va: usize,
@@ -872,9 +873,11 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
     }
 
+    let file_inode = crate::vfs::resolve_inode(path).unwrap_or(0);
+
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(128, "[ELF] On-demand loading from path, file_size={} ({}MB), is_pie={}\n",
-            file_size, file_size / 1024 / 1024, is_pie);
+        crate::safe_print!(128, "[ELF] On-demand loading from path, file_size={} ({}MB), is_pie={}, inode={}\n",
+            file_size, file_size / 1024 / 1024, is_pie, file_inode);
     }
 
     for phdr in &phdrs {
@@ -916,6 +919,7 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
             page_flags,
             file_source: Some(FileSegmentSource {
                 path: String::from(path),
+                inode: file_inode,
                 file_offset: offset,
                 filesz,
                 segment_va: vaddr,

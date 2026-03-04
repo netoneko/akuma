@@ -476,6 +476,7 @@ pub enum LazySource {
     /// Backed by file data; pages beyond `filesz` are zero-filled (BSS).
     File {
         path: String,
+        inode: u32,
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
@@ -1015,16 +1016,16 @@ pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
 }
 
 /// Check if a virtual address falls within any lazy region of the current process.
-/// Returns `(flags, source)` if found. The source is cloned so the caller can
-/// release the table lock before performing I/O.
-pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource)> {
+/// Returns `(flags, source, region_start, region_size)` if found.
+/// The source is cloned so the caller can release the table lock before performing I/O.
+pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
     let pid = read_current_pid()?;
     crate::irq::with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
             for r in regions {
                 if va >= r.start_va && va < r.start_va + r.size {
-                    return Some((r.flags, r.source.clone()));
+                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
                 }
             }
         }
@@ -1645,6 +1646,7 @@ impl Process {
             let source = match &seg.file_source {
                 Some(fs) => LazySource::File {
                     path: fs.path.clone(),
+                    inode: fs.inode,
                     file_offset: fs.file_offset,
                     filesz: fs.filesz,
                     segment_va: fs.segment_va,
@@ -1797,6 +1799,7 @@ impl Process {
             let source = match &seg.file_source {
                 Some(fs) => LazySource::File {
                     path: fs.path.clone(),
+                    inode: fs.inode,
                     file_offset: fs.file_offset,
                     filesz: fs.filesz,
                     segment_va: fs.segment_va,

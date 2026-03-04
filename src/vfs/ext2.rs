@@ -15,6 +15,11 @@ use super::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, s
 use crate::block;
 use crate::console;
 
+const BLOCK_CACHE_MAX: usize = 512;
+
+static BLOCK_CACHE: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -276,9 +281,24 @@ impl Ext2Filesystem {
     // ========================================================================
 
     fn read_block(state: &Ext2State, block_num: u32) -> Result<Vec<u8>, FsError> {
+        {
+            let cache = BLOCK_CACHE.lock();
+            if let Some(data) = cache.get(&block_num) {
+                return Ok(data.clone());
+            }
+        }
+
         let mut buf = vec![0u8; state.block_size];
         let offset = block_num as u64 * state.block_size as u64;
         block::read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
+
+        {
+            let mut cache = BLOCK_CACHE.lock();
+            if cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, buf.clone());
+            }
+        }
+
         Ok(buf)
     }
 
@@ -286,6 +306,7 @@ impl Ext2Filesystem {
         if data.len() != state.block_size {
             return Err(FsError::Internal);
         }
+        { BLOCK_CACHE.lock().remove(&block_num); }
         let offset = block_num as u64 * state.block_size as u64;
         block::write_bytes(offset, data).map_err(|_| FsError::IoError)?;
         Ok(())
@@ -1157,6 +1178,48 @@ impl Ext2Filesystem {
         let parent_inode = Self::lookup_path_internal(&state, parent_path)?;
         Ok((parent_inode, name.to_string()))
     }
+
+    pub fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
+        self.lookup_path(path)
+    }
+
+    pub fn read_at_by_inode(&self, inode_num: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let state = self.state.lock();
+        let inode = Self::read_inode(&state, inode_num)?;
+
+        let file_size = inode.size_lower as usize;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let block_size = state.block_size;
+        let end = core::cmp::min(offset + buf.len(), file_size);
+        let mut total_read = 0usize;
+        let mut pos = offset;
+
+        while pos < end {
+            let logical_block = (pos / block_size) as u32;
+            let offset_in_block = pos % block_size;
+            let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+
+            if let Some(phys_block) = Self::get_block_num(&state, &inode, logical_block)? {
+                let block_data = Self::read_block(&state, phys_block)?;
+                buf[total_read..total_read + chunk]
+                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
+            } else {
+                buf[total_read..total_read + chunk].fill(0);
+            }
+
+            pos += chunk;
+            total_read += chunk;
+        }
+
+        Ok(total_read)
+    }
 }
 
 // ============================================================================
@@ -1645,8 +1708,15 @@ impl Filesystem for Ext2Filesystem {
     }
 
     fn sync(&self) -> Result<(), FsError> {
-        // All writes are synchronous, nothing to sync
         Ok(())
+    }
+
+    fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
+        self.lookup_path(path)
+    }
+
+    fn read_at_by_inode(&self, inode_num: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        Ext2Filesystem::read_at_by_inode(self, inode_num, offset, buf)
     }
 }
 

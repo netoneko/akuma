@@ -1124,50 +1124,100 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
             let far_usize = far as usize;
             if is_translation_fault {
-                if let Some((flags, source)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC };
-                    if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                        let mut is_file_backed = false;
-                        if let crate::process::LazySource::File { ref path, file_offset, filesz, segment_va } = source {
-                            is_file_backed = true;
-                            let copy_start = if page_va < segment_va { segment_va - page_va } else { 0 };
-                            let offset_in_seg = page_va.saturating_sub(segment_va);
-                            if offset_in_seg < filesz {
-                                let file_pos = file_offset + offset_in_seg;
-                                let read_len = core::cmp::min(0x1000 - copy_start, filesz - offset_in_seg);
-                                let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
-                                let dst = unsafe { (page_ptr as *mut u8).add(copy_start) };
-                                let buf = unsafe { core::slice::from_raw_parts_mut(dst, read_len) };
-                                let _ = crate::vfs::read_at(path, file_pos, buf);
+                    let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
+
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        const READAHEAD_PAGES: usize = 32;
+                        let region_end = region_start + region_size;
+                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
+
+                        let data_va_start = core::cmp::max(page_va, segment_va);
+                        let data_va_end = core::cmp::min(ra_end, segment_va + filesz);
+
+                        let mut big_buf = alloc::vec::Vec::new();
+                        if data_va_start < data_va_end {
+                            let data_file_start = file_offset + (data_va_start - segment_va);
+                            let data_len = data_va_end - data_va_start;
+                            big_buf = alloc::vec![0u8; data_len];
+                            if inode != 0 {
+                                let _ = crate::vfs::read_at_by_inode(path, inode, data_file_start, &mut big_buf);
+                            } else {
+                                let _ = crate::vfs::read_at(path, data_file_start, &mut big_buf);
                             }
                         }
-                        // Cache maintenance for executable pages loaded via data abort:
-                        // the instruction cache won't see data written through the data cache
-                        // unless we explicitly clean D-cache and invalidate I-cache.
-                        if is_file_backed && (map_flags & crate::mmu::flags::UXN) == 0 {
-                            let kva = crate::mmu::phys_to_virt(page_frame.addr) as usize;
-                            for off in (0..0x1000_usize).step_by(64) {
-                                unsafe {
-                                    core::arch::asm!("dc cvau, {}", in(reg) kva + off);
-                                    core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+
+                        let mut any_mapped = false;
+                        let mut cur_va = page_va;
+                        while cur_va < ra_end {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                                let pg_data_start = core::cmp::max(cur_va, data_va_start);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, data_va_end);
+                                if pg_data_start < pg_data_end {
+                                    let dst_off = pg_data_start - cur_va;
+                                    let src_off = pg_data_start - data_va_start;
+                                    let len = pg_data_end - pg_data_start;
+                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            big_buf.as_ptr().add(src_off),
+                                            (page_ptr as *mut u8).add(dst_off),
+                                            len,
+                                        );
+                                    }
                                 }
+
+                                if is_exec {
+                                    let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe {
+                                            core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                            core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                                        }
+                                    }
+                                }
+
+                                let table_frames = unsafe {
+                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                };
+                                if let Some(proc) = crate::process::current_process() {
+                                    proc.address_space.track_user_frame(pf);
+                                    for tf in table_frames {
+                                        proc.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                                any_mapped = true;
+                            } else {
+                                break;
                             }
+                            cur_va += 0x1000;
+                        }
+
+                        if is_exec {
                             unsafe {
                                 core::arch::asm!("dsb ish");
                                 core::arch::asm!("isb");
                             }
                         }
-                        let table_frames = unsafe {
-                            crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                        };
-                        if let Some(proc) = crate::process::current_process() {
-                            proc.address_space.track_user_frame(page_frame);
-                            for tf in table_frames {
-                                proc.address_space.track_page_table_frame(tf);
-                            }
+
+                        if any_mapped {
+                            return unsafe { (*frame).x0 };
                         }
-                        return unsafe { (*frame).x0 };
+                    } else {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                            let table_frames = unsafe {
+                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            if let Some(proc) = crate::process::current_process() {
+                                proc.address_space.track_user_frame(page_frame);
+                                for tf in table_frames {
+                                    proc.address_space.track_page_table_frame(tf);
+                                }
+                            }
+                            return unsafe { (*frame).x0 };
+                        }
                     }
                 } else {
                     crate::process::lazy_region_debug(far_usize);
@@ -1199,45 +1249,95 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_translation_fault {
-                if let Some((flags, source)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RX };
-                    if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                        if let crate::process::LazySource::File { ref path, file_offset, filesz, segment_va } = source {
-                            let copy_start = if page_va < segment_va { segment_va - page_va } else { 0 };
-                            let offset_in_seg = page_va.saturating_sub(segment_va);
-                            if offset_in_seg < filesz {
-                                let file_pos = file_offset + offset_in_seg;
-                                let read_len = core::cmp::min(0x1000 - copy_start, filesz - offset_in_seg);
-                                let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
-                                let dst = unsafe { (page_ptr as *mut u8).add(copy_start) };
-                                let buf = unsafe { core::slice::from_raw_parts_mut(dst, read_len) };
-                                let _ = crate::vfs::read_at(path, file_pos, buf);
+
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        const READAHEAD_PAGES: usize = 32;
+                        let region_end = region_start + region_size;
+                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
+
+                        let data_va_start = core::cmp::max(page_va, segment_va);
+                        let data_va_end = core::cmp::min(ra_end, segment_va + filesz);
+
+                        let mut big_buf = alloc::vec::Vec::new();
+                        if data_va_start < data_va_end {
+                            let data_file_start = file_offset + (data_va_start - segment_va);
+                            let data_len = data_va_end - data_va_start;
+                            big_buf = alloc::vec![0u8; data_len];
+                            if inode != 0 {
+                                let _ = crate::vfs::read_at_by_inode(path, inode, data_file_start, &mut big_buf);
+                            } else {
+                                let _ = crate::vfs::read_at(path, data_file_start, &mut big_buf);
                             }
                         }
 
-                        let kva = crate::mmu::phys_to_virt(page_frame.addr) as usize;
-                        for off in (0..0x1000_usize).step_by(64) {
-                            unsafe {
-                                core::arch::asm!("dc cvau, {}", in(reg) kva + off);
-                                core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                        let mut any_mapped = false;
+                        let mut cur_va = page_va;
+                        while cur_va < ra_end {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                                let pg_data_start = core::cmp::max(cur_va, data_va_start);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, data_va_end);
+                                if pg_data_start < pg_data_end {
+                                    let dst_off = pg_data_start - cur_va;
+                                    let src_off = pg_data_start - data_va_start;
+                                    let len = pg_data_end - pg_data_start;
+                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            big_buf.as_ptr().add(src_off),
+                                            (page_ptr as *mut u8).add(dst_off),
+                                            len,
+                                        );
+                                    }
+                                }
+
+                                let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                for off in (0..0x1000_usize).step_by(64) {
+                                    unsafe {
+                                        core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                        core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                                    }
+                                }
+
+                                let table_frames = unsafe {
+                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                };
+                                if let Some(proc) = crate::process::current_process() {
+                                    proc.address_space.track_user_frame(pf);
+                                    for tf in table_frames {
+                                        proc.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                                any_mapped = true;
+                            } else {
+                                break;
                             }
+                            cur_va += 0x1000;
                         }
+
                         unsafe {
                             core::arch::asm!("dsb ish");
                             core::arch::asm!("isb");
                         }
 
-                        let table_frames = unsafe {
-                            crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                        };
-                        if let Some(proc) = crate::process::current_process() {
-                            proc.address_space.track_user_frame(page_frame);
-                            for tf in table_frames {
-                                proc.address_space.track_page_table_frame(tf);
-                            }
+                        if any_mapped {
+                            return unsafe { (*frame).x0 };
                         }
-                        return unsafe { (*frame).x0 };
+                    } else {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                            let table_frames = unsafe {
+                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            if let Some(proc) = crate::process::current_process() {
+                                proc.address_space.track_user_frame(page_frame);
+                                for tf in table_frames {
+                                    proc.address_space.track_page_table_frame(tf);
+                                }
+                            }
+                            return unsafe { (*frame).x0 };
+                        }
                     }
                 } else {
                     crate::process::lazy_region_debug(far_usize);

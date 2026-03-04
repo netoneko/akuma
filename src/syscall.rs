@@ -354,6 +354,7 @@ pub mod nr {
     pub const SCHED_SETAFFINITY: u64 = 122; // Linux arm64 sched_setaffinity
     pub const SCHED_GETAFFINITY: u64 = 123; // Linux arm64 sched_getaffinity
     pub const TKILL: u64 = 130;          // Linux arm64 tkill
+    pub const PIDFD_OPEN: u64 = 434;     // Linux arm64 pidfd_open
     pub const CLOSE_RANGE: u64 = 436;    // Linux arm64 close_range
     pub const SYSINFO: u64 = 179;        // Linux arm64 sysinfo
     pub const CLOCK_GETRES: u64 = 114;   // Linux arm64 clock_getres
@@ -876,6 +877,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             // Stub: signal delivery not implemented.
             // Previously this killed the calling thread — must not do that.
             0
+        }
+        nr::PIDFD_OPEN => {
+            let target_pid = args[0] as u32;
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(64, "[syscall] pidfd_open(pid={})\n", target_pid);
+            }
+            ENOSYS
         }
         nr::CLOSE_RANGE => 0,
         nr::SYSINFO => sys_sysinfo(args[0] as usize),
@@ -2459,7 +2467,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    {
         let pid = crate::process::read_current_pid().unwrap_or(0);
         crate::safe_print!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
