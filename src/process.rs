@@ -2966,7 +2966,11 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
-    // Prepare full arguments (argv[0] = path/name)
+    let resolved = crate::vfs::resolve_symlinks(path);
+    let elf_path = &resolved;
+
+    // Prepare full arguments (argv[0] = original path so busybox-style
+    // multi-call binaries can identify which applet to run)
     let mut full_args = Vec::new();
     full_args.push(path.to_string());
     if let Some(arg_slice) = args {
@@ -2982,15 +2986,15 @@ pub fn spawn_process_with_channel_ext(
 
     // Try to read the ELF file; for large files that exceed the in-memory
     // limit, fall back to on-demand loading via read_at().
-    let mut process = match crate::fs::read_file(path) {
+    let mut process = match crate::fs::read_file(elf_path) {
         Ok(elf_data) => {
-            Process::from_elf(path, &full_args, &full_env, &elf_data)
+            Process::from_elf(elf_path, &full_args, &full_env, &elf_data)
                 .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
         }
         Err(_) => {
-            let file_size = crate::vfs::file_size(path)
-                .map_err(|e| alloc::format!("Failed to stat {}: {}", path, e))? as usize;
-            Process::from_elf_path(path, path, file_size, &full_args, &full_env)
+            let file_size = crate::vfs::file_size(elf_path)
+                .map_err(|e| alloc::format!("Failed to stat {}: {}", elf_path, e))? as usize;
+            Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env)
                 .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?
         }
     };
