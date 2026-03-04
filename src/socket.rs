@@ -707,5 +707,6 @@ pub mod libc_errno {
     pub const ETIMEDOUT: i32 = 110;
     pub const EDESTADDRREQ: i32 = 89;
     pub const EINPROGRESS: i32 = 115;
+    pub const ENOTCONN: i32 = 107;
     pub const ECONNREFUSED: i32 = 111;
 }

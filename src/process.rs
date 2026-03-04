@@ -409,8 +409,8 @@ pub enum FileDescriptor {
     DevUrandom,
     /// timerfd — reads return 8-byte expiration count
     TimerFd(u32),
-    /// epoll instance
-    EpollFd,
+    /// epoll instance (epoll_id into global EPOLL_TABLE)
+    EpollFd(u32),
 }
 
 /// Kernel file handle for open files
@@ -1357,6 +1357,38 @@ impl UserContext {
     }
 }
 
+// ============================================================================
+// Signal Infrastructure
+// ============================================================================
+
+pub const MAX_SIGNALS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignalHandler {
+    Default,
+    Ignore,
+    UserFn(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SignalAction {
+    pub handler: SignalHandler,
+    pub flags: u64,
+    pub mask: u64,
+    pub restorer: usize,
+}
+
+impl SignalAction {
+    pub const fn default() -> Self {
+        Self {
+            handler: SignalHandler::Default,
+            flags: 0,
+            mask: 0,
+            restorer: 0,
+        }
+    }
+}
+
 /// Memory regions for a process
 #[derive(Debug, Clone)]
 pub struct ProcessMemory {
@@ -1542,6 +1574,9 @@ pub struct Process {
 
     /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID)
     pub clear_child_tid: u64,
+
+    /// Per-process signal action table (sigaction storage)
+    pub signal_actions: [SignalAction; MAX_SIGNALS],
 }
 
 
@@ -1633,6 +1668,7 @@ impl Process {
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
+            signal_actions: [SignalAction::default(); MAX_SIGNALS],
         })
     }
 
@@ -1724,6 +1760,7 @@ impl Process {
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
+            signal_actions: [SignalAction::default(); MAX_SIGNALS],
         })
     }
 
@@ -2539,6 +2576,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: 0,
+        signal_actions: parent.signal_actions,
     });
     
     // 4. Perform memory copy
@@ -2755,6 +2793,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
+        signal_actions: parent.signal_actions,
     });
 
     let parent_tid = crate::threading::current_thread_id();

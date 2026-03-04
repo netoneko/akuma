@@ -144,6 +144,21 @@ fn us_to_timespec(us: u64, ptr: usize) {
     }
 }
 
+fn timerfd_can_read(timer_id: u32) -> bool {
+    let now = crate::timer::uptime_us();
+    TIMERFD_TABLE.lock().get(&timer_id).map_or(false, |state| {
+        if state.initial_us == 0 { return false; }
+        let elapsed = now.saturating_sub(state.armed_at_us);
+        if elapsed < state.initial_us { return false; }
+        let total = if state.interval_us > 0 {
+            1 + (elapsed - state.initial_us) / state.interval_us
+        } else {
+            1
+        };
+        total > state.expirations_consumed
+    })
+}
+
 // ============================================================================
 // Kernel Pipe Infrastructure
 // ============================================================================
@@ -264,6 +279,18 @@ fn pipe_set_reader_thread(id: u32, tid: usize) {
     });
 }
 
+fn pipe_can_read(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(false, |p| !p.buffer.is_empty() || p.write_count == 0)
+    })
+}
+
+fn pipe_can_write(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(false, |p| p.read_count > 0)
+    })
+}
+
 // ============================================================================
 // Kernel EventFd Infrastructure
 // ============================================================================
@@ -340,6 +367,39 @@ fn eventfd_is_nonblock(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().get(&id).map_or(false, |efd| efd.flags & EFD_NONBLOCK != 0)
     })
+}
+
+// ============================================================================
+// Kernel Epoll Infrastructure
+// ============================================================================
+
+struct EpollEntry {
+    events: u32,
+    data: u64,
+}
+
+struct EpollInstance {
+    interest_list: BTreeMap<u32, EpollEntry>,
+}
+
+static EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>> = Spinlock::new(BTreeMap::new());
+static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
+
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
+
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLL_CTL_MOD: i32 = 3;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
 }
 
 pub fn eventfd_close(id: u32) {
@@ -497,6 +557,13 @@ pub mod nr {
     pub const TIMERFD_SETTIME: u64 = 86; // Linux arm64 timerfd_settime
     pub const TIMERFD_GETTIME: u64 = 87; // Linux arm64 timerfd_gettime
     pub const CAPGET: u64 = 90;           // Linux arm64 capget
+    pub const IO_URING_SETUP: u64 = 425;   // Linux arm64 io_uring_setup
+    pub const IO_URING_ENTER: u64 = 426;   // Linux arm64 io_uring_enter
+    pub const IO_URING_REGISTER: u64 = 427; // Linux arm64 io_uring_register
+    pub const INOTIFY_INIT1: u64 = 26;     // Linux arm64 inotify_init1
+    pub const INOTIFY_ADD_WATCH: u64 = 27; // Linux arm64 inotify_add_watch
+    pub const INOTIFY_RM_WATCH: u64 = 28;  // Linux arm64 inotify_rm_watch
+    pub const ACCEPT4: u64 = 242;          // Linux arm64 accept4
 }
 
 /// Thread CPU statistics for top command
@@ -536,6 +603,7 @@ const EAGAIN: u64 = (-11i64) as u64;
 const ENOMEM: u64 = (-12i64) as u64;
 const EAFNOSUPPORT: u64 = (-97i64) as u64;
 const EINPROGRESS: u64 = (-115i64) as u64;
+const ETIMEDOUT: u64 = (-110i64) as u64;
 
 /// Encode an exit code into Linux-compatible wait status.
 /// Negative codes are treated as signal kills (e.g. -11 → SIGSEGV).
@@ -909,14 +977,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::BIND => sys_bind(args[0] as u32, args[1], args[2] as usize),
         nr::LISTEN => sys_listen(args[0] as u32, args[1] as i32),
         nr::ACCEPT => sys_accept(args[0] as u32, args[1], args[2]),
+        nr::ACCEPT4 => sys_accept4(args[0] as u32, args[1], args[2], args[3] as u32),
         nr::CONNECT => sys_connect(args[0] as u32, args[1], args[2] as usize),
         nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
         nr::GETSOCKNAME => sys_getsockname(args[0] as u32, args[1], args[2]),
-        nr::GETPEERNAME => {
-            crate::safe_print!(96, "[stub] getpeername(fd={})\n", args[0]);
-            0
-        }
+        nr::GETPEERNAME => sys_getpeername(args[0] as u32, args[1], args[2]),
         nr::SETSOCKOPT => 0, // stub — no socket options to set
         nr::GETSOCKOPT => sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
@@ -962,10 +1028,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT_GROUP => sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
-        nr::RT_SIGACTION => {
-            crate::safe_print!(96, "[stub] rt_sigaction(sig={}, act={:#x})\n", args[0], args[1]);
-            0
-        }
+        nr::RT_SIGACTION => sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
@@ -1040,10 +1103,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             }
             0
         }
-        nr::TKILL => {
-            crate::safe_print!(96, "[stub] tkill(tid={}, sig={})\n", args[0], args[1]);
-            0
-        }
+        nr::TKILL => sys_tkill(args[0] as u32, args[1] as u32),
         nr::PIDFD_OPEN => {
             let target_pid = args[0] as u32;
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -1089,6 +1149,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             }
             0
         }
+        nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => ENOSYS,
+        nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => ENOSYS,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1711,7 +1773,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 8
             } else { EINVAL }
         }
-        crate::process::FileDescriptor::EpollFd => EINVAL,
+        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => !0u64
     }
 }
@@ -1746,7 +1808,7 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
             count as u64
         }
         crate::process::FileDescriptor::TimerFd(_) => EAGAIN,
-        crate::process::FileDescriptor::EpollFd => EINVAL,
+        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => EBADF
     }
 }
@@ -2286,7 +2348,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::TimerFd(_)) | Some(crate::process::FileDescriptor::EpollFd) => {
+        Some(crate::process::FileDescriptor::TimerFd(_)) | Some(crate::process::FileDescriptor::EpollFd(_)) => {
             let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
@@ -3191,6 +3253,31 @@ fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     !0u64
 }
 
+fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+    if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
+    if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
+    if let Some(idx) = get_socket_from_fd(fd) {
+        if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
+            if let Some(proc) = crate::process::current_process() {
+                if addr_ptr != 0 {
+                    unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
+                }
+                let new_fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(new_idx));
+                const SOCK_CLOEXEC: u32 = 0x80000;
+                const SOCK_NONBLOCK: u32 = 0x800;
+                if flags & SOCK_CLOEXEC != 0 {
+                    proc.set_cloexec(new_fd);
+                }
+                if flags & SOCK_NONBLOCK != 0 {
+                    proc.set_nonblock(new_fd);
+                }
+                return new_fd as u64;
+            }
+        }
+    }
+    !0u64
+}
+
 fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -3238,6 +3325,56 @@ fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         }
     }
     0
+}
+
+fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if addr_ptr == 0 || len_ptr == 0 { return (-libc_errno::EINVAL as i64) as u64; }
+    if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let remote = socket::with_socket(idx, |sock| {
+        match &sock.inner {
+            socket::SocketType::Stream(h) => {
+                crate::smoltcp_net::with_network(|net| {
+                    let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                    s.remote_endpoint().map(|ep| {
+                        let ip = if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr {
+                            addr.octets()
+                        } else {
+                            [0; 4]
+                        };
+                        (ip, ep.port)
+                    })
+                }).flatten()
+            }
+            socket::SocketType::Datagram { peer, .. } => {
+                peer.map(|p| (p.ip, p.port))
+            }
+            _ => None,
+        }
+    }).flatten();
+
+    match remote {
+        Some((ip, port)) => {
+            let sa = SockAddrIn {
+                sin_family: 2,
+                sin_port: port.to_be(),
+                sin_addr: u32::from_ne_bytes(ip),
+                sin_zero: [0u8; 8],
+            };
+            if validate_user_ptr(addr_ptr, core::mem::size_of::<SockAddrIn>()) {
+                unsafe {
+                    core::ptr::write(addr_ptr as *mut SockAddrIn, sa);
+                    core::ptr::write(len_ptr as *mut u32, core::mem::size_of::<SockAddrIn>() as u32);
+                }
+            }
+            0
+        }
+        None => (-libc_errno::ENOTCONN as i64) as u64,
+    }
 }
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
@@ -3307,14 +3444,57 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, a
 
 fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
-fn sys_getsockopt(_fd: u32, _level: i32, _optname: i32, optval: u64, optlen: u64) -> u64 {
-    if optval != 0 && optlen != 0 {
-        if !validate_user_ptr(optlen, 4) { return EFAULT; }
-        let len = unsafe { core::ptr::read(optlen as *const u32) } as usize;
-        if len >= 4 && validate_user_ptr(optval, 4) {
-            unsafe { core::ptr::write(optval as *mut i32, 0); }
-            unsafe { core::ptr::write(optlen as *mut u32, 4); }
+fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
+    const SOL_SOCKET: i32 = 1;
+    const SO_ERROR: i32 = 4;
+    const SO_SNDBUF: i32 = 7;
+    const SO_RCVBUF: i32 = 8;
+    const SO_KEEPALIVE: i32 = 9;
+    const SO_TYPE: i32 = 3;
+
+    if optval == 0 || optlen == 0 { return 0; }
+    if !validate_user_ptr(optlen, 4) { return EFAULT; }
+    let len = unsafe { core::ptr::read(optlen as *const u32) } as usize;
+    if len < 4 || !validate_user_ptr(optval, 4) { return EFAULT; }
+
+    let val: i32 = if level == SOL_SOCKET {
+        match optname {
+            SO_ERROR => {
+                if let Some(idx) = get_socket_from_fd(fd) {
+                    socket::with_socket(idx, |sock| {
+                        if let socket::SocketType::Stream(h) = &sock.inner {
+                            crate::smoltcp_net::with_network(|net| {
+                                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                                if s.is_active() || s.may_send() { 0 }
+                                else { libc_errno::ECONNREFUSED }
+                            }).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    }).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            SO_TYPE => {
+                if let Some(idx) = get_socket_from_fd(fd) {
+                    if socket::is_udp_socket(idx) { 2 } else { 1 }
+                } else {
+                    1
+                }
+            }
+            SO_SNDBUF => 131072,
+            SO_RCVBUF => 131072,
+            SO_KEEPALIVE => 0,
+            _ => 0,
         }
+    } else {
+        0
+    };
+
+    unsafe {
+        core::ptr::write(optval as *mut i32, val);
+        core::ptr::write(optlen as *mut u32, 4);
     }
     0
 }
@@ -3683,25 +3863,317 @@ fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
 
 fn sys_epoll_create1(_flags: u32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd);
-        crate::safe_print!(96, "[stub] epoll_create1() = fd {}\n", fd);
+        let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
+        EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
+            interest_list: BTreeMap::new(),
+        });
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd(epoll_id));
+        crate::safe_print!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
         fd as u64
     } else {
         EBADF
     }
 }
 
-fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, _event: usize) -> u64 {
-    crate::safe_print!(96, "[stub] epoll_ctl(epfd={}, op={}, fd={})\n", epfd, op, fd);
+fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
+    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let mut table = EPOLL_TABLE.lock();
+    let instance = match table.get_mut(&epoll_id) {
+        Some(inst) => inst,
+        None => return EBADF,
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            if instance.interest_list.contains_key(&fd) {
+                return EEXIST;
+            }
+            let ev_events = { ev.events };
+            let ev_data = { ev.data };
+            instance.interest_list.insert(fd, EpollEntry {
+                events: ev_events,
+                data: ev_data,
+            });
+            crate::safe_print!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            0
+        }
+        EPOLL_CTL_MOD => {
+            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            let ev_events = { ev.events };
+            let ev_data = { ev.data };
+            match instance.interest_list.get_mut(&fd) {
+                Some(entry) => {
+                    entry.events = ev_events;
+                    entry.data = ev_data;
+                    0
+                }
+                None => ENOENT,
+            }
+        }
+        EPOLL_CTL_DEL => {
+            match instance.interest_list.remove(&fd) {
+                Some(_) => 0,
+                None => ENOENT,
+            }
+        }
+        _ => EINVAL,
+    }
+}
+
+fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
+    let fd_entry = crate::process::current_process().and_then(|p| p.get_fd(fd_num));
+    let fd_entry = match fd_entry {
+        Some(e) => e,
+        None => return EPOLLHUP | EPOLLERR,
+    };
+
+    let mut ready = 0u32;
+
+    match fd_entry {
+        crate::process::FileDescriptor::Socket(idx) => {
+            if socket::is_udp_socket(idx) {
+                if let Some(handle) = socket_get_udp_handle(idx) {
+                    if requested & EPOLLIN != 0 && crate::smoltcp_net::udp_can_recv(handle) {
+                        ready |= EPOLLIN;
+                    }
+                    if requested & EPOLLOUT != 0 && crate::smoltcp_net::udp_can_send(handle) {
+                        ready |= EPOLLOUT;
+                    }
+                }
+            } else {
+                if requested & EPOLLIN != 0 && socket_can_recv_tcp(idx) {
+                    ready |= EPOLLIN;
+                }
+                if requested & EPOLLOUT != 0 && socket_can_send_tcp(idx) {
+                    ready |= EPOLLOUT;
+                }
+            }
+        }
+        crate::process::FileDescriptor::EventFd(efd_id) => {
+            if requested & EPOLLIN != 0 && eventfd_can_read(efd_id) {
+                ready |= EPOLLIN;
+            }
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
+        crate::process::FileDescriptor::PipeRead(pipe_id) => {
+            if requested & EPOLLIN != 0 && pipe_can_read(pipe_id) {
+                ready |= EPOLLIN;
+            }
+        }
+        crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+            if requested & EPOLLOUT != 0 && pipe_can_write(pipe_id) {
+                ready |= EPOLLOUT;
+            }
+        }
+        crate::process::FileDescriptor::TimerFd(timer_id) => {
+            if requested & EPOLLIN != 0 && timerfd_can_read(timer_id) {
+                ready |= EPOLLIN;
+            }
+        }
+        crate::process::FileDescriptor::Stdin => {
+            if requested & EPOLLIN != 0 {
+                if let Some(ch) = crate::process::current_channel() {
+                    if ch.has_stdin_data() {
+                        ready |= EPOLLIN;
+                    }
+                }
+            }
+        }
+        crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
+        _ => {
+            if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
+            if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }
+        }
+    }
+
+    ready
+}
+
+fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+    if maxevents <= 0 { return EINVAL; }
+    let maxevents = maxevents as usize;
+    let out_size = maxevents * 12;
+    if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
+
+    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let timeout_us = if timeout > 0 {
+        (timeout as u64) * 1000
+    } else {
+        0
+    };
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        crate::smoltcp_net::poll();
+
+        let interest_snapshot: Vec<(u32, u32, u64)> = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(&epoll_id) {
+                Some(inst) => inst.interest_list.iter()
+                    .map(|(&fd, entry)| (fd, entry.events, entry.data))
+                    .collect(),
+                None => return EBADF,
+            }
+        };
+
+        let mut ready_count = 0usize;
+        for &(fd, requested_events, data) in &interest_snapshot {
+            if ready_count >= maxevents { break; }
+
+            let revents = epoll_check_fd_readiness(fd, requested_events);
+            if revents != 0 {
+                let out_event = EpollEvent { events: revents, data };
+                unsafe {
+                    core::ptr::write_unaligned(
+                        (events_ptr + ready_count * 12) as *mut EpollEvent,
+                        out_event,
+                    );
+                }
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            return ready_count as u64;
+        }
+
+        if timeout == 0 {
+            return 0;
+        }
+
+        if timeout > 0 {
+            let elapsed = crate::timer::uptime_us() - start_time;
+            if elapsed >= timeout_us {
+                return 0;
+            }
+        }
+
+        if crate::process::is_current_interrupted() {
+            return EINTR;
+        }
+
+        crate::threading::yield_now();
+    }
+}
+
+// ============================================================================
+// Signal Syscalls
+// ============================================================================
+
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
+#[repr(C)]
+struct KernelSigaction {
+    sa_handler: usize,
+    sa_flags: u64,
+    sa_restorer: usize,
+    sa_mask: u64,
+}
+
+fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usize) -> u64 {
+    if sig == 0 || sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+    if sig == 9 || sig == 19 { return EINVAL; } // SIGKILL/SIGSTOP cannot be caught
+    let sigset_ok = sigsetsize == 8;
+
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return ENOSYS,
+    };
+
+    let idx = (sig - 1) as usize;
+
+    if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
+        let old = &proc.signal_actions[idx];
+        let handler_val = match old.handler {
+            crate::process::SignalHandler::Default => SIG_DFL,
+            crate::process::SignalHandler::Ignore => SIG_IGN,
+            crate::process::SignalHandler::UserFn(addr) => addr,
+        };
+        let out = KernelSigaction {
+            sa_handler: handler_val,
+            sa_flags: old.flags,
+            sa_restorer: old.restorer,
+            sa_mask: if sigset_ok { old.mask } else { 0 },
+        };
+        unsafe { core::ptr::write_unaligned(oldact_ptr as *mut KernelSigaction, out); }
+    }
+
+    if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
+        let sa = unsafe { core::ptr::read_unaligned(act_ptr as *const KernelSigaction) };
+        let handler = match sa.sa_handler {
+            SIG_DFL => crate::process::SignalHandler::Default,
+            SIG_IGN => crate::process::SignalHandler::Ignore,
+            addr => crate::process::SignalHandler::UserFn(addr),
+        };
+        proc.signal_actions[idx] = crate::process::SignalAction {
+            handler,
+            flags: sa.sa_flags,
+            mask: if sigset_ok { sa.sa_mask } else { 0 },
+            restorer: sa.sa_restorer,
+        };
+    }
+
     0
 }
 
-fn sys_epoll_pwait(epfd: u32, _events: usize, maxevents: i32, timeout: i32) -> u64 {
-    crate::safe_print!(96, "[stub] epoll_pwait(epfd={}, max={}, timeout={})\n", epfd, maxevents, timeout);
-    if timeout != 0 {
-        crate::threading::yield_now();
+fn signal_is_fatal_default(sig: u32) -> bool {
+    matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
+}
+
+fn sys_tkill(tid: u32, sig: u32) -> u64 {
+    if sig == 0 { return 0; }
+    if sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+
+    crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
+
+    if sig == 9 {
+        // SIGKILL is always fatal, cannot be caught or ignored
+        sys_exit_group(-(sig as i32));
+        return 0;
     }
-    0
+
+    let handler = crate::process::current_process()
+        .map(|p| {
+            let idx = (sig - 1) as usize;
+            p.signal_actions[idx].handler
+        })
+        .unwrap_or(crate::process::SignalHandler::Default);
+
+    match handler {
+        crate::process::SignalHandler::Ignore => 0,
+        crate::process::SignalHandler::Default => {
+            if signal_is_fatal_default(sig) {
+                sys_exit_group(-(sig as i32));
+            }
+            0
+        }
+        crate::process::SignalHandler::UserFn(_) => {
+            // True userspace signal delivery not yet implemented.
+            // For fatal signals sent to self (abort pattern), terminate cleanly.
+            if sig == 6 {
+                sys_exit_group(-(sig as i32));
+            }
+            0
+        }
+    }
 }
 
 fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
@@ -3791,32 +4263,98 @@ fn timerfd_read(timer_id: u32) -> u64 {
     new_expirations
 }
 
-/// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)
-pub fn futex_wake(_uaddr: usize, _max_wake: i32) {
-    crate::threading::yield_now();
+// ============================================================================
+// Futex Wait Queue Infrastructure
+// ============================================================================
+
+static FUTEX_WAITERS: Spinlock<BTreeMap<usize, Vec<usize>>> = Spinlock::new(BTreeMap::new());
+
+fn futex_do_wake(uaddr: usize, max_wake: u32) -> u64 {
+    let mut waiters = FUTEX_WAITERS.lock();
+    let woken = if let Some(queue) = waiters.get_mut(&uaddr) {
+        let count = (max_wake as usize).min(queue.len());
+        let to_wake: Vec<usize> = queue.drain(..count).collect();
+        if queue.is_empty() {
+            waiters.remove(&uaddr);
+        }
+        drop(waiters);
+        for tid in &to_wake {
+            crate::threading::get_waker_for_thread(*tid).wake();
+        }
+        to_wake.len() as u64
+    } else {
+        0
+    };
+    woken
 }
 
-fn sys_futex(uaddr: usize, op: i32, val: u32, _timeout: u64, _uaddr2: usize, _val3: u32) -> u64 {
+/// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)
+pub fn futex_wake(uaddr: usize, max_wake: i32) {
+    futex_do_wake(uaddr, max_wake as u32);
+}
+
+fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, _uaddr2: usize, _val3: u32) -> u64 {
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
+    const FUTEX_WAIT_BITSET: i32 = 9;
+    const FUTEX_WAKE_BITSET: i32 = 10;
     const FUTEX_PRIVATE_FLAG: i32 = 128;
+    const FUTEX_CLOCK_REALTIME: i32 = 256;
 
-    let cmd = op & !(FUTEX_PRIVATE_FLAG);
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
     match cmd {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let current = unsafe { (uaddr as *const AtomicU32).as_ref() };
             if let Some(atomic) = current {
                 if atomic.load(Ordering::SeqCst) != val {
                     return EAGAIN;
                 }
+            } else {
+                return EFAULT;
             }
-            crate::threading::yield_now();
+
+            let tid = crate::threading::current_thread_id();
+
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                let queue = waiters.entry(uaddr).or_insert_with(Vec::new);
+                queue.push(tid);
+            }
+
+            let deadline = if timeout_ptr != 0 && validate_user_ptr(timeout_ptr, 16) {
+                let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+                let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
+                if cmd == FUTEX_WAIT_BITSET {
+                    let now_us = crate::timer::uptime_us();
+                    if timeout_us > now_us { timeout_us } else { now_us }
+                } else {
+                    crate::timer::uptime_us() + timeout_us
+                }
+            } else {
+                u64::MAX
+            };
+
+            crate::threading::schedule_blocking(deadline);
+
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                if let Some(queue) = waiters.get_mut(&uaddr) {
+                    queue.retain(|&t| t != tid);
+                    if queue.is_empty() {
+                        waiters.remove(&uaddr);
+                    }
+                }
+            }
+
+            if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {
+                return ETIMEDOUT;
+            }
+
             0
         }
-        FUTEX_WAKE => {
-            crate::threading::yield_now();
-            val as u64
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            futex_do_wake(uaddr, val)
         }
         _ => 0,
     }
