@@ -1211,12 +1211,12 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 } else {
                     crate::process::lazy_region_debug(far_usize);
                     let pid = crate::process::read_current_pid().unwrap_or(0);
-                    crate::safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
+                    crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }
             }
 
             let frame_ref = unsafe { &*frame };
-            crate::safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
+            crate::tprint!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
@@ -1319,13 +1319,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     }
                 } else {
                     crate::process::lazy_region_debug(far_usize);
-                    crate::safe_print!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
+                    crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                 }
             }
 
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             let frame_ref = unsafe { &*frame };
-            crate::safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
+            crate::tprint!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);

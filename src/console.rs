@@ -212,6 +212,21 @@ macro_rules! safe_print {
     }};
 }
 
+/// Like safe_print but prepends a `[T<secs>.<cs>]` uptime timestamp.
+#[macro_export]
+macro_rules! tprint {
+    ($size:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let __us = $crate::timer::uptime_us();
+        let __s = __us / 1_000_000;
+        let __cs = (__us % 1_000_000) / 10_000;
+        let mut writer = $crate::console::StackWriter::<$size>::new();
+        let _ = write!(writer, "[T{}.{:02}] ", __s, __cs);
+        let _ = write!(writer, $($arg)*);
+        writer.flush();
+    }};
+}
+
 /// Check if a character is available for reading
 pub fn has_char() -> bool {
     UART.has_data()

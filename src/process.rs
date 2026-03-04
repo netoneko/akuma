@@ -1039,7 +1039,7 @@ pub fn lazy_region_debug(va: usize) {
     crate::irq::with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            crate::safe_print!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
+            crate::tprint!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
                 pid, va, regions.len());
             for (i, r) in regions.iter().enumerate() {
                 if i > 0 { crate::safe_print!(8, ","); }
@@ -1047,7 +1047,7 @@ pub fn lazy_region_debug(va: usize) {
             }
             crate::safe_print!(8, "]\n");
         } else {
-            crate::safe_print!(64, "[DP] lazy miss: pid={} va={:#x} no entry in table\n", pid, va);
+            crate::tprint!(64, "[DP] lazy miss: pid={} va={:#x} no entry in table\n", pid, va);
         }
     });
 }
@@ -1147,7 +1147,7 @@ fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize
     });
 
     if let Some((op, freed_start, freed_pages)) = result {
-        crate::safe_print!(128, "[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)\n",
+        crate::tprint!(128, "[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)\n",
             op as char, pid, freed_start, freed_pages * 4096, freed_pages);
         Some((freed_start, freed_pages))
     } else {
@@ -1163,7 +1163,7 @@ pub fn clear_lazy_regions(pid: Pid) {
         count
     });
     if count > 0 {
-        crate::safe_print!(64, "[LR!] clear pid={} ({} regions)\n", pid, count);
+        crate::tprint!(64, "[LR!] clear pid={} ({} regions)\n", pid, count);
     }
 }
 
@@ -1174,7 +1174,7 @@ pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
             let cloned = regions.clone();
             let len = cloned.len();
             table.insert(to_pid, cloned);
-            crate::safe_print!(64, "[LR] clone pid={}->{} ({} regions)\n", from_pid, to_pid, len);
+            crate::tprint!(64, "[LR] clone pid={}->{} ({} regions)\n", from_pid, to_pid, len);
         }
     });
 }
@@ -2390,11 +2390,12 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 
         let start_us = lookup_process(pid).map(|p| p.start_time_us).unwrap_or(0);
         let elapsed_us = crate::timer::uptime_us().saturating_sub(start_us);
-        let elapsed_ms = elapsed_us / 1000;
+        let secs = elapsed_us / 1_000_000;
+        let frac = (elapsed_us % 1_000_000) / 10_000; // centiseconds
 
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
-        crate::safe_print!(128, "[Process] PID {} thread {} exited ({}) [{}ms]\n", pid, tid, exit_code, elapsed_ms);
+        crate::tprint!(128, "[Process] PID {} thread {} exited ({}) [{}.{:02}s]\n", pid, tid, exit_code, secs, frac);
     } else {
         crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
     }

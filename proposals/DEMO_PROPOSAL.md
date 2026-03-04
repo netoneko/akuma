@@ -230,6 +230,96 @@ Run two boxes simultaneously — one for the greeting API, one for meow — demo
 
 Use Firecracker's REST API to hot-plug a second VirtIO-blk device containing a pre-built container rootfs, avoiding the OCI pull entirely for faster cold starts.
 
+## Pre-Firecracker Validation (on QEMU)
+
+Before touching a Graviton instance, validate the Firecracker-critical paths on QEMU. Each test removes one QEMU-specific dependency that Firecracker does not provide.
+
+### Test 1 — Boot without semihosting
+
+Remove `-semihosting` from `scripts/run.sh`. If Akuma uses semihosting for debug output or exit, those code paths need a UART-only fallback.
+
+```bash
+# In scripts/run.sh, remove the -semihosting flag and boot
+qemu-system-aarch64 ... # everything except -semihosting
+```
+
+**Pass:** Kernel boots, serial output works, acceptance tests pass.
+
+### Test 2 — Boot with QEMU-generated FDT
+
+Akuma currently loads a custom FDT via `-device loader,file=virt.dtb,addr=0x4ff00000`. Firecracker generates its own FDT and passes the address in register `x0` (ARM64 boot protocol). Remove the custom DTB loader and let QEMU generate one.
+
+```bash
+# Remove: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on
+qemu-system-aarch64 ... # without the DTB loader device
+```
+
+If boot fails, the FDT address is hardcoded somewhere — fix it to read from `x0`.
+
+**Pass:** Kernel parses QEMU-generated FDT, discovers UART/GIC/VirtIO devices, acceptance tests pass.
+
+### Test 3 — Boot as PE Image (ARM64 Image format)
+
+Firecracker on aarch64 expects a PE-formatted kernel image with the standard 64-byte ARM64 header. Add an `objcopy` step and verify QEMU can load it:
+
+```bash
+aarch64-linux-gnu-objcopy -O binary target/.../akuma akuma.bin
+# Verify QEMU boots with the binary image
+qemu-system-aarch64 -kernel akuma.bin ...
+```
+
+**Pass:** Same behavior as loading the ELF directly.
+
+### Test 4 — Verify GICv2 (already used)
+
+Firecracker uses GICv2. Akuma already targets GICv2 on QEMU virt — this is a confirmation test, not a change.
+
+```bash
+qemu-system-aarch64 -machine virt,gic-version=2 ...
+```
+
+**Pass:** Interrupts, timers, VirtIO all work.
+
+### Test 5 — Full acceptance suite without QEMU-specific features
+
+Combine tests 1-3: no semihosting, no custom DTB, PE image format. Run the full acceptance suite:
+
+```
+busybox ls /
+elftest
+quickjs /public/cgi-bin/akuma.js
+```
+
+**Pass:** All three commands succeed. The kernel is now Firecracker-ready.
+
+### Debugging on Firecracker
+
+If something fails after the pre-validation passes, three debugging tools are available:
+
+| Tool | What it shows | When to use |
+|------|--------------|-------------|
+| **Serial console** | Akuma's `console::print` output (same as QEMU) | First thing to check — did the kernel boot? |
+| **Firecracker logs** | VMM-level events: device init, memory mapping, VirtIO errors | Kernel didn't boot at all — what did the VMM see? |
+| **GDB remote attach** | Full symbol-level debugging of the guest kernel | Kernel panics or hangs — set breakpoints, inspect state |
+
+Firecracker logs are configured in the launch JSON:
+
+```json
+{
+  "logger": {
+    "log_path": "/tmp/firecracker.log",
+    "level": "Debug"
+  }
+}
+```
+
+GDB attach (if needed):
+
+```bash
+firecracker --config-file config.json --gdb-socket /tmp/fc-gdb.sock
+gdb-multiarch target/aarch64-unknown-none/release/akuma -ex "target remote /tmp/fc-gdb.sock"
+```
+
 ## Success Criteria
 
 1. Akuma boots under Firecracker on a Graviton EC2 instance

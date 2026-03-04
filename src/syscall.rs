@@ -2110,7 +2110,7 @@ fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
     if flags & EFD_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }
-    crate::safe_print!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
+    crate::tprint!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
     fd as u64
 }
 
@@ -2610,7 +2610,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) 
     const CLONE_VFORK: u64 = 0x4000;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+        crate::tprint!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
     // CLONE_THREAD | CLONE_VM — pthread_create
@@ -2679,7 +2679,7 @@ fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+        crate::tprint!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
     sys_clone(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid)
@@ -2728,7 +2728,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 
     {
         let pid = crate::process::read_current_pid().unwrap_or(0);
-        crate::safe_print!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+        crate::tprint!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
 
     // Parse envp from user space
@@ -3670,34 +3670,37 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
     const MAP_NORESERVE: u32 = 0x4000;
+    const MAP_FIXED_NOREPLACE: u32 = 0x100000;
     const PROT_NONE: u32 = 0;
 
     let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
+    let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
     let proc = match crate::process::current_process() {
         Some(p) => p,
         None => return !0u64,
     };
 
-    let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
+    let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
-        // MAP_FIXED overwrites any existing mappings in the range.
-        // Remove overlapping lazy regions so they don't shadow the new mapping.
-        let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-        let _ = crate::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
-        for i in 0..pages {
-            let va = addr + i * 4096;
-            let _ = proc.address_space.unmap_page(va);
+        if is_fixed {
+            // MAP_FIXED overwrites any existing mappings in the range.
+            let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+            let _ = crate::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
+            for i in 0..pages {
+                let va = addr + i * 4096;
+                let _ = proc.address_space.unmap_page(va);
+            }
         }
+        // Both MAP_FIXED and MAP_FIXED_NOREPLACE use the exact address
         addr
     } else {
         match proc.memory.alloc_mmap(pages * 4096) {
             Some(a) => a,
             None => {
-                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                    crate::safe_print!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
-                        proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
-                }
+                crate::tprint!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                    proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
                 return !0u64;
             }
         }
@@ -3715,10 +3718,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
         // Use address-space owner PID so all CLONE_VM threads share lazy regions
         let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
         let count = crate::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-            crate::safe_print!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
-                proc.pid, len, prot, flags, mmap_addr, count);
-        }
+        crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
+            proc.pid, len, prot, flags, mmap_addr, count);
         return mmap_addr as u64;
     }
 
@@ -3736,7 +3737,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
             proc.address_space.track_user_frame(frame);
         } else {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::safe_print!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
+                crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
                     proc.pid, len, i, pages);
             }
             return !0u64;
@@ -3771,8 +3772,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
                 let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
             }
         }
-    } else if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-        crate::safe_print!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+    } else {
+        crate::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
             proc.pid, len, prot, flags, mmap_addr);
     }
 
@@ -3849,7 +3850,7 @@ fn sys_sysinfo(info_ptr: usize) -> u64 {
         let ptr = info_ptr as *mut u64;
         core::ptr::write(ptr.add(0), 3600);                  // uptime
         // loads[3] at offsets 1,2,3 — left as 0
-        core::ptr::write(ptr.add(4), 256 * 1024 * 1024);     // totalram
+        core::ptr::write(ptr.add(4), 1024 * 1024 * 1024u64);  // totalram — report 1GB so V8 reserves a large enough heap cage
         core::ptr::write(ptr.add(5), free_pages * 4096);      // freeram
         // sharedram, bufferram, totalswap, freeswap at 6,7,8,9 — 0
         // procs (u16) at byte offset 80
@@ -3882,7 +3883,7 @@ fn sys_epoll_create1(_flags: u32) -> u64 {
             interest_list: BTreeMap::new(),
         });
         let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd(epoll_id));
-        crate::safe_print!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
+        crate::tprint!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
         fd as u64
     } else {
         EBADF
@@ -3914,7 +3915,7 @@ fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
                 events: ev_events,
                 data: ev_data,
             });
-            crate::safe_print!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
             0
         }
         EPOLL_CTL_MOD => {
@@ -4434,14 +4435,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if let Some(proc) = crate::process::current_process() {
         for i in 0..pages {
             let va = addr + i * 4096;
-            if proc.address_space.update_page_flags(va, new_flags).is_err() || !proc.address_space.is_mapped(va) {
-                if prot != 0 {
-                    if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-                        unsafe { crate::mmu::map_user_page(va, frame.addr, new_flags); }
-                        proc.address_space.track_user_frame(frame);
-                    }
-                }
+            if proc.address_space.is_mapped(va) {
+                let _ = proc.address_space.update_page_flags(va, new_flags);
             }
+            // Unmapped pages are left alone — demand paging will allocate
+            // them with the correct flags on first access (matching Linux
+            // behavior where mprotect only changes VMA flags, not PTEs).
         }
         if adding_exec {
             // Flush data cache and invalidate instruction cache for JIT code.
