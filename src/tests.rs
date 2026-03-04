@@ -3805,10 +3805,9 @@ fn test_eager_munmap_prefix_preserves_suffix() -> bool {
     pass
 }
 
-/// Suffix munmap of an eager region: addr != start, so current code is a no-op.
-/// Documents the behavior (no crash, but leaked pages).
+/// Suffix munmap of an eager region: frees last N pages, preserves the prefix.
 fn test_eager_munmap_suffix_preserves_prefix() -> bool {
-    console::print("\n[TEST] Bug 10: munmap suffix — current code is no-op (safe leak)\n");
+    console::print("\n[TEST] Bug 10: munmap suffix of eager region preserves prefix\n");
 
     let pages = 127usize;
     let keep = 100usize;
@@ -3833,18 +3832,19 @@ fn test_eager_munmap_suffix_preserves_prefix() -> bool {
         &mut mmap_regions, suffix_addr, trim * 4096,
     );
 
-    let no_match = matched.is_none();
-    let original_intact = mmap_regions.iter().any(|(start, fr)| {
-        *start == base && fr.len() == pages
+    let did_match = matched.is_some();
+    let freed_correct = freed_count == trim;
+    let prefix_intact = mmap_regions.iter().any(|(start, fr)| {
+        *start == base && fr.len() == keep
     });
 
     for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
 
-    let pass = no_match && original_intact;
+    let pass = did_match && freed_correct && prefix_intact;
     if !pass {
         crate::safe_print!(128,
-            "  matched={:?} freed={} original_intact={}\n",
-            matched, freed_count, original_intact);
+            "  matched={:?} freed={} (expected {}) prefix_intact={}\n",
+            matched, freed_count, trim, prefix_intact);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
