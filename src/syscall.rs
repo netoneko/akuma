@@ -564,6 +564,7 @@ pub mod nr {
     pub const INOTIFY_ADD_WATCH: u64 = 27; // Linux arm64 inotify_add_watch
     pub const INOTIFY_RM_WATCH: u64 = 28;  // Linux arm64 inotify_rm_watch
     pub const ACCEPT4: u64 = 242;          // Linux arm64 accept4
+    pub const TIMES: u64 = 153;            // Linux arm64 times
 }
 
 /// Thread CPU statistics for top command
@@ -1073,6 +1074,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETITIMER => 0,
         nr::MEMBARRIER => 0,
         nr::PRCTL => 0,
+        nr::TIMES => sys_times(args[0] as usize),
         nr::GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => 0,
         nr::PROCESS_VM_READV => ENOSYS,
@@ -4383,6 +4385,22 @@ fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64
         }
     }
     0
+}
+
+fn sys_times(buf_ptr: usize) -> u64 {
+    // struct tms has four clock_t fields (8 bytes each = 32 bytes on aarch64).
+    // Fields are in USER_HZ ticks (100 ticks/second).
+    // We don't track per-process CPU time, so utime/stime are reported as zero.
+    // The return value is the elapsed real time in USER_HZ ticks since boot,
+    // which is what tools like `busybox time` use for "real" time reporting.
+    if buf_ptr != 0 {
+        const TMS_SIZE: usize = 32;
+        if !validate_user_ptr(buf_ptr as u64, TMS_SIZE) { return EFAULT; }
+        unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, TMS_SIZE); }
+    }
+    // uptime_us / 10_000 converts microseconds to centiseconds (USER_HZ=100)
+    let uptime_us = crate::timer::uptime_us();
+    (uptime_us / 10_000) as u64
 }
 
 fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
