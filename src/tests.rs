@@ -3272,6 +3272,7 @@ fn make_test_process(
         channel: None, delegate_pid: None, clear_child_tid: 0,
         signal_actions: [crate::process::SignalAction::default(); crate::process::MAX_SIGNALS],
         start_time_us: 0,
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
     })
 }
 

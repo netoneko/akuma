@@ -987,6 +987,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
+    if let Some(proc) = crate::process::current_process() {
+        proc.last_syscall.store(syscall_num, core::sync::atomic::Ordering::Relaxed);
+    }
+
     syscall_counters::inc_total();
     match syscall_num {
         nr::MMAP => { syscall_counters::inc_mmap(((args[1] as usize) + 4095) / 4096); }
@@ -1898,17 +1902,16 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                let display_len = count.min(32);
-                let mut snippet = [0u8; 32];
+            {
+                let display_len = count.min(64);
+                let mut snippet = [0u8; 64];
                 let n = display_len.min(snippet.len());
                 snippet[..n].copy_from_slice(&buf[..n]);
-                // Simple printable check
                 for byte in &mut snippet[..n] {
                     if *byte < 32 || *byte > 126 { *byte = b'.'; }
                 }
                 let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-                crate::safe_print!(128, "[syscall] write(fd={}, count={}) \"{}\"\n", fd_num, count, snippet_str);
+                crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
             }
 
             // Write to process channel (for SSH)

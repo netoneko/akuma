@@ -1225,6 +1225,7 @@ pub struct ProcessInfo2 {
     pub box_id: u64,
     pub name: String,
     pub state: &'static str,
+    pub last_syscall: u64,
 }
 
 /// List all running processes
@@ -1251,6 +1252,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
                 box_id: proc.box_id,
                 name: proc.name.clone(),
                 state,
+                last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
             });
         }
 
@@ -1599,6 +1601,9 @@ pub struct Process {
 
     /// Monotonic timestamp (us) when the process was created
     pub start_time_us: u64,
+
+    /// Last syscall number (for debugging stuck processes)
+    pub last_syscall: core::sync::atomic::AtomicU64,
 }
 
 
@@ -1692,7 +1697,8 @@ impl Process {
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: crate::timer::uptime_us(),
-        })
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+})
     }
 
     /// Create a process from a large ELF file on disk, loading segments on demand.
@@ -1785,7 +1791,8 @@ impl Process {
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: crate::timer::uptime_us(),
-        })
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+})
     }
 
     /// Replace current process image with a new ELF binary (execve core)
@@ -2606,8 +2613,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         delegate_pid: None,
         clear_child_tid: 0,
         signal_actions: parent.signal_actions,
-        start_time_us: crate::timer::uptime_us(),
-    });
+            start_time_us: crate::timer::uptime_us(),
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+});
     
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top;
@@ -2824,8 +2832,9 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
         signal_actions: parent.signal_actions,
-        start_time_us: crate::timer::uptime_us(),
-    });
+            start_time_us: crate::timer::uptime_us(),
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+});
 
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
