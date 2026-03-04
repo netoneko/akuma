@@ -849,7 +849,6 @@ struct PollFd {
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
-    let pre_bytes = crate::allocator::allocated_bytes();
     if crate::process::is_current_interrupted() {
         if let Some(proc) = crate::process::current_process() {
             proc.exited = true;
@@ -1096,20 +1095,6 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
     };
-
-    let post_bytes = crate::allocator::allocated_bytes();
-    if post_bytes > pre_bytes {
-        static SC_LEAK_TOTAL: AtomicU64 = AtomicU64::new(0);
-        static SC_LEAK_CALLS: AtomicU64 = AtomicU64::new(0);
-        let delta = (post_bytes - pre_bytes) as u64;
-        let total = SC_LEAK_TOTAL.fetch_add(delta, Ordering::Relaxed) + delta;
-        let calls = SC_LEAK_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if calls <= 5 || (calls <= 100 && calls % 20 == 0) || calls % 100000 == 0 {
-            crate::safe_print!(256, "[SC-LEAK] nr={} +{} bytes (fd={} cmd={} heap={}MB cum={}KB calls={})\n",
-                syscall_num, delta, args[0], args[1],
-                post_bytes / 1024 / 1024, total / 1024, calls);
-        }
-    }
 
     result
 }

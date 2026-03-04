@@ -1130,8 +1130,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        crate::syscall::CURRENT_SYSCALL_NR.store(99998, core::sync::atomic::Ordering::Relaxed);
-                        let _heap_before_da = crate::allocator::allocated_bytes();
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
@@ -1194,15 +1192,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
-                            let heap_after_da = crate::allocator::allocated_bytes();
-                            if heap_after_da > _heap_before_da + 4096 {
-                                crate::safe_print!(192,
-                                    "[DA-LEAK] pid={} +{}KB (pages={}, heap={}MB)\n",
-                                    pid,
-                                    (heap_after_da - _heap_before_da) / 1024,
-                                    pages_mapped,
-                                    heap_after_da / 1024 / 1024);
-                            }
                             return unsafe { (*frame).x0 };
                         }
                     } else {
@@ -1254,8 +1243,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let map_flags = if flags != 0 { flags } else { crate::mmu::user_flags::RX };
 
                     if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        crate::syscall::CURRENT_SYSCALL_NR.store(99997, core::sync::atomic::Ordering::Relaxed);
-                        let _heap_before_ia = crate::allocator::allocated_bytes();
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
@@ -1314,15 +1301,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
-                            let heap_after_ia = crate::allocator::allocated_bytes();
-                            if heap_after_ia > _heap_before_ia + 4096 {
-                                crate::safe_print!(192,
-                                    "[IA-LEAK] pid={} +{}KB (pages={}, heap={}MB)\n",
-                                    pid,
-                                    (heap_after_ia - _heap_before_ia) / 1024,
-                                    pages_mapped,
-                                    heap_after_ia / 1024 / 1024);
-                            }
                             return unsafe { (*frame).x0 };
                         }
                     } else {

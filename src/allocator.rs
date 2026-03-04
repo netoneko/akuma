@@ -317,9 +317,6 @@ static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PEAK_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_ALLOC_VOLUME: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_DEALLOC_VOLUME: AtomicUsize = AtomicUsize::new(0);
 
 /// Memory statistics
 #[derive(Debug, Clone, Copy)]
@@ -564,9 +561,6 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
             let heap_used = ALLOCATED_BYTES.load(Ordering::Relaxed);
             let heap_peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
             let heap_count = ALLOCATION_COUNT.load(Ordering::Relaxed);
-            let dealloc_count = DEALLOC_COUNT.load(Ordering::Relaxed);
-            let total_alloc_vol = TOTAL_ALLOC_VOLUME.load(Ordering::Relaxed);
-            let total_dealloc_vol = TOTAL_DEALLOC_VOLUME.load(Ordering::Relaxed);
             crate::safe_print!(256,
                 "\n[ALLOC FAIL] requested={} heap_total={}MB heap_used={}MB ({}%) peak={}MB allocs={}\n",
                 user_size,
@@ -575,12 +569,6 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
                 if heap_total > 0 { heap_used * 100 / heap_total } else { 0 },
                 heap_peak / 1024 / 1024,
                 heap_count);
-            crate::safe_print!(256,
-                "[ALLOC DETAIL] deallocs={} alloc_vol={}MB dealloc_vol={}MB retained={}MB\n",
-                dealloc_count,
-                total_alloc_vol / 1024 / 1024,
-                total_dealloc_vol / 1024 / 1024,
-                (total_alloc_vol.saturating_sub(total_dealloc_vol)) / 1024 / 1024);
             crate::syscall::syscall_counters::dump();
             return ptr::null_mut();
         }
@@ -612,7 +600,6 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         let new_allocated =
             ALLOCATED_BYTES.fetch_add(user_size, Ordering::Relaxed) + user_size;
         ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        TOTAL_ALLOC_VOLUME.fetch_add(user_size, Ordering::Relaxed);
         let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
         while new_allocated > peak {
             match PEAK_ALLOCATED.compare_exchange_weak(
@@ -703,8 +690,6 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
         TALC.lock()
             .free(core::ptr::NonNull::new_unchecked(actual_ptr), actual_layout);
         ALLOCATED_BYTES.fetch_sub(user_size, Ordering::Relaxed);
-        DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        TOTAL_DEALLOC_VOLUME.fetch_add(user_size, Ordering::Relaxed);
     })
 }}
 
@@ -753,8 +738,6 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 TALC.lock()
                     .free(core::ptr::NonNull::new_unchecked(actual_ptr), actual_layout);
                 ALLOCATED_BYTES.fetch_sub(old_user_size, Ordering::Relaxed);
-                DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-                TOTAL_DEALLOC_VOLUME.fetch_add(old_user_size, Ordering::Relaxed);
                 return ptr::null_mut();
             }
 
@@ -802,7 +785,6 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
             // Update allocation stats for new allocation
             let new_allocated = ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed) + new_size;
             ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-            TOTAL_ALLOC_VOLUME.fetch_add(new_size, Ordering::Relaxed);
             let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
             while new_allocated > peak {
                 match PEAK_ALLOCATED.compare_exchange_weak(
@@ -851,8 +833,6 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 TALC.lock()
                     .free(core::ptr::NonNull::new_unchecked(old_actual_ptr), old_actual_layout);
                 ALLOCATED_BYTES.fetch_sub(old_user_size, Ordering::Relaxed);
-                DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-                TOTAL_DEALLOC_VOLUME.fetch_add(old_user_size, Ordering::Relaxed);
             }
 
             // Heap growth monitor for realloc (net growth = new_size - old_user_size)
