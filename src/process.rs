@@ -979,7 +979,9 @@ pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>
 /// Allocate mmap region for current process
 /// Returns the address or 0 on failure
 pub fn alloc_mmap(size: usize) -> usize {
-    let proc = match current_process() {
+    // Use address-space owner so CLONE_VM threads share allocation state.
+    let pid = read_current_pid().unwrap_or(0);
+    let proc = match lookup_process(pid) {
         Some(p) => p,
         None => {
             console::print("[mmap] ERROR: No current process\n");
@@ -1003,7 +1005,8 @@ pub fn alloc_mmap(size: usize) -> usize {
 /// Called by sys_mmap after allocating frames.
 /// The frames Vec should contain all physical frames for this region.
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
-    if let Some(proc) = current_process() {
+    let pid = read_current_pid().unwrap_or(0);
+    if let Some(proc) = lookup_process(pid) {
         proc.mmap_regions.push((start_va, frames));
     }
 }
@@ -1011,7 +1014,8 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
 /// Record a lazy mmap region — VA reserved, no physical pages.
 /// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
 pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
-    if let Some(proc) = current_process() {
+    let pid = read_current_pid().unwrap_or(0);
+    if let Some(proc) = lookup_process(pid) {
         proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
     }
 }
@@ -1189,7 +1193,8 @@ pub fn is_in_lazy_region(va: usize) -> bool {
 /// Called by sys_munmap to find frames to free.
 /// Returns None if no region starts at this VA.
 pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
-    let proc = current_process()?;
+    let pid = read_current_pid().unwrap_or(0);
+    let proc = lookup_process(pid)?;
     
     // Find the region
     let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;

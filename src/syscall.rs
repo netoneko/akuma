@@ -2171,7 +2171,8 @@ fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
 }
@@ -3733,7 +3734,12 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
-    let proc = match crate::process::current_process() {
+    // Use address-space owner for all memory state (ProcessMemory, mmap_regions,
+    // frame tracking).  For CLONE_VM worker threads, current_process() returns
+    // the worker's Process which has cloned-but-stale ProcessMemory and empty
+    // mmap_regions.  All memory bookkeeping must go through the owner.
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let proc = match crate::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,
     };
@@ -3857,10 +3863,14 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         return ENOMEM;
     }
 
-    let new_addr = crate::process::alloc_mmap(new_pages * 4096);
-    if new_addr == 0 { return ENOMEM; }
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let new_addr = match crate::process::lookup_process(owner_pid)
+        .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
+        Some(a) => a,
+        None => return ENOMEM,
+    };
 
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         let mut new_frames = alloc::vec::Vec::new();
         for i in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
@@ -3875,14 +3885,18 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
             unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
         }
 
-        crate::process::record_mmap_region(new_addr, new_frames);
+        proc.mmap_regions.push((new_addr, new_frames));
 
-        if let Some(old_frames) = crate::process::remove_mmap_region(old_addr) {
+        // Remove old region from owner's mmap_regions (inline, not via helper)
+        if let Some(idx) = proc.mmap_regions.iter().position(|(va, _)| *va == old_addr) {
+            let (_, old_frames) = proc.mmap_regions.remove(idx);
+            let freed_size = old_frames.len() * 4096;
             for (i, frame) in old_frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page(old_addr + i * 4096);
                 proc.address_space.remove_user_frame(frame);
                 crate::pmm::free_page(frame);
             }
+            proc.memory.free_regions.push((old_addr, freed_size));
         }
 
         new_addr as u64
@@ -4488,7 +4502,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let pages = (len + 4095) / 4096;
     let new_flags = crate::mmu::user_flags::from_prot(prot);
     let adding_exec = prot & 0x4 != 0; // PROT_EXEC
-    if let Some(proc) = crate::process::current_process() {
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         for i in 0..pages {
             let va = addr + i * 4096;
             if proc.address_space.is_mapped(va) {
@@ -4527,7 +4542,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 }
 
 fn sys_munmap(addr: usize, len: usize) -> u64 {
-    let proc = match crate::process::current_process() {
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let proc = match crate::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,
     };

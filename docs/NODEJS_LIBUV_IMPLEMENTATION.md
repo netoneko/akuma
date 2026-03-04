@@ -550,6 +550,46 @@ instruction-abort handlers with `lookup_process(pid)`, where `pid` comes from
 **File:** `src/exceptions.rs` — 6 call sites changed from `current_process()`
 to `lookup_process(pid)`.
 
+### Bug 9: Memory Syscalls Used Wrong Process for CLONE_VM Threads
+
+**Crash:** Same `FAR=0x680c0000` symptom as Bug 8 — persisted after the
+exception-handler fix because the root cause was upstream in the syscall path.
+
+**Root cause:** Bug 8 fixed the exception handler to look up `mmap_regions` on
+the address-space owner.  But the **mmap syscall itself** was the one that
+pushed the region to the wrong Process in the first place.
+
+`sys_mmap` (and `sys_munmap`, `sys_brk`, `sys_mprotect`, `sys_mremap`) all
+obtained their `proc` via `current_process()`.  For `CLONE_VM` worker threads
+this returns the worker's `Process` struct, which has:
+
+- **Cloned-but-stale `ProcessMemory`** — `alloc_mmap()` allocates from the
+  worker's `next_mmap`, which was snapshot at `clone_thread` time.  Multiple
+  workers allocate from the same snapshot, producing overlapping VA ranges.
+- **Empty `mmap_regions`** — `push((addr, frames))` goes to the worker's
+  vec, so the owner's vec never sees it.  The exception-handler fallback
+  (Bug 8 fix) searches the owner's vec and finds nothing.
+- **Stale `brk`** — heap expansion on a worker updates the worker's `brk`
+  but not the owner's.
+
+The mmap log showed `pid=19` because logging used `read_current_pid()` (which
+returns the owner), but `proc.mmap_regions.push()` used the worker's Process.
+
+**Fix:** Changed all memory-management syscalls and helpers to obtain `proc`
+via `lookup_process(read_current_pid())` instead of `current_process()`:
+
+| Function | File | Change |
+|----------|------|--------|
+| `sys_mmap` | `src/syscall.rs` | `proc = lookup_process(owner_pid)` |
+| `sys_munmap` | `src/syscall.rs` | `proc = lookup_process(owner_pid)` |
+| `sys_mremap` | `src/syscall.rs` | inline alloc + region tracking via owner |
+| `sys_mprotect` | `src/syscall.rs` | `proc = lookup_process(owner_pid)` |
+| `sys_brk` | `src/syscall.rs` | `proc = lookup_process(owner_pid)` |
+| `alloc_mmap` | `src/process.rs` | `lookup_process(read_current_pid())` |
+| `record_mmap_region` | `src/process.rs` | `lookup_process(read_current_pid())` |
+| `remove_mmap_region` | `src/process.rs` | `lookup_process(read_current_pid())` |
+| `record_lazy_region` | `src/process.rs` | `lookup_process(read_current_pid())` |
+
 ### Kernel Tests
 
 **File:** `src/tests.rs`
