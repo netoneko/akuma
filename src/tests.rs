@@ -88,6 +88,11 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
     run_test!(test_clone_vm_eager_fallback_finds_region, "clone_vm_eager_fallback_finds_region");
 
+    // PTE durability — tests the ACTUAL invariant that broke in the crash
+    run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
+    run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
+    run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -3416,6 +3421,242 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let pass = found_via_owner == Some((region_base, pages)) && found_via_worker.is_none();
     if !pass {
         crate::safe_print!(128, "  owner={:?} worker={:?}\n", found_via_owner, found_via_worker);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// PTE Durability Tests
+//
+// These test the REAL invariant that broke in the Node.js crash:
+//   After map_user_page(va, pa, flags), the PTE at va must exist.
+// Previous tests validated theories about CLONE_VM lookup. These verify
+// hardware-level page table state.
+// ============================================================================
+
+/// Walk the page table from a given L0 physical address and read the L3 PTE.
+/// Returns the raw PTE value (0 if any level is missing).
+fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
+    let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    unsafe {
+        let l0e = l0_ptr.add(l0_idx).read_volatile();
+        if l0e & 1 == 0 { return 0; }
+        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add(l1_idx).read_volatile();
+        if l1e & 1 == 0 { return 0; }
+        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add(l2_idx).read_volatile();
+        if l2e & 1 == 0 { return 0; }
+        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        l3_ptr.add(l3_idx).read_volatile()
+    }
+}
+
+/// Helper: clear a PTE by walking the page table.
+fn clear_pte(l0_phys: usize, va: usize) {
+    unsafe {
+        let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return; }
+        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return; }
+        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return; }
+        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+        crate::mmu::flush_tlb_page(va);
+    }
+}
+
+/// Map 127 pages (matching the crash scenario) and verify EVERY PTE exists.
+/// The crash always hits page 35 (offset 0x23000). If this test fails,
+/// the bug is in map_user_page. If it passes, the bug is downstream.
+fn test_map_127_pages_all_ptes_exist() -> bool {
+    console::print("\n[TEST] map 127 pages, verify every PTE exists\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // Each test uses a unique 2MB-aligned VA range to avoid cross-test
+    // contamination through shared L1/L2 entries. Page table frames are
+    // intentionally LEAKED (not freed) — this matches real kernel behavior
+    // where map_user_page's return value is dropped and PhysFrame has no Drop.
+    let base_va: usize = 0x1_0000_0000; // L1[4], unique to this test
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                console::print("  OOM\n");
+                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+                for f in frames { crate::pmm::free_page(f); }
+                return false;
+            }
+        };
+        // Drop the returned table frames — matches real kernel behavior
+        let _ = unsafe {
+            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+        };
+        frames.push(frame);
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 {
+            missing.push(i);
+        }
+    }
+
+    // Cleanup: clear leaf PTEs, free data frames. Table frames are leaked.
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs at page indices: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 127 pages, then alloc 64 more zeroed pages. Verify original PTEs survive.
+/// Catches: PMM returning an in-use page-table frame, alloc_page_zeroed
+/// destroying the L3 table.
+fn test_map_pages_survive_subsequent_allocs() -> bool {
+    console::print("\n[TEST] map 127 pages, alloc 64 more, verify PTEs survive\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    let base_va: usize = 0x1_4000_0000; // L1[5], unique to this test
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        };
+        let _ = unsafe {
+            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+        };
+        frames.push(frame);
+    }
+
+    // Allocate 64 more zeroed pages without mapping them
+    let mut extra = Vec::new();
+    for _ in 0..64 {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { extra.push(f); }
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 { missing.push(i); }
+    }
+
+    for f in extra { crate::pmm::free_page(f); }
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs after alloc: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 1+3+5+127 pages in the same 2MB range, exactly like the crash log.
+/// Verifies all 136 PTEs exist and point to the correct physical addresses.
+fn test_map_interleaved_regions_same_l3() -> bool {
+    console::print("\n[TEST] map 1+3+5+127 pages in same 2MB range, verify all PTEs\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // L1[6], unique to this test. Offsets within a single 2MB range.
+    let base_2mb: usize = 0x1_8000_0000;
+    let regions: [(usize, usize); 4] = [
+        (0x94000, 1),   // L3[148]
+        (0x95000, 3),   // L3[149-151]
+        (0x98000, 5),   // L3[152-156]
+        (0x9d000, 127), // L3[157-283], crash page = L3[192]
+    ];
+
+    let mut mappings: Vec<(usize, crate::pmm::PhysFrame)> = Vec::new();
+
+    for &(offset, count) in &regions {
+        for i in 0..count {
+            let frame = match crate::pmm::alloc_page_zeroed() {
+                Some(f) => f,
+                None => {
+                    console::print("  OOM\n");
+                    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+                    for (_, f) in mappings { crate::pmm::free_page(f); }
+                    return false;
+                }
+            };
+            let va = base_2mb + offset + i * 4096;
+            let _ = unsafe {
+                crate::mmu::map_user_page(va, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+            };
+            mappings.push((va, frame));
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut wrong_pa = Vec::new();
+    for (idx, (va, frame)) in mappings.iter().enumerate() {
+        let pte = read_l3_pte(l0_phys, *va);
+        if pte & 1 == 0 {
+            missing.push((idx, *va));
+        } else {
+            let pte_pa = (pte & 0x0000_FFFF_FFFF_F000) as usize;
+            if pte_pa != frame.addr {
+                wrong_pa.push((idx, *va, pte_pa, frame.addr));
+            }
+        }
+    }
+
+    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+    for (_, f) in mappings { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty() && wrong_pa.is_empty();
+    if !pass {
+        if !missing.is_empty() {
+            crate::safe_print!(128, "  MISSING PTEs ({}):\n", missing.len());
+            for (idx, va) in &missing[..core::cmp::min(missing.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} L3[{}]\n",
+                    idx, va, (va >> 12) & 0x1FF);
+            }
+        }
+        if !wrong_pa.is_empty() {
+            crate::safe_print!(128, "  WRONG PA ({}):\n", wrong_pa.len());
+            for (idx, va, got, exp) in &wrong_pa[..core::cmp::min(wrong_pa.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} got=0x{:x} exp=0x{:x}\n",
+                    idx, va, got, exp);
+            }
+        }
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

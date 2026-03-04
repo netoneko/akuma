@@ -605,6 +605,11 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     let pte_atomic = &*((l3_ptr.add(l3_idx)) as *const core::sync::atomic::AtomicU64);
     let existing = pte_atomic.load(core::sync::atomic::Ordering::Acquire);
     if existing & flags::VALID != 0 {
+        let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
+        if existing_pa != pa {
+            crate::safe_print!(128, "[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}\n",
+                va, existing_pa, pa);
+        }
         return allocated_tables;
     }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
