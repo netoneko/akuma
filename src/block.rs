@@ -104,10 +104,12 @@ impl VirtioBlockDevice {
     }
 
     /// Get mutable access to the inner VirtIOBlk
-    /// SAFETY: Caller must ensure exclusive access (e.g., via the BLOCK_DEVICE Spinlock)
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access (e.g., via the BLOCK_DEVICE Spinlock).
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn inner_mut(&self) -> &mut VirtIOBlk<VirtioHal, MmioTransport> {
-        // SAFETY: We have exclusive access via the Spinlock guard
         unsafe { &mut *self.inner.get() }
     }
 

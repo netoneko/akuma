@@ -39,7 +39,7 @@
 
 ## What is Akuma?
 
-Akuma is a bare-metal operating system for the **AArch64** architecture, written entirely in **Rust** (`no_std`, ~36k lines). It runs on QEMU's `virt` machine, booting into a preemptively multitasking kernel that executes standard ELF binaries via a Linux-compatible syscall interface.
+Akuma is a bare-metal operating system for the **AArch64** architecture, written entirely in **Rust** (`no_std`, ~62k lines across kernel and 8 extracted crates). It runs on QEMU's `virt` machine, booting into a preemptively multitasking kernel that executes standard ELF binaries via a Linux-compatible syscall interface.
 
 The system provides a Unix-like environment with multiple shells, 100+ standard utilities, networking, filesystems, containers, development tools, and even games — all accessible over SSH.
 
@@ -50,10 +50,11 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | Feature | Details |
 |---|---|
 | **Preemptive multitasking** | 32-thread pool, 10ms round-robin scheduling, hybrid threads + embassy async executor |
-| **Memory management** | MMU-based address space isolation per process, physical memory manager, talc heap allocator (~120 MB) |
-| **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables |
-| **Linux syscall ABI** | ~60 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
+| **Memory management** | MMU-based address space isolation per process, demand paging, physical memory manager, talc heap allocator (~63 MB) |
+| **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables, `CLONE_VM` threads |
+| **Linux syscall ABI** | ~105 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
 | **ELF loader** | Static, static-PIE, and dynamically linked ELF binaries; loads `ld-musl-aarch64.so.1` for dynamic linking |
+| **Demand paging** | Lazy anonymous and file-backed page allocation on first access, readahead, partial munmap with region splitting |
 | **Pipes & IPC** | Kernel pipes (`pipe2`), `eventfd2`, `futex`, `pselect6`, `ppoll` |
 | **Signals** | `kill`, SIGSEGV handling, Ctrl+C interrupt propagation |
 | **Containers** | Lightweight process isolation ("boxes") with per-container root filesystems, process namespaces, and socket isolation |
@@ -94,6 +95,7 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | Feature | Details |
 |---|---|
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
+| **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |
 | **Git client (scratch)** | Clone, fetch, pull, push, commit, branch, tag, status — Git Smart HTTP protocol over HTTPS |
 | **Vi editor (neatvi)** | Vi-like text editor, compilable on-target with TCC |
@@ -162,38 +164,96 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 ┌──────────────────────────────────────────────────────────────────┐
 │                          Userspace                               │
 │  ┌──────┐ ┌─────┐ ┌─────┐ ┌───────┐ ┌─────┐ ┌──────┐ ┌──────┐  │
-│  │ dash │ │ tcc │ │ qjs │ │scratch│ │ doom│ │ meow │ │ sbase│  │
+│  │ dash │ │ tcc │ │ bun │ │scratch│ │ doom│ │ meow │ │ sbase│  │
 │  └──────┘ └─────┘ └─────┘ └───────┘ └─────┘ └──────┘ └──────┘  │
 │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────────┐  │
 │  │ herd │ │ box  │ │ sqld │ │ httpd│ │ xbps │ │ apk          │  │
 │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
-│  Syscall Interface (Linux AArch64 ABI, ~60 syscalls)             │
+│  Syscall Interface (Linux AArch64 ABI, ~105 syscalls)            │
 ├──────────────────────────────────────────────────────────────────┤
-│                           Kernel                                 │
-│  ┌───────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
-│  │ Scheduler │ │ VFS          │ │ Network  │ │ SSH Server    │   │
-│  │ (32 thr)  │ │ ext2/memfs/  │ │ smoltcp  │ │ (SSH-2)       │   │
-│  │ preemptive│ │ procfs       │ │ TCP/UDP  │ │ Ed25519       │   │
-│  └───────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
-│  ┌───────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
-│  │ MMU       │ │ ELF Loader   │ │ Pipes &  │ │ Containers    │   │
-│  │ per-proc  │ │ static/PIE/  │ │ Signals  │ │ (box isolation│   │
-│  │ isolation │ │ dynamic      │ │ IPC      │ │  per-root fs) │   │
-│  └───────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
+│                      Kernel  (~43k lines)                        │
+│  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
+│  │Exceptions│ │ Syscalls     │ │ IRQ      │ │ SSH Server    │   │
+│  │ (EL0/EL1)│ │ (105 calls)  │ │ dispatch │ │ (SSH-2)       │   │
+│  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
+│  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
+│  │ GIC      │ │ VirtIO       │ │ Timer    │ │ Console       │   │
+│  │ (GICv2)  │ │ net/blk/rng  │ │ PL031    │ │ PL011 UART    │   │
+│  │          │ │              │ │ ARM CNTP │ │               │   │
+│  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
 ├──────────────────────────────────────────────────────────────────┤
-│  Hardware: QEMU virt — VirtIO-net, VirtIO-blk, ramfb, PL011     │
+│               Extracted Crates  (~19k lines)                     │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  akuma-exec (8.7k) — threading, process, MMU, ELF loader │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
+│  │akuma-net │ │akuma-ext2│ │akuma-vfs │ │ akuma-shell       │   │
+│  │ (3.1k)   │ │ (2.1k)   │ │ (1.1k)   │ │ (1.3k)            │   │
+│  └──────────┘ └──────────┘ └──────────┘ └───────────────────┘   │
+│  ┌──────────┐ ┌──────────────┐ ┌────────────────────────────┐   │
+│  │akuma-ssh │ │akuma-ssh-    │ │ akuma-terminal (0.5k)      │   │
+│  │ (0.9k)   │ │crypto (0.9k) │ │                            │   │
+│  └──────────┘ └──────────────┘ └────────────────────────────┘   │
+├──────────────────────────────────────────────────────────────────┤
+│  Hardware: QEMU virt — VirtIO-net, VirtIO-blk, VirtIO-rng,      │
+│            GICv2, PL011 UART, PL031 RTC, ramfb                   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-- **Kernel** (~36k lines of Rust, `no_std`): Manages hardware, scheduling, memory, and provides core services. Drives VirtIO devices, manages the filesystem and network stacks, and runs an in-kernel SSH server.
-- **Userspace**: Standard ELF binaries linked against musl libc. Programs compiled with `musl-gcc`, the included TCC, or Rust (via `libakuma`) run on Akuma through its Linux-compatible syscall interface.
+### Crate Structure
 
-For more details, see the [Architecture Document](docs/ARCHITECTURE.md).
+The kernel is split into a monolithic core (`src/`, ~43k lines) and 8 extracted crates (`crates/`, ~19k lines):
+
+| Crate | Lines | Purpose |
+|---|---|---|
+| `akuma-exec` | 8,730 | Threading, process management, MMU page tables, ELF loader — the execution engine |
+| `akuma-net` | 3,116 | Socket layer, TCP/UDP abstractions, smoltcp integration |
+| `akuma-ext2` | 2,064 | ext2 filesystem implementation with read/write support |
+| `akuma-shell` | 1,334 | Shell parser, command pipeline, redirection, variable expansion |
+| `akuma-vfs` | 1,068 | Virtual filesystem types, mount table, path resolution |
+| `akuma-ssh-crypto` | 932 | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
+| `akuma-ssh` | 881 | SSH-2 protocol handling, channel management, auth |
+| `akuma-terminal` | 538 | Terminal emulation, raw/cooked modes, escape sequences |
+
+### Memory Layout
+
+```
+0x40000000  ┌──────────────────┐
+            │ Kernel code+stack│  32 MB
+0x42000000  ├──────────────────┤
+            │ Kernel heap      │  ~63 MB (talc allocator)
+0x45FC0000  ├──────────────────┤
+            │ User pages (PMM) │  ~159 MB (demand-paged)
+0x4FF00000  ├──────────────────┤
+            │ DTB              │
+0x50000000  └──────────────────┘
+```
+
+User processes get isolated virtual address spaces (up to 4 GB) with demand-paged anonymous and file-backed memory. The kernel uses identity mapping; device MMIO is accessed via remapped VAs under L0[1].
+
+## Project Layout
+
+```
+src/              Kernel source (~43k lines of no_std Rust)
+crates/           Extracted kernel crates (8 crates, ~19k lines)
+userspace/        Userspace applications and libraries
+  libakuma/         Rust syscall wrapper library
+  meow/             AI coding assistant
+  quickjs/          JavaScript interpreter
+  tcc/              Tiny C Compiler
+  herd/             Process supervisor
+  sbase/            Unix utilities
+  dash/             POSIX shell
+  paws/             Interactive shell
+docs/             Architecture notes and design docs
+scripts/          Build and debug scripts
+config/           Configuration files
+linker.ld         Kernel linker script
+```
 
 ## License
 
 MIT
 
 If a userspace application is under a license different from MIT (like GPL2 or LGPL2), then the associated userspace programs and the code around them follows their respective license.
-
