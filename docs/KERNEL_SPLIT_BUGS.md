@@ -723,3 +723,37 @@ is verified via QEMU integration testing instead.
   - SSH login works
   - `bun --version` returns `1.2.21`
   - `curl https://ifconfig.me/ip` returns an IP address
+
+---
+
+## Bug 13: IrqGuard DAIF save/restore regression
+
+**Symptom:** `bun run /public/cgi-bin/akuma.js` crashed with SIGSEGV and "0 free pages"
+OOM, accompanied by many `[MMU] WARN: va already mapped` warnings.
+
+**Root cause:** During the akuma-exec extraction, `IrqGuard` was reimplemented using
+`(runtime().disable_irqs)()` / `(runtime().enable_irqs)()` function pointers instead
+of the original inline-assembly DAIF save/restore. This broke nesting: when
+`map_user_page` (called from the demand paging exception handler, where IRQs are
+architecturally disabled) dropped its `IrqGuard`, it unconditionally re-enabled IRQs.
+This allowed timer preemption inside the exception handler, causing race conditions
+where multiple threads mapped the same VA to different physical pages, leaking frames
+until OOM.
+
+**Fix:** Reimplemented `IrqGuard` in `crates/akuma-exec/src/runtime.rs` to save/restore
+the DAIF register using inline assembly (`mrs`/`msr daif`), mirroring the kernel's
+original `src/irq.rs` implementation.
+
+**Init ordering fix:** `akuma_exec::init()` must be called before
+`mmu::init_shared_device_tables()`, since the latter uses `runtime()` to access PMM
+callbacks. Moved `akuma_exec::init()` to right after PMM initialization in `src/main.rs`.
+
+**Tests added** (in `src/tests.rs`, run as part of Memory Tests):
+- `test_irqguard_preserves_disabled_state` — verifies IrqGuard drop doesn't re-enable
+  IRQs when they were already disabled (the exact bug scenario)
+- `test_irqguard_nesting_preserves_state` — verifies outer/inner guard nesting restores
+  intermediate state correctly
+- `test_with_irqs_disabled_nesting` — verifies `with_irqs_disabled` called in an
+  already-disabled context doesn't leak state
+- `test_map_user_page_preserves_irq_state` — verifies `map_user_page` (which uses
+  IrqGuard internally) doesn't alter the caller's IRQ state

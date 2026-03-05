@@ -88,6 +88,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
     run_test!(test_clone_vm_eager_fallback_finds_region, "clone_vm_eager_fallback_finds_region");
 
+    // IrqGuard correctness — tests the DAIF save/restore invariant (Bug 13: akuma-exec extraction)
+    run_test!(test_irqguard_preserves_disabled_state, "irqguard_preserves_disabled_state");
+    run_test!(test_irqguard_nesting_preserves_state, "irqguard_nesting_preserves_state");
+    run_test!(test_with_irqs_disabled_nesting, "with_irqs_disabled_nesting");
+    run_test!(test_map_user_page_preserves_irq_state, "map_user_page_preserves_irq_state");
+
     // PTE durability — tests the ACTUAL invariant that broke in the crash
     run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
@@ -3128,6 +3134,195 @@ fn test_lazy_region_munmap_multi() -> bool {
 }
 
 /// Verify map_user_page actually creates a PTE, and clearing it works
+/// Bug 13: IrqGuard must not unconditionally enable IRQs on drop.
+///
+/// The akuma-exec extraction introduced a broken IrqGuard that called
+/// enable_irqs() on drop instead of restoring the saved DAIF register.
+/// When map_user_page (called from the exception handler with IRQs
+/// architecturally disabled) dropped its IrqGuard, IRQs were re-enabled
+/// inside the exception handler, causing preemption races during demand
+/// paging readahead. This leaked physical pages and caused OOM crashes.
+///
+/// This test verifies that creating and dropping an IrqGuard in an
+/// already-disabled context does not re-enable IRQs.
+fn test_irqguard_preserves_disabled_state() -> bool {
+    console::print("\n[TEST] Bug 13: IrqGuard preserves disabled state\n");
+
+    fn read_daif_i() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 1 // DAIF.I bit
+    }
+
+    // Disable IRQs manually
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    let disabled_before = read_daif_i();
+
+    // Create and drop an IrqGuard while IRQs are already disabled
+    {
+        let _guard = akuma_exec::runtime::IrqGuard::new();
+        // IRQs should still be disabled inside the guard
+    }
+    // After drop: IRQs must still be disabled (the bug would enable them here)
+    let disabled_after = read_daif_i();
+
+    // Restore IRQs
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+
+    let pass = disabled_before && disabled_after;
+    if !pass {
+        crate::safe_print!(128, "  disabled_before={} disabled_after={}\n",
+            disabled_before, disabled_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: Nested IrqGuard must restore intermediate state correctly.
+///
+/// Outer guard disables IRQs, inner guard disables again (no-op), inner
+/// drops (must keep disabled), outer drops (must re-enable).
+fn test_irqguard_nesting_preserves_state() -> bool {
+    console::print("\n[TEST] Bug 13: IrqGuard nesting preserves state\n");
+
+    fn read_daif_i() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 1
+    }
+
+    // IRQs start enabled
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    let irqs_enabled_initially = !read_daif_i();
+
+    let irqs_disabled_in_outer;
+    let irqs_disabled_after_inner_drop;
+    {
+        let _outer = akuma_exec::runtime::IrqGuard::new();
+        irqs_disabled_in_outer = read_daif_i();
+        {
+            let _inner = akuma_exec::runtime::IrqGuard::new();
+        }
+        // After inner drop: must still be disabled
+        irqs_disabled_after_inner_drop = read_daif_i();
+    }
+    // After outer drop: must be re-enabled (restored to initial state)
+    let irqs_enabled_after_outer = !read_daif_i();
+
+    let pass = irqs_enabled_initially
+        && irqs_disabled_in_outer
+        && irqs_disabled_after_inner_drop
+        && irqs_enabled_after_outer;
+    if !pass {
+        crate::safe_print!(192,
+            "  initial_enabled={} outer_disabled={} after_inner_disabled={} after_outer_enabled={}\n",
+            irqs_enabled_initially, irqs_disabled_in_outer,
+            irqs_disabled_after_inner_drop, irqs_enabled_after_outer);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: with_irqs_disabled must not leak state when nested.
+fn test_with_irqs_disabled_nesting() -> bool {
+    console::print("\n[TEST] Bug 13: with_irqs_disabled nesting\n");
+
+    fn read_daif_i() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 1
+    }
+
+    // Disable IRQs manually (simulating exception context)
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+
+    // Call with_irqs_disabled while already disabled
+    let inner_disabled = akuma_exec::runtime::with_irqs_disabled(|| read_daif_i());
+
+    // After return: must still be disabled
+    let still_disabled = read_daif_i();
+
+    // Clean up
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+
+    let pass = inner_disabled && still_disabled;
+    if !pass {
+        crate::safe_print!(128, "  inner_disabled={} still_disabled={}\n",
+            inner_disabled, still_disabled);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: map_user_page must not re-enable IRQs in caller's context.
+///
+/// This is the exact scenario that caused the bun crash: the demand paging
+/// handler (running with IRQs disabled) calls map_user_page, which creates
+/// and drops an IrqGuard internally. With the broken IrqGuard, this
+/// re-enabled IRQs in the exception handler, allowing preemption races.
+fn test_map_user_page_preserves_irq_state() -> bool {
+    console::print("\n[TEST] Bug 13: map_user_page preserves IRQ state\n");
+
+    fn read_daif_i() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 1
+    }
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let test_va: usize = 0x1_E000_0000;
+
+    // Disable IRQs (simulating exception handler context)
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    let disabled_before = read_daif_i();
+
+    // Call map_user_page — the internal IrqGuard must not leak state
+    let table_frames = unsafe {
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+    };
+
+    let disabled_after = read_daif_i();
+
+    // Re-enable IRQs before cleanup (cleanup allocates, needs IRQs for PMM)
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+
+    // Clean up: clear PTE and free frames
+    unsafe {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 != 0 {
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
+            if l1e & 1 != 0 {
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
+                if l2e & 1 != 0 {
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
+                    akuma_exec::mmu::flush_tlb_page(test_va);
+                }
+            }
+        }
+    }
+    crate::pmm::free_page(frame);
+    for tf in table_frames { crate::pmm::free_page(tf); }
+
+    let pass = disabled_before && disabled_after;
+    if !pass {
+        crate::safe_print!(128, "  disabled_before={} disabled_after={}\n",
+            disabled_before, disabled_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 fn test_map_user_page_roundtrip() -> bool {
     console::print("\n[TEST] map_user_page: map → verify → unmap → verify\n");
 
