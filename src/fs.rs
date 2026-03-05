@@ -85,7 +85,7 @@ pub fn init() -> Result<(), FsError> {
     vfs::init();
 
     // Mount ext2 filesystem at root
-    let ext2_fs = vfs::ext2::Ext2Filesystem::mount()?;
+    let ext2_fs = vfs::ext2::mount()?;
     vfs::mount("/", ext2_fs)?;
 
     log("[FS] Ext2 filesystem mounted at /\n");

@@ -1,8 +1,7 @@
 //! Virtual Filesystem (VFS) Layer
 //!
-//! Provides an abstraction layer for filesystem operations, allowing multiple
-//! filesystem backends (ext2, in-memory, etc.) to be mounted and accessed
-//! through a unified API.
+//! Kernel-side VFS: owns the global mount table, provides process-aware path
+//! resolution, and re-exports types from the `akuma_vfs` crate.
 
 pub mod ext2;
 pub mod memory;
@@ -15,412 +14,17 @@ use alloc::vec::Vec;
 use alloc::format;
 use spinning_top::Spinlock;
 
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Filesystem error type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-    /// Block device not initialized
-    BlockDeviceNotInitialized,
-    /// Filesystem not initialized/mounted
-    NotInitialized,
-    /// File or directory not found
-    NotFound,
-    /// Permission denied
-    PermissionDenied,
-    /// File or directory already exists
-    AlreadyExists,
-    /// Path is not a directory
-    NotADirectory,
-    /// Path is not a file
-    NotAFile,
-    /// Directory is not empty
-    DirectoryNotEmpty,
-    /// I/O error
-    IoError,
-    /// Invalid path
-    InvalidPath,
-    /// No space left on device
-    NoSpace,
-    /// Too many open files
-    TooManyOpenFiles,
-    /// Invalid file handle
-    InvalidHandle,
-    /// Filesystem is corrupt
-    Corrupt,
-    /// End of file reached
-    EndOfFile,
-    /// No filesystem found on device
-    NoFilesystem,
-    /// Internal error
-    Internal,
-    /// Read-only filesystem
-    ReadOnly,
-    /// Not supported by this filesystem
-    NotSupported,
-}
-
-impl core::fmt::Display for FsError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            FsError::BlockDeviceNotInitialized => write!(f, "Block device not initialized"),
-            FsError::NotInitialized => write!(f, "Filesystem not initialized"),
-            FsError::NotFound => write!(f, "Not found"),
-            FsError::PermissionDenied => write!(f, "Permission denied"),
-            FsError::AlreadyExists => write!(f, "Already exists"),
-            FsError::NotADirectory => write!(f, "Not a directory"),
-            FsError::NotAFile => write!(f, "Not a file"),
-            FsError::DirectoryNotEmpty => write!(f, "Directory not empty"),
-            FsError::IoError => write!(f, "I/O error"),
-            FsError::InvalidPath => write!(f, "Invalid path"),
-            FsError::NoSpace => write!(f, "No space left"),
-            FsError::TooManyOpenFiles => write!(f, "Too many open files"),
-            FsError::InvalidHandle => write!(f, "Invalid file handle"),
-            FsError::Corrupt => write!(f, "Filesystem corrupt"),
-            FsError::EndOfFile => write!(f, "End of file"),
-            FsError::NoFilesystem => write!(f, "No filesystem found"),
-            FsError::Internal => write!(f, "Internal error"),
-            FsError::ReadOnly => write!(f, "Read-only filesystem"),
-            FsError::NotSupported => write!(f, "Operation not supported"),
-        }
-    }
-}
+// Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
+pub use akuma_vfs::{
+    DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
+    canonicalize_path, resolve_path, split_path, path_components,
+};
 
 // ============================================================================
-// Directory Entry
+// Mount Table (kernel-side global)
 // ============================================================================
 
-/// Directory entry information
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    /// Name of the file or directory
-    pub name: String,
-    /// Whether this is a directory
-    pub is_dir: bool,
-    /// Size in bytes (0 for directories)
-    pub size: u64,
-}
-
-// ============================================================================
-// Metadata
-// ============================================================================
-
-/// File or directory metadata
-#[derive(Debug, Clone)]
-pub struct Metadata {
-    /// Whether this is a directory
-    pub is_dir: bool,
-    /// Size in bytes
-    pub size: u64,
-    /// Inode number (unique within filesystem)
-    pub inode: u64,
-    /// File mode (type + permissions), e.g. 0o100755 for executable file
-    pub mode: u32,
-    /// Creation time (Unix timestamp, if available)
-    pub created: Option<u64>,
-    /// Last modification time (Unix timestamp, if available)
-    pub modified: Option<u64>,
-    /// Last access time (Unix timestamp, if available)
-    pub accessed: Option<u64>,
-}
-
-// ============================================================================
-// Filesystem Statistics
-// ============================================================================
-
-/// Filesystem statistics
-#[derive(Debug, Clone)]
-pub struct FsStats {
-    /// Block/cluster size in bytes
-    pub block_size: u32,
-    /// Total number of blocks
-    pub total_blocks: u64,
-    /// Number of free blocks
-    pub free_blocks: u64,
-}
-
-impl FsStats {
-    /// Get total size in bytes
-    pub fn total_bytes(&self) -> u64 {
-        self.total_blocks * self.block_size as u64
-    }
-
-    /// Get free space in bytes
-    pub fn free_bytes(&self) -> u64 {
-        self.free_blocks * self.block_size as u64
-    }
-
-    /// Get used space in bytes
-    pub fn used_bytes(&self) -> u64 {
-        self.total_bytes() - self.free_bytes()
-    }
-}
-
-// ============================================================================
-// Filesystem Trait
-// ============================================================================
-
-/// Trait for filesystem implementations
-///
-/// This trait is object-safe to allow for dynamic dispatch between different
-/// filesystem backends (ext2, in-memory, etc.)
-pub trait Filesystem: Send + Sync {
-    /// Get the filesystem name/type (e.g., "ext2", "memfs")
-    fn name(&self) -> &str;
-
-    /// List directory contents
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
-
-    /// Read entire file contents
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
-
-    /// Write data to a file (creates or truncates)
-    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
-
-    /// Append data to a file
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
-
-    /// Read data from a specific offset within a file.
-    /// Returns the number of bytes actually read (may be less than buf.len()
-    /// at end-of-file, or 0 if offset is past the end).
-    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Default: fall back to read-entire-file-and-slice (slow but correct)
-        let data = self.read_file(path)?;
-        if offset >= data.len() {
-            return Ok(0);
-        }
-        let n = buf.len().min(data.len() - offset);
-        buf[..n].copy_from_slice(&data[offset..offset + n]);
-        Ok(n)
-    }
-
-    /// Write data at a specific offset within a file.
-    /// Extends the file if offset + data.len() > current size.
-    /// Returns the number of bytes written.
-    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-        // Default: fall back to read-modify-write (slow but correct)
-        let mut contents = self.read_file(path).unwrap_or_default();
-        let end = offset + data.len();
-        if end > contents.len() {
-            contents.resize(end, 0);
-        }
-        contents[offset..end].copy_from_slice(data);
-        self.write_file(path, &contents)?;
-        Ok(data.len())
-    }
-
-    /// Create a directory
-    fn create_dir(&self, path: &str) -> Result<(), FsError>;
-
-    /// Remove a file
-    fn remove_file(&self, path: &str) -> Result<(), FsError>;
-
-    /// Remove an empty directory
-    fn remove_dir(&self, path: &str) -> Result<(), FsError>;
-
-    /// Check if a path exists
-    fn exists(&self, path: &str) -> bool;
-
-    /// Get metadata for a path
-    fn metadata(&self, path: &str) -> Result<Metadata, FsError>;
-
-    /// Create a symbolic link at `link_path` pointing to `target`
-    fn create_symlink(&self, _link_path: &str, _target: &str) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
-    }
-
-    /// Read the target of a symbolic link
-    fn read_symlink(&self, _path: &str) -> Result<String, FsError> {
-        Err(FsError::NotFound)
-    }
-
-    /// Check whether a path is a symlink (without following it)
-    fn is_symlink(&self, _path: &str) -> bool {
-        false
-    }
-
-    /// Change file permissions (mode bits only, not file type)
-    fn chmod(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
-    }
-
-    /// Rename/move a file or directory
-    fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
-    }
-
-    /// Get filesystem statistics
-    fn stats(&self) -> Result<FsStats, FsError>;
-
-    /// Sync/flush any cached data to disk
-    fn sync(&self) -> Result<(), FsError> {
-        Ok(())
-    }
-
-    /// Resolve a path to an opaque inode number for later use with read_at_by_inode.
-    fn resolve_inode(&self, _path: &str) -> Result<u32, FsError> {
-        Err(FsError::NotSupported)
-    }
-
-    /// Read from a file identified by inode number (returned by resolve_inode),
-    /// bypassing path lookup. Falls back to NotSupported if unimplemented.
-    fn read_at_by_inode(&self, _inode: u32, _offset: usize, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
-    }
-}
-
-// ============================================================================
-// Mount Table
-// ============================================================================
-
-/// Maximum number of mount points
-const MAX_MOUNTS: usize = 8;
-
-/// A mount point entry
-struct MountEntry {
-    /// Mount path (e.g., "/", "/tmp")
-    path: String,
-    /// The mounted filesystem
-    fs: Box<dyn Filesystem>,
-}
-
-/// Global mount table
-static MOUNT_TABLE: Spinlock<Option<MountTable>> = Spinlock::new(None);
-
-/// Mount table managing all mounted filesystems
-struct MountTable {
-    mounts: Vec<MountEntry>,
-}
-
-impl MountTable {
-    fn new() -> Self {
-        Self {
-            mounts: Vec::with_capacity(MAX_MOUNTS),
-        }
-    }
-
-    /// Mount a filesystem at the given path
-    fn mount(&mut self, path: &str, fs: Box<dyn Filesystem>) -> Result<(), FsError> {
-        if self.mounts.len() >= MAX_MOUNTS {
-            return Err(FsError::NoSpace);
-        }
-
-        // Check if already mounted
-        if self.mounts.iter().any(|m| m.path == path) {
-            return Err(FsError::AlreadyExists);
-        }
-
-        self.mounts.push(MountEntry {
-            path: String::from(path),
-            fs,
-        });
-
-        // Sort by path length (longest first) for proper matching
-        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
-
-        Ok(())
-    }
-
-    /// Unmount a filesystem at the given path
-    fn unmount(&mut self, path: &str) -> Result<(), FsError> {
-        let idx = self
-            .mounts
-            .iter()
-            .position(|m| m.path == path)
-            .ok_or(FsError::NotFound)?;
-
-        self.mounts.remove(idx);
-        Ok(())
-    }
-
-    /// Find the filesystem and relative path for a given absolute path
-    fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a dyn Filesystem, &'a str)> {
-        // Normalize the path (add leading / if missing, remove trailing /)
-        let normalized = normalize_path(path);
-
-        for mount in &self.mounts {
-            // Special case: root mount "/"
-            if mount.path == "/" {
-                // Root mount matches everything
-                return Some((mount.fs.as_ref(), normalized));
-            }
-
-            // Exact match
-            if normalized == mount.path {
-                return Some((mount.fs.as_ref(), "/"));
-            }
-
-            // Prefix match (e.g., path="/tmp/foo" matches mount="/tmp")
-            if normalized.starts_with(&mount.path) {
-                let rest = &normalized[mount.path.len()..];
-                if rest.is_empty() {
-                    return Some((mount.fs.as_ref(), "/"));
-                }
-                if rest.starts_with('/') {
-                    return Some((mount.fs.as_ref(), rest));
-                }
-            }
-        }
-
-        None
-    }
-}
-
-// ============================================================================
-// Path Utilities
-// ============================================================================
-
-/// Non-allocating normalization (trims trailing slashes)
-fn normalize_path(path: &str) -> &str {
-    let path = path.trim_end_matches('/');
-    if path.is_empty() { "/" } else { path }
-}
-
-/// Robust normalization (resolves . and ..)
-pub fn canonicalize_path(path: &str) -> String {
-    let mut components: Vec<&str> = Vec::new();
-
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            c => {
-                components.push(c);
-            }
-        }
-    }
-
-    if components.is_empty() {
-        String::from("/")
-    } else {
-        let mut result = String::new();
-        for c in components {
-            result.push('/');
-            result.push_str(c);
-        }
-        result
-    }
-}
-
-/// Resolve a path relative to a base directory
-pub fn resolve_path(base_cwd: &str, path: &str) -> String {
-    if path.starts_with('/') {
-        // Absolute path
-        canonicalize_path(path)
-    } else {
-        // Relative path
-        let full_path = if base_cwd == "/" {
-            format!("/{}", path)
-        } else {
-            format!("{}/{}", base_cwd, path)
-        };
-        canonicalize_path(&full_path)
-    }
-}
+static MOUNT_TABLE: Spinlock<Option<akuma_vfs::MountTable>> = Spinlock::new(None);
 
 /// Normalize path with allocation (adds leading / if missing)
 fn normalize_path_owned(path: &str) -> String {
@@ -434,23 +38,6 @@ fn normalize_path_owned(path: &str) -> String {
     }
 }
 
-/// Split a path into (parent_path, filename)
-pub fn split_path(path: &str) -> (&str, &str) {
-    let path = path.trim_start_matches('/').trim_end_matches('/');
-    match path.rfind('/') {
-        Some(idx) => (&path[..idx], &path[idx + 1..]),
-        None => ("", path),
-    }
-}
-
-/// Split path into components
-pub fn path_components(path: &str) -> Vec<&str> {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 // ============================================================================
 // Public API - Mount Operations
 // ============================================================================
@@ -459,7 +46,7 @@ pub fn path_components(path: &str) -> Vec<&str> {
 pub fn init() {
     let mut table = MOUNT_TABLE.lock();
     if table.is_none() {
-        *table = Some(MountTable::new());
+        *table = Some(akuma_vfs::MountTable::new());
     }
 }
 
@@ -670,41 +257,14 @@ pub fn stats(path: &str) -> Result<FsStats, FsError> {
 pub fn sync_all() -> Result<(), FsError> {
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-
-    for mount in &table.mounts {
-        mount.fs.sync()?;
-    }
-    Ok(())
-}
-
-// ============================================================================
-// Mount Information
-// ============================================================================
-
-/// Information about a mounted filesystem
-#[derive(Debug, Clone)]
-pub struct MountInfo {
-    /// Mount path (e.g., "/", "/proc")
-    pub path: String,
-    /// Filesystem type name (e.g., "ext2", "procfs")
-    pub fs_type: String,
+    table.sync_all()
 }
 
 /// List all mounted filesystems
 pub fn list_mounts() -> Result<Vec<MountInfo>, FsError> {
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-
-    let mounts: Vec<MountInfo> = table
-        .mounts
-        .iter()
-        .map(|m| MountInfo {
-            path: m.path.clone(),
-            fs_type: String::from(m.fs.name()),
-        })
-        .collect();
-
-    Ok(mounts)
+    Ok(table.list_mounts())
 }
 
 // ============================================================================
@@ -785,56 +345,10 @@ pub fn resolve_symlinks(path: &str) -> String {
     resolved
 }
 
-/// Get mount points that are direct children of a directory
-/// Used by list_dir to include virtual mount points in directory listings
 fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
     let table = MOUNT_TABLE.lock();
-    let table = match table.as_ref() {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
-    let parent = normalize_path(parent_path);
-    let mut entries = Vec::new();
-
-    for mount in &table.mounts {
-        // Skip the root mount and the parent itself
-        if mount.path == "/" || mount.path == parent {
-            continue;
-        }
-
-        // Check if this mount is a direct child of parent
-        // For parent="/", child mount "/proc" -> name is "proc"
-        // For parent="/foo", child mount "/foo/bar" -> name is "bar"
-        let mount_path = mount.path.as_str();
-
-        if parent == "/" {
-            // Direct children of root: /proc, /tmp, etc.
-            // Check if mount path has exactly one component after root
-            if mount_path.starts_with('/') && !mount_path[1..].contains('/') {
-                let name = &mount_path[1..]; // Remove leading /
-                entries.push(DirEntry {
-                    name: String::from(name),
-                    is_dir: true,
-                    size: 0,
-                });
-            }
-        } else {
-            // Direct children of non-root: /foo -> /foo/bar
-            let prefix = format!("{}/", parent);
-            if mount_path.starts_with(&prefix) {
-                let rest = &mount_path[prefix.len()..];
-                // Only direct children (no more slashes)
-                if !rest.contains('/') {
-                    entries.push(DirEntry {
-                        name: String::from(rest),
-                        is_dir: true,
-                        size: 0,
-                    });
-                }
-            }
-        }
+    match table.as_ref() {
+        Some(t) => t.child_mount_points(parent_path),
+        None => Vec::new(),
     }
-
-    entries
 }

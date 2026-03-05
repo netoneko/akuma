@@ -42,7 +42,10 @@ name = "akuma"
 version = "0.0.4"
 dependencies = [
  "aes",
+ "akuma-ext2",
+ "akuma-ssh-crypto",
  "akuma-terminal",
+ "akuma-vfs",
  "arm_pl031",
  "const-oid",
  "critical-section",
@@ -69,7 +72,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-ext2"
+version = "0.1.0"
+dependencies = [
+ "akuma-vfs",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-ssh-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "ctr",
+ "ed25519-dalek",
+ "hmac",
+ "sha2",
+]
+
+[[package]]
 name = "akuma-terminal"
+version = "0.1.0"
+dependencies = [
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [
  "spinning_top",

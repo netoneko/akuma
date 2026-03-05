@@ -1,0 +1,12 @@
+[package]
+name = "akuma-ext2"
+version = "0.1.0"
+edition = "2024"
+description = "Ext2 filesystem implementation for no_std kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-vfs = { path = "../akuma-vfs" }
+spinning_top = "0.3"

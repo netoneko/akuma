@@ -1,0 +1,11 @@
+[package]
+name = "akuma-vfs"
+version = "0.1.0"
+edition = "2024"
+description = "Virtual filesystem traits, types, and in-memory filesystem for no_std kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+spinning_top = "0.3"
