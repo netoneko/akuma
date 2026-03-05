@@ -14,19 +14,6 @@ use crate::vfs;
 pub use crate::vfs::{DirEntry, FsError};
 
 // ============================================================================
-// Open Mode (for async_fs compatibility)
-// ============================================================================
-
-/// File open mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenMode {
-    Read,
-    Write,
-    Append,
-    ReadWrite,
-}
-
-// ============================================================================
 // Filesystem Statistics (backward compatible wrapper)
 // ============================================================================
 

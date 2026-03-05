@@ -95,18 +95,6 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
     crate::gic::enable_irq(irq);
 }
 
-/// Unregister an IRQ handler
-pub fn unregister_handler(irq: u32) {
-    let mut handlers = IRQ_HANDLERS.lock();
-
-    if (irq as usize) < handlers.handlers.len() {
-        handlers.handlers[irq as usize] = None;
-    }
-
-    // Disable the IRQ in GIC
-    crate::gic::disable_irq(irq);
-}
-
 /// Dispatch an IRQ to its registered handler
 pub fn dispatch_irq(irq: u32) {
     // Copy the handler out while holding the lock, then call it without the lock

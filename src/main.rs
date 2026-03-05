@@ -39,7 +39,6 @@ mod timer;
 mod vfs;
 mod virtio_hal;
 
-use alloc::format;
 use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
 
@@ -127,9 +126,6 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 
     kernel_main(dtb_ptr)
 }
-
-/// DTB magic number (big-endian: 0xd00dfeed)
-const DTB_MAGIC: u32 = 0xd00dfeed;
 
 /// Fixed address where we tell QEMU to load the DTB via loader device
 /// Use: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on
@@ -854,11 +850,9 @@ fn run_async_main() -> ! {
         // without draining, TCP ACKs/window updates are delayed until the
         // next scheduler slot, causing the remote sender's TCP window to
         // shrink and throughput to collapse.
-        let mut net_progress = false;
         {
             let mut polls = 0u32;
             while akuma_net::smoltcp_net::poll() {
-                net_progress = true;
                 polls += 1;
                 if polls >= 64 {
                     break; // Safety cap to avoid starving other threads
@@ -894,17 +888,6 @@ fn run_async_main() -> ! {
         // consumer threads process the data between bursts.
         threading::yield_now();
     }
-}
-
-/// Check if IRQs are currently enabled (I bit in DAIF is clear)
-#[inline]
-fn is_irq_enabled() -> bool {
-    let daif: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-    }
-    // Bit 7 (0x80) is the I flag - if clear, IRQs are enabled
-    (daif & 0x80) == 0
 }
 
 /// Async task that periodically reports memory usage

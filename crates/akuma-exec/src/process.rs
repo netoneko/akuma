@@ -1658,7 +1658,7 @@ impl Process {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
         let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData, pid);
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
 
         address_space
             .map_page(
@@ -1760,7 +1760,7 @@ impl Process {
         }
 
         let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData, pid);
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
 
         address_space
             .map_page(
@@ -1857,7 +1857,7 @@ impl Process {
         
         // Re-write process info page in the NEW address space
         let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData, self.pid);
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
         
         self.address_space
             .map_page(
@@ -1926,7 +1926,7 @@ impl Process {
         self.context = UserContext::new(entry_point, sp);
 
         let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData, self.pid);
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
 
         self.address_space
             .map_page(
@@ -2587,7 +2587,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     
     // 2. Allocate process info page
     let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
-    (runtime().track_frame)(process_info_frame, FrameSource::UserData, child_pid);
+    (runtime().track_frame)(process_info_frame, FrameSource::UserData);
     
     new_address_space
         .map_page(
@@ -2727,7 +2727,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let page_va = va_start + i * mmu::PAGE_SIZE;
             match (runtime().alloc_page_zeroed)() {
                 Some(frame) => {
-                    (runtime().track_frame)(frame, FrameSource::UserData, child_pid);
+                    (runtime().track_frame)(frame, FrameSource::UserData);
                     unsafe {
                         let src = mmu::phys_to_virt(pf.addr) as *const u8;
                         let dst = mmu::phys_to_virt(frame.addr);

@@ -56,7 +56,7 @@ pub struct ExecRuntime {
     pub alloc_page: fn() -> Option<PhysFrame>,
     pub free_page: fn(PhysFrame),
     pub pmm_stats: fn() -> (usize, usize, usize),
-    pub track_frame: fn(PhysFrame, FrameSource, u32),
+    pub track_frame: fn(PhysFrame, FrameSource),
     pub free_count: fn() -> usize,
     pub total_count: fn() -> usize,
 

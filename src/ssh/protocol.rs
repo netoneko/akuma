@@ -58,11 +58,6 @@ pub fn init_host_key() {
     }
 }
 
-pub async fn init_host_key_async() {
-    let _key = keys::load_or_generate_host_key().await;
-    log("[SSH] Host key loaded/generated from filesystem\n");
-}
-
 // ============================================================================
 // SSH Channel Stream (embedded_io_async adapter — kernel-coupled)
 // ============================================================================
@@ -91,10 +86,6 @@ impl<'a> SshChannelStream<'a> {
             current_process_pid: None,
             current_process_channel: None,
         }
-    }
-
-    pub fn terminal_state(&self) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-        akuma_exec::process::get_terminal_state(akuma_exec::threading::current_thread_id())
     }
 
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {

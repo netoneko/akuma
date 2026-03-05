@@ -19,10 +19,10 @@ use akuma_exec::process;
 use crate::ssh::protocol::SshChannelStream;
 
 pub use akuma_shell::{
-    expand_variables, parse_command_chain, parse_command_line, parse_pipeline,
+    expand_variables, parse_pipeline,
     split_first_word, trim_bytes, translate_input_keys,
-    ChainExecutionResult, ChainOperator, ChainedCommand, Command, CommandRegistry,
-    InteractiveRead, ParsedCommandLine, RedirectMode, ShellContext, ShellError,
+    ChainExecutionResult, Command, CommandRegistry,
+    InteractiveRead, ShellContext, ShellError,
     StreamableCommand, VecWriter,
 };
 

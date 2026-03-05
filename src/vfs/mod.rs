@@ -4,7 +4,6 @@
 //! resolution, and re-exports types from the `akuma_vfs` crate.
 
 pub mod ext2;
-pub mod memory;
 pub mod proc;
 
 use alloc::boxed::Box;
@@ -17,7 +16,7 @@ use spinning_top::Spinlock;
 // Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
 pub use akuma_vfs::{
     DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
-    canonicalize_path, resolve_path, split_path, path_components,
+    canonicalize_path, resolve_path, split_path,
 };
 
 // ============================================================================
@@ -50,23 +49,11 @@ pub fn init() {
     }
 }
 
-/// Check if VFS is initialized
-pub fn is_initialized() -> bool {
-    MOUNT_TABLE.lock().is_some()
-}
-
 /// Mount a filesystem at the given path
 pub fn mount(path: &str, fs: Box<dyn Filesystem>) -> Result<(), FsError> {
     let mut table = MOUNT_TABLE.lock();
     let table = table.as_mut().ok_or(FsError::NotInitialized)?;
     table.mount(path, fs)
-}
-
-/// Unmount a filesystem at the given path
-pub fn unmount(path: &str) -> Result<(), FsError> {
-    let mut table = MOUNT_TABLE.lock();
-    let table = table.as_mut().ok_or(FsError::NotInitialized)?;
-    table.unmount(path)
 }
 
 // ============================================================================
@@ -251,13 +238,6 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
 /// Get filesystem statistics for a path
 pub fn stats(path: &str) -> Result<FsStats, FsError> {
     with_fs(path, |fs, _| fs.stats())
-}
-
-/// Sync all mounted filesystems
-pub fn sync_all() -> Result<(), FsError> {
-    let table = MOUNT_TABLE.lock();
-    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-    table.sync_all()
 }
 
 /// List all mounted filesystems

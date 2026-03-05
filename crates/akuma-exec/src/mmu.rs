@@ -274,7 +274,7 @@ impl UserAddressSpace {
     pub fn new() -> Option<Self> {
         let rt = runtime();
         let l0_frame = (rt.alloc_page_zeroed)()?;
-        (rt.track_frame)(l0_frame, FrameSource::UserPageTable, 0);
+        (rt.track_frame)(l0_frame, FrameSource::UserPageTable);
         let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
         let mut addr_space = Self {
             l0_frame,
@@ -303,7 +303,7 @@ impl UserAddressSpace {
     fn add_kernel_mappings(&mut self) -> Result<(), &'static str> {
         let rt = runtime();
         let l1_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L1 table")?;
-        (rt.track_frame)(l1_frame, FrameSource::UserPageTable, 0);
+        (rt.track_frame)(l1_frame, FrameSource::UserPageTable);
         self.page_table_frames.push(l1_frame);
 
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
@@ -314,7 +314,7 @@ impl UserAddressSpace {
 
         let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
         let l2_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L2 table")?;
-        (rt.track_frame)(l2_frame, FrameSource::UserPageTable, 0);
+        (rt.track_frame)(l2_frame, FrameSource::UserPageTable);
         self.page_table_frames.push(l2_frame);
 
         unsafe {
@@ -340,7 +340,7 @@ impl UserAddressSpace {
         // actual 256MB of RAM (128 blocks) instead of a 1GB L1 block.
         // This leaves VA 0x50000000-0x7FFFFFFF available for user mmap.
         let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
-        (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable, 0);
+        (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable);
         self.page_table_frames.push(l2_ram_frame);
 
         unsafe {
@@ -398,7 +398,7 @@ impl UserAddressSpace {
             if entry & flags::VALID != 0 {
                 if entry & flags::TABLE == 0 {
                     let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
-                    (rt.track_frame)(frame, FrameSource::UserPageTable, 0);
+                    (rt.track_frame)(frame, FrameSource::UserPageTable);
                     self.page_table_frames.push(frame);
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     table_ptr.add(idx).write_volatile(new_entry);
@@ -408,7 +408,7 @@ impl UserAddressSpace {
                 }
             } else {
                 let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
-                (rt.track_frame)(frame, FrameSource::UserPageTable, 0);
+                (rt.track_frame)(frame, FrameSource::UserPageTable);
                 self.page_table_frames.push(frame);
                 let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                 table_ptr.add(idx).write_volatile(new_entry);
@@ -428,7 +428,7 @@ impl UserAddressSpace {
     pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
         let rt = runtime();
         let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
-        (rt.track_frame)(frame, FrameSource::ElfLoader, 0);
+        (rt.track_frame)(frame, FrameSource::ElfLoader);
         self.user_frames.push(frame);
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)

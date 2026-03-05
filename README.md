@@ -39,7 +39,7 @@
 
 ## What is Akuma?
 
-Akuma is a bare-metal operating system for the **AArch64** architecture, written entirely in **Rust** (`no_std`, ~62k lines across kernel and 8 extracted crates). It runs on QEMU's `virt` machine, booting into a preemptively multitasking kernel that executes standard ELF binaries via a Linux-compatible syscall interface.
+Akuma is a bare-metal operating system for the **AArch64** architecture, written entirely in **Rust** (`no_std`, ~36k lines of code across kernel and 8 extracted crates, plus ~7k lines of tests). It runs on QEMU's `virt` machine, booting into a preemptively multitasking kernel that executes standard ELF binaries via a Linux-compatible syscall interface.
 
 The system provides a Unix-like environment with multiple shells, 100+ standard utilities, networking, filesystems, containers, development tools, and even games — all accessible over SSH.
 
@@ -52,7 +52,7 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | **Preemptive multitasking** | 32-thread pool, 10ms round-robin scheduling, hybrid threads + embassy async executor |
 | **Memory management** | MMU-based address space isolation per process, demand paging, physical memory manager, talc heap allocator (~63 MB) |
 | **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables, `CLONE_VM` threads |
-| **Linux syscall ABI** | ~105 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
+| **Linux syscall ABI** | ~140 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
 | **ELF loader** | Static, static-PIE, and dynamically linked ELF binaries; loads `ld-musl-aarch64.so.1` for dynamic linking |
 | **Demand paging** | Lazy anonymous and file-backed page allocation on first access, readahead, partial munmap with region splitting |
 | **Pipes & IPC** | Kernel pipes (`pipe2`), `eventfd2`, `futex`, `pselect6`, `ppoll` |
@@ -76,7 +76,6 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 |---|---|
 | **VFS layer** | Mount table, path resolution with symlink following, cross-filesystem operations |
 | **ext2** | Read/write ext2 on VirtIO block device — directories, symlinks, permissions, metadata |
-| **memfs** | In-memory temporary filesystem |
 | **procfs** | `/proc/<pid>/fd/` for process I/O, process listing filtered by container |
 
 ### Shells & Utilities
@@ -170,12 +169,12 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 │  │ herd │ │ box  │ │ sqld │ │ httpd│ │ xbps │ │ apk          │  │
 │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
-│  Syscall Interface (Linux AArch64 ABI, ~105 syscalls)            │
+│  Syscall Interface (Linux AArch64 ABI, ~140 syscalls)            │
 ├──────────────────────────────────────────────────────────────────┤
-│                      Kernel  (~43k lines)                        │
+│                      Kernel  (~18k lines)                        │
 │  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
 │  │Exceptions│ │ Syscalls     │ │ IRQ      │ │ SSH Server    │   │
-│  │ (EL0/EL1)│ │ (105 calls)  │ │ dispatch │ │ (SSH-2)       │   │
+│  │ (EL0/EL1)│ │ (140 calls)  │ │ dispatch │ │ (SSH-2)       │   │
 │  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
 │  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
 │  │ GIC      │ │ VirtIO       │ │ Timer    │ │ Console       │   │
@@ -183,17 +182,17 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 │  │          │ │              │ │ ARM CNTP │ │               │   │
 │  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
 ├──────────────────────────────────────────────────────────────────┤
-│               Extracted Crates  (~19k lines)                     │
+│               Extracted Crates  (~17k lines)                     │
 │  ┌───────────────────────────────────────────────────────────┐   │
-│  │  akuma-exec (8.7k) — threading, process, MMU, ELF loader │   │
+│  │  akuma-exec (8.7k) — threading, process, MMU, ELF loader  │   │
 │  └───────────────────────────────────────────────────────────┘   │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
 │  │akuma-net │ │akuma-ext2│ │akuma-vfs │ │ akuma-shell       │   │
-│  │ (3.1k)   │ │ (2.1k)   │ │ (1.1k)   │ │ (1.3k)            │   │
+│  │ (2.9k)   │ │ (1.7k)   │ │ (0.8k)   │ │ (1.1k)            │   │
 │  └──────────┘ └──────────┘ └──────────┘ └───────────────────┘   │
 │  ┌──────────┐ ┌──────────────┐ ┌────────────────────────────┐   │
 │  │akuma-ssh │ │akuma-ssh-    │ │ akuma-terminal (0.5k)      │   │
-│  │ (0.9k)   │ │crypto (0.9k) │ │                            │   │
+│  │ (0.7k)   │ │crypto (0.7k) │ │                            │   │
 │  └──────────┘ └──────────────┘ └────────────────────────────┘   │
 ├──────────────────────────────────────────────────────────────────┤
 │  Hardware: QEMU virt — VirtIO-net, VirtIO-blk, VirtIO-rng,      │
@@ -203,17 +202,17 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 
 ### Crate Structure
 
-The kernel is split into a monolithic core (`src/`, ~43k lines) and 8 extracted crates (`crates/`, ~19k lines):
+The kernel is split into a monolithic core (`src/`, ~18k lines) and 8 extracted crates (`crates/`, ~17k lines), with ~7k lines of tests:
 
 | Crate | Lines | Purpose |
 |---|---|---|
 | `akuma-exec` | 8,730 | Threading, process management, MMU page tables, ELF loader — the execution engine |
-| `akuma-net` | 3,116 | Socket layer, TCP/UDP abstractions, smoltcp integration |
-| `akuma-ext2` | 2,064 | ext2 filesystem implementation with read/write support |
-| `akuma-shell` | 1,334 | Shell parser, command pipeline, redirection, variable expansion |
-| `akuma-vfs` | 1,068 | Virtual filesystem types, mount table, path resolution |
-| `akuma-ssh-crypto` | 932 | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
-| `akuma-ssh` | 881 | SSH-2 protocol handling, channel management, auth |
+| `akuma-net` | 2,940 | Socket layer, TCP/UDP abstractions, smoltcp integration |
+| `akuma-ext2` | 1,746 | ext2 filesystem implementation with read/write support |
+| `akuma-shell` | 1,050 | Shell parser, command pipeline, redirection, variable expansion |
+| `akuma-vfs` | 838 | Virtual filesystem types, mount table, path resolution |
+| `akuma-ssh-crypto` | 670 | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
+| `akuma-ssh` | 733 | SSH-2 protocol handling, channel management, auth |
 | `akuma-terminal` | 538 | Terminal emulation, raw/cooked modes, escape sequences |
 
 ### Memory Layout
@@ -235,8 +234,8 @@ User processes get isolated virtual address spaces (up to 4 GB) with demand-page
 ## Project Layout
 
 ```
-src/              Kernel source (~43k lines of no_std Rust)
-crates/           Extracted kernel crates (8 crates, ~19k lines)
+src/              Kernel source (~18k lines of no_std Rust, ~5k lines of tests)
+crates/           Extracted kernel crates (8 crates, ~17k lines, ~1k lines of tests)
 userspace/        Userspace applications and libraries
   libakuma/         Rust syscall wrapper library
   meow/             AI coding assistant

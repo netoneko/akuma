@@ -24,8 +24,6 @@ pub const DEBUG_FRAME_TRACKING: bool = false;
 pub struct FrameInfo {
     /// Source of the allocation
     pub source: FrameSource,
-    /// Process ID (0 for kernel)
-    pub pid: u32,
 }
 
 /// Debug tracker for frame allocations
@@ -57,8 +55,8 @@ impl FrameTracker {
         }
     }
 
-    fn track(&mut self, addr: usize, source: FrameSource, pid: u32) {
-        if let Some(_old) = self.allocations.insert(addr, FrameInfo { source, pid }) {
+    fn track(&mut self, addr: usize, source: FrameSource) {
+        if let Some(_old) = self.allocations.insert(addr, FrameInfo { source }) {
             // Double allocation detected! Use stack-only print to avoid heap in PMM
             crate::console::print("[PMM WARN] Double allocation detected!\n");
         }
@@ -131,9 +129,9 @@ pub struct FrameTrackingStats {
 static FRAME_TRACKER: Spinlock<FrameTracker> = Spinlock::new(FrameTracker::new());
 
 /// Track a frame allocation (only if DEBUG_FRAME_TRACKING is enabled)
-pub fn track_frame(frame: PhysFrame, source: FrameSource, pid: u32) {
+pub fn track_frame(frame: PhysFrame, source: FrameSource) {
     if DEBUG_FRAME_TRACKING {
-        FRAME_TRACKER.lock().track(frame.addr, source, pid);
+        FRAME_TRACKER.lock().track(frame.addr, source);
     }
 }
 
@@ -292,43 +290,6 @@ impl BitmapAllocator {
         None
     }
 
-    /// Allocate contiguous pages
-    fn alloc_pages(&mut self, count: usize) -> Option<PhysFrame> {
-        if count == 0 {
-            return None;
-        }
-        if count == 1 {
-            return self.alloc_page();
-        }
-
-        // Search for contiguous free pages
-        let mut start = 0;
-        let mut found = 0;
-
-        for page_idx in 0..self.total_pages {
-            if self.is_free(page_idx) {
-                if found == 0 {
-                    start = page_idx;
-                }
-                found += 1;
-                if found == count {
-                    // Found enough contiguous pages
-                    for i in start..start + count {
-                        self.mark_used(i);
-                    }
-                    self.free_pages -= count;
-                    self.next_free_hint = start + count;
-                    let addr = self.base_addr + start * PAGE_SIZE;
-                    return Some(PhysFrame::new(addr));
-                }
-            } else {
-                found = 0;
-            }
-        }
-
-        None
-    }
-
     /// Free a single page
     fn free_page(&mut self, frame: PhysFrame) {
         if frame.addr < self.base_addr {
@@ -347,12 +308,6 @@ impl BitmapAllocator {
         }
     }
 
-    /// Free contiguous pages
-    fn free_pages(&mut self, frame: PhysFrame, count: usize) {
-        for i in 0..count {
-            self.free_page(PhysFrame::new(frame.addr + i * PAGE_SIZE));
-        }
-    }
 }
 
 /// Global physical memory allocator
@@ -391,19 +346,6 @@ pub fn alloc_page() -> Option<PhysFrame> {
     })
 }
 
-/// Allocate contiguous physical pages
-pub fn alloc_pages(count: usize) -> Option<PhysFrame> {
-    // CRITICAL: Disable IRQs to prevent deadlock!
-    crate::irq::with_irqs_disabled(|| {
-        let mut pmm = PMM.lock();
-        let result = pmm.alloc_pages(count);
-        if result.is_some() {
-            ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
-        }
-        result
-    })
-}
-
 /// Free a single physical page
 pub fn free_page(frame: PhysFrame) {
     // Untrack BEFORE freeing to prevent race condition:
@@ -416,16 +358,6 @@ pub fn free_page(frame: PhysFrame) {
         let mut pmm = PMM.lock();
         pmm.free_page(frame);
         ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
-    })
-}
-
-/// Free contiguous physical pages
-pub fn free_pages(frame: PhysFrame, count: usize) {
-    // CRITICAL: Disable IRQs to prevent deadlock!
-    crate::irq::with_irqs_disabled(|| {
-        let mut pmm = PMM.lock();
-        pmm.free_pages(frame, count);
-        ALLOCATED_PAGES.fetch_sub(count, Ordering::Relaxed);
     })
 }
 
@@ -477,29 +409,3 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
     Some(frame)
 }
 
-/// Allocate zeroed contiguous pages
-pub fn alloc_pages_zeroed(count: usize) -> Option<PhysFrame> {
-    use akuma_exec::mmu::phys_to_virt;
-
-    let frame = alloc_pages(count)?;
-    let total_size = PAGE_SIZE * count;
-    unsafe {
-        // Use phys_to_virt to get a valid kernel VA for the physical address
-        let virt_addr = phys_to_virt(frame.addr);
-        core::ptr::write_bytes(virt_addr, 0, total_size);
-
-        // Clean data cache for all pages
-        const CACHE_LINE_SIZE: usize = 64;
-        let mut addr = virt_addr as usize;
-        let end = addr + total_size;
-        while addr < end {
-            core::arch::asm!(
-                "dc cvac, {addr}",
-                addr = in(reg) addr,
-            );
-            addr += CACHE_LINE_SIZE;
-        }
-        core::arch::asm!("dsb ish");
-    }
-    Some(frame)
-}

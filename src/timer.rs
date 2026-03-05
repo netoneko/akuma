@@ -5,13 +5,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
-// Manual tick counter (u64)
-// Overflow times at different frequencies:
-// - 1 kHz (ms): ~584 million years
-// - 1 MHz (μs): ~584 thousand years
-// For most embedded systems, u64 is sufficient. Use wrapping arithmetic if needed.
-static TICK_COUNT: Spinlock<u64> = Spinlock::new(0);
-
 // UTC offset in microseconds since Unix epoch (1970-01-01 00:00:00)
 // Can be set via set_utc_offset() to sync with real time
 static UTC_OFFSET_US: Spinlock<Option<u64>> = Spinlock::new(None);
@@ -92,15 +85,6 @@ pub fn timer_irq_handler(_irq: u32) {
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 
-pub fn tick() {
-    let mut count = TICK_COUNT.lock();
-    *count = count.wrapping_add(1);
-}
-
-pub fn get_ticks() -> u64 {
-    *TICK_COUNT.lock()
-}
-
 // Read the ARM Generic Timer counter
 pub fn read_counter() -> u64 {
     let counter: u64;
@@ -129,108 +113,6 @@ pub fn get_time_us() -> u64 {
         ((counter as u128 * 1_000_000) / freq as u128) as u64
     } else {
         0
-    }
-}
-
-// Simple delay using the timer counter
-// Uses wrapping subtraction to handle counter overflow correctly
-pub fn delay_us(us: u64) {
-    let start = get_time_us();
-    while get_time_us().wrapping_sub(start) < us {
-        core::hint::spin_loop();
-    }
-}
-
-pub fn delay_ms(ms: u64) {
-    delay_us(ms * 1000);
-}
-
-// Get time in nanoseconds using u128 to avoid overflow
-// u128 can represent ~5.8 billion years at nanosecond precision
-pub fn get_time_ns() -> u128 {
-    let counter = read_counter();
-    let freq = read_frequency();
-    if freq > 0 {
-        // Use u128 to prevent overflow
-        (counter as u128 * 1_000_000_000) / freq as u128
-    } else {
-        0
-    }
-}
-
-// Monotonic time structure - never overflows in practice
-// Stores seconds and nanoseconds separately like POSIX timespec
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timespec {
-    pub sec: u64,  // Seconds since boot (overflows in 584 billion years)
-    pub nsec: u32, // Nanoseconds (0-999,999,999)
-}
-
-impl Timespec {
-    pub const fn zero() -> Self {
-        Self { sec: 0, nsec: 0 }
-    }
-
-    pub fn now() -> Self {
-        let counter = read_counter();
-        let freq = read_frequency();
-        if freq > 0 {
-            let sec = counter / freq;
-            let remainder = counter % freq;
-            let nsec = ((remainder as u128 * 1_000_000_000) / freq as u128) as u32;
-            Self { sec, nsec }
-        } else {
-            Self::zero()
-        }
-    }
-
-    pub fn elapsed(&self) -> Self {
-        let now = Self::now();
-        now.sub(*self)
-    }
-
-    pub fn sub(&self, other: Self) -> Self {
-        let mut sec = self.sec.wrapping_sub(other.sec);
-        let mut nsec = self.nsec as i64 - other.nsec as i64;
-
-        if nsec < 0 {
-            sec = sec.wrapping_sub(1);
-            nsec += 1_000_000_000;
-        }
-
-        Self {
-            sec,
-            nsec: nsec as u32,
-        }
-    }
-
-    pub fn as_nanos(&self) -> u128 {
-        (self.sec as u128) * 1_000_000_000 + (self.nsec as u128)
-    }
-
-    pub fn as_micros(&self) -> u128 {
-        (self.sec as u128) * 1_000_000 + (self.nsec as u128) / 1000
-    }
-
-    pub fn as_millis(&self) -> u128 {
-        (self.sec as u128) * 1000 + (self.nsec as u128) / 1_000_000
-    }
-}
-
-// Nanosecond delay using hardware counter directly
-// More accurate than microsecond delay for sub-microsecond delays
-pub fn delay_ns(ns: u64) {
-    let freq = read_frequency();
-    if freq == 0 {
-        return;
-    }
-
-    let start = read_counter();
-    // Convert nanoseconds to counter ticks
-    let ticks = ((ns as u128 * freq as u128) / 1_000_000_000) as u64;
-
-    while read_counter().wrapping_sub(start) < ticks {
-        core::hint::spin_loop();
     }
 }
 
@@ -362,19 +244,6 @@ impl DateTime {
             self.microsecond
         )
     }
-
-    // Format as ISO 8601 without microseconds: YYYY-MM-DDTHH:MM:SSZ
-    pub fn to_iso8601_simple(&self) -> String {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            self.year,
-            self.month,
-            self.day,
-            self.hour,
-            self.minute,
-            self.second
-        )
-    }
 }
 
 // Check if a year is a leap year
@@ -387,14 +256,6 @@ fn is_leap_year(year: u32) -> bool {
 pub fn utc_iso8601() -> String {
     match utc_time_us() {
         Some(us) => DateTime::from_unix_us(us).to_iso8601(),
-        None => String::from("NOT_SET"),
-    }
-}
-
-// Get current UTC time as simple ISO 8601 string (no microseconds)
-pub fn utc_iso8601_simple() -> String {
-    match utc_time_us() {
-        Some(us) => DateTime::from_unix_us(us).to_iso8601_simple(),
         None => String::from("NOT_SET"),
     }
 }

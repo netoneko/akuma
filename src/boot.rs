@@ -12,9 +12,6 @@
 
 use core::arch::global_asm;
 
-// Kernel physical base address
-pub const KERNEL_PHYS_BASE: usize = 0x4000_0000;
-
 global_asm!(
     r#"
 .section .text._boot

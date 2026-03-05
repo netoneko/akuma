@@ -12,42 +12,18 @@ use core::pin::Pin;
 
 use embedded_io_async::Write;
 
-use crate::async_fs::{AsyncFile, OpenMode};
+use crate::async_fs;
 use crate::shell::{execute_external_streaming, Command, ShellContext, ShellError, VecWriter};
 use akuma_net::http::{self, ParsedUrl, parse_url};
 use akuma_net::smoltcp_net;
 
-/// Adapter that wraps `AsyncFile` to implement `embedded_io_async::Write`.
-struct AsyncFileWriter(AsyncFile);
-
-impl embedded_io_async::ErrorType for AsyncFileWriter {
-    type Error = embedded_io_async::ErrorKind;
-}
-
-impl embedded_io_async::Write for AsyncFileWriter {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.0.write(buf).await.map_err(|_| embedded_io_async::ErrorKind::Other)
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-/// Stream an HTTP GET response body directly to a file on disk via
-/// `akuma_net::http::http_get_streaming`. Returns status code and bytes written.
-async fn http_get_streaming_to_file(
-    url: &ParsedUrl,
-    dest_path: &str,
-) -> Result<(u16, usize), &'static str> {
-    let file = AsyncFile::open(dest_path, OpenMode::Write)
+/// Download an HTTP GET response to a file. Returns status code and bytes written.
+async fn http_get_to_file(url: &ParsedUrl, dest_path: &str) -> Result<(u16, usize), &'static str> {
+    let resp = http::http_get(url, false).await.map_err(|_| "HTTP request failed")?;
+    async_fs::write_file(dest_path, &resp.body)
         .await
-        .map_err(|_| "Failed to open destination file")?;
-    let mut writer = AsyncFileWriter(file);
-
-    let result = http::http_get_streaming(url, false, &mut writer, |_| {}).await;
-    writer.0.close().await;
-    result
+        .map_err(|_| "Failed to write destination file")?;
+    Ok((resp.status, resp.body.len()))
 }
 
 // ============================================================================
@@ -292,7 +268,7 @@ impl PkgCommand {
                 let msg = format!("pkg: streaming download {}...\r\n", url_str);
                 let _ = stdout.write(msg.as_bytes()).await;
 
-                match http_get_streaming_to_file(&url, &tmp_path).await {
+                match http_get_to_file(&url, &tmp_path).await {
                     Ok((200, size)) => {
                         if size == 0 {
                             let _ = crate::async_fs::remove_file(&tmp_path).await;

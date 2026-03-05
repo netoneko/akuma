@@ -486,11 +486,6 @@ pub fn init() -> Result<(), RngError> {
     Err(RngError::NotFound)
 }
 
-/// Check if RNG device is initialized
-pub fn is_initialized() -> bool {
-    RNG_DEVICE.lock().is_some()
-}
-
 /// Fill a buffer with random bytes from the hardware RNG
 ///
 /// # Arguments

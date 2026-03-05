@@ -561,56 +561,53 @@ Files were moved with `cp` then patched with `StrReplace` — not retyped.
   try, see bug #5 above — pre-existing, not a regression)
 - `curl http://...` (plain HTTP) — works
 
-### Known issue: HTTPS `curl` returns "Read error"
+### ~~Known issue: HTTPS `curl` returns "Read error"~~ (RESOLVED)
 
 `curl -Lkv https://ifconfig.me/ip` connects to port 443 and appears to
 complete the TLS handshake (no "TLS handshake failed" error), but the
 subsequent HTTP read returns "Read error" immediately (zero bytes received).
 
-**Possible causes:**
-- `embedded-tls` may not fully support the server's TLS configuration
-  (e.g. TLS 1.2 fallback, certain cipher suites, or ALPN negotiation).
-- The HTTP/1.0 request format may not be accepted by `ifconfig.me` over TLS.
-- The smoltcp TCP receive window or buffer may be too small for the TLS
-  record size, causing the TLS layer to fail on the first read.
-- QEMU's user-mode networking may interfere with TLS record framing.
-
-**Status:** Not yet debugged. The TLS infrastructure (`TlsStream`,
-`TlsOptions`, `X509Verifier`) is in place and structurally correct. The
-issue is likely a compatibility or configuration problem with `embedded-tls`
-against real-world servers, not a bug in the extraction itself.
+**Status:** Verified working.
 
 ---
 
-## TODO: Clippy cleanup pass across all extracted crates
+## Dead Code Cleanup (completed)
 
-During the `akuma-net` extraction, many clippy warnings from the moved kernel
-code were suppressed with `#[allow(...)]` attributes rather than properly
-fixed. This was expedient for getting the extraction working but is technical
-debt.
+Removed all dead code from the kernel and switched the main kernel crate to
+inherit workspace lints (`[lints] workspace = true`), which includes
+`dead_code = "deny"`, `unused_imports = "deny"`, and `unused_variables = "deny"`.
+Any future dead code will be a compile error.
 
-A dedicated pass is needed to:
+### Scope
 
-1. **Remove `#[allow(...)]` attributes** and fix the underlying code instead.
-   Key offenders: `deref_addrof` (unsafe raw pointer patterns in the smoltcp
-   device impls), `cast_possible_wrap` (u64-to-i64 timestamp casts),
-   `result_unit_err` (functions returning `Result<_, ()>`), and
-   `option_if_let_else` (URL parsing).
+~80 items removed across ~25 files:
 
-2. **Audit lint settings per crate.** Each crate inherits `workspace.lints`
-   (clippy all + pedantic + nursery). Some lints may need to be permanently
-   allowed at the crate level (e.g. `future_not_send` for async + spinlock
-   code), but the decision should be intentional and documented, not a
-   blanket suppression.
+| Area | Items removed |
+|------|---------------|
+| **timer.rs** | `TICK_COUNT`, `tick`, `get_ticks`, `delay_us`, `delay_ms`, `get_time_ns`, `Timespec` (struct + impl), `delay_ns`, `to_iso8601_simple`, `utc_iso8601_simple` |
+| **allocator.rs** | `RegistryStats`, `registry_stats`, `registry_contains`, `scan_for_corruption`, `dump_allocations`, `print_registry_stats` |
+| **pmm.rs** | `FrameInfo::pid` field, `BitmapAllocator::alloc_pages`, `BitmapAllocator::free_pages`, public `alloc_pages`, `free_pages`, `alloc_pages_zeroed` |
+| **ssh/** | `CONFIG_PATH`, `load_config`, `ensure_default_config`, `SSHD_DIR`, `HOST_KEY_PATH`, `HOST_KEY_PUB_PATH`, `ensure_sshd_directory`, `generate_keypair`, `load_or_generate_host_key`, `init_host_key_async`, `terminal_state`, `build_encrypted_packet`, `next_u64`, unused re-exports |
+| **vfs/** | `MemoryFilesystem` module (deleted entirely), `is_initialized`, `unmount`, `sync_all`, `path_components` re-export |
+| **async_fs.rs** | `AsyncFile` (struct + impl), `SeekFrom`, `file_size`, `read_string`, `write_string`, `append_string` |
+| **block.rs** | Module-level `capacity`, `capacity_sectors`, `read_sectors`, `write_sectors` |
+| **gic.rs** | `Gic::read_dist`, `Gic::disable_irq`, public `disable_irq` |
+| **irq.rs** | `unregister_handler` |
+| **misc** | `DTB_MAGIC`, `KERNEL_PHYS_BASE`, `AKUMA_120`, `FWCfgFile`, `is_irq_enabled`, `StackWriter::clear`, `Duration::from_micros`, `rng::is_initialized`, `OpenMode` enum, `EPOLLRDHUP`, `EACCES`, editor constants |
 
-3. **Unify style across crates.** The extracted code carries kernel
-   conventions (e.g. `Result<_, ()>` instead of proper error types,
-   `if let` chains instead of `map_or`, manual `let...else` patterns).
-   These should be modernized to match the workspace lint level.
+### `track_frame` signature change
 
-4. **Crates to review:** `akuma-net`, `akuma-ssh`, `akuma-shell`,
-   `akuma-ssh-crypto`, `akuma-terminal`, `akuma-vfs`, `akuma-ext2`,
-   `akuma-exec`.
+Removing `FrameInfo::pid` required updating the `track_frame` function pointer
+in `ExecRuntime` from `fn(PhysFrame, FrameSource, u32)` to
+`fn(PhysFrame, FrameSource)`. All call sites in `akuma-exec` (process.rs,
+mmu.rs) and the kernel (allocator.rs, main.rs) were updated.
+
+### Remaining TODO: Clippy style cleanup
+
+The extracted crates still carry some `#[allow(...)]` attributes from the
+extraction process. A dedicated pass is needed to remove them and fix the
+underlying code. Key offenders: `deref_addrof`, `cast_possible_wrap`,
+`result_unit_err`, `option_if_let_else`.
 
 ---
 
@@ -653,7 +650,7 @@ management are deeply coupled to every kernel subsystem.
        pub trigger_sgi: fn(u32),
        pub alloc_page_zeroed: fn() -> Option<PhysFrame>,
        pub free_page: fn(PhysFrame),
-       pub track_frame: fn(PhysFrame, FrameSource, u32),
+       pub track_frame: fn(PhysFrame, FrameSource),
        pub read_file: fn(&str) -> Result<Vec<u8>, i32>,
        pub remove_socket: fn(usize),
        // ... and more

@@ -55,13 +55,6 @@ impl Gic {
         }
     }
 
-    /// Read from a distributor register
-    #[inline]
-    fn read_dist(&self, offset: usize) -> u32 {
-        // SAFETY: Reading from GIC distributor register at known QEMU virt machine address
-        unsafe { core::ptr::read_volatile((self.dist_base + offset) as *const u32) }
-    }
-
     /// Write a byte to a distributor register
     #[inline]
     fn write_dist_byte(&self, offset: usize, value: u8) {
@@ -133,17 +126,6 @@ impl Gic {
         self.write_dist(offset, bit);
     }
 
-    /// Disable a specific IRQ
-    fn disable_irq(&self, irq: u32) {
-        if irq >= 1020 {
-            return; // Invalid IRQ number
-        }
-
-        let offset = dist::ICENABLER + ((irq / 32) * 4) as usize;
-        let bit = 1u32 << (irq % 32);
-        self.write_dist(offset, bit);
-    }
-
     /// Acknowledge an interrupt and return its IRQ number
     fn acknowledge_irq(&self) -> Option<u32> {
         let iar = self.read_cpu(cpu::IAR);
@@ -202,11 +184,6 @@ pub fn init() {
 /// Enable a specific IRQ
 pub fn enable_irq(irq: u32) {
     GIC.enable_irq(irq);
-}
-
-/// Disable a specific IRQ
-pub fn disable_irq(irq: u32) {
-    GIC.disable_irq(irq);
 }
 
 /// Acknowledge an interrupt and return its IRQ number

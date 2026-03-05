@@ -92,27 +92,6 @@ static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static INVALID_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CANARY_CORRUPTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Registry statistics
-#[derive(Debug, Clone, Copy)]
-pub struct RegistryStats {
-    pub active_allocations: usize,
-    pub overlaps_detected: usize,
-    pub double_frees_detected: usize,
-    pub invalid_frees_detected: usize,
-    pub canary_corruptions: usize,
-}
-
-/// Get registry statistics
-pub fn registry_stats() -> RegistryStats {
-    RegistryStats {
-        active_allocations: REGISTRY_COUNT.load(Ordering::Relaxed),
-        overlaps_detected: OVERLAP_COUNT.load(Ordering::Relaxed),
-        double_frees_detected: DOUBLE_FREE_COUNT.load(Ordering::Relaxed),
-        invalid_frees_detected: INVALID_FREE_COUNT.load(Ordering::Relaxed),
-        canary_corruptions: CANARY_CORRUPTION_COUNT.load(Ordering::Relaxed),
-    }
-}
-
 /// Check if two ranges overlap
 fn ranges_overlap(start1: usize, size1: usize, start2: usize, size2: usize) -> bool {
     if size1 == 0 || size2 == 0 {
@@ -194,117 +173,6 @@ fn registry_remove(addr: usize) -> bool {
     INVALID_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::safe_print!(64, "[ALLOC] INVALID FREE at 0x{:x}\n", addr);
     false
-}
-
-/// Check if an address is in the registry (for double-free detection)
-fn registry_contains(addr: usize) -> bool {
-    if !ENABLE_ALLOCATION_REGISTRY {
-        return true;
-    }
-
-    let registry = ALLOCATION_REGISTRY.lock();
-    for record in registry.iter() {
-        if record.active && record.addr == addr {
-            return true;
-        }
-    }
-    false
-}
-
-/// Scan all allocations for canary corruption
-/// Returns number of corrupted allocations found
-pub fn scan_for_corruption() -> usize {
-    if !ENABLE_ALLOCATION_REGISTRY || !ENABLE_CANARIES {
-        return 0;
-    }
-
-    let registry = ALLOCATION_REGISTRY.lock();
-    let mut corrupted = 0;
-
-    for record in registry.iter() {
-        if !record.active {
-            continue;
-        }
-
-        let user_ptr = record.addr;
-        let user_size = record.size;
-
-        // Check canary before
-        let canary_before_ptr = (user_ptr - CANARY_SIZE) as *const u64;
-        let canary_before = unsafe { core::ptr::read_volatile(canary_before_ptr) };
-        if canary_before != CANARY_BEFORE {
-            corrupted += 1;
-            crate::safe_print!(
-                128,
-                "[ALLOC] CANARY CORRUPTION (before) at 0x{:x}: expected 0x{:x}, got 0x{:x}\n",
-                user_ptr,
-                CANARY_BEFORE,
-                canary_before
-            );
-        }
-
-        // Check canary after
-        let canary_after_ptr = (user_ptr + user_size) as *const u64;
-        let canary_after = unsafe { core::ptr::read_volatile(canary_after_ptr) };
-        if canary_after != CANARY_AFTER {
-            corrupted += 1;
-            crate::safe_print!(
-                128,
-                "[ALLOC] CANARY CORRUPTION (after) at 0x{:x}+{}: expected 0x{:x}, got 0x{:x}\n",
-                user_ptr,
-                user_size,
-                CANARY_AFTER,
-                canary_after
-            );
-        }
-    }
-
-    if corrupted > 0 {
-        CANARY_CORRUPTION_COUNT.fetch_add(corrupted, Ordering::Relaxed);
-    }
-
-    corrupted
-}
-
-/// Dump all active allocations (for debugging)
-pub fn dump_allocations() {
-    if !ENABLE_ALLOCATION_REGISTRY {
-        crate::console::print("[ALLOC] Registry disabled\n");
-        return;
-    }
-
-    let registry = ALLOCATION_REGISTRY.lock();
-    let mut count = 0;
-
-    crate::console::print("=== Active Allocations ===\n");
-    for record in registry.iter() {
-        if record.active {
-            crate::safe_print!(
-                64,
-                "  0x{:x}-0x{:x} (size={})\n",
-                record.addr,
-                record.addr + record.size,
-                record.size
-            );
-            count += 1;
-            if count >= 50 {
-                crate::console::print("  ... (truncated)\n");
-                break;
-            }
-        }
-    }
-    crate::safe_print!(48, "Total: {} allocations\n", REGISTRY_COUNT.load(Ordering::Relaxed));
-}
-
-/// Print registry stats
-pub fn print_registry_stats() {
-    let stats = registry_stats();
-    crate::console::print("=== Allocation Registry Stats ===\n");
-    crate::safe_print!(48, "  Active allocations: {}\n", stats.active_allocations);
-    crate::safe_print!(48, "  Overlaps detected: {}\n", stats.overlaps_detected);
-    crate::safe_print!(48, "  Double frees: {}\n", stats.double_frees_detected);
-    crate::safe_print!(48, "  Invalid frees: {}\n", stats.invalid_frees_detected);
-    crate::safe_print!(48, "  Canary corruptions: {}\n", stats.canary_corruptions);
 }
 
 #[global_allocator]
@@ -449,7 +317,7 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
         for i in 0..pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 // Track as kernel allocation (PID=0 for kernel)
-                crate::pmm::track_frame(frame, crate::pmm::FrameSource::Kernel, 0);
+                crate::pmm::track_frame(frame, crate::pmm::FrameSource::Kernel);
                 if i == 0 {
                     // Convert physical address to kernel virtual address
                     first_addr = Some(akuma_exec::mmu::phys_to_virt(frame.addr));

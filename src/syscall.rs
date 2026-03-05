@@ -3,7 +3,6 @@
 //! Implements the syscall interface for user programs.
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
-use crate::console;
 use crate::config;
 use akuma_terminal::mode_flags;
 use alloc::string::String;
@@ -389,7 +388,6 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
-const EPOLLRDHUP: u32 = 0x2000;
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -588,8 +586,6 @@ const ENOENT: u64 = (-2i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
 /// Error code for invalid argument
 const EINVAL: u64 = (-22i64) as u64;
-/// Error code for permission denied
-const EACCES: u64 = (-13i64) as u64;
 /// Error code for bad file descriptor
 const EBADF: u64 = (-9i64) as u64;
 /// Error code for function not implemented
@@ -672,7 +668,7 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
     let mut va = page_start;
     while va < page_end {
         if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-            if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(va) {
+            if let Some((flags, source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(va) {
                 let map_flags = match &source {
                     akuma_exec::process::LazySource::File { .. } => {
                         if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
@@ -1355,7 +1351,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let _proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     
     // We only support terminal ioctls on stdin/stdout for now
     if fd > 2 {
@@ -3163,7 +3159,7 @@ fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     }
 }
 
-use akuma_net::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
+use akuma_net::socket::{self, SockAddrIn, libc_errno};
 
 fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF; // mask off SOCK_CLOEXEC (0x80000) and SOCK_NONBLOCK (0x800)
@@ -4821,7 +4817,7 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
 }
 
 /// sys_set_terminal_attributes - Sets terminal control attributes
-fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
+fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
         None => return (-libc_errno::ENOMEM as i64) as u64,
@@ -4851,7 +4847,7 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
 }
 
 /// sys_get_terminal_attributes - Retrieves current terminal control attributes
-fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
+fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
         return (-libc_errno::EINVAL as i64) as u64;
     }

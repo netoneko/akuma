@@ -176,11 +176,6 @@ impl<const N: usize> StackWriter<N> {
         print(self.as_str());
         self.pos = 0;
     }
-
-    /// Clear the buffer
-    pub fn clear(&mut self) {
-        self.pos = 0;
-    }
 }
 
 impl<const N: usize> Write for StackWriter<N> {

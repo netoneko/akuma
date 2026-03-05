@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use alloc::format;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
-use crate::config::{PROC_STDIN_MAX_SIZE, PROC_STDOUT_MAX_SIZE};
+use crate::config::PROC_STDOUT_MAX_SIZE;
 use akuma_exec::process::{self, Pid};
 
 // ============================================================================

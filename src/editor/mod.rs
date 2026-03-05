@@ -15,8 +15,6 @@ use crate::async_fs;
 // ANSI Escape Sequences
 // ============================================================================
 
-/// Move cursor to home and clear screen (combined for reliability)
-const CLEAR_AND_HOME: &[u8] = b"\x1b[H\x1b[J";
 /// Clear entire screen
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
 /// Move cursor to home position (1,1)
@@ -29,8 +27,6 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 const REVERSE_VIDEO: &[u8] = b"\x1b[7m";
 /// Reset all attributes
 const RESET_ATTRS: &[u8] = b"\x1b[0m";
-/// Dim text (for line numbers)
-const DIM_TEXT: &[u8] = b"\x1b[2m";
 /// Clear to end of line
 const CLEAR_EOL: &[u8] = b"\x1b[K";
 
@@ -57,14 +53,6 @@ impl TermSize {
         Self {
             width: width as usize,
             height: height as usize,
-        }
-    }
-
-    /// Default terminal size (80x24)
-    pub fn default() -> Self {
-        Self {
-            width: 80,
-            height: 24,
         }
     }
 
@@ -166,11 +154,6 @@ impl EditorBuffer {
     /// Get the current line
     fn current_line(&self) -> &String {
         &self.lines[self.cursor_row]
-    }
-
-    /// Get mutable reference to current line
-    fn current_line_mut(&mut self) -> &mut String {
-        &mut self.lines[self.cursor_row]
     }
 
     /// Insert a character at cursor position

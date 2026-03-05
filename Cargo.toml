@@ -34,10 +34,8 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-# Kernel keeps its own lint config — does NOT inherit workspace lints
-# until all Phase 1 extractions are complete.
-[lints.clippy]
-disallowed_macros = "warn"
+[lints]
+workspace = true
 
 [dependencies]
 akuma-terminal = { path = "crates/akuma-terminal" }

@@ -37,10 +37,6 @@ impl Duration {
         Self { us: ms * 1_000 }
     }
 
-    pub const fn from_micros(us: u64) -> Self {
-        Self { us }
-    }
-
     pub const fn as_micros(&self) -> u64 {
         self.us
     }

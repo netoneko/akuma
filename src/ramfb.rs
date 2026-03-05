@@ -31,13 +31,9 @@ struct RamFBCfg {
 
 /// Global framebuffer state
 struct FramebufferState {
-    /// Physical (and virtual, due to identity mapping) address of pixel data
-    addr: usize,
     width: u32,
     height: u32,
     stride: u32,
-    /// Total size in bytes
-    size: usize,
 }
 
 static FB_STATE: Spinlock<Option<FramebufferState>> = Spinlock::new(None);
@@ -101,11 +97,9 @@ pub fn init(width: u32, height: u32) -> Result<(), &'static str> {
     {
         let mut state = FB_STATE.lock();
         *state = Some(FramebufferState {
-            addr: fb_addr,
             width,
             height,
             stride,
-            size: fb_size,
         });
     }
     FB_ADDR.store(fb_addr, Ordering::Release);

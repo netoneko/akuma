@@ -7,8 +7,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::config;
 use crate::console;
-use crate::shell::Command;
-use crate::shell::commands::builtin;
 use akuma_exec::threading;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;

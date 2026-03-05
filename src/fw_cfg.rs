@@ -35,15 +35,6 @@ struct FWCfgDmaAccess {
     addr: u64,
 }
 
-/// Directory entry as stored by QEMU (64 bytes each)
-#[repr(C)]
-pub struct FWCfgFile {
-    pub size: u32,    // big-endian
-    pub select: u16,  // big-endian
-    _reserved: u16,
-    pub name: [u8; 56],
-}
-
 /// Select a fw_cfg entry by its selector number.
 fn select(key: u16) {
     unsafe {
@@ -83,7 +74,7 @@ pub fn find_file(name: &str) -> Option<(u16, u32)> {
     crate::console::print(" entries\n");
 
     // Each entry is 64 bytes: size(4) + select(2) + reserved(2) + name(56)
-    for i in 0..num_entries {
+    for _i in 0..num_entries {
         let mut entry_buf = [0u8; 64];
         read_bytes(&mut entry_buf);
 
