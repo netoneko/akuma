@@ -1038,6 +1038,21 @@ pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> 
     })
 }
 
+/// Like lazy_region_lookup but takes an explicit PID (for tests and non-current-process use).
+pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
+    crate::irq::with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&pid) {
+            for r in regions {
+                if va >= r.start_va && va < r.start_va + r.size {
+                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
+                }
+            }
+        }
+        None
+    })
+}
+
 pub fn lazy_region_debug(va: usize) {
     let pid = read_current_pid().unwrap_or(0);
     crate::irq::with_irqs_disabled(|| {
@@ -1068,6 +1083,23 @@ pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page
         regions.len()
     });
     len
+}
+
+/// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
+/// Called by sys_mprotect so demand paging uses the correct permissions.
+pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
+    let range_end = range_start + range_size;
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get_mut(&pid) {
+            for r in regions.iter_mut() {
+                let r_end = r.start_va + r.size;
+                if r.start_va < range_end && r_end > range_start {
+                    r.flags = new_flags;
+                }
+            }
+        }
+    });
 }
 
 pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {

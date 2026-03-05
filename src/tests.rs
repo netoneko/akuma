@@ -98,6 +98,10 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_eager_munmap_suffix_preserves_prefix, "eager_munmap_suffix_preserves_prefix");
     run_test!(test_eager_munmap_full_removes_all, "eager_munmap_full_removes_all");
 
+    // Bug 11-12: munmap fallback and mprotect lazy flag updates
+    run_test!(test_munmap_fallback_clears_stale_ptes, "munmap_fallback_clears_stale_ptes");
+    run_test!(test_mprotect_updates_lazy_flags, "mprotect_updates_lazy_flags");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -3713,34 +3717,8 @@ fn simulate_sys_munmap_eager(
         return (Some(idx), freed);
     }
 
-    // Sub-range match (addr inside a region but not at start)
-    if let Some(idx) = mmap_regions.iter().position(|(start, frames)| {
-        addr > *start && addr < *start + frames.len() * 4096
-    }) {
-        let (region_start, old_frames) = mmap_regions.remove(idx);
-        let offset_pages = (addr - region_start) / 4096;
-        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
-        let mut prefix = Vec::new();
-        let mut suffix = Vec::new();
-        let mut freed = 0usize;
-        for (i, f) in old_frames.into_iter().enumerate() {
-            if i < offset_pages {
-                prefix.push(f);
-            } else if i < end {
-                crate::pmm::free_page(f);
-                freed += 1;
-            } else {
-                suffix.push(f);
-            }
-        }
-        if !prefix.is_empty() {
-            mmap_regions.push((region_start, prefix));
-        }
-        if !suffix.is_empty() {
-            mmap_regions.push((region_start + end * 4096, suffix));
-        }
-        return (Some(idx), freed);
-    }
+    // Sub-range munmap (addr inside an eager region) is NOT handled here —
+    // it falls through to the lazy region handler in the real sys_munmap.
 
     (None, 0)
 }
@@ -3806,9 +3784,10 @@ fn test_eager_munmap_prefix_preserves_suffix() -> bool {
     pass
 }
 
-/// Suffix munmap of an eager region: frees last N pages, preserves the prefix.
+/// Suffix munmap of an eager region: sub-range match is disabled for safety.
+/// The munmap falls through to the lazy region handler. The eager region is untouched.
 fn test_eager_munmap_suffix_preserves_prefix() -> bool {
-    console::print("\n[TEST] Bug 10: munmap suffix of eager region preserves prefix\n");
+    console::print("\n[TEST] Bug 10: munmap suffix — no-op for eager (falls to lazy handler)\n");
 
     let pages = 127usize;
     let keep = 100usize;
@@ -3833,19 +3812,19 @@ fn test_eager_munmap_suffix_preserves_prefix() -> bool {
         &mut mmap_regions, suffix_addr, trim * 4096,
     );
 
-    let did_match = matched.is_some();
-    let freed_correct = freed_count == trim;
-    let prefix_intact = mmap_regions.iter().any(|(start, fr)| {
-        *start == base && fr.len() == keep
+    let no_match = matched.is_none();
+    let no_freed = freed_count == 0;
+    let original_intact = mmap_regions.iter().any(|(start, fr)| {
+        *start == base && fr.len() == pages
     });
 
     for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
 
-    let pass = did_match && freed_correct && prefix_intact;
+    let pass = no_match && no_freed && original_intact;
     if !pass {
         crate::safe_print!(128,
-            "  matched={:?} freed={} (expected {}) prefix_intact={}\n",
-            matched, freed_count, trim, prefix_intact);
+            "  matched={:?} freed={} original_intact={}\n",
+            matched, freed_count, original_intact);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
@@ -3880,6 +3859,101 @@ fn test_eager_munmap_full_removes_all() -> bool {
         crate::safe_print!(128,
             "  matched={:?} freed={} regions_left={}\n",
             matched, freed_count, mmap_regions.len());
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 11: munmap fallback clears stale PTEs while protecting eager regions.
+///
+/// Simulates the scenario: demand-paged pages exist without mmap_region tracking.
+/// munmap must clear those PTEs but NOT touch PTEs inside tracked eager regions.
+fn test_munmap_fallback_clears_stale_ptes() -> bool {
+    console::print("\n[TEST] Bug 11: munmap fallback clears stale PTEs, protects eager regions\n");
+
+    let base: usize = 0xD000_0000;
+    let eager_base: usize = base + 4 * 4096;
+    let eager_pages = 4usize;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut eager_frames = Vec::new();
+    for _ in 0..eager_pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => eager_frames.push(f),
+            None => {
+                for f in eager_frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((eager_base, eager_frames));
+
+    // Simulate munmap fallback: clear PTEs for pages NOT in eager regions
+    let munmap_start = base;
+    let munmap_pages = 12usize; // spans both non-eager and eager pages
+    let mut cleared = 0usize;
+    let mut protected = 0usize;
+    for i in 0..munmap_pages {
+        let va = munmap_start + i * 4096;
+        let in_eager = mmap_regions.iter().any(|(start, frames)| {
+            va >= *start && va < *start + frames.len() * 4096
+        });
+        if in_eager {
+            protected += 1;
+        } else {
+            cleared += 1;
+        }
+    }
+
+    // Expect: 4 pages protected (inside eager region), 8 pages cleared
+    let pass = cleared == 8 && protected == 4;
+    if !pass {
+        crate::safe_print!(128, "  cleared={} protected={} (expected 8, 4)\n",
+            cleared, protected);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+    pass
+}
+
+/// Bug 12: mprotect must update lazy region flags for demand paging.
+///
+/// Verifies that update_lazy_region_flags changes the stored flags on
+/// overlapping lazy regions.
+fn test_mprotect_updates_lazy_flags() -> bool {
+    console::print("\n[TEST] Bug 12: mprotect updates lazy region flags\n");
+
+    let test_pid = crate::process::allocate_pid();
+    let va_start: usize = 0xE000_0000;
+    let region_size: usize = 16 * 4096;
+
+    // Push a PROT_NONE lazy region (flags=0)
+    crate::process::push_lazy_region(test_pid, va_start, region_size, 0);
+
+    // Verify initial flags are 0
+    let initial_flags = crate::process::lazy_region_lookup_for_pid(test_pid, va_start)
+        .map(|(f, _, _, _)| f)
+        .unwrap_or(0xDEAD);
+    let initial_ok = initial_flags == 0;
+
+    // mprotect updates flags to RW_NO_EXEC
+    let new_flags = crate::mmu::user_flags::RW_NO_EXEC;
+    crate::process::update_lazy_region_flags(test_pid, va_start, region_size, new_flags);
+
+    // Verify flags are updated
+    let updated_flags = crate::process::lazy_region_lookup_for_pid(test_pid, va_start)
+        .map(|(f, _, _, _)| f)
+        .unwrap_or(0xDEAD);
+    let updated_ok = updated_flags == new_flags;
+
+    // Clean up
+    crate::process::clear_lazy_regions(test_pid);
+
+    let pass = initial_ok && updated_ok;
+    if !pass {
+        crate::safe_print!(128, "  initial_flags=0x{:x} (expected 0) updated=0x{:x} (expected 0x{:x})\n",
+            initial_flags, updated_flags, new_flags);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

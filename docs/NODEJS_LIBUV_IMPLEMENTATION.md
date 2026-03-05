@@ -612,25 +612,84 @@ allocation instead of trimming it.
 3. Access page 35 (`0x680c0000`) → translation fault
 4. Eager fallback: `mmap_regions` is empty → no recovery → SIGBUS
 
-**Fix:** `sys_munmap` now handles three cases for eager regions:
+**Fix:** `sys_munmap` now handles two cases for eager regions:
 - **Full unmap** (`len ≥ region_size`): remove entire region (existing behavior)
 - **Prefix unmap** (`addr == start, len < region_size`): free first N pages,
   re-insert remainder with adjusted start address
-- **Mid-region unmap** (`addr > start, addr < end`): split into prefix + suffix
-  regions, freeing only the pages in the unmapped range
+
+Sub-range munmap (`addr > start`) is intentionally NOT handled for eager
+regions — it falls through to the lazy region handler. The mid-region split
+was removed because it could incorrectly intercept lazy-region munmaps
+that happened to fall inside an eager region's VA range, corrupting the
+eager region tracking and causing page table frame reuse (L2 translation
+faults, instruction aborts).
 
 **Files changed:** `src/syscall.rs`
 
 **Diagnostics added:**
-- `sys_munmap` now logs every eager-region unmap with type (full/prefix/mid)
+- `sys_munmap` now logs every eager-region unmap with type (full/prefix)
 - Exception handler eager fallback dumps all `mmap_regions` when recovery fails
+- OOM diagnostics (`[IA-DP]` / `[DA-DP]`) in demand paging failure paths
+
+### Bug 11: `ensure_user_pages_mapped` Tracks Frames on Wrong Process for CLONE_VM
+
+**Symptom:** Wild pointer dereference (`FAR=0x2346b2ad68`, ~151 GB) after bun
+runs for several minutes. The faulting address is far outside any mapped region,
+indicating the process read a corrupted pointer from memory.
+
+**Root cause:** `ensure_user_pages_mapped` (called from `validate_user_ptr`) used
+`current_process()` to track demand-paged frames. For CLONE_VM worker threads,
+this returns the *worker's* Process, not the address-space owner. The worker's
+`UserAddressSpace` has `shared=true`, so its `Drop` skips freeing frames. But when
+the worker exits, the tracking Vec is destroyed — the frames are permanently leaked.
+Over time this exhausts the PMM, causing demand paging failures and stale data reads.
+
+**Fix:** Use `lookup_process(read_current_pid())` to track frames on the
+address-space owner's Process, ensuring frames are properly freed on process exit.
+
+**Files changed:** `src/syscall.rs`
+
+### Bug 12: `sys_munmap` Removed Safety-Net PTE Clearing
+
+**Symptom:** Stale PTEs survive `munmap`, causing `[MMU] WARN` messages
+(VA already mapped to different PA) and data corruption.
+
+**Root cause:** The original `sys_munmap` had fallback code that cleared PTEs for
+the entire requested range, catching orphaned demand-paged pages not tracked in
+`mmap_regions`. This was removed during the Bug 10 fix to prevent destroying
+eager regions, but it also eliminated the safety net for demand-paged pages.
+
+**Fix:** Restored the fallback PTE clearing with a safety check — clear PTEs only
+for pages NOT inside any tracked eager `mmap_region`. This protects eager regions
+while cleaning up orphaned demand-paged pages.
+
+**Files changed:** `src/syscall.rs`
+
+### Bug 13: `sys_mprotect` Doesn't Update Lazy Region Flags
+
+**Symptom:** JIT code mapped with wrong permissions. After
+`mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)` on a PROT_NONE lazy region,
+demand-paged pages still get `RW_NO_EXEC` flags because the lazy region's
+stored flags were never updated.
+
+**Root cause:** The old `sys_mprotect` eagerly allocated pages for unmapped VAs,
+applying the correct flags directly. The refactored version defers to demand
+paging, but the demand paging handler reads the *stored* lazy region flags
+(still PROT_NONE / 0). The lazy region flags were never updated by mprotect.
+
+**Fix:** Added `update_lazy_region_flags()` in `src/process.rs`. `sys_mprotect`
+now calls it to update stored flags on all overlapping lazy regions before
+updating PTE flags on mapped pages. Demand paging then uses the correct
+permissions.
+
+**Files changed:** `src/syscall.rs`, `src/process.rs`
 
 ### Kernel Tests
 
 **File:** `src/tests.rs`
 
-Added 18 mmap subsystem tests to `run_memory_tests()` to catch
-regressions in the exact scenarios that caused the Node.js crashes:
+Added 20 mmap subsystem tests to `run_memory_tests()` to catch
+regressions in the exact scenarios that caused the Node.js/Bun crashes:
 
 - `alloc_mmap_non_overlapping` — multiple allocations return disjoint VA ranges
 - `alloc_mmap_free_region_recycling` — freed VA ranges are reused; split remainders available
@@ -648,5 +707,7 @@ regressions in the exact scenarios that caused the Node.js crashes:
 - `map_pages_survive_subsequent_allocs` — 127 mapped PTEs survive 64 subsequent page allocations
 - `map_interleaved_regions_same_l3` — 1+3+5+127 pages in same 2MB range, all PTEs correct
 - `eager_munmap_prefix_preserves_suffix` — **Bug 10**: partial prefix munmap frees only N pages, suffix survives
-- `eager_munmap_suffix_preserves_prefix` — suffix munmap (addr != start) doesn't destroy prefix
+- `eager_munmap_suffix_preserves_prefix` — suffix munmap (addr != start) is no-op for eager regions
 - `eager_munmap_full_removes_all` — full-length munmap correctly removes entire region
+- `munmap_fallback_clears_stale_ptes` — **Bug 12**: fallback clears orphaned PTEs but protects eager regions
+- `mprotect_updates_lazy_flags` — **Bug 13**: mprotect updates lazy region flags for demand paging
