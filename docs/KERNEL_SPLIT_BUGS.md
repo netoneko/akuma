@@ -193,6 +193,7 @@ After the `akuma-ssh` extraction is working, verify that the other extracted
 crates follow this strategy:
 
 - [x] `akuma-ssh` — uses `log` crate throughout (confirmed working)
+- [x] `akuma-shell` — no kernel logging in crate code (pure framework, OK as-is)
 - [ ] `akuma-ssh-crypto` — currently has no logging (pure crypto, OK as-is)
 - [ ] `akuma-terminal` — currently has no logging (pure data, OK as-is)
 - [ ] `akuma-vfs` — check for any stray `safe_print!` or direct console use
@@ -274,3 +275,138 @@ into `crates/akuma-ssh/`, leaving kernel-coupled glue in `src/ssh/`.
 - `cargo test -p akuma-ssh --target aarch64-apple-darwin` — 11 tests pass
 - End-to-end SSH exec in QEMU: `ssh user@localhost -p 2222 "echo hello"` returns
   correctly with full protocol flow (kex, auth, channel open, exec, EOF, close)
+
+---
+
+## `akuma-shell` Crate Extraction (completed)
+
+Extracted the shell framework (types, traits, parsing, pipeline/chain execution)
+from `src/shell/mod.rs` (~1357 lines) into `crates/akuma-shell/` (~640 lines),
+leaving command implementations and kernel-coupled execution in `src/shell/`.
+
+### What moved to the crate
+
+| Module | Contents |
+|--------|----------|
+| `context.rs` | `ShellContext` (per-session state: cwd, env vars, exec flags), `normalize_path` |
+| `types.rs` | `Command` trait, `ShellError`, `VecWriter`, `InteractiveRead` trait, `StreamableCommand`, `ChainExecutionResult` |
+| `registry.rs` | `CommandRegistry` (command lookup by name/alias, up to 40 commands) |
+| `parse.rs` | `parse_pipeline`, `parse_command_chain`, `parse_command_line`, `parse_args`, `expand_variables` ($VAR, ${VAR}, ~, $$) |
+| `exec.rs` | `ShellBackend` trait, `execute_pipeline`, `execute_command_chain`, `check_streamable_command` — all generic over `ShellBackend` |
+| `util.rs` | `trim_bytes`, `split_first_word`, `translate_input_keys` |
+| `tests.rs` | 31 host-runnable tests (parsing, expansion, context, registry, utilities) |
+
+### What stayed in the kernel `src/shell/`
+
+- `commands/` — All command implementations (`builtin.rs`, `fs.rs`, `net.rs`,
+  `exec.rs`) stay in the kernel. They are heavily coupled to kernel subsystems
+  (process, async_fs, smoltcp_net, allocator, threading, timer, pmm, vfs).
+- `commands/mod.rs` — `create_default_registry()` which wires up all kernel
+  command statics into a `CommandRegistry`.
+- `KernelShellBackend` — Implements `ShellBackend` by delegating to
+  `async_fs`, `process`, and `config` subsystems.
+- `new_shell_context()` — Creates a `ShellContext` pre-loaded with kernel
+  defaults (`DEFAULT_ENV`, `ENABLE_SSH_ASYNC_EXEC`).
+- `execute_external_interactive()` — Bidirectional I/O bridge between SSH
+  channel and spawned process (deeply coupled to `SshChannelStream`,
+  `spawn_process_with_channel_cwd`, `threading`, `process`).
+- `execute_command_streaming_interactive()` — SSH-specific entry point that
+  dispatches between streaming external execution and buffered built-in
+  execution.
+- `enable_async_exec()` / `is_async_exec_enabled()` — Global flag for
+  async execution mode.
+
+### Key design decisions
+
+1. **`ShellBackend` trait.** Abstracts the five kernel services that the
+   pipeline executor needs:
+   ```rust
+   pub trait ShellBackend {
+       fn builtins_first(&self) -> bool;
+       fn find_executable(&self, name: &str) -> impl Future<Output = Option<String>>;
+       fn execute_buffered(&self, ...) -> impl Future<Output = Result<(), ShellError>>;
+       fn execute_streaming<W: Write>(&self, ...) -> impl Future<Output = Result<(), ShellError>>;
+       fn write_file(&self, path: &str, data: &[u8]) -> impl Future<Output = Result<(), String>>;
+       fn append_file(&self, path: &str, data: &[u8]) -> impl Future<Output = Result<(), String>>;
+   }
+   ```
+   The kernel implements this with `KernelShellBackend`. The crate can be
+   tested with a mock backend.
+
+2. **`ShellContext::with_defaults(env, async_exec)`.** The crate's constructor
+   takes explicit parameters instead of reading kernel globals. The kernel
+   provides `new_shell_context()` which supplies `DEFAULT_ENV` and
+   `ENABLE_SSH_ASYNC_EXEC`.
+
+3. **Byte utilities duplicated.** `trim_bytes` and `split_first_word` exist in
+   both `akuma-ssh-crypto` and `akuma-shell`. This avoids a semantic dependency
+   of the shell on SSH crypto. The functions are 10 lines each and stable.
+
+4. **`parse` module is `pub`.** The kernel calls `akuma_shell::parse::parse_args`
+   directly from `execute_command_streaming_interactive`, so the parse module
+   must be public.
+
+5. **`CommandRegistry` removed from kernel.** The kernel's `src/shell/commands/mod.rs`
+   previously defined its own `CommandRegistry` struct. This was removed; it now
+   imports `CommandRegistry` from the crate via `super::CommandRegistry`.
+
+### Verification
+
+- `cargo clippy -p akuma-shell -- -D warnings` — clean
+- `cargo build --release` — succeeds
+- `cargo test -p akuma-shell --target aarch64-apple-darwin` — 31 tests pass
+- All 6 crate test suites pass (145 total: 28+31+30+11+21+24)
+- End-to-end in QEMU:
+  - SSH exec: `ssh ... "echo hello from akuma-shell"` — correct output
+  - Pipeline: `ssh ... "echo test123 | grep test"` — correct output
+  - Chain: `ssh ... "echo one; echo two"` — correct output
+  - `bun run /public/cgi-bin/akuma.js` — succeeds (see crash note below)
+
+---
+
+## 5. Intermittent bun CLONE_VM worker crash during `bun run`
+
+**Symptom:** Running `bun run /public/cgi-bin/akuma.js` via SSH exec sometimes
+crashes with a data abort in one of bun's CLONE_VM worker threads. The crash
+is non-deterministic — a second attempt on a fresh boot succeeds.
+
+**Crash log:**
+```
+[MMU] WARN: va=0x48ae000 already mapped to pa=0x49bbf000, wanted pa=0x4a648000
+[MMU] WARN: va=0x48af000 already mapped to pa=0x49bc0000, wanted pa=0x4a649000
+[T137.00] [Fault] Data abort from EL0 at FAR=0x2346b2ad68, ELR=0x4416d74, ISS=0x45
+[Fault]  x0=0x203ffbad58 x1=0x203ffbac24 x2=0x203ffbac24 x3=0x5
+[Fault]  x19=0x203ffbad58 x20=0x203ffbad80 x29=0x203ffbabc0 x30=0x4b35580
+[Fault]  SP_EL0=0x203ffbabc0 SPSR=0x20000000 TPIDR_EL0=0x303f60e8
+[RTK] code=-11 tid=8 LR=0x400a7614
+[T137.00] [LR!] clear pid=23 (18 regions)
+[Process] Killed 1 sibling thread(s) for PID 20
+[T137.00] [LR!] clear pid=20 (18 regions)
+[T137.00] [Process] PID 20 thread 8 exited (-11) [115.17s]
+```
+
+**Key observations:**
+- FAR=0x2346b2ad68 is a 37-bit address, far beyond the 4 GB userspace VA
+  limit. This looks like address corruption — a register holding a pointer
+  has been clobbered or a JIT-compiled code path computed a bad address.
+- ISS=0x45 means DFSC=0x05, a level-1 translation fault (no L1 page table
+  entry for the top bits of the VA).
+- Two sibling bun workers (PIDs 21, 22) exited cleanly with code 0 before
+  the crash in PID 23. The parent (PID 20) was killed as a consequence.
+- The MMU "already mapped" warnings immediately before the crash suggest a
+  race in demand-paging for CLONE_VM threads: two threads fault on the same
+  lazy page and both try to map it.
+- This is NOT related to the `akuma-shell` extraction. The shell changes
+  only affect command parsing and pipeline execution. The crash is in bun's
+  JIT runtime at a userspace instruction (ELR=0x4416d74), and the same bun
+  binary succeeds on a retry.
+
+**Likely cause:** Race condition in the demand-paging path for CLONE_VM
+threads. When two threads sharing an address space fault on the same lazy
+page concurrently, one succeeds and the other gets the "already mapped"
+warning. If the losing thread's page table walk state is stale, the JIT
+code may subsequently access a corrupt pointer. Alternatively, this could
+be a pre-existing bun JIT bug triggered by timing differences in emulation.
+
+**Reproduction:** Intermittent. Run `bun run /public/cgi-bin/akuma.js` via
+SSH exec repeatedly — it fails roughly 1 in 2 attempts on a cold boot.
