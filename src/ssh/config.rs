@@ -72,10 +72,10 @@ impl SshdConfig {
                     self.shell = Some(alloc::string::String::from(value));
                 }
                 _ => {
-                    log(&alloc::format!(
+                    safe_print!(256, 
                         "[SSH Config] Unknown config key: {}\n",
                         key
-                    ));
+                    );
                 }
             }
         }
@@ -129,16 +129,16 @@ pub async fn load_config() -> SshdConfig {
                 for line in content.lines() {
                     config.parse_line(line);
                 }
-                log(&alloc::format!(
+                safe_print!(256, 
                     "[SSH Config] Loaded config: disable_key_verification={}\n",
                     config.disable_key_verification
-                ));
+                );
             }
             Err(e) => {
-                log(&alloc::format!(
+                safe_print!(256, 
                     "[SSH Config] Failed to read config: {}, using defaults\n",
                     e
-                ));
+                );
             }
         }
     }
@@ -167,15 +167,15 @@ disable_key_verification = false
 "#;
 
     if let Err(e) = async_fs::write_file(CONFIG_PATH, default_content.as_bytes()).await {
-        log(&alloc::format!(
+        safe_print!(256, 
             "[SSH Config] Failed to create default config: {}\n",
             e
-        ));
+        );
     } else {
-        log(&alloc::format!(
+        safe_print!(256, 
             "[SSH Config] Created default config at {}\n",
             CONFIG_PATH
-        ));
+        );
     }
 }
 

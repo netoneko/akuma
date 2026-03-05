@@ -15,6 +15,23 @@ use alloc::string::String;
 /// Set to false to reduce boot verbosity
 pub const DEBUG_ELF_LOADING: bool = true;
 
+/// File-backed source for a deferred lazy segment.
+pub struct FileSegmentSource {
+    pub path: String,
+    pub inode: u32,
+    pub file_offset: usize,
+    pub filesz: usize,
+    pub segment_va: usize,
+}
+
+/// Segment whose pages will be allocated on first access (demand paging).
+pub struct DeferredLazySegment {
+    pub start_va: usize,
+    pub size: usize,
+    pub page_flags: u64,
+    pub file_source: Option<FileSegmentSource>,
+}
+
 /// Result of loading an ELF binary
 pub struct LoadedElf {
     /// Entry point virtual address (program's own entry)
@@ -31,6 +48,8 @@ pub struct LoadedElf {
     pub phent: usize,
     /// If a dynamic linker was loaded: its entry point and base address
     pub interp: Option<InterpInfo>,
+    /// Segments to register as lazy regions after PID allocation
+    pub deferred_segments: Vec<DeferredLazySegment>,
 }
 
 /// Information about a loaded interpreter (dynamic linker)
@@ -325,6 +344,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         phnum: elf.ehdr.e_phnum as usize,
         phent: elf.ehdr.e_phentsize as usize,
         interp,
+        deferred_segments: Vec::new(),
     })
 }
 
@@ -614,16 +634,47 @@ pub fn setup_linux_stack(
     stack.sp
 }
 
+/// Compute user stack top address dynamically based on binary layout.
+///
+/// Small static binaries get the default 1GB address space.
+/// Large binaries or dynamically-linked ones (with interpreter) get expanded
+/// space to accommodate arena allocators that reserve GBs of VA upfront.
+fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
+    const DEFAULT: usize = 0x4000_0000; // 1GB — original default
+
+    if !has_interp && brk < 0x400_0000 {
+        return DEFAULT;
+    }
+
+    const INTERP_END: usize = 0x3010_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128GB for large/dynamic binaries (JSC gigacage needs 128GB)
+    const MAX_STACK_TOP: usize = 0x40_0000_0000; // 256GB — well within 48-bit VA (T0SZ=16)
+
+    let base_mmap = (brk + 0x1000_0000) & !0xFFFF; // brk + 256MB gap
+    let mmap_start = if has_interp {
+        core::cmp::max(base_mmap, INTERP_END)
+    } else {
+        base_mmap
+    };
+
+    let needed = mmap_start + MIN_MMAP_SPACE;
+    let raw = core::cmp::max(DEFAULT, needed);
+    let aligned = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    core::cmp::min(aligned, MAX_STACK_TOP)
+}
+
 pub fn load_elf_with_stack(
     elf_data: &[u8],
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize), ElfError> {
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
     let mut loaded = load_elf(elf_data)?;
-    const STACK_TOP: usize = 0x4000_0000;
+    let has_interp = loaded.interp.is_some();
+    let stack_top = compute_stack_top(loaded.brk, has_interp);
+    let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
     let total_size = stack_size + PAGE_SIZE;
-    let guard_page = (STACK_TOP - total_size) & !(PAGE_SIZE - 1);
+    let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -637,7 +688,7 @@ pub fn load_elf_with_stack(
         stack_frames.push(frame);
     }
 
-    let mut stack = UserStack::new(stack_bottom, STACK_TOP, stack_frames);
+    let mut stack = UserStack::new(stack_bottom, stack_top, stack_frames);
     let random_ptr = stack.push_raw(&[0u8; 16]);
 
     let actual_entry = if let Some(ref interp) = loaded.interp {
@@ -672,12 +723,348 @@ pub fn load_elf_with_stack(
     if DEBUG_ELF_LOADING {
         crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
         crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
-            stack_bottom, STACK_TOP, sp, args.len());
+            stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
             crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
                 actual_entry, loaded.entry_point);
         }
     }
 
-    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, STACK_TOP))
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor, Vec::new()))
+}
+
+// ============================================================================
+// On-demand ELF loading from file path (for large binaries)
+// ============================================================================
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const ELF64_EHDR_SIZE: usize = 64;
+const ELF64_PHDR_SIZE: usize = 56;
+
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off], buf[off+1], buf[off+2], buf[off+3],
+        buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+    ])
+}
+
+struct Elf64Ehdr {
+    e_type: u16,
+    e_machine: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_phentsize: u16,
+    e_phnum: u16,
+}
+
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+}
+
+fn parse_elf64_ehdr(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
+    if buf.len() < ELF64_EHDR_SIZE {
+        return Err(ElfError::InvalidFormat("Header too short"));
+    }
+    if buf[0..4] != ELF_MAGIC {
+        return Err(ElfError::InvalidFormat("Bad magic"));
+    }
+    if buf[4] != ELFCLASS64 {
+        return Err(ElfError::InvalidFormat("Not ELF64"));
+    }
+    if buf[5] != ELFDATA2LSB {
+        return Err(ElfError::InvalidFormat("Not little-endian"));
+    }
+    Ok(Elf64Ehdr {
+        e_type: read_u16_le(buf, 16),
+        e_machine: read_u16_le(buf, 18),
+        e_entry: read_u64_le(buf, 24),
+        e_phoff: read_u64_le(buf, 32),
+        e_phentsize: read_u16_le(buf, 54),
+        e_phnum: read_u16_le(buf, 56),
+    })
+}
+
+fn parse_elf64_phdr(buf: &[u8]) -> Elf64Phdr {
+    Elf64Phdr {
+        p_type: read_u32_le(buf, 0),
+        p_flags: read_u32_le(buf, 4),
+        p_offset: read_u64_le(buf, 8),
+        p_vaddr: read_u64_le(buf, 16),
+        p_filesz: read_u64_le(buf, 32),
+        p_memsz: read_u64_le(buf, 40),
+    }
+}
+
+/// Read exactly `len` bytes from a file at `offset`, returning an error on short reads.
+fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, ElfError> {
+    let mut buf = alloc::vec![0u8; len];
+    let n = crate::vfs::read_at(path, offset, &mut buf)
+        .map_err(|_| ElfError::InvalidFormat("File read failed"))?;
+    if n < len {
+        return Err(ElfError::InvalidFormat("Short read"));
+    }
+    Ok(buf)
+}
+
+/// Load an ELF binary on demand from a file path, reading segment data
+/// page-by-page via read_at() instead of buffering the entire file.
+/// Supports PIE (ET_DYN) and non-PIE (ET_EXEC) without relocations.
+pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, ElfError> {
+    let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
+    let ehdr = parse_elf64_ehdr(&hdr_buf)?;
+
+    if ehdr.e_machine != EM_AARCH64 as u16 {
+        return Err(ElfError::WrongArchitecture);
+    }
+
+    let is_pie = ehdr.e_type == ET_DYN as u16;
+    if ehdr.e_type != ET_EXEC as u16 && !is_pie {
+        return Err(ElfError::NotExecutable);
+    }
+
+    const PIE_BASE: usize = 0x1000_0000;
+    let base = if is_pie { PIE_BASE } else { 0 };
+    let entry_point = base + ehdr.e_entry as usize;
+
+    let mut address_space = UserAddressSpace::new().ok_or(ElfError::AddressSpaceFailed)?;
+    let mut brk: usize = 0;
+    let mut phdr_addr: usize = 0;
+    let mut interp_path: Option<String> = None;
+    let mut deferred_segments: Vec<DeferredLazySegment> = Vec::new();
+
+    let phdr_table_size = ehdr.e_phnum as usize * ehdr.e_phentsize as usize;
+    let phdr_buf = file_read_exact(path, ehdr.e_phoff as usize, phdr_table_size)?;
+
+    let mut phdrs = Vec::with_capacity(ehdr.e_phnum as usize);
+    for i in 0..ehdr.e_phnum as usize {
+        let off = i * ehdr.e_phentsize as usize;
+        phdrs.push(parse_elf64_phdr(&phdr_buf[off..]));
+    }
+
+    for phdr in &phdrs {
+        if phdr.p_type == PT_INTERP && phdr.p_filesz > 1 {
+            let interp_data = file_read_exact(path, phdr.p_offset as usize, phdr.p_filesz as usize)?;
+            let raw = if interp_data.last() == Some(&0) {
+                &interp_data[..interp_data.len() - 1]
+            } else {
+                &interp_data[..]
+            };
+            if let Ok(s) = core::str::from_utf8(raw) {
+                interp_path = Some(String::from(s));
+            }
+        }
+        if phdr.p_type == PT_PHDR {
+            phdr_addr = base + phdr.p_vaddr as usize;
+        }
+    }
+
+    let file_inode = crate::vfs::resolve_inode(path).unwrap_or(0);
+
+    if DEBUG_ELF_LOADING {
+        crate::safe_print!(128, "[ELF] On-demand loading from path, file_size={} ({}MB), is_pie={}, inode={}\n",
+            file_size, file_size / 1024 / 1024, is_pie, file_inode);
+    }
+
+    for phdr in &phdrs {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+
+        let vaddr = base + phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        let filesz = phdr.p_filesz as usize;
+        let offset = phdr.p_offset as usize;
+        let flags = phdr.p_flags;
+
+        if phdr_addr == 0 && phdr.p_offset == 0 {
+            phdr_addr = vaddr + ehdr.e_phoff as usize;
+        }
+
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(128, "[ELF] Segment (deferred): VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+                vaddr, filesz, memsz,
+                if flags & PF_R != 0 { "R" } else { "-" },
+                if flags & PF_W != 0 { "W" } else { "-" },
+                if flags & PF_X != 0 { "X" } else { "-" });
+        }
+
+        let page_flags = if (flags & PF_X) != 0 {
+            user_flags::RX
+        } else {
+            user_flags::RW_NO_EXEC
+        };
+
+        let start_page = vaddr & !(PAGE_SIZE - 1);
+        let end_page = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let seg_size = end_page - start_page;
+
+        deferred_segments.push(DeferredLazySegment {
+            start_va: start_page,
+            size: seg_size,
+            page_flags,
+            file_source: Some(FileSegmentSource {
+                path: String::from(path),
+                inode: file_inode,
+                file_offset: offset,
+                filesz,
+                segment_va: vaddr,
+            }),
+        });
+
+        let segment_end = vaddr + memsz;
+        if segment_end > brk {
+            brk = segment_end;
+        }
+    }
+
+    // Register gap regions between PT_LOAD segments as zero-fill lazy regions.
+    let mut load_segments: Vec<(usize, usize)> = phdrs.iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .map(|p| {
+            let va = base + p.p_vaddr as usize;
+            let end = va + p.p_memsz as usize;
+            let page_start = va & !(PAGE_SIZE - 1);
+            let page_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            (page_start, page_end)
+        })
+        .collect();
+    load_segments.sort_by_key(|&(start, _)| start);
+
+    for w in load_segments.windows(2) {
+        let prev_end = w[0].1;
+        let next_start = w[1].0;
+        if prev_end < next_start {
+            let gap_size = next_start - prev_end;
+            deferred_segments.push(DeferredLazySegment {
+                start_va: prev_end,
+                size: gap_size,
+                page_flags: user_flags::RW_NO_EXEC,
+                file_source: None,
+            });
+            if DEBUG_ELF_LOADING {
+                crate::safe_print!(128, "[ELF] Gap region (deferred): 0x{:08x}-0x{:08x} ({} pages)\n",
+                    prev_end, next_start, gap_size / PAGE_SIZE);
+            }
+        }
+    }
+
+    if DEBUG_ELF_LOADING {
+        crate::safe_print!(80, "[ELF] Deferred: entry=0x{:x} brk=0x{:x} segments={}\n",
+            entry_point, brk, deferred_segments.len());
+    }
+
+    let interp = if let Some(ref ipath) = interp_path {
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(128, "[ELF] Loading interpreter: {}\n", ipath);
+        }
+        let interp_data = crate::fs::read_file(ipath)
+            .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+        let interp_info = load_interpreter(&interp_data, &mut address_space)?;
+        if DEBUG_ELF_LOADING {
+            crate::safe_print!(128, "[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}\n",
+                interp_info.base_addr, interp_info.entry_point);
+        }
+        Some(interp_info)
+    } else {
+        None
+    };
+
+    Ok(LoadedElf {
+        entry_point,
+        address_space,
+        brk,
+        phdr_addr,
+        phnum: ehdr.e_phnum as usize,
+        phent: ehdr.e_phentsize as usize,
+        interp,
+        deferred_segments,
+    })
+}
+
+pub fn load_elf_with_stack_from_path(
+    path: &str,
+    file_size: usize,
+    args: &[String],
+    env: &[String],
+    stack_size: usize,
+) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
+    let mut loaded = load_elf_from_path(path, file_size)?;
+    let has_interp = loaded.interp.is_some();
+    let stack_top = compute_stack_top(loaded.brk, has_interp);
+    let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
+    let total_size = stack_size + PAGE_SIZE;
+    let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
+    let stack_bottom = guard_page + PAGE_SIZE;
+    let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let mut stack_frames = Vec::new();
+    for i in 0..stack_pages {
+        let page_va = stack_bottom + i * PAGE_SIZE;
+        let frame = loaded
+            .address_space
+            .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
+            .map_err(|e| ElfError::MappingFailed(e))?;
+        stack_frames.push(frame);
+    }
+
+    let mut stack = UserStack::new(stack_bottom, stack_top, stack_frames);
+    let random_ptr = stack.push_raw(&[0u8; 16]);
+
+    let actual_entry = if let Some(ref interp) = loaded.interp {
+        interp.entry_point
+    } else {
+        loaded.entry_point
+    };
+
+    let mut auxv_vec = Vec::new();
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHDR, a_val: loaded.phdr_addr as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHNUM, a_val: loaded.phnum as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PHENT, a_val: loaded.phent as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_PAGESZ, a_val: PAGE_SIZE as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_ENTRY, a_val: loaded.entry_point as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_CLKTCK, a_val: 100 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_RANDOM, a_val: random_ptr as u64 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_UID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_EUID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_GID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_EGID, a_val: 0 });
+    if let Some(ref interp) = loaded.interp {
+        auxv_vec.push(AuxEntry { a_type: auxv::AT_BASE, a_val: interp.base_addr as u64 });
+    }
+
+    let sp = setup_linux_stack(&mut stack, args, env, &auxv_vec);
+
+    let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    for i in 0..16 {
+        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, user_flags::RW_NO_EXEC);
+    }
+
+    if DEBUG_ELF_LOADING {
+        crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
+        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
+            stack_bottom, stack_top, sp, args.len());
+        if loaded.interp.is_some() {
+            crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
+                actual_entry, loaded.entry_point);
+        }
+        crate::safe_print!(128, "[ELF] {} deferred lazy segments for demand paging\n",
+            loaded.deferred_segments.len());
+    }
+
+    Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor, loaded.deferred_segments))
 }

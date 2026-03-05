@@ -1,10 +1,7 @@
 //! QEMU fw_cfg MMIO driver for AArch64
 //!
 //! The fw_cfg device provides firmware configuration data to the guest.
-//! On the AArch64 virt machine it is exposed as MMIO at:
-//!   - 0x0902_0000: data register (8 bytes, read/write)
-//!   - 0x0902_0008: selector register (2 bytes, write)
-//!   - 0x0902_0010: DMA register (8 bytes, write)
+//! Physical MMIO at 0x0902_0000; accessed via remapped VA (see `mmu::DEV_FW_CFG_VA`).
 //!
 //! We use the legacy selector+data interface for simplicity and reliability.
 //! The DMA interface is used only for write operations (required for ramfb).
@@ -13,8 +10,8 @@
 
 use core::ptr::{addr_of, read_volatile, write_volatile};
 
-/// MMIO base address for fw_cfg on AArch64 virt
-const FW_CFG_BASE: usize = 0x0902_0000;
+/// Remapped VA for fw_cfg (physical 0x0902_0000 via L0[1])
+const FW_CFG_BASE: usize = crate::mmu::DEV_FW_CFG_VA;
 /// Data register: read/write 1 byte at a time
 const FW_CFG_DATA: *mut u8 = FW_CFG_BASE as *mut u8;
 /// Selector register: write a 16-bit big-endian value to select a key

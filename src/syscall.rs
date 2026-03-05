@@ -9,8 +9,155 @@ use crate::terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use alloc::format;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+
+pub static CURRENT_SYSCALL_NR: AtomicU64 = AtomicU64::new(9999);
+pub fn current_syscall_nr() -> u64 { CURRENT_SYSCALL_NR.load(Ordering::Relaxed) }
+
+// Syscall counters for diagnosing kernel heap usage
+pub mod syscall_counters {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
+    static MUNMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static BRK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static READ_COUNT: AtomicU64 = AtomicU64::new(0);
+    static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static OPENAT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLOSE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MPROTECT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FUTEX_COUNT: AtomicU64 = AtomicU64::new(0);
+    static SIGPROCMASK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static SIGACTION_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static IOCTL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FSTAT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MADVISE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MREMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static LSEEK_COUNT: AtomicU64 = AtomicU64::new(0);
+    static GETRANDOM_COUNT: AtomicU64 = AtomicU64::new(0);
+    static GETPID_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FCNTL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static PAGEFAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static PAGEFAULT_PAGES: AtomicU64 = AtomicU64::new(0);
+    static OTHER_LAST_NR: AtomicU64 = AtomicU64::new(0);
+    static OTHER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn inc_mmap(pages: usize) { MMAP_COUNT.fetch_add(1, Ordering::Relaxed); MMAP_PAGES.fetch_add(pages as u64, Ordering::Relaxed); }
+    pub fn inc_munmap() { MUNMAP_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_brk() { BRK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_read() { READ_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_write() { WRITE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_openat() { OPENAT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_close() { CLOSE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_mprotect() { MPROTECT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_futex() { FUTEX_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_sigprocmask() { SIGPROCMASK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_sigaction() { SIGACTION_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_clock() { CLOCK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_ioctl() { IOCTL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_fstat() { FSTAT_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_yield() { YIELD_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_madvise() { MADVISE_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_mremap() { MREMAP_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_lseek() { LSEEK_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_getrandom() { GETRANDOM_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_getpid() { GETPID_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_fcntl() { FCNTL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_other(nr: u64) { OTHER_COUNT.fetch_add(1, Ordering::Relaxed); OTHER_LAST_NR.store(nr, Ordering::Relaxed); }
+    pub fn inc_total() { TOTAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_pagefault(pages_mapped: u64) { PAGEFAULT_COUNT.fetch_add(1, Ordering::Relaxed); PAGEFAULT_PAGES.fetch_add(pages_mapped, Ordering::Relaxed); }
+
+    pub fn dump() {
+        let total = TOTAL_COUNT.load(Ordering::Relaxed);
+        let other = OTHER_COUNT.load(Ordering::Relaxed);
+        let last_nr = OTHER_LAST_NR.load(Ordering::Relaxed);
+        crate::safe_print!(512,
+            "[SC-STATS] total={} madvise={} mremap={} lseek={} rnd={} pid={} fcntl={} other={}(last_nr={})\n",
+            total,
+            MADVISE_COUNT.load(Ordering::Relaxed),
+            MREMAP_COUNT.load(Ordering::Relaxed),
+            LSEEK_COUNT.load(Ordering::Relaxed),
+            GETRANDOM_COUNT.load(Ordering::Relaxed),
+            GETPID_COUNT.load(Ordering::Relaxed),
+            FCNTL_COUNT.load(Ordering::Relaxed),
+            other, last_nr,
+        );
+        crate::safe_print!(512,
+            "[SC-STATS] futex={} sigmask={} sigact={} clk={} ioctl={} fstat={} yield={}\n",
+            FUTEX_COUNT.load(Ordering::Relaxed),
+            SIGPROCMASK_COUNT.load(Ordering::Relaxed),
+            SIGACTION_COUNT.load(Ordering::Relaxed),
+            CLOCK_COUNT.load(Ordering::Relaxed),
+            IOCTL_COUNT.load(Ordering::Relaxed),
+            FSTAT_COUNT.load(Ordering::Relaxed),
+            YIELD_COUNT.load(Ordering::Relaxed),
+        );
+        crate::safe_print!(384,
+            "[SC-STATS] mmap={}({}pg) munmap={} brk={} read={} write={} open={} close={} mprot={} pgfault={}({}pg)\n",
+            MMAP_COUNT.load(Ordering::Relaxed),
+            MMAP_PAGES.load(Ordering::Relaxed),
+            MUNMAP_COUNT.load(Ordering::Relaxed),
+            BRK_COUNT.load(Ordering::Relaxed),
+            READ_COUNT.load(Ordering::Relaxed),
+            WRITE_COUNT.load(Ordering::Relaxed),
+            OPENAT_COUNT.load(Ordering::Relaxed),
+            CLOSE_COUNT.load(Ordering::Relaxed),
+            MPROTECT_COUNT.load(Ordering::Relaxed),
+            PAGEFAULT_COUNT.load(Ordering::Relaxed),
+            PAGEFAULT_PAGES.load(Ordering::Relaxed),
+        );
+    }
+}
+
+// ============================================================================
+// TimerFd State Tracking
+// ============================================================================
+
+struct TimerFdState {
+    armed_at_us: u64,
+    initial_us: u64,
+    interval_us: u64,
+    expirations_consumed: u64,
+}
+
+static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTreeMap::new());
+static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn timespec_to_us(ptr: usize) -> u64 {
+    if ptr == 0 { return 0; }
+    let sec = unsafe { core::ptr::read(ptr as *const u64) };
+    let nsec = unsafe { core::ptr::read((ptr + 8) as *const u64) };
+    sec * 1_000_000 + nsec / 1_000
+}
+
+fn us_to_timespec(us: u64, ptr: usize) {
+    let sec = us / 1_000_000;
+    let nsec = (us % 1_000_000) * 1_000;
+    unsafe {
+        core::ptr::write(ptr as *mut u64, sec);
+        core::ptr::write((ptr + 8) as *mut u64, nsec);
+    }
+}
+
+fn timerfd_can_read(timer_id: u32) -> bool {
+    let now = crate::timer::uptime_us();
+    TIMERFD_TABLE.lock().get(&timer_id).map_or(false, |state| {
+        if state.initial_us == 0 { return false; }
+        let elapsed = now.saturating_sub(state.armed_at_us);
+        if elapsed < state.initial_us { return false; }
+        let total = if state.interval_us > 0 {
+            1 + (elapsed - state.initial_us) / state.interval_us
+        } else {
+            1
+        };
+        total > state.expirations_consumed
+    })
+}
 
 // ============================================================================
 // Kernel Pipe Infrastructure
@@ -132,6 +279,18 @@ fn pipe_set_reader_thread(id: u32, tid: usize) {
     });
 }
 
+fn pipe_can_read(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(false, |p| !p.buffer.is_empty() || p.write_count == 0)
+    })
+}
+
+fn pipe_can_write(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(false, |p| p.read_count > 0)
+    })
+}
+
 // ============================================================================
 // Kernel EventFd Infrastructure
 // ============================================================================
@@ -208,6 +367,39 @@ fn eventfd_is_nonblock(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().get(&id).map_or(false, |efd| efd.flags & EFD_NONBLOCK != 0)
     })
+}
+
+// ============================================================================
+// Kernel Epoll Infrastructure
+// ============================================================================
+
+struct EpollEntry {
+    events: u32,
+    data: u64,
+}
+
+struct EpollInstance {
+    interest_list: BTreeMap<u32, EpollEntry>,
+}
+
+static EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>> = Spinlock::new(BTreeMap::new());
+static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
+
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
+
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLL_CTL_MOD: i32 = 3;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
 }
 
 pub fn eventfd_close(id: u32) {
@@ -347,6 +539,32 @@ pub mod nr {
     pub const PWRITE64: u64 = 68;        // Linux arm64 pwrite64
     pub const SETITIMER: u64 = 103;      // Linux arm64 setitimer
     pub const MEMBARRIER: u64 = 283;     // Linux arm64 membarrier
+    pub const PRCTL: u64 = 167;          // Linux arm64 prctl
+    pub const GETRUSAGE: u64 = 165;      // Linux arm64 getrusage
+    pub const MSYNC: u64 = 227;          // Linux arm64 msync
+    pub const PROCESS_VM_READV: u64 = 270; // Linux arm64 process_vm_readv
+    pub const SCHED_SETAFFINITY: u64 = 122; // Linux arm64 sched_setaffinity
+    pub const SCHED_GETAFFINITY: u64 = 123; // Linux arm64 sched_getaffinity
+    pub const TKILL: u64 = 130;          // Linux arm64 tkill
+    pub const PIDFD_OPEN: u64 = 434;     // Linux arm64 pidfd_open
+    pub const CLOSE_RANGE: u64 = 436;    // Linux arm64 close_range
+    pub const SYSINFO: u64 = 179;        // Linux arm64 sysinfo
+    pub const CLOCK_GETRES: u64 = 114;   // Linux arm64 clock_getres
+    pub const EPOLL_CREATE1: u64 = 20;   // Linux arm64 epoll_create1
+    pub const EPOLL_CTL: u64 = 21;       // Linux arm64 epoll_ctl
+    pub const EPOLL_PWAIT: u64 = 22;     // Linux arm64 epoll_pwait
+    pub const TIMERFD_CREATE: u64 = 85;  // Linux arm64 timerfd_create
+    pub const TIMERFD_SETTIME: u64 = 86; // Linux arm64 timerfd_settime
+    pub const TIMERFD_GETTIME: u64 = 87; // Linux arm64 timerfd_gettime
+    pub const CAPGET: u64 = 90;           // Linux arm64 capget
+    pub const IO_URING_SETUP: u64 = 425;   // Linux arm64 io_uring_setup
+    pub const IO_URING_ENTER: u64 = 426;   // Linux arm64 io_uring_enter
+    pub const IO_URING_REGISTER: u64 = 427; // Linux arm64 io_uring_register
+    pub const INOTIFY_INIT1: u64 = 26;     // Linux arm64 inotify_init1
+    pub const INOTIFY_ADD_WATCH: u64 = 27; // Linux arm64 inotify_add_watch
+    pub const INOTIFY_RM_WATCH: u64 = 28;  // Linux arm64 inotify_rm_watch
+    pub const ACCEPT4: u64 = 242;          // Linux arm64 accept4
+    pub const TIMES: u64 = 153;            // Linux arm64 times
 }
 
 /// Thread CPU statistics for top command
@@ -386,6 +604,7 @@ const EAGAIN: u64 = (-11i64) as u64;
 const ENOMEM: u64 = (-12i64) as u64;
 const EAFNOSUPPORT: u64 = (-97i64) as u64;
 const EINPROGRESS: u64 = (-115i64) as u64;
+const ETIMEDOUT: u64 = (-110i64) as u64;
 
 /// Encode an exit code into Linux-compatible wait status.
 /// Negative codes are treated as signal kills (e.g. -11 → SIGSEGV).
@@ -417,10 +636,16 @@ fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     }
 }
 
-/// Validate a user pointer for reading/writing
-/// 
-/// Pointers must be below the userspace limit (0x40000000)
-/// and above the process info page (0x1000).
+/// Validate a user pointer for reading/writing.
+/// Upper bound is the current process's stack_top (dynamic per binary).
+fn user_va_limit() -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        proc.memory.stack_top as u64
+    } else {
+        0x4000_0000
+    }
+}
+
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
     if ptr < 0x1000 { return false; }
@@ -428,27 +653,84 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
-    if end > 0x4000_0000 { return false; }
-    
-    // CRITICAL: Check if the range is actually mapped in the current page tables
+    if end > user_va_limit() { return false; }
+
     if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
-        return false;
+        if !ensure_user_pages_mapped(ptr as usize, len) {
+            return false;
+        }
     }
-    
+
+    true
+}
+
+/// Demand-page unmapped user pages that fall within lazy regions.
+/// Returns false if any page in the range is neither mapped nor in a lazy region.
+fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
+    let page_start = start & !0xFFF;
+    let page_end = (start + len + 0xFFF) & !0xFFF;
+    let mut va = page_start;
+    while va < page_end {
+        if !crate::mmu::is_current_user_page_mapped(va) {
+            if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(va) {
+                let map_flags = match &source {
+                    crate::process::LazySource::File { .. } => {
+                        if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                    }
+                    _ => crate::mmu::user_flags::RW_NO_EXEC,
+                };
+                if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        let pg_data_start = core::cmp::max(va, segment_va);
+                        let pg_data_end = core::cmp::min(va + 0x1000, segment_va + filesz);
+                        if pg_data_start < pg_data_end {
+                            let dst_off = pg_data_start - va;
+                            let file_off = file_offset + (pg_data_start - segment_va);
+                            let read_len = pg_data_end - pg_data_start;
+                            let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
+                            let page_buf = unsafe {
+                                core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), read_len)
+                            };
+                            if inode != 0 {
+                                let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                            } else {
+                                let _ = crate::vfs::read_at(path, file_off, page_buf);
+                            }
+                        }
+                    }
+                    let table_frames = unsafe {
+                        crate::mmu::map_user_page(va, page_frame.addr, map_flags)
+                    };
+                    if let Some(proc) = crate::process::current_process() {
+                        proc.address_space.track_user_frame(page_frame);
+                        for tf in table_frames {
+                            proc.address_space.track_page_table_frame(tf);
+                        }
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        va += 4096;
+    }
     true
 }
 
 /// Copy a null-terminated string from userspace
 fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
+    let limit = user_va_limit();
     if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-        if ptr < 0x1000 || ptr >= 0x4000_0000 { return Err(EFAULT); }
+        if ptr < 0x1000 || ptr >= limit { return Err(EFAULT); }
         if !crate::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
     }
     let mut len = 0;
     while len < max_len {
         let addr = ptr + len as u64;
         if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            if addr >= 0x4000_0000 { return Err(EFAULT); }
+            if addr >= limit { return Err(EFAULT); }
             // Check mapping every page boundary
             if addr % 4096 == 0 {
                 if !crate::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
@@ -690,6 +972,8 @@ struct PollFd {
 
 /// Handle a system call
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
+    CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
+
     if crate::process::is_current_interrupted() {
         if let Some(proc) = crate::process::current_process() {
             proc.exited = true;
@@ -699,11 +983,37 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         return EINTR;
     }
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK {
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK && syscall_num != nr::NANOSLEEP && syscall_num != nr::WAITPID && syscall_num != nr::UPTIME && syscall_num != nr::FUTEX && syscall_num != nr::MEMBARRIER && syscall_num != nr::RT_SIGACTION && syscall_num != nr::SCHED_SETAFFINITY && syscall_num != nr::SCHED_GETAFFINITY {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
+    syscall_counters::inc_total();
     match syscall_num {
+        nr::MMAP => { syscall_counters::inc_mmap(((args[1] as usize) + 4095) / 4096); }
+        nr::MUNMAP => { syscall_counters::inc_munmap(); }
+        nr::BRK => { syscall_counters::inc_brk(); }
+        nr::READ | nr::READV | nr::PREAD64 => { syscall_counters::inc_read(); }
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 => { syscall_counters::inc_write(); }
+        nr::OPENAT => { syscall_counters::inc_openat(); }
+        nr::CLOSE => { syscall_counters::inc_close(); }
+        nr::MPROTECT => { syscall_counters::inc_mprotect(); }
+        nr::FUTEX => { syscall_counters::inc_futex(); }
+        nr::RT_SIGPROCMASK => { syscall_counters::inc_sigprocmask(); }
+        nr::RT_SIGACTION => { syscall_counters::inc_sigaction(); }
+        nr::CLOCK_GETTIME => { syscall_counters::inc_clock(); }
+        nr::IOCTL => { syscall_counters::inc_ioctl(); }
+        nr::FSTAT | nr::NEWFSTATAT => { syscall_counters::inc_fstat(); }
+        124 => { syscall_counters::inc_yield(); }
+        nr::MADVISE => { syscall_counters::inc_madvise(); }
+        nr::MREMAP => { syscall_counters::inc_mremap(); }
+        nr::LSEEK => { syscall_counters::inc_lseek(); }
+        nr::GETRANDOM => { syscall_counters::inc_getrandom(); }
+        nr::GETPID => { syscall_counters::inc_getpid(); }
+        nr::FCNTL => { syscall_counters::inc_fcntl(); }
+        _ => { syscall_counters::inc_other(syscall_num); }
+    }
+
+    let result = match syscall_num {
         nr::EXIT => sys_exit(args[0] as i32),
         nr::READ => sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => sys_write(args[0], args[1], args[2] as usize),
@@ -724,11 +1034,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::BIND => sys_bind(args[0] as u32, args[1], args[2] as usize),
         nr::LISTEN => sys_listen(args[0] as u32, args[1] as i32),
         nr::ACCEPT => sys_accept(args[0] as u32, args[1], args[2]),
+        nr::ACCEPT4 => sys_accept4(args[0] as u32, args[1], args[2], args[3] as u32),
         nr::CONNECT => sys_connect(args[0] as u32, args[1], args[2] as usize),
         nr::SENDTO => sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
         nr::GETSOCKNAME => sys_getsockname(args[0] as u32, args[1], args[2]),
-        nr::GETPEERNAME => 0, // stub
+        nr::GETPEERNAME => sys_getpeername(args[0] as u32, args[1], args[2]),
         nr::SETSOCKOPT => 0, // stub — no socket options to set
         nr::GETSOCKOPT => sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => sys_shutdown(args[0] as u32, args[1] as i32),
@@ -771,10 +1082,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => sys_set_tid_address(args[0]),
-        nr::EXIT_GROUP => sys_exit(args[0] as i32),
+        nr::EXIT_GROUP => sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
-        nr::RT_SIGACTION => 0,    // Success (do nothing)
+        nr::RT_SIGACTION => sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
@@ -818,12 +1129,94 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PWRITE64 => sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::SETITIMER => 0,
         nr::MEMBARRIER => 0,
+        nr::PRCTL => 0,
+        nr::TIMES => sys_times(args[0] as usize),
+        nr::GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as usize),
+        nr::MSYNC => 0,
+        nr::PROCESS_VM_READV => ENOSYS,
+        nr::SCHED_SETAFFINITY => 0,
+        118 => { // sched_setparam — stub
+            0
+        }
+        119 => { // sched_getparam — return default (priority 0)
+            let param_ptr = args[1] as usize;
+            if param_ptr != 0 && validate_user_ptr(param_ptr as u64, 4) {
+                unsafe { core::ptr::write(param_ptr as *mut i32, 0); }
+            }
+            0
+        }
+        124 => { // sched_yield
+            crate::threading::yield_now();
+            0
+        }
+        nr::SCHED_GETAFFINITY => {
+            // Return a single-CPU affinity mask
+            let mask_ptr = args[2] as usize;
+            let cpusetsize = args[1] as usize;
+            if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
+                unsafe {
+                    core::ptr::write_bytes(mask_ptr as *mut u8, 0, cpusetsize);
+                    core::ptr::write(mask_ptr as *mut u64, 1); // CPU 0
+                }
+            }
+            0
+        }
+        nr::TKILL => sys_tkill(args[0] as u32, args[1] as u32),
+        nr::PIDFD_OPEN => {
+            let target_pid = args[0] as u32;
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(64, "[syscall] pidfd_open(pid={})\n", target_pid);
+            }
+            ENOSYS
+        }
+        nr::CLOSE_RANGE => {
+            crate::safe_print!(96, "[stub] close_range(lo={}, hi={}, flags={})\n", args[0], args[1], args[2]);
+            0
+        }
+        nr::CAPGET => {
+            let data_ptr = args[1] as usize;
+            if data_ptr != 0 && validate_user_ptr(args[1], 24) {
+                unsafe { core::ptr::write_bytes(data_ptr as *mut u8, 0, 24); }
+            }
+            0
+        }
+        nr::SYSINFO => sys_sysinfo(args[0] as usize),
+        nr::CLOCK_GETRES => sys_clock_getres(args[0] as u32, args[1] as usize),
+        nr::EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
+        nr::EPOLL_CTL => sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
+        nr::EPOLL_PWAIT => sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32),
+        nr::TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
+        nr::TIMERFD_SETTIME => sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
+        nr::TIMERFD_GETTIME => {
+            let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(args[0] as u32)) {
+                Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+                _ => return EBADF,
+            };
+            let out = args[1] as usize;
+            if out != 0 && validate_user_ptr(args[1] as u64, 32) {
+                let table = TIMERFD_TABLE.lock();
+                if let Some(state) = table.get(&timer_id) {
+                    let now = crate::timer::uptime_us();
+                    let elapsed = now.saturating_sub(state.armed_at_us);
+                    let remaining = state.initial_us.saturating_sub(elapsed);
+                    us_to_timespec(state.interval_us, out);
+                    us_to_timespec(remaining, out + 16);
+                } else {
+                    unsafe { core::ptr::write_bytes(out as *mut u8, 0, 32); }
+                }
+            }
+            0
+        }
+        nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => ENOSYS,
+        nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => ENOSYS,
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
             ENOSYS
         }
-    }
+    };
+
+    result
 }
 
 fn sys_set_tpidr_el0(address: u64) -> u64 {
@@ -932,6 +1325,17 @@ fn sys_exit(code: i32) -> u64 {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = crate::process::ProcessState::Zombie(code);
+    }
+    code as u64
+}
+
+fn sys_exit_group(code: i32) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let l0_phys = proc.address_space.l0_phys();
+        proc.exited = true;
+        proc.exit_code = code;
+        proc.state = crate::process::ProcessState::Zombie(code);
+        crate::process::kill_thread_group(proc.pid, l0_phys);
     }
     code as u64
 }
@@ -1415,6 +1819,19 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         crate::process::FileDescriptor::DevNull => 0,
+        crate::process::FileDescriptor::DevUrandom => {
+            fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
+        crate::process::FileDescriptor::TimerFd(timer_id) => {
+            let result = timerfd_read(timer_id);
+            if result == EAGAIN { return EAGAIN; }
+            if count >= 8 && validate_user_ptr(buf_ptr, 8) {
+                unsafe { core::ptr::write(buf_ptr as *mut u64, result); }
+                8
+            } else { EINVAL }
+        }
+        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => !0u64
     }
 }
@@ -1444,6 +1861,12 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
             }
         }
         crate::process::FileDescriptor::DevNull => 0,
+        crate::process::FileDescriptor::DevUrandom => {
+            fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
+        crate::process::FileDescriptor::TimerFd(_) => EAGAIN,
+        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => EBADF
     }
 }
@@ -1462,7 +1885,7 @@ fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::DevNull => count as u64,
+        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
         _ => EBADF
     }
 }
@@ -1569,7 +1992,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
-        crate::process::FileDescriptor::DevNull => count as u64,
+        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
         _ => !0u64
     }
 }
@@ -1743,12 +2166,13 @@ fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
     if flags & EFD_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }
-    crate::safe_print!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
+    crate::tprint!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
     fd as u64
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
 }
@@ -1837,6 +2261,31 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
         return !0u64;
     }
 
+    if path == "/dev/urandom" || path == "/dev/random" {
+        if let Some(proc) = crate::process::current_process() {
+            let fd = proc.alloc_fd(crate::process::FileDescriptor::DevUrandom);
+            if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return fd as u64;
+        }
+        return !0u64;
+    }
+
+    // /proc/self/exe → redirect to the process's own binary path
+    let path = if path == "/proc/self/exe" {
+        if let Some(proc) = crate::process::current_process() {
+            proc.name.clone()
+        } else {
+            return ENOENT;
+        }
+    } else {
+        path
+    };
+
     if !crate::fs::exists(&path) {
         let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
         if !is_creat {
@@ -1851,7 +2300,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
             let parent_path = if parent_raw.starts_with('/') {
                 String::from(parent_raw)
             } else {
-                alloc::format!("/{}", parent_raw)
+                format!("/{}", parent_raw)
             };
             if parent_path != "/" && !crate::fs::exists(&parent_path) {
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -1939,7 +2388,7 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     match proc.get_fd(fd) {
         Some(crate::process::FileDescriptor::File(f)) => {
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
-                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
@@ -1950,6 +2399,16 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
         Some(crate::process::FileDescriptor::DevNull) => {
             let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::DevUrandom) => {
+            let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(crate::process::FileDescriptor::TimerFd(_)) | Some(crate::process::FileDescriptor::EpollFd(_)) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
@@ -2045,6 +2504,7 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
             st_mode: meta.mode, 
             st_nlink: if meta.is_dir { 2 } else { 1 },
             st_blksize: 4096,
+            st_blocks: ((meta.size as i64) + 511) / 512,
             st_atime: meta.accessed.unwrap_or(0) as i64,
             st_mtime: meta.modified.unwrap_or(0) as i64,
             st_ctime: meta.created.unwrap_or(0) as i64,
@@ -2207,7 +2667,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) 
     const CLONE_VFORK: u64 = 0x4000;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+        crate::tprint!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
     // CLONE_THREAD | CLONE_VM — pthread_create
@@ -2276,7 +2736,7 @@ fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+        crate::tprint!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
     sys_clone(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid)
@@ -2323,9 +2783,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    {
         let pid = crate::process::read_current_pid().unwrap_or(0);
-        crate::safe_print!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+        crate::tprint!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
 
     // Parse envp from user space
@@ -2349,18 +2809,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
-    // Read the file
+    // Try to read the file; for large files fall back to on-demand loading.
     let file_data = match crate::fs::read_file(&resolved_path) {
-        Ok(data) => data,
+        Ok(data) => Some(data),
+        Err(crate::vfs::FsError::Internal) => None,
         Err(_) => {
             crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
             return ENOENT;
         }
     };
 
-    // Check for shebang (#!) scripts
-    if file_data.len() >= 2 && file_data[0] == b'#' && file_data[1] == b'!' {
-        return exec_shebang(&resolved_path, &file_data, args, env);
+    // Check for shebang (#!) scripts (only possible if we could read the file)
+    if let Some(ref data) = file_data {
+        if data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
+            return exec_shebang(&resolved_path, data, args, env);
+        }
     }
 
     // Otherwise treat as ELF binary
@@ -2384,7 +2847,20 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         }
     }
 
-    if let Err(e) = proc.replace_image(&file_data, &args, &env) {
+    let replace_result = if let Some(ref data) = file_data {
+        proc.replace_image(data, &args, &env)
+    } else {
+        let file_size = match crate::vfs::file_size(&resolved_path) {
+            Ok(sz) => sz as usize,
+            Err(_) => {
+                crate::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
+                return ENOENT;
+            }
+        };
+        proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
+    };
+
+    if let Err(e) = replace_result {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
         return ENOENT;
     }
@@ -2454,9 +2930,17 @@ fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>,
     do_execve(interpreter, new_args, env)
 }
 
-fn sys_wait4(pid: i32, status_ptr: u64, options: i32, _rusage: u64) -> u64 {
+fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
+    }
+
+    // Zero-fill the rusage struct if provided. We don't track per-process CPU
+    // time yet, so returning zeroes is correct rather than leaving the caller's
+    // stack uninitialized (which produced nonsense user/sys output in busybox time).
+    const RUSAGE_SIZE: usize = 144; // struct rusage on aarch64: 18 × 8-byte fields
+    if rusage_ptr != 0 && validate_user_ptr(rusage_ptr, RUSAGE_SIZE) {
+        unsafe { core::ptr::write_bytes(rusage_ptr as *mut u8, 0, RUSAGE_SIZE); }
     }
 
     let wnohang = options & 1 != 0;
@@ -2551,7 +3035,11 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
-    let proc = match crate::process::current_process() { Some(p) => p, None => return 0 };
+    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+
+    if proc.get_fd(fd).is_none() {
+        return EBADF;
+    }
 
     match cmd {
         F_GETFD => {
@@ -2702,7 +3190,7 @@ fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
     }
     match crate::vfs::create_symlink(&link_path, &target) {
         Ok(_) => 0,
-        Err(_) => !0u64,
+        Err(e) => fs_error_to_errno(e),
     }
 }
 
@@ -2723,6 +3211,20 @@ fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u6
         Err(e) => return e,
     };
     let path = resolve_path_at(dirfd, &raw_path);
+
+    if path == "/proc/self/exe" {
+        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        let exe = if let Some(proc) = crate::process::current_process() {
+            proc.name.clone()
+        } else {
+            String::from("/bin/unknown")
+        };
+        let bytes = exe.as_bytes();
+        let copy_len = bytes.len().min(bufsize);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        return copy_len as u64;
+    }
+
     if let Some(target) = crate::vfs::read_symlink(&path) {
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
         let bytes = target.as_bytes();
@@ -2733,8 +3235,21 @@ fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u6
     EINVAL
 }
 
-fn sys_nanosleep(seconds: u64, nanoseconds: u64) -> u64 {
-    let total_us = seconds.saturating_mul(1_000_000).saturating_add(nanoseconds / 1_000);
+fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
+    // Support two ABIs:
+    // - Linux/musl: a0 = pointer to struct timespec {tv_sec, tv_nsec}
+    // - libakuma:   a0 = seconds (raw), a1 = nanoseconds (raw)
+    // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
+    let (sec, nsec) = if a0 >= 4096 && validate_user_ptr(a0, 16) {
+        unsafe {
+            let p = a0 as *const u64;
+            (core::ptr::read(p), core::ptr::read(p.add(1)))
+        }
+    } else {
+        (a0, a1)
+    };
+    let total_us = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
+    if total_us == 0 { return 0; }
     let deadline = crate::timer::uptime_us().saturating_add(total_us);
     loop {
         if crate::timer::uptime_us() >= deadline { return 0; }
@@ -2805,6 +3320,31 @@ fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     !0u64
 }
 
+fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+    if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
+    if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
+    if let Some(idx) = get_socket_from_fd(fd) {
+        if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
+            if let Some(proc) = crate::process::current_process() {
+                if addr_ptr != 0 {
+                    unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
+                }
+                let new_fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(new_idx));
+                const SOCK_CLOEXEC: u32 = 0x80000;
+                const SOCK_NONBLOCK: u32 = 0x800;
+                if flags & SOCK_CLOEXEC != 0 {
+                    proc.set_cloexec(new_fd);
+                }
+                if flags & SOCK_NONBLOCK != 0 {
+                    proc.set_nonblock(new_fd);
+                }
+                return new_fd as u64;
+            }
+        }
+    }
+    !0u64
+}
+
 fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return !0u64; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -2852,6 +3392,56 @@ fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         }
     }
     0
+}
+
+fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if addr_ptr == 0 || len_ptr == 0 { return (-libc_errno::EINVAL as i64) as u64; }
+    if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return (-libc_errno::EBADF as i64) as u64,
+    };
+
+    let remote = socket::with_socket(idx, |sock| {
+        match &sock.inner {
+            socket::SocketType::Stream(h) => {
+                crate::smoltcp_net::with_network(|net| {
+                    let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                    s.remote_endpoint().map(|ep| {
+                        let ip = if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr {
+                            addr.octets()
+                        } else {
+                            [0; 4]
+                        };
+                        (ip, ep.port)
+                    })
+                }).flatten()
+            }
+            socket::SocketType::Datagram { peer, .. } => {
+                peer.map(|p| (p.ip, p.port))
+            }
+            _ => None,
+        }
+    }).flatten();
+
+    match remote {
+        Some((ip, port)) => {
+            let sa = SockAddrIn {
+                sin_family: 2,
+                sin_port: port.to_be(),
+                sin_addr: u32::from_ne_bytes(ip),
+                sin_zero: [0u8; 8],
+            };
+            if validate_user_ptr(addr_ptr, core::mem::size_of::<SockAddrIn>()) {
+                unsafe {
+                    core::ptr::write(addr_ptr as *mut SockAddrIn, sa);
+                    core::ptr::write(len_ptr as *mut u32, core::mem::size_of::<SockAddrIn>() as u32);
+                }
+            }
+            0
+        }
+        None => (-libc_errno::ENOTCONN as i64) as u64,
+    }
 }
 
 fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
@@ -2921,14 +3511,57 @@ fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, a
 
 fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
-fn sys_getsockopt(_fd: u32, _level: i32, _optname: i32, optval: u64, optlen: u64) -> u64 {
-    if optval != 0 && optlen != 0 {
-        if !validate_user_ptr(optlen, 4) { return EFAULT; }
-        let len = unsafe { core::ptr::read(optlen as *const u32) } as usize;
-        if len >= 4 && validate_user_ptr(optval, 4) {
-            unsafe { core::ptr::write(optval as *mut i32, 0); }
-            unsafe { core::ptr::write(optlen as *mut u32, 4); }
+fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
+    const SOL_SOCKET: i32 = 1;
+    const SO_ERROR: i32 = 4;
+    const SO_SNDBUF: i32 = 7;
+    const SO_RCVBUF: i32 = 8;
+    const SO_KEEPALIVE: i32 = 9;
+    const SO_TYPE: i32 = 3;
+
+    if optval == 0 || optlen == 0 { return 0; }
+    if !validate_user_ptr(optlen, 4) { return EFAULT; }
+    let len = unsafe { core::ptr::read(optlen as *const u32) } as usize;
+    if len < 4 || !validate_user_ptr(optval, 4) { return EFAULT; }
+
+    let val: i32 = if level == SOL_SOCKET {
+        match optname {
+            SO_ERROR => {
+                if let Some(idx) = get_socket_from_fd(fd) {
+                    socket::with_socket(idx, |sock| {
+                        if let socket::SocketType::Stream(h) = &sock.inner {
+                            crate::smoltcp_net::with_network(|net| {
+                                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                                if s.is_active() || s.may_send() { 0 }
+                                else { libc_errno::ECONNREFUSED }
+                            }).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    }).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            SO_TYPE => {
+                if let Some(idx) = get_socket_from_fd(fd) {
+                    if socket::is_udp_socket(idx) { 2 } else { 1 }
+                } else {
+                    1
+                }
+            }
+            SO_SNDBUF => 131072,
+            SO_RCVBUF => 131072,
+            SO_KEEPALIVE => 0,
+            _ => 0,
         }
+    } else {
+        0
+    };
+
+    unsafe {
+        core::ptr::write(optval as *mut i32, val);
+        core::ptr::write(optlen as *mut u32, 4);
     }
     0
 }
@@ -3093,68 +3726,131 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
+    const MAP_NORESERVE: u32 = 0x4000;
+    const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+    const PROT_NONE: u32 = 0;
 
-    let mmap_addr = if flags & MAP_FIXED != 0 && addr != 0 {
+    let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
+    let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+
+    // Use address-space owner for all memory state (ProcessMemory, mmap_regions,
+    // frame tracking).  For CLONE_VM worker threads, current_process() returns
+    // the worker's Process which has cloned-but-stale ProcessMemory and empty
+    // mmap_regions.  All memory bookkeeping must go through the owner.
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let proc = match crate::process::lookup_process(owner_pid) {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
+    let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
-        if let Some(proc) = crate::process::current_process() {
+        if is_fixed {
+            // MAP_FIXED overwrites any existing mappings in the range.
+            let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+            let _ = crate::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
             for i in 0..pages {
                 let va = addr + i * 4096;
                 let _ = proc.address_space.unmap_page(va);
             }
         }
+        // Both MAP_FIXED and MAP_FIXED_NOREPLACE use the exact address
         addr
     } else {
-        let a = crate::process::alloc_mmap(pages * 4096);
-        if a == 0 { return !0u64; }
-        a
+        match proc.memory.alloc_mmap(pages * 4096) {
+            Some(a) => a,
+            None => {
+                crate::tprint!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                    proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
+                return !0u64;
+            }
+        }
     };
 
-    if let Some(proc) = crate::process::current_process() {
-        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
-        let initial_flags = if is_file_backed {
-            crate::mmu::user_flags::RW_NO_EXEC
+    let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+
+    let use_lazy = !is_file_backed && (
+        is_lazy ||
+        (flags & MAP_NORESERVE != 0) ||
+        pages > 256
+    );
+
+    if use_lazy {
+        // Use address-space owner PID so all CLONE_VM threads share lazy regions
+        let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+        let count = crate::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+        crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
+            proc.pid, len, prot, flags, mmap_addr, count);
+        return mmap_addr as u64;
+    }
+
+    let initial_flags = if is_file_backed {
+        crate::mmu::user_flags::RW_NO_EXEC
+    } else {
+        page_flags
+    };
+
+    let mut frames = alloc::vec::Vec::new();
+    for i in 0..pages {
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            frames.push(frame);
+            unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
+            proc.address_space.track_user_frame(frame);
         } else {
-            page_flags
-        };
-
-        let mut frames = alloc::vec::Vec::new();
-        for i in 0..pages {
-            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-                frames.push(frame);
-                unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
-                proc.address_space.track_user_frame(frame);
-            } else { return !0u64; }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
+                    proc.pid, len, i, pages);
+            }
+            return !0u64;
         }
-        crate::process::record_mmap_region(mmap_addr, frames);
-
-        if is_file_backed {
-            if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
-                let path = f.path.clone();
-                let mut buf = alloc::vec![0u8; len];
-                if let Ok(n) = crate::fs::read_at(&path, offset, &mut buf) {
-                    let copy_len = n.min(len);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(buf.as_ptr(), mmap_addr as *mut u8, copy_len);
+    }
+    if is_file_backed {
+        if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
+            let path = f.path.clone();
+            let mut file_off = offset;
+            let mut bytes_read = 0usize;
+            for i in 0..pages {
+                let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
+                if chunk == 0 { break; }
+                let page_kva = crate::mmu::phys_to_virt(frames[i].addr);
+                let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
+                match crate::fs::read_at(&path, file_off, page_buf) {
+                    Ok(n) => {
+                        bytes_read += n;
+                        file_off += n;
+                        if n < chunk { break; }
                     }
-                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                        crate::safe_print!(256, "[syscall] mmap(fd={}, file={}, off={}, len={}) = 0x{:x} (read {} bytes)\n", fd, &path, offset, len, mmap_addr, copy_len);
-                    }
+                    Err(_) => break,
                 }
             }
-            if page_flags != initial_flags {
-                for i in 0..pages {
-                    let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
-                }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
+                    proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
+        if page_flags != initial_flags {
+            for i in 0..pages {
+                let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
+            }
+        }
+    } else {
+        crate::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+            proc.pid, len, prot, flags, mmap_addr);
+    }
 
-        mmap_addr as u64
-    } else { !0u64 }
+    proc.mmap_regions.push((mmap_addr, frames));
+
+    mmap_addr as u64
 }
 
 fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
     if new_size == 0 { return EINVAL; }
+    if old_addr & 0xFFF != 0 { return EINVAL; }
     const MREMAP_MAYMOVE: u32 = 1;
+
+    let va_limit = user_va_limit() as usize;
+    if old_addr >= va_limit { return EFAULT; }
 
     let old_pages = (old_size + 4095) / 4096;
     let new_pages = (new_size + 4095) / 4096;
@@ -3167,10 +3863,14 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         return ENOMEM;
     }
 
-    let new_addr = crate::process::alloc_mmap(new_pages * 4096);
-    if new_addr == 0 { return ENOMEM; }
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let new_addr = match crate::process::lookup_process(owner_pid)
+        .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
+        Some(a) => a,
+        None => return ENOMEM,
+    };
 
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         let mut new_frames = alloc::vec::Vec::new();
         for i in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
@@ -3181,63 +3881,565 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         }
 
         let copy_len = old_size.min(new_size);
-        unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+        if validate_user_ptr(old_addr as u64, copy_len) {
+            unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+        }
 
-        crate::process::record_mmap_region(new_addr, new_frames);
+        proc.mmap_regions.push((new_addr, new_frames));
 
-        if let Some(old_frames) = crate::process::remove_mmap_region(old_addr) {
+        // Remove old region from owner's mmap_regions (inline, not via helper)
+        if let Some(idx) = proc.mmap_regions.iter().position(|(va, _)| *va == old_addr) {
+            let (_, old_frames) = proc.mmap_regions.remove(idx);
+            let freed_size = old_frames.len() * 4096;
             for (i, frame) in old_frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page(old_addr + i * 4096);
                 proc.address_space.remove_user_frame(frame);
                 crate::pmm::free_page(frame);
             }
+            proc.memory.free_regions.push((old_addr, freed_size));
         }
 
         new_addr as u64
     } else { ENOMEM }
 }
 
-fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
-    const MADV_DONTNEED: i32 = 4;
-    if advice == MADV_DONTNEED && len > 0 {
-        let aligned_addr = addr & !0xFFF;
-        let aligned_end = (addr + len + 0xFFF) & !0xFFF;
-        let aligned_len = aligned_end - aligned_addr;
-        if aligned_len <= 128 * 1024 * 1024 {
-            unsafe {
-                core::ptr::write_bytes(aligned_addr as *mut u8, 0, aligned_len);
-            }
+fn sys_madvise(_addr: usize, _len: usize, _advice: i32) -> u64 {
+    // No-op: MADV_DONTNEED/MADV_FREE/etc. are hints only.
+    // We cannot safely zero pages here because lazy-mapped regions
+    // may not have physical pages yet (causes EL1 data abort).
+    // Demand paging provides fresh zero pages on first access anyway.
+    0
+}
+
+fn sys_sysinfo(info_ptr: usize) -> u64 {
+    if !validate_user_ptr(info_ptr as u64, 112) { return EFAULT; }
+    unsafe { core::ptr::write_bytes(info_ptr as *mut u8, 0, 112); }
+    let free_pages = crate::pmm::free_count() as u64;
+    // struct sysinfo on arm64: all fields are u64 except procs(u16) and mem_unit(u32)
+    unsafe {
+        let ptr = info_ptr as *mut u64;
+        core::ptr::write(ptr.add(0), 3600);                  // uptime
+        // loads[3] at offsets 1,2,3 — left as 0
+        core::ptr::write(ptr.add(4), 256 * 1024 * 1024);     // totalram
+        core::ptr::write(ptr.add(5), free_pages * 4096);      // freeram
+        // sharedram, bufferram, totalswap, freeswap at 6,7,8,9 — 0
+        // procs (u16) at byte offset 80
+        let procs_ptr = (info_ptr + 80) as *mut u16;
+        core::ptr::write(procs_ptr, 1);
+        // mem_unit (u32) at byte offset 100 (after totalhigh, freehigh)
+        let memunit_ptr = (info_ptr + 100) as *mut u32;
+        core::ptr::write(memunit_ptr, 1);
+    }
+    0
+}
+
+fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
+    let _ = clock_id;
+    if res_ptr != 0 && validate_user_ptr(res_ptr as u64, 16) {
+        // 1 nanosecond resolution
+        unsafe {
+            let ptr = res_ptr as *mut u64;
+            core::ptr::write(ptr, 0);  // tv_sec
+            core::ptr::write(ptr.add(1), 1); // tv_nsec = 1
         }
     }
     0
 }
 
-/// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)
-pub fn futex_wake(_uaddr: usize, _max_wake: i32) {
-    crate::threading::yield_now();
+fn sys_epoll_create1(_flags: u32) -> u64 {
+    if let Some(proc) = crate::process::current_process() {
+        let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
+        EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
+            interest_list: BTreeMap::new(),
+        });
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd(epoll_id));
+        crate::tprint!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
+        fd as u64
+    } else {
+        EBADF
+    }
 }
 
-fn sys_futex(uaddr: usize, op: i32, val: u32, _timeout: u64, _uaddr2: usize, _val3: u32) -> u64 {
+fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
+    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let mut table = EPOLL_TABLE.lock();
+    let instance = match table.get_mut(&epoll_id) {
+        Some(inst) => inst,
+        None => return EBADF,
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            if instance.interest_list.contains_key(&fd) {
+                return EEXIST;
+            }
+            let ev_events = { ev.events };
+            let ev_data = { ev.data };
+            instance.interest_list.insert(fd, EpollEntry {
+                events: ev_events,
+                data: ev_data,
+            });
+            crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            0
+        }
+        EPOLL_CTL_MOD => {
+            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            let ev_events = { ev.events };
+            let ev_data = { ev.data };
+            match instance.interest_list.get_mut(&fd) {
+                Some(entry) => {
+                    entry.events = ev_events;
+                    entry.data = ev_data;
+                    0
+                }
+                None => ENOENT,
+            }
+        }
+        EPOLL_CTL_DEL => {
+            match instance.interest_list.remove(&fd) {
+                Some(_) => 0,
+                None => ENOENT,
+            }
+        }
+        _ => EINVAL,
+    }
+}
+
+fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
+    let fd_entry = crate::process::current_process().and_then(|p| p.get_fd(fd_num));
+    let fd_entry = match fd_entry {
+        Some(e) => e,
+        None => return EPOLLHUP | EPOLLERR,
+    };
+
+    let mut ready = 0u32;
+
+    match fd_entry {
+        crate::process::FileDescriptor::Socket(idx) => {
+            if socket::is_udp_socket(idx) {
+                if let Some(handle) = socket_get_udp_handle(idx) {
+                    if requested & EPOLLIN != 0 && crate::smoltcp_net::udp_can_recv(handle) {
+                        ready |= EPOLLIN;
+                    }
+                    if requested & EPOLLOUT != 0 && crate::smoltcp_net::udp_can_send(handle) {
+                        ready |= EPOLLOUT;
+                    }
+                }
+            } else {
+                if requested & EPOLLIN != 0 && socket_can_recv_tcp(idx) {
+                    ready |= EPOLLIN;
+                }
+                if requested & EPOLLOUT != 0 && socket_can_send_tcp(idx) {
+                    ready |= EPOLLOUT;
+                }
+            }
+        }
+        crate::process::FileDescriptor::EventFd(efd_id) => {
+            if requested & EPOLLIN != 0 && eventfd_can_read(efd_id) {
+                ready |= EPOLLIN;
+            }
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
+        crate::process::FileDescriptor::PipeRead(pipe_id) => {
+            if requested & EPOLLIN != 0 && pipe_can_read(pipe_id) {
+                ready |= EPOLLIN;
+            }
+        }
+        crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+            if requested & EPOLLOUT != 0 && pipe_can_write(pipe_id) {
+                ready |= EPOLLOUT;
+            }
+        }
+        crate::process::FileDescriptor::TimerFd(timer_id) => {
+            if requested & EPOLLIN != 0 && timerfd_can_read(timer_id) {
+                ready |= EPOLLIN;
+            }
+        }
+        crate::process::FileDescriptor::Stdin => {
+            if requested & EPOLLIN != 0 {
+                if let Some(ch) = crate::process::current_channel() {
+                    if ch.has_stdin_data() {
+                        ready |= EPOLLIN;
+                    }
+                }
+            }
+        }
+        crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
+        _ => {
+            if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
+            if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }
+        }
+    }
+
+    ready
+}
+
+fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+    if maxevents <= 0 { return EINVAL; }
+    let maxevents = maxevents as usize;
+    let out_size = maxevents * 12;
+    if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
+
+    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let timeout_us = if timeout > 0 {
+        (timeout as u64) * 1000
+    } else {
+        0
+    };
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        crate::smoltcp_net::poll();
+
+        let interest_snapshot: Vec<(u32, u32, u64)> = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(&epoll_id) {
+                Some(inst) => inst.interest_list.iter()
+                    .map(|(&fd, entry)| (fd, entry.events, entry.data))
+                    .collect(),
+                None => return EBADF,
+            }
+        };
+
+        let mut ready_count = 0usize;
+        for &(fd, requested_events, data) in &interest_snapshot {
+            if ready_count >= maxevents { break; }
+
+            let revents = epoll_check_fd_readiness(fd, requested_events);
+            if revents != 0 {
+                let out_event = EpollEvent { events: revents, data };
+                unsafe {
+                    core::ptr::write_unaligned(
+                        (events_ptr + ready_count * 12) as *mut EpollEvent,
+                        out_event,
+                    );
+                }
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            return ready_count as u64;
+        }
+
+        if timeout == 0 {
+            return 0;
+        }
+
+        if timeout > 0 {
+            let elapsed = crate::timer::uptime_us() - start_time;
+            if elapsed >= timeout_us {
+                return 0;
+            }
+        }
+
+        if crate::process::is_current_interrupted() {
+            return EINTR;
+        }
+
+        crate::threading::yield_now();
+    }
+}
+
+// ============================================================================
+// Signal Syscalls
+// ============================================================================
+
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
+#[repr(C)]
+struct KernelSigaction {
+    sa_handler: usize,
+    sa_flags: u64,
+    sa_restorer: usize,
+    sa_mask: u64,
+}
+
+fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usize) -> u64 {
+    if sig == 0 || sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+    if sig == 9 || sig == 19 { return EINVAL; } // SIGKILL/SIGSTOP cannot be caught
+    let sigset_ok = sigsetsize == 8;
+
+    let proc = match crate::process::current_process() {
+        Some(p) => p,
+        None => return ENOSYS,
+    };
+
+    let idx = (sig - 1) as usize;
+
+    if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
+        let old = &proc.signal_actions[idx];
+        let handler_val = match old.handler {
+            crate::process::SignalHandler::Default => SIG_DFL,
+            crate::process::SignalHandler::Ignore => SIG_IGN,
+            crate::process::SignalHandler::UserFn(addr) => addr,
+        };
+        let out = KernelSigaction {
+            sa_handler: handler_val,
+            sa_flags: old.flags,
+            sa_restorer: old.restorer,
+            sa_mask: if sigset_ok { old.mask } else { 0 },
+        };
+        unsafe { core::ptr::write_unaligned(oldact_ptr as *mut KernelSigaction, out); }
+    }
+
+    if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
+        let sa = unsafe { core::ptr::read_unaligned(act_ptr as *const KernelSigaction) };
+        let handler = match sa.sa_handler {
+            SIG_DFL => crate::process::SignalHandler::Default,
+            SIG_IGN => crate::process::SignalHandler::Ignore,
+            addr => crate::process::SignalHandler::UserFn(addr),
+        };
+        proc.signal_actions[idx] = crate::process::SignalAction {
+            handler,
+            flags: sa.sa_flags,
+            mask: if sigset_ok { sa.sa_mask } else { 0 },
+            restorer: sa.sa_restorer,
+        };
+    }
+
+    0
+}
+
+fn signal_is_fatal_default(sig: u32) -> bool {
+    matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
+}
+
+fn sys_tkill(tid: u32, sig: u32) -> u64 {
+    if sig == 0 { return 0; }
+    if sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+
+    crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
+
+    if sig == 9 {
+        // SIGKILL is always fatal, cannot be caught or ignored
+        sys_exit_group(-(sig as i32));
+        return 0;
+    }
+
+    let handler = crate::process::current_process()
+        .map(|p| {
+            let idx = (sig - 1) as usize;
+            p.signal_actions[idx].handler
+        })
+        .unwrap_or(crate::process::SignalHandler::Default);
+
+    match handler {
+        crate::process::SignalHandler::Ignore => 0,
+        crate::process::SignalHandler::Default => {
+            if signal_is_fatal_default(sig) {
+                sys_exit_group(-(sig as i32));
+            }
+            0
+        }
+        crate::process::SignalHandler::UserFn(_) => {
+            // True userspace signal delivery not yet implemented.
+            // For fatal signals sent to self (abort pattern), terminate cleanly.
+            if sig == 6 {
+                sys_exit_group(-(sig as i32));
+            }
+            0
+        }
+    }
+}
+
+fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
+    let timer_id = TIMERFD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Some(proc) = crate::process::current_process() {
+        let fd = proc.alloc_fd(crate::process::FileDescriptor::TimerFd(timer_id));
+        crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
+        fd as u64
+    } else {
+        EBADF
+    }
+}
+
+fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> u64 {
+    let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(fd_num)) {
+        Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+        _ => return EBADF,
+    };
+
+    let mut table = TIMERFD_TABLE.lock();
+
+    if old_value != 0 && validate_user_ptr(old_value as u64, 32) {
+        if let Some(state) = table.get(&timer_id) {
+            let now = crate::timer::uptime_us();
+            let elapsed = now.saturating_sub(state.armed_at_us);
+            let remaining = state.initial_us.saturating_sub(elapsed);
+            us_to_timespec(remaining, old_value);
+            us_to_timespec(state.interval_us, old_value + 16);
+        } else {
+            unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
+        }
+    }
+
+    if !validate_user_ptr(new_value as u64, 32) { return EFAULT; }
+
+    let initial_us = timespec_to_us(new_value + 16);
+    let interval_us = timespec_to_us(new_value);
+
+    const TFD_TIMER_ABSTIME: i32 = 1;
+    let now = crate::timer::uptime_us();
+    let effective_initial = if flags & TFD_TIMER_ABSTIME != 0 {
+        initial_us.saturating_sub(now)
+    } else {
+        initial_us
+    };
+
+    crate::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
+        timer_id, effective_initial, interval_us);
+
+    if initial_us == 0 && interval_us == 0 {
+        table.remove(&timer_id);
+    } else {
+        table.insert(timer_id, TimerFdState {
+            armed_at_us: now,
+            initial_us: effective_initial,
+            interval_us,
+            expirations_consumed: 0,
+        });
+    }
+
+    0
+}
+
+fn timerfd_read(timer_id: u32) -> u64 {
+    let now = crate::timer::uptime_us();
+    let mut table = TIMERFD_TABLE.lock();
+    let state = match table.get_mut(&timer_id) {
+        Some(s) => s,
+        None => return EAGAIN,
+    };
+
+    if state.initial_us == 0 { return EAGAIN; }
+
+    let elapsed = now.saturating_sub(state.armed_at_us);
+    if elapsed < state.initial_us { return EAGAIN; }
+
+    let total_expirations = if state.interval_us > 0 {
+        1 + (elapsed - state.initial_us) / state.interval_us
+    } else {
+        1
+    };
+
+    let new_expirations = total_expirations.saturating_sub(state.expirations_consumed);
+    if new_expirations == 0 { return EAGAIN; }
+
+    state.expirations_consumed = total_expirations;
+    new_expirations
+}
+
+// ============================================================================
+// Futex Wait Queue Infrastructure
+// ============================================================================
+
+static FUTEX_WAITERS: Spinlock<BTreeMap<usize, Vec<usize>>> = Spinlock::new(BTreeMap::new());
+
+fn futex_do_wake(uaddr: usize, max_wake: u32) -> u64 {
+    let mut waiters = FUTEX_WAITERS.lock();
+    let woken = if let Some(queue) = waiters.get_mut(&uaddr) {
+        let count = (max_wake as usize).min(queue.len());
+        let to_wake: Vec<usize> = queue.drain(..count).collect();
+        if queue.is_empty() {
+            waiters.remove(&uaddr);
+        }
+        drop(waiters);
+        for tid in &to_wake {
+            crate::threading::get_waker_for_thread(*tid).wake();
+        }
+        to_wake.len() as u64
+    } else {
+        0
+    };
+    woken
+}
+
+/// Wake futex waiters (called from process.rs for CLONE_CHILD_CLEARTID)
+pub fn futex_wake(uaddr: usize, max_wake: i32) {
+    futex_do_wake(uaddr, max_wake as u32);
+}
+
+fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, _uaddr2: usize, _val3: u32) -> u64 {
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
+    const FUTEX_WAIT_BITSET: i32 = 9;
+    const FUTEX_WAKE_BITSET: i32 = 10;
     const FUTEX_PRIVATE_FLAG: i32 = 128;
+    const FUTEX_CLOCK_REALTIME: i32 = 256;
 
-    let cmd = op & !(FUTEX_PRIVATE_FLAG);
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
     match cmd {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let current = unsafe { (uaddr as *const AtomicU32).as_ref() };
             if let Some(atomic) = current {
                 if atomic.load(Ordering::SeqCst) != val {
                     return EAGAIN;
                 }
+            } else {
+                return EFAULT;
             }
-            crate::threading::yield_now();
+
+            let tid = crate::threading::current_thread_id();
+
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                let queue = waiters.entry(uaddr).or_insert_with(Vec::new);
+                queue.push(tid);
+            }
+
+            let deadline = if timeout_ptr != 0 && validate_user_ptr(timeout_ptr, 16) {
+                let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+                let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
+                if cmd == FUTEX_WAIT_BITSET {
+                    let now_us = crate::timer::uptime_us();
+                    if timeout_us > now_us { timeout_us } else { now_us }
+                } else {
+                    crate::timer::uptime_us() + timeout_us
+                }
+            } else {
+                u64::MAX
+            };
+
+            crate::threading::schedule_blocking(deadline);
+
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                if let Some(queue) = waiters.get_mut(&uaddr) {
+                    queue.retain(|&t| t != tid);
+                    if queue.is_empty() {
+                        waiters.remove(&uaddr);
+                    }
+                }
+            }
+
+            if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {
+                return ETIMEDOUT;
+            }
+
             0
         }
-        FUTEX_WAKE => {
-            crate::threading::yield_now();
-            val as u64
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            futex_do_wake(uaddr, val)
         }
         _ => 0,
     }
@@ -3268,14 +4470,70 @@ fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64
     0
 }
 
+fn sys_times(buf_ptr: usize) -> u64 {
+    // struct tms has four clock_t fields (8 bytes each = 32 bytes on aarch64).
+    // Fields are in USER_HZ ticks (100 ticks/second).
+    // We don't track per-process CPU time, so utime/stime are reported as zero.
+    // The return value is the elapsed real time in USER_HZ ticks since boot,
+    // which is what tools like `busybox time` use for "real" time reporting.
+    if buf_ptr != 0 {
+        const TMS_SIZE: usize = 32;
+        if !validate_user_ptr(buf_ptr as u64, TMS_SIZE) { return EFAULT; }
+        unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, TMS_SIZE); }
+    }
+    // uptime_us / 10_000 converts microseconds to centiseconds (USER_HZ=100)
+    let uptime_us = crate::timer::uptime_us();
+    (uptime_us / 10_000) as u64
+}
+
+fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
+    // struct rusage is 144 bytes on aarch64 (18 × 8-byte fields)
+    const RUSAGE_SIZE: usize = 144;
+    if !validate_user_ptr(usage_ptr as u64, RUSAGE_SIZE) { return EFAULT; }
+    // Zero-fill: we don't track per-process resource usage yet
+    unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, RUSAGE_SIZE); }
+    let _ = who;
+    0
+}
+
 fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
     let pages = (len + 4095) / 4096;
     let new_flags = crate::mmu::user_flags::from_prot(prot);
-    if let Some(proc) = crate::process::current_process() {
+    let adding_exec = prot & 0x4 != 0; // PROT_EXEC
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = crate::process::lookup_process(owner_pid) {
         for i in 0..pages {
-            let _ = proc.address_space.update_page_flags(addr + i * 4096, new_flags);
+            let va = addr + i * 4096;
+            if proc.address_space.is_mapped(va) {
+                let _ = proc.address_space.update_page_flags(va, new_flags);
+            }
+            // Unmapped pages are left alone — demand paging will allocate
+            // them with the correct flags on first access (matching Linux
+            // behavior where mprotect only changes VMA flags, not PTEs).
+        }
+        if adding_exec {
+            // Flush data cache and invalidate instruction cache for JIT code.
+            // AArch64 has non-coherent I/D caches; without this, the CPU may
+            // execute stale instructions from before the code was written.
+            for i in 0..pages {
+                let va = addr + i * 4096;
+                unsafe {
+                    // Clean each cache line in the page (64-byte lines typical)
+                    let mut off = 0usize;
+                    while off < 4096 {
+                        let line = (va + off) as u64;
+                        core::arch::asm!("dc cvau, {}", in(reg) line);
+                        core::arch::asm!("ic ivau, {}", in(reg) line);
+                        off += 64;
+                    }
+                }
+            }
+            unsafe {
+                core::arch::asm!("dsb ish");
+                core::arch::asm!("isb");
+            }
         }
         0
     } else {
@@ -3283,18 +4541,111 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     }
 }
 
-fn sys_munmap(addr: usize, _len: usize) -> u64 {
-    if let Some(frames) = crate::process::remove_mmap_region(addr) {
-        if let Some(proc) = crate::process::current_process() {
+fn sys_munmap(addr: usize, len: usize) -> u64 {
+    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+    let proc = match crate::process::lookup_process(owner_pid) {
+        Some(p) => p,
+        None => return !0u64,
+    };
+
+    let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
+    let unmap_pages = unmap_len / 4096;
+
+    // Try normal (eagerly-mapped) region first
+    if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
+        let region_pages = proc.mmap_regions[idx].1.len();
+        if unmap_pages >= region_pages {
+            // Full unmap — remove entire region
+            let (_, frames) = proc.mmap_regions.remove(idx);
+            let freed_size = frames.len() * 4096;
+            crate::tprint!(128, "[munmap] pid={} addr=0x{:x} full ({} pages)\n",
+                proc.pid, addr, frames.len());
             for (i, frame) in frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page(addr + i * 4096);
                 proc.address_space.remove_user_frame(frame);
                 crate::pmm::free_page(frame);
             }
-            return 0;
+            proc.memory.free_regions.push((addr, freed_size));
+        } else {
+            // Partial prefix unmap — split: free first `unmap_pages`, keep the rest
+            let (old_start, old_frames) = proc.mmap_regions.remove(idx);
+            crate::tprint!(192, "[munmap] pid={} addr=0x{:x} partial prefix {}/{} pages\n",
+                proc.pid, addr, unmap_pages, old_frames.len());
+            let mut iter = old_frames.into_iter();
+            for i in 0..unmap_pages {
+                if let Some(frame) = iter.next() {
+                    let _ = proc.address_space.unmap_page(old_start + i * 4096);
+                    proc.address_space.remove_user_frame(frame);
+                    crate::pmm::free_page(frame);
+                }
+            }
+            let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
+            if !remaining.is_empty() {
+                let new_start = old_start + unmap_pages * 4096;
+                proc.mmap_regions.push((new_start, remaining));
+            }
+            proc.memory.free_regions.push((addr, unmap_pages * 4096));
         }
+        return 0;
     }
-    !0u64
+
+    // Check for sub-range munmap inside an eager region (addr != start but within range)
+    let sub_range_match = proc.mmap_regions.iter().position(|(start, frames)| {
+        addr > *start && addr < *start + frames.len() * 4096
+    });
+    if let Some(idx) = sub_range_match {
+        let (region_start, old_frames) = proc.mmap_regions.remove(idx);
+        let region_size = old_frames.len() * 4096;
+        let offset = addr - region_start;
+        let offset_pages = offset / 4096;
+        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
+        crate::tprint!(192, "[munmap] pid={} addr=0x{:x} mid-region start=0x{:x} pages {}-{}/{}\n",
+            proc.pid, addr, region_start, offset_pages, end, old_frames.len());
+
+        let mut old_iter = old_frames.into_iter().enumerate();
+        let mut prefix_frames = Vec::new();
+        let mut suffix_frames = Vec::new();
+
+        for (i, frame) in &mut old_iter {
+            if i < offset_pages {
+                prefix_frames.push(frame);
+            } else if i < end {
+                let _ = proc.address_space.unmap_page(region_start + i * 4096);
+                proc.address_space.remove_user_frame(frame);
+                crate::pmm::free_page(frame);
+            } else {
+                suffix_frames.push(frame);
+            }
+        }
+
+        if !prefix_frames.is_empty() {
+            proc.mmap_regions.push((region_start, prefix_frames));
+        }
+        if !suffix_frames.is_empty() {
+            proc.mmap_regions.push((region_start + end * 4096, suffix_frames));
+        }
+        proc.memory.free_regions.push((addr, (end - offset_pages) * 4096));
+        return 0;
+    }
+
+    // Try lazy region(s) — the unmap range may span multiple lazy regions.
+    let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
+    let results = crate::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
+    if !results.is_empty() {
+        for &(freed_start, freed_pages) in &results {
+            for i in 0..freed_pages {
+                let _ = proc.address_space.unmap_page(freed_start + i * 4096);
+            }
+            proc.memory.free_regions.push((freed_start, freed_pages * 4096));
+        }
+        return 0;
+    }
+
+    // No tracked region matched — return success without unmapping.
+    // On Linux, munmap on a range not backed by any VMA is a no-op.
+    // Blindly unmapping here would destroy pages belonging to tracked
+    // eager mmap regions when V8 does sub-range munmaps.
+    0
 }
 
 fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
@@ -3515,11 +4866,24 @@ fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     0
 }
 
+fn fill_random_bytes(ptr: *mut u8, len: usize) {
+    let mut remaining = len;
+    let mut dst = ptr;
+    while remaining > 0 {
+        let chunk = remaining.min(256);
+        let mut buf = alloc::vec![0u8; chunk];
+        if crate::rng::fill_bytes(&mut buf).is_ok() {
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, chunk); }
+        }
+        remaining -= chunk;
+        dst = unsafe { dst.add(chunk) };
+    }
+}
+
 fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(ptr, len) { return EFAULT; }
-    let mut buf = alloc::vec![0u8; len.min(256)];
-    if crate::rng::fill_bytes(&mut buf).is_ok() { unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()); } return buf.len() as u64; }
-    !0u64
+    fill_random_bytes(ptr as *mut u8, len);
+    len as u64
 }
 
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
@@ -3665,7 +5029,7 @@ fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     // VT100/ANSI escape sequence: ESC[{row};{col}H (1-indexed)
     let row_1 = row + 1;
     let col_1 = col + 1;
-    let sequence = alloc::format!("\x1b[{};{}H", row_1, col_1);
+    let sequence = format!("\x1b[{};{}H", row_1, col_1);
     write_to_process_channel(sequence.as_bytes())
 }
 

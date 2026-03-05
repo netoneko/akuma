@@ -12,6 +12,7 @@
 
 use alloc::format;
 use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc; // Added
 use spinning_top::Spinlock;use core::convert::TryInto;
@@ -771,7 +772,7 @@ async fn send_channel_data(
             if *byte < 32 || *byte > 126 { *byte = b'.'; }
         }
         let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-        log(&alloc::format!("[SSH] Sending {} bytes channel data \"{}\"\n", data.len(), snippet_str));
+        safe_print!(256, "[SSH] Sending {} bytes channel data \"{}\"\n", data.len(), snippet_str);
     }
 
     let mut payload = vec![SSH_MSG_CHANNEL_DATA];
@@ -946,8 +947,14 @@ async fn run_shell_session(
 
     // Send welcome message
     {
-        let welcome = b"\r\n=================================\r\n  Welcome to Akuma SSH Server\r\n=================================\r\n\r\nType 'help' for available commands.\r\n\r\n";
-        let _ = channel_stream.write(welcome).await;
+        const BANNER_ART: &str = include_str!("../akuma_40.txt");
+        let mut welcome = String::from("\r\n");
+        for line in BANNER_ART.lines() {
+            welcome.push_str(line);
+            welcome.push_str("\r\n");
+        }
+        welcome.push_str("\r\n========================================\r\n      Welcome to Akuma SSH Server\r\n========================================\r\n\r\nType 'help' for available commands.\r\n\r\n");
+        let _ = channel_stream.write(welcome.as_bytes()).await;
         let prompt = generate_prompt(&ctx);
         let _ = channel_stream.write(prompt.as_bytes()).await;
     }
@@ -977,10 +984,10 @@ async fn run_shell_session(
                 if last_read_time_us > 0 {
                     let gap = read_time - last_read_time_us;
                     if gap < 2_000_000 {
-                        log(&alloc::format!(
+                        safe_print!(256, 
                             "[SSH-ECHO] read gap={}us, {} bytes\n",
                             gap, n
-                        ));
+                        );
                     }
                 }
                 last_read_time_us = read_time;
@@ -1182,10 +1189,10 @@ async fn run_shell_session(
                                             channel_stream.write(&line_buffer[cursor_pos - 1..]).await;
                                         let echo_us = crate::timer::uptime_us() - echo_start;
                                         if echo_us > 5_000 {
-                                            log(&alloc::format!(
+                                            safe_print!(256, 
                                                 "[SSH-ECHO-SLOW] echo took {}us for '{}'\n",
                                                 echo_us, byte as char
-                                            ));
+                                            );
                                         }
                                         // Move cursor back to position
                                         let moves = line_buffer.len() - cursor_pos;
@@ -1370,10 +1377,10 @@ async fn handle_message(
     payload: &[u8],
     session: &mut SshSession,
 ) -> Result<MessageResult, TcpError> {
-    log(&alloc::format!(
+    safe_print!(256, 
         "[SSH] Received message type {}\n",
         msg_type
-    ));
+    );
 
     match msg_type {
         SSH_MSG_KEXINIT => {
@@ -1411,10 +1418,10 @@ async fn handle_message(
         SSH_MSG_SERVICE_REQUEST => {
             let mut offset = 0;
             if let Some(service) = read_string(payload, &mut offset) {
-                log(&alloc::format!(
+                safe_print!(256, 
                     "[SSH] Service request: {:?}\n",
                     core::str::from_utf8(service)
-                ));
+                );
 
                 let mut reply = vec![SSH_MSG_SERVICE_ACCEPT];
                 write_string(&mut reply, service);
@@ -1481,10 +1488,10 @@ async fn handle_message(
             };
 
             if let Some(req_type) = request_type {
-                log(&alloc::format!(
+                safe_print!(256, 
                     "[SSH] Channel request: {:?}\n",
                     core::str::from_utf8(req_type)
-                ));
+                );
 
                 let success = matches!(req_type, b"pty-req" | b"shell" | b"env" | b"exec");
 
@@ -1497,11 +1504,11 @@ async fn handle_message(
                         if let Some(height) = read_u32(payload, &mut offset) {
                             session.term_width = width;
                             session.term_height = height;
-                            log(&alloc::format!(
+                            safe_print!(256, 
                                 "[SSH] Terminal size: {}x{}\n",
                                 width,
                                 height
-                            ));
+                            );
                         }
                     }
                 }
@@ -1649,12 +1656,12 @@ fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
     mac.update(&decrypted);
 
     if mac.verify_slice(received_mac).is_err() {
-        log(&alloc::format!(
+        safe_print!(256, 
             "[SSH] MAC verification failed (seq={}, pkt_len={}, buf_len={})\n",
             seq,
             packet_len,
             session.input_buffer.len()
-        ));
+        );
         return None;
     }
 

@@ -4,7 +4,7 @@
 
 set -e
 
-SIZE_MB=${1:-256}
+SIZE_MB=${1:-512}
 DISK_IMG="disk.img"
 
 echo "Creating ${SIZE_MB}MB ext2 disk image..."
@@ -29,11 +29,11 @@ fi
 if [ "$OS" = "Darwin" ]; then
     # macOS: Use e2fsprogs from Homebrew
     if command -v mkfs.ext2 &> /dev/null; then
-        mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
+        mkfs.ext2 -F -b 4096 -L "AKUMA" "$DISK_IMG"
     elif command -v /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 &> /dev/null; then
-        /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
+        /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2 -F -b 4096 -L "AKUMA" "$DISK_IMG"
     elif command -v /usr/local/sbin/mkfs.ext2 &> /dev/null; then
-        /usr/local/sbin/mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
+        /usr/local/sbin/mkfs.ext2 -F -b 4096 -L "AKUMA" "$DISK_IMG"
     else
         echo ""
         echo "Error: mkfs.ext2 not found."
@@ -51,7 +51,7 @@ if [ "$OS" = "Darwin" ]; then
 else
     # Linux: Use mkfs.ext2
     if command -v mkfs.ext2 &> /dev/null; then
-        mkfs.ext2 -F -L "AKUMA" "$DISK_IMG"
+        mkfs.ext2 -F -b 4096 -L "AKUMA" "$DISK_IMG"
     else
         echo "Error: mkfs.ext2 not found. Install e2fsprogs."
         echo "  Ubuntu/Debian: sudo apt install e2fsprogs"

@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Page size: 4KB
 pub const PAGE_SIZE: usize = 4096;
@@ -23,6 +23,16 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 
 /// Virtual address bits per level
 pub const BITS_PER_LEVEL: usize = 9;
+
+/// Remapped device MMIO virtual addresses.
+/// Devices are mapped via L0[1] (VA 0x80_0000_0000+) so they never conflict
+/// with user heap/mmap/stack in L0[0].  Physical addresses are unchanged;
+/// only the VAs used by driver code differ from the identity mapping.
+pub const DEV_GIC_DIST_VA: usize = 0x80_0000_0000;
+pub const DEV_GIC_CPU_VA: usize  = 0x80_0000_1000;
+pub const DEV_UART_VA: usize     = 0x80_0000_2000;
+pub const DEV_FW_CFG_VA: usize   = 0x80_0000_3000;
+pub const DEV_VIRTIO_VA: usize   = 0x80_0000_4000;
 
 /// Memory attribute indices (configured in MAIR_EL1)
 pub const MAIR_DEVICE_NGNRNE: u64 = 0; // Device memory, non-Gathering, non-Reordering, non-Early Write Acknowledgement
@@ -96,6 +106,49 @@ pub fn is_initialized() -> bool {
 /// Mark MMU as initialized
 pub fn init(_ram_base: usize, _ram_size: usize) {
     MMU_INITIALIZED.store(true, Ordering::Release);
+}
+
+/// Physical address of the shared device L1 table (under L0[1]).
+/// Allocated once by `init_shared_device_tables()`, then referenced
+/// by every user address space's `add_kernel_mappings()`.
+static SHARED_DEV_L1_PHYS: AtomicUsize = AtomicUsize::new(0);
+
+/// Device physical addresses and their L3 slot indices.
+const DEV_PAGES: &[(usize, usize)] = &[
+    (0, 0x0800_0000), // L3[0]: GIC distributor
+    (1, 0x0801_0000), // L3[1]: GIC CPU interface
+    (2, 0x0900_0000), // L3[2]: UART PL011
+    (3, 0x0902_0000), // L3[3]: fw_cfg
+    (4, 0x0A00_0000), // L3[4]: VirtIO MMIO
+];
+
+/// Allocate the shared L1/L2/L3 device page tables that every user address
+/// space will reference via L0[1].  Must be called once during kernel init,
+/// after the PMM is ready.
+pub fn init_shared_device_tables() {
+    let l1 = pmm::alloc_page_zeroed().expect("shared dev L1");
+    let l2 = pmm::alloc_page_zeroed().expect("shared dev L2");
+    let l3 = pmm::alloc_page_zeroed().expect("shared dev L3");
+
+    let device_page_flags: u64 = flags::VALID | flags::TABLE | flags::AF
+        | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
+
+    unsafe {
+        let l1_ptr = phys_to_virt(l1.addr) as *mut u64;
+        let l2_ptr = phys_to_virt(l2.addr) as *mut u64;
+        let l3_ptr = phys_to_virt(l3.addr) as *mut u64;
+
+        // L1[0] -> L2
+        l1_ptr.write_volatile((l2.addr as u64) | flags::VALID | flags::TABLE);
+        // L2[0] -> L3
+        l2_ptr.write_volatile((l3.addr as u64) | flags::VALID | flags::TABLE);
+
+        for &(idx, pa) in DEV_PAGES {
+            l3_ptr.add(idx).write_volatile((pa as u64) | device_page_flags);
+        }
+    }
+
+    SHARED_DEV_L1_PHYS.store(l1.addr, Ordering::Release);
 }
 
 // =============================================================================
@@ -267,17 +320,40 @@ impl UserAddressSpace {
         }
 
         let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
-        let device_block_flags = flags::VALID | flags::BLOCK | flags::AF | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
+        let _ = l2_ptr; // L1[0]'s L2 is now empty; all devices are under L0[1].
 
-        for i in 64..96 {
-            let pa = (i as u64) * 0x200000;
-            unsafe { core::ptr::write_volatile(l2_ptr.add(i), pa | device_block_flags); }
+        // L0[1] -> shared device L1 table (all devices at VA 0x80_0000_0000+).
+        // These pages are shared across all user address spaces and must NOT be
+        // pushed to page_table_frames (they are never freed).
+        let dev_l1_phys = SHARED_DEV_L1_PHYS.load(Ordering::Acquire);
+        if dev_l1_phys != 0 {
+            unsafe {
+                let dev_l0_entry = (dev_l1_phys as u64) | flags::VALID | flags::TABLE;
+                core::ptr::write_volatile(l0_ptr.add(1), dev_l0_entry);
+            }
         }
 
-        let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
+        // L1[1]: kernel RAM. Use an L2 table with 2MB blocks for only the
+        // actual 256MB of RAM (128 blocks) instead of a 1GB L1 block.
+        // This leaves VA 0x50000000-0x7FFFFFFF available for user mmap.
+        let l2_ram_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate kernel RAM L2 table")?;
+        pmm::track_frame(l2_ram_frame, pmm::FrameSource::UserPageTable, 0);
+        self.page_table_frames.push(l2_ram_frame);
+
         unsafe {
-            core::ptr::write_volatile(l1_ptr.add(1), 0x4000_0000u64 | kernel_ram_flags);
-            core::ptr::write_volatile(l1_ptr.add(2), 0x8000_0000u64 | kernel_ram_flags);
+            let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
+            core::ptr::write_volatile(l1_ptr.add(1), l2_ram_entry);
+
+            let l2_ram_ptr = phys_to_virt(l2_ram_frame.addr) as *mut u64;
+            let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
+                | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
+
+            // 256MB = 128 × 2MB blocks: VA 0x40000000-0x4FFFFFFF → PA 0x40000000-0x4FFFFFFF
+            for i in 0..128u64 {
+                let pa = 0x4000_0000 + i * 0x20_0000;
+                core::ptr::write_volatile(l2_ram_ptr.add(i as usize), pa | kernel_ram_flags);
+            }
+            // L2[128..511] left zeroed — VA 0x50000000-0x7FFFFFFF available for user pages
         }
         Ok(())
     }
@@ -285,6 +361,10 @@ impl UserAddressSpace {
     pub fn ttbr0(&self) -> u64 {
         ((self.asid as u64) << 48) | (self.l0_frame.addr as u64)
     }
+
+    pub fn l0_phys(&self) -> usize { self.l0_frame.addr }
+
+    pub fn is_shared(&self) -> bool { self.shared }
 
     pub fn asid(&self) -> u16 { self.asid }
 
@@ -312,7 +392,19 @@ impl UserAddressSpace {
         unsafe {
             let entry = table_ptr.add(idx).read_volatile();
             if entry & flags::VALID != 0 {
-                Ok(PhysFrame::new((entry & 0x0000_FFFF_FFFF_F000) as usize))
+                if entry & flags::TABLE == 0 {
+                    // BLOCK descriptor occupies this slot — replace with a table.
+                    // The block mapped nonexistent or kernel-only memory that we
+                    // now need to carve into per-page mappings for user space.
+                    let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
+                    pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
+                    self.page_table_frames.push(frame);
+                    let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+                    table_ptr.add(idx).write_volatile(new_entry);
+                    Ok(frame)
+                } else {
+                    Ok(PhysFrame::new((entry & 0x0000_FFFF_FFFF_F000) as usize))
+                }
             } else {
                 let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
                 pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
@@ -375,11 +467,13 @@ impl UserAddressSpace {
     }
 
     pub fn track_user_frame(&mut self, frame: PhysFrame) { self.user_frames.push(frame); }
+    pub fn track_page_table_frame(&mut self, frame: PhysFrame) { self.page_table_frames.push(frame); }
     pub fn remove_user_frame(&mut self, frame: PhysFrame) {
         if let Some(idx) = self.user_frames.iter().position(|f| f.addr == frame.addr) { self.user_frames.swap_remove(idx); }
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
+        let _irq_guard = crate::irq::IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -404,6 +498,7 @@ impl UserAddressSpace {
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+        let _irq_guard = crate::irq::IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -427,6 +522,12 @@ impl UserAddressSpace {
         }
         flush_tlb_page(va);
         Ok(())
+    }
+
+    /// Check whether a virtual address has a valid page table entry (public).
+    pub fn is_mapped(&self, va: usize) -> bool {
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *const u64;
+        self.is_page_mapped(l0_ptr, va)
     }
 
     pub fn activate(&self) {
@@ -478,6 +579,11 @@ pub mod user_flags {
 }
 
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
+    // Disable IRQs for the entire page table walk+write to prevent preemption
+    // races. Without this, a timer IRQ mid-walk can context-switch to another
+    // thread that creates a competing page table entry (see Bug 7 in docs).
+    // The CAS in get_or_create_table_atomic is defense-in-depth for multi-core.
+    let _irq_guard = crate::irq::IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
     core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
@@ -487,30 +593,76 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
     let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
-    let (l1_addr, l1_frame) = get_or_create_table_raw(l0_ptr, l0_idx);
+    let (l1_addr, l1_frame) = get_or_create_table_atomic(l0_ptr, l0_idx);
     if let Some(frame) = l1_frame { allocated_tables.push(frame); }
     let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
-    let (l2_addr, l2_frame) = get_or_create_table_raw(l1_ptr, l1_idx);
+    let (l2_addr, l2_frame) = get_or_create_table_atomic(l1_ptr, l1_idx);
     if let Some(frame) = l2_frame { allocated_tables.push(frame); }
     let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
-    let (l3_addr, l3_frame) = get_or_create_table_raw(l2_ptr, l2_idx);
+    let (l3_addr, l3_frame) = get_or_create_table_atomic(l2_ptr, l2_idx);
     if let Some(frame) = l3_frame { allocated_tables.push(frame); }
     let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
+    let pte_atomic = &*((l3_ptr.add(l3_idx)) as *const core::sync::atomic::AtomicU64);
+    let existing = pte_atomic.load(core::sync::atomic::Ordering::Acquire);
+    if existing & flags::VALID != 0 {
+        let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
+        if existing_pa != pa {
+            crate::safe_print!(128, "[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}\n",
+                va, existing_pa, pa);
+        }
+        return allocated_tables;
+    }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
-    l3_ptr.add(l3_idx).write_volatile(entry);
+    let _ = pte_atomic.compare_exchange(existing, entry,
+        core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
     allocated_tables
 }}
 
-unsafe fn get_or_create_table_raw(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
-    let entry = table_ptr.add(idx).read_volatile();
-    if entry & flags::VALID != 0 {
-        ((entry & 0x0000_FFFF_FFFF_F000) as usize, None)
-    } else if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-        let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
-        table_ptr.add(idx).write_volatile(new_entry);
-        (frame.addr, Some(frame))
-    } else { (0, None) }
+/// Atomically get or create a page table at `table_ptr[idx]`.
+///
+/// Uses compare_exchange to prevent the race where two concurrent paths
+/// (e.g. mmap syscall preempted by a demand-paging fault handler) both
+/// see the entry as invalid, both allocate a new table, and the second
+/// write overwrites the first — orphaning all PTEs in the lost table.
+unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize, Option<PhysFrame>) { unsafe {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let atomic = &*((table_ptr.add(idx)) as *const AtomicU64);
+
+    loop {
+        let entry = atomic.load(Ordering::Acquire);
+
+        if entry & flags::VALID != 0 {
+            if entry & flags::TABLE == 0 {
+                // BLOCK descriptor — replace with a table so we can map individual pages
+                if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                    let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+                    match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => return (frame.addr, Some(frame)),
+                        Err(_) => {
+                            crate::pmm::free_page(frame);
+                            continue;
+                        }
+                    }
+                }
+                return (0, None);
+            }
+            return ((entry & 0x0000_FFFF_FFFF_F000) as usize, None);
+        }
+
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
+            match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return (frame.addr, Some(frame)),
+                Err(_) => {
+                    crate::pmm::free_page(frame);
+                    continue;
+                }
+            }
+        } else {
+            return (0, None);
+        }
+    }
 }}
 
 pub fn protect_kernel_code() {
@@ -601,6 +753,14 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
         if !is_page_mapped_ptr(l0_ptr, start_page + i * PAGE_SIZE) { return false; }
     }
     true
+}
+
+pub fn is_current_user_page_mapped(va: usize) -> bool {
+    let ttbr0 = get_current_ttbr0();
+    if ttbr0 == 0 { return false; }
+    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_ptr = phys_to_virt(l0_addr) as *const u64;
+    is_page_mapped_ptr(l0_ptr, va & !(PAGE_SIZE - 1))
 }
 
 /// Translate a user VA to its physical address using the given L0 page table.

@@ -7,6 +7,8 @@ const APK_STATIC_URL: &str =
     "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/apk-tools-static-3.0.5-r0.apk";
 const ALPINE_KEYS_URL: &str =
     "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/alpine-keys-2.6-r0.apk";
+const CA_CERTIFICATES_URL: &str =
+    "https://curl.se/ca/cacert.pem";
 
 fn download_if_missing(url: &str, dest: &Path) {
     if dest.exists() {
@@ -41,8 +43,10 @@ fn main() {
     // ── Download ────────────────────────────────────────────────────────────
     let apk_pkg = vendor_dir.join("apk-tools-static.apk");
     let keys_pkg = vendor_dir.join("alpine-keys.apk");
+    let ca_bundle = vendor_dir.join("cacert.pem");
     download_if_missing(APK_STATIC_URL, &apk_pkg);
     download_if_missing(ALPINE_KEYS_URL, &keys_pkg);
+    download_if_missing(CA_CERTIFICATES_URL, &ca_bundle);
 
     // ── Extract apk.static binary, rename to apk, place in bin/ ────────────
     let staging_bin = staging_dir.join("bin");
@@ -124,8 +128,8 @@ fn main() {
 
     fs::write(
         apk_etc.join("repositories"),
-        "http://dl-cdn.alpinelinux.org/alpine/latest-stable/main\n\
-         http://dl-cdn.alpinelinux.org/alpine/latest-stable/community\n",
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main\n\
+         https://dl-cdn.alpinelinux.org/alpine/latest-stable/community\n",
     )
     .unwrap();
 
@@ -140,6 +144,15 @@ fn main() {
             fs::copy(entry.path(), apk_keys.join(entry.file_name())).unwrap();
         }
     }
+
+    // ── Bootstrap: CA certificates for HTTPS ──────────────────────────────
+    let ssl_dir = bootstrap.join("etc/ssl");
+    let ssl_certs = ssl_dir.join("certs");
+    fs::create_dir_all(&ssl_certs).unwrap();
+    fs::copy(&ca_bundle, ssl_certs.join("ca-certificates.crt"))
+        .expect("Failed to copy CA certificate bundle to certs/");
+    fs::copy(&ca_bundle, ssl_dir.join("cert.pem"))
+        .expect("Failed to copy CA certificate bundle to cert.pem");
 
     // Seed the APK database so `apk add` works without --initdb
     let installed = apk_db.join("installed");

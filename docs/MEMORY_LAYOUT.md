@@ -124,13 +124,25 @@ The kernel code isn't being fully loaded into memory. This can happen when:
 
 The kernel uses AArch64 4-level page tables with 4KB granule:
 
-- **TTBR0_EL1**: User space (lower half, per-process)
-- **TTBR1_EL1**: Kernel space (upper half, shared)
+- **TTBR0_EL1**: Used for both kernel and user space (identity mapping)
+- **TTBR1_EL1**: Points to same tables as TTBR0 (unused, reserved for future)
+
+### Boot page tables
 
 Boot code sets up identity mapping using 1GB blocks:
 - L1[0]: Device memory (0x00000000 - 0x3FFFFFFF)
 - L1[1]: RAM block 1 (0x40000000 - 0x7FFFFFFF)
 - L1[2]: RAM block 2 (0x80000000 - 0xBFFFFFFF)
+
+### User page tables
+
+Each process gets its own TTBR0 page tables. These include:
+- **L1[0] → L2 table**: User code/data pages via L3 tables, plus VirtIO device
+  pages at L2[80] (0x0a00_0000). GIC, UART, and fw_cfg are NOT mapped here —
+  the kernel accesses them via a temporary TTBR0 swap to boot page tables
+  (see `docs/DEVICE_MMIO_VA_CONFLICT.md`).
+- **L1[1] → L2 table**: Kernel RAM at 0x40000000-0x4FFFFFFF (128 × 2MB blocks),
+  plus user mmap region at 0x50000000-0x7FFFFFFF.
 
 ## Configuration Files
 

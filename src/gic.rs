@@ -184,8 +184,8 @@ impl Gic {
     }
 }
 
-/// Global GIC instance for QEMU virt machine
-static GIC: Gic = Gic::new(0x0800_0000, 0x0801_0000);
+/// Global GIC instance at remapped VAs (physical 0x0800_0000 / 0x0801_0000 via L0[1])
+static GIC: Gic = Gic::new(crate::mmu::DEV_GIC_DIST_VA, crate::mmu::DEV_GIC_CPU_VA);
 
 // ============================================================================
 // Public API - Safe wrappers around GIC operations

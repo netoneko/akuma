@@ -56,18 +56,22 @@ impl Uart {
     }
 }
 
-/// Global UART instance for QEMU virt machine
-static UART: Uart = Uart::new(0x0900_0000);
+/// Global UART instance at remapped VA (physical 0x0900_0000 via L0[1])
+static UART: Uart = Uart::new(crate::mmu::DEV_UART_VA);
 
 // ============================================================================
 // Public API - Safe wrappers around UART operations
 // ============================================================================
 
-/// Print a string to the console
+/// Print a string to the console.
+/// Disables IRQs to prevent timer preemption from interleaving output
+/// of two threads mid-message.
 pub fn print(s: &str) {
-    for c in s.bytes() {
-        UART.write(c);
-    }
+    crate::irq::with_irqs_disabled(|| {
+        for c in s.bytes() {
+            UART.write(c);
+        }
+    });
 }
 
 /// Print a single character
@@ -203,6 +207,21 @@ macro_rules! safe_print {
     ($size:expr, $($arg:tt)*) => {{
         use core::fmt::Write;
         let mut writer = $crate::console::StackWriter::<$size>::new();
+        let _ = write!(writer, $($arg)*);
+        writer.flush();
+    }};
+}
+
+/// Like safe_print but prepends a `[T<secs>.<cs>]` uptime timestamp.
+#[macro_export]
+macro_rules! tprint {
+    ($size:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let __us = $crate::timer::uptime_us();
+        let __s = __us / 1_000_000;
+        let __cs = (__us % 1_000_000) / 10_000;
+        let mut writer = $crate::console::StackWriter::<$size>::new();
+        let _ = write!(writer, "[T{}.{:02}] ", __s, __cs);
         let _ = write!(writer, $($arg)*);
         writer.flush();
     }};

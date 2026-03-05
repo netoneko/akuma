@@ -328,6 +328,11 @@ pub struct MemoryStats {
     pub peak_allocated: usize,
 }
 
+/// Get current allocated bytes (live allocations)
+pub fn allocated_bytes() -> usize {
+    ALLOCATED_BYTES.load(Ordering::Relaxed)
+}
+
 /// Get current memory statistics
 pub fn stats() -> MemoryStats {
     let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
@@ -552,7 +557,19 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
             .unwrap_or(ptr::null_mut());
 
         if result.is_null() {
-            crate::console::print("[ALLOC FAIL]");
+            let heap_total = HEAP_SIZE.load(Ordering::Relaxed);
+            let heap_used = ALLOCATED_BYTES.load(Ordering::Relaxed);
+            let heap_peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+            let heap_count = ALLOCATION_COUNT.load(Ordering::Relaxed);
+            crate::safe_print!(256,
+                "\n[ALLOC FAIL] requested={} heap_total={}MB heap_used={}MB ({}%) peak={}MB allocs={}\n",
+                user_size,
+                heap_total / 1024 / 1024,
+                heap_used / 1024 / 1024,
+                if heap_total > 0 { heap_used * 100 / heap_total } else { 0 },
+                heap_peak / 1024 / 1024,
+                heap_count);
+            crate::syscall::syscall_counters::dump();
             return ptr::null_mut();
         }
 
@@ -594,6 +611,17 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
                 Ok(_) => break,
                 Err(p) => peak = p,
             }
+        }
+
+        // Heap growth monitor: print at each 5MB boundary crossing
+        static NEXT_REPORT_MB: AtomicUsize = AtomicUsize::new(13);
+        let mb = new_allocated / (1024 * 1024);
+        let next = NEXT_REPORT_MB.load(Ordering::Relaxed);
+        if mb >= next {
+            NEXT_REPORT_MB.store(mb + 5, Ordering::Relaxed);
+            let sc_nr = crate::syscall::current_syscall_nr();
+            let tid = crate::threading::current_thread_id();
+            crate::safe_print!(192, "[HEAP] {}MB used (alloc={} bytes, sc_nr={}, tid={})\n", mb, user_size, sc_nr, tid);
         }
 
         user_ptr
@@ -805,6 +833,18 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 TALC.lock()
                     .free(core::ptr::NonNull::new_unchecked(old_actual_ptr), old_actual_layout);
                 ALLOCATED_BYTES.fetch_sub(old_user_size, Ordering::Relaxed);
+            }
+
+            // Heap growth monitor for realloc (net growth = new_size - old_user_size)
+            {
+                static NEXT_REALLOC_REPORT_MB: AtomicUsize = AtomicUsize::new(15);
+                let current = ALLOCATED_BYTES.load(Ordering::Relaxed);
+                let mb = current / (1024 * 1024);
+                let next = NEXT_REALLOC_REPORT_MB.load(Ordering::Relaxed);
+                if mb >= next {
+                    NEXT_REALLOC_REPORT_MB.store(mb + 5, Ordering::Relaxed);
+                    crate::safe_print!(128, "[HEAP-R] {}MB used (realloc {}->{})\n", mb, old_user_size, new_size);
+                }
             }
 
             new_user_ptr

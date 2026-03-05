@@ -604,6 +604,8 @@ mod esr {
     pub const EC_SVC64: u64 = 0b010101; // SVC instruction from AArch64
     pub const EC_DATA_ABORT_LOWER: u64 = 0b100100; // Data abort from lower EL
     pub const EC_INST_ABORT_LOWER: u64 = 0b100000; // Instruction abort from lower EL
+    pub const EC_MSR_MRS_TRAP: u64 = 0b011000; // Trapped MSR/MRS/System instruction from EL0
+    pub const EC_BRK_AARCH64: u64 = 0b111100; // BRK instruction from AArch64
 }
 
 /// Install exception vector table
@@ -1019,6 +1021,37 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let frame_ref = unsafe { &*frame };
             let syscall_num = frame_ref.x8;
 
+            // JIT cache coherency workaround: bogus syscall numbers (> 500)
+            // indicate stale instruction cache — JIT wrote new code but the
+            // CPU (or QEMU's TB cache) still has old translations.
+            // IC IALLU from EL1 flushes the entire I-cache; on QEMU TCG this
+            // calls tb_flush() which clears all translated blocks.
+            // Counter-based: allow up to 16 consecutive retries before giving up.
+            {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static JIT_RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
+                if syscall_num > 500 {
+                    let count = JIT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count < 16 {
+                        let elr = frame_ref.elr_el1;
+                        crate::safe_print!(128, "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x}\n",
+                            count + 1, syscall_num, elr);
+                        unsafe {
+                            core::arch::asm!("ic iallu");
+                            core::arch::asm!("dsb ish");
+                            core::arch::asm!("isb");
+                            (*frame).elr_el1 = elr.wrapping_sub(4);
+                        }
+                        return frame_ref.x0;
+                    }
+                    crate::safe_print!(128, "[JIT] giving up after {} retries, nr={}\n",
+                        count + 1, syscall_num);
+                    JIT_RETRY_COUNT.store(0, Ordering::Relaxed);
+                } else {
+                    JIT_RETRY_COUNT.store(0, Ordering::Relaxed);
+                }
+            }
+
             // Save trap frame pointer so fork/clone can read full register state
             crate::threading::set_current_trap_frame(frame);
             let args = [
@@ -1077,33 +1110,294 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
-            // Data abort from user - terminate with error
             let far: u64;
             let elr: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
+
+            let pid = crate::process::read_current_pid().unwrap_or(0);
+
+            // Translation/permission fault (ISS bits [5:2]) — try demand paging
+            let fault_type = iss & 0x3C; // DFSC[5:2]
+            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
+            let is_permission_fault = fault_type == 0x0C;
+            let far_usize = far as usize;
+
+            if is_permission_fault {
+                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    if let Some(owner) = crate::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RW_NO_EXEC);
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
+
+            if is_translation_fault {
+                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    let map_flags = match source {
+                        crate::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                        }
+                        _ => crate::mmu::user_flags::RW_NO_EXEC,
+                    };
+                    let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
+
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        const READAHEAD_PAGES: usize = 256;
+                        let region_end = region_start + region_size;
+                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
+
+                        let mut any_mapped = false;
+                        let mut pages_mapped = 0u64;
+                        let mut cur_va = page_va;
+                        while cur_va < ra_end {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                                let pg_data_start = core::cmp::max(cur_va, segment_va);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
+                                if pg_data_start < pg_data_end {
+                                    let dst_off = pg_data_start - cur_va;
+                                    let file_off = file_offset + (pg_data_start - segment_va);
+                                    let len = pg_data_end - pg_data_start;
+                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    let page_buf = unsafe {
+                                        core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
+                                    };
+                                    if inode != 0 {
+                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                                    } else {
+                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
+                                    }
+                                }
+
+                                if is_exec {
+                                    let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe {
+                                            core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                            core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                                        }
+                                    }
+                                }
+
+                                let table_frames = unsafe {
+                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                };
+                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(pf);
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                                any_mapped = true;
+                                pages_mapped += 1;
+                            } else {
+                                break;
+                            }
+                            cur_va += 0x1000;
+                        }
+
+                        if is_exec {
+                            unsafe {
+                                core::arch::asm!("dsb ish");
+                                core::arch::asm!("isb");
+                            }
+                        }
+
+                        if any_mapped {
+                            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
+                            return unsafe { (*frame).x0 };
+                        }
+                    } else {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                            let table_frames = unsafe {
+                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            if let Some(owner) = crate::process::lookup_process(pid) {
+                                owner.address_space.track_user_frame(page_frame);
+                                for tf in table_frames {
+                                    owner.address_space.track_page_table_frame(tf);
+                                }
+                            }
+                            return unsafe { (*frame).x0 };
+                        }
+                    }
+                } else {
+                    // Fallback: check eager mmap regions — the PTE may have been lost.
+                    // Use lookup_process(pid) where pid = address-space owner (from
+                    // read_current_pid / process info page).  current_process() goes
+                    // through THREAD_PID_MAP and returns the *worker* thread's Process
+                    // for CLONE_VM threads — that Process has empty mmap_regions because
+                    // all mmaps were performed on the parent.
+                    let page_va = far_usize & !0xFFF;
+                    let mut recovered = false;
+                    if let Some(proc) = crate::process::lookup_process(pid) {
+                        for (start, frames) in &proc.mmap_regions {
+                            let region_end = *start + frames.len() * 4096;
+                            if page_va >= *start && page_va < region_end {
+                                let page_idx = (page_va - *start) / 4096;
+                                let phys = frames[page_idx];
+                                crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
+                                    pid, page_va, phys.addr);
+                                unsafe {
+                                    crate::mmu::map_user_page(page_va, phys.addr, crate::mmu::user_flags::RW_NO_EXEC);
+                                }
+                                recovered = true;
+                                break;
+                            }
+                        }
+                    }
+                    if recovered {
+                        return unsafe { (*frame).x0 };
+                    }
+                    // Dump mmap_regions for debugging: shows what the eager fallback searched
+                    if let Some(dbg_proc) = crate::process::lookup_process(pid) {
+                        let n = dbg_proc.mmap_regions.len();
+                        crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
+                            pid, far_usize, n);
+                        for (i, (start, fr)) in dbg_proc.mmap_regions.iter().enumerate() {
+                            if i >= 10 { crate::safe_print!(32, "  ...\n"); break; }
+                            crate::safe_print!(128, "  [{}] 0x{:x}-0x{:x} ({} pages)\n",
+                                i, start, start + fr.len() * 4096, fr.len());
+                        }
+                    } else {
+                        crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
+                    }
+                    crate::process::lazy_region_debug(far_usize);
+                    crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
+                }
+            }
+
             let frame_ref = unsafe { &*frame };
-            crate::safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
+            crate::tprint!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
             crate::safe_print!(128, "[Fault]  x19={:#x} x20={:#x} x29={:#x} x30={:#x}\n",
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
-            crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x}\n",
-                frame_ref.sp_el0, frame_ref.spsr_el1);
-            // Terminate process
+            crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
+                frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
             crate::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
-            // Instruction abort from user - terminate
             let far: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
+            let pid = crate::process::read_current_pid().unwrap_or(0);
+
+            let fault_type = iss & 0x3C;
+            let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
+            let is_permission_fault = fault_type == 0x0C;
+            let far_usize = far as usize;
+
+            if is_permission_fault {
+                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    if let Some(owner) = crate::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RX);
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
+
+            if is_translation_fault {
+                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                    let page_va = far_usize & !(0xFFF);
+                    let map_flags = match source {
+                        crate::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { crate::mmu::user_flags::RX }
+                        }
+                        _ => crate::mmu::user_flags::RX,
+                    };
+
+                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        const READAHEAD_PAGES: usize = 256;
+                        let region_end = region_start + region_size;
+                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
+
+                        let mut any_mapped = false;
+                        let mut pages_mapped = 0u64;
+                        let mut cur_va = page_va;
+                        while cur_va < ra_end {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                                let pg_data_start = core::cmp::max(cur_va, segment_va);
+                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
+                                if pg_data_start < pg_data_end {
+                                    let dst_off = pg_data_start - cur_va;
+                                    let file_off = file_offset + (pg_data_start - segment_va);
+                                    let len = pg_data_end - pg_data_start;
+                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    let page_buf = unsafe {
+                                        core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
+                                    };
+                                    if inode != 0 {
+                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                                    } else {
+                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
+                                    }
+                                }
+
+                                let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                for off in (0..0x1000_usize).step_by(64) {
+                                    unsafe {
+                                        core::arch::asm!("dc cvau, {}", in(reg) kva + off);
+                                        core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+                                    }
+                                }
+
+                                let table_frames = unsafe {
+                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                };
+                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(pf);
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                                any_mapped = true;
+                                pages_mapped += 1;
+                            } else {
+                                break;
+                            }
+                            cur_va += 0x1000;
+                        }
+
+                        unsafe {
+                            core::arch::asm!("dsb ish");
+                            core::arch::asm!("isb");
+                        }
+
+                        if any_mapped {
+                            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
+                            return unsafe { (*frame).x0 };
+                        }
+                    } else {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                            let table_frames = unsafe {
+                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            if let Some(owner) = crate::process::lookup_process(pid) {
+                                owner.address_space.track_user_frame(page_frame);
+                                for tf in table_frames {
+                                    owner.address_space.track_page_table_frame(tf);
+                                }
+                            }
+                            return unsafe { (*frame).x0 };
+                        }
+                    }
+                } else {
+                    crate::process::lazy_region_debug(far_usize);
+                    crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
+                }
+            }
+
+            crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             let frame_ref = unsafe { &*frame };
-            crate::safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
+            crate::tprint!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
@@ -1112,6 +1406,60 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} ELR={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.elr_el1, frame_ref.spsr_el1);
             crate::process::return_to_kernel(-11) // never returns
+        }
+        esr::EC_MSR_MRS_TRAP => {
+            // Trapped MSR/MRS/System instruction from EL0.
+            let direction = iss & 1; // 1 = MRS (read), 0 = MSR (write)
+            let rt = ((iss >> 5) & 0x1F) as usize;
+            let op0 = (iss >> 20) & 0x3;
+            let op1 = (iss >> 14) & 0x7;
+            let crn = (iss >> 10) & 0xF;
+            let crm = (iss >> 1) & 0xF;
+            let op2 = (iss >> 17) & 0x7;
+
+            if direction == 1 && rt < 31 {
+                // MRS (read) — emulate system register reads
+                let value = if op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 1 {
+                    // CTR_EL0
+                    let ctr: u64;
+                    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
+                    ctr
+                } else {
+                    0
+                };
+                unsafe {
+                    let regs = frame as *mut u64;
+                    core::ptr::write_volatile(regs.add(rt), value);
+                }
+            } else if direction == 0 {
+                // MSR/DC/IC (write) — perform cache maintenance on behalf of user
+                let addr = if rt < 31 {
+                    unsafe { core::ptr::read_volatile((frame as *const u64).add(rt)) }
+                } else {
+                    0
+                };
+                if op0 == 1 && crn == 7 {
+                    // Cache maintenance instruction (DC or IC).
+                    // DC CVAU: op1=3, crm=11, op2=1
+                    // IC IVAU: op1=3, crm=5, op2=1
+                    if op1 == 3 && crm == 11 && op2 == 1 {
+                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr); }
+                    } else if op1 == 3 && crm == 5 && op2 == 1 {
+                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr); }
+                    }
+                }
+            }
+            // Advance past the trapped instruction (always 4 bytes on AArch64)
+            unsafe {
+                let elr_ptr = &mut (*frame).elr_el1 as *mut u64;
+                let elr = core::ptr::read_volatile(elr_ptr);
+                core::ptr::write_volatile(elr_ptr, elr + 4);
+            }
+            return unsafe { (*frame).x0 };
+        }
+        esr::EC_BRK_AARCH64 => {
+            // BRK instruction — intentional trap/abort from user code
+            crate::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
             // Capture additional state for debugging

@@ -18,6 +18,7 @@ fi
 
 qemu-system-aarch64 \
   -semihosting \
+  -accel hvf \
   -machine virt \
   -cpu max \
   -m 256M \

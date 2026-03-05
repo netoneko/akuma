@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::format;
 use spinning_top::Spinlock;
 
 // ============================================================================
@@ -255,7 +256,18 @@ pub trait Filesystem: Send + Sync {
 
     /// Sync/flush any cached data to disk
     fn sync(&self) -> Result<(), FsError> {
-        Ok(()) // Default: no-op for filesystems that don't cache
+        Ok(())
+    }
+
+    /// Resolve a path to an opaque inode number for later use with read_at_by_inode.
+    fn resolve_inode(&self, _path: &str) -> Result<u32, FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Read from a file identified by inode number (returned by resolve_inode),
+    /// bypassing path lookup. Falls back to NotSupported if unimplemented.
+    fn read_at_by_inode(&self, _inode: u32, _offset: usize, _buf: &mut [u8]) -> Result<usize, FsError> {
+        Err(FsError::NotSupported)
     }
 }
 
@@ -402,9 +414,9 @@ pub fn resolve_path(base_cwd: &str, path: &str) -> String {
     } else {
         // Relative path
         let full_path = if base_cwd == "/" {
-            alloc::format!("/{}", path)
+            format!("/{}", path)
         } else {
-            alloc::format!("{}/{}", base_cwd, path)
+            format!("{}/{}", base_cwd, path)
         };
         canonicalize_path(&full_path)
     }
@@ -416,7 +428,7 @@ fn normalize_path_owned(path: &str) -> String {
     if trimmed.is_empty() {
         String::from("/")
     } else if !trimmed.starts_with('/') {
-        alloc::format!("/{}", trimmed)
+        format!("/{}", trimmed)
     } else {
         String::from(trimmed)
     }
@@ -488,9 +500,9 @@ where
             // Join root_dir and absolute path
             // e.g. root_dir="/box1", absolute="/etc" -> "/box1/etc"
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &absolute[1..])
+                format!("{}{}", proc.root_dir, &absolute[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, absolute)
+                format!("{}{}", proc.root_dir, absolute)
             }
         } else {
             absolute
@@ -552,6 +564,16 @@ pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsErr
     with_fs(path, |fs, rel| fs.read_at(rel, offset, buf))
 }
 
+/// Resolve a file path to an inode number for use with read_at_by_inode.
+pub fn resolve_inode(path: &str) -> Result<u32, FsError> {
+    with_fs(path, |fs, rel| fs.resolve_inode(rel))
+}
+
+/// Read from a file by inode number, bypassing path lookup.
+pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     with_fs(path, |fs, rel| fs.write_at(rel, offset, data))
@@ -599,9 +621,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
         let abs = resolve_path(&proc.cwd, old_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+                format!("{}{}", proc.root_dir, &abs[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, abs)
+                format!("{}{}", proc.root_dir, abs)
             }
         } else {
             abs
@@ -614,9 +636,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
         let abs = resolve_path(&proc.cwd, new_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {
-                alloc::format!("{}{}", proc.root_dir, &abs[1..])
+                format!("{}{}", proc.root_dir, &abs[1..])
             } else {
-                alloc::format!("{}{}", proc.root_dir, abs)
+                format!("{}{}", proc.root_dir, abs)
             }
         } else {
             abs
@@ -799,7 +821,7 @@ fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
             }
         } else {
             // Direct children of non-root: /foo -> /foo/bar
-            let prefix = alloc::format!("{}/", parent);
+            let prefix = format!("{}/", parent);
             if mount_path.starts_with(&prefix) {
                 let rest = &mount_path[prefix.len()..];
                 // Only direct children (no more slashes)

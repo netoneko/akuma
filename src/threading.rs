@@ -6,6 +6,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use alloc::sync::Arc; // Added
+use alloc::format;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
@@ -3034,7 +3035,7 @@ pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSumma
     // We need at least 8KB of usable kernel stack for execute() and other kernel code
     const MIN_USABLE_KERNEL_STACK: usize = 8 * 1024;
     if summary.usable_kernel_stack < MIN_USABLE_KERNEL_STACK {
-        return Err(alloc::format!(
+        return Err(format!(
             "Exception stack too large! Usable kernel stack: {} KB < {} KB minimum\n\
              Stack layout per thread:\n\
              - Total stack: {} KB\n\
@@ -3054,7 +3055,7 @@ pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSumma
     let heap_required = summary.system_total + summary.user_total;
     
     if heap_required > available_heap {
-        return Err(alloc::format!(
+        return Err(format!(
             "Stack memory exceeds heap! Required: {} KB, Available: {} KB\n\
              Breakdown:\n\
              - {} system threads × {} KB = {} KB\n\

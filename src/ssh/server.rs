@@ -135,11 +135,23 @@ fn block_on<F: Future>(mut future: F) -> F::Output {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
             Poll::Pending => {
-                // Re-poll the future immediately if the network made progress,
-                // since the incoming packet may have satisfied our pending read.
-                // Only yield when idle. The preemptive 10ms timer ensures other
-                // threads still get CPU time.
-                if !smoltcp_net::poll() {
+                if smoltcp_net::poll() {
+                    continue;
+                }
+                // Brief spin-poll to catch packets arriving just after our
+                // poll returned false. Without this, yield_now() can defer
+                // the thread for 20-60ms while the data is already sitting
+                // in VirtIO's RX ring. ~200us of spinning costs < 2% CPU.
+                let deadline = crate::timer::uptime_us() + 200;
+                let mut caught = false;
+                while crate::timer::uptime_us() < deadline {
+                    if smoltcp_net::poll() {
+                        caught = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if !caught {
                     crate::threading::yield_now();
                 }
             }

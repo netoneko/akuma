@@ -41,10 +41,9 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// when using miniz_oxide zlib decompression with deep call stacks.
 /// Increased to 512KB for DOOM which has deep rendering call stacks.
 /// A guard page is placed below the stack to detect overflow.
-// pub const USER_STACK_SIZE: usize = 512 * 1024;
-/// Increased from 128KB to handle complex workloads like TCC compiling neatvi.
+/// Stack size for user processes. 2MB handles heavy workloads like bun/JSC.
 /// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 256 * 1024;
+pub const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum kernel threads
 ///
@@ -138,7 +137,7 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // legacy option, now using 
 /// - ratio=8: (87.5% / 4) = ~22% CPU each
 /// 
 /// Lower values = better network responsiveness, higher = more CPU for downloads
-pub const NETWORK_THREAD_RATIO: u32 = 2;
+pub const NETWORK_THREAD_RATIO: u32 = 4;
 
 pub const IGNORE_THREADING_TESTS: bool = false;
 
@@ -202,7 +201,7 @@ pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 
 /// Option to disable [syscall] debug prints to the kernel log.
-pub const SYSCALL_DEBUG_INFO_ENABLED: bool = true;
+pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
 
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
@@ -239,7 +238,7 @@ pub const TX_QUEUE_SLOTS: usize = 8;
 pub const TX_PACKET_BUFFER_SIZE: usize = 2048;
 
 // Debug prints
-// WARNING: SGI debug prints use alloc::format! which can deadlock if the
+// WARNING: SGI debug prints use format! which can deadlock if the
 // allocator lock is held when timer fires. Keep disabled unless debugging.
 pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
 pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
@@ -276,7 +275,7 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-pub const AUTO_START_HERD: bool = true;
+pub const AUTO_START_HERD: bool = false;
 
 // ============================================================================
 // Procfs Buffer Size Limits

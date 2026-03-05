@@ -405,6 +405,12 @@ pub enum FileDescriptor {
     EventFd(u32),
     /// /dev/null — reads return EOF, writes are discarded
     DevNull,
+    /// /dev/urandom — reads return random bytes
+    DevUrandom,
+    /// timerfd — reads return 8-byte expiration count
+    TimerFd(u32),
+    /// epoll instance (epoll_id into global EPOLL_TABLE)
+    EpollFd(u32),
 }
 
 /// Kernel file handle for open files
@@ -462,6 +468,36 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
 static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
+/// Source of data for a lazy region page.
+#[derive(Clone)]
+pub enum LazySource {
+    /// Zero-filled on demand (anonymous mapping).
+    Zero,
+    /// Backed by file data; pages beyond `filesz` are zero-filled (BSS).
+    File {
+        path: String,
+        inode: u32,
+        file_offset: usize,
+        filesz: usize,
+        segment_va: usize,
+    },
+}
+
+/// A lazily-backed virtual memory region.
+#[derive(Clone)]
+pub struct LazyRegion {
+    pub start_va: usize,
+    pub size: usize,
+    pub flags: u64,
+    pub source: LazySource,
+}
+
+/// Global lazy region table, keyed by PID.
+/// Stored separately from Process to avoid aliasing/corruption issues
+/// with &mut Process references from current_process().
+pub static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<LazyRegion>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
 /// Register a process in the table (takes ownership)
 pub fn register_process(pid: Pid, proc: Box<Process>) {
     crate::irq::with_irqs_disabled(|| {
@@ -473,7 +509,7 @@ pub fn register_process(pid: Pid, proc: Box<Process>) {
 ///
 /// Returns the owned Process so it can be dropped, freeing all memory
 /// including the UserAddressSpace and all its physical pages.
-fn unregister_process(pid: Pid) -> Option<Box<Process>> {
+pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     crate::irq::with_irqs_disabled(|| {
         PROCESS_TABLE.lock().remove(&pid)
     })
@@ -485,6 +521,7 @@ fn unregister_process(pid: Pid) -> Option<Box<Process>> {
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32};
 
 /// Channel for streaming process output between threads
@@ -942,7 +979,9 @@ pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>
 /// Allocate mmap region for current process
 /// Returns the address or 0 on failure
 pub fn alloc_mmap(size: usize) -> usize {
-    let proc = match current_process() {
+    // Use address-space owner so CLONE_VM threads share allocation state.
+    let pid = read_current_pid().unwrap_or(0);
+    let proc = match lookup_process(pid) {
         Some(p) => p,
         None => {
             console::print("[mmap] ERROR: No current process\n");
@@ -954,7 +993,8 @@ pub fn alloc_mmap(size: usize) -> usize {
     match proc.memory.alloc_mmap(size) {
         Some(addr) => addr,
         None => {
-            crate::safe_print!(64, "[mmap] REJECT: size 0x{:x} exceeds limit\n", size);
+            crate::safe_print!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                proc.pid, size, proc.memory.next_mmap, proc.memory.mmap_limit);
             0
         }
     }
@@ -965,9 +1005,187 @@ pub fn alloc_mmap(size: usize) -> usize {
 /// Called by sys_mmap after allocating frames.
 /// The frames Vec should contain all physical frames for this region.
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
-    if let Some(proc) = current_process() {
+    let pid = read_current_pid().unwrap_or(0);
+    if let Some(proc) = lookup_process(pid) {
         proc.mmap_regions.push((start_va, frames));
     }
+}
+
+/// Record a lazy mmap region — VA reserved, no physical pages.
+/// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
+pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
+    let pid = read_current_pid().unwrap_or(0);
+    if let Some(proc) = lookup_process(pid) {
+        proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
+    }
+}
+
+/// Check if a virtual address falls within any lazy region of the current process.
+/// Returns `(flags, source, region_start, region_size)` if found.
+/// The source is cloned so the caller can release the table lock before performing I/O.
+pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
+    let pid = read_current_pid()?;
+    crate::irq::with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&pid) {
+            for r in regions {
+                if va >= r.start_va && va < r.start_va + r.size {
+                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
+                }
+            }
+        }
+        None
+    })
+}
+
+pub fn lazy_region_debug(va: usize) {
+    let pid = read_current_pid().unwrap_or(0);
+    crate::irq::with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&pid) {
+            crate::tprint!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
+                pid, va, regions.len());
+            for (i, r) in regions.iter().enumerate() {
+                if i > 0 { crate::safe_print!(8, ","); }
+                crate::safe_print!(64, "{:#x}-{:#x}", r.start_va, r.start_va + r.size);
+            }
+            crate::safe_print!(8, "]\n");
+        } else {
+            crate::tprint!(64, "[DP] lazy miss: pid={} va={:#x} no entry in table\n", pid, va);
+        }
+    });
+}
+
+pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64) -> usize {
+    push_lazy_region_with_source(pid, start_va, size, page_flags, LazySource::Zero)
+}
+
+pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
+    let len = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let regions = table.entry(pid).or_insert_with(Vec::new);
+        regions.push(LazyRegion { start_va, size, flags: page_flags, source });
+        regions.len()
+    });
+    len
+}
+
+pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get_mut(&pid) {
+            if let Some(idx) = regions.iter().position(|r| r.start_va == start_va) {
+                let removed = regions.remove(idx);
+                return Some((removed, regions.len()));
+            }
+        }
+        None
+    });
+    if let Some((removed, _remaining)) = result {
+        Some(removed)
+    } else {
+        None
+    }
+}
+
+/// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
+/// Returns a Vec of (freed_start, freed_pages) for each affected region.
+pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> alloc::vec::Vec<(usize, usize)> {
+    let unmap_end = unmap_addr + unmap_len;
+    let mut results = alloc::vec::Vec::new();
+
+    loop {
+        if let Some(result) = munmap_lazy_region_overlapping(pid, unmap_addr, unmap_end) {
+            results.push(result);
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+/// Find and modify a single lazy region that overlaps with [range_start, range_end).
+/// Uses overlap check rather than containment check, so it finds regions that
+/// start within the range even if range_start is in a gap between regions.
+fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let regions = table.get_mut(&pid)?;
+
+        let idx = regions.iter().position(|r| {
+            let reg_end = r.start_va + r.size;
+            r.start_va < range_end && reg_end > range_start
+        })?;
+
+        let reg_start = regions[idx].start_va;
+        let reg_size = regions[idx].size;
+        let reg_end = reg_start + reg_size;
+
+        let clip_start = if range_start > reg_start { range_start } else { reg_start };
+        let clip_end = if range_end < reg_end { range_end } else { reg_end };
+
+        if clip_start == reg_start && clip_end == reg_end {
+            regions.remove(idx);
+            Some(('F', reg_start, reg_size / 4096))
+        } else if clip_start == reg_start {
+            regions[idx].start_va = clip_end;
+            regions[idx].size = reg_end - clip_end;
+            let freed = (clip_end - clip_start) / 4096;
+            Some(('P', clip_start, freed))
+        } else if clip_end == reg_end {
+            regions[idx].size = clip_start - reg_start;
+            let freed = (reg_end - clip_start) / 4096;
+            Some(('S', clip_start, freed))
+        } else {
+            let right = LazyRegion {
+                start_va: clip_end,
+                size: reg_end - clip_end,
+                flags: regions[idx].flags,
+                source: regions[idx].source.clone(),
+            };
+            regions[idx].size = clip_start - reg_start;
+            regions.push(right);
+            let freed = (clip_end - clip_start) / 4096;
+            Some(('M', clip_start, freed))
+        }
+    });
+
+    if let Some((op, freed_start, freed_pages)) = result {
+        crate::tprint!(128, "[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)\n",
+            op as char, pid, freed_start, freed_pages * 4096, freed_pages);
+        Some((freed_start, freed_pages))
+    } else {
+        None
+    }
+}
+
+pub fn clear_lazy_regions(pid: Pid) {
+    let count = crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        let count = table.get(&pid).map_or(0, |r| r.len());
+        table.remove(&pid);
+        count
+    });
+    if count > 0 {
+        crate::tprint!(64, "[LR!] clear pid={} ({} regions)\n", pid, count);
+    }
+}
+
+pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&from_pid) {
+            let cloned = regions.clone();
+            let len = cloned.len();
+            table.insert(to_pid, cloned);
+            crate::tprint!(64, "[LR] clone pid={}->{} ({} regions)\n", from_pid, to_pid, len);
+        }
+    });
+}
+
+/// Check if a virtual address falls within any lazy region.
+pub fn is_in_lazy_region(va: usize) -> bool {
+    lazy_region_lookup(va).is_some()
 }
 
 /// Remove and return mmap region starting at the given VA
@@ -975,7 +1193,8 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
 /// Called by sys_munmap to find frames to free.
 /// Returns None if no region starts at this VA.
 pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
-    let proc = current_process()?;
+    let pid = read_current_pid().unwrap_or(0);
+    let proc = lookup_process(pid)?;
     
     // Find the region
     let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;
@@ -1157,6 +1376,38 @@ impl UserContext {
     }
 }
 
+// ============================================================================
+// Signal Infrastructure
+// ============================================================================
+
+pub const MAX_SIGNALS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignalHandler {
+    Default,
+    Ignore,
+    UserFn(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SignalAction {
+    pub handler: SignalHandler,
+    pub flags: u64,
+    pub mask: u64,
+    pub restorer: usize,
+}
+
+impl SignalAction {
+    pub const fn default() -> Self {
+        Self {
+            handler: SignalHandler::Default,
+            flags: 0,
+            mask: 0,
+            restorer: 0,
+        }
+    }
+}
+
 /// Memory regions for a process
 #[derive(Debug, Clone)]
 pub struct ProcessMemory {
@@ -1177,12 +1428,14 @@ pub struct ProcessMemory {
 }
 
 impl ProcessMemory {
-    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize) -> Self {
+    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) -> Self {
         // Mmap region starts 256MB above code_end to leave room for heap
         // growth (brk grows upward from code_end). Must be above code_end
         // so PIE binaries loaded at 0x1000_0000 don't get their code pages
         // overwritten by mmap allocations.
-        let mmap_start = (code_end + 0x1000_0000) & !0xFFFF;
+        // Also must be above mmap_floor (e.g. above the interpreter region).
+        let base = (code_end + 0x1000_0000) & !0xFFFF;
+        let mmap_start = core::cmp::max(base, mmap_floor);
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
 
         Self {
@@ -1202,30 +1455,37 @@ impl ProcessMemory {
         addr < self.stack_top && end > self.stack_bottom
     }
 
+    /// Kernel identity-maps VA 0x40000000-0x4FFFFFFF (256MB RAM via 2MB blocks).
+    /// User mmap regions must not overlap this range.
+    const KERNEL_VA_START: usize = 0x4000_0000;
+    const KERNEL_VA_END: usize   = 0x5000_0000;
+
     /// Allocate mmap region, returns None if would overlap stack
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
         // 1. Try to find a hole in free_regions (first-fit)
         for i in 0..self.free_regions.len() {
             let (start, f_size) = self.free_regions[i];
             if f_size >= size {
-                // Found a suitable hole
                 self.free_regions.remove(i);
-                
-                // If the hole is larger than requested, add the remainder back
                 if f_size > size {
                     self.free_regions.push((start + size, f_size - size));
                 }
-                
                 return Some(start);
             }
         }
 
-        // 2. Fall back to bump allocator
-        let addr = self.next_mmap;
+        // 2. Fall back to bump allocator — skip the kernel identity-mapped VA range
+        let mut addr = self.next_mmap;
+
+        // If we're about to enter the kernel VA hole, jump past it
+        if addr < Self::KERNEL_VA_END && addr + size > Self::KERNEL_VA_START {
+            addr = Self::KERNEL_VA_END;
+        }
+
         let end = addr.checked_add(size)?;
 
         if end > self.mmap_limit {
-            return None; // Would get too close to stack
+            return None;
         }
 
         self.next_mmap = end;
@@ -1293,6 +1553,11 @@ pub struct Process {
     /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
     /// Used by munmap to find and free the correct frames.
     pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
+    /// Lazy mmap regions. VA is reserved but physical pages are allocated
+    /// on demand via page fault. flags=0 means PROT_NONE (needs mprotect
+    /// before access); non-zero means demand-paged with those permissions
+    /// on first touch.
+    pub lazy_regions: Vec<LazyRegion>,
 
     // ========== File Descriptor Table ==========
     /// Per-process file descriptor table
@@ -1328,28 +1593,37 @@ pub struct Process {
 
     /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID)
     pub clear_child_tid: u64,
+
+    /// Per-process signal action table (sigaction storage)
+    pub signal_actions: [SignalAction; MAX_SIGNALS],
+
+    /// Monotonic timestamp (us) when the process was created
+    pub start_time_us: u64,
 }
 
+
+fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
+    const MIN_HEAP: usize = 16 * 1024 * 1024;
+    const RESERVE_PAGES: usize = 2048; // 8MB
+
+    let (_, _, free) = crate::pmm::stats();
+    let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
+    let va_cap = memory.next_mmap.saturating_sub(brk);
+
+    core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
+}
 
 impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
-        // Load ELF with stack and pre-allocated heap
-        // Stack size is configurable via config::USER_STACK_SIZE
-        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top) =
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
             elf_loader::load_elf_with_stack(elf_data, args, env, config::USER_STACK_SIZE)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
-        // Allocate and map the process info page (read-only for userspace)
-        // The kernel will write to this page before entering userspace
         let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
-        // Track as user data for this process
         crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
 
-        // Map as read-only at the fixed address
-        // user_flags::RO = AP_RO_ALL, meaning read-only for both EL1 and EL0
-        // But we use phys_to_virt to write, bypassing page tables
         address_space
             .map_page(
                 PROCESS_INFO_ADDR,
@@ -1358,11 +1632,9 @@ impl Process {
             )
             .map_err(|_| ElfError::MappingFailed("process info page"))?;
 
-        // Track the frame so it's freed when the address space is dropped
         address_space.track_user_frame(process_info_frame);
 
-        // Initialize per-process memory tracking
-        let memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
         crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
@@ -1399,6 +1671,7 @@ impl Process {
             dynamic_page_tables: Vec::new(),
             // Mmap regions - for tracking VA->frames mapping (used by munmap)
             mmap_regions: Vec::new(),
+            lazy_regions: Vec::new(),
             // File descriptor table - stdin/stdout/stderr pre-allocated
             fd_table: Spinlock::new(fd_map),
             cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
@@ -1417,28 +1690,125 @@ impl Process {
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
+            signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            start_time_us: crate::timer::uptime_us(),
+        })
+    }
+
+    /// Create a process from a large ELF file on disk, loading segments on demand.
+    pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
+        {
+            let stats = crate::allocator::stats();
+            crate::safe_print!(192, "[Process] heap before ELF load: {}MB / {}MB ({}%), allocs={}\n",
+                stats.allocated / 1024 / 1024, stats.heap_size / 1024 / 1024,
+                if stats.heap_size > 0 { stats.allocated * 100 / stats.heap_size } else { 0 },
+                stats.allocation_count);
+        }
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
+            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
+
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        for seg in &deferred_segments {
+            let source = match &seg.file_source {
+                Some(fs) => LazySource::File {
+                    path: fs.path.clone(),
+                    inode: fs.inode,
+                    file_offset: fs.file_offset,
+                    filesz: fs.filesz,
+                    segment_va: fs.segment_va,
+                },
+                None => LazySource::Zero,
+            };
+            push_lazy_region_with_source(pid, seg.start_va, seg.size, seg.page_flags, source);
+        }
+
+        let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
+        crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
+
+        address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+            )
+            .map_err(|_| ElfError::MappingFailed("process info page"))?;
+
+        address_space.track_user_frame(process_info_frame);
+
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+
+        crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
+
+        let mut fd_map = alloc::collections::BTreeMap::new();
+        fd_map.insert(0, FileDescriptor::Stdin);
+        fd_map.insert(1, FileDescriptor::Stdout);
+        fd_map.insert(2, FileDescriptor::Stderr);
+
+        let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
+        push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+
+        Ok(Self {
+            pid,
+            pgid: pid,
+            name: String::from(name),
+            state: ProcessState::Ready,
+            address_space,
+            context: UserContext::new(entry_point, stack_pointer),
+            parent_pid: 0,
+            brk,
+            initial_brk: brk,
+            entry_point,
+            memory,
+            process_info_phys: process_info_frame.addr,
+            args: Vec::new(),
+            cwd: String::from("/"),
+            stdin: Spinlock::new(StdioBuffer::new()),
+            stdout: Spinlock::new(StdioBuffer::new()),
+            exited: false,
+            exit_code: 0,
+            dynamic_page_tables: Vec::new(),
+            mmap_regions: Vec::new(),
+            lazy_regions: Vec::new(),
+            fd_table: Spinlock::new(fd_map),
+            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+            nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+            next_fd: AtomicU32::new(3),
+            thread_id: None,
+            spawner_pid: None,
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
+            box_id: 0,
+            root_dir: String::from("/"),
+            channel: None,
+            delegate_pid: None,
+            clear_child_tid: 0,
+            signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            start_time_us: crate::timer::uptime_us(),
         })
     }
 
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
-        // Reuse load_elf_with_stack to handle address space creation, ELF loading, and stack setup
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top) = 
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) = 
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
             .map_err(|_| "Failed to load ELF")?;
             
-        // Deactivate old address space before dropping it (if it was active)
         mmu::UserAddressSpace::deactivate();
         
-        // Replace address space (old one is dropped here, freeing frames)
         self.address_space = address_space;
         self.entry_point = entry_point;
         self.brk = brk;
         self.initial_brk = brk;
-        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top);
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
+        self.lazy_regions.clear();
+        clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+
+        let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
+        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
@@ -1472,6 +1842,74 @@ impl Process {
         // Reset I/O state (but keep FDs and Channel!)
         self.reset_io();
         
+        Ok(())
+    }
+
+    /// Replace current process image using on-demand loading from a file path.
+    pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
+            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, crate::config::USER_STACK_SIZE)
+            .map_err(|_| "Failed to load ELF")?;
+
+        mmu::UserAddressSpace::deactivate();
+
+        self.address_space = address_space;
+        self.entry_point = entry_point;
+        self.brk = brk;
+        self.initial_brk = brk;
+        self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+        self.mmap_regions.clear();
+        self.lazy_regions.clear();
+        clear_lazy_regions(self.pid);
+        self.dynamic_page_tables.clear();
+        self.args = args.to_vec();
+
+        for seg in &deferred_segments {
+            let source = match &seg.file_source {
+                Some(fs) => LazySource::File {
+                    path: fs.path.clone(),
+                    inode: fs.inode,
+                    file_offset: fs.file_offset,
+                    filesz: fs.filesz,
+                    segment_va: fs.segment_va,
+                },
+                None => LazySource::Zero,
+            };
+            push_lazy_region_with_source(self.pid, seg.start_va, seg.size, seg.page_flags, source);
+        }
+
+        let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
+        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+                self.pid, entry_point, brk, stack_bottom, stack_top, sp);
+        }
+
+        self.context = UserContext::new(entry_point, sp);
+
+        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
+        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+
+        self.address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+            )
+            .map_err(|_| "Failed to map process info")?;
+
+        self.address_space.track_user_frame(process_info_frame);
+        self.process_info_phys = process_info_frame.addr;
+
+        unsafe {
+            let info_ptr = mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+            core::ptr::write(info_ptr, info);
+        }
+
+        self.reset_io();
+
         Ok(())
     }
 
@@ -1558,22 +1996,23 @@ impl Process {
 
     /// Set program break, returns new value.
     /// Maps any new pages between old and new brk.
+    /// Returns the exact requested value (matching Linux brk ABI).
     pub fn set_brk(&mut self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
             return self.brk;
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;
-        // Page-align old_top UP: the partial page containing self.brk is
-        // already mapped by the ELF loader, so only map from the next page.
         let old_top = (self.brk + 0xFFF) & !0xFFF;
         if aligned > old_top {
             let mut page = old_top;
             while page < aligned {
-                let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                if !self.address_space.is_range_mapped(page, 0x1000) {
+                    let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                }
                 page += 0x1000;
             }
         }
-        self.brk = aligned;
+        self.brk = new_brk;
         self.brk
     }
 
@@ -1820,10 +2259,53 @@ pub extern "C" fn check_process_exit() -> bool {
 /// context system (THREAD_CONTEXTS vs KernelContext) that was a source of bugs.
 /// 
 /// The thread is marked as terminated and the scheduler will reclaim it.
+/// Kill all threads sharing the same address space (L0 page table).
+/// Used by exit_group and when the address-space owner exits to prevent
+/// sibling threads from running with freed page tables.
+pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
+    let siblings: Vec<(Pid, Option<usize>)> = crate::irq::with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(pid, proc)| **pid != my_pid && proc.address_space.l0_phys() == l0_phys)
+            .map(|(pid, proc)| (*pid, proc.thread_id))
+            .collect()
+    });
+
+    for (sib_pid, sib_tid) in &siblings {
+        if let Some(proc) = lookup_process(*sib_pid) {
+            cleanup_process_fds(proc);
+        }
+        clear_lazy_regions(*sib_pid);
+
+        if let Some(tid) = sib_tid {
+            crate::irq::with_irqs_disabled(|| {
+                THREAD_PID_MAP.lock().remove(tid);
+            });
+            if let Some(channel) = remove_channel(*tid) {
+                channel.set_exited(137);
+            }
+        }
+
+        let _dropped = unregister_process(*sib_pid);
+
+        if let Some(tid) = sib_tid {
+            crate::threading::mark_thread_terminated(*tid);
+        }
+    }
+
+    if !siblings.is_empty() {
+        crate::safe_print!(128, "[Process] Killed {} sibling thread(s) for PID {}\n",
+            siblings.len(), my_pid);
+    }
+}
+
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    let lr: u64;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
     let tid = crate::threading::current_thread_id();
+    crate::safe_print!(128, "[RTK] code={} tid={} LR={:#x}\n", exit_code, tid, lr);
     
     // Check if this thread was already killed externally (by kill_process).
     // If so, cleanup has already been done - just skip to the yield loop.
@@ -1901,9 +2383,24 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
+        // If this process owns the address space (not shared), kill all
+        // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
+        // all page tables; siblings still using them would cause EL1 faults.
+        if let Some(proc) = lookup_process(pid) {
+            if !proc.address_space.is_shared() {
+                let l0_phys = proc.address_space.l0_phys();
+                kill_thread_group(pid, l0_phys);
+            }
+        }
+
+        let start_us = lookup_process(pid).map(|p| p.start_time_us).unwrap_or(0);
+        let elapsed_us = crate::timer::uptime_us().saturating_sub(start_us);
+        let secs = elapsed_us / 1_000_000;
+        let frac = (elapsed_us % 1_000_000) / 10_000; // centiseconds
+
+        clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
-        // _dropped_process goes out of scope here and is dropped, freeing all memory
-        crate::safe_print!(64, "[Process] PID {} thread {} exited ({})\n", pid, tid, exit_code);
+        crate::tprint!(128, "[Process] PID {} thread {} exited ({}) [{}.{:02}s]\n", pid, tid, exit_code, secs, frac);
     } else {
         crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
     }
@@ -2085,6 +2582,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(),
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
@@ -2107,10 +2605,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: 0,
+        signal_actions: parent.signal_actions,
+        start_time_us: crate::timer::uptime_us(),
     });
     
     // 4. Perform memory copy
-    let stack_top = 0x40000000;
+    let stack_top = parent.memory.stack_top;
     let stack_size = config::USER_STACK_SIZE; 
     let stack_start = stack_top - stack_size;
     
@@ -2216,6 +2716,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     }
 
     new_proc.mmap_regions = child_mmap_regions;
+    new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap = parent.memory.next_mmap;
     
     // 5. Write ProcessInfo to child's process info page
@@ -2259,6 +2760,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     // Register process BEFORE marking thread READY
     register_process(child_pid, new_proc);
+    clone_lazy_regions(parent_pid, child_pid);
     
     // Now safe to start the thread
     crate::threading::mark_thread_ready(tid);
@@ -2298,6 +2800,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(), // managed via LAZY_REGION_TABLE
         fd_table: {
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
@@ -2320,6 +2823,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
+        signal_actions: parent.signal_actions,
+        start_time_us: crate::timer::uptime_us(),
     });
 
     let parent_tid = crate::threading::current_thread_id();
@@ -2352,6 +2857,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     });
 
     register_process(child_pid, new_proc);
+    clone_lazy_regions(parent_pid, child_pid);
 
     // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID)
     if parent_tid_ptr != 0 {
@@ -2538,11 +3044,11 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
-    // Read the ELF file
-    let elf_data =
-        crate::fs::read_file(path).map_err(|e| alloc::format!("Failed to read {}: {}", path, e))?;
+    let resolved = crate::vfs::resolve_symlinks(path);
+    let elf_path = &resolved;
 
-    // Prepare full arguments (argv[0] = path/name)
+    // Prepare full arguments (argv[0] = original path so busybox-style
+    // multi-call binaries can identify which applet to run)
     let mut full_args = Vec::new();
     full_args.push(path.to_string());
     if let Some(arg_slice) = args {
@@ -2556,9 +3062,20 @@ pub fn spawn_process_with_channel_ext(
         _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
     };
 
-    // Create the process
-    let mut process = Process::from_elf(path, &full_args, &full_env, &elf_data)
-        .map_err(|e| alloc::format!("Failed to load ELF: {}", e))?;
+    // Try to read the ELF file; for large files that exceed the in-memory
+    // limit, fall back to on-demand loading via read_at().
+    let mut process = match crate::fs::read_file(elf_path) {
+        Ok(elf_data) => {
+            Process::from_elf(elf_path, &full_args, &full_env, &elf_data)
+                .map_err(|e| format!("Failed to load ELF: {}", e))?
+        }
+        Err(_) => {
+            let file_size = crate::vfs::file_size(elf_path)
+                .map_err(|e| format!("Failed to stat {}: {}", elf_path, e))? as usize;
+            Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env)
+                .map_err(|e| format!("Failed to load ELF: {}", e))?
+        }
+    };
 
     // Always create a fresh channel per spawned process.
     // Reusing the parent's channel would cause the child's set_exited() call
@@ -2680,7 +3197,7 @@ pub fn spawn_process_with_channel_ext(
             loop { crate::threading::yield_now(); }
         }
     })
-    .map_err(|e| alloc::format!("Failed to spawn thread: {}", e))?;
+    .map_err(|e| format!("Failed to spawn thread: {}", e))?;
 
     // Set the thread ID in the process table entry for the parent to see immediately
     if let Some(p) = lookup_process(pid) {

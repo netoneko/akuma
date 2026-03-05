@@ -68,6 +68,36 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_mmap_vec_capacity_doubling, "mmap_vec_capacity_doubling");
     run_test!(test_mmap_interleaved_strings, "mmap_interleaved_strings");
 
+    // Allocator leak detection tests
+    run_test!(test_alloc_free_no_leak, "alloc_free_no_leak");
+    run_test!(test_btreemap_churn_no_leak, "btreemap_churn_no_leak");
+    run_test!(test_vec_growth_no_leak, "vec_growth_no_leak");
+    run_test!(test_high_volume_small_allocs_no_leak, "high_volume_small_allocs_no_leak");
+
+    // Mmap subsystem tests
+    run_test!(test_alloc_mmap_non_overlapping, "alloc_mmap_non_overlapping");
+    run_test!(test_alloc_mmap_free_region_recycling, "alloc_mmap_free_region_recycling");
+    run_test!(test_lazy_region_push_lookup, "lazy_region_push_lookup");
+    run_test!(test_lazy_region_munmap_full, "lazy_region_munmap_full");
+    run_test!(test_lazy_region_munmap_prefix, "lazy_region_munmap_prefix");
+    run_test!(test_lazy_region_munmap_suffix, "lazy_region_munmap_suffix");
+    run_test!(test_lazy_region_munmap_middle, "lazy_region_munmap_middle");
+    run_test!(test_lazy_region_munmap_multi, "lazy_region_munmap_multi");
+    run_test!(test_map_user_page_roundtrip, "map_user_page_roundtrip");
+    run_test!(test_eager_mmap_pages_survive_subrange_munmap, "eager_mmap_subrange_munmap");
+    run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
+    run_test!(test_clone_vm_eager_fallback_finds_region, "clone_vm_eager_fallback_finds_region");
+
+    // PTE durability — tests the ACTUAL invariant that broke in the crash
+    run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
+    run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
+    run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
+
+    // Bug 10: partial munmap of eager regions
+    run_test!(test_eager_munmap_prefix_preserves_suffix, "eager_munmap_prefix_preserves_suffix");
+    run_test!(test_eager_munmap_suffix_preserves_prefix, "eager_munmap_suffix_preserves_prefix");
+    run_test!(test_eager_munmap_full_removes_all, "eager_munmap_full_removes_all");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -2687,4 +2717,1169 @@ pub fn test_block_on_noop_waker() -> bool {
     let ok = result == Some(5) && poll_count == 5;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+// ============================================================================
+// Allocator leak detection tests
+//
+// These verify that repeated alloc/dealloc cycles don't leak kernel heap.
+// Modeled after the pattern that caused Node.js OOM: 4M+ fcntl syscalls
+// leaking ~11 bytes each via BTreeMap/Vec operations.
+// ============================================================================
+
+fn heap_used() -> usize {
+    crate::allocator::allocated_bytes()
+}
+
+/// Basic alloc/free cycle leak test: 100K rounds of 56-byte and 152-byte
+/// allocations (the exact sizes observed in the Node.js OOM).
+fn test_alloc_free_no_leak() -> bool {
+    console::print("\n[TEST] Alloc/free leak detection (100K cycles, 56+152 bytes)\n");
+    use alloc::alloc::{alloc, dealloc, Layout};
+
+    let before = heap_used();
+    let iterations = 100_000usize;
+
+    for _ in 0..iterations {
+        unsafe {
+            let layout56 = Layout::from_size_align(56, 8).unwrap();
+            let p1 = alloc(layout56);
+            if !p1.is_null() {
+                core::ptr::write_bytes(p1, 0xAB, 56);
+                dealloc(p1, layout56);
+            }
+
+            let layout152 = Layout::from_size_align(152, 8).unwrap();
+            let p2 = alloc(layout152);
+            if !p2.is_null() {
+                core::ptr::write_bytes(p2, 0xCD, 152);
+                dealloc(p2, layout152);
+            }
+        }
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// BTreeMap churn: insert + lookup + remove on 1000-entry maps, repeated 100
+/// times.  BTreeMap node allocation/deallocation is the most likely source of
+/// the per-syscall leak since BTreeSet is used for cloexec_fds/nonblock_fds
+/// and BTreeMap for fd_table, THREAD_PID_MAP, etc.
+fn test_btreemap_churn_no_leak() -> bool {
+    console::print("\n[TEST] BTreeMap churn leak detection\n");
+    use alloc::collections::BTreeMap;
+
+    let before = heap_used();
+
+    for round in 0..100u32 {
+        let mut map: BTreeMap<u32, u64> = BTreeMap::new();
+        for i in 0..1000u32 {
+            map.insert(i + round * 1000, i as u64);
+        }
+        for i in 0..1000u32 {
+            let _ = map.get(&(i + round * 1000));
+        }
+        for i in 0..1000u32 {
+            map.remove(&(i + round * 1000));
+        }
+        drop(map);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Vec growth pattern: repeatedly grow a Vec (triggering realloc), drain it,
+/// and drop.  Tests the realloc path for leaks since Vec capacity doubling
+/// goes through GlobalAlloc::realloc.
+fn test_vec_growth_no_leak() -> bool {
+    console::print("\n[TEST] Vec growth/shrink leak detection\n");
+
+    let before = heap_used();
+
+    for _ in 0..200u32 {
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..2000u64 {
+            v.push(i);
+        }
+        v.clear();
+        v.shrink_to_fit();
+        drop(v);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// High-volume small allocations: 500K alloc+free of sizes 8-256 bytes,
+/// simulating the syscall dispatch path where temporary Strings, Vecs, and
+/// BTreeMap nodes are created and destroyed.  At 4M+ calls this is where
+/// even a 1-byte-per-call leak becomes fatal.
+fn test_high_volume_small_allocs_no_leak() -> bool {
+    console::print("\n[TEST] High-volume small allocs leak detection (500K cycles)\n");
+    use alloc::collections::BTreeSet;
+
+    let before = heap_used();
+
+    let mut set: BTreeSet<u32> = BTreeSet::new();
+    for i in 0..500_000u32 {
+        set.insert(i % 64);
+        set.remove(&(i % 64));
+
+        if i % 10000 == 0 {
+            let s = format!("iter_{}", i);
+            drop(s);
+        }
+    }
+    drop(set);
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Mmap subsystem tests
+// ============================================================================
+
+/// Verify alloc_mmap returns non-overlapping address ranges
+fn test_alloc_mmap_non_overlapping() -> bool {
+    console::print("\n[TEST] alloc_mmap: non-overlapping addresses\n");
+
+    let mut mem = crate::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    let mut addrs = Vec::new();
+    let sizes = [0x1000, 0x4000, 0x10000, 0x1000, 0x8000, 0x7F000];
+    for &sz in &sizes {
+        match mem.alloc_mmap(sz) {
+            Some(a) => addrs.push((a, sz)),
+            None => {
+                crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
+                    sz, mem.next_mmap, mem.mmap_limit);
+                return false;
+            }
+        }
+    }
+
+    let mut ok = true;
+    for i in 0..addrs.len() {
+        let (a_start, a_sz) = addrs[i];
+        let a_end = a_start + a_sz;
+        for j in (i + 1)..addrs.len() {
+            let (b_start, b_sz) = addrs[j];
+            let b_end = b_start + b_sz;
+            if a_start < b_end && b_start < a_end {
+                crate::safe_print!(192, "  OVERLAP: [{:#x}..{:#x}) vs [{:#x}..{:#x})\n",
+                    a_start, a_end, b_start, b_end);
+                ok = false;
+            }
+        }
+    }
+
+    crate::safe_print!(64, "  {} allocations, all disjoint: {}\n", addrs.len(), ok);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify free_regions are reused before bump allocator advances
+fn test_alloc_mmap_free_region_recycling() -> bool {
+    console::print("\n[TEST] alloc_mmap: free region recycling\n");
+
+    let mut mem = crate::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    let a1 = mem.alloc_mmap(0x4000).unwrap();
+    let _a2 = mem.alloc_mmap(0x4000).unwrap();
+    let bump_after = mem.next_mmap;
+
+    mem.free_regions.push((a1, 0x4000));
+
+    // Should reuse the freed region, not bump
+    let a3 = mem.alloc_mmap(0x2000).unwrap();
+    let ok1 = a3 == a1 && mem.next_mmap == bump_after;
+
+    // Remaining 0x2000 should also come from the split free region
+    let a4 = mem.alloc_mmap(0x2000).unwrap();
+    let ok2 = a4 == a1 + 0x2000;
+
+    // After free_regions exhausted, bump should advance
+    let a5 = mem.alloc_mmap(0x1000).unwrap();
+    let ok3 = a5 == bump_after;
+
+    let pass = ok1 && ok2 && ok3;
+    if !pass {
+        crate::safe_print!(192, "  a1={:#x} a3={:#x} a4={:#x} a5={:#x} bump={:#x}\n",
+            a1, a3, a4, a5, bump_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+const TEST_PID: u32 = 9999;
+
+/// Verify push_lazy_region stores the region and it can be found
+fn test_lazy_region_push_lookup() -> bool {
+    console::print("\n[TEST] lazy_region: push and lookup\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+
+    let start = 0x5000_0000usize;
+    let size = 0x1000_0000usize;
+    crate::process::push_lazy_region(TEST_PID, start, size, 0);
+
+    let found = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&TEST_PID) {
+            let mid = start + size / 2;
+            regions.iter().any(|r| mid >= r.start_va && mid < r.start_va + r.size)
+        } else {
+            false
+        }
+    });
+
+    // Verify address outside region is NOT found
+    let outside = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        if let Some(regions) = table.get(&TEST_PID) {
+            let outside_va = start + size + 0x1000;
+            regions.iter().any(|r| outside_va >= r.start_va && outside_va < r.start_va + r.size)
+        } else {
+            false
+        }
+    });
+
+    crate::process::clear_lazy_regions(TEST_PID);
+
+    let ok = found && !outside;
+    crate::safe_print!(64, "  found_inside={} found_outside={}\n", found, outside);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the entire lazy region
+fn test_lazy_region_munmap_full() -> bool {
+    console::print("\n[TEST] lazy_region: munmap full region\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x1_0000);
+
+    let remaining = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        table.get(&TEST_PID).map_or(0, |r| r.len())
+    });
+
+    let ok = results.len() == 1 && results[0] == (0x5000_0000, 16) && remaining == 0;
+    if !ok {
+        crate::safe_print!(128, "  results.len()={}, remaining={}\n", results.len(), remaining);
+    }
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the prefix of a lazy region
+fn test_lazy_region_munmap_prefix() -> bool {
+    console::print("\n[TEST] lazy_region: munmap prefix\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x4000);
+
+    let (start, size) = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        match table.get(&TEST_PID) {
+            Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
+            _ => (0, 0),
+        }
+    });
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_0000, 4)
+        && start == 0x5000_4000
+        && size == 0xC000;
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the suffix of a lazy region
+fn test_lazy_region_munmap_suffix() -> bool {
+    console::print("\n[TEST] lazy_region: munmap suffix\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_C000, 0x4000);
+
+    let (start, size) = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        match table.get(&TEST_PID) {
+            Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
+            _ => (0, 0),
+        }
+    });
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_C000, 4)
+        && start == 0x5000_0000
+        && size == 0xC000;
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the middle of a lazy region — should split into two
+fn test_lazy_region_munmap_middle() -> bool {
+    console::print("\n[TEST] lazy_region: munmap middle (split)\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_4000, 0x4000);
+
+    let regions = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        table.get(&TEST_PID).map_or(Vec::new(), |r| {
+            r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
+        })
+    });
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_4000, 4)
+        && regions.len() == 2
+        && regions.iter().any(|&(s, sz)| s == 0x5000_0000 && sz == 0x4000)
+        && regions.iter().any(|&(s, sz)| s == 0x5000_8000 && sz == 0x8000);
+
+    if !ok {
+        crate::safe_print!(192, "  freed={:?} regions={:?}\n", results, regions);
+    }
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap range spanning two adjacent lazy regions
+fn test_lazy_region_munmap_multi() -> bool {
+    console::print("\n[TEST] lazy_region: munmap spanning two regions\n");
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    crate::process::push_lazy_region(TEST_PID, 0x5001_0000, 0x1_0000, 0);
+
+    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_8000, 0x1_0000);
+
+    let remaining = crate::irq::with_irqs_disabled(|| {
+        let table = crate::process::LAZY_REGION_TABLE.lock();
+        table.get(&TEST_PID).map_or(Vec::new(), |r| {
+            r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
+        })
+    });
+
+    let ok = results.len() == 2
+        && remaining.len() == 2
+        && remaining.iter().any(|&(s, sz)| s == 0x5000_0000 && sz == 0x8000)
+        && remaining.iter().any(|&(s, sz)| s == 0x5001_8000 && sz == 0x8000);
+
+    if !ok {
+        crate::safe_print!(192, "  freed={:?} remain={:?}\n", results, remaining);
+    }
+
+    crate::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify map_user_page actually creates a PTE, and clearing it works
+fn test_map_user_page_roundtrip() -> bool {
+    console::print("\n[TEST] map_user_page: map → verify → unmap → verify\n");
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    // Use a VA unlikely to conflict with anything. The kernel test thread
+    // runs with the kernel TTBR0 so we need an address within the identity-
+    // mapped range. Pick a VA in an unused user-range gap if available,
+    // or use a high address.
+    let test_va: usize = 0x1_F000_0000;
+
+    let before = crate::mmu::is_current_user_page_mapped(test_va);
+
+    let table_frames = unsafe {
+        crate::mmu::map_user_page(test_va, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+    };
+
+    let after_map = crate::mmu::is_current_user_page_mapped(test_va);
+
+    // Clear the PTE directly
+    unsafe {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = crate::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 != 0 {
+            let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
+            if l1e & 1 != 0 {
+                let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
+                if l2e & 1 != 0 {
+                    let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
+                    crate::mmu::flush_tlb_page(test_va);
+                }
+            }
+        }
+    }
+
+    let after_clear = crate::mmu::is_current_user_page_mapped(test_va);
+
+    crate::pmm::free_page(frame);
+    for tf in table_frames { crate::pmm::free_page(tf); }
+
+    let ok = !before && after_map && !after_clear;
+    if !ok {
+        crate::safe_print!(128, "  before={} after_map={} after_clear={}\n",
+            before, after_map, after_clear);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify sub-range munmap of an eager allocation is a no-op
+/// (the fix for Bug 5: sys_munmap must not blindly unmap pages)
+fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
+    console::print("\n[TEST] munmap: sub-range of eager alloc is no-op\n");
+
+    let mut mem = crate::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    let base = mem.alloc_mmap(0x7F000).unwrap();
+    let pages = 0x7F000 / 4096; // 127
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => { console::print("  OOM\n"); return false; }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    // Simulate sys_munmap for sub-range (base + 0x23000)
+    let sub_addr = base + 0x23000;
+    let sub_len = 0x1000;
+
+    // Step 1: exact start match in mmap_regions?
+    let exact = mmap_regions.iter().position(|(start, _)| *start == sub_addr);
+
+    // Step 2: lazy region match?
+    crate::process::clear_lazy_regions(TEST_PID);
+    let lazy_results = crate::process::munmap_lazy_regions_in_range(TEST_PID, sub_addr, sub_len);
+
+    // With Bug 5 fix: neither matches → return success, no pages unmapped
+    let ok = exact.is_none() && lazy_results.is_empty();
+
+    // Verify frame count unchanged (nothing freed)
+    let frames_intact = mmap_regions[0].1.len() == pages;
+
+    // Cleanup
+    for (_, region_frames) in mmap_regions {
+        for f in region_frames { crate::pmm::free_page(f); }
+    }
+    crate::process::clear_lazy_regions(TEST_PID);
+
+    let pass = ok && frames_intact;
+    if !pass {
+        crate::safe_print!(128, "  exact={:?} lazy={} frames_intact={}\n",
+            exact, lazy_results.len(), frames_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Helper: create a minimal test Process and box it for PROCESS_TABLE registration.
+fn make_test_process(
+    pid: u32,
+    ppid: u32,
+    addr_space: crate::mmu::UserAddressSpace,
+    info_phys: usize,
+) -> alloc::boxed::Box<crate::process::Process> {
+    use spinning_top::Spinlock;
+    let mem = crate::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+    alloc::boxed::Box::new(crate::process::Process {
+        pid, pgid: pid, name: String::from("test"),
+        state: crate::process::ProcessState::Ready,
+        address_space: addr_space,
+        context: crate::process::UserContext::new(0, 0),
+        parent_pid: ppid, brk: 0x1000_0000, initial_brk: 0x1000_0000,
+        entry_point: 0, memory: mem, process_info_phys: info_phys,
+        args: Vec::new(), cwd: String::from("/"),
+        stdin: Spinlock::new(crate::process::StdioBuffer::new()),
+        stdout: Spinlock::new(crate::process::StdioBuffer::new()),
+        exited: false, exit_code: 0,
+        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
+        lazy_regions: Vec::new(),
+        fd_table: Spinlock::new(alloc::collections::BTreeMap::new()),
+        cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+        nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
+        next_fd: core::sync::atomic::AtomicU32::new(3),
+        thread_id: None, spawner_pid: None,
+        terminal_state: alloc::sync::Arc::new(Spinlock::new(
+            crate::terminal::TerminalState::default(),
+        )),
+        box_id: 0, root_dir: String::from("/"),
+        channel: None, delegate_pid: None, clear_child_tid: 0,
+        signal_actions: [crate::process::SignalAction::default(); crate::process::MAX_SIGNALS],
+        start_time_us: 0,
+    })
+}
+
+/// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.
+///
+/// Registers a parent and a CLONE_VM child in PROCESS_TABLE. Adds mmap_regions
+/// to the parent. Verifies lookup_process(parent) sees the regions while
+/// lookup_process(child) sees none.
+fn test_clone_vm_mmap_regions_on_owner() -> bool {
+    console::print("\n[TEST] CLONE_VM: mmap_regions only on address-space owner\n");
+
+    let parent_pid = crate::process::allocate_pid();
+    let child_pid = crate::process::allocate_pid();
+
+    let parent_as = match crate::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (parent AS)\n"); return false; }
+    };
+    let l0 = parent_as.l0_phys();
+    let child_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+        Some(a) => a,
+        None => { console::print("  OOM (child AS)\n"); return false; }
+    };
+    let info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let mut parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
+
+    // Simulate an eager mmap on the parent
+    let test_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    parent_proc.mmap_regions.push((0x6809_d000, vec![test_frame]));
+
+    let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
+
+    crate::process::register_process(parent_pid, parent_proc);
+    crate::process::register_process(child_pid, child_proc);
+
+    let parent_regions = crate::process::lookup_process(parent_pid)
+        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+    let child_regions = crate::process::lookup_process(child_pid)
+        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+
+    // Cleanup
+    let _ = crate::process::unregister_process(child_pid);
+    let mut pp = crate::process::unregister_process(parent_pid);
+    if let Some(ref mut p) = pp {
+        for (_, frames) in p.mmap_regions.drain(..) {
+            for f in frames { crate::pmm::free_page(f); }
+        }
+    }
+    drop(pp);
+    crate::pmm::free_page(info);
+
+    let pass = parent_regions == 1 && child_regions == 0;
+    if !pass {
+        crate::safe_print!(128, "  parent_regions={} child_regions={}\n",
+            parent_regions, child_regions);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 8: Eager mmap fallback must search owner's mmap_regions, not worker's.
+///
+/// Simulates the fault-handler recovery logic: given a fault VA inside an
+/// eager mmap tracked on the owner, verify that searching owner.mmap_regions
+/// finds it while searching worker.mmap_regions does not.
+fn test_clone_vm_eager_fallback_finds_region() -> bool {
+    console::print("\n[TEST] CLONE_VM: eager fallback lookup by owner PID\n");
+
+    let owner_pid = crate::process::allocate_pid();
+    let worker_pid = crate::process::allocate_pid();
+
+    let owner_as = match crate::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let l0 = owner_as.l0_phys();
+    let worker_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let mut owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
+    let worker_proc = make_test_process(worker_pid, owner_pid, worker_as, info.addr);
+
+    // 127-page eager mmap tracked on the owner
+    let region_base: usize = 0x6809_d000;
+    let pages = 127usize;
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM (frames)\n");
+                return false;
+            }
+        }
+    }
+    owner_proc.mmap_regions.push((region_base, frames));
+
+    crate::process::register_process(owner_pid, owner_proc);
+    crate::process::register_process(worker_pid, worker_proc);
+
+    // Fault at 0x680c0000 — page 35 inside the region
+    let fault_va: usize = 0x680c_0000;
+    let page_va = fault_va & !0xFFF;
+
+    // Search via owner PID (correct path after fix)
+    let found_via_owner = crate::process::lookup_process(owner_pid).and_then(|p| {
+        for (start, fr) in &p.mmap_regions {
+            let end = *start + fr.len() * 4096;
+            if page_va >= *start && page_va < end {
+                return Some((*start, fr.len()));
+            }
+        }
+        None
+    });
+
+    // Search via worker PID (broken path before fix)
+    let found_via_worker = crate::process::lookup_process(worker_pid).and_then(|p| {
+        for (start, fr) in &p.mmap_regions {
+            let end = *start + fr.len() * 4096;
+            if page_va >= *start && page_va < end {
+                return Some((*start, fr.len()));
+            }
+        }
+        None
+    });
+
+    // Cleanup
+    let _ = crate::process::unregister_process(worker_pid);
+    let mut op = crate::process::unregister_process(owner_pid);
+    if let Some(ref mut p) = op {
+        for (_, frs) in p.mmap_regions.drain(..) {
+            for f in frs { crate::pmm::free_page(f); }
+        }
+    }
+    drop(op);
+    crate::pmm::free_page(info);
+
+    let pass = found_via_owner == Some((region_base, pages)) && found_via_worker.is_none();
+    if !pass {
+        crate::safe_print!(128, "  owner={:?} worker={:?}\n", found_via_owner, found_via_worker);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// PTE Durability Tests
+//
+// These test the REAL invariant that broke in the Node.js crash:
+//   After map_user_page(va, pa, flags), the PTE at va must exist.
+// Previous tests validated theories about CLONE_VM lookup. These verify
+// hardware-level page table state.
+// ============================================================================
+
+/// Walk the page table from a given L0 physical address and read the L3 PTE.
+/// Returns the raw PTE value (0 if any level is missing).
+fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
+    let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    unsafe {
+        let l0e = l0_ptr.add(l0_idx).read_volatile();
+        if l0e & 1 == 0 { return 0; }
+        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add(l1_idx).read_volatile();
+        if l1e & 1 == 0 { return 0; }
+        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add(l2_idx).read_volatile();
+        if l2e & 1 == 0 { return 0; }
+        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        l3_ptr.add(l3_idx).read_volatile()
+    }
+}
+
+/// Helper: clear a PTE by walking the page table.
+fn clear_pte(l0_phys: usize, va: usize) {
+    unsafe {
+        let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return; }
+        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return; }
+        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return; }
+        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+        crate::mmu::flush_tlb_page(va);
+    }
+}
+
+/// Map 127 pages (matching the crash scenario) and verify EVERY PTE exists.
+/// The crash always hits page 35 (offset 0x23000). If this test fails,
+/// the bug is in map_user_page. If it passes, the bug is downstream.
+fn test_map_127_pages_all_ptes_exist() -> bool {
+    console::print("\n[TEST] map 127 pages, verify every PTE exists\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // Each test uses a unique 2MB-aligned VA range to avoid cross-test
+    // contamination through shared L1/L2 entries. Page table frames are
+    // intentionally LEAKED (not freed) — this matches real kernel behavior
+    // where map_user_page's return value is dropped and PhysFrame has no Drop.
+    let base_va: usize = 0x1_0000_0000; // L1[4], unique to this test
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                console::print("  OOM\n");
+                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+                for f in frames { crate::pmm::free_page(f); }
+                return false;
+            }
+        };
+        // Drop the returned table frames — matches real kernel behavior
+        let _ = unsafe {
+            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+        };
+        frames.push(frame);
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 {
+            missing.push(i);
+        }
+    }
+
+    // Cleanup: clear leaf PTEs, free data frames. Table frames are leaked.
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs at page indices: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 127 pages, then alloc 64 more zeroed pages. Verify original PTEs survive.
+/// Catches: PMM returning an in-use page-table frame, alloc_page_zeroed
+/// destroying the L3 table.
+fn test_map_pages_survive_subsequent_allocs() -> bool {
+    console::print("\n[TEST] map 127 pages, alloc 64 more, verify PTEs survive\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    let base_va: usize = 0x1_4000_0000; // L1[5], unique to this test
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        };
+        let _ = unsafe {
+            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+        };
+        frames.push(frame);
+    }
+
+    // Allocate 64 more zeroed pages without mapping them
+    let mut extra = Vec::new();
+    for _ in 0..64 {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { extra.push(f); }
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 { missing.push(i); }
+    }
+
+    for f in extra { crate::pmm::free_page(f); }
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs after alloc: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 1+3+5+127 pages in the same 2MB range, exactly like the crash log.
+/// Verifies all 136 PTEs exist and point to the correct physical addresses.
+fn test_map_interleaved_regions_same_l3() -> bool {
+    console::print("\n[TEST] map 1+3+5+127 pages in same 2MB range, verify all PTEs\n");
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // L1[6], unique to this test. Offsets within a single 2MB range.
+    let base_2mb: usize = 0x1_8000_0000;
+    let regions: [(usize, usize); 4] = [
+        (0x94000, 1),   // L3[148]
+        (0x95000, 3),   // L3[149-151]
+        (0x98000, 5),   // L3[152-156]
+        (0x9d000, 127), // L3[157-283], crash page = L3[192]
+    ];
+
+    let mut mappings: Vec<(usize, crate::pmm::PhysFrame)> = Vec::new();
+
+    for &(offset, count) in &regions {
+        for i in 0..count {
+            let frame = match crate::pmm::alloc_page_zeroed() {
+                Some(f) => f,
+                None => {
+                    console::print("  OOM\n");
+                    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+                    for (_, f) in mappings { crate::pmm::free_page(f); }
+                    return false;
+                }
+            };
+            let va = base_2mb + offset + i * 4096;
+            let _ = unsafe {
+                crate::mmu::map_user_page(va, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+            };
+            mappings.push((va, frame));
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut wrong_pa = Vec::new();
+    for (idx, (va, frame)) in mappings.iter().enumerate() {
+        let pte = read_l3_pte(l0_phys, *va);
+        if pte & 1 == 0 {
+            missing.push((idx, *va));
+        } else {
+            let pte_pa = (pte & 0x0000_FFFF_FFFF_F000) as usize;
+            if pte_pa != frame.addr {
+                wrong_pa.push((idx, *va, pte_pa, frame.addr));
+            }
+        }
+    }
+
+    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+    for (_, f) in mappings { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty() && wrong_pa.is_empty();
+    if !pass {
+        if !missing.is_empty() {
+            crate::safe_print!(128, "  MISSING PTEs ({}):\n", missing.len());
+            for (idx, va) in &missing[..core::cmp::min(missing.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} L3[{}]\n",
+                    idx, va, (va >> 12) & 0x1FF);
+            }
+        }
+        if !wrong_pa.is_empty() {
+            crate::safe_print!(128, "  WRONG PA ({}):\n", wrong_pa.len());
+            for (idx, va, got, exp) in &wrong_pa[..core::cmp::min(wrong_pa.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} got=0x{:x} exp=0x{:x}\n",
+                    idx, va, got, exp);
+            }
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 10: Partial munmap of eager mmap regions
+//
+// sys_munmap removes the ENTIRE eager region when the start address matches,
+// ignoring the requested unmap length. Node.js/V8/jemalloc frequently mmap a
+// large region then trim prefix/suffix via munmap to get alignment.
+// ============================================================================
+
+/// Helper: replicates the FIXED sys_munmap eager-region logic.
+/// Supports partial prefix unmap: when len < region_size, only the first
+/// `len/4096` pages are freed and the remainder is re-inserted.
+fn simulate_sys_munmap_eager(
+    mmap_regions: &mut Vec<(usize, Vec<crate::pmm::PhysFrame>)>,
+    addr: usize,
+    len: usize,
+) -> (Option<usize>, usize) {
+    let unmap_pages = len / 4096;
+
+    // Exact start match
+    if let Some(idx) = mmap_regions.iter().position(|(start, _)| *start == addr) {
+        let region_pages = mmap_regions[idx].1.len();
+        if unmap_pages >= region_pages {
+            let (_, frames) = mmap_regions.remove(idx);
+            let freed = frames.len();
+            for f in frames { crate::pmm::free_page(f); }
+            return (Some(idx), freed);
+        }
+        // Partial prefix unmap
+        let (old_start, old_frames) = mmap_regions.remove(idx);
+        let mut iter = old_frames.into_iter();
+        let mut freed = 0usize;
+        for _ in 0..unmap_pages {
+            if let Some(f) = iter.next() {
+                crate::pmm::free_page(f);
+                freed += 1;
+            }
+        }
+        let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
+        if !remaining.is_empty() {
+            let new_start = old_start + unmap_pages * 4096;
+            mmap_regions.push((new_start, remaining));
+        }
+        return (Some(idx), freed);
+    }
+
+    // Sub-range match (addr inside a region but not at start)
+    if let Some(idx) = mmap_regions.iter().position(|(start, frames)| {
+        addr > *start && addr < *start + frames.len() * 4096
+    }) {
+        let (region_start, old_frames) = mmap_regions.remove(idx);
+        let offset_pages = (addr - region_start) / 4096;
+        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
+        let mut prefix = Vec::new();
+        let mut suffix = Vec::new();
+        let mut freed = 0usize;
+        for (i, f) in old_frames.into_iter().enumerate() {
+            if i < offset_pages {
+                prefix.push(f);
+            } else if i < end {
+                crate::pmm::free_page(f);
+                freed += 1;
+            } else {
+                suffix.push(f);
+            }
+        }
+        if !prefix.is_empty() {
+            mmap_regions.push((region_start, prefix));
+        }
+        if !suffix.is_empty() {
+            mmap_regions.push((region_start + end * 4096, suffix));
+        }
+        return (Some(idx), freed);
+    }
+
+    (None, 0)
+}
+
+/// Prefix munmap of an eager region MUST preserve the suffix.
+///
+/// Scenario matching the Node.js crash:
+///   1. mmap(NULL, 127*4096) → base_addr  (eager, 127 pages)
+///   2. munmap(base_addr, 4*4096)          (trim prefix — only 4 pages)
+///   3. Access page 35 → should still be mapped
+///
+/// Expected: after step 2, only 4 pages are freed and pages 4–126 survive.
+/// BUG: sys_munmap removes ALL 127 pages because it ignores `len`.
+fn test_eager_munmap_prefix_preserves_suffix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap prefix of eager region preserves suffix\n");
+
+    let pages = 127usize;
+    let unmap_pages = 4usize;
+    let base: usize = 0xA000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    // Simulate munmap(base, 4*4096) — should free only first 4 pages
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, unmap_pages * 4096,
+    );
+
+    // CORRECT behavior assertions:
+    // 1. The munmap should match (start == addr)
+    let did_match = matched.is_some();
+    // 2. Only 4 pages should be freed, not 127
+    let freed_correct = freed_count == unmap_pages;
+    // 3. A region for the suffix (pages 4–126) should remain
+    let suffix_addr = base + unmap_pages * 4096;
+    let suffix_remaining = mmap_regions.iter().any(|(start, fr)| {
+        *start == suffix_addr && fr.len() == pages - unmap_pages
+    });
+
+    // Cleanup remaining regions
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = did_match && freed_correct && suffix_remaining;
+    if !pass {
+        crate::safe_print!(256,
+            "  matched={} freed={} (expected {}) suffix_present={}\n",
+            did_match, freed_count, unmap_pages, suffix_remaining);
+        crate::safe_print!(128,
+            "  BUG: sys_munmap freed ALL {} pages instead of {} — suffix destroyed\n",
+            freed_count, unmap_pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Suffix munmap of an eager region: frees last N pages, preserves the prefix.
+fn test_eager_munmap_suffix_preserves_prefix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap suffix of eager region preserves prefix\n");
+
+    let pages = 127usize;
+    let keep = 100usize;
+    let trim = pages - keep;
+    let base: usize = 0xB000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    let suffix_addr = base + keep * 4096;
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, suffix_addr, trim * 4096,
+    );
+
+    let did_match = matched.is_some();
+    let freed_correct = freed_count == trim;
+    let prefix_intact = mmap_regions.iter().any(|(start, fr)| {
+        *start == base && fr.len() == keep
+    });
+
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = did_match && freed_correct && prefix_intact;
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} (expected {}) prefix_intact={}\n",
+            matched, freed_count, trim, prefix_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Full munmap correctly removes the entire region.
+fn test_eager_munmap_full_removes_all() -> bool {
+    console::print("\n[TEST] munmap: full-length eager region removal\n");
+
+    let pages = 127usize;
+    let base: usize = 0xC000_0000;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames { crate::pmm::free_page(f); }
+                console::print("  OOM\n"); return false;
+            }
+        }
+    }
+    mmap_regions.push((base, frames));
+
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, pages * 4096,
+    );
+
+    let pass = matched.is_some() && freed_count == pages && mmap_regions.is_empty();
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} regions_left={}\n",
+            matched, freed_count, mmap_regions.len());
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
 }

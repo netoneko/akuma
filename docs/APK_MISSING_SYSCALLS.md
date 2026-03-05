@@ -303,9 +303,13 @@ APK requires these files/directories on the disk image (created by `userspace/ap
 ### Repository URLs
 
 ```
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/community
 ```
+
+**Note:** Alpine's CDN (`dl-cdn.alpinelinux.org`) no longer serves plain HTTP — requests
+to `http://` return 403 Forbidden. HTTPS is required. The disk image includes Mozilla's
+CA certificate bundle at `/etc/ssl/certs/ca-certificates.crt` for TLS verification.
 
 ### Signing keys
 

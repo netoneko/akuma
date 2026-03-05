@@ -40,7 +40,6 @@ mod shell;
 mod shell_tests;
 mod socket;
 mod ssh;
-mod std_compat;
 mod syscall;
 mod terminal;
 mod tests;
@@ -298,7 +297,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = MIN_CODE_AND_STACK; // 32 MB — keep kernel heap small, maximize user pages
+    let heap_size = core::cmp::max(ram_size / 4, MIN_CODE_AND_STACK); // 1/4 RAM (min 32MB) for demand paging bookkeeping
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
@@ -364,6 +363,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize MMU with identity mapping for kernel
     console::print("Initializing MMU...\n");
     mmu::init(ram_base, ram_size);
+    mmu::init_shared_device_tables();
     console::print("MMU enabled with identity mapping\n");
 
     // Log kernel section boundaries (for future read-only protection)
@@ -814,12 +814,12 @@ fn run_async_main() -> ! {
         }
         
         GLOBAL_POLL_STEP.store(6, Ordering::Relaxed);
-        // Only yield when idle. During active network transfers, keep running
-        // to process packets as fast as possible. The preemptive scheduler
-        // (10ms timer) still ensures other threads get CPU time.
-        if !net_progress {
-            threading::yield_now();
-        }
+        // Yield after every iteration so threads waiting on network I/O
+        // (e.g. SSH sessions) can run promptly when data arrives. The
+        // polling loop above already drains bursts (up to 64 packets),
+        // so yielding here doesn't hurt bulk throughput — it just lets
+        // consumer threads process the data between bursts.
+        threading::yield_now();
     }
 }
 

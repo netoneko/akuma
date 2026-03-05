@@ -7,6 +7,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
+use crate::safe_print;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
@@ -43,9 +44,16 @@ fn alloc_ephemeral_port() -> u16 {
     }
 }
 
-/// QEMU virt machine virtio MMIO addresses
+/// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
+    crate::mmu::DEV_VIRTIO_VA,
+    crate::mmu::DEV_VIRTIO_VA + 0x200,
+    crate::mmu::DEV_VIRTIO_VA + 0x400,
+    crate::mmu::DEV_VIRTIO_VA + 0x600,
+    crate::mmu::DEV_VIRTIO_VA + 0x800,
+    crate::mmu::DEV_VIRTIO_VA + 0xa00,
+    crate::mmu::DEV_VIRTIO_VA + 0xc00,
+    crate::mmu::DEV_VIRTIO_VA + 0xe00,
 ];
 
 // ============================================================================
@@ -511,7 +519,7 @@ pub fn poll() -> bool {
                             let _ = net.iface.routes_mut().add_default_ipv4_route(router);
                         }
                         
-                        log(&alloc::format!("[SmolNet] IP: {}\n", config.address));
+                        safe_print!(256, "[SmolNet] IP: {}\n", config.address);
                         DHCP_CONFIGURED.store(true, Ordering::Release);
                         dhcp_changed = true;
                     }

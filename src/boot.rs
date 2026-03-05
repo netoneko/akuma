@@ -42,6 +42,10 @@ global_asm!(
 .equ DEVICE_BLOCK, (PT_VALID | PT_BLOCK | PT_AF | PT_SH_OUTER | PT_ATTR_DEVICE)
 // Flags for normal memory block (1GB)  
 .equ NORMAL_BLOCK, (PT_VALID | PT_BLOCK | PT_AF | PT_SH_INNER | PT_ATTR_NORMAL)
+// Flags for device L3 page descriptor (PXN | UXN prevent execution)
+.equ PT_PXN, (1 << 53)
+.equ PT_UXN, (1 << 54)
+.equ DEVICE_PAGE, (PT_VALID | PT_TABLE | PT_AF | PT_SH_OUTER | PT_ATTR_DEVICE | PT_PXN | PT_UXN)
 
 _boot:
     // DEBUG: Store x0 immediately at entry (before ANY modification)
@@ -74,6 +78,8 @@ _boot:
     orr     x0, x0, #1              // M bit = MMU enable
     orr     x0, x0, #(1 << 2)       // C bit = data cache
     orr     x0, x0, #(1 << 12)      // I bit = instruction cache
+    orr     x0, x0, #(1 << 15)      // UCT = EL0 access to CTR_EL0
+    orr     x0, x0, #(1 << 26)      // UCI = EL0 cache maintenance (DC CVAU, IC IVAU)
     msr     sctlr_el1, x0
     isb
     
@@ -104,9 +110,16 @@ setup_boot_page_tables:
     // x13 = boot_l1 (L1 for TTBR0 identity mapping)
     add     x13, x10, #(PAGE_SIZE * 2)
     
-    // Clear page tables (3 pages)
+    // x14 = boot_dev_l1 (L1 for device MMIO under L0[1])
+    add     x14, x10, #(PAGE_SIZE * 3)
+    // x15 = boot_dev_l2 (L2 for device MMIO)
+    add     x15, x10, #(PAGE_SIZE * 4)
+    // x16 = boot_dev_l3 (L3 for device MMIO pages)
+    add     x16, x10, #(PAGE_SIZE * 5)
+    
+    // Clear page tables (6 pages)
     mov     x0, x10
-    mov     x1, #(PAGE_SIZE * 3)
+    mov     x1, #(PAGE_SIZE * 6)
 3:  str     xzr, [x0], #8
     subs    x1, x1, #8
     b.ne    3b
@@ -132,6 +145,53 @@ setup_boot_page_tables:
     ldr     x1, =NORMAL_BLOCK
     orr     x0, x0, x1
     str     x0, [x13, #16]          // L1[2]
+    
+    // === Device MMIO remapping via L0[1] ===
+    // Maps device pages at VA 0x80_0000_0000+ so they don't conflict
+    // with user heap in L0[0].
+    
+    // L0[1] -> boot_dev_l1
+    mov     x0, x14
+    orr     x0, x0, #(PT_VALID | PT_TABLE)
+    str     x0, [x11, #8]           // L0[1]
+    
+    // boot_dev_l1[0] -> boot_dev_l2
+    mov     x0, x15
+    orr     x0, x0, #(PT_VALID | PT_TABLE)
+    str     x0, [x14, #0]           // dev_l1[0]
+    
+    // boot_dev_l2[0] -> boot_dev_l3
+    mov     x0, x16
+    orr     x0, x0, #(PT_VALID | PT_TABLE)
+    str     x0, [x15, #0]           // dev_l2[0]
+    
+    // Device page entries in boot_dev_l3:
+    // L3[0] = GIC distributor  (PA 0x0800_0000)
+    // L3[1] = GIC CPU          (PA 0x0801_0000)
+    // L3[2] = UART PL011       (PA 0x0900_0000)
+    // L3[3] = fw_cfg           (PA 0x0902_0000)
+    // L3[4] = VirtIO MMIO      (PA 0x0A00_0000)
+    ldr     x1, =DEVICE_PAGE
+    
+    ldr     x0, =0x08000000
+    orr     x0, x0, x1
+    str     x0, [x16, #0]           // L3[0]: GIC dist
+    
+    ldr     x0, =0x08010000
+    orr     x0, x0, x1
+    str     x0, [x16, #8]           // L3[1]: GIC CPU
+    
+    ldr     x0, =0x09000000
+    orr     x0, x0, x1
+    str     x0, [x16, #16]          // L3[2]: UART
+    
+    ldr     x0, =0x09020000
+    orr     x0, x0, x1
+    str     x0, [x16, #24]          // L3[3]: fw_cfg
+    
+    ldr     x0, =0x0a000000
+    orr     x0, x0, x1
+    str     x0, [x16, #32]          // L3[4]: VirtIO MMIO
     
     // Store TTBR0 address
     adrp    x0, boot_ttbr0_addr
@@ -200,12 +260,14 @@ boot_ttbr1_addr:
 boot_x0_at_entry:
     .quad   0xDEADBEEF
 
-// Reserve space for boot page tables (3 pages = 12KB)
+// Reserve space for boot page tables (6 pages = 24KB)
+// Pages 0-2: L0 TTBR0, L0 TTBR1, L1 (identity mapping)
+// Pages 3-5: L1, L2, L3 for device MMIO under L0[1]
 // Must be 4KB aligned
 .section .bss.boot
 .balign 4096
 .global boot_page_tables
 boot_page_tables:
-    .space  4096 * 3
+    .space  4096 * 6
 "#
 );
