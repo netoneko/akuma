@@ -41,7 +41,6 @@ mod shell_tests;
 mod socket;
 mod ssh;
 mod syscall;
-mod terminal;
 mod tests;
 mod threading;
 mod timer;

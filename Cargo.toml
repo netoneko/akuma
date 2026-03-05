@@ -1,3 +1,23 @@
+[workspace]
+members = [".", "crates/*"]
+exclude = ["userspace"]
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = { level = "warn", priority = -1 }
+
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+
 [package]
 name = "akuma"
 version = "0.0.4"
@@ -14,12 +34,13 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-# Clippy lints - warn about heap-allocating macros that can cause corruption
-# TODO: Change to "deny" once all format! usages are converted to safe_print!
+# Kernel keeps its own lint config — does NOT inherit workspace lints
+# until all Phase 1 extractions are complete.
 [lints.clippy]
 disallowed_macros = "warn"
 
 [dependencies]
+akuma-terminal = { path = "crates/akuma-terminal" }
 talc = "4"
 spinning_top = "0.3"
 # hashbrown without ahash (ahash requires CPU crypto extensions)

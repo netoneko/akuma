@@ -48,7 +48,7 @@ use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::{self, UserAddressSpace};
 use crate::pmm::{self, PhysFrame};
-use crate::terminal;
+use akuma_terminal as terminal;
 
 /// Fixed address for process info page (read-only from userspace)
 ///

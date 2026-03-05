@@ -1,0 +1,11 @@
+[package]
+name = "akuma-terminal"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal state and termios constants for no_std kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+spinning_top = "0.3"

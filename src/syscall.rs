@@ -5,7 +5,7 @@
 
 use crate::console;
 use crate::config;
-use crate::terminal::mode_flags;
+use akuma_terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
@@ -1405,10 +1405,8 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
             }
 
-            // Sync with process channel
             if let Some(ch) = crate::process::current_channel() {
-                let is_raw = (ts.lflag & mode_flags::ICANON) == 0;
-                ch.set_raw_mode(is_raw);
+                ch.set_raw_mode(!ts.is_canonical());
                 if cmd == TCSETSF {
                     ch.flush_stdin();
                 }
@@ -1506,18 +1504,14 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // either way it's not an interactive TTY.
                 let is_pipe = ch.is_stdin_closed();
 
-                // In canonical mode, check for already-completed lines first
                 if !is_pipe {
                     let term_state_lock = crate::process::current_terminal_state();
                     if let Some(ref ts_lock) = term_state_lock {
                         let mut ts = ts_lock.lock();
-                        if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0
-                            && !ts.canon_ready.is_empty()
-                        {
-                            let to_read = count.min(ts.canon_ready.len());
-                            for i in 0..to_read {
-                                kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
-                            }
+                        if ts.is_canonical() && !ts.canon_ready.is_empty() {
+                            let ready = ts.drain_canon_ready(count);
+                            let to_read = ready.len();
+                            kernel_buf[..to_read].copy_from_slice(&ready);
                             drop(ts);
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
@@ -1541,72 +1535,22 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
 
-                            // ICRNL: Map CR to NL on input
-                            if (ts.iflag & crate::terminal::mode_flags::ICRNL) != 0 {
-                                for i in 0..n {
-                                    if kernel_buf[i] == b'\r' {
-                                        kernel_buf[i] = b'\n';
-                                    }
+                            ts.map_cr_to_nl(&mut kernel_buf[..n]);
+
+                            if ts.is_canonical() {
+                                let result = ts.process_canon_input(&kernel_buf[..n]);
+                                if !result.echo.is_empty() {
+                                    ch.write(&result.echo);
                                 }
-                            }
-
-                            if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0 {
-                                // Canonical mode: line-buffer input, handle erase/kill
-                                let echo = (ts.lflag & crate::terminal::mode_flags::ECHO) != 0;
-                                let echoe = (ts.lflag & crate::terminal::mode_flags::ECHOE) != 0;
-                                let echonl = (ts.lflag & crate::terminal::mode_flags::ECHONL) != 0;
-                                let onlcr = (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0;
-                                let verase = ts.cc[crate::terminal::cc_index::VERASE];
-                                let veof = ts.cc[crate::terminal::cc_index::VEOF];
-                                let vkill = ts.cc[crate::terminal::cc_index::VKILL];
-
-                                for i in 0..n {
-                                    let byte = kernel_buf[i];
-
-                                    if byte == verase || byte == 0x08 {
-                                        if ts.canon_buffer.pop().is_some() && echoe {
-                                            ch.write(b"\x08 \x08");
-                                        }
-                                    } else if byte == vkill && vkill != 0 {
-                                        let erased = ts.canon_buffer.len();
-                                        ts.canon_buffer.clear();
-                                        if echoe {
-                                            for _ in 0..erased {
-                                                ch.write(b"\x08 \x08");
-                                            }
-                                        }
-                                    } else if byte == veof && veof != 0 {
-                                        if !ts.canon_buffer.is_empty() {
-                                            let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
-                                            ts.canon_ready.extend(line);
-                                        } else {
-                                            drop(ts);
-                                            return 0; // EOF
-                                        }
-                                    } else if byte == b'\n' {
-                                        ts.canon_buffer.push(byte);
-                                        if echo || echonl {
-                                            if onlcr {
-                                                ch.write(b"\r\n");
-                                            } else {
-                                                ch.write(b"\n");
-                                            }
-                                        }
-                                        let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
-                                        ts.canon_ready.extend(line);
-                                    } else {
-                                        ts.canon_buffer.push(byte);
-                                        if echo {
-                                            ch.write(&[byte]);
-                                        }
-                                    }
+                                if result.eof {
+                                    drop(ts);
+                                    return 0;
                                 }
 
                                 if !ts.canon_ready.is_empty() {
-                                    let to_read = count.min(ts.canon_ready.len());
-                                    for i in 0..to_read {
-                                        kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
-                                    }
+                                    let ready = ts.drain_canon_ready(count);
+                                    let to_read = ready.len();
+                                    kernel_buf[..to_read].copy_from_slice(&ready);
                                     drop(ts);
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
@@ -1620,30 +1564,13 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     }
                                     return to_read as u64;
                                 }
-                                // No complete line yet, keep waiting for more input
                                 continue;
                             } else {
-                                // Non-canonical mode: echo and return immediately
-                                if (ts.lflag & crate::terminal::mode_flags::ECHO) != 0 {
-                                    if (ts.oflag & crate::terminal::mode_flags::ONLCR) != 0 {
-                                        let mut echo_buf = Vec::with_capacity(n * 2);
-                                        for i in 0..n {
-                                            if kernel_buf[i] == b'\n' {
-                                                echo_buf.extend_from_slice(b"\r\n");
-                                            } else {
-                                                echo_buf.push(kernel_buf[i]);
-                                            }
-                                        }
-                                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                            crate::safe_print!(128, "[syscall] read: echoing {} bytes (ONLCR mapped)\n", echo_buf.len());
-                                        }
-                                        ch.write(&echo_buf);
-                                    } else {
-                                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                            crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", n);
-                                        }
-                                        ch.write(&kernel_buf[..n]);
+                                if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
                                     }
+                                    ch.write(&echo_buf);
                                 }
                             }
                         }
@@ -1663,22 +1590,16 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return n as u64;
                 }
 
-                // Check for EOF if channel is closed
                 if ch.is_stdin_closed() {
-                    // In canonical mode, deliver any partially buffered line before EOF
                     if !is_pipe {
                         let term_state_lock = crate::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
-                            if (ts.lflag & crate::terminal::mode_flags::ICANON) != 0
-                                && !ts.canon_buffer.is_empty()
-                            {
-                                let line: Vec<u8> = ts.canon_buffer.drain(..).collect();
-                                ts.canon_ready.extend(line);
-                                let to_read = count.min(ts.canon_ready.len());
-                                for i in 0..to_read {
-                                    kernel_buf[i] = ts.canon_ready.pop_front().unwrap();
-                                }
+                            if ts.is_canonical() && !ts.canon_buffer.is_empty() {
+                                ts.flush_canon_buffer();
+                                let ready = ts.drain_canon_ready(count);
+                                let to_read = ready.len();
+                                kernel_buf[..to_read].copy_from_slice(&ready);
                                 drop(ts);
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(
@@ -1911,35 +1832,19 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
             }
 
-            // Write to process channel (for SSH)
             if let Some(ch) = crate::process::current_channel() {
                 // Skip ONLCR for piped processes — the pipeline handler
-                // (execute_external) does its own \n→\r\n translation for the
-                // final stage output. Translating here too would double it.
-                let translate = if ch.is_stdin_closed() {
-                    false
+                // does its own \n->\r\n translation for the final stage.
+                if ch.is_stdin_closed() {
+                    ch.write(buf);
                 } else {
                     let term_state_opt = crate::process::current_terminal_state();
                     if let Some(ts_lock) = term_state_opt {
-                        let ts = ts_lock.lock();
-                        (ts.oflag & mode_flags::ONLCR) != 0
+                        let translated = ts_lock.lock().translate_output(buf);
+                        ch.write(&translated);
                     } else {
-                        true
+                        ch.write(buf);
                     }
-                };
-
-                if translate {
-                    let mut translated = Vec::with_capacity(buf.len() + 8);
-                    for &byte in buf {
-                        if byte == b'\n' {
-                            translated.extend_from_slice(b"\r\n");
-                        } else {
-                            translated.push(byte);
-                        }
-                    }
-                    ch.write(&translated);
-                } else {
-                    ch.write(buf);
                 }
             }
             
@@ -4925,42 +4830,17 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
     let mut term_state = term_state_lock.lock();
     term_state.mode_flags = mode_flags_arg;
 
-    // Standard Linux-style flags for compatibility
     if (mode_flags_arg & mode_flags::RAW_MODE_ENABLE) != 0 {
-        // Save the current flags so we can restore them exactly when raw mode ends.
-        term_state.saved_iflag = Some(term_state.iflag);
-        term_state.saved_oflag = Some(term_state.oflag);
-        term_state.saved_lflag = Some(term_state.lflag);
-        term_state.iflag &= !(0x00000100 | 0x00000040); // IGNBRK | ICRNL
-        term_state.oflag &= !mode_flags::OPOST;
-        term_state.lflag &= !(mode_flags::ECHO | mode_flags::ICANON);
+        term_state.enter_raw_mode();
     } else {
-        // Restore whatever flags were in place before raw mode was enabled.
-        // This correctly handles the case where the parent (e.g. dash) had already
-        // configured the terminal (raw mode, no echo, etc.) before the child (meow)
-        // temporarily enabled its own raw mode.
-        if let Some(saved) = term_state.saved_iflag.take() {
-            term_state.iflag = saved;
-        }
-        if let Some(saved) = term_state.saved_oflag.take() {
-            term_state.oflag = saved;
-        }
-        if let Some(saved) = term_state.saved_lflag.take() {
-            term_state.lflag = saved;
-        } else {
-            // No saved state (raw mode was never enabled via this syscall).
-            // Fall back to restoring a sane default.
-            term_state.oflag |= mode_flags::OPOST | mode_flags::ONLCR;
-            term_state.lflag |= mode_flags::ECHO | mode_flags::ICANON;
-        }
+        term_state.exit_raw_mode();
     }
 
-    // Propagate raw mode setting to the ProcessChannel
     let proc_channel = match crate::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
-    proc_channel.set_raw_mode((term_state.lflag & mode_flags::ICANON) == 0);
+    proc_channel.set_raw_mode(!term_state.is_canonical());
 
     // Handle action: TCSAFLUSH (2) flushes input
     if action == 2 {

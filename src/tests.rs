@@ -3270,7 +3270,7 @@ fn make_test_process(
         next_fd: core::sync::atomic::AtomicU32::new(3),
         thread_id: None, spawner_pid: None,
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
-            crate::terminal::TerminalState::default(),
+            akuma_terminal::TerminalState::default(),
         )),
         box_id: 0, root_dir: String::from("/"),
         channel: None, delegate_pid: None, clear_child_tid: 0,

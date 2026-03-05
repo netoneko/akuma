@@ -37,7 +37,7 @@ use crate::console;
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
 use crate::process::{self, Pid};
-use crate::terminal::{self, mode_flags};
+use akuma_terminal as terminal;
 use crate::kernel_timer::Duration;
 
 // ============================================================================
