@@ -69,6 +69,84 @@ vi
 
 ---
 
+## 3. Second `bun run` crashes with OOM in anonymous page fault handler
+
+**Symptom:** Running `bun run /public/cgi-bin/akuma.js` succeeds the first time
+(prints a cat picture and greeting), but running it again crashes with a data
+abort from EL0. The page fault handler fails to allocate a physical page for an
+anonymous mmap region because there are 0 free pages left.
+
+**Crash log:**
+```
+[MMU] WARN: va=0x58fb000 already mapped to pa=0x469de000, wanted pa=0x4f584000
+[MMU] WARN: va=0x58fc000 already mapped to pa=0x469df000, wanted pa=0x4f585000
+[MMU] WARN: va=0x58fd000 already mapped to pa=0x469e0000, wanted pa=0x4f586000
+[T368.68] [DA-DP] pid=26 va=0x63fa000 anon alloc failed, 0 free pages
+[T368.68] [Fault] Data abort from EL0 at FAR=0x63fa000, ELR=0x4b2ecf4, ISS=0x7
+[Fault]  x0=0x5013634 x1=0x4d45ac8 x2=0x0 x3=0x9907e740
+[Fault]  x19=0x990512f0 x20=0x203ffbace8 x29=0x203ffbac60 x30=0x4b2ea20
+[Fault]  SP_EL0=0x203ffbac50 SPSR=0x80000000 TPIDR_EL0=0x303f60e8
+[RTK] code=-11 tid=8 LR=0x40087374
+[T368.68] [LR!] clear pid=29 (19 regions)
+[T368.68] [LR!] clear pid=31 (20 regions)
+[Process] Killed 2 sibling thread(s) for PID 26
+[T368.68] [LR!] clear pid=26 (20 regions)
+[T368.68] [Process] PID 26 thread 8 exited (-11) [115.94s]
+```
+
+**Key observations:**
+- The MMU warns that several VAs are "already mapped" to different PAs than
+  requested, suggesting physical pages from the first run were not fully
+  reclaimed or page table entries were not torn down properly.
+- The allocation failure reports **0 free pages** — the physical memory manager
+  is completely exhausted by the second invocation.
+- The process has 20 lazy regions and spawns at least 2 sibling CLONE_VM
+  threads (PIDs 29, 31), all of which are cleaned up after the crash.
+- Exit code -11 (SIGSEGV) is the result of failing the demand-page fault.
+
+**Likely cause:** Physical pages allocated for the first `bun` run are not
+being freed when the process exits. The "already mapped" warnings suggest that
+either page table entries are leaking (mapped pages not unmapped during process
+teardown) or the physical memory manager is not reclaiming pages returned by
+`munmap`/process exit. After one full bun run consumes most of physical memory,
+the second run exhausts the remaining pages and OOMs.
+
+**Reproduction:**
+```
+ssh -p 2222 akuma
+bun run /public/cgi-bin/akuma.js   # succeeds
+bun run /public/cgi-bin/akuma.js   # crashes with OOM
+```
+
+---
+
+## 4. Global block cache in `akuma-ext2` causes cross-instance contamination
+
+**Symptom:** When multiple `Ext2Filesystem` instances exist (e.g. in tests, or
+if the kernel ever mounts two ext2 volumes), reads return data from the wrong
+filesystem. In the test suite this manifested as non-deterministic failures:
+`create_dir` would return `AlreadyExists` on a freshly mounted image because
+the block cache still held directory blocks from a different test's filesystem.
+
+**Root cause:** `BLOCK_CACHE` was a `static Spinlock<BTreeMap<u32, Vec<u8>>>`
+keyed only by block number. All `Ext2Filesystem` instances shared the same
+cache, so a block read by instance A could be returned to instance B if they
+happened to request the same block number (which is almost certain — block
+group descriptors, inode tables, and root directory blocks have fixed numbers
+on every ext2 image).
+
+**Fix applied:** Moved the cache from a global `static` to a per-instance field
+(`block_cache: Spinlock<BTreeMap<u32, Vec<u8>>>`) on `Ext2Filesystem<B>`. Each
+filesystem instance now has its own isolated cache.
+
+**Impact:** This was a correctness bug, not just a test issue. In the kernel
+there is only one ext2 mount so it was latent, but the global cache also
+violated the `Ext2Filesystem` abstraction — any future use of multiple
+instances (e.g. container overlay mounts) would have produced silent data
+corruption.
+
+---
+
 ## Logging Strategy for Extracted Crates
 
 When extracting kernel modules into standalone crates, logging requires special

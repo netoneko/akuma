@@ -41,9 +41,6 @@ use crate::BlockDevice;
 
 const BLOCK_CACHE_MAX: usize = 512;
 
-static BLOCK_CACHE: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -227,6 +224,7 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     time_fn: fn() -> u64,
     state: Spinlock<Ext2State>,
+    block_cache: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>>,
 }
 
 impl<B: BlockDevice> Ext2Filesystem<B> {
@@ -278,6 +276,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             dev,
             time_fn: utc_time_us,
             state: Spinlock::new(state),
+            block_cache: Spinlock::new(alloc::collections::BTreeMap::new()),
         })
     }
 
@@ -291,7 +290,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     fn read_block(&self, state: &Ext2State, block_num: u32) -> Result<Vec<u8>, FsError> {
         {
-            let cache = BLOCK_CACHE.lock();
+            let cache = self.block_cache.lock();
             if let Some(data) = cache.get(&block_num) {
                 return Ok(data.clone());
             }
@@ -302,7 +301,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
 
         {
-            let mut cache = BLOCK_CACHE.lock();
+            let mut cache = self.block_cache.lock();
             if cache.len() < BLOCK_CACHE_MAX {
                 cache.insert(block_num, buf.clone());
             }
@@ -315,7 +314,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if data.len() != state.block_size {
             return Err(FsError::Internal);
         }
-        { BLOCK_CACHE.lock().remove(&block_num); }
+        { self.block_cache.lock().remove(&block_num); }
         let offset = block_num as u64 * state.block_size as u64;
         self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)?;
         Ok(())
