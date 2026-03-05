@@ -477,8 +477,7 @@ impl Command for PsCommand {
         Box::pin(async move {
             use crate::process;
 
-            // Header
-            let _ = stdout.write(b"  PID  PPID  BOX  STATE     NAME\r\n").await;
+            let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  NAME\r\n").await;
 
             let procs = process::list_processes();
 
@@ -487,9 +486,10 @@ impl Command for PsCommand {
             } else {
                 for p in procs {
                     let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
+                    let sc = if p.last_syscall > 0 { format!("{:>3}", p.last_syscall) } else { String::from("  -") };
                     let line = format!(
-                        "{:>5}  {:>4}  {:<8}  {:<8}  {}\r\n",
-                        p.pid, p.ppid, box_str, p.state, p.name
+                        "{:>5}  {:>4}  {:<8}  {:<8}  {:>7}  {}\r\n",
+                        p.pid, p.ppid, box_str, p.state, sc, p.name
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }

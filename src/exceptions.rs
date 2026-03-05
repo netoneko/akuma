@@ -1210,6 +1210,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             return unsafe { (*frame).x0 };
+                        } else {
+                            let (_, _, free) = crate::pmm::stats();
+                            crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} file readahead mapped 0 pages, {} free pages\n",
+                                pid, far_usize, free);
                         }
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
@@ -1223,6 +1227,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                             }
                             return unsafe { (*frame).x0 };
+                        } else {
+                            let (_, _, free) = crate::pmm::stats();
+                            crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
+                                pid, far_usize, free);
                         }
                     }
                 } else {
@@ -1374,6 +1382,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             return unsafe { (*frame).x0 };
+                        } else {
+                            let (_, _, free) = crate::pmm::stats();
+                            crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} file readahead mapped 0 pages, {} free pages\n",
+                                pid, far_usize, free);
                         }
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
@@ -1387,6 +1399,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                             }
                             return unsafe { (*frame).x0 };
+                        } else {
+                            let (_, _, free) = crate::pmm::stats();
+                            crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
+                                pid, far_usize, free);
                         }
                     }
                 } else {

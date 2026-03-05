@@ -701,10 +701,11 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                     let table_frames = unsafe {
                         crate::mmu::map_user_page(va, page_frame.addr, map_flags)
                     };
-                    if let Some(proc) = crate::process::current_process() {
-                        proc.address_space.track_user_frame(page_frame);
+                    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
+                    if let Some(owner) = crate::process::lookup_process(owner_pid) {
+                        owner.address_space.track_user_frame(page_frame);
                         for tf in table_frames {
-                            proc.address_space.track_page_table_frame(tf);
+                            owner.address_space.track_page_table_frame(tf);
                         }
                     }
                 } else {
@@ -1899,16 +1900,15 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                let display_len = count.min(32);
-                let mut snippet = [0u8; 32];
+                let display_len = count.min(64);
+                let mut snippet = [0u8; 64];
                 let n = display_len.min(snippet.len());
                 snippet[..n].copy_from_slice(&buf[..n]);
-                // Simple printable check
                 for byte in &mut snippet[..n] {
                     if *byte < 32 || *byte > 126 { *byte = b'.'; }
                 }
                 let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-                crate::safe_print!(128, "[syscall] write(fd={}, count={}) \"{}\"\n", fd_num, count, snippet_str);
+                crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
             }
 
             // Write to process channel (for SSH)
@@ -4504,14 +4504,14 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let adding_exec = prot & 0x4 != 0; // PROT_EXEC
     let owner_pid = crate::process::read_current_pid().unwrap_or(0);
     if let Some(proc) = crate::process::lookup_process(owner_pid) {
+        // Update lazy region flags so demand paging uses correct permissions
+        crate::process::update_lazy_region_flags(owner_pid, addr, pages * 4096, new_flags);
+
         for i in 0..pages {
             let va = addr + i * 4096;
             if proc.address_space.is_mapped(va) {
                 let _ = proc.address_space.update_page_flags(va, new_flags);
             }
-            // Unmapped pages are left alone — demand paging will allocate
-            // them with the correct flags on first access (matching Linux
-            // behavior where mprotect only changes VMA flags, not PTEs).
         }
         if adding_exec {
             // Flush data cache and invalidate instruction cache for JIT code.
@@ -4589,45 +4589,6 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
         return 0;
     }
 
-    // Check for sub-range munmap inside an eager region (addr != start but within range)
-    let sub_range_match = proc.mmap_regions.iter().position(|(start, frames)| {
-        addr > *start && addr < *start + frames.len() * 4096
-    });
-    if let Some(idx) = sub_range_match {
-        let (region_start, old_frames) = proc.mmap_regions.remove(idx);
-        let region_size = old_frames.len() * 4096;
-        let offset = addr - region_start;
-        let offset_pages = offset / 4096;
-        let end = core::cmp::min(offset_pages + unmap_pages, old_frames.len());
-        crate::tprint!(192, "[munmap] pid={} addr=0x{:x} mid-region start=0x{:x} pages {}-{}/{}\n",
-            proc.pid, addr, region_start, offset_pages, end, old_frames.len());
-
-        let mut old_iter = old_frames.into_iter().enumerate();
-        let mut prefix_frames = Vec::new();
-        let mut suffix_frames = Vec::new();
-
-        for (i, frame) in &mut old_iter {
-            if i < offset_pages {
-                prefix_frames.push(frame);
-            } else if i < end {
-                let _ = proc.address_space.unmap_page(region_start + i * 4096);
-                proc.address_space.remove_user_frame(frame);
-                crate::pmm::free_page(frame);
-            } else {
-                suffix_frames.push(frame);
-            }
-        }
-
-        if !prefix_frames.is_empty() {
-            proc.mmap_regions.push((region_start, prefix_frames));
-        }
-        if !suffix_frames.is_empty() {
-            proc.mmap_regions.push((region_start + end * 4096, suffix_frames));
-        }
-        proc.memory.free_regions.push((addr, (end - offset_pages) * 4096));
-        return 0;
-    }
-
     // Try lazy region(s) — the unmap range may span multiple lazy regions.
     let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
     let results = crate::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
@@ -4641,10 +4602,19 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
         return 0;
     }
 
-    // No tracked region matched — return success without unmapping.
-    // On Linux, munmap on a range not backed by any VMA is a no-op.
-    // Blindly unmapping here would destroy pages belonging to tracked
-    // eager mmap regions when V8 does sub-range munmaps.
+    // No tracked region matched — clear stale PTEs for demand-paged pages
+    // that aren't backed by any tracked eager region. Without this, orphaned
+    // PTEs from demand paging survive munmap and can cause stale data reads.
+    let total_pages = unmap_len / 4096;
+    for i in 0..total_pages {
+        let va = addr + i * 4096;
+        let in_eager = proc.mmap_regions.iter().any(|(start, frames)| {
+            va >= *start && va < *start + frames.len() * 4096
+        });
+        if !in_eager {
+            let _ = proc.address_space.unmap_page(va);
+        }
+    }
     0
 }
 
