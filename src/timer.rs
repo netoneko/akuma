@@ -66,7 +66,7 @@ pub fn timer_irq_handler(_irq: u32) {
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
     if crate::config::ENABLE_PREEMPTION_WATCHDOG {
-        if let Some(duration_us) = crate::threading::check_preemption_watchdog() {
+        if let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
             // Log warning
             // Use AtomicU64 instead of static mut to avoid data races
             static LAST_WARN_US: AtomicU64 = AtomicU64::new(0);

@@ -475,7 +475,7 @@ impl Command for PsCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            use crate::process;
+            use akuma_exec::process;
 
             let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  NAME\r\n").await;
 
@@ -529,7 +529,7 @@ impl Command for KthreadsCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            use crate::threading;
+            use akuma_exec::threading;
 
             // Header
             let _ = stdout.write(b"  TID  STATE     STACK_BASE  STACK_SIZE  STACK_USED  CANARY  TYPE         NAME\r\n").await;
@@ -865,7 +865,7 @@ impl Command for KillCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            use crate::process;
+            use akuma_exec::process;
 
             // Parse the PID argument
             let args_str = match core::str::from_utf8(args) {

@@ -6,7 +6,7 @@
 // IMPORTANT: Uses virt_to_phys/phys_to_virt for address translation.
 // See docs/IDENTITY_MAPPING_DEPENDENCIES.md for details.
 
-use crate::mmu::{phys_to_virt, virt_to_phys};
+use akuma_exec::mmu::{phys_to_virt, virt_to_phys};
 use core::ptr::NonNull;
 use virtio_drivers::Hal;
 

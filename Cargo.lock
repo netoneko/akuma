@@ -42,6 +42,7 @@ name = "akuma"
 version = "0.0.4"
 dependencies = [
  "aes",
+ "akuma-exec",
  "akuma-ext2",
  "akuma-net",
  "akuma-shell",
@@ -55,7 +56,6 @@ dependencies = [
  "ctr",
  "der",
  "ed25519-dalek",
- "elf",
  "embedded-io-async",
  "embedded-tls",
  "fdt",
@@ -72,6 +72,17 @@ dependencies = [
  "virtio-drivers",
  "x25519-dalek",
  "x509-cert",
+]
+
+[[package]]
+name = "akuma-exec"
+version = "0.1.0"
+dependencies = [
+ "akuma-terminal",
+ "elf",
+ "embedded-io-async",
+ "log",
+ "spinning_top",
 ]
 
 [[package]]

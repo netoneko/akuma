@@ -8,6 +8,7 @@ use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD
 use elf::endian::LittleEndian;
 
 use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
+use crate::runtime::runtime;
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -212,7 +213,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         }
 
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+            log::debug!("[ELF] Segment: VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}",
                 vaddr, filesz, memsz,
                 if flags & PF_R != 0 { "R" } else { "-" },
                 if flags & PF_W != 0 { "W" } else { "-" },
@@ -316,19 +317,19 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     } // !is_pie
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(80, "[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}\n",
+        log::debug!("[ELF] Loaded: entry=0x{:x} brk=0x{:x} pages={}",
             entry_point, brk, mapped_pages.len());
     }
 
     let interp = if let Some(ref path) = interp_path {
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Loading interpreter: {}\n", path);
+            log::debug!("[ELF] Loading interpreter: {}", path);
         }
-        let interp_data = crate::fs::read_file(path)
+        let interp_data = (runtime().read_file)(path)
             .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
         let interp_info = load_interpreter(&interp_data, &mut address_space)?;
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}\n",
+            log::debug!("[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}",
                 interp_info.base_addr, interp_info.entry_point);
         }
         Some(interp_info)
@@ -477,12 +478,12 @@ fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Re
             }
         }
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(80, "[ELF] Interpreter: applied {} relocations\n", rela_count);
+            log::debug!("[ELF] Interpreter: applied {} relocations", rela_count);
         }
     }
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(80, "[ELF] Interpreter: entry=0x{:x} pages={}\n", entry_point, mapped_pages.len());
+        log::debug!("[ELF] Interpreter: entry=0x{:x} pages={}", entry_point, mapped_pages.len());
     }
 
     Ok(InterpInfo { entry_point, base_addr: base })
@@ -493,11 +494,11 @@ pub struct UserStack {
     pub stack_bottom: usize,
     pub stack_top: usize,
     pub sp: usize,
-    pub frames: Vec<crate::pmm::PhysFrame>,
+    pub frames: Vec<crate::runtime::PhysFrame>,
 }
 
 impl UserStack {
-    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<crate::pmm::PhysFrame>) -> Self {
+    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<crate::runtime::PhysFrame>) -> Self {
         Self {
             stack_bottom,
             stack_top,
@@ -721,11 +722,11 @@ pub fn load_elf_with_stack(
     }
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
-        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
+        log::debug!("[ELF] Heap pre-alloc: 0x{:x} (16 pages)", hs);
+        log::debug!("[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}",
             stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
-            crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
+            log::debug!("[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}",
                 actual_entry, loaded.entry_point);
         }
     }
@@ -741,7 +742,6 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ELF64_EHDR_SIZE: usize = 64;
-const ELF64_PHDR_SIZE: usize = 56;
 
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
@@ -813,7 +813,7 @@ fn parse_elf64_phdr(buf: &[u8]) -> Elf64Phdr {
 /// Read exactly `len` bytes from a file at `offset`, returning an error on short reads.
 fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, ElfError> {
     let mut buf = alloc::vec![0u8; len];
-    let n = crate::vfs::read_at(path, offset, &mut buf)
+    let n = (runtime().read_at)(path, offset, &mut buf)
         .map_err(|_| ElfError::InvalidFormat("File read failed"))?;
     if n < len {
         return Err(ElfError::InvalidFormat("Short read"));
@@ -873,10 +873,10 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
     }
 
-    let file_inode = crate::vfs::resolve_inode(path).unwrap_or(0);
+    let file_inode = (runtime().resolve_inode)(path).unwrap_or(0);
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(128, "[ELF] On-demand loading from path, file_size={} ({}MB), is_pie={}, inode={}\n",
+        log::debug!("[ELF] On-demand loading from path, file_size={} ({}MB), is_pie={}, inode={}",
             file_size, file_size / 1024 / 1024, is_pie, file_inode);
     }
 
@@ -896,7 +896,7 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
         }
 
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Segment (deferred): VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}\n",
+            log::debug!("[ELF] Segment (deferred): VA=0x{:08x} filesz=0x{:x} memsz=0x{:x} flags={}{}{}",
                 vaddr, filesz, memsz,
                 if flags & PF_R != 0 { "R" } else { "-" },
                 if flags & PF_W != 0 { "W" } else { "-" },
@@ -957,26 +957,26 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
                 file_source: None,
             });
             if DEBUG_ELF_LOADING {
-                crate::safe_print!(128, "[ELF] Gap region (deferred): 0x{:08x}-0x{:08x} ({} pages)\n",
+                log::debug!("[ELF] Gap region (deferred): 0x{:08x}-0x{:08x} ({} pages)",
                     prev_end, next_start, gap_size / PAGE_SIZE);
             }
         }
     }
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(80, "[ELF] Deferred: entry=0x{:x} brk=0x{:x} segments={}\n",
+        log::debug!("[ELF] Deferred: entry=0x{:x} brk=0x{:x} segments={}",
             entry_point, brk, deferred_segments.len());
     }
 
     let interp = if let Some(ref ipath) = interp_path {
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Loading interpreter: {}\n", ipath);
+            log::debug!("[ELF] Loading interpreter: {}", ipath);
         }
-        let interp_data = crate::fs::read_file(ipath)
+        let interp_data = (runtime().read_file)(ipath)
             .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
         let interp_info = load_interpreter(&interp_data, &mut address_space)?;
         if DEBUG_ELF_LOADING {
-            crate::safe_print!(128, "[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}\n",
+            log::debug!("[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}",
                 interp_info.base_addr, interp_info.entry_point);
         }
         Some(interp_info)
@@ -1055,14 +1055,14 @@ pub fn load_elf_with_stack_from_path(
     }
 
     if DEBUG_ELF_LOADING {
-        crate::safe_print!(64, "[ELF] Heap pre-alloc: 0x{:x} (16 pages)\n", hs);
-        crate::safe_print!(128, "[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}\n",
+        log::debug!("[ELF] Heap pre-alloc: 0x{:x} (16 pages)", hs);
+        log::debug!("[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}",
             stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
-            crate::safe_print!(128, "[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}\n",
+            log::debug!("[ELF] Dynamic: start at interpreter 0x{:x}, AT_ENTRY=0x{:x}",
                 actual_entry, loaded.entry_point);
         }
-        crate::safe_print!(128, "[ELF] {} deferred lazy segments for demand paging\n",
+        log::debug!("[ELF] {} deferred lazy segments for demand paging",
             loaded.deferred_segments.len());
     }
 

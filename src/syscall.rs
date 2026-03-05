@@ -206,7 +206,7 @@ fn pipe_write(id: u32, data: &[u8]) -> usize {
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.buffer.extend_from_slice(data);
             if let Some(tid) = pipe.reader_thread.take() {
-                crate::threading::get_waker_for_thread(tid).wake();
+                akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
             data.len()
         } else {
@@ -245,7 +245,7 @@ pub fn pipe_close_write(id: u32) {
             }
             if pipe.write_count == 0 {
                 if let Some(tid) = pipe.reader_thread.take() {
-                    crate::threading::get_waker_for_thread(tid).wake();
+                    akuma_exec::threading::get_waker_for_thread(tid).wake();
                 }
             }
             if pipe.write_count == 0 && pipe.read_count == 0 {
@@ -348,7 +348,7 @@ fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
         if let Some(efd) = table.get_mut(&id) {
             efd.counter = efd.counter.saturating_add(val);
             if let Some(tid) = efd.reader_thread.take() {
-                crate::threading::get_waker_for_thread(tid).wake();
+                akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
             Ok(())
         } else {
@@ -639,7 +639,7 @@ fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
 /// Validate a user pointer for reading/writing.
 /// Upper bound is the current process's stack_top (dynamic per binary).
 fn user_va_limit() -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         proc.memory.stack_top as u64
     } else {
         0x4000_0000
@@ -655,7 +655,7 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     };
     if end > user_va_limit() { return false; }
 
-    if !crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
+    if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len) {
         if !ensure_user_pages_mapped(ptr as usize, len) {
             return false;
         }
@@ -671,23 +671,23 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
     let page_end = (start + len + 0xFFF) & !0xFFF;
     let mut va = page_start;
     while va < page_end {
-        if !crate::mmu::is_current_user_page_mapped(va) {
-            if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(va) {
+        if !akuma_exec::mmu::is_current_user_page_mapped(va) {
+            if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(va) {
                 let map_flags = match &source {
-                    crate::process::LazySource::File { .. } => {
-                        if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                    akuma_exec::process::LazySource::File { .. } => {
+                        if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
                     }
-                    _ => crate::mmu::user_flags::RW_NO_EXEC,
+                    _ => akuma_exec::mmu::user_flags::RW_NO_EXEC,
                 };
                 if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         let pg_data_start = core::cmp::max(va, segment_va);
                         let pg_data_end = core::cmp::min(va + 0x1000, segment_va + filesz);
                         if pg_data_start < pg_data_end {
                             let dst_off = pg_data_start - va;
                             let file_off = file_offset + (pg_data_start - segment_va);
                             let read_len = pg_data_end - pg_data_start;
-                            let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
+                            let page_ptr = akuma_exec::mmu::phys_to_virt(page_frame.addr);
                             let page_buf = unsafe {
                                 core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), read_len)
                             };
@@ -699,10 +699,10 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                         }
                     }
                     let table_frames = unsafe {
-                        crate::mmu::map_user_page(va, page_frame.addr, map_flags)
+                        akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
                     };
-                    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-                    if let Some(owner) = crate::process::lookup_process(owner_pid) {
+                    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                    if let Some(owner) = akuma_exec::process::lookup_process(owner_pid) {
                         owner.address_space.track_user_frame(page_frame);
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
@@ -725,7 +725,7 @@ fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     let limit = user_va_limit();
     if !BYPASS_VALIDATION.load(Ordering::Acquire) {
         if ptr < 0x1000 || ptr >= limit { return Err(EFAULT); }
-        if !crate::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
+        if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
     }
     let mut len = 0;
     while len < max_len {
@@ -734,7 +734,7 @@ fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
             if addr >= limit { return Err(EFAULT); }
             // Check mapping every page boundary
             if addr % 4096 == 0 {
-                if !crate::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
+                if !akuma_exec::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
             }
         }
         let c = unsafe { *(addr as *const u8) };
@@ -806,8 +806,8 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
             if !in_read && !in_write { continue; }
 
             let socket_idx = if fd > 2 {
-                if let Some(proc) = crate::process::current_process() {
-                    if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
+                if let Some(proc) = akuma_exec::process::current_process() {
+                    if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
                         Some(idx)
                     } else { None }
                 } else { None }
@@ -815,7 +815,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
 
             if in_read {
                 let readable = if fd == 0 {
-                    crate::process::current_channel().map_or(false, |ch| ch.has_stdin_data())
+                    akuma_exec::process::current_channel().map_or(false, |ch| ch.has_stdin_data())
                 } else if let Some(idx) = socket_idx {
                     if socket::is_udp_socket(idx) {
                         socket_get_udp_handle(idx).map_or(false, |h| akuma_net::smoltcp_net::udp_can_recv(h))
@@ -854,7 +854,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
             return 0;
         }
 
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 }
 
@@ -884,24 +884,24 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
                 if fd.fd < 0 { continue; }
 
                 let fd_entry = if fd.fd > 2 {
-                    crate::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
+                    akuma_exec::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
                 } else {
                     None
                 };
 
                 let socket_idx = match &fd_entry {
-                    Some(crate::process::FileDescriptor::Socket(idx)) => Some(*idx),
+                    Some(akuma_exec::process::FileDescriptor::Socket(idx)) => Some(*idx),
                     _ => None,
                 };
                 let eventfd_id = match &fd_entry {
-                    Some(crate::process::FileDescriptor::EventFd(id)) => Some(*id),
+                    Some(akuma_exec::process::FileDescriptor::EventFd(id)) => Some(*id),
                     _ => None,
                 };
 
                 // 1. Check for POLLIN (Read)
                 if fd.events & 1 != 0 {
                     if fd.fd == 0 {
-                        if let Some(ch) = crate::process::current_channel() {
+                        if let Some(ch) = akuma_exec::process::current_channel() {
                             if ch.has_stdin_data() {
                                 fd.revents |= 1;
                             }
@@ -960,7 +960,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
             return 0;
         }
 
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 }
 
@@ -975,11 +975,11 @@ struct PollFd {
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
-    if crate::process::is_current_interrupted() {
-        if let Some(proc) = crate::process::current_process() {
+    if akuma_exec::process::is_current_interrupted() {
+        if let Some(proc) = akuma_exec::process::current_process() {
             proc.exited = true;
             proc.exit_code = 130;
-            proc.state = crate::process::ProcessState::Zombie(130);
+            proc.state = akuma_exec::process::ProcessState::Zombie(130);
         }
         return EINTR;
     }
@@ -1104,7 +1104,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETEUID => sys_geteuid(),
         nr::GETGID => 0,
         nr::GETEGID => 0,
-        nr::GETTID => crate::threading::current_thread_id() as u64,
+        nr::GETTID => akuma_exec::threading::current_thread_id() as u64,
         nr::KILL_LINUX => sys_kill(args[0] as u32, args[1] as u32),
         nr::SETPGID => sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => sys_getpgid(args[0] as u32),
@@ -1147,7 +1147,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         124 => { // sched_yield
-            crate::threading::yield_now();
+            akuma_exec::threading::yield_now();
             0
         }
         nr::SCHED_GETAFFINITY => {
@@ -1189,8 +1189,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
         nr::TIMERFD_SETTIME => sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
         nr::TIMERFD_GETTIME => {
-            let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(args[0] as u32)) {
-                Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+            let timer_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(args[0] as u32)) {
+                Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
                 _ => return EBADF,
             };
             let out = args[1] as usize;
@@ -1229,14 +1229,14 @@ fn sys_set_tpidr_el0(address: u64) -> u64 {
 
 fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
     let target_pid = if pid == 0 {
-        match crate::process::read_current_pid() { Some(p) => p, None => return !0u64 }
+        match akuma_exec::process::read_current_pid() { Some(p) => p, None => return !0u64 }
     } else {
         pid
     };
 
     let target_pgid = if pgid == 0 { target_pid } else { pgid };
 
-    if let Some(proc) = crate::process::lookup_process(target_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process(target_pid) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, proc.pgid, target_pgid);
         }
@@ -1249,11 +1249,11 @@ fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
 
 fn sys_getpgid(pid: u32) -> u64 {
     let target_pid = if pid == 0 {
-        match crate::process::read_current_pid() { 
+        match akuma_exec::process::read_current_pid() { 
             Some(p) => p, 
             None => {
                 // System thread fallback: use TID as PGID
-                let tid = crate::threading::current_thread_id();
+                let tid = akuma_exec::threading::current_thread_id();
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     crate::safe_print!(128, "[syscall] getpgid(0) kernel fallback: returning TID {}\n", tid);
                 }
@@ -1264,7 +1264,7 @@ fn sys_getpgid(pid: u32) -> u64 {
         pid
     };
 
-    if let Some(proc) = crate::process::lookup_process(target_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process(target_pid) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
             crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
         }
@@ -1279,7 +1279,7 @@ fn sys_getpgid(pid: u32) -> u64 {
 }
 
 fn sys_setsid() -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         proc.pgid = proc.pid;
         proc.pid as u64 // New SID is the PID
     } else {
@@ -1314,7 +1314,7 @@ fn sys_uname(buf: u64) -> u64 {
 }
 
 fn sys_set_tid_address(tidptr: u64) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         proc.clear_child_tid = tidptr;
         return proc.pid as u64;
     }
@@ -1322,21 +1322,21 @@ fn sys_set_tid_address(tidptr: u64) -> u64 {
 }
 
 fn sys_exit(code: i32) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         proc.exited = true;
         proc.exit_code = code;
-        proc.state = crate::process::ProcessState::Zombie(code);
+        proc.state = akuma_exec::process::ProcessState::Zombie(code);
     }
     code as u64
 }
 
 fn sys_exit_group(code: i32) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         let l0_phys = proc.address_space.l0_phys();
         proc.exited = true;
         proc.exit_code = code;
-        proc.state = crate::process::ProcessState::Zombie(code);
-        crate::process::kill_thread_group(proc.pid, l0_phys);
+        proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
     }
     code as u64
 }
@@ -1355,7 +1355,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
-    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     
     // We only support terminal ioctls on stdin/stdout for now
     if fd > 2 {
@@ -1365,7 +1365,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     let result = match cmd {
         TCGETS => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
-            let term_state_lock = match crate::process::current_terminal_state() {
+            let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return (-(12i64)) as u64, // ENOMEM
             };
@@ -1384,7 +1384,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TCSETS | TCSETSW | TCSETSF => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
-            let term_state_lock = match crate::process::current_terminal_state() {
+            let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return (-(12i64)) as u64, // ENOMEM
             };
@@ -1405,7 +1405,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
             }
 
-            if let Some(ch) = crate::process::current_channel() {
+            if let Some(ch) = akuma_exec::process::current_channel() {
                 ch.set_raw_mode(!ts.is_canonical());
                 if cmd == TCSETSF {
                     ch.flush_stdin();
@@ -1415,7 +1415,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCGWINSZ => {
             if !validate_user_ptr(arg, 8) { return EFAULT; }
-            let term_state_lock = match crate::process::current_terminal_state() {
+            let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return (-(12i64)) as u64, // ENOMEM
             };
@@ -1431,7 +1431,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCGPGRP => {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
-            let term_state_lock = match crate::process::current_terminal_state() {
+            let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return (-(12i64)) as u64, // ENOMEM
             };
@@ -1447,7 +1447,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         TIOCSPGRP => {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
-            let term_state_lock = match crate::process::current_terminal_state() {
+            let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return (-(12i64)) as u64, // ENOMEM
             };
@@ -1472,7 +1472,7 @@ fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
 fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
@@ -1480,8 +1480,8 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     }
 
     match fd {
-        crate::process::FileDescriptor::Stdin => {
-            let ch = match crate::process::current_channel() {
+        akuma_exec::process::FileDescriptor::Stdin => {
+            let ch = match akuma_exec::process::current_channel() {
                 Some(c) => c,
                 None => {
                     // Fallback for processes without a channel (unlikely in modern Akuma)
@@ -1505,7 +1505,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let is_pipe = ch.is_stdin_closed();
 
                 if !is_pipe {
-                    let term_state_lock = crate::process::current_terminal_state();
+                    let term_state_lock = akuma_exec::process::current_terminal_state();
                     if let Some(ref ts_lock) = term_state_lock {
                         let mut ts = ts_lock.lock();
                         if ts.is_canonical() && !ts.canon_ready.is_empty() {
@@ -1531,7 +1531,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
                     if !is_pipe {
-                        let term_state_lock = crate::process::current_terminal_state();
+                        let term_state_lock = akuma_exec::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
 
@@ -1592,7 +1592,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
                 if ch.is_stdin_closed() {
                     if !is_pipe {
-                        let term_state_lock = crate::process::current_terminal_state();
+                        let term_state_lock = akuma_exec::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
                             let mut ts = ts_lock.lock();
                             if ts.is_canonical() && !ts.canon_buffer.is_empty() {
@@ -1619,12 +1619,12 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
 
                 // Check for interrupt
-                if crate::process::is_current_interrupted() {
+                if akuma_exec::process::is_current_interrupted() {
                     return EINTR;
                 }
 
                 // Register waker and block
-                let term_state_lock = match crate::process::current_terminal_state() {
+                let term_state_lock = match akuma_exec::process::current_terminal_state() {
                     Some(state) => state,
                     None => {
                         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -1635,26 +1635,26 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 };
 
                 {
-                    crate::threading::disable_preemption();
+                    akuma_exec::threading::disable_preemption();
                     let mut term_state = term_state_lock.lock();
-                    let thread_id = crate::threading::current_thread_id();
-                    term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
-                    crate::threading::enable_preemption();
+                    let thread_id = akuma_exec::threading::current_thread_id();
+                    term_state.set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
+                    akuma_exec::threading::enable_preemption();
                 }
 
                 // Yield until woken by new input
-                crate::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::schedule_blocking(u64::MAX);
 
                 // Clear waker
                 {
-                    crate::threading::disable_preemption();
+                    akuma_exec::threading::disable_preemption();
                     let mut term_state = term_state_lock.lock();
                     term_state.input_waker.lock().take();
-                    crate::threading::enable_preemption();
+                    akuma_exec::threading::enable_preemption();
                 }
             }
         }
-        crate::process::FileDescriptor::File(ref f) => {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
@@ -1663,7 +1663,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Ok(n) => {
                     if n > 0 {
                         unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
-                        proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
@@ -1673,7 +1673,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::Socket(idx) => {
+        akuma_exec::process::FileDescriptor::Socket(idx) => {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
             let nonblock = fd_is_nonblock(fd_num as u32);
             let result = if socket::is_udp_socket(idx) {
@@ -1692,8 +1692,8 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
-        crate::process::FileDescriptor::ChildStdout(child_pid) => {
-            if let Some(ch) = crate::process::get_child_channel(child_pid) {
+        akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+            if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
                 let mut temp = alloc::vec![0u8; count];
                 let n = ch.read(&mut temp);
                 if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
@@ -1702,7 +1702,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 !0u64
             }
         }
-        crate::process::FileDescriptor::PipeRead(pipe_id) => {
+        akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             let mut temp = alloc::vec![0u8; count];
             loop {
                 let (n, eof) = pipe_read(pipe_id, &mut temp);
@@ -1713,15 +1713,15 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if eof {
                     return 0;
                 }
-                if crate::process::is_current_interrupted() {
+                if akuma_exec::process::is_current_interrupted() {
                     return EINTR;
                 }
-                let tid = crate::threading::current_thread_id();
+                let tid = akuma_exec::threading::current_thread_id();
                 pipe_set_reader_thread(pipe_id, tid);
-                crate::threading::schedule_blocking(u64::MAX);
+                akuma_exec::threading::schedule_blocking(u64::MAX);
             }
         }
-        crate::process::FileDescriptor::EventFd(efd_id) => {
+        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if count < 8 { return EINVAL; }
             let nonblock = eventfd_is_nonblock(efd_id) || fd_is_nonblock(fd_num as u32);
             loop {
@@ -1732,20 +1732,20 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     Err(_) => {
                         if nonblock { return EAGAIN; }
-                        if crate::process::is_current_interrupted() { return EINTR; }
-                        let tid = crate::threading::current_thread_id();
+                        if akuma_exec::process::is_current_interrupted() { return EINTR; }
+                        let tid = akuma_exec::threading::current_thread_id();
                         eventfd_set_reader_thread(efd_id, tid);
-                        crate::threading::schedule_blocking(u64::MAX);
+                        akuma_exec::threading::schedule_blocking(u64::MAX);
                     }
                 }
             }
         }
-        crate::process::FileDescriptor::DevNull => 0,
-        crate::process::FileDescriptor::DevUrandom => {
+        akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevUrandom => {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
-        crate::process::FileDescriptor::TimerFd(timer_id) => {
+        akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             let result = timerfd_read(timer_id);
             if result == EAGAIN { return EAGAIN; }
             if count >= 8 && validate_user_ptr(buf_ptr, 8) {
@@ -1753,7 +1753,7 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 8
             } else { EINVAL }
         }
-        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
+        akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => !0u64
     }
 }
@@ -1761,11 +1761,11 @@ fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
 
     match fd {
-        crate::process::FileDescriptor::File(ref f) => {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
@@ -1782,13 +1782,13 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::DevNull => 0,
-        crate::process::FileDescriptor::DevUrandom => {
+        akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevUrandom => {
             fill_random_bytes(buf_ptr as *mut u8, count);
             count as u64
         }
-        crate::process::FileDescriptor::TimerFd(_) => EAGAIN,
-        crate::process::FileDescriptor::EpollFd(_) => EINVAL,
+        akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
+        akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
         _ => EBADF
     }
 }
@@ -1796,30 +1796,30 @@ fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
 fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
 
     match fd {
-        crate::process::FileDescriptor::File(ref f) => {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
             let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
             match crate::fs::write_at(&f.path, offset as usize, buf) {
                 Ok(n) => n as u64,
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
+        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
         _ => EBADF
     }
 }
 
 fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
     match fd {
-        crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+        akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 let display_len = count.min(64);
                 let mut snippet = [0u8; 64];
@@ -1832,13 +1832,13 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
             }
 
-            if let Some(ch) = crate::process::current_channel() {
+            if let Some(ch) = akuma_exec::process::current_channel() {
                 // Skip ONLCR for piped processes — the pipeline handler
                 // does its own \n->\r\n translation for the final stage.
                 if ch.is_stdin_closed() {
                     ch.write(buf);
                 } else {
-                    let term_state_opt = crate::process::current_terminal_state();
+                    let term_state_opt = akuma_exec::process::current_terminal_state();
                     if let Some(ts_lock) = term_state_opt {
                         let translated = ts_lock.lock().translate_output(buf);
                         ch.write(&translated);
@@ -1855,16 +1855,16 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             
             count as u64
         }
-        crate::process::FileDescriptor::File(ref f) => {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
             match crate::fs::write_at(&f.path, f.position, buf) {
                 Ok(n) => {
-                    proc.update_fd(fd_num as u32, |entry| if let crate::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                     n as u64
                 }
                 Err(_) => !0u64
             }
         }
-        crate::process::FileDescriptor::Socket(idx) => {
+        akuma_exec::process::FileDescriptor::Socket(idx) => {
             let nonblock = fd_is_nonblock(fd_num as u32);
             let result = if socket::is_udp_socket(idx) {
                 match socket::udp_default_peer(idx) {
@@ -1885,10 +1885,10 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
-        crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+        akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
             pipe_write(pipe_id, buf) as u64
         }
-        crate::process::FileDescriptor::EventFd(efd_id) => {
+        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if count < 8 { return EINVAL; }
             let val = unsafe { core::ptr::read(buf_ptr as *const u64) };
             if val == u64::MAX { return EINVAL; }
@@ -1897,7 +1897,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => (-(e as i64)) as u64,
             }
         }
-        crate::process::FileDescriptor::DevNull | crate::process::FileDescriptor::DevUrandom => count as u64,
+        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
         _ => !0u64
     }
 }
@@ -1945,7 +1945,7 @@ fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
 
 fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         if proc.get_fd(fd).is_none() { return EBADF; }
     } else { return ENOSYS; }
     #[repr(C)]
@@ -1982,14 +1982,14 @@ fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
 }
 
 fn sys_dup(oldfd: u32) -> u64 {
-    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
     };
     match &entry {
-        crate::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
-        crate::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
+        akuma_exec::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
+        akuma_exec::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
         _ => {}
     }
     let newfd = proc.alloc_fd(entry);
@@ -2003,7 +2003,7 @@ fn sys_dup(oldfd: u32) -> u64 {
 
 fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
@@ -2017,23 +2017,23 @@ fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     // If newfd was a pipe fd, close it properly before replacing
     if let Some(old_entry) = proc.get_fd(newfd) {
         match old_entry {
-            crate::process::FileDescriptor::PipeWrite(id) => pipe_close_write(id),
-            crate::process::FileDescriptor::PipeRead(id) => pipe_close_read(id),
+            akuma_exec::process::FileDescriptor::PipeWrite(id) => pipe_close_write(id),
+            akuma_exec::process::FileDescriptor::PipeRead(id) => pipe_close_read(id),
             _ => {}
         }
     }
 
     // Increment ref count for cloned pipe fds
     match &entry {
-        crate::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
-        crate::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
+        akuma_exec::process::FileDescriptor::PipeWrite(id) => pipe_clone_ref(*id, true),
+        akuma_exec::process::FileDescriptor::PipeRead(id) => pipe_clone_ref(*id, false),
         _ => {}
     }
 
     proc.set_fd(newfd, entry);
 
     // dup3 sets CLOEXEC on newfd only if O_CLOEXEC is in flags
-    if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+    if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
         proc.set_cloexec(newfd);
     } else {
         proc.clear_cloexec(newfd);
@@ -2044,13 +2044,13 @@ fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
 
 fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
 
     let pipe_id = pipe_create();
-    let fd_r = proc.alloc_fd(crate::process::FileDescriptor::PipeRead(pipe_id));
-    let fd_w = proc.alloc_fd(crate::process::FileDescriptor::PipeWrite(pipe_id));
+    let fd_r = proc.alloc_fd(akuma_exec::process::FileDescriptor::PipeRead(pipe_id));
+    let fd_w = proc.alloc_fd(akuma_exec::process::FileDescriptor::PipeWrite(pipe_id));
 
-    if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+    if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
         proc.set_cloexec(fd_r);
         proc.set_cloexec(fd_w);
     }
@@ -2062,9 +2062,9 @@ fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
 }
 
 fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
-    let proc = match crate::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
     let efd_id = eventfd_create(initval, flags);
-    let fd = proc.alloc_fd(crate::process::FileDescriptor::EventFd(efd_id));
+    let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EventFd(efd_id));
     if flags & EFD_CLOEXEC != 0 {
         proc.set_cloexec(fd);
     }
@@ -2076,8 +2076,8 @@ fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
 }
 
 fn sys_brk(new_brk: usize) -> u64 {
-    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-    if let Some(proc) = crate::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
 }
@@ -2087,14 +2087,14 @@ fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
         return crate::vfs::canonicalize_path(raw_path);
     }
     let base = if dirfd == -100 { // AT_FDCWD
-        if let Some(proc) = crate::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process() {
             proc.cwd.clone()
         } else {
             String::from("/")
         }
     } else if dirfd >= 0 {
-        if let Some(proc) = crate::process::current_process() {
-            if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                 f.path.clone()
             } else {
                 String::from("/")
@@ -2122,14 +2122,14 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
         crate::vfs::canonicalize_path(&raw_path)
     } else {
         let base = if dirfd == -100 { // AT_FDCWD
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 proc.cwd.clone()
             } else {
                 String::from("/")
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = crate::process::current_process() {
-                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path.clone()
                 } else {
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -2153,9 +2153,9 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
     let path = crate::vfs::resolve_symlinks(&path);
 
     if path == "/dev/null" {
-        if let Some(proc) = crate::process::current_process() {
-            let fd = proc.alloc_fd(crate::process::FileDescriptor::DevNull);
-            if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -2167,9 +2167,9 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
     }
 
     if path == "/dev/urandom" || path == "/dev/random" {
-        if let Some(proc) = crate::process::current_process() {
-            let fd = proc.alloc_fd(crate::process::FileDescriptor::DevUrandom);
-            if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevUrandom);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -2182,7 +2182,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
 
     // /proc/self/exe → redirect to the process's own binary path
     let path = if path == "/proc/self/exe" {
-        if let Some(proc) = crate::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process() {
             proc.name.clone()
         } else {
             return ENOENT;
@@ -2192,7 +2192,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
     };
 
     if !crate::fs::exists(&path) {
-        let is_creat = flags & crate::process::open_flags::O_CREAT != 0;
+        let is_creat = flags & akuma_exec::process::open_flags::O_CREAT != 0;
         if !is_creat {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
@@ -2216,18 +2216,18 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
         }
     }
 
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         let file_existed = crate::fs::exists(&path);
-        if !file_existed && (flags & crate::process::open_flags::O_CREAT != 0) {
+        if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
             let _ = crate::fs::write_file(&path, &[]);
             if mode & 0o7777 != 0 {
                 let _ = crate::vfs::chmod(&path, mode & 0o7777);
             }
-        } else if file_existed && (flags & crate::process::open_flags::O_TRUNC != 0) {
+        } else if file_existed && (flags & akuma_exec::process::open_flags::O_TRUNC != 0) {
             let _ = crate::fs::write_file(&path, &[]);
         }
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::File(crate::process::KernelFile::new(path.clone(), flags)));
-        if flags & crate::process::open_flags::O_CLOEXEC != 0 {
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(akuma_exec::process::KernelFile::new(path.clone(), flags)));
+        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -2238,21 +2238,21 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
 }
 
 fn sys_close(fd: u32) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         if let Some(entry) = proc.remove_fd(fd) {
             proc.clear_cloexec(fd);
             match entry {
-                crate::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
-                crate::process::FileDescriptor::ChildStdout(child_pid) => {
-                    crate::process::remove_child_channel(child_pid);
+                akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+                akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                    akuma_exec::process::remove_child_channel(child_pid);
                 }
-                crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+                akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
                     pipe_close_write(pipe_id);
                 }
-                crate::process::FileDescriptor::PipeRead(pipe_id) => {
+                akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
                     pipe_close_read(pipe_id);
                 }
-                crate::process::FileDescriptor::EventFd(efd_id) => {
+                akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     eventfd_close(efd_id);
                 }
                 _ => {}
@@ -2264,14 +2264,14 @@ fn sys_close(fd: u32) -> u64 {
 }
 
 fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
-        if let Some(crate::process::FileDescriptor::DevNull) = proc.get_fd(fd) {
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(akuma_exec::process::FileDescriptor::DevNull) = proc.get_fd(fd) {
             return 0;
         }
         let mut new_pos = 0i64;
         let mut success = false;
         proc.update_fd(fd, |entry| {
-            if let crate::process::FileDescriptor::File(f) = entry {
+            if let akuma_exec::process::FileDescriptor::File(f) = entry {
                 let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
                 new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
                 if new_pos >= 0 { f.position = new_pos as usize; success = true; }
@@ -2289,9 +2289,9 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 
 fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
-    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     match proc.get_fd(fd) {
-        Some(crate::process::FileDescriptor::File(f)) => {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
                 let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
@@ -2302,27 +2302,27 @@ fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             }
             !0u64
         }
-        Some(crate::process::FileDescriptor::DevNull) => {
+        Some(akuma_exec::process::FileDescriptor::DevNull) => {
             let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::DevUrandom) => {
+        Some(akuma_exec::process::FileDescriptor::DevUrandom) => {
             let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::TimerFd(_)) | Some(crate::process::FileDescriptor::EpollFd(_)) => {
+        Some(akuma_exec::process::FileDescriptor::TimerFd(_)) | Some(akuma_exec::process::FileDescriptor::EpollFd(_)) => {
             let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::Stdin) | Some(crate::process::FileDescriptor::Stdout) | Some(crate::process::FileDescriptor::Stderr) => {
+        Some(akuma_exec::process::FileDescriptor::Stdin) | Some(akuma_exec::process::FileDescriptor::Stdout) | Some(akuma_exec::process::FileDescriptor::Stderr) => {
             let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
-        Some(crate::process::FileDescriptor::PipeRead(_)) | Some(crate::process::FileDescriptor::PipeWrite(_)) => {
+        Some(akuma_exec::process::FileDescriptor::PipeRead(_)) | Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
             let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
@@ -2350,14 +2350,14 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
          String::from(&path)
     } else {
         let base_path = if dirfd == -100 { // AT_FDCWD
-             if let Some(proc) = crate::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process() {
                  proc.cwd.clone()
              } else {
                  return !0u64; // EBADF
              }
         } else if dirfd >= 0 {
-             if let Some(proc) = crate::process::current_process() {
-                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      // Check if it is a directory? For now assume yes if used as dirfd.
                      f.path.clone()
                  } else {
@@ -2441,15 +2441,15 @@ fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 
 }
 
 fn sys_fchmod(fd: u32, mode: u32) -> u64 {
-    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
-        Some(crate::process::FileDescriptor::File(f)) => {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
             match crate::vfs::chmod(&f.path, mode) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }
         }
-        Some(crate::process::FileDescriptor::DevNull) => 0,
+        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
         _ => 0, // silently succeed for stdin/stdout/pipes
     }
 }
@@ -2464,14 +2464,14 @@ fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
         crate::vfs::canonicalize_path(&raw_path)
     } else {
         let base = if dirfd == -100 { // AT_FDCWD
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 proc.cwd.clone()
             } else {
                 return EBADF;
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = crate::process::current_process() {
-                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path.clone()
                 } else {
                     return EBADF;
@@ -2534,14 +2534,14 @@ fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
          path
     } else {
         let base_path = if dirfd == -100 { // AT_FDCWD
-             if let Some(proc) = crate::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process() {
                  proc.cwd.clone()
              } else {
                  return !0u64; // EBADF
              }
         } else if dirfd >= 0 {
-             if let Some(proc) = crate::process::current_process() {
-                 if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path.clone()
                  } else {
                      return !0u64; // EBADF
@@ -2577,7 +2577,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) 
 
     // CLONE_THREAD | CLONE_VM — pthread_create
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
-        match crate::process::clone_thread(stack, tls, parent_tid, child_tid) {
+        match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid) {
             Ok(tid) => return tid as u64,
             Err(e) => {
                 crate::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
@@ -2587,18 +2587,18 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) 
     }
 
     if flags & CLONE_VFORK != 0 || flags & 0x11 == 0x11 {
-        let parent_proc = match crate::process::current_process() {
+        let parent_proc = match akuma_exec::process::current_process() {
             Some(p) => p,
             None => return !0u64,
         };
         
-        let child_pid = crate::process::allocate_pid();
+        let child_pid = akuma_exec::process::allocate_pid();
         
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
         }
 
-        match crate::process::fork_process(child_pid, stack) {
+        match akuma_exec::process::fork_process(child_pid, stack) {
             Ok(new_pid) => {
                 return new_pid as u64;
             },
@@ -2660,7 +2660,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let resolved_path = if path.starts_with('/') {
         path
     } else {
-        if let Some(proc) = crate::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process() {
             crate::vfs::resolve_path(&proc.cwd, &path)
         } else {
             path
@@ -2689,7 +2689,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
 
     {
-        let pid = crate::process::read_current_pid().unwrap_or(0);
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         crate::tprint!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
 
@@ -2732,7 +2732,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
     }
 
     // Otherwise treat as ELF binary
-    let mut proc = match crate::process::current_process() {
+    let mut proc = match akuma_exec::process::current_process() {
         Some(p) => p,
         None => return !0u64,
     };
@@ -2741,13 +2741,13 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
     let closed_fds = proc.close_cloexec_fds();
     for (_fd, entry) in closed_fds {
         match entry {
-            crate::process::FileDescriptor::PipeWrite(pipe_id) => pipe_close_write(pipe_id),
-            crate::process::FileDescriptor::PipeRead(pipe_id) => pipe_close_read(pipe_id),
-            crate::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
-            crate::process::FileDescriptor::ChildStdout(child_pid) => {
-                crate::process::remove_child_channel(child_pid);
+            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => pipe_close_write(pipe_id),
+            akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => pipe_close_read(pipe_id),
+            akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
+            akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                akuma_exec::process::remove_child_channel(child_pid);
             }
-            crate::process::FileDescriptor::EventFd(efd_id) => eventfd_close(efd_id),
+            akuma_exec::process::FileDescriptor::EventFd(efd_id) => eventfd_close(efd_id),
             _ => {}
         }
     }
@@ -2781,7 +2781,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
 
     // Now jump to the new entry point. This never returns.
     unsafe {
-        crate::process::enter_user_mode(&proc.context);
+        akuma_exec::process::enter_user_mode(&proc.context);
     }
 }
 
@@ -2850,7 +2850,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
 
     let wnohang = options & 1 != 0;
 
-    let current_pid = match crate::process::read_current_pid() {
+    let current_pid = match akuma_exec::process::read_current_pid() {
         Some(p) => p,
         None => return (-libc_errno::ECHILD as i64) as u64,
     };
@@ -2858,7 +2858,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if pid > 0 {
         // Wait for specific child
         let p = pid as u32;
-        if let Some(ch) = crate::process::get_child_channel(p) {
+        if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
                     let code = ch.exit_code();
@@ -2868,19 +2868,19 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                         unsafe { *(status_ptr as *mut u32) = encode_wait_status(code); }
                     }
-                    crate::process::remove_child_channel(p);
+                    akuma_exec::process::remove_child_channel(p);
                     return p as u64;
                 }
 
                 if wnohang {
                     return 0;
                 }
-                crate::threading::yield_now();
+                akuma_exec::threading::yield_now();
             }
         }
     } else if pid == -1 || pid == 0 {
         // Wait for any child (pid=-1) or any child in same pgid (pid=0, treat same)
-        if !crate::process::has_children(current_pid) {
+        if !akuma_exec::process::has_children(current_pid) {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
             }
@@ -2888,7 +2888,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
         }
 
         loop {
-            if let Some((child_pid, ch)) = crate::process::find_exited_child(current_pid) {
+            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
                 let code = ch.exit_code();
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", child_pid, code);
@@ -2896,14 +2896,14 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
                 if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                     unsafe { *(status_ptr as *mut u32) = encode_wait_status(code); }
                 }
-                crate::process::remove_child_channel(child_pid);
+                akuma_exec::process::remove_child_channel(child_pid);
                 return child_pid as u64;
             }
 
             if wnohang {
                 return 0;
             }
-            crate::threading::yield_now();
+            akuma_exec::threading::yield_now();
         }
     }
 
@@ -2916,7 +2916,7 @@ fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
 
 fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         let cwd_bytes = proc.cwd.as_bytes();
         // Check if buffer is large enough (including null terminator)
         if cwd_bytes.len() + 1 > size {
@@ -2940,7 +2940,7 @@ fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
-    let proc = match crate::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
 
     if proc.get_fd(fd).is_none() {
         return EBADF;
@@ -2983,14 +2983,14 @@ fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
         crate::vfs::canonicalize_path(&raw_path)
     } else {
         let base = if dirfd == -100 { // AT_FDCWD
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 proc.cwd.clone()
             } else {
                 return EBADF;
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = crate::process::current_process() {
-                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path.clone()
                 } else {
                     return EBADF;
@@ -3024,14 +3024,14 @@ fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
         crate::vfs::canonicalize_path(&path)
     } else {
         let base = if dirfd == -100 {
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 proc.cwd.clone()
             } else {
                 return EBADF;
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = crate::process::current_process() {
-                if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path.clone()
                 } else {
                     return EBADF;
@@ -3119,7 +3119,7 @@ fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u6
 
     if path == "/proc/self/exe" {
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
-        let exe = if let Some(proc) = crate::process::current_process() {
+        let exe = if let Some(proc) = akuma_exec::process::current_process() {
             proc.name.clone()
         } else {
             String::from("/bin/unknown")
@@ -3158,8 +3158,8 @@ fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     let deadline = crate::timer::uptime_us().saturating_add(total_us);
     loop {
         if crate::timer::uptime_us() >= deadline { return 0; }
-        if crate::process::is_current_interrupted() { return EINTR; }
-        crate::threading::schedule_blocking(deadline);
+        if akuma_exec::process::is_current_interrupted() { return EINTR; }
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
@@ -3174,8 +3174,8 @@ fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
         return EAFNOSUPPORT;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
-        if let Some(proc) = crate::process::current_process() {
-            let fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(idx));
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(idx));
             if cloexec {
                 proc.set_cloexec(fd);
             }
@@ -3216,9 +3216,9 @@ fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 if addr_ptr != 0 { unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); } }
-                return proc.alloc_fd(crate::process::FileDescriptor::Socket(new_idx)) as u64;
+                return proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64;
             }
         }
     }
@@ -3230,11 +3230,11 @@ fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 if addr_ptr != 0 {
                     unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
                 }
-                let new_fd = proc.alloc_fd(crate::process::FileDescriptor::Socket(new_idx));
+                let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
                 const SOCK_CLOEXEC: u32 = 0x80000;
                 const SOCK_NONBLOCK: u32 = 0x800;
                 if flags & SOCK_CLOEXEC != 0 {
@@ -3580,12 +3580,12 @@ fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 }
 
 fn get_socket_from_fd(fd: u32) -> Option<usize> {
-    let proc = crate::process::current_process()?;
-    if let Some(crate::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
+    let proc = akuma_exec::process::current_process()?;
+    if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
 }
 
 fn fd_is_nonblock(fd: u32) -> bool {
-    crate::process::current_process().map_or(false, |p| p.is_nonblock(fd))
+    akuma_exec::process::current_process().map_or(false, |p| p.is_nonblock(fd))
 }
 
 fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net::SocketHandle> {
@@ -3627,7 +3627,7 @@ fn socket_can_send_tcp(idx: usize) -> bool {
 fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return !0u64; }
     let pages = (len + 4095) / 4096;
-    let page_flags = crate::mmu::user_flags::from_prot(prot);
+    let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
 
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
@@ -3643,8 +3643,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     // frame tracking).  For CLONE_VM worker threads, current_process() returns
     // the worker's Process which has cloned-but-stale ProcessMemory and empty
     // mmap_regions.  All memory bookkeeping must go through the owner.
-    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-    let proc = match crate::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,
     };
@@ -3653,8 +3653,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
         if addr & 0xFFF != 0 { return !0u64; }
         if is_fixed {
             // MAP_FIXED overwrites any existing mappings in the range.
-            let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-            let _ = crate::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
+            let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
+            let _ = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
             for i in 0..pages {
                 let va = addr + i * 4096;
                 let _ = proc.address_space.unmap_page(va);
@@ -3683,15 +3683,15 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
 
     if use_lazy {
         // Use address-space owner PID so all CLONE_VM threads share lazy regions
-        let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-        let count = crate::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+        let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
+        let count = akuma_exec::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
         crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
             proc.pid, len, prot, flags, mmap_addr, count);
         return mmap_addr as u64;
     }
 
     let initial_flags = if is_file_backed {
-        crate::mmu::user_flags::RW_NO_EXEC
+        akuma_exec::mmu::user_flags::RW_NO_EXEC
     } else {
         page_flags
     };
@@ -3700,7 +3700,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     for i in 0..pages {
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             frames.push(frame);
-            unsafe { crate::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
+            unsafe { akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
             proc.address_space.track_user_frame(frame);
         } else {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -3711,14 +3711,14 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
         }
     }
     if is_file_backed {
-        if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
+        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
             let mut file_off = offset;
             let mut bytes_read = 0usize;
             for i in 0..pages {
                 let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
                 if chunk == 0 { break; }
-                let page_kva = crate::mmu::phys_to_virt(frames[i].addr);
+                let page_kva = akuma_exec::mmu::phys_to_virt(frames[i].addr);
                 let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
                 match crate::fs::read_at(&path, file_off, page_buf) {
                     Ok(n) => {
@@ -3768,19 +3768,19 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         return ENOMEM;
     }
 
-    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-    let new_addr = match crate::process::lookup_process(owner_pid)
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let new_addr = match akuma_exec::process::lookup_process(owner_pid)
         .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
         Some(a) => a,
         None => return ENOMEM,
     };
 
-    if let Some(proc) = crate::process::lookup_process(owner_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         let mut new_frames = alloc::vec::Vec::new();
         for i in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
-                unsafe { crate::mmu::map_user_page(new_addr + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC); }
+                unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC); }
                 proc.address_space.track_user_frame(frame);
             } else { return ENOMEM; }
         }
@@ -3852,12 +3852,12 @@ fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
 }
 
 fn sys_epoll_create1(_flags: u32) -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
             interest_list: BTreeMap::new(),
         });
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::EpollFd(epoll_id));
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
         crate::tprint!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
         fd as u64
     } else {
@@ -3866,8 +3866,8 @@ fn sys_epoll_create1(_flags: u32) -> u64 {
 }
 
 fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
-    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
-        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+    let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
     };
 
@@ -3918,7 +3918,7 @@ fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
 }
 
 fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
-    let fd_entry = crate::process::current_process().and_then(|p| p.get_fd(fd_num));
+    let fd_entry = akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num));
     let fd_entry = match fd_entry {
         Some(e) => e,
         None => return EPOLLHUP | EPOLLERR,
@@ -3927,7 +3927,7 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
     let mut ready = 0u32;
 
     match fd_entry {
-        crate::process::FileDescriptor::Socket(idx) => {
+        akuma_exec::process::FileDescriptor::Socket(idx) => {
             if socket::is_udp_socket(idx) {
                 if let Some(handle) = socket_get_udp_handle(idx) {
                     if requested & EPOLLIN != 0 && akuma_net::smoltcp_net::udp_can_recv(handle) {
@@ -3946,7 +3946,7 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                 }
             }
         }
-        crate::process::FileDescriptor::EventFd(efd_id) => {
+        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if requested & EPOLLIN != 0 && eventfd_can_read(efd_id) {
                 ready |= EPOLLIN;
             }
@@ -3954,31 +3954,31 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                 ready |= EPOLLOUT;
             }
         }
-        crate::process::FileDescriptor::PipeRead(pipe_id) => {
+        akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             if requested & EPOLLIN != 0 && pipe_can_read(pipe_id) {
                 ready |= EPOLLIN;
             }
         }
-        crate::process::FileDescriptor::PipeWrite(pipe_id) => {
+        akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
             if requested & EPOLLOUT != 0 && pipe_can_write(pipe_id) {
                 ready |= EPOLLOUT;
             }
         }
-        crate::process::FileDescriptor::TimerFd(timer_id) => {
+        akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             if requested & EPOLLIN != 0 && timerfd_can_read(timer_id) {
                 ready |= EPOLLIN;
             }
         }
-        crate::process::FileDescriptor::Stdin => {
+        akuma_exec::process::FileDescriptor::Stdin => {
             if requested & EPOLLIN != 0 {
-                if let Some(ch) = crate::process::current_channel() {
+                if let Some(ch) = akuma_exec::process::current_channel() {
                     if ch.has_stdin_data() {
                         ready |= EPOLLIN;
                     }
                 }
             }
         }
-        crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
+        akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
             if requested & EPOLLOUT != 0 {
                 ready |= EPOLLOUT;
             }
@@ -3998,8 +3998,8 @@ fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -
     let out_size = maxevents * 12;
     if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
 
-    let epoll_id = match crate::process::current_process().and_then(|p| p.get_fd(epfd)) {
-        Some(crate::process::FileDescriptor::EpollFd(id)) => id,
+    let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
+        Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
     };
 
@@ -4055,11 +4055,11 @@ fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -
             }
         }
 
-        if crate::process::is_current_interrupted() {
+        if akuma_exec::process::is_current_interrupted() {
             return EINTR;
         }
 
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 }
 
@@ -4079,11 +4079,11 @@ struct KernelSigaction {
 }
 
 fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usize) -> u64 {
-    if sig == 0 || sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+    if sig == 0 || sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
     if sig == 9 || sig == 19 { return EINVAL; } // SIGKILL/SIGSTOP cannot be caught
     let sigset_ok = sigsetsize == 8;
 
-    let proc = match crate::process::current_process() {
+    let proc = match akuma_exec::process::current_process() {
         Some(p) => p,
         None => return ENOSYS,
     };
@@ -4093,9 +4093,9 @@ fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usi
     if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
         let old = &proc.signal_actions[idx];
         let handler_val = match old.handler {
-            crate::process::SignalHandler::Default => SIG_DFL,
-            crate::process::SignalHandler::Ignore => SIG_IGN,
-            crate::process::SignalHandler::UserFn(addr) => addr,
+            akuma_exec::process::SignalHandler::Default => SIG_DFL,
+            akuma_exec::process::SignalHandler::Ignore => SIG_IGN,
+            akuma_exec::process::SignalHandler::UserFn(addr) => addr,
         };
         let out = KernelSigaction {
             sa_handler: handler_val,
@@ -4109,11 +4109,11 @@ fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usi
     if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
         let sa = unsafe { core::ptr::read_unaligned(act_ptr as *const KernelSigaction) };
         let handler = match sa.sa_handler {
-            SIG_DFL => crate::process::SignalHandler::Default,
-            SIG_IGN => crate::process::SignalHandler::Ignore,
-            addr => crate::process::SignalHandler::UserFn(addr),
+            SIG_DFL => akuma_exec::process::SignalHandler::Default,
+            SIG_IGN => akuma_exec::process::SignalHandler::Ignore,
+            addr => akuma_exec::process::SignalHandler::UserFn(addr),
         };
-        proc.signal_actions[idx] = crate::process::SignalAction {
+        proc.signal_actions[idx] = akuma_exec::process::SignalAction {
             handler,
             flags: sa.sa_flags,
             mask: if sigset_ok { sa.sa_mask } else { 0 },
@@ -4130,7 +4130,7 @@ fn signal_is_fatal_default(sig: u32) -> bool {
 
 fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig == 0 { return 0; }
-    if sig as usize > crate::process::MAX_SIGNALS { return EINVAL; }
+    if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 
     crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
 
@@ -4140,22 +4140,22 @@ fn sys_tkill(tid: u32, sig: u32) -> u64 {
         return 0;
     }
 
-    let handler = crate::process::current_process()
+    let handler = akuma_exec::process::current_process()
         .map(|p| {
             let idx = (sig - 1) as usize;
             p.signal_actions[idx].handler
         })
-        .unwrap_or(crate::process::SignalHandler::Default);
+        .unwrap_or(akuma_exec::process::SignalHandler::Default);
 
     match handler {
-        crate::process::SignalHandler::Ignore => 0,
-        crate::process::SignalHandler::Default => {
+        akuma_exec::process::SignalHandler::Ignore => 0,
+        akuma_exec::process::SignalHandler::Default => {
             if signal_is_fatal_default(sig) {
                 sys_exit_group(-(sig as i32));
             }
             0
         }
-        crate::process::SignalHandler::UserFn(_) => {
+        akuma_exec::process::SignalHandler::UserFn(_) => {
             // True userspace signal delivery not yet implemented.
             // For fatal signals sent to self (abort pattern), terminate cleanly.
             if sig == 6 {
@@ -4168,8 +4168,8 @@ fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
 fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     let timer_id = TIMERFD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Some(proc) = crate::process::current_process() {
-        let fd = proc.alloc_fd(crate::process::FileDescriptor::TimerFd(timer_id));
+    if let Some(proc) = akuma_exec::process::current_process() {
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::TimerFd(timer_id));
         crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
         fd as u64
     } else {
@@ -4178,8 +4178,8 @@ fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
 }
 
 fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> u64 {
-    let timer_id = match crate::process::current_process().and_then(|p| p.get_fd(fd_num)) {
-        Some(crate::process::FileDescriptor::TimerFd(id)) => id,
+    let timer_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num)) {
+        Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
         _ => return EBADF,
     };
 
@@ -4269,7 +4269,7 @@ fn futex_do_wake(uaddr: usize, max_wake: u32) -> u64 {
         }
         drop(waiters);
         for tid in &to_wake {
-            crate::threading::get_waker_for_thread(*tid).wake();
+            akuma_exec::threading::get_waker_for_thread(*tid).wake();
         }
         to_wake.len() as u64
     } else {
@@ -4304,7 +4304,7 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, _uaddr2: usize, 
                 return EFAULT;
             }
 
-            let tid = crate::threading::current_thread_id();
+            let tid = akuma_exec::threading::current_thread_id();
 
             {
                 let mut waiters = FUTEX_WAITERS.lock();
@@ -4325,7 +4325,7 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, _uaddr2: usize, 
                 u64::MAX
             };
 
-            crate::threading::schedule_blocking(deadline);
+            akuma_exec::threading::schedule_blocking(deadline);
 
             {
                 let mut waiters = FUTEX_WAITERS.lock();
@@ -4405,12 +4405,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
     let pages = (len + 4095) / 4096;
-    let new_flags = crate::mmu::user_flags::from_prot(prot);
+    let new_flags = akuma_exec::mmu::user_flags::from_prot(prot);
     let adding_exec = prot & 0x4 != 0; // PROT_EXEC
-    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-    if let Some(proc) = crate::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         // Update lazy region flags so demand paging uses correct permissions
-        crate::process::update_lazy_region_flags(owner_pid, addr, pages * 4096, new_flags);
+        akuma_exec::process::update_lazy_region_flags(owner_pid, addr, pages * 4096, new_flags);
 
         for i in 0..pages {
             let va = addr + i * 4096;
@@ -4447,8 +4447,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 }
 
 fn sys_munmap(addr: usize, len: usize) -> u64 {
-    let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-    let proc = match crate::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,
     };
@@ -4495,8 +4495,8 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     }
 
     // Try lazy region(s) — the unmap range may span multiple lazy regions.
-    let as_pid = crate::process::read_current_pid().unwrap_or(proc.pid);
-    let results = crate::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
+    let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
             for i in 0..freed_pages {
@@ -4528,9 +4528,9 @@ fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
     let name = unsafe { core::str::from_utf8(core::slice::from_raw_parts(name_ptr as *const u8, name_len)).unwrap_or("unknown") };
     let root = unsafe { core::str::from_utf8(core::slice::from_raw_parts(root_ptr as *const u8, root_len)).unwrap_or("/") };
-    let creator_pid = crate::process::read_current_pid().unwrap_or(0);
+    let creator_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
 
-    crate::process::register_box(crate::process::BoxInfo {
+    akuma_exec::process::register_box(akuma_exec::process::BoxInfo {
         id,
         name: String::from(name),
         root_dir: String::from(root),
@@ -4557,8 +4557,8 @@ fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
 
 fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(ptr, size) { return EFAULT; }
-    if let Some(proc) = crate::process::current_process() {
-        if let Some(crate::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
             if let Ok(entries) = crate::fs::list_dir(&f.path) {
                 if f.position >= entries.len() { return 0; }
                 let mut written = 0;
@@ -4575,7 +4575,7 @@ fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
                         p.add(19 + entry.name.len()).write(0);
                     }
                     written += reclen;
-                    proc.update_fd(fd, |e| if let crate::process::FileDescriptor::File(file) = e { file.position += 1; });
+                    proc.update_fd(fd, |e| if let akuma_exec::process::FileDescriptor::File(file) = e { file.position += 1; });
                 }
                 return written as u64;
             }
@@ -4644,10 +4644,10 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_
         None
     };
 
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
-        if let Some(proc) = crate::process::current_process() {
-            crate::process::register_child_channel(pid, ch, proc.pid);
-            return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin, None) {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            akuma_exec::process::register_child_channel(pid, ch, proc.pid);
+            return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
     !0u64
@@ -4695,10 +4695,10 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
     };
 
     // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = crate::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
-        if let Some(proc) = crate::process::current_process() {
-            crate::process::register_child_channel(pid, ch, proc.pid);
-            return (pid as u64) | ((proc.alloc_fd(crate::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            akuma_exec::process::register_child_channel(pid, ch, proc.pid);
+            return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
     !0u64
@@ -4708,12 +4708,12 @@ fn sys_kill(pid: u32, _sig: u32) -> u64 {
     // Safety: prevent killing init or Box 0 implicitly if we add box killing logic here
     if pid == 0 { return 0; } // Success for process group 0 (stub)
     if pid <= 1 { return !0u64; }
-    if crate::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
+    if akuma_exec::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
 }
 
 fn sys_kill_box(box_id: u64) -> u64 {
 
-    if crate::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
+    if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
 
 }
 
@@ -4721,7 +4721,7 @@ fn sys_kill_box(box_id: u64) -> u64 {
 
 fn sys_reattach(pid: u32) -> u64 {
 
-    if crate::process::reattach_process(pid).is_ok() { 0 } else { !0u64 }
+    if akuma_exec::process::reattach_process(pid).is_ok() { 0 } else { !0u64 }
 
 }
 
@@ -4732,7 +4732,7 @@ fn sys_reattach(pid: u32) -> u64 {
 fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
-    if let Some(ch) = crate::process::get_child_channel(pid) {
+    if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
         if ch.has_exited() {
             if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = encode_wait_status(ch.exit_code()); } }
             return pid as u64;
@@ -4764,13 +4764,13 @@ fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 fn sys_time() -> u64 { crate::timer::utc_time_us().unwrap_or(0) }
 
 fn sys_fchdir(fd: u32) -> u64 {
-    let proc = match crate::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     let entry = match proc.get_fd(fd) {
         Some(e) => e,
         None => return EBADF,
     };
     let path = match entry {
-        crate::process::FileDescriptor::File(f) => f.path.clone(),
+        akuma_exec::process::FileDescriptor::File(f) => f.path.clone(),
         _ => return ENOTDIR,
     };
     if let Ok(meta) = crate::vfs::metadata(&path) {
@@ -4791,7 +4791,7 @@ fn sys_chdir(ptr: u64) -> u64 {
         Err(e) => return e,
     };
     
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         // Resolve path relative to current CWD
         let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
         
@@ -4812,7 +4812,7 @@ fn sys_chdir(ptr: u64) -> u64 {
 
 /// Helper: write data to the current process's ProcessChannel (stdout buffer)
 fn write_to_process_channel(data: &[u8]) -> u64 {
-    let proc_channel = match crate::process::current_channel() {
+    let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
@@ -4822,7 +4822,7 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
 
 /// sys_set_terminal_attributes - Sets terminal control attributes
 fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
-    let term_state_lock = match crate::process::current_terminal_state() {
+    let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
@@ -4836,7 +4836,7 @@ fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64
         term_state.exit_raw_mode();
     }
 
-    let proc_channel = match crate::process::current_channel() {
+    let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
@@ -4857,7 +4857,7 @@ fn sys_get_terminal_attributes(fd: u64, attr_ptr: u64) -> u64 {
     }
     if !validate_user_ptr(attr_ptr, 8) { return EFAULT; }
 
-    let term_state_lock = match crate::process::current_terminal_state() {
+    let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
@@ -4918,12 +4918,12 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
         // crate::safe_print!(64, "[syscall] poll_input_event: timeout={}us\n", timeout_us);
     }
 
-    let proc_channel = match crate::process::current_channel() {
+    let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
         None => return (-libc_errno::ENOMEM as i64) as u64,
     };
 
-    let term_state_lock = match crate::process::current_terminal_state() {
+    let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
         None => return (-libc_errno::EBADF as i64) as u64,
     };
@@ -4945,11 +4945,11 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
         loop {
             // CRITICAL: Register waker BEFORE checking for data to avoid lost wake-up race
             {
-                crate::threading::disable_preemption();
+                akuma_exec::threading::disable_preemption();
                 let mut term_state = term_state_lock.lock();
-                let thread_id = crate::threading::current_thread_id();
-                term_state.set_input_waker(crate::threading::get_waker_for_thread(thread_id));
-                crate::threading::enable_preemption();
+                let thread_id = akuma_exec::threading::current_thread_id();
+                term_state.set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
+                akuma_exec::threading::enable_preemption();
             }
 
             // Check for data AFTER registering waker
@@ -4959,7 +4959,7 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
                 break;
             }
 
-            if crate::process::is_current_interrupted() {
+            if akuma_exec::process::is_current_interrupted() {
                 return (-libc_errno::EINTR as i64) as u64;
             }
 
@@ -4969,14 +4969,14 @@ fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
             }
 
             // Yield, will be woken by SSH if input arrives (calling waker.wake())
-            crate::threading::schedule_blocking(deadline);
+            akuma_exec::threading::schedule_blocking(deadline);
 
             // Clear waker after being woken up or timeout
             {
-                crate::threading::disable_preemption();
+                akuma_exec::threading::disable_preemption();
                 let mut term_state = term_state_lock.lock();
                 term_state.input_waker.lock().take();
-                crate::threading::enable_preemption();
+                akuma_exec::threading::enable_preemption();
             }
         }
     }
@@ -4997,15 +4997,15 @@ fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
     for i in 0..count {
         let mut stat = ThreadCpuStat {
             tid: i as u32,
-            total_time_us: crate::threading::get_thread_cpu_time(i),
-            state: crate::threading::get_thread_state(i),
+            total_time_us: akuma_exec::threading::get_thread_cpu_time(i),
+            state: akuma_exec::threading::get_thread_state(i),
             ..Default::default()
         };
 
         // Lookup PID and name from process table
-        if let Some(pid) = crate::process::find_pid_by_thread(i) {
+        if let Some(pid) = akuma_exec::process::find_pid_by_thread(i) {
             stat.pid = pid;
-            if let Some(proc) = crate::process::lookup_process(pid) {
+            if let Some(proc) = akuma_exec::process::lookup_process(pid) {
                 stat.box_id = proc.box_id;
                 let name_bytes = proc.name.as_bytes();
                 // Ensure name is clean (already zeroed by Default::default(), but being explicit)
@@ -5104,11 +5104,11 @@ fn sys_fb_info(info_ptr: u64) -> u64 {
 }
 
 fn sys_getpid() -> u64 {
-    crate::process::read_current_pid().map_or(!0u64, |pid| pid as u64)
+    akuma_exec::process::read_current_pid().map_or(!0u64, |pid| pid as u64)
 }
 
 fn sys_getppid() -> u64 {
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         proc.parent_pid as u64
     } else {
         !0u64 // Return error if no current process

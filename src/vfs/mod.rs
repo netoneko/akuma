@@ -78,7 +78,7 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    let mut normalized = if let Some(proc) = crate::process::current_process() {
+    let mut normalized = if let Some(proc) = akuma_exec::process::current_process() {
         // 1. Resolve relative path against process CWD
         let absolute = resolve_path(&proc.cwd, path);
         
@@ -204,7 +204,7 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
 /// Rename/move a file or directory
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     // Both paths must be on the same filesystem for an atomic rename
-    let mut old_full = if let Some(proc) = crate::process::current_process() {
+    let mut old_full = if let Some(proc) = akuma_exec::process::current_process() {
         let abs = resolve_path(&proc.cwd, old_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {
@@ -219,7 +219,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
         normalize_path_owned(old_path)
     };
 
-    let mut new_full = if let Some(proc) = crate::process::current_process() {
+    let mut new_full = if let Some(proc) = akuma_exec::process::current_process() {
         let abs = resolve_path(&proc.cwd, new_path);
         if proc.root_dir != "/" {
             if proc.root_dir.ends_with('/') {

@@ -557,47 +557,7 @@ pub fn init_exception_stack() {
     set_current_exception_stack(boot_stack_top);
 }
 
-/// Saved user context from EL0 exception
-/// Layout must match the assembly save/restore sequence
-#[repr(C)]
-pub struct UserTrapFrame {
-    pub x0: u64,
-    pub x1: u64,
-    pub x2: u64,
-    pub x3: u64,
-    pub x4: u64,
-    pub x5: u64,
-    pub x6: u64,
-    pub x7: u64,
-    pub x8: u64, // Syscall number
-    pub x9: u64,
-    pub x10: u64,
-    pub x11: u64,
-    pub x12: u64,
-    pub x13: u64,
-    pub x14: u64,
-    pub x15: u64,
-    pub x16: u64,
-    pub x17: u64,
-    pub x18: u64,
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64,
-    pub x30: u64,
-    pub sp_el0: u64,
-    pub elr_el1: u64, // User PC
-    pub spsr_el1: u64,
-    pub tpidr_el0: u64,
-    pub _padding: u64,
-}
+pub use akuma_exec::threading::UserTrapFrame;
 
 /// ESR_EL1 exception class values
 mod esr {
@@ -647,7 +607,7 @@ extern "C" fn rust_default_exception_handler() {
         core::arch::asm!("mov {}, sp", out(reg) sp);
     }
     let ec = (esr >> 26) & 0x3F;
-    let tid = crate::threading::current_thread_id();
+    let tid = akuma_exec::threading::current_thread_id();
     
     // Use stack-only print to avoid heap allocation in exception context
     crate::safe_print!(128, "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
@@ -690,7 +650,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         // Special handling for scheduler SGI
         if irq == crate::gic::SGI_SCHEDULER {
             // Returns new SP if switch needed, or 0 if not
-            return crate::threading::sgi_scheduler_handler_with_sp(irq, current_sp);
+            return akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp);
         } else {
             // Normal IRQs: call handler then EOI
             crate::irq::dispatch_irq(irq);
@@ -728,7 +688,7 @@ extern "C" fn rust_sync_el1_handler() {
 
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
-    let tid = crate::threading::current_thread_id();
+    let tid = akuma_exec::threading::current_thread_id();
 
     // Use static buffer for formatting (no heap allocation)
     let mut w = StaticWriter::new();
@@ -770,7 +730,7 @@ extern "C" fn rust_sync_el1_handler() {
         safe_print!(128, "  PAGE TABLE WALK FAULT - checking page table integrity:\n");
         
         // Get expected boot TTBR0
-        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+        let boot_ttbr0 = akuma_exec::mmu::get_boot_ttbr0();
         let _ = write!(w, "    Expected boot_ttbr0: {:#x}\n", boot_ttbr0);
         w.flush();
         let _ = write!(w, "    Current TTBR0:       {:#x}\n", ttbr0);
@@ -928,14 +888,14 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     }
     
     // Thread stack info
-    let (thread_count, running, terminated) = crate::threading::thread_stats();
+    let (thread_count, running, terminated) = akuma_exec::threading::thread_stats();
     let _ = write!(w, "  Threads: {} total, {} running, {} terminated\n",
         thread_count, running, terminated
     );
     w.flush();
     
     // Current thread's kernel stack info
-    if let Some(stack_info) = crate::threading::get_thread_stack_info(tid) {
+    if let Some(stack_info) = akuma_exec::threading::get_thread_stack_info(tid) {
         let kernel_stack_used = if kernel_sp >= stack_info.0 as u64 && kernel_sp <= stack_info.1 as u64 {
             stack_info.1 - kernel_sp as usize
         } else {
@@ -953,7 +913,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     }
     
     // User process info (if any)
-    if let Some(proc) = crate::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process() {
         let mem = &proc.memory;
         let stack_size = mem.stack_top - mem.stack_bottom;
         let stack_used = if user_sp >= mem.stack_bottom as u64 && user_sp < mem.stack_top as u64 {
@@ -1053,7 +1013,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             // Save trap frame pointer so fork/clone can read full register state
-            crate::threading::set_current_trap_frame(frame);
+            akuma_exec::threading::set_current_trap_frame(frame as *const _);
             let args = [
                 frame_ref.x0,
                 frame_ref.x1,
@@ -1075,7 +1035,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
             
             // Check if process exited - if so, return to kernel
-            if let Some(proc) = crate::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process() {
                 if proc.exited {
                     let exit_code = proc.exit_code;
                     
@@ -1097,7 +1057,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     crate::safe_print!(128, "[exception] Process {} ({}) exited, calling return_to_kernel({})\n",
                         proc.pid, proc.name, exit_code);
                     // Don't ERET back to user - return to kernel instead
-                    crate::process::return_to_kernel(exit_code);
+                    akuma_exec::process::return_to_kernel(exit_code);
                 }
             } else {
                 // Only log if we just handled EXIT syscall
@@ -1106,7 +1066,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
-            crate::threading::clear_current_trap_frame();
+            akuma_exec::threading::clear_current_trap_frame();
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
@@ -1117,7 +1077,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
             }
 
-            let pid = crate::process::read_current_pid().unwrap_or(0);
+            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
@@ -1126,27 +1086,27 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    if let Some(owner) = crate::process::lookup_process(pid) {
-                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RW_NO_EXEC);
+                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                         return unsafe { (*frame).x0 };
                     }
                 }
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
-                        crate::process::LazySource::File { .. } => {
-                            if flags != 0 { flags } else { crate::mmu::user_flags::RW_NO_EXEC }
+                        akuma_exec::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
                         }
-                        _ => crate::mmu::user_flags::RW_NO_EXEC,
+                        _ => akuma_exec::mmu::user_flags::RW_NO_EXEC,
                     };
-                    let is_exec = (map_flags & crate::mmu::flags::UXN) == 0;
+                    let is_exec = (map_flags & akuma_exec::mmu::flags::UXN) == 0;
 
-                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
@@ -1162,7 +1122,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     let dst_off = pg_data_start - cur_va;
                                     let file_off = file_offset + (pg_data_start - segment_va);
                                     let len = pg_data_end - pg_data_start;
-                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
                                     let page_buf = unsafe {
                                         core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
                                     };
@@ -1174,7 +1134,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
 
                                 if is_exec {
-                                    let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                                     for off in (0..0x1000_usize).step_by(64) {
                                         unsafe {
                                             core::arch::asm!("dc cvau, {}", in(reg) kva + off);
@@ -1184,9 +1144,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
 
                                 let table_frames = unsafe {
-                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                    akuma_exec::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                     owner.address_space.track_user_frame(pf);
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
@@ -1218,9 +1178,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
                             let table_frames = unsafe {
-                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(owner) = crate::process::lookup_process(pid) {
+                            if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                 owner.address_space.track_user_frame(page_frame);
                                 for tf in table_frames {
                                     owner.address_space.track_page_table_frame(tf);
@@ -1242,7 +1202,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // all mmaps were performed on the parent.
                     let page_va = far_usize & !0xFFF;
                     let mut recovered = false;
-                    if let Some(proc) = crate::process::lookup_process(pid) {
+                    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
                         for (start, frames) in &proc.mmap_regions {
                             let region_end = *start + frames.len() * 4096;
                             if page_va >= *start && page_va < region_end {
@@ -1251,7 +1211,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
                                     pid, page_va, phys.addr);
                                 unsafe {
-                                    crate::mmu::map_user_page(page_va, phys.addr, crate::mmu::user_flags::RW_NO_EXEC);
+                                    akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                                 }
                                 recovered = true;
                                 break;
@@ -1262,7 +1222,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         return unsafe { (*frame).x0 };
                     }
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
-                    if let Some(dbg_proc) = crate::process::lookup_process(pid) {
+                    if let Some(dbg_proc) = akuma_exec::process::lookup_process(pid) {
                         let n = dbg_proc.mmap_regions.len();
                         crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
                             pid, far_usize, n);
@@ -1274,7 +1234,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     } else {
                         crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
                     }
-                    crate::process::lazy_region_debug(far_usize);
+                    akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
                 }
             }
@@ -1288,14 +1248,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
-            crate::process::return_to_kernel(-11) // SIGSEGV - never returns
+            akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
             let far: u64;
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
-            let pid = crate::process::read_current_pid().unwrap_or(0);
+            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
 
             let fault_type = iss & 0x3C;
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
@@ -1303,26 +1263,26 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
-                    if let Some(owner) = crate::process::lookup_process(pid) {
-                        let _ = owner.address_space.update_page_flags(page_va, crate::mmu::user_flags::RX);
+                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
                         return unsafe { (*frame).x0 };
                     }
                 }
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = crate::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
-                        crate::process::LazySource::File { .. } => {
-                            if flags != 0 { flags } else { crate::mmu::user_flags::RX }
+                        akuma_exec::process::LazySource::File { .. } => {
+                            if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RX }
                         }
-                        _ => crate::mmu::user_flags::RX,
+                        _ => akuma_exec::mmu::user_flags::RX,
                     };
 
-                    if let crate::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
@@ -1338,7 +1298,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     let dst_off = pg_data_start - cur_va;
                                     let file_off = file_offset + (pg_data_start - segment_va);
                                     let len = pg_data_end - pg_data_start;
-                                    let page_ptr = crate::mmu::phys_to_virt(pf.addr);
+                                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
                                     let page_buf = unsafe {
                                         core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), len)
                                     };
@@ -1349,7 +1309,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 }
 
-                                let kva = crate::mmu::phys_to_virt(pf.addr) as usize;
+                                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                                 for off in (0..0x1000_usize).step_by(64) {
                                     unsafe {
                                         core::arch::asm!("dc cvau, {}", in(reg) kva + off);
@@ -1358,9 +1318,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
 
                                 let table_frames = unsafe {
-                                    crate::mmu::map_user_page(cur_va, pf.addr, map_flags)
+                                    akuma_exec::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(owner) = crate::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                     owner.address_space.track_user_frame(pf);
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
@@ -1390,9 +1350,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
                             let table_frames = unsafe {
-                                crate::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(owner) = crate::process::lookup_process(pid) {
+                            if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                 owner.address_space.track_user_frame(page_frame);
                                 for tf in table_frames {
                                     owner.address_space.track_page_table_frame(tf);
@@ -1406,7 +1366,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
                     }
                 } else {
-                    crate::process::lazy_region_debug(far_usize);
+                    akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                 }
             }
@@ -1421,7 +1381,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} ELR={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.elr_el1, frame_ref.spsr_el1);
-            crate::process::return_to_kernel(-11) // never returns
+            akuma_exec::process::return_to_kernel(-11) // never returns
         }
         esr::EC_MSR_MRS_TRAP => {
             // Trapped MSR/MRS/System instruction from EL0.
@@ -1475,7 +1435,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
         }
         esr::EC_BRK_AARCH64 => {
             // BRK instruction — intentional trap/abort from user code
-            crate::process::return_to_kernel(-5) // SIGTRAP
+            akuma_exec::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
             // Capture additional state for debugging
@@ -1491,7 +1451,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
                 core::arch::asm!("mov {}, sp", out(reg) sp);
             }
-            let tid = crate::threading::current_thread_id();
+            let tid = akuma_exec::threading::current_thread_id();
             
             crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n", ec, iss);
             crate::safe_print!(128, "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", tid, elr, far, spsr);
@@ -1503,7 +1463,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 safe_print!(128, "  WARNING: TTBR0 looks like boot page tables, not user process!\n");
             }
             
-            crate::process::return_to_kernel(-1) // never returns
+            akuma_exec::process::return_to_kernel(-1) // never returns
         }
     }
 }

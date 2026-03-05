@@ -43,11 +43,9 @@ impl Future for YieldOnce {
 }
 use spinning_top::Spinlock;
 
-use crate::config;
-use crate::console;
 use crate::elf_loader::{self, ElfError};
 use crate::mmu::{self, UserAddressSpace};
-use crate::pmm::{self, PhysFrame};
+use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled};
 use akuma_terminal as terminal;
 
 /// Fixed address for process info page (read-only from userspace)
@@ -121,28 +119,28 @@ static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
 
 /// Register a new box in the global registry
 pub fn register_box(info: BoxInfo) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         BOX_REGISTRY.lock().insert(info.id, info);
     })
 }
 
 /// Unregister a box from the global registry
 pub fn unregister_box(id: u64) -> Option<BoxInfo> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         BOX_REGISTRY.lock().remove(&id)
     })
 }
 
 /// List all active boxes
 pub fn list_boxes() -> Vec<BoxInfo> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         BOX_REGISTRY.lock().values().cloned().collect()
     })
 }
 
 /// Find a box ID by name
 pub fn find_box_by_name(name: &str) -> Option<u64> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         BOX_REGISTRY.lock().values().find(|b| b.name == name).map(|b| b.id)
     })
 }
@@ -170,7 +168,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     }
 
     // 1. Write to the legacy StdioBuffer (for procfs visibility)
-    proc.stdin.lock().write_with_limit(data, crate::config::PROC_STDIN_MAX_SIZE);
+    proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
     
     // 2. If the process has a ProcessChannel, write to it so the process actually 
     // receives the input in sys_read/sys_poll_input_event.
@@ -180,16 +178,16 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
         // 3. Wake up the process if it's waiting for input in sys_poll_input_event
         crate::threading::disable_preemption();
         if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(64, "[Process] Waking PID {}\n", pid);
+            if config().syscall_debug_info_enabled {
+                log::debug!("[Process] Waking PID {}", pid);
             }
             waker.wake();
             // Ensure scheduler runs to pick up the newly ready process
-            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+            (runtime().trigger_sgi)(0);
         } else {
             // Even if no waker is registered, we should still trigger SGI
             // to ensure the process gets a chance to poll soon.
-            crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+            (runtime().trigger_sgi)(0);
         }
         crate::threading::enable_preemption();
     }
@@ -223,7 +221,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
         allowed = true; // Same box
     } else if let Some(pid) = caller_pid {
         // Check if caller created the target's box (child box)
-        let box_info = crate::irq::with_irqs_disabled(|| {
+        let box_info = with_irqs_disabled(|| {
             BOX_REGISTRY.lock().get(&target_box_id).cloned()
         });
         if let Some(info) = box_info {
@@ -252,8 +250,8 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
         target.channel = channel;
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Reattached (caller={:?}) -> PID {}\n", caller_pid, target_pid);
+    if config().syscall_debug_info_enabled {
+        log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);
     }
 
     Ok(())
@@ -272,7 +270,7 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     }
 
     // 1. Get list of PIDs in this box
-    let pids: Vec<Pid> = crate::irq::with_irqs_disabled(|| {
+    let pids: Vec<Pid> = with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
         table.iter()
             .filter(|(_, proc)| proc.box_id == box_id)
@@ -500,7 +498,7 @@ pub static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<Laz
 
 /// Register a process in the table (takes ownership)
 pub fn register_process(pid: Pid, proc: Box<Process>) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_TABLE.lock().insert(pid, proc);
     })
 }
@@ -510,7 +508,7 @@ pub fn register_process(pid: Pid, proc: Box<Process>) {
 /// Returns the owned Process so it can be dropped, freeing all memory
 /// including the UserAddressSpace and all its physical pages.
 pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_TABLE.lock().remove(&pid)
     })
 }
@@ -581,7 +579,7 @@ impl ProcessChannel {
         let mut kernel_copy = Vec::with_capacity(data.len());
         kernel_copy.extend_from_slice(data);
 
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if config().syscall_debug_info_enabled {
             let sn_len = kernel_copy.len().min(32);
             let mut snippet = [0u8; 32];
             let n = sn_len.min(snippet.len());
@@ -590,11 +588,11 @@ impl ProcessChannel {
                 if *byte < 32 || *byte > 126 { *byte = b'.'; }
             }
             let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-            crate::safe_print!(128, "[ProcessChannel] Write {} bytes to stdout \"{}\"\n", kernel_copy.len(), snippet_str);
+            log::debug!("[ProcessChannel] Write {} bytes to stdout \"{}\"", kernel_copy.len(), snippet_str);
         }
 
         // CRITICAL: Disable IRQs while holding the lock!
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             
             // Check for buffer overflow
@@ -622,7 +620,7 @@ impl ProcessChannel {
     /// Read available data from the channel (non-blocking)
     /// Returns None if no data is available
     pub fn try_read(&self) -> Option<Vec<u8>> {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             if buf.is_empty() {
                 None
@@ -635,14 +633,14 @@ impl ProcessChannel {
     /// Read available data from the channel into a buffer
     /// Returns number of bytes read
     pub fn read(&self, buf: &mut [u8]) -> usize {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut buffer = self.buffer.lock();
             let to_read = buf.len().min(buffer.len());
             for (i, byte) in buffer.drain(..to_read).enumerate() {
                 buf[i] = byte;
             }
-            if to_read > 0 && crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[ProcessChannel] Read {} bytes from stdout\n", to_read);
+            if to_read > 0 && config().syscall_debug_info_enabled {
+                log::debug!("[ProcessChannel] Read {} bytes from stdout", to_read);
             }
             to_read
         })
@@ -650,7 +648,7 @@ impl ProcessChannel {
 
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             buf.drain(..).collect()
         })
@@ -658,7 +656,7 @@ impl ProcessChannel {
 
     /// Write data to stdin buffer (SSH -> process)
     pub fn write_stdin(&self, data: &[u8]) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut buf = self.stdin_buffer.lock();
             
             // Check for buffer overflow
@@ -684,7 +682,7 @@ impl ProcessChannel {
     /// Read from stdin buffer (process reads from SSH input)
     /// Returns number of bytes read into buf
     pub fn read_stdin(&self, buf: &mut [u8]) -> usize {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut stdin = self.stdin_buffer.lock();
             let to_read = buf.len().min(stdin.len());
             for (i, byte) in stdin.drain(..to_read).enumerate() {
@@ -696,14 +694,14 @@ impl ProcessChannel {
 
     /// Check if stdin has data available
     pub fn has_stdin_data(&self) -> bool {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             !self.stdin_buffer.lock().is_empty()
         })
     }
 
     /// Clear all pending data from the stdin buffer
     pub fn flush_stdin(&self) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.stdin_buffer.lock().clear();
         })
     }
@@ -766,49 +764,49 @@ static TERMINAL_STATES: Spinlock<alloc::collections::BTreeMap<usize, Arc<Spinloc
 
 /// Register a process channel for a thread
 pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().insert(thread_id, channel);
     })
 }
 
 /// Register a terminal state for a thread
 pub fn register_terminal_state(thread_id: usize, state: Arc<Spinlock<terminal::TerminalState>>) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         TERMINAL_STATES.lock().insert(thread_id, state);
     })
 }
 
 /// Register a process channel for a system thread (one that doesn't have a Process struct)
 pub fn register_system_thread_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().insert(thread_id, channel);
     });
 }
 
 /// Get the process channel for a thread (if any)
 pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().get(&thread_id).cloned()
     })
 }
 
 /// Get the terminal state for a thread (if any)
 pub fn get_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         TERMINAL_STATES.lock().get(&thread_id).cloned()
     })
 }
 
 /// Remove and return the process channel for a thread
 pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         PROCESS_CHANNELS.lock().remove(&thread_id)
     })
 }
 
 /// Remove and return the terminal state for a thread
 pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         TERMINAL_STATES.lock().remove(&thread_id)
     })
 }
@@ -825,28 +823,28 @@ static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, (Arc<ProcessCh
 
 /// Register a child process channel (called when spawning via syscall)
 pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         CHILD_CHANNELS.lock().insert(child_pid, (channel, parent_pid));
     })
 }
 
 /// Get a child process channel by PID
 pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         CHILD_CHANNELS.lock().get(&child_pid).map(|(ch, _)| ch.clone())
     })
 }
 
 /// Remove a child process channel (called when child exits or parent closes FD)
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
     })
 }
 
 /// Find any exited child of the given parent. Returns (child_pid, channel).
 pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let channels = CHILD_CHANNELS.lock();
         for (&child_pid, (ch, ppid)) in channels.iter() {
             if *ppid == parent_pid && ch.has_exited() {
@@ -859,7 +857,7 @@ pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> 
 
 /// Check if the given parent has any children registered.
 pub fn has_children(parent_pid: Pid) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         CHILD_CHANNELS.lock().values().any(|(_, ppid)| *ppid == parent_pid)
     })
 }
@@ -934,7 +932,7 @@ pub fn read_current_pid() -> Option<Pid> {
 /// Returns a mutable reference to the process if found.
 /// SAFETY: The caller must ensure no other code is mutating the process.
 pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let mut table = PROCESS_TABLE.lock();
         table.get_mut(&pid).map(|boxed| {
             // SAFETY: We return a 'static reference because:
@@ -952,7 +950,7 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
 /// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
 pub fn current_process() -> Option<&'static mut Process> {
     let tid = crate::threading::current_thread_id();
-    let thread_pid = crate::irq::with_irqs_disabled(|| {
+    let thread_pid = with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().get(&tid).copied()
     });
     if let Some(pid) = thread_pid {
@@ -984,7 +982,7 @@ pub fn alloc_mmap(size: usize) -> usize {
     let proc = match lookup_process(pid) {
         Some(p) => p,
         None => {
-            console::print("[mmap] ERROR: No current process\n");
+            (runtime().print_str)("[mmap] ERROR: No current process\n");
             return 0;
         }
     };
@@ -993,7 +991,7 @@ pub fn alloc_mmap(size: usize) -> usize {
     match proc.memory.alloc_mmap(size) {
         Some(addr) => addr,
         None => {
-            crate::safe_print!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+            log::debug!("[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}",
                 proc.pid, size, proc.memory.next_mmap, proc.memory.mmap_limit);
             0
         }
@@ -1025,7 +1023,7 @@ pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
 /// The source is cloned so the caller can release the table lock before performing I/O.
 pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
     let pid = read_current_pid()?;
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
             for r in regions {
@@ -1040,7 +1038,7 @@ pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> 
 
 /// Like lazy_region_lookup but takes an explicit PID (for tests and non-current-process use).
 pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
             for r in regions {
@@ -1055,18 +1053,19 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
 
 pub fn lazy_region_debug(va: usize) {
     let pid = read_current_pid().unwrap_or(0);
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            crate::tprint!(256, "[DP] lazy miss: pid={} va={:#x} regions={} [",
-                pid, va, regions.len());
+            let mut s = alloc::format!("[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
             for (i, r) in regions.iter().enumerate() {
-                if i > 0 { crate::safe_print!(8, ","); }
-                crate::safe_print!(64, "{:#x}-{:#x}", r.start_va, r.start_va + r.size);
+                if i > 0 { s.push(','); }
+                use core::fmt::Write;
+                let _ = write!(s, "{:#x}-{:#x}", r.start_va, r.start_va + r.size);
             }
-            crate::safe_print!(8, "]\n");
+            s.push(']');
+            log::debug!("{}", s);
         } else {
-            crate::tprint!(64, "[DP] lazy miss: pid={} va={:#x} no entry in table\n", pid, va);
+            log::debug!("[DP] lazy miss: pid={} va={:#x} no entry in table", pid, va);
         }
     });
 }
@@ -1076,7 +1075,7 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
 }
 
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
-    let len = crate::irq::with_irqs_disabled(|| {
+    let len = with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.entry(pid).or_insert_with(Vec::new);
         regions.push(LazyRegion { start_va, size, flags: page_flags, source });
@@ -1089,7 +1088,7 @@ pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page
 /// Called by sys_mprotect so demand paging uses the correct permissions.
 pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
     let range_end = range_start + range_size;
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
             for r in regions.iter_mut() {
@@ -1103,7 +1102,7 @@ pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize,
 }
 
 pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
-    let result = crate::irq::with_irqs_disabled(|| {
+    let result = with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
             if let Some(idx) = regions.iter().position(|r| r.start_va == start_va) {
@@ -1140,7 +1139,7 @@ pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usiz
 /// Uses overlap check rather than containment check, so it finds regions that
 /// start within the range even if range_start is in a gap between regions.
 fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
-    let result = crate::irq::with_irqs_disabled(|| {
+    let result = with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.get_mut(&pid)?;
 
@@ -1183,7 +1182,7 @@ fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize
     });
 
     if let Some((op, freed_start, freed_pages)) = result {
-        crate::tprint!(128, "[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)\n",
+        log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
             op as char, pid, freed_start, freed_pages * 4096, freed_pages);
         Some((freed_start, freed_pages))
     } else {
@@ -1192,25 +1191,25 @@ fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize
 }
 
 pub fn clear_lazy_regions(pid: Pid) {
-    let count = crate::irq::with_irqs_disabled(|| {
+    let count = with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         let count = table.get(&pid).map_or(0, |r| r.len());
         table.remove(&pid);
         count
     });
     if count > 0 {
-        crate::tprint!(64, "[LR!] clear pid={} ({} regions)\n", pid, count);
+        log::debug!("[LR!] clear pid={} ({} regions)", pid, count);
     }
 }
 
 pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&from_pid) {
             let cloned = regions.clone();
             let len = cloned.len();
             table.insert(to_pid, cloned);
-            crate::tprint!(64, "[LR] clone pid={}->{} ({} regions)\n", from_pid, to_pid, len);
+            log::debug!("[LR] clone pid={}->{} ({} regions)", from_pid, to_pid, len);
         }
     });
 }
@@ -1267,7 +1266,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
     // Take a quick snapshot while holding lock with IRQs disabled
     // to prevent deadlock if timer fires while holding PROCESS_TABLE lock.
     // We collect data into a local Vec while locked, then return it.
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
         let mut result = Vec::new();
 
@@ -1296,7 +1295,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
 ///
 /// Returns the PID of the process running on the given thread, if any.
 pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
         for (&pid, proc) in table.iter() {
             if proc.thread_id == Some(thread_id) {
@@ -1643,7 +1642,7 @@ fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
     const MIN_HEAP: usize = 16 * 1024 * 1024;
     const RESERVE_PAGES: usize = 2048; // 8MB
 
-    let (_, _, free) = crate::pmm::stats();
+    let (_, _, free) = (runtime().pmm_stats)();
     let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
     let va_cap = memory.next_mmap.saturating_sub(brk);
 
@@ -1654,12 +1653,12 @@ impl Process {
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
-            elf_loader::load_elf_with_stack(elf_data, args, env, config::USER_STACK_SIZE)?;
+            elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
-        let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
-        crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData, pid);
 
         address_space
             .map_page(
@@ -1673,7 +1672,7 @@ impl Process {
 
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
-        crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+        log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
 
         // Initialize FD table with stdin/stdout/stderr pre-allocated
@@ -1728,7 +1727,7 @@ impl Process {
             delegate_pid: None,
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
-            start_time_us: crate::timer::uptime_us(),
+            start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
 })
     }
@@ -1736,14 +1735,13 @@ impl Process {
     /// Create a process from a large ELF file on disk, loading segments on demand.
     pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
         {
-            let stats = crate::allocator::stats();
-            crate::safe_print!(192, "[Process] heap before ELF load: {}MB / {}MB ({}%), allocs={}\n",
-                stats.allocated / 1024 / 1024, stats.heap_size / 1024 / 1024,
-                if stats.heap_size > 0 { stats.allocated * 100 / stats.heap_size } else { 0 },
-                stats.allocation_count);
+            let (allocated, heap_size) = (runtime().heap_stats)();
+            log::debug!("[Process] heap before ELF load: {}MB / {}MB ({}%)",
+                allocated / 1024 / 1024, heap_size / 1024 / 1024,
+                if heap_size > 0 { allocated * 100 / heap_size } else { 0 });
         }
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
-            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config::USER_STACK_SIZE)?;
+            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
@@ -1761,8 +1759,8 @@ impl Process {
             push_lazy_region_with_source(pid, seg.start_va, seg.size, seg.page_flags, source);
         }
 
-        let process_info_frame = crate::pmm::alloc_page_zeroed().ok_or(ElfError::OutOfMemory)?;
-        crate::pmm::track_frame(process_info_frame, crate::pmm::FrameSource::UserData, pid);
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData, pid);
 
         address_space
             .map_page(
@@ -1776,7 +1774,7 @@ impl Process {
 
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
-        crate::safe_print!(160, "[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}\n",
+        log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
 
         let mut fd_map = alloc::collections::BTreeMap::new();
@@ -1822,7 +1820,7 @@ impl Process {
             delegate_pid: None,
             clear_child_tid: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
-            start_time_us: crate::timer::uptime_us(),
+            start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
 })
     }
@@ -1830,7 +1828,7 @@ impl Process {
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) = 
-            crate::elf_loader::load_elf_with_stack(elf_data, args, env, crate::config::USER_STACK_SIZE)
+            crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size)
             .map_err(|_| "Failed to load ELF")?;
             
         mmu::UserAddressSpace::deactivate();
@@ -1849,8 +1847,8 @@ impl Process {
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
         
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(160, "[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+        if config().syscall_debug_info_enabled {
+            log::debug!("[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
                 self.pid, entry_point, brk, stack_bottom, stack_top, sp);
         }
 
@@ -1858,8 +1856,8 @@ impl Process {
         self.context = UserContext::new(entry_point, sp);
         
         // Re-write process info page in the NEW address space
-        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
-        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData, self.pid);
         
         self.address_space
             .map_page(
@@ -1887,7 +1885,7 @@ impl Process {
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
-            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, crate::config::USER_STACK_SIZE)
+            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size)
             .map_err(|_| "Failed to load ELF")?;
 
         mmu::UserAddressSpace::deactivate();
@@ -1920,15 +1918,15 @@ impl Process {
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
 
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(160, "[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}\n",
+        if config().syscall_debug_info_enabled {
+            log::debug!("[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
                 self.pid, entry_point, brk, stack_bottom, stack_top, sp);
         }
 
         self.context = UserContext::new(entry_point, sp);
 
-        let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
-        pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, self.pid);
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData, self.pid);
 
         self.address_space
             .map_page(
@@ -2003,7 +2001,7 @@ impl Process {
     /// Set stdin data for this process (with size limit)
     pub fn set_stdin(&mut self, data: &[u8]) {
         let mut stdin = self.stdin.lock();
-        stdin.set_with_limit(data, config::PROC_STDIN_MAX_SIZE);
+        stdin.set_with_limit(data, config().proc_stdin_max_size);
     }
 
     /// Read from this process's stdin
@@ -2019,7 +2017,7 @@ impl Process {
     /// PROC_STDOUT_MAX_SIZE, clears buffer before writing.
     pub fn write_stdout(&mut self, data: &[u8]) {
         let mut stdout = self.stdout.lock();
-        stdout.write_with_limit(data, config::PROC_STDOUT_MAX_SIZE);
+        stdout.write_with_limit(data, config().proc_stdout_max_size);
     }
 
     /// Take captured stdout (transfers ownership)
@@ -2070,7 +2068,7 @@ impl Process {
     /// This is the correct pattern to avoid race conditions:
     /// the FD number is allocated and inserted while holding the lock.
     pub fn alloc_fd(&self, entry: FileDescriptor) -> u32 {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut table = self.fd_table.lock();
             let fd = self.next_fd.fetch_add(1, Ordering::SeqCst);
             table.insert(fd, entry);
@@ -2082,21 +2080,21 @@ impl Process {
     ///
     /// Returns a clone of the entry to avoid holding the lock.
     pub fn get_fd(&self, fd: u32) -> Option<FileDescriptor> {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.fd_table.lock().get(&fd).cloned()
         })
     }
 
     /// Remove and return a file descriptor entry
     pub fn remove_fd(&self, fd: u32) -> Option<FileDescriptor> {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.fd_table.lock().remove(&fd)
         })
     }
 
     /// Set a file descriptor entry at a specific FD number, replacing any existing entry
     pub fn set_fd(&self, fd: u32, entry: FileDescriptor) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.fd_table.lock().insert(fd, entry);
         });
     }
@@ -2106,7 +2104,7 @@ impl Process {
     where
         F: FnOnce(&mut FileDescriptor),
     {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let mut table = self.fd_table.lock();
             if let Some(entry) = table.get_mut(&fd) {
                 f(entry);
@@ -2118,44 +2116,44 @@ impl Process {
     }
 
     pub fn set_cloexec(&self, fd: u32) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.cloexec_fds.lock().insert(fd);
         });
     }
 
     pub fn clear_cloexec(&self, fd: u32) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.cloexec_fds.lock().remove(&fd);
         });
     }
 
     pub fn is_cloexec(&self, fd: u32) -> bool {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.cloexec_fds.lock().contains(&fd)
         })
     }
 
     pub fn set_nonblock(&self, fd: u32) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.nonblock_fds.lock().insert(fd);
         });
     }
 
     pub fn clear_nonblock(&self, fd: u32) {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.nonblock_fds.lock().remove(&fd);
         });
     }
 
     pub fn is_nonblock(&self, fd: u32) -> bool {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             self.nonblock_fds.lock().contains(&fd)
         })
     }
 
     /// Close all FDs marked close-on-exec, returning them for cleanup.
     pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
-        crate::irq::with_irqs_disabled(|| {
+        with_irqs_disabled(|| {
             let cloexec: Vec<u32> = self.cloexec_fds.lock().iter().copied().collect();
             let mut closed = Vec::new();
             let mut table = self.fd_table.lock();
@@ -2175,7 +2173,7 @@ impl Drop for Process {
         // Free any remaining dynamically allocated page table frames
         // This handles the case where the process is dropped without execute() being called
         for frame in self.dynamic_page_tables.drain(..) {
-            crate::pmm::free_page(frame);
+            (runtime().free_page)(frame);
         }
     }
 }
@@ -2186,7 +2184,7 @@ impl Drop for Process {
 /// Does not return.
 #[inline(never)]
 #[allow(dead_code)]
-pub(crate) unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
+pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     // SAFETY: This inline asm sets up CPU state and ERETs to user mode.
     // x30 is pinned as the context pointer and loaded last to avoid corruption.
     unsafe {
@@ -2240,6 +2238,7 @@ pub(crate) unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
 /// When return_to_kernel() calls unregister_process(), the Box is returned
 /// and dropped, calling Process::drop() -> UserAddressSpace::drop() which
 /// frees all physical pages (code, data, stack, heap, page tables).
+#[allow(dead_code)]
 fn execute_boxed(mut process: Box<Process>) -> ! {
     // Prepare the process (set state, write process info page)
     process.prepare_for_execution();
@@ -2267,7 +2266,7 @@ fn execute_boxed(mut process: Box<Process>) -> ! {
     proc_ref.address_space.activate();
 
     // Now safe to enable IRQs - TTBR0 is set to user tables
-    crate::irq::enable_irqs();
+    (runtime().enable_irqs)();
 
     // Enter user mode via ERET - this never returns
     // When user calls exit(), the exception handler calls return_to_kernel()
@@ -2302,7 +2301,7 @@ pub extern "C" fn check_process_exit() -> bool {
 /// Used by exit_group and when the address-space owner exits to prevent
 /// sibling threads from running with freed page tables.
 pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
-    let siblings: Vec<(Pid, Option<usize>)> = crate::irq::with_irqs_disabled(|| {
+    let siblings: Vec<(Pid, Option<usize>)> = with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
         table.iter()
             .filter(|(pid, proc)| **pid != my_pid && proc.address_space.l0_phys() == l0_phys)
@@ -2317,7 +2316,7 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
         clear_lazy_regions(*sib_pid);
 
         if let Some(tid) = sib_tid {
-            crate::irq::with_irqs_disabled(|| {
+            with_irqs_disabled(|| {
                 THREAD_PID_MAP.lock().remove(tid);
             });
             if let Some(channel) = remove_channel(*tid) {
@@ -2333,7 +2332,7 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
     }
 
     if !siblings.is_empty() {
-        crate::safe_print!(128, "[Process] Killed {} sibling thread(s) for PID {}\n",
+        log::debug!("[Process] Killed {} sibling thread(s) for PID {}",
             siblings.len(), my_pid);
     }
 }
@@ -2344,7 +2343,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let lr: u64;
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
     let tid = crate::threading::current_thread_id();
-    crate::safe_print!(128, "[RTK] code={} tid={} LR={:#x}\n", exit_code, tid, lr);
+    log::debug!("[RTK] code={} tid={} LR={:#x}", exit_code, tid, lr);
     
     // Check if this thread was already killed externally (by kill_process).
     // If so, cleanup has already been done - just skip to the yield loop.
@@ -2377,7 +2376,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
     
     // Clean up THREAD_PID_MAP entry for thread clones
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().remove(&tid);
     });
 
@@ -2388,7 +2387,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             let tid_addr = proc.clear_child_tid;
             if tid_addr != 0 {
                 unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
-                crate::syscall::futex_wake(tid_addr as usize, i32::MAX);
+                (runtime().futex_wake)(tid_addr as usize, i32::MAX);
             }
         }
     }
@@ -2408,17 +2407,17 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     if let Some(pid) = pid {
         // Check if this was a primary process for an active box.
         // If so, the entire box should be shut down.
-        let box_to_kill = crate::irq::with_irqs_disabled(|| {
+        let box_to_kill = with_irqs_disabled(|| {
             BOX_REGISTRY.lock().values()
                 .find(|b| b.primary_pid == pid && b.id != 0)
                 .map(|b| b.id)
         });
 
         if let Some(bid) = box_to_kill {
-            crate::safe_print!(128, "[Process] Primary PID {} exited, shutting down box {:08x}\n", pid, bid);
+            log::debug!("[Process] Primary PID {} exited, shutting down box {:08x}", pid, bid);
             // kill_box handles unregistering the box and killing remaining PIDs
             if let Err(e) = kill_box(bid) {
-                crate::safe_print!(128, "[Process] Error: Failed to kill box {:08x}: {}\n", bid, e);
+                log::debug!("[Process] Error: Failed to kill box {:08x}: {}", bid, e);
             }
         }
 
@@ -2433,15 +2432,15 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         }
 
         let start_us = lookup_process(pid).map(|p| p.start_time_us).unwrap_or(0);
-        let elapsed_us = crate::timer::uptime_us().saturating_sub(start_us);
+        let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000; // centiseconds
 
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
-        crate::tprint!(128, "[Process] PID {} thread {} exited ({}) [{}.{:02}s]\n", pid, tid, exit_code, secs, frac);
+        log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
     } else {
-        crate::safe_print!(64, "[Process] Thread {} exited ({})\n", tid, exit_code);
+        log::debug!("[Process] Thread {} exited ({})", tid, exit_code);
     }
     
     // Mark thread as terminated so scheduler stops scheduling it
@@ -2467,19 +2466,19 @@ fn cleanup_process_fds(proc: &Process) {
     for fd in fds {
         match fd {
             FileDescriptor::Socket(idx) => {
-                akuma_net::socket::remove_socket(idx);
+                (runtime().remove_socket)(idx);
             }
             FileDescriptor::ChildStdout(child_pid) => {
-                crate::process::remove_child_channel(child_pid);
+                remove_child_channel(child_pid);
             }
             FileDescriptor::PipeWrite(pipe_id) => {
-                crate::syscall::pipe_close_write(pipe_id);
+                (runtime().pipe_close_write)(pipe_id);
             }
             FileDescriptor::PipeRead(pipe_id) => {
-                crate::syscall::pipe_close_read(pipe_id);
+                (runtime().pipe_close_read)(pipe_id);
             }
             FileDescriptor::EventFd(efd_id) => {
-                crate::syscall::eventfd_close(efd_id);
+                (runtime().eventfd_close)(efd_id);
             }
             _ => {}
         }
@@ -2562,7 +2561,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Mark the thread as terminated so scheduler stops scheduling it
     crate::threading::mark_thread_terminated(thread_id);
     
-    crate::safe_print!(64, "[kill] Killed PID {} (thread {})\n", pid, thread_id);
+    log::debug!("[kill] Killed PID {} (thread {})", pid, thread_id);
     
     Ok(())
 }
@@ -2587,8 +2586,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
     
     // 2. Allocate process info page
-    let process_info_frame = pmm::alloc_page_zeroed().ok_or("OOM process info")?;
-    pmm::track_frame(process_info_frame, pmm::FrameSource::UserData, child_pid);
+    let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
+    (runtime().track_frame)(process_info_frame, FrameSource::UserData, child_pid);
     
     new_address_space
         .map_page(
@@ -2626,8 +2625,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
                 match entry {
-                    FileDescriptor::PipeWrite(id) => crate::syscall::pipe_clone_ref(*id, true),
-                    FileDescriptor::PipeRead(id) => crate::syscall::pipe_clone_ref(*id, false),
+                    FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
+                    FileDescriptor::PipeRead(id) => (runtime().pipe_clone_ref)(*id, false),
                     _ => {}
                 }
             }
@@ -2645,13 +2644,13 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         delegate_pid: None,
         clear_child_tid: 0,
         signal_actions: parent.signal_actions,
-            start_time_us: crate::timer::uptime_us(),
+            start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
 });
     
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top;
-    let stack_size = config::USER_STACK_SIZE; 
+    let stack_size = config().user_stack_size; 
     let stack_start = stack_top - stack_size;
     
     // Snapshot parent's L0 page table pointer so we can translate VAs to
@@ -2678,8 +2677,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 copied += 1;
             }
         }
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED && copied < pages {
-            crate::safe_print!(160, "[fork] copy_range WARNING: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)\n",
+        if config().syscall_debug_info_enabled && copied < pages {
+            log::debug!("[fork] copy_range WARNING: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)",
                 src_va, src_va + len, copied, pages, pages - copied);
         }
         Ok(())
@@ -2712,23 +2711,23 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // copied pages to avoid OOM when a parent has huge file mappings.
     const MAX_FORK_MMAP_PAGES: usize = 2048; // 8 MB cap
     let mut total_copied_pages: usize = 0;
-    let mut child_mmap_regions: Vec<(usize, Vec<pmm::PhysFrame>)> = Vec::new();
+    let mut child_mmap_regions: Vec<(usize, Vec<PhysFrame>)> = Vec::new();
 
     for (va_start, parent_frames) in &parent.mmap_regions {
         if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap\n",
+            if config().syscall_debug_info_enabled {
+                log::debug!("[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap",
                     va_start, parent_frames.len());
             }
             continue;
         }
-        let mut child_frames: Vec<pmm::PhysFrame> = Vec::new();
+        let mut child_frames: Vec<PhysFrame> = Vec::new();
         let mut ok = true;
         for (i, pf) in parent_frames.iter().enumerate() {
             let page_va = va_start + i * mmu::PAGE_SIZE;
-            match pmm::alloc_page_zeroed() {
+            match (runtime().alloc_page_zeroed)() {
                 Some(frame) => {
-                    pmm::track_frame(frame, pmm::FrameSource::UserData, child_pid);
+                    (runtime().track_frame)(frame, FrameSource::UserData, child_pid);
                     unsafe {
                         let src = mmu::phys_to_virt(pf.addr) as *const u8;
                         let dst = mmu::phys_to_virt(frame.addr);
@@ -2748,8 +2747,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             total_copied_pages += child_frames.len();
             child_mmap_regions.push((*va_start, child_frames));
         } else {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[fork] OOM copying mmap region 0x{:x}, skipping rest\n", va_start);
+            if config().syscall_debug_info_enabled {
+                log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);
             }
             break;
         }
@@ -2782,7 +2781,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     // 7. Allocate thread but keep it INITIALIZING
     let tid = crate::threading::spawn_user_thread_initializing(
-        crate::process::entry_point_trampoline as extern "C" fn() -> !, 
+        entry_point_trampoline as extern "C" fn() -> !, 
         core::ptr::null_mut(), 
         false
     )?;
@@ -2845,8 +2844,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
             let cloned = parent.fd_table.lock().clone();
             for entry in cloned.values() {
                 match entry {
-                    FileDescriptor::PipeWrite(id) => crate::syscall::pipe_clone_ref(*id, true),
-                    FileDescriptor::PipeRead(id) => crate::syscall::pipe_clone_ref(*id, false),
+                    FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
+                    FileDescriptor::PipeRead(id) => (runtime().pipe_clone_ref)(*id, false),
                     _ => {}
                 }
             }
@@ -2864,7 +2863,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
         signal_actions: parent.signal_actions,
-            start_time_us: crate::timer::uptime_us(),
+            start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
 });
 
@@ -2893,7 +2892,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     register_child_channel(child_pid, exit_channel, parent_pid);
 
     // Register in THREAD_PID_MAP so current_process() works for this thread
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(tid, child_pid);
     });
 
@@ -2911,8 +2910,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
 
     crate::threading::mark_thread_ready(tid);
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone_thread: PID {} -> thread PID {} (tid {})\n", parent_pid, child_pid, tid);
+    if config().syscall_debug_info_enabled {
+        log::debug!("[syscall] clone_thread: PID {} -> thread PID {} (tid {})", parent_pid, child_pid, tid);
     }
 
     Ok(child_pid)
@@ -2929,7 +2928,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
     let mut proc_ptr: *mut Process = core::ptr::null_mut();
     
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let mut processes = PROCESS_TABLE.lock();
         for proc in processes.values_mut() {
             if proc.thread_id == Some(tid) {
@@ -2940,7 +2939,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     });
     
     if proc_ptr.is_null() {
-        crate::safe_print!(128, "[process] FATAL: No process found for thread {}\n", tid);
+        log::debug!("[process] FATAL: No process found for thread {}", tid);
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
     }
@@ -3085,7 +3084,7 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
-    let resolved = crate::vfs::resolve_symlinks(path);
+    let resolved = (runtime().resolve_symlinks)(path);
     let elf_path = &resolved;
 
     // Prepare full arguments (argv[0] = original path so busybox-style
@@ -3105,13 +3104,13 @@ pub fn spawn_process_with_channel_ext(
 
     // Try to read the ELF file; for large files that exceed the in-memory
     // limit, fall back to on-demand loading via read_at().
-    let mut process = match crate::fs::read_file(elf_path) {
+    let mut process = match (runtime().read_file)(elf_path) {
         Ok(elf_data) => {
             Process::from_elf(elf_path, &full_args, &full_env, &elf_data)
                 .map_err(|e| format!("Failed to load ELF: {}", e))?
         }
         Err(_) => {
-            let file_size = crate::vfs::file_size(elf_path)
+            let file_size = (runtime().file_size)(elf_path)
                 .map_err(|e| format!("Failed to stat {}: {}", elf_path, e))? as usize;
             Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env)
                 .map_err(|e| format!("Failed to load ELF: {}", e))?
@@ -3138,8 +3137,8 @@ pub fn spawn_process_with_channel_ext(
 
     // Inherit terminal state from caller if available
     if let Some(shared_state) = current_terminal_state() {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[Process] Inheriting shared terminal state at {:p} for PID {}\n", Arc::as_ptr(&shared_state), process.pid);
+        if config().syscall_debug_info_enabled {
+            log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }
         process.terminal_state = shared_state;
         
@@ -3148,8 +3147,8 @@ pub fn spawn_process_with_channel_ext(
         let pid_to_delegate = process.pid;
         process.terminal_state.lock().foreground_pgid = pid_to_delegate;
     } else {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[Process] NO shared terminal state found for caller thread {}, using default for PID {}\n", crate::threading::current_thread_id(), process.pid);
+        if config().syscall_debug_info_enabled {
+            log::debug!("[Process] NO shared terminal state found for caller thread {}, using default for PID {}", crate::threading::current_thread_id(), process.pid);
         }
     }
 
@@ -3196,8 +3195,8 @@ pub fn spawn_process_with_channel_ext(
         process.box_id = caller_box_id;
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[Process] Spawning {} (box_id={}, root_dir={})\n", path, process.box_id, process.root_dir);
+    if config().syscall_debug_info_enabled {
+        log::debug!("[Process] Spawning {} (box_id={}, root_dir={})", path, process.box_id, process.root_dir);
     }
 
     // Set spawner PID (the process that called spawn, if any)
@@ -3234,7 +3233,7 @@ pub fn spawn_process_with_channel_ext(
             // Execute the process (already in the table)
             run_registered_process(pid);
         } else {
-            crate::safe_print!(64, "[Process] FATAL: PID {} disappeared during spawn\n", pid);
+            log::debug!("[Process] FATAL: PID {} disappeared during spawn", pid);
             loop { crate::threading::yield_now(); }
         }
     })
@@ -3259,7 +3258,7 @@ fn run_registered_process(pid: Pid) -> ! {
     proc.address_space.activate();
 
     // Now safe to enable IRQs - TTBR0 is set to user tables
-    crate::irq::enable_irqs();
+    (runtime().enable_irqs)();
 
     // Enter user mode via ERET - this never returns
     unsafe {

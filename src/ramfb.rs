@@ -73,7 +73,7 @@ pub fn init(width: u32, height: u32) -> Result<(), &'static str> {
             return Err("failed to allocate framebuffer memory");
         }
         // Identity mapping: virtual address == physical address
-        crate::mmu::virt_to_phys(ptr as usize)
+        akuma_exec::mmu::virt_to_phys(ptr as usize)
     };
 
     // Build the configuration structure (all fields big-endian)
@@ -136,7 +136,7 @@ pub fn draw(src: &[u8]) -> usize {
     }
 
     // Copy pixels to framebuffer (identity-mapped, so phys == virt)
-    let fb_ptr = crate::mmu::phys_to_virt(fb_addr) as *mut u8;
+    let fb_ptr = akuma_exec::mmu::phys_to_virt(fb_addr) as *mut u8;
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), fb_ptr, copy_len);
     }

@@ -609,4 +609,117 @@ A dedicated pass is needed to:
    These should be modernized to match the workspace lint level.
 
 4. **Crates to review:** `akuma-net`, `akuma-ssh`, `akuma-shell`,
-   `akuma-ssh-crypto`, `akuma-terminal`, `akuma-vfs`, `akuma-ext2`.
+   `akuma-ssh-crypto`, `akuma-terminal`, `akuma-vfs`, `akuma-ext2`,
+   `akuma-exec`.
+
+---
+
+## `akuma-exec` Crate Extraction (completed)
+
+Extracted the core execution subsystem (~7,900 lines) from the kernel into
+`crates/akuma-exec/`. This is the hardest extraction — threading and process
+management are deeply coupled to every kernel subsystem.
+
+### What moved to the crate
+
+| Module | Contents | Lines |
+|--------|----------|-------|
+| `threading.rs` | Thread pool, scheduler, context switch, preemption, wakers | ~3,100 |
+| `process.rs` | Process table, fork, clone, exec, lazy regions, FD table | ~3,400 |
+| `mmu.rs` | Page tables, `UserAddressSpace`, TLB management, ASID allocator | ~820 |
+| `elf_loader.rs` | ELF parser + loader, demand loading, dynamic linker | ~1,070 |
+
+### What stayed in the kernel
+
+- `src/exceptions.rs` — Exception vectors, IRQ dispatch (uses `akuma_exec::threading::UserTrapFrame`)
+- `src/syscall.rs` — Syscall handler (calls `akuma_exec::process::*` and `akuma_exec::threading::*`)
+- `src/irq.rs`, `src/timer.rs`, `src/gic.rs` — Hardware interrupt handling
+- `src/pmm.rs` — Physical memory manager (re-exports `akuma_exec::PhysFrame`)
+- `src/allocator.rs` — Heap allocator
+- `src/config.rs` — Kernel configuration constants
+- `src/vfs/`, `src/fs.rs` — Virtual filesystem
+- `src/shell/`, `src/ssh/` — Shell and SSH (import from `akuma_exec`)
+
+### Key design decisions
+
+1. **`ExecRuntime` function pointer struct.** All kernel dependencies are
+   abstracted via a struct of ~25 function pointers:
+   ```rust
+   pub struct ExecRuntime {
+       pub uptime_us: fn() -> u64,
+       pub disable_irqs: fn(),
+       pub enable_irqs: fn(),
+       pub end_of_interrupt: fn(u32),
+       pub trigger_sgi: fn(u32),
+       pub alloc_page_zeroed: fn() -> Option<PhysFrame>,
+       pub free_page: fn(PhysFrame),
+       pub track_frame: fn(PhysFrame, FrameSource, u32),
+       pub read_file: fn(&str) -> Result<Vec<u8>, i32>,
+       pub remove_socket: fn(usize),
+       // ... and more
+   }
+   ```
+
+2. **`ExecConfig` for constants.** Kernel configuration constants
+   (`MAX_THREADS`, `USER_STACK_SIZE`, `ENABLE_STACK_CANARIES`, etc.) are
+   passed as a separate `ExecConfig` struct rather than function pointers,
+   since they're compile-time values. One exception: `MAX_THREADS` is also
+   defined as a `const` in threading.rs for static array sizes.
+
+3. **`PhysFrame` canonical definition in `akuma-exec`.** The `PhysFrame`
+   and `FrameSource` types are defined in `akuma_exec::runtime` and
+   re-exported by `akuma_exec`. The kernel's `pmm.rs` uses
+   `pub use akuma_exec::{PhysFrame, FrameSource}` instead of defining its own.
+
+4. **`UserTrapFrame` defined in akuma-exec.** The `UserTrapFrame` struct
+   (saved user register state) moved to `akuma_exec::threading` since
+   threading.rs needs it. The kernel's `exceptions.rs` re-exports it:
+   `pub use akuma_exec::threading::UserTrapFrame`.
+
+5. **`set_current_exception_stack` moved to akuma-exec.** This function
+   writes TPIDR_EL1 via inline assembly. Since threading.rs calls it during
+   context switch, it's defined locally in the crate rather than adding a
+   runtime callback.
+
+6. **Socket/pipe/eventfd cleanup via callbacks.** Process cleanup calls
+   `remove_socket`, `pipe_close_write`, `pipe_close_read`, `eventfd_close`
+   etc. via `ExecRuntime` callbacks, keeping `akuma-exec` independent of
+   `akuma-net` and the kernel's pipe/eventfd subsystems.
+
+7. **IRQ guard in runtime.** `IrqGuard` (RAII IRQ disable) and
+   `with_irqs_disabled()` are defined in `akuma_exec::runtime` using the
+   `ExecRuntime` callbacks. All four moved modules use these instead of
+   `crate::irq::*`.
+
+### Host-runnable tests
+
+**Blocked.** The crate is `no_std` and uses `global_asm!` for AArch64
+context switch assembly. Attempting `cargo test -p akuma-exec` fails with:
+
+```
+error[E0463]: can't find crate for `test`
+error: no global memory allocator found
+error: `#[panic_handler]` function required, but not found
+```
+
+The `no_std` environment lacks a test harness, global allocator, and panic
+handler. On the user's ARM Mac (aarch64-apple-darwin), the assembly would
+compile, but privileged EL1 instructions (`msr ttbr0_el1`, `eret`) would
+fault at runtime anyway. Making this testable would require:
+
+- A `#[cfg(test)]` allocator + panic handler
+- Extensive `#[cfg(test)]` stubs for all privileged instructions
+- Mock implementations of `ExecRuntime` callbacks
+
+This is a significant effort better deferred to a dedicated task. The crate
+is verified via QEMU integration testing instead.
+
+### Verification
+
+- `cargo clippy -p akuma-exec -- -D warnings` — clean
+- `cargo build --release` — succeeds
+- QEMU boot:
+  - All kernel self-tests pass (memory, threading, process, shell, network)
+  - SSH login works
+  - `bun --version` returns `1.2.21`
+  - `curl https://ifconfig.me/ip` returns an IP address

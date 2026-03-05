@@ -47,6 +47,7 @@ akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
 akuma-net = { path = "crates/akuma-net" }
+akuma-exec = { path = "crates/akuma-exec" }
 talc = "4"
 spinning_top = "0.3"
 # hashbrown without ahash (ahash requires CPU crypto extensions)
@@ -73,8 +74,6 @@ critical-section = { version = "1.2", default-features = false }
 
 embedded-io-async = { version = "0.6", default-features = false }
 
-# ELF parser (no_std)
-elf = { version = "0.7", default-features = false }
 
 # TLS support (no_std compatible)
 # Using fork with exposed handshake/extensions modules for custom TlsVerifier

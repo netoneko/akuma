@@ -57,7 +57,7 @@ impl Uart {
 }
 
 /// Global UART instance at remapped VA (physical 0x0900_0000 via L0[1])
-static UART: Uart = Uart::new(crate::mmu::DEV_UART_VA);
+static UART: Uart = Uart::new(akuma_exec::mmu::DEV_UART_VA);
 
 // ============================================================================
 // Public API - Safe wrappers around UART operations

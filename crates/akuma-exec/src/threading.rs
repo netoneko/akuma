@@ -5,15 +5,77 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use alloc::sync::Arc; // Added
 use alloc::format;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
-// Use the shared IRQ guard from the irq module
-use crate::config;
-use crate::irq::with_irqs_disabled;
+use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
+
+/// Compile-time constant for static array sizes (must match ExecConfig::max_threads).
+pub const MAX_THREADS: usize = 32;
+
+/// Set the current exception stack pointer (TPIDR_EL1).
+#[inline]
+pub fn set_current_exception_stack(stack_top: u64) {
+    unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top); }
+}
+
+/// User trap frame saved by the EL0 sync/IRQ handler.
+#[repr(C)]
+pub struct UserTrapFrame {
+    pub x0: u64, pub x1: u64, pub x2: u64, pub x3: u64,
+    pub x4: u64, pub x5: u64, pub x6: u64, pub x7: u64,
+    pub x8: u64, pub x9: u64, pub x10: u64, pub x11: u64,
+    pub x12: u64, pub x13: u64, pub x14: u64, pub x15: u64,
+    pub x16: u64, pub x17: u64, pub x18: u64, pub x19: u64,
+    pub x20: u64, pub x21: u64, pub x22: u64, pub x23: u64,
+    pub x24: u64, pub x25: u64, pub x26: u64, pub x27: u64,
+    pub x28: u64, pub x29: u64, pub x30: u64,
+    pub sp_el0: u64,
+    pub elr_el1: u64,
+    pub spsr_el1: u64,
+    pub tpidr_el0: u64,
+    pub _padding: u64,
+}
+
+/// Stack-based writer for formatting without heap allocation.
+struct StackWriter<const N: usize> {
+    buf: [u8; N],
+    pos: usize,
+}
+
+impl<const N: usize> StackWriter<N> {
+    const fn new() -> Self {
+        Self { buf: [0; N], pos: 0 }
+    }
+    fn flush(&mut self) {
+        if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
+            (runtime().print_str)(s);
+        }
+        self.pos = 0;
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackWriter<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = N - self.pos;
+        let len = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
+        self.pos += len;
+        Ok(())
+    }
+}
+
+macro_rules! safe_print {
+    ($size:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut writer = StackWriter::<$size>::new();
+        let _ = write!(writer, $($arg)*);
+        writer.flush();
+    }};
+}
 
 // ============================================================================
 // Lock-Free Thread State Management
@@ -31,35 +93,35 @@ pub mod thread_state {
 
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
-static THREAD_STATES: [AtomicU8; config::MAX_THREADS] = {
+static THREAD_STATES: [AtomicU8; MAX_THREADS] = {
     const INIT: AtomicU8 = AtomicU8::new(thread_state::FREE);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Per-thread current trap frame pointer (set during EL0 sync handler)
 /// Used by fork to capture full register state from the parent's trap frame.
-static CURRENT_TRAP_FRAME: [AtomicU64; config::MAX_THREADS] = {
+static CURRENT_TRAP_FRAME: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Atomic wake times for WAITING threads - scheduler checks these
 /// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
-static WAKE_TIMES: [AtomicU64; config::MAX_THREADS] = {
+static WAKE_TIMES: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Atomic total CPU time in microseconds for each thread
-static TOTAL_CPU_TIMES: [AtomicU64; config::MAX_THREADS] = {
+static TOTAL_CPU_TIMES: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Atomic "sticky wake" flags - set when wake() is called, cleared when thread resumes
-static WOKEN_STATES: [AtomicBool; config::MAX_THREADS] = {
+static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Current running thread - stored in TPIDRRO_EL0 register
@@ -87,10 +149,10 @@ fn get_current_thread_register() -> usize {
     }
     let tid = val as usize;
     // Bounds check - if corrupted, halt immediately
-    if tid >= config::MAX_THREADS {
+    if tid >= MAX_THREADS {
         // Log corruption and halt - we cannot safely continue
         safe_print!(256, "[FATAL] TPIDRRO_EL0 CORRUPT: tid=0x{:x} >= MAX_THREADS ({})\nSystem halted - cannot determine current thread\n", 
-            val, config::MAX_THREADS);
+            val, MAX_THREADS);
         loop {
             unsafe { core::arch::asm!("wfi"); }
         }
@@ -122,23 +184,23 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
 }
 
 /// Per-thread termination timestamp (for cooldown tracking)
-static TERMINATION_TIME: [AtomicU64; config::MAX_THREADS] = {
+static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Mark a thread as terminated (lock-free)
 pub fn mark_thread_terminated(idx: usize) {
-    if idx != IDLE_THREAD_IDX && idx < config::MAX_THREADS {
+    if idx != IDLE_THREAD_IDX && idx < MAX_THREADS {
         // Record termination time for cooldown tracking
-        TERMINATION_TIME[idx].store(crate::timer::uptime_us(), Ordering::SeqCst);
+        TERMINATION_TIME[idx].store((runtime().uptime_us)(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);
     }
 }
 
 /// Mark a thread as ready (lock-free)
 pub fn mark_thread_ready(idx: usize) {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         THREAD_STATES[idx].store(thread_state::READY, Ordering::SeqCst);
     }
 }
@@ -169,7 +231,7 @@ impl ThreadPool {
     ) -> Result<usize, &'static str> {
         if !self.initialized { return Err("Thread pool not initialized"); }
 
-        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+        for i in config().reserved_threads..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // Claim the slot atomically
                 if THREAD_STATES[i].compare_exchange(thread_state::FREE, thread_state::INITIALIZING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -215,14 +277,14 @@ impl ThreadPool {
 
 /// Mark a thread as running (lock-free)
 fn mark_thread_running(idx: usize) {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         THREAD_STATES[idx].store(thread_state::RUNNING, Ordering::SeqCst);
     }
 }
 
 /// Mark a thread as waiting with a wake time (lock-free)
 fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         WAKE_TIMES[idx].store(wake_time_us, Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::WAITING, Ordering::SeqCst);
     }
@@ -230,7 +292,7 @@ fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
 
 /// Get thread wake time (lock-free read)
 fn get_wake_time(idx: usize) -> u64 {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         WAKE_TIMES[idx].load(Ordering::Relaxed)
     } else {
         0
@@ -239,7 +301,7 @@ fn get_wake_time(idx: usize) -> u64 {
 
 /// Get thread state (lock-free read)
 pub fn get_thread_state(idx: usize) -> u8 {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         THREAD_STATES[idx].load(Ordering::SeqCst)
     } else {
         thread_state::FREE
@@ -253,7 +315,7 @@ pub fn is_thread_terminated(thread_id: usize) -> bool {
 
 /// Get total CPU time for a thread in microseconds
 pub fn get_thread_cpu_time(idx: usize) -> u64 {
-    if idx < config::MAX_THREADS {
+    if idx < MAX_THREADS {
         let mut total = TOTAL_CPU_TIMES[idx].load(Ordering::Relaxed);
         
         // If the thread is currently running, add the time since it started
@@ -263,7 +325,7 @@ pub fn get_thread_cpu_time(idx: usize) -> u64 {
                 pool.slots[idx].start_time_us
             });
             if start_time > 0 {
-                let now = crate::timer::uptime_us();
+                let now = (runtime().uptime_us)();
                 total += now.saturating_sub(start_time);
             }
         }
@@ -299,7 +361,7 @@ pub fn cleanup_terminated_force() -> usize {
 /// Internal cleanup implementation
 fn cleanup_terminated_internal(force: bool) -> usize {
     // In deferred mode (unless forced), only allow cleanup from thread 0
-    if !force && config::DEFERRED_THREAD_CLEANUP {
+    if !force && config().deferred_thread_cleanup {
         let current = get_current_thread_register();
         if current != IDLE_THREAD_IDX {
             // Not main thread - skip cleanup
@@ -307,19 +369,19 @@ fn cleanup_terminated_internal(force: bool) -> usize {
         }
     }
     
-    let now = crate::timer::uptime_us();
+    let now = (runtime().uptime_us)();
     let mut count = 0;
     
-    for i in 1..config::MAX_THREADS {
+    for i in 1..MAX_THREADS {
         // Check if thread is terminated
         if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::TERMINATED {
             continue;
         }
         
         // In deferred mode (unless forced), check cooldown period
-        if !force && config::DEFERRED_THREAD_CLEANUP {
+        if !force && config().deferred_thread_cleanup {
             let term_time = TERMINATION_TIME[i].load(Ordering::SeqCst);
-            if term_time > 0 && now.saturating_sub(term_time) < config::THREAD_CLEANUP_COOLDOWN_US {
+            if term_time > 0 && now.saturating_sub(term_time) < config().thread_cleanup_cooldown_us {
                 // Thread hasn't been terminated long enough - skip
                 continue;
             }
@@ -360,7 +422,7 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // if a timer fires while we hold the lock, the SGI handler will try to
             // acquire the same lock and spin forever (single CPU = deadlock).
             {
-                let _guard = crate::irq::IrqGuard::new();
+                let _guard = IrqGuard::new();
                 
                 // Zero the context in THREAD_CONTEXTS
                 unsafe {
@@ -375,11 +437,11 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             }
             
             // Re-initialize canary for reuse
-            if config::ENABLE_STACK_CANARIES {
+            if config().enable_stack_canaries {
                 // Must disable IRQs when acquiring POOL lock to prevent deadlock
                 // if timer fires - SGI handler would try to acquire the same lock
                 let stack_base = {
-                    let _guard = crate::irq::IrqGuard::new();
+                    let _guard = IrqGuard::new();
                     POOL.lock().stacks[i].base
                 };
                 if stack_base != 0 {
@@ -406,16 +468,16 @@ fn cleanup_terminated_internal(force: bool) -> usize {
 /// Per-thread preemption disable counters.
 /// Each thread has its own counter to track nested disable_preemption() calls.
 /// This prevents one thread's preemption state from affecting another thread.
-static PREEMPTION_DISABLED: [AtomicUsize; config::MAX_THREADS] = {
+static PREEMPTION_DISABLED: [AtomicUsize; MAX_THREADS] = {
     const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Per-thread timestamp (in microseconds) when preemption was last disabled.
 /// Used by the watchdog to detect stuck threads.
-static PREEMPTION_DISABLED_SINCE: [AtomicU64; config::MAX_THREADS] = {
+static PREEMPTION_DISABLED_SINCE: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Track last time we ran the watchdog check (for detecting time jumps)
@@ -444,7 +506,7 @@ pub fn disable_preemption() {
     let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
     // Record timestamp on first disable (nesting level 0 -> 1)
     if prev == 0 {
-        PREEMPTION_DISABLED_SINCE[tid].store(crate::timer::uptime_us(), Ordering::Release);
+        PREEMPTION_DISABLED_SINCE[tid].store((runtime().uptime_us)(), Ordering::Release);
     }
 }
 
@@ -476,7 +538,7 @@ pub fn is_preemption_disabled() -> bool {
 /// - Some(duration_us): preemption disabled for this many microseconds
 pub fn check_preemption_watchdog() -> Option<u64> {
     let tid = get_current_thread_register();
-    let now = crate::timer::uptime_us();
+    let now = (runtime().uptime_us)();
     
     // Detect time jumps (host sleep/wake)
     let last_check = LAST_WATCHDOG_CHECK_US.swap(now, Ordering::SeqCst);
@@ -926,9 +988,9 @@ impl SyncContext {
 
 /// Per-thread CPU contexts - accessed without POOL lock
 /// Safety: Access only when IRQs are masked and thread state is valid
-static THREAD_CONTEXTS: [SyncContext; config::MAX_THREADS] = {
+static THREAD_CONTEXTS: [SyncContext; MAX_THREADS] = {
     const INIT: SyncContext = SyncContext::new();
-    [INIT; config::MAX_THREADS]
+    [INIT; MAX_THREADS]
 };
 
 /// Get a mutable pointer to a thread's context
@@ -1042,8 +1104,8 @@ impl ThreadSlot {
 
 /// Fixed-size thread pool with per-thread stack sizes
 pub struct ThreadPool {
-    slots: [ThreadSlot; config::MAX_THREADS],
-    stacks: [StackInfo; config::MAX_THREADS],
+    slots: [ThreadSlot; MAX_THREADS],
+    stacks: [StackInfo; MAX_THREADS],
     current_idx: usize,
     initialized: bool,
     /// Counter for proportional scheduling of thread 0
@@ -1058,8 +1120,8 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub const fn new() -> Self {
         Self {
-            slots: [const { ThreadSlot::empty() }; config::MAX_THREADS],
-            stacks: [const { StackInfo::empty() }; config::MAX_THREADS],
+            slots: [const { ThreadSlot::empty() }; MAX_THREADS],
+            stacks: [const { StackInfo::empty() }; MAX_THREADS],
             current_idx: 0,
             initialized: false,
             network_boost_counter: 0,
@@ -1084,7 +1146,7 @@ impl ThreadPool {
         THREAD_STATES[IDLE_THREAD_IDX].store(thread_state::RUNNING, Ordering::SeqCst);
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
-        self.slots[IDLE_THREAD_IDX].start_time_us = crate::timer::uptime_us();
+        self.slots[IDLE_THREAD_IDX].start_time_us = (runtime().uptime_us)();
         
         // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
         unsafe {
@@ -1102,11 +1164,11 @@ impl ThreadPool {
         // Boot stack info (fixed location from boot.rs)
         // The boot stack was already in use before threading init, starting at
         // 0x42000000 and growing down. We CANNOT reserve space at the top.
-        let boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
+        let _boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
         let boot_stack_base = 0x41F00000usize; // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             boot_stack_base,
-            config::KERNEL_STACK_SIZE,
+            config().kernel_stack_size,
         );
         
         // Allocate a SEPARATE exception stack for thread 0 (boot thread).
@@ -1126,23 +1188,23 @@ impl ThreadPool {
         // exceptions::init() set it to 0x42000000 (boot stack top) initially,
         // but we've now allocated a proper exception stack from the heap.
         // Without this, the first IRQ would use the wrong exception stack pointer.
-        crate::exceptions::set_current_exception_stack(self.slots[IDLE_THREAD_IDX].exception_stack_top);
+        set_current_exception_stack(self.slots[IDLE_THREAD_IDX].exception_stack_top);
         
         // Initialize canary for boot stack
-        if config::ENABLE_STACK_CANARIES {
+        if config().enable_stack_canaries {
             init_stack_canary(boot_stack_base);
         }
 
         // Threads 1 to RESERVED_THREADS-1: System threads with large stacks (256KB)
         // Used for shell, SSH sessions, async executor, etc.
-        for i in 1..config::RESERVED_THREADS {
-            self.allocate_stack_for_slot(i, config::SYSTEM_THREAD_STACK_SIZE);
+        for i in 1..config().reserved_threads {
+            self.allocate_stack_for_slot(i, config().system_thread_stack_size);
         }
 
         // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (128KB)
         // Used for running user processes
-        for i in config::RESERVED_THREADS..config::MAX_THREADS {
-            self.allocate_stack_for_slot(i, config::USER_THREAD_STACK_SIZE);
+        for i in config().reserved_threads..MAX_THREADS {
+            self.allocate_stack_for_slot(i, config().user_thread_stack_size);
         }
 
         self.initialized = true;
@@ -1165,7 +1227,7 @@ impl ThreadPool {
         let stack_info = StackInfo::new(stack_ptr as usize, size);
 
         // Initialize canary at bottom of stack
-        if config::ENABLE_STACK_CANARIES {
+        if config().enable_stack_canaries {
             init_stack_canary(stack_info.base);
         }
 
@@ -1181,7 +1243,7 @@ impl ThreadPool {
         if slot_idx == 0 {
             return Err("Cannot reallocate boot stack");
         }
-        if slot_idx >= config::MAX_THREADS {
+        if slot_idx >= MAX_THREADS {
             return Err("Invalid slot index");
         }
         if THREAD_STATES[slot_idx].load(Ordering::SeqCst) != thread_state::FREE {
@@ -1204,7 +1266,7 @@ impl ThreadPool {
 
         // Check for overlaps with other stacks
         let new_stack = &self.stacks[slot_idx];
-        for i in 0..config::MAX_THREADS {
+        for i in 0..MAX_THREADS {
             if i != slot_idx && new_stack.overlaps(&self.stacks[i]) {
                 // This shouldn't happen with heap allocation, but check anyway
                 return Err("New stack overlaps with existing stack");
@@ -1220,7 +1282,7 @@ impl ThreadPool {
         entry: extern "C" fn() -> !,
         cooperative: bool,
     ) -> Result<usize, &'static str> {
-        self.spawn_with_stack_size(entry, config::DEFAULT_THREAD_STACK_SIZE, cooperative)
+        self.spawn_with_stack_size(entry, config().default_thread_stack_size, cooperative)
     }
 
     /// Spawn a new thread with extern "C" entry function and custom stack size
@@ -1235,7 +1297,7 @@ impl ThreadPool {
         }
 
         // Find first free slot (skip slot 0 = idle)
-        for i in 1..config::MAX_THREADS {
+        for i in 1..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // Reallocate stack if size differs
                 if self.stacks[i].size != stack_size {
@@ -1315,14 +1377,14 @@ impl ThreadPool {
         }
 
         // Only search in system thread range (skip thread 0 = boot/async)
-        for i in 1..config::RESERVED_THREADS {
+        for i in 1..config().reserved_threads {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // System thread stacks should be pre-allocated at correct size
                 // If not, something corrupted them (bug in spawn_closure_with_stack_size)
                 debug_assert!(
-                    self.stacks[i].size == config::SYSTEM_THREAD_STACK_SIZE,
+                    self.stacks[i].size == config().system_thread_stack_size,
                     "System thread {} has wrong stack size: {} (expected {})",
-                    i, self.stacks[i].size, config::SYSTEM_THREAD_STACK_SIZE
+                    i, self.stacks[i].size, config().system_thread_stack_size
                 );
                 
                 let stack = &self.stacks[i];
@@ -1394,13 +1456,13 @@ impl ThreadPool {
         }
 
         // Only search in user thread range
-        for i in config::RESERVED_THREADS..config::MAX_THREADS {
+        for i in config().reserved_threads..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // User thread stacks should be pre-allocated at correct size
                 debug_assert!(
-                    self.stacks[i].size == config::USER_THREAD_STACK_SIZE,
+                    self.stacks[i].size == config().user_thread_stack_size,
                     "User thread {} has wrong stack size: {} (expected {})",
-                    i, self.stacks[i].size, config::USER_THREAD_STACK_SIZE
+                    i, self.stacks[i].size, config().user_thread_stack_size
                 );
                 
                 let stack = &self.stacks[i];
@@ -1418,7 +1480,7 @@ impl ThreadPool {
                     0,                                          // x21 - enable IRQs
                 );
                 
-                crate::safe_print!(96, "[spawn_user] tid={} stack_top={:#x} irq_sp={:#x}\n",
+                safe_print!(96, "[spawn_user] tid={} stack_top={:#x} irq_sp={:#x}\n",
                     i, stack_top, sp);
 
                 // Write minimal context
@@ -1455,12 +1517,12 @@ impl ThreadPool {
 
     /// Reclaim a terminated thread slot (just mark as Free)
     pub fn reclaim(&mut self, idx: usize) {
-        if idx > 0 && idx < config::MAX_THREADS && 
+        if idx > 0 && idx < MAX_THREADS && 
            THREAD_STATES[idx].load(Ordering::SeqCst) == thread_state::TERMINATED
         {
             THREAD_STATES[idx].store(thread_state::FREE, Ordering::SeqCst);
             // Re-initialize canary for reuse
-            if config::ENABLE_STACK_CANARIES && self.stacks[idx].is_allocated() {
+            if config().enable_stack_canaries && self.stacks[idx].is_allocated() {
                 init_stack_canary(self.stacks[idx].base);
             }
         }
@@ -1469,11 +1531,11 @@ impl ThreadPool {
     /// Clean up all terminated threads
     pub fn cleanup_terminated(&mut self) -> usize {
         let mut count = 0;
-        for i in 1..config::MAX_THREADS {
+        for i in 1..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::TERMINATED {
                 THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
                 // Re-initialize canary for reuse
-                if config::ENABLE_STACK_CANARIES && self.stacks[i].is_allocated() {
+                if config().enable_stack_canaries && self.stacks[i].is_allocated() {
                     init_stack_canary(self.stacks[i].base);
                 }
                 count += 1;
@@ -1506,7 +1568,7 @@ impl ThreadPool {
         if !voluntary && current.cooperative && current_state == thread_state::RUNNING {
             let timeout = current.timeout_us;
             if timeout > 0 && current.start_time_us > 0 {
-                let now = crate::timer::uptime_us();
+                let now = (runtime().uptime_us)();
                 let elapsed = now.saturating_sub(current.start_time_us);
                 if elapsed < timeout {
                     return None;
@@ -1521,7 +1583,7 @@ impl ThreadPool {
         // This gives thread 0 a 1/N share of CPU time (e.g., 25% with ratio=4).
         if current_idx != 0 {
             self.network_boost_counter += 1;
-            if self.network_boost_counter >= config::NETWORK_THREAD_RATIO {
+            if self.network_boost_counter >= config().network_thread_ratio {
                 self.network_boost_counter = 0;
                 let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
                 if thread0_state == thread0_state { // Always true, just to keep structure
@@ -1531,7 +1593,7 @@ impl ThreadPool {
                             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                         }
                         THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
-                        let now = crate::timer::uptime_us();
+                        let now = (runtime().uptime_us)();
                         self.slots[0].start_time_us = now;
                         set_current_thread_register(0);
                         self.current_idx = 0;
@@ -1543,9 +1605,9 @@ impl ThreadPool {
         // If current_idx == 0 or counter hasn't reached ratio, use round-robin below
 
         // First pass: Wake any WAITING threads whose wake time has passed
-        let now = crate::timer::uptime_us();
+        let now = (runtime().uptime_us)();
         let mut woke_any = false;
-        for i in 0..config::MAX_THREADS {
+        for i in 0..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
                 let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
                 if wake_time > 0 && now >= wake_time {
@@ -1565,7 +1627,7 @@ impl ThreadPool {
         // This ensures fair rotation through ALL threads, not just starting from current.
         // Without this, threads 10, 11 would never run if 8, 9 are always ready and
         // the scheduler always runs from a low-numbered system thread.
-        let mut next_idx = (self.round_robin_idx + 1) % config::MAX_THREADS;
+        let mut next_idx = (self.round_robin_idx + 1) % MAX_THREADS;
         let start_idx = next_idx;
 
         loop {
@@ -1579,7 +1641,7 @@ impl ThreadPool {
                 }
             }
 
-            next_idx = (next_idx + 1) % config::MAX_THREADS;
+            next_idx = (next_idx + 1) % MAX_THREADS;
 
             if next_idx == start_idx {
                 // Wrapped around without finding a different ready thread
@@ -1595,7 +1657,7 @@ impl ThreadPool {
         // Don't change state if thread is TERMINATED or WAITING
         // WAITING threads keep their state - scheduler handles wake time
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-        let now = crate::timer::uptime_us();
+        let now = (runtime().uptime_us)();
 
         // Accumulate CPU time for the thread being scheduled out
         if current.start_time_us > 0 {
@@ -1623,7 +1685,7 @@ impl ThreadPool {
         let mut running = 0;
         let mut terminated = 0;
         // Use atomic THREAD_STATES array (source of truth)
-        for i in 0..config::MAX_THREADS {
+        for i in 0..MAX_THREADS {
             match THREAD_STATES[i].load(Ordering::Relaxed) {
                 thread_state::READY => ready += 1,
                 thread_state::RUNNING => running += 1,
@@ -1636,7 +1698,7 @@ impl ThreadPool {
 
     pub fn thread_count(&self) -> usize {
         // Use atomic THREAD_STATES array (source of truth)
-        (0..config::MAX_THREADS)
+        (0..MAX_THREADS)
             .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
             .count()
     }
@@ -1664,8 +1726,8 @@ fn init_stack_canary(stack_base: usize) {
     }
     unsafe {
         let ptr = stack_base as *mut u64;
-        for i in 0..config::CANARY_WORDS {
-            ptr.add(i).write_volatile(config::STACK_CANARY);
+        for i in 0..config().canary_words {
+            ptr.add(i).write_volatile(config().stack_canary);
         }
     }
 }
@@ -1677,8 +1739,8 @@ fn check_stack_canary(stack_base: usize) -> bool {
     }
     unsafe {
         let ptr = stack_base as *const u64;
-        for i in 0..config::CANARY_WORDS {
-            if ptr.add(i).read_volatile() != config::STACK_CANARY {
+        for i in 0..config().canary_words {
+            if ptr.add(i).read_volatile() != config().stack_canary {
                 return false; // Corrupted!
             }
         }
@@ -1699,7 +1761,7 @@ pub fn init() {
     print_stack_requirements();
     
     // Verify stack memory fits in available heap
-    let heap_size = crate::allocator::stats().heap_size;
+    let heap_size = (runtime().heap_stats)().0;
     if let Err(msg) = verify_stack_memory(heap_size) {
         panic!("Stack allocation failed: {}", msg);
     }
@@ -1713,7 +1775,7 @@ pub fn init() {
     // Initialize atomic thread states to match ThreadPool state
     // Thread 0 is RUNNING (boot thread), all others are FREE
     THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
-    for i in 1..config::MAX_THREADS {
+    for i in 1..MAX_THREADS {
         THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
     }
     set_current_thread_register(0);  // Initialize CPU register for boot thread
@@ -1794,7 +1856,7 @@ where
 /// Kept for reference and potential fallback.
 #[allow(dead_code)]
 pub fn sgi_scheduler_handler(irq: u32) {
-    crate::gic::end_of_interrupt(irq);
+    (runtime().end_of_interrupt)(irq);
 
     let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
 
@@ -1817,14 +1879,14 @@ pub fn sgi_scheduler_handler(irq: u32) {
     };  // Lock released here - safe because contexts are in separate static array
 
     if let Some((old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)) = switch_info {
-        if config::ENABLE_SGI_DEBUG_PRINTS {
+        if config().enable_sgi_debug_prints {
             // Safe print without heap allocation (critical in IRQ context!)
             safe_print!(128, "[SGI] switching {} -> {}\n", old_idx, new_idx);
         }
         
         unsafe {
             // Verify stack canaries before switching (only if enabled)
-            if config::ENABLE_STACK_CANARIES {
+            if config().enable_stack_canaries {
                 if !check_stack_canary(old_stack_base) {
                     // Don't allocate in IRQ context!
                     safe_print!(128, "[CANARY] old thread stack corrupt\n");
@@ -1881,13 +1943,13 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // This check runs ALWAYS (not behind debug flag) since it's critical
             let new_x19 = new_ctx.x19;
             if new_saved_elr == 0 && new_idx != 0 {
-                crate::safe_print!(64, "[CTX BUG] tid={} ELR=0 x30={:#x}\n", new_idx, new_saved_x30);
+                safe_print!(64, "[CTX BUG] tid={} ELR=0 x30={:#x}\n", new_idx, new_saved_x30);
             }
             if new_x19 == 0 && new_idx != 0 {
-                crate::safe_print!(64, "[CTX BUG] tid={} x19=0 (trampoline)\n", new_idx);
+                safe_print!(64, "[CTX BUG] tid={} x19=0 (trampoline)\n", new_idx);
             }
             if new_saved_x30 == 0 && new_idx != 0 {
-                crate::safe_print!(64, "[CTX BUG] tid={} x30=0 (link reg)\n", new_idx);
+                safe_print!(64, "[CTX BUG] tid={} x30=0 (link reg)\n", new_idx);
             }
             
             // Check for context corruption
@@ -1897,7 +1959,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             // CRITICAL: System threads (0-7) should NEVER have user-mode SPSR!
             if new_idx < 8 && !is_new_thread && is_user_spsr {
                 // Don't allocate in IRQ context!
-                crate::console::print("[SGI CORRUPT] system thread has user SPSR - recovering\n");
+                (runtime().print_str)("[SGI CORRUPT] system thread has user SPSR - recovering\n");
                 // Try to recover by forcing kernel mode in SPSR
                 (*get_context_mut(new_idx)).spsr = 0x00000345; // EL1h, IRQs enabled
             }
@@ -1909,23 +1971,23 @@ pub fn sgi_scheduler_handler(irq: u32) {
                 
                 if is_user_elr && is_user_spsr && is_boot_ttbr0 {
                     // Don't allocate in IRQ context!
-                    crate::console::print("[SGI CORRUPT] user thread has boot TTBR0\n");
+                    (runtime().print_str)("[SGI CORRUPT] user thread has boot TTBR0\n");
                 }
             }
             
             // DEBUG: Log context info for user threads (always, to diagnose hang)
             if new_idx >= 8 {
-                crate::safe_print!(128, "[CTX] tid={} elr={:#x} spsr={:#x} ttbr0={:#x} sp={:#x} x19={:#x}\n",
+                safe_print!(128, "[CTX] tid={} elr={:#x} spsr={:#x} ttbr0={:#x} sp={:#x} x19={:#x}\n",
                     new_idx, new_saved_elr, new_saved_spsr, new_saved_ttbr0, new_ctx.sp, new_x19);
             }
             
             // Update exception stack BEFORE switching
-            crate::exceptions::set_current_exception_stack(new_tpidr);
+            set_current_exception_stack(new_tpidr);
             
             // Note: TPIDRRO_EL0 (thread ID) is already updated by schedule_indices
             
             // Debug: Print context SPs before switch AND actual SP register
-            if config::ENABLE_SGI_DEBUG_PRINTS {
+            if config().enable_sgi_debug_prints {
                 let actual_sp: u64;
                 core::arch::asm!("mov {}, sp", out(reg) actual_sp);
                 let new_sp = (*new_ptr).sp;
@@ -1942,12 +2004,10 @@ pub fn sgi_scheduler_handler(irq: u32) {
             core::arch::asm!("msr daifset, #2", options(nomem, nostack));
             
             // Debug: Print SP after return
-            if config::ENABLE_SGI_DEBUG_PRINTS {
+            if config().enable_sgi_debug_prints {
                 let current_sp: u64;
                 core::arch::asm!("mov {}, sp", out(reg) current_sp);
-                crate::console::print("[SGI] back, SP=0x");
-                crate::console::print_hex(current_sp);
-                crate::console::print("\n");
+                safe_print!(64, "[SGI] back, SP={:#x}\n", current_sp);
             }
             
             // Check for TTBR0/SPSR mismatch - detect context corruption early
@@ -1963,10 +2023,10 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             if returning_to_user && has_boot_ttbr0 {
                 // Don't allocate in IRQ context!
-                crate::console::print("[SGI DANGER] returning to EL0 with boot TTBR0\n");
+                (runtime().print_str)("[SGI DANGER] returning to EL0 with boot TTBR0\n");
             }
             
-            if config::ENABLE_SGI_DEBUG_PRINTS {
+            if config().enable_sgi_debug_prints {
                 // Add sequence number, SP, and x30 to help debug double-return issue
                 // Safe print without heap allocation (critical in IRQ context!)
                 static RETURN_SEQ: core::sync::atomic::AtomicU64 = 
@@ -1996,7 +2056,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
 /// Yield to another thread
 pub fn yield_now() {
     VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
-    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+    (runtime().trigger_sgi)(0);
 }
 
 /// SIMPLIFIED SGI handler for stack-based context switching
@@ -2005,7 +2065,7 @@ pub fn yield_now() {
 /// The assembly does the actual SP switch AFTER this function returns.
 /// This avoids the problem of switching SP in the middle of Rust code.
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
-    crate::gic::end_of_interrupt(irq);
+    (runtime().end_of_interrupt)(irq);
     
     let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
     
@@ -2019,8 +2079,8 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     };
     
     if let Some((old_idx, new_idx, new_tpidr)) = switch_info {
-        if config::ENABLE_SGI_DEBUG_PRINTS {
-            crate::safe_print!(64, "[SGI-S] {} -> {}\n", old_idx, new_idx);
+        if config().enable_sgi_debug_prints {
+            safe_print!(64, "[SGI-S] {} -> {}\n", old_idx, new_idx);
         }
         
         unsafe {
@@ -2043,12 +2103,12 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             
             // Verify new SP is valid
             if new_sp == 0 || new_sp < 0x4000_0000 {
-                crate::safe_print!(64, "[SGI-S FATAL] new_sp={:#x} invalid!\n", new_sp);
+                safe_print!(64, "[SGI-S FATAL] new_sp={:#x} invalid!\n", new_sp);
                 loop { core::arch::asm!("wfi"); }
             }
             
             // Update exception stack for new thread
-            crate::exceptions::set_current_exception_stack(new_tpidr);
+            set_current_exception_stack(new_tpidr);
             
             // Load TTBR0 for new thread
             let new_ttbr0 = (*new_ctx).ttbr0;
@@ -2062,8 +2122,8 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 ttbr0 = in(reg) new_ttbr0,
             );
             
-            if config::ENABLE_SGI_DEBUG_PRINTS {
-                crate::safe_print!(64, "[SGI-S] returning new_sp={:#x}\n", new_sp);
+            if config().enable_sgi_debug_prints {
+                safe_print!(64, "[SGI-S] returning new_sp={:#x}\n", new_sp);
             }
             
             // Return new SP - assembly will do the switch
@@ -2077,7 +2137,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 /// Update a thread's context for a new execution (e.g., after execve or fork)
 pub fn update_thread_context(thread_id: usize, user_context: &crate::process::UserContext) {
     // Disable IRQs to safely access context
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         unsafe {
             let ctx = &mut *get_context_mut(thread_id);
             
@@ -2134,7 +2194,7 @@ impl ThreadWaker {
     /// Wake the thread associated with this waker
     pub fn wake(&self) {
         let tid = self.thread_id;
-        if tid < config::MAX_THREADS {
+        if tid < MAX_THREADS {
             // Set sticky wake flag so schedule_blocking knows we were woken
             WOKEN_STATES[tid].store(true, Ordering::SeqCst);
 
@@ -2143,7 +2203,7 @@ impl ThreadWaker {
                 WAKE_TIMES[tid].store(0, Ordering::SeqCst);
                 THREAD_STATES[tid].store(thread_state::READY, Ordering::SeqCst);
                 // Trigger SGI to ensure scheduler runs and picks up the thread
-                crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+                (runtime().trigger_sgi)(0);
             }
         }
     }
@@ -2221,7 +2281,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
         return;
     }
 
-    let now = crate::timer::uptime_us();
+    let now = (runtime().uptime_us)();
     
     // Check if already past deadline - don't bother blocking
     if now >= wake_time_us {
@@ -2233,7 +2293,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
     if was_disabled {
         // Log this as it might be a sign of a bug (blocking while holding a lock)
         // but we'll allow it by temporarily enabling preemption.
-        // crate::safe_print!(64, "[threading] schedule_blocking called with preemption disabled (tid={})\n", tid);
+        // safe_print!(64, "[threading] schedule_blocking called with preemption disabled (tid={})\n", tid);
         
         // We MUST enable preemption here, otherwise the timer IRQ will acknowledge
         // but will NOT schedule another thread, leading to a hang in the wfi loop.
@@ -2278,7 +2338,7 @@ pub fn thread_stats() -> (usize, usize, usize) {
     let mut ready = 0;
     let mut running = 0;
     let mut terminated = 0;
-    for i in 0..config::MAX_THREADS {
+    for i in 0..MAX_THREADS {
         match THREAD_STATES[i].load(Ordering::Relaxed) {
             thread_state::READY => ready += 1,
             thread_state::RUNNING => running += 1,
@@ -2309,7 +2369,7 @@ pub fn thread_stats_full() -> ThreadStatsFull {
         initializing: 0,
         waiting: 0,
     };
-    for i in 0..config::MAX_THREADS {
+    for i in 0..MAX_THREADS {
         match THREAD_STATES[i].load(Ordering::Relaxed) {
             thread_state::FREE => stats.free += 1,
             thread_state::READY => stats.ready += 1,
@@ -2331,7 +2391,7 @@ pub fn cleanup_terminated() -> usize {
 /// Get active thread count
 pub fn thread_count() -> usize {
     // Lock-free: count non-free threads
-    (0..config::MAX_THREADS)
+    (0..MAX_THREADS)
         .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
         .count()
 }
@@ -2339,7 +2399,7 @@ pub fn thread_count() -> usize {
 /// Get stack info for a specific thread (base, top)
 /// Returns None if thread index is invalid
 pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
-    if tid >= config::MAX_THREADS {
+    if tid >= MAX_THREADS {
         return None;
     }
     // Disable IRQs to prevent deadlock if timer fires while we hold the lock
@@ -2371,7 +2431,7 @@ pub fn current_thread_id() -> usize {
 
 /// Get max thread count
 pub fn max_threads() -> usize {
-    config::MAX_THREADS
+    MAX_THREADS
 }
 
 // ============================================================================
@@ -2388,7 +2448,7 @@ where
     F: FnOnce() -> ! + Send + 'static,
 {
     // Step 1: Atomically claim a free slot (lock-free)
-    let slot_idx = match claim_free_slot(1, config::RESERVED_THREADS) {
+    let slot_idx = match claim_free_slot(1, config().reserved_threads) {
         Some(idx) => idx,
         None => return Err("No free system thread slots"),
     };
@@ -2422,7 +2482,7 @@ where
         );
         
         // Debug output
-        crate::safe_print!(128, "[spawn_system_fn SIMPLE] tid={} stack_top={:#x} irq_sp={:#x}\n",
+        safe_print!(128, "[spawn_system_fn SIMPLE] tid={} stack_top={:#x} irq_sp={:#x}\n",
             slot_idx, stack_top, sp);
 
         // Write minimal context - only SP and TTBR0 needed for simple path
@@ -2459,7 +2519,7 @@ where
 /// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_available() -> usize {
     // Lock-free: count free system thread slots
-    count_free_slots(1, config::RESERVED_THREADS)
+    count_free_slots(1, config().reserved_threads)
 }
 
 /// Count active system threads
@@ -2467,7 +2527,7 @@ pub fn system_threads_available() -> usize {
 /// Returns the number of non-free slots in the system thread range (1..RESERVED_THREADS).
 pub fn system_threads_active() -> usize {
     // Lock-free: count non-free system thread slots
-    (1..config::RESERVED_THREADS)
+    (1..config().reserved_threads)
         .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
         .count()
 }
@@ -2517,7 +2577,7 @@ where
     F: FnOnce() -> ! + Send + 'static,
 {
     // Step 1: Atomically claim a free slot (lock-free)
-    let slot_idx = match claim_free_slot(config::RESERVED_THREADS, config::MAX_THREADS) {
+    let slot_idx = match claim_free_slot(config().reserved_threads, MAX_THREADS) {
         Some(idx) => idx,
         None => return Err("No free user thread slots"),
     };
@@ -2591,7 +2651,7 @@ where
 /// Returns the number of free slots in the user thread range (RESERVED_THREADS..MAX_THREADS).
 pub fn user_threads_available() -> usize {
     // Lock-free: count free user thread slots
-    count_free_slots(config::RESERVED_THREADS, config::MAX_THREADS)
+    count_free_slots(config().reserved_threads, MAX_THREADS)
 }
 
 /// Count active user threads
@@ -2599,7 +2659,7 @@ pub fn user_threads_available() -> usize {
 /// Returns the number of non-free slots in the user thread range.
 pub fn user_threads_active() -> usize {
     // Lock-free: count non-free user thread slots
-    (config::RESERVED_THREADS..config::MAX_THREADS)
+    (config().reserved_threads..MAX_THREADS)
         .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
         .count()
 }
@@ -2608,7 +2668,7 @@ pub fn user_threads_active() -> usize {
 
 /// Get the state of a specific thread (for debugging) - LOCK-FREE
 pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
-    if thread_id >= config::MAX_THREADS {
+    if thread_id >= MAX_THREADS {
         return None;
     }
     let state = THREAD_STATES[thread_id].load(Ordering::Relaxed);
@@ -2624,9 +2684,9 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
 
 /// Save the current trap frame pointer for a thread.
 /// Called at the start of EL0 sync handler so fork can read full register state.
-pub fn set_current_trap_frame(frame: *const crate::exceptions::UserTrapFrame) {
+pub fn set_current_trap_frame(frame: *const UserTrapFrame) {
     let tid = current_thread_id();
-    if tid < config::MAX_THREADS {
+    if tid < MAX_THREADS {
         CURRENT_TRAP_FRAME[tid].store(frame as u64, Ordering::Release);
     }
 }
@@ -2634,7 +2694,7 @@ pub fn set_current_trap_frame(frame: *const crate::exceptions::UserTrapFrame) {
 /// Clear the current trap frame pointer for a thread.
 pub fn clear_current_trap_frame() {
     let tid = current_thread_id();
-    if tid < config::MAX_THREADS {
+    if tid < MAX_THREADS {
         CURRENT_TRAP_FRAME[tid].store(0, Ordering::Release);
     }
 }
@@ -2643,7 +2703,7 @@ pub fn clear_current_trap_frame() {
 /// Used by fork() to duplicate the parent's state.
 /// Reads from the live trap frame on the stack when available (captures all registers).
 pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
-    if thread_id >= config::MAX_THREADS {
+    if thread_id >= MAX_THREADS {
         return None;
     }
 
@@ -2651,12 +2711,12 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
     if thread_id == current_thread_id() {
         let frame_ptr = CURRENT_TRAP_FRAME[thread_id].load(Ordering::Acquire);
         if frame_ptr != 0 {
-            let frame = unsafe { &*(frame_ptr as *const crate::exceptions::UserTrapFrame) };
+            let frame = unsafe { &*(frame_ptr as *const UserTrapFrame) };
             let ctx = unsafe { &*get_context(thread_id) };
             let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() };
 
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
+            if config().syscall_debug_info_enabled {
+                safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
                     thread_id, frame.elr_el1, frame.sp_el0);
             }
             return Some(crate::process::UserContext {
@@ -2678,12 +2738,12 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
     }
     
     // Fallback to saved context fields (less accurate, no GP registers)
-    crate::irq::with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let ctx = unsafe { &*get_context(thread_id) };
         
         if ctx.is_user_process != 0 {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
+            if config().syscall_debug_info_enabled {
+                safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
             }
             Some(crate::process::UserContext {
                 pc: ctx.user_entry,
@@ -2697,8 +2757,8 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
                 x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
             })
         } else {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process\n", thread_id);
+            if config().syscall_debug_info_enabled {
+                safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process\n", thread_id);
             }
             None
         }
@@ -2737,15 +2797,15 @@ pub fn spawn_user_thread(
 /// Returns list of (thread_a, thread_b) pairs that overlap
 pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
     // Copy stack info while holding lock (quick), process outside
-    let stacks: [StackInfo; config::MAX_THREADS] = with_irqs_disabled(|| {
+    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| {
         let pool = POOL.lock();
         pool.stacks
     });
 
     // O(n²) check done outside critical section
     let mut overlaps = Vec::new();
-    for i in 0..config::MAX_THREADS {
-        for j in (i + 1)..config::MAX_THREADS {
+    for i in 0..MAX_THREADS {
+        for j in (i + 1)..MAX_THREADS {
             if stacks[i].overlaps(&stacks[j]) {
                 overlaps.push((i, j));
             }
@@ -2758,7 +2818,7 @@ pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
 pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
     with_irqs_disabled(|| {
         let pool = POOL.lock();
-        if thread_id < config::MAX_THREADS && pool.stacks[thread_id].is_allocated() {
+        if thread_id < MAX_THREADS && pool.stacks[thread_id].is_allocated() {
             Some((pool.stacks[thread_id].base, pool.stacks[thread_id].top))
         } else {
             None
@@ -2783,19 +2843,19 @@ pub fn validate_current_sp() -> bool {
 /// Check all thread stack canaries for corruption
 /// Returns list of thread IDs with corrupted canaries
 pub fn check_all_stack_canaries() -> Vec<usize> {
-    if !config::ENABLE_STACK_CANARIES {
+    if !config().enable_stack_canaries {
         return Vec::new();
     }
 
     // Copy stack info quickly while holding lock
-    let stacks: [StackInfo; config::MAX_THREADS] = with_irqs_disabled(|| {
+    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| {
         let pool = POOL.lock();
         pool.stacks
     });
 
     // Check canaries outside critical section (memory reads can be slow)
     let mut bad = Vec::new();
-    for i in 1..config::MAX_THREADS {
+    for i in 1..MAX_THREADS {
         if stacks[i].is_allocated() && !check_stack_canary(stacks[i].base) {
             bad.push(i);
         }
@@ -2806,7 +2866,7 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
 /// Check if there are any threads ready to run
 pub fn has_ready_threads() -> bool {
     // Use atomic THREAD_STATES array (lock-free)
-    (0..config::MAX_THREADS)
+    (0..MAX_THREADS)
         .any(|i| THREAD_STATES[i].load(Ordering::Relaxed) == thread_state::READY)
 }
 
@@ -2837,10 +2897,10 @@ pub struct KernelThreadInfo {
 
 /// Snapshot data copied from thread pool (to minimize IRQ-disabled time)
 struct ThreadPoolSnapshot {
-    states: [ThreadState; config::MAX_THREADS],
-    cooperative: [bool; config::MAX_THREADS],
-    sps: [u64; config::MAX_THREADS],
-    stacks: [StackInfo; config::MAX_THREADS],
+    states: [ThreadState; MAX_THREADS],
+    cooperative: [bool; MAX_THREADS],
+    sps: [u64; MAX_THREADS],
+    stacks: [StackInfo; MAX_THREADS],
 }
 
 /// Get list of all kernel threads with their info
@@ -2849,11 +2909,11 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
     let snapshot: ThreadPoolSnapshot = with_irqs_disabled(|| {
         let pool = POOL.lock();
         
-        let mut states = [ThreadState::Free; config::MAX_THREADS];
-        let mut cooperative = [false; config::MAX_THREADS];
-        let mut sps = [0u64; config::MAX_THREADS];
+        let mut states = [ThreadState::Free; MAX_THREADS];
+        let mut cooperative = [false; MAX_THREADS];
+        let mut sps = [0u64; MAX_THREADS];
         
-        for i in 0..config::MAX_THREADS {
+        for i in 0..MAX_THREADS {
             // Read state from atomic array (lock-free source of truth)
             states[i] = match THREAD_STATES[i].load(Ordering::Relaxed) {
                 thread_state::FREE => ThreadState::Free,
@@ -2880,7 +2940,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
     // Process snapshot outside critical section (Vec allocation, canary checks, etc.)
     let mut threads = Vec::new();
 
-    for i in 0..config::MAX_THREADS {
+    for i in 0..MAX_THREADS {
         // Skip free slots
         if snapshot.states[i] == ThreadState::Free {
             continue;
@@ -2911,7 +2971,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         // Check canary status (memory read, done outside lock)
         let canary_ok = if i == 0 || !stack.is_allocated() {
             true
-        } else if config::ENABLE_STACK_CANARIES {
+        } else if config().enable_stack_canaries {
             check_stack_canary(stack.base)
         } else {
             true
@@ -2920,7 +2980,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         // Thread name based on index range and state
         let name = match i {
             0 => "bootstrap",
-            1 => if crate::config::COOPERATIVE_MAIN_THREAD { "system-thread" } else { "network" },
+            1 => if config().cooperative_main_thread { "system-thread" } else { "network" },
             2..=7 => "system-thread",
             _ if snapshot.cooperative[i] => "cooperative",
             _ => "user-process",
@@ -2942,13 +3002,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
 }
 
 pub fn dump_stack_info() {
-    use crate::threading;
-    let threads = threading::list_kernel_threads();
+    let threads = list_kernel_threads();
 
     for t in threads {
         let size_kb = t.stack_size / 1024;
         let used_kb = t.stack_used / 1024;
-        crate::safe_print!(192, "Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb);
+        safe_print!(192, "Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb);
     }
 }
 
@@ -2995,27 +3054,27 @@ pub struct StackAllocationSummary {
 /// Note: Thread 0's boot stack is at a fixed address and doesn't count
 /// against heap memory, but is included for completeness.
 pub fn calculate_stack_requirements() -> StackAllocationSummary {
-    let system_thread_count = config::RESERVED_THREADS - 1; // Threads 1 to RESERVED_THREADS-1
-    let user_thread_count = config::MAX_THREADS - config::RESERVED_THREADS;
+    let system_thread_count = config().reserved_threads - 1; // Threads 1 to RESERVED_THREADS-1
+    let user_thread_count = MAX_THREADS - config().reserved_threads;
     
-    let system_total = system_thread_count * config::SYSTEM_THREAD_STACK_SIZE;
-    let user_total = user_thread_count * config::USER_THREAD_STACK_SIZE;
+    let system_total = system_thread_count * config().system_thread_stack_size;
+    let user_total = user_thread_count * config().user_thread_stack_size;
     
     // Boot stack is at fixed location, not from heap
     let heap_allocated = system_total + user_total;
     
     // Calculate usable kernel stack (smallest of the stack types minus exception area)
-    let min_stack = config::SYSTEM_THREAD_STACK_SIZE.min(config::USER_THREAD_STACK_SIZE);
+    let min_stack = config().system_thread_stack_size.min(config().user_thread_stack_size);
     let usable_kernel_stack = min_stack.saturating_sub(EXCEPTION_STACK_SIZE);
     
     StackAllocationSummary {
-        total_bytes: config::KERNEL_STACK_SIZE + heap_allocated,
-        boot_stack: config::KERNEL_STACK_SIZE,
+        total_bytes: config().kernel_stack_size + heap_allocated,
+        boot_stack: config().kernel_stack_size,
         system_thread_count,
-        system_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
+        system_stack_size: config().system_thread_stack_size,
         system_total,
         user_thread_count,
-        user_stack_size: config::USER_THREAD_STACK_SIZE,
+        user_stack_size: config().user_thread_stack_size,
         user_total,
         exception_stack_size: EXCEPTION_STACK_SIZE,
         usable_kernel_stack,
@@ -3076,29 +3135,27 @@ pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSumma
 
 /// Print stack allocation summary to console
 pub fn print_stack_requirements() {
-    use crate::console;
-    
     let summary = calculate_stack_requirements();
     let heap_required = summary.system_total + summary.user_total;
     
-    console::print("=== Stack Memory Requirements ===\n");
-    crate::safe_print!(64, "Boot stack (fixed):     {} KB\n", summary.boot_stack / 1024);
-    crate::safe_print!(128, "System threads:         {} × {} KB = {} KB\n",
+    (runtime().print_str)("=== Stack Memory Requirements ===\n");
+    safe_print!(64, "Boot stack (fixed):     {} KB\n", summary.boot_stack / 1024);
+    safe_print!(128, "System threads:         {} × {} KB = {} KB\n",
         summary.system_thread_count,
         summary.system_stack_size / 1024,
         summary.system_total / 1024);
-    crate::safe_print!(128, "User threads:           {} × {} KB = {} KB\n",
+    safe_print!(128, "User threads:           {} × {} KB = {} KB\n",
         summary.user_thread_count,
         summary.user_stack_size / 1024,
         summary.user_total / 1024);
-    crate::safe_print!(96, "Exception area/thread:  {} KB (for IRQ/syscall handlers)\n",
+    safe_print!(96, "Exception area/thread:  {} KB (for IRQ/syscall handlers)\n",
         summary.exception_stack_size / 1024);
-    crate::safe_print!(96, "Usable kernel stack:    {} KB (per thread, for execute() etc.)\n",
+    safe_print!(96, "Usable kernel stack:    {} KB (per thread, for execute() etc.)\n",
         summary.usable_kernel_stack / 1024);
-    crate::safe_print!(96, "Total from heap:        {} KB ({} MB)\n",
+    safe_print!(96, "Total from heap:        {} KB ({} MB)\n",
         heap_required / 1024,
         heap_required / (1024 * 1024));
-    crate::safe_print!(96, "Grand total:            {} KB ({} MB)\n",
+    safe_print!(96, "Grand total:            {} KB ({} MB)\n",
         summary.total_bytes / 1024,
         summary.total_bytes / (1024 * 1024));
 }

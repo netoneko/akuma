@@ -22,14 +22,14 @@ use crate::console;
 
 /// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    crate::mmu::DEV_VIRTIO_VA,
-    crate::mmu::DEV_VIRTIO_VA + 0x200,
-    crate::mmu::DEV_VIRTIO_VA + 0x400,
-    crate::mmu::DEV_VIRTIO_VA + 0x600,
-    crate::mmu::DEV_VIRTIO_VA + 0x800,
-    crate::mmu::DEV_VIRTIO_VA + 0xa00,
-    crate::mmu::DEV_VIRTIO_VA + 0xc00,
-    crate::mmu::DEV_VIRTIO_VA + 0xe00,
+    akuma_exec::mmu::DEV_VIRTIO_VA,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
 ];
 
 /// VirtIO device ID for RNG devices (entropy device)
@@ -290,7 +290,7 @@ impl VirtioRngDevice {
 
         // Set queue PFN (page frame number) - legacy mode
         // VirtIO needs the physical address for DMA
-        let queue_phys = crate::mmu::virt_to_phys(queue_mem as usize);
+        let queue_phys = akuma_exec::mmu::virt_to_phys(queue_mem as usize);
         let queue_pfn = queue_phys / PAGE_SIZE;
         unsafe {
             write_volatile(
@@ -353,7 +353,7 @@ impl VirtioRngDevice {
             let desc_idx = 0u16;
             unsafe {
                 let d = &mut *self.desc.add(desc_idx as usize);
-                d.addr = crate::mmu::virt_to_phys(self.buffer as usize) as u64;
+                d.addr = akuma_exec::mmu::virt_to_phys(self.buffer as usize) as u64;
                 d.len = to_read as u32;
                 d.flags = VIRTQ_DESC_F_WRITE;
                 d.next = 0;

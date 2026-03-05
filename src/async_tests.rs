@@ -29,7 +29,7 @@ where
             core::task::Poll::Ready(val) => return val,
             core::task::Poll::Pending => {
                 akuma_net::smoltcp_net::poll();
-                crate::threading::yield_now();
+                akuma_exec::threading::yield_now();
             }
         }
     }

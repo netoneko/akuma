@@ -21,14 +21,14 @@ pub const SECTOR_SIZE: usize = 512;
 
 /// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    crate::mmu::DEV_VIRTIO_VA,
-    crate::mmu::DEV_VIRTIO_VA + 0x200,
-    crate::mmu::DEV_VIRTIO_VA + 0x400,
-    crate::mmu::DEV_VIRTIO_VA + 0x600,
-    crate::mmu::DEV_VIRTIO_VA + 0x800,
-    crate::mmu::DEV_VIRTIO_VA + 0xa00,
-    crate::mmu::DEV_VIRTIO_VA + 0xc00,
-    crate::mmu::DEV_VIRTIO_VA + 0xe00,
+    akuma_exec::mmu::DEV_VIRTIO_VA,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
+    akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
 ];
 
 /// VirtIO device ID for block devices

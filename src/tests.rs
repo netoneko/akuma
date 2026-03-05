@@ -9,7 +9,7 @@ use crate::config;
 use crate::console;
 use crate::shell::Command;
 use crate::shell::commands::builtin;
-use crate::threading;
+use akuma_exec::threading;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -209,7 +209,7 @@ fn test_terminal_syscalls() -> bool {
     }
 
     let result = crate::async_tests::run_async_test(async {
-        crate::process::exec_async("/bin/terminal_test", None, None).await
+        akuma_exec::process::exec_async("/bin/terminal_test", None, None).await
     });
 
     let (exit_code, output) = match result {
@@ -2390,7 +2390,7 @@ fn test_parallel_processes() -> bool {
     let process_args: Option<&[&str]> = Some(&["10", "100"]);
     // Spawn first process using spawn_process_with_channel
     console::print("  Spawning process 1...");
-    let result1 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
+    let result1 = akuma_exec::process::spawn_process_with_channel("/bin/hello", process_args, None);
     
     let (tid1, channel1) = match result1 {
         Ok((tid, channel, _pid)) => {
@@ -2407,7 +2407,7 @@ fn test_parallel_processes() -> bool {
 
     // Spawn second process
     console::print("  Spawning process 2...");
-    let result2 = crate::process::spawn_process_with_channel("/bin/hello", process_args, None);
+    let result2 = akuma_exec::process::spawn_process_with_channel("/bin/hello", process_args, None);
 
     let (tid2, channel2) = match result2 {
         Ok((tid, channel, _pid)) => {
@@ -2438,8 +2438,8 @@ fn test_parallel_processes() -> bool {
     loop {
         threading::yield_now();
         
-        let p1_done = channel1.has_exited() || crate::threading::is_thread_terminated(tid1);
-        let p2_done = channel2.has_exited() || crate::threading::is_thread_terminated(tid2);
+        let p1_done = channel1.has_exited() || akuma_exec::threading::is_thread_terminated(tid1);
+        let p2_done = channel2.has_exited() || akuma_exec::threading::is_thread_terminated(tid2);
         let exit_code1 = channel1.exit_code();
         let exit_code2 = channel2.exit_code();
         if exit_code1 != 0 || exit_code2 != 0 {
@@ -2874,7 +2874,7 @@ fn test_high_volume_small_allocs_no_leak() -> bool {
 fn test_alloc_mmap_non_overlapping() -> bool {
     console::print("\n[TEST] alloc_mmap: non-overlapping addresses\n");
 
-    let mut mem = crate::process::ProcessMemory::new(
+    let mut mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -2915,7 +2915,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
 fn test_alloc_mmap_free_region_recycling() -> bool {
     console::print("\n[TEST] alloc_mmap: free region recycling\n");
 
-    let mut mem = crate::process::ProcessMemory::new(
+    let mut mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -2952,14 +2952,14 @@ const TEST_PID: u32 = 9999;
 fn test_lazy_region_push_lookup() -> bool {
     console::print("\n[TEST] lazy_region: push and lookup\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
 
     let start = 0x5000_0000usize;
     let size = 0x1000_0000usize;
-    crate::process::push_lazy_region(TEST_PID, start, size, 0);
+    akuma_exec::process::push_lazy_region(TEST_PID, start, size, 0);
 
     let found = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&TEST_PID) {
             let mid = start + size / 2;
             regions.iter().any(|r| mid >= r.start_va && mid < r.start_va + r.size)
@@ -2970,7 +2970,7 @@ fn test_lazy_region_push_lookup() -> bool {
 
     // Verify address outside region is NOT found
     let outside = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&TEST_PID) {
             let outside_va = start + size + 0x1000;
             regions.iter().any(|r| outside_va >= r.start_va && outside_va < r.start_va + r.size)
@@ -2979,7 +2979,7 @@ fn test_lazy_region_push_lookup() -> bool {
         }
     });
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
 
     let ok = found && !outside;
     crate::safe_print!(64, "  found_inside={} found_outside={}\n", found, outside);
@@ -2991,13 +2991,13 @@ fn test_lazy_region_push_lookup() -> bool {
 fn test_lazy_region_munmap_full() -> bool {
     console::print("\n[TEST] lazy_region: munmap full region\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
-    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
-    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x1_0000);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x1_0000);
 
     let remaining = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&TEST_PID).map_or(0, |r| r.len())
     });
 
@@ -3006,7 +3006,7 @@ fn test_lazy_region_munmap_full() -> bool {
         crate::safe_print!(128, "  results.len()={}, remaining={}\n", results.len(), remaining);
     }
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3015,13 +3015,13 @@ fn test_lazy_region_munmap_full() -> bool {
 fn test_lazy_region_munmap_prefix() -> bool {
     console::print("\n[TEST] lazy_region: munmap prefix\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
-    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
-    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x4000);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x4000);
 
     let (start, size) = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         match table.get(&TEST_PID) {
             Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
             _ => (0, 0),
@@ -3033,7 +3033,7 @@ fn test_lazy_region_munmap_prefix() -> bool {
         && start == 0x5000_4000
         && size == 0xC000;
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3042,13 +3042,13 @@ fn test_lazy_region_munmap_prefix() -> bool {
 fn test_lazy_region_munmap_suffix() -> bool {
     console::print("\n[TEST] lazy_region: munmap suffix\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
-    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
-    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_C000, 0x4000);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_C000, 0x4000);
 
     let (start, size) = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         match table.get(&TEST_PID) {
             Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
             _ => (0, 0),
@@ -3060,7 +3060,7 @@ fn test_lazy_region_munmap_suffix() -> bool {
         && start == 0x5000_0000
         && size == 0xC000;
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3069,13 +3069,13 @@ fn test_lazy_region_munmap_suffix() -> bool {
 fn test_lazy_region_munmap_middle() -> bool {
     console::print("\n[TEST] lazy_region: munmap middle (split)\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
-    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
-    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_4000, 0x4000);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_4000, 0x4000);
 
     let regions = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&TEST_PID).map_or(Vec::new(), |r| {
             r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
         })
@@ -3091,7 +3091,7 @@ fn test_lazy_region_munmap_middle() -> bool {
         crate::safe_print!(192, "  freed={:?} regions={:?}\n", results, regions);
     }
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3100,14 +3100,14 @@ fn test_lazy_region_munmap_middle() -> bool {
 fn test_lazy_region_munmap_multi() -> bool {
     console::print("\n[TEST] lazy_region: munmap spanning two regions\n");
 
-    crate::process::clear_lazy_regions(TEST_PID);
-    crate::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
-    crate::process::push_lazy_region(TEST_PID, 0x5001_0000, 0x1_0000, 0);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5001_0000, 0x1_0000, 0);
 
-    let results = crate::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_8000, 0x1_0000);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_8000, 0x1_0000);
 
     let remaining = crate::irq::with_irqs_disabled(|| {
-        let table = crate::process::LAZY_REGION_TABLE.lock();
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&TEST_PID).map_or(Vec::new(), |r| {
             r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
         })
@@ -3122,7 +3122,7 @@ fn test_lazy_region_munmap_multi() -> bool {
         crate::safe_print!(192, "  freed={:?} remain={:?}\n", results, remaining);
     }
 
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3142,37 +3142,37 @@ fn test_map_user_page_roundtrip() -> bool {
     // or use a high address.
     let test_va: usize = 0x1_F000_0000;
 
-    let before = crate::mmu::is_current_user_page_mapped(test_va);
+    let before = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
     let table_frames = unsafe {
-        crate::mmu::map_user_page(test_va, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
     };
 
-    let after_map = crate::mmu::is_current_user_page_mapped(test_va);
+    let after_map = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
     // Clear the PTE directly
     unsafe {
         let ttbr0: u64;
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = crate::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
         let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
         if l0e & 1 != 0 {
-            let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
             let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
             if l1e & 1 != 0 {
-                let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
                 let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
                 if l2e & 1 != 0 {
-                    let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
                     l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
-                    crate::mmu::flush_tlb_page(test_va);
+                    akuma_exec::mmu::flush_tlb_page(test_va);
                 }
             }
         }
     }
 
-    let after_clear = crate::mmu::is_current_user_page_mapped(test_va);
+    let after_clear = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
     crate::pmm::free_page(frame);
     for tf in table_frames { crate::pmm::free_page(tf); }
@@ -3191,7 +3191,7 @@ fn test_map_user_page_roundtrip() -> bool {
 fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     console::print("\n[TEST] munmap: sub-range of eager alloc is no-op\n");
 
-    let mut mem = crate::process::ProcessMemory::new(
+    let mut mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -3216,8 +3216,8 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     let exact = mmap_regions.iter().position(|(start, _)| *start == sub_addr);
 
     // Step 2: lazy region match?
-    crate::process::clear_lazy_regions(TEST_PID);
-    let lazy_results = crate::process::munmap_lazy_regions_in_range(TEST_PID, sub_addr, sub_len);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, sub_addr, sub_len);
 
     // With Bug 5 fix: neither matches → return success, no pages unmapped
     let ok = exact.is_none() && lazy_results.is_empty();
@@ -3229,7 +3229,7 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     for (_, region_frames) in mmap_regions {
         for f in region_frames { crate::pmm::free_page(f); }
     }
-    crate::process::clear_lazy_regions(TEST_PID);
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
 
     let pass = ok && frames_intact;
     if !pass {
@@ -3244,23 +3244,23 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
 fn make_test_process(
     pid: u32,
     ppid: u32,
-    addr_space: crate::mmu::UserAddressSpace,
+    addr_space: akuma_exec::mmu::UserAddressSpace,
     info_phys: usize,
-) -> alloc::boxed::Box<crate::process::Process> {
+) -> alloc::boxed::Box<akuma_exec::process::Process> {
     use spinning_top::Spinlock;
-    let mem = crate::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
-    alloc::boxed::Box::new(crate::process::Process {
+    alloc::boxed::Box::new(akuma_exec::process::Process {
         pid, pgid: pid, name: String::from("test"),
-        state: crate::process::ProcessState::Ready,
+        state: akuma_exec::process::ProcessState::Ready,
         address_space: addr_space,
-        context: crate::process::UserContext::new(0, 0),
+        context: akuma_exec::process::UserContext::new(0, 0),
         parent_pid: ppid, brk: 0x1000_0000, initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: info_phys,
         args: Vec::new(), cwd: String::from("/"),
-        stdin: Spinlock::new(crate::process::StdioBuffer::new()),
-        stdout: Spinlock::new(crate::process::StdioBuffer::new()),
+        stdin: Spinlock::new(akuma_exec::process::StdioBuffer::new()),
+        stdout: Spinlock::new(akuma_exec::process::StdioBuffer::new()),
         exited: false, exit_code: 0,
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
@@ -3274,7 +3274,7 @@ fn make_test_process(
         )),
         box_id: 0, root_dir: String::from("/"),
         channel: None, delegate_pid: None, clear_child_tid: 0,
-        signal_actions: [crate::process::SignalAction::default(); crate::process::MAX_SIGNALS],
+        signal_actions: [akuma_exec::process::SignalAction::default(); akuma_exec::process::MAX_SIGNALS],
         start_time_us: 0,
         last_syscall: core::sync::atomic::AtomicU64::new(0),
     })
@@ -3288,15 +3288,15 @@ fn make_test_process(
 fn test_clone_vm_mmap_regions_on_owner() -> bool {
     console::print("\n[TEST] CLONE_VM: mmap_regions only on address-space owner\n");
 
-    let parent_pid = crate::process::allocate_pid();
-    let child_pid = crate::process::allocate_pid();
+    let parent_pid = akuma_exec::process::allocate_pid();
+    let child_pid = akuma_exec::process::allocate_pid();
 
-    let parent_as = match crate::mmu::UserAddressSpace::new() {
+    let parent_as = match akuma_exec::mmu::UserAddressSpace::new() {
         Some(a) => a,
         None => { console::print("  OOM (parent AS)\n"); return false; }
     };
     let l0 = parent_as.l0_phys();
-    let child_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+    let child_as = match akuma_exec::mmu::UserAddressSpace::new_shared(l0) {
         Some(a) => a,
         None => { console::print("  OOM (child AS)\n"); return false; }
     };
@@ -3316,17 +3316,17 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
 
     let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
 
-    crate::process::register_process(parent_pid, parent_proc);
-    crate::process::register_process(child_pid, child_proc);
+    akuma_exec::process::register_process(parent_pid, parent_proc);
+    akuma_exec::process::register_process(child_pid, child_proc);
 
-    let parent_regions = crate::process::lookup_process(parent_pid)
+    let parent_regions = akuma_exec::process::lookup_process(parent_pid)
         .map(|p| p.mmap_regions.len()).unwrap_or(0);
-    let child_regions = crate::process::lookup_process(child_pid)
+    let child_regions = akuma_exec::process::lookup_process(child_pid)
         .map(|p| p.mmap_regions.len()).unwrap_or(0);
 
     // Cleanup
-    let _ = crate::process::unregister_process(child_pid);
-    let mut pp = crate::process::unregister_process(parent_pid);
+    let _ = akuma_exec::process::unregister_process(child_pid);
+    let mut pp = akuma_exec::process::unregister_process(parent_pid);
     if let Some(ref mut p) = pp {
         for (_, frames) in p.mmap_regions.drain(..) {
             for f in frames { crate::pmm::free_page(f); }
@@ -3352,15 +3352,15 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
 fn test_clone_vm_eager_fallback_finds_region() -> bool {
     console::print("\n[TEST] CLONE_VM: eager fallback lookup by owner PID\n");
 
-    let owner_pid = crate::process::allocate_pid();
-    let worker_pid = crate::process::allocate_pid();
+    let owner_pid = akuma_exec::process::allocate_pid();
+    let worker_pid = akuma_exec::process::allocate_pid();
 
-    let owner_as = match crate::mmu::UserAddressSpace::new() {
+    let owner_as = match akuma_exec::mmu::UserAddressSpace::new() {
         Some(a) => a,
         None => { console::print("  OOM\n"); return false; }
     };
     let l0 = owner_as.l0_phys();
-    let worker_as = match crate::mmu::UserAddressSpace::new_shared(l0) {
+    let worker_as = match akuma_exec::mmu::UserAddressSpace::new_shared(l0) {
         Some(a) => a,
         None => { console::print("  OOM\n"); return false; }
     };
@@ -3388,15 +3388,15 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     }
     owner_proc.mmap_regions.push((region_base, frames));
 
-    crate::process::register_process(owner_pid, owner_proc);
-    crate::process::register_process(worker_pid, worker_proc);
+    akuma_exec::process::register_process(owner_pid, owner_proc);
+    akuma_exec::process::register_process(worker_pid, worker_proc);
 
     // Fault at 0x680c0000 — page 35 inside the region
     let fault_va: usize = 0x680c_0000;
     let page_va = fault_va & !0xFFF;
 
     // Search via owner PID (correct path after fix)
-    let found_via_owner = crate::process::lookup_process(owner_pid).and_then(|p| {
+    let found_via_owner = akuma_exec::process::lookup_process(owner_pid).and_then(|p| {
         for (start, fr) in &p.mmap_regions {
             let end = *start + fr.len() * 4096;
             if page_va >= *start && page_va < end {
@@ -3407,7 +3407,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     });
 
     // Search via worker PID (broken path before fix)
-    let found_via_worker = crate::process::lookup_process(worker_pid).and_then(|p| {
+    let found_via_worker = akuma_exec::process::lookup_process(worker_pid).and_then(|p| {
         for (start, fr) in &p.mmap_regions {
             let end = *start + fr.len() * 4096;
             if page_va >= *start && page_va < end {
@@ -3418,8 +3418,8 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     });
 
     // Cleanup
-    let _ = crate::process::unregister_process(worker_pid);
-    let mut op = crate::process::unregister_process(owner_pid);
+    let _ = akuma_exec::process::unregister_process(worker_pid);
+    let mut op = akuma_exec::process::unregister_process(owner_pid);
     if let Some(ref mut p) = op {
         for (_, frs) in p.mmap_regions.drain(..) {
             for f in frs { crate::pmm::free_page(f); }
@@ -3448,7 +3448,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 /// Walk the page table from a given L0 physical address and read the L3 PTE.
 /// Returns the raw PTE value (0 if any level is missing).
 fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
-    let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
@@ -3456,13 +3456,13 @@ fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
     unsafe {
         let l0e = l0_ptr.add(l0_idx).read_volatile();
         if l0e & 1 == 0 { return 0; }
-        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l1e = l1_ptr.add(l1_idx).read_volatile();
         if l1e & 1 == 0 { return 0; }
-        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l2e = l2_ptr.add(l2_idx).read_volatile();
         if l2e & 1 == 0 { return 0; }
-        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         l3_ptr.add(l3_idx).read_volatile()
     }
 }
@@ -3470,18 +3470,18 @@ fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
 /// Helper: clear a PTE by walking the page table.
 fn clear_pte(l0_phys: usize, va: usize) {
     unsafe {
-        let l0_ptr = crate::mmu::phys_to_virt(l0_phys) as *const u64;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
         let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
         if l0e & 1 == 0 { return; }
-        let l1_ptr = crate::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
         if l1e & 1 == 0 { return; }
-        let l2_ptr = crate::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
         if l2e & 1 == 0 { return; }
-        let l3_ptr = crate::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
         l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
-        crate::mmu::flush_tlb_page(va);
+        akuma_exec::mmu::flush_tlb_page(va);
     }
 }
 
@@ -3515,7 +3515,7 @@ fn test_map_127_pages_all_ptes_exist() -> bool {
         };
         // Drop the returned table frames — matches real kernel behavior
         let _ = unsafe {
-            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+            akuma_exec::mmu::map_user_page(base_va + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
         };
         frames.push(frame);
     }
@@ -3565,7 +3565,7 @@ fn test_map_pages_survive_subsequent_allocs() -> bool {
             }
         };
         let _ = unsafe {
-            crate::mmu::map_user_page(base_va + i * 4096, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+            akuma_exec::mmu::map_user_page(base_va + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
         };
         frames.push(frame);
     }
@@ -3628,7 +3628,7 @@ fn test_map_interleaved_regions_same_l3() -> bool {
             };
             let va = base_2mb + offset + i * 4096;
             let _ = unsafe {
-                crate::mmu::map_user_page(va, frame.addr, crate::mmu::user_flags::RW_NO_EXEC)
+                akuma_exec::mmu::map_user_page(va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
             };
             mappings.push((va, frame));
         }
@@ -3924,31 +3924,31 @@ fn test_munmap_fallback_clears_stale_ptes() -> bool {
 fn test_mprotect_updates_lazy_flags() -> bool {
     console::print("\n[TEST] Bug 12: mprotect updates lazy region flags\n");
 
-    let test_pid = crate::process::allocate_pid();
+    let test_pid = akuma_exec::process::allocate_pid();
     let va_start: usize = 0xE000_0000;
     let region_size: usize = 16 * 4096;
 
     // Push a PROT_NONE lazy region (flags=0)
-    crate::process::push_lazy_region(test_pid, va_start, region_size, 0);
+    akuma_exec::process::push_lazy_region(test_pid, va_start, region_size, 0);
 
     // Verify initial flags are 0
-    let initial_flags = crate::process::lazy_region_lookup_for_pid(test_pid, va_start)
+    let initial_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
         .map(|(f, _, _, _)| f)
         .unwrap_or(0xDEAD);
     let initial_ok = initial_flags == 0;
 
     // mprotect updates flags to RW_NO_EXEC
-    let new_flags = crate::mmu::user_flags::RW_NO_EXEC;
-    crate::process::update_lazy_region_flags(test_pid, va_start, region_size, new_flags);
+    let new_flags = akuma_exec::mmu::user_flags::RW_NO_EXEC;
+    akuma_exec::process::update_lazy_region_flags(test_pid, va_start, region_size, new_flags);
 
     // Verify flags are updated
-    let updated_flags = crate::process::lazy_region_lookup_for_pid(test_pid, va_start)
+    let updated_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
         .map(|(f, _, _, _)| f)
         .unwrap_or(0xDEAD);
     let updated_ok = updated_flags == new_flags;
 
     // Clean up
-    crate::process::clear_lazy_regions(test_pid);
+    akuma_exec::process::clear_lazy_regions(test_pid);
 
     let pass = initial_ok && updated_ok;
     if !pass {

@@ -34,7 +34,7 @@ pub fn run_tests() {
             if crate::timer::uptime_us() - start > timeout_us {
                 break;
             }
-            crate::threading::yield_now();
+            akuma_exec::threading::yield_now();
         }
         if !settled {
             log("[NetTest] DHCP did not settle, continuing with static IP\n");
@@ -82,7 +82,7 @@ fn test_loopback_connection() {
             success = true;
             break;
         }
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 
     if !success {
@@ -124,7 +124,7 @@ fn test_loopback_connection() {
             received = true;
             break;
         }
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 
     if !received {

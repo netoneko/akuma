@@ -127,9 +127,9 @@ where
                     panic!("Shell test timed out");
                 }
                 // Yield to allow spawned process threads to run
-                crate::threading::yield_now();
+                akuma_exec::threading::yield_now();
                 // Clean up any terminated threads
-                crate::threading::cleanup_terminated();
+                akuma_exec::threading::cleanup_terminated();
             }
         }
     }

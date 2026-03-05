@@ -452,7 +452,7 @@ unsafe fn page_alloc(layout: Layout) -> *mut u8 {
                 crate::pmm::track_frame(frame, crate::pmm::FrameSource::Kernel, 0);
                 if i == 0 {
                     // Convert physical address to kernel virtual address
-                    first_addr = Some(crate::mmu::phys_to_virt(frame.addr));
+                    first_addr = Some(akuma_exec::mmu::phys_to_virt(frame.addr));
                 }
                 // Track allocation
                 ALLOCATED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
@@ -491,7 +491,7 @@ unsafe fn page_dealloc(ptr: *mut u8, layout: Layout) {
         let pages = alloc_size / PAGE_SIZE;
 
         // Convert virtual address back to physical and free each page
-        let phys_addr = crate::mmu::virt_to_phys(ptr as usize);
+        let phys_addr = akuma_exec::mmu::virt_to_phys(ptr as usize);
         for i in 0..pages {
             let frame = crate::pmm::PhysFrame::new(phys_addr + i * PAGE_SIZE);
             crate::pmm::free_page(frame);
@@ -620,7 +620,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         if mb >= next {
             NEXT_REPORT_MB.store(mb + 5, Ordering::Relaxed);
             let sc_nr = crate::syscall::current_syscall_nr();
-            let tid = crate::threading::current_thread_id();
+            let tid = akuma_exec::threading::current_thread_id();
             crate::safe_print!(192, "[HEAP] {}MB used (alloc={} bytes, sc_nr={}, tid={})\n", mb, user_size, sc_nr, tid);
         }
 

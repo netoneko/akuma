@@ -11,7 +11,7 @@
 use core::ptr::{addr_of, read_volatile, write_volatile};
 
 /// Remapped VA for fw_cfg (physical 0x0902_0000 via L0[1])
-const FW_CFG_BASE: usize = crate::mmu::DEV_FW_CFG_VA;
+const FW_CFG_BASE: usize = akuma_exec::mmu::DEV_FW_CFG_VA;
 /// Data register: read/write 1 byte at a time
 const FW_CFG_DATA: *mut u8 = FW_CFG_BASE as *mut u8;
 /// Selector register: write a 16-bit big-endian value to select a key

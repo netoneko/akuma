@@ -185,7 +185,7 @@ impl Gic {
 }
 
 /// Global GIC instance at remapped VAs (physical 0x0800_0000 / 0x0801_0000 via L0[1])
-static GIC: Gic = Gic::new(crate::mmu::DEV_GIC_DIST_VA, crate::mmu::DEV_GIC_CPU_VA);
+static GIC: Gic = Gic::new(akuma_exec::mmu::DEV_GIC_DIST_VA, akuma_exec::mmu::DEV_GIC_CPU_VA);
 
 // ============================================================================
 // Public API - Safe wrappers around GIC operations

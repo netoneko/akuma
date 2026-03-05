@@ -5,7 +5,7 @@
 use crate::config;
 use crate::console;
 use crate::fs;
-use crate::process;
+use akuma_exec::process;
 use alloc::string::ToString;
 use alloc::format;
 
@@ -268,7 +268,7 @@ fn test_procfs_stdio() {
     let wait_start = crate::timer::uptime_us();
     let wait_duration_us = 500_000; // 500ms
     while crate::timer::uptime_us() - wait_start < wait_duration_us {
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
 
     // 4. Read echo2's stdin via procfs: /proc/<echo2_pid>/fd/0
@@ -317,7 +317,7 @@ fn test_procfs_stdio() {
 
     // Cleanup: wait for processes to exit
     // Note: we don't have waitpid in this context, but processes should have exited by now
-    crate::threading::cleanup_terminated();
+    akuma_exec::threading::cleanup_terminated();
 
     crate::safe_print!(64, "[Test] procfs stdio test complete\n");
 }

@@ -1,0 +1,14 @@
+[package]
+name = "akuma-exec"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+spinning_top = "0.3"
+log = { version = "0.4", default-features = false }
+elf = { version = "0.7", default-features = false }
+akuma-terminal = { path = "../akuma-terminal" }
+embedded-io-async = { version = "0.6", default-features = false }

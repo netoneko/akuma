@@ -29,7 +29,7 @@ use super::keys;
 use akuma_net::smoltcp_net::{TcpError, TcpStream};
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
-use crate::process::{self, Pid};
+use akuma_exec::process::{self, Pid};
 use akuma_terminal as terminal;
 use crate::kernel_timer::Duration;
 
@@ -80,7 +80,7 @@ pub struct SshChannelStream<'a> {
     stream: &'a mut TcpStream,
     session: &'a mut SshSession,
     pub current_process_pid: Option<Pid>,
-    pub current_process_channel: Option<Arc<crate::process::ProcessChannel>>,
+    pub current_process_channel: Option<Arc<akuma_exec::process::ProcessChannel>>,
 }
 
 impl<'a> SshChannelStream<'a> {
@@ -94,7 +94,7 @@ impl<'a> SshChannelStream<'a> {
     }
 
     pub fn terminal_state(&self) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-        crate::process::get_terminal_state(crate::threading::current_thread_id())
+        akuma_exec::process::get_terminal_state(akuma_exec::threading::current_thread_id())
     }
 
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
@@ -367,14 +367,14 @@ async fn bridge_process(
     stream: &mut TcpStream,
     session: &mut SshSession,
     pid: u32,
-    process_channel: Arc<crate::process::ProcessChannel>,
+    process_channel: Arc<akuma_exec::process::ProcessChannel>,
     terminal_state: Arc<Spinlock<terminal::TerminalState>>,
 ) -> Result<(), TcpError> {
     log(&format!("[SSH] Starting I/O bridge for PID {}\n", pid));
     let mut buf = [0u8; 1024];
 
     loop {
-        if let Some((_, _exit_code)) = crate::process::waitpid(pid) {
+        if let Some((_, _exit_code)) = akuma_exec::process::waitpid(pid) {
             log(&format!("[SSH] Process PID {} exited, ending bridge\n", pid));
             break;
         }
@@ -400,7 +400,7 @@ async fn bridge_process(
                         let _recipient = read_u32(&payload, &mut offset);
                         if let Some(data) = read_string(&payload, &mut offset) {
                             let translated = translate_input_keys(data);
-                            let _ = crate::process::write_to_process_stdin(pid, &translated);
+                            let _ = akuma_exec::process::write_to_process_stdin(pid, &translated);
                         }
                     } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
                         let mut offset = 0;
@@ -429,7 +429,7 @@ async fn bridge_process(
             _ => {}
         }
 
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
     Ok(())
 }
@@ -467,14 +467,14 @@ async fn run_shell_session(
     }
     log(&format!("[SSH] Created shared terminal state at {:p}\n", Arc::as_ptr(&terminal_state)));
 
-    let tid = crate::threading::current_thread_id();
-    let channel = Arc::new(crate::process::ProcessChannel::new());
-    crate::process::register_system_thread_channel(tid, channel.clone());
-    crate::process::register_terminal_state(tid, terminal_state.clone());
+    let tid = akuma_exec::threading::current_thread_id();
+    let channel = Arc::new(akuma_exec::process::ProcessChannel::new());
+    akuma_exec::process::register_system_thread_channel(tid, channel.clone());
+    akuma_exec::process::register_terminal_state(tid, terminal_state.clone());
 
     if let Some(shell_path) = shell_path_opt {
         log(&format!("[SSH] Spawning external shell: {}\n", shell_path));
-        if let Ok((_tid, proc_channel, pid)) = crate::process::spawn_process_with_channel(&shell_path, None, None) {
+        if let Ok((_tid, proc_channel, pid)) = akuma_exec::process::spawn_process_with_channel(&shell_path, None, None) {
             return bridge_process(stream, session, pid, proc_channel, terminal_state.clone()).await;
         }
         log(&format!("[SSH] Failed to spawn external shell {}, falling back to built-in\n", shell_path));

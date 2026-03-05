@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::runtime::{PhysFrame, FrameSource, runtime, with_irqs_disabled, IrqGuard};
 
 /// Page size: 4KB
 pub const PAGE_SIZE: usize = 4096;
@@ -126,9 +127,10 @@ const DEV_PAGES: &[(usize, usize)] = &[
 /// space will reference via L0[1].  Must be called once during kernel init,
 /// after the PMM is ready.
 pub fn init_shared_device_tables() {
-    let l1 = pmm::alloc_page_zeroed().expect("shared dev L1");
-    let l2 = pmm::alloc_page_zeroed().expect("shared dev L2");
-    let l3 = pmm::alloc_page_zeroed().expect("shared dev L3");
+    let rt = runtime();
+    let l1 = (rt.alloc_page_zeroed)().expect("shared dev L1");
+    let l2 = (rt.alloc_page_zeroed)().expect("shared dev L2");
+    let l3 = (rt.alloc_page_zeroed)().expect("shared dev L3");
 
     let device_page_flags: u64 = flags::VALID | flags::TABLE | flags::AF
         | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
@@ -218,7 +220,6 @@ pub fn flush_tlb_page(va: usize) {
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
-use crate::pmm::{self, PhysFrame};
 
 const MAX_ASID: u16 = 256;
 static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::new());
@@ -271,9 +272,10 @@ pub struct UserAddressSpace {
 
 impl UserAddressSpace {
     pub fn new() -> Option<Self> {
-        let l0_frame = pmm::alloc_page_zeroed()?;
-        pmm::track_frame(l0_frame, pmm::FrameSource::UserPageTable, 0);
-        let asid = crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        let rt = runtime();
+        let l0_frame = (rt.alloc_page_zeroed)()?;
+        (rt.track_frame)(l0_frame, FrameSource::UserPageTable, 0);
+        let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
         let mut addr_space = Self {
             l0_frame,
             page_table_frames: Vec::new(),
@@ -288,7 +290,7 @@ impl UserAddressSpace {
     /// Create a shared view of an existing address space (for CLONE_THREAD).
     /// Uses the same L0 page table; Drop will NOT free the pages.
     pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
-        let asid = crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             page_table_frames: Vec::new(),
@@ -299,8 +301,9 @@ impl UserAddressSpace {
     }
 
     fn add_kernel_mappings(&mut self) -> Result<(), &'static str> {
-        let l1_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate L1 table")?;
-        pmm::track_frame(l1_frame, pmm::FrameSource::UserPageTable, 0);
+        let rt = runtime();
+        let l1_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L1 table")?;
+        (rt.track_frame)(l1_frame, FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l1_frame);
 
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
@@ -310,8 +313,8 @@ impl UserAddressSpace {
         }
 
         let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
-        let l2_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate L2 table")?;
-        pmm::track_frame(l2_frame, pmm::FrameSource::UserPageTable, 0);
+        let l2_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L2 table")?;
+        (rt.track_frame)(l2_frame, FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l2_frame);
 
         unsafe {
@@ -336,8 +339,8 @@ impl UserAddressSpace {
         // L1[1]: kernel RAM. Use an L2 table with 2MB blocks for only the
         // actual 256MB of RAM (128 blocks) instead of a 1GB L1 block.
         // This leaves VA 0x50000000-0x7FFFFFFF available for user mmap.
-        let l2_ram_frame = pmm::alloc_page_zeroed().ok_or("Failed to allocate kernel RAM L2 table")?;
-        pmm::track_frame(l2_ram_frame, pmm::FrameSource::UserPageTable, 0);
+        let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
+        (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable, 0);
         self.page_table_frames.push(l2_ram_frame);
 
         unsafe {
@@ -389,15 +392,13 @@ impl UserAddressSpace {
     }
 
     fn get_or_create_table(&mut self, table_ptr: *mut u64, idx: usize) -> Result<PhysFrame, &'static str> {
+        let rt = runtime();
         unsafe {
             let entry = table_ptr.add(idx).read_volatile();
             if entry & flags::VALID != 0 {
                 if entry & flags::TABLE == 0 {
-                    // BLOCK descriptor occupies this slot — replace with a table.
-                    // The block mapped nonexistent or kernel-only memory that we
-                    // now need to carve into per-page mappings for user space.
-                    let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
-                    pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
+                    let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
+                    (rt.track_frame)(frame, FrameSource::UserPageTable, 0);
                     self.page_table_frames.push(frame);
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     table_ptr.add(idx).write_volatile(new_entry);
@@ -406,8 +407,8 @@ impl UserAddressSpace {
                     Ok(PhysFrame::new((entry & 0x0000_FFFF_FFFF_F000) as usize))
                 }
             } else {
-                let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for page table")?;
-                pmm::track_frame(frame, pmm::FrameSource::UserPageTable, 0);
+                let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
+                (rt.track_frame)(frame, FrameSource::UserPageTable, 0);
                 self.page_table_frames.push(frame);
                 let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                 table_ptr.add(idx).write_volatile(new_entry);
@@ -425,8 +426,9 @@ impl UserAddressSpace {
     }
 
     pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
-        let frame = pmm::alloc_page_zeroed().ok_or("Out of memory for user page")?;
-        pmm::track_frame(frame, pmm::FrameSource::ElfLoader, 0);
+        let rt = runtime();
+        let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
+        (rt.track_frame)(frame, FrameSource::ElfLoader, 0);
         self.user_frames.push(frame);
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)
@@ -473,7 +475,7 @@ impl UserAddressSpace {
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
-        let _irq_guard = crate::irq::IrqGuard::new();
+        let _irq_guard = IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -498,7 +500,7 @@ impl UserAddressSpace {
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
-        let _irq_guard = crate::irq::IrqGuard::new();
+        let _irq_guard = IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
         let l2_idx = (va >> 21) & 0x1FF;
@@ -552,11 +554,12 @@ impl UserAddressSpace {
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
         if !self.shared {
-            for frame in &self.user_frames { pmm::free_page(*frame); }
-            for frame in &self.page_table_frames { pmm::free_page(*frame); }
-            pmm::free_page(self.l0_frame);
+            let rt = runtime();
+            for frame in &self.user_frames { (rt.free_page)(*frame); }
+            for frame in &self.page_table_frames { (rt.free_page)(*frame); }
+            (rt.free_page)(self.l0_frame);
         }
-        crate::irq::with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
+        with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
         flush_tlb_asid(self.asid);
     }
 }
@@ -579,11 +582,7 @@ pub mod user_flags {
 }
 
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
-    // Disable IRQs for the entire page table walk+write to prevent preemption
-    // races. Without this, a timer IRQ mid-walk can context-switch to another
-    // thread that creates a competing page table entry (see Bug 7 in docs).
-    // The CAS in get_or_create_table_atomic is defense-in-depth for multi-core.
-    let _irq_guard = crate::irq::IrqGuard::new();
+    let _irq_guard = IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
     core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
@@ -607,7 +606,7 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     if existing & flags::VALID != 0 {
         let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
         if existing_pa != pa {
-            crate::safe_print!(128, "[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}\n",
+            log::warn!("[MMU] va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}",
                 va, existing_pa, pa);
         }
         return allocated_tables;
@@ -635,12 +634,12 @@ unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize,
         if entry & flags::VALID != 0 {
             if entry & flags::TABLE == 0 {
                 // BLOCK descriptor — replace with a table so we can map individual pages
-                if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+                if let Some(frame) = (runtime().alloc_page_zeroed)() {
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => return (frame.addr, Some(frame)),
                         Err(_) => {
-                            crate::pmm::free_page(frame);
+                            (runtime().free_page)(frame);
                             continue;
                         }
                     }
@@ -650,12 +649,12 @@ unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize,
             return ((entry & 0x0000_FFFF_FFFF_F000) as usize, None);
         }
 
-        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+        if let Some(frame) = (runtime().alloc_page_zeroed)() {
             let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
             match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return (frame.addr, Some(frame)),
                 Err(_) => {
-                    crate::pmm::free_page(frame);
+                    (runtime().free_page)(frame);
                     continue;
                 }
             }
@@ -690,7 +689,8 @@ pub fn protect_kernel_code() {
     let l3_block_end = if data_block_start > rodata_block_end { rodata_block_end } else { data_block_start + 1 };
     let num_l3_blocks = l3_block_end - l3_block_start;
     
-    let l2_table = match crate::pmm::alloc_page() {
+    let rt = runtime();
+    let l2_table = match (rt.alloc_page)() {
         Some(frame) => frame.start_address(),
         None => return,
     };
@@ -699,7 +699,7 @@ pub fn protect_kernel_code() {
     let mut l3_tables: [usize; 16] = [0; 16];
     if num_l3_blocks > 16 { return; }
     for i in 0..num_l3_blocks {
-        l3_tables[i] = match crate::pmm::alloc_page() {
+        l3_tables[i] = match (rt.alloc_page)() {
             Some(frame) => frame.start_address(),
             None => return,
         };

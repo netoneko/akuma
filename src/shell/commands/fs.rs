@@ -158,7 +158,7 @@ async fn find_recursive(path: &str, stdout: &mut VecWriter) -> Result<(), crate:
 
     for entry in entries {
         // Yield to allow other tasks to run
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
 
         // Construct full path
         let full_path = if path == "/" {
@@ -506,7 +506,7 @@ async fn remove_dir_recursive(path: &str) -> Result<(), RemoveError> {
     // Remove all entries
     for entry in entries {
         // Yield between operations to allow other tasks to run
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
 
         let entry_path = if path == "/" {
             format!("/{}", entry.name)
@@ -933,7 +933,7 @@ async fn copy_dir_recursive(source: &str, dest: &str) -> Result<(), crate::fs::F
 
     let entries = async_fs::list_dir(source).await?;
     for entry in entries {
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
 
         let src_path = if source == "/" {
             format!("/{}", entry.name)

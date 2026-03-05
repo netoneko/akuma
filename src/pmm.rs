@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
-use crate::mmu::PAGE_SIZE;
+use akuma_exec::mmu::PAGE_SIZE;
+pub use akuma_exec::{PhysFrame, FrameSource};
 
 // ============================================================================
 // Debug Frame Tracking
@@ -17,21 +18,6 @@ use crate::mmu::PAGE_SIZE;
 /// Enable debug frame tracking (adds overhead but helps find leaks)
 /// Set to true to track all frame allocations with metadata
 pub const DEBUG_FRAME_TRACKING: bool = false;
-
-/// Allocation source for debug tracking
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameSource {
-    /// Kernel heap allocation
-    Kernel,
-    /// User page table
-    UserPageTable,
-    /// User data page (mmap/brk)
-    UserData,
-    /// ELF loader (code/data segments)
-    ElfLoader,
-    /// Unknown/unspecified
-    Unknown,
-}
 
 /// Information about a tracked frame allocation
 #[derive(Debug, Clone)]
@@ -176,27 +162,6 @@ pub fn leak_count() -> usize {
     }
 }
 
-/// Physical page frame
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhysFrame {
-    pub addr: usize,
-}
-
-impl PhysFrame {
-    pub const fn new(addr: usize) -> Self {
-        Self {
-            addr: addr & !(PAGE_SIZE - 1),
-        }
-    }
-
-    pub fn containing_address(addr: usize) -> Self {
-        Self::new(addr)
-    }
-
-    pub fn start_address(&self) -> usize {
-        self.addr
-    }
-}
 
 /// Bitmap-based physical memory allocator
 struct BitmapAllocator {
@@ -485,7 +450,7 @@ pub fn total_count() -> usize {
 
 /// Allocate a zeroed page
 pub fn alloc_page_zeroed() -> Option<PhysFrame> {
-    use crate::mmu::phys_to_virt;
+    use akuma_exec::mmu::phys_to_virt;
 
     let frame = alloc_page()?;
     unsafe {
@@ -514,7 +479,7 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
 
 /// Allocate zeroed contiguous pages
 pub fn alloc_pages_zeroed(count: usize) -> Option<PhysFrame> {
-    use crate::mmu::phys_to_virt;
+    use akuma_exec::mmu::phys_to_virt;
 
     let frame = alloc_pages(count)?;
     let total_size = PAGE_SIZE * count;

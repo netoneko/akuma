@@ -15,7 +15,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::process;
+use akuma_exec::process;
 use crate::ssh::protocol::SshChannelStream;
 
 pub use akuma_shell::{
@@ -103,7 +103,7 @@ impl ShellBackend for KernelShellBackend {
 
 /// Create a new `ShellContext` initialized with kernel defaults.
 pub fn new_shell_context() -> ShellContext {
-    ShellContext::with_defaults(crate::process::DEFAULT_ENV, crate::config::ENABLE_SSH_ASYNC_EXEC)
+    ShellContext::with_defaults(akuma_exec::process::DEFAULT_ENV, crate::config::ENABLE_SSH_ASYNC_EXEC)
 }
 
 async fn find_executable(name: &str) -> Option<String> {
@@ -139,9 +139,9 @@ async fn execute_external(
     add_exit_code: bool,
 ) -> Result<(), ShellError> {
     let result = if is_async_exec_enabled() {
-        crate::process::exec_async_cwd(path, args, env, stdin, cwd).await
+        akuma_exec::process::exec_async_cwd(path, args, env, stdin, cwd).await
     } else {
-        crate::process::exec_with_io_cwd(path, args, env, stdin, cwd)
+        akuma_exec::process::exec_with_io_cwd(path, args, env, stdin, cwd)
     };
 
     match result {
@@ -183,7 +183,7 @@ pub async fn execute_external_streaming<W>(
 where
     W: embedded_io_async::Write,
 {
-    match crate::process::exec_streaming_cwd(path, args, env, stdin, cwd, stdout).await {
+    match akuma_exec::process::exec_streaming_cwd(path, args, env, stdin, cwd, stdout).await {
         Ok(exit_code) => {
             if exit_code != 0 {
                 let msg = format!("[exit code: {exit_code}]\r\n");
@@ -207,7 +207,7 @@ pub async fn execute_external_interactive(
     cwd: Option<&str>,
     channel_stream: &mut SshChannelStream<'_>,
 ) -> Result<(), ShellError> {
-    use crate::process::spawn_process_with_channel_cwd;
+    use akuma_exec::process::spawn_process_with_channel_cwd;
     use embedded_io_async::Write;
 
     let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, env, stdin, cwd) {
@@ -249,7 +249,7 @@ pub async fn execute_external_interactive(
             let _ = channel_stream.flush().await;
         }
 
-        if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
+        if channel.has_exited() || akuma_exec::threading::is_thread_terminated(thread_id) {
             while let Some(data) = channel.try_read() {
                 if raw_mode {
                     let _ = channel_stream.write_all(&data).await;
@@ -286,7 +286,7 @@ pub async fn execute_external_interactive(
             Err(_) => {}
         }
 
-        crate::process::YieldOnce::new().await;
+        akuma_exec::process::YieldOnce::new().await;
     }
 
     let exit_code = if channel.is_interrupted() && !channel.has_exited() {
@@ -295,7 +295,7 @@ pub async fn execute_external_interactive(
         channel.exit_code()
     };
 
-    crate::threading::cleanup_terminated();
+    akuma_exec::threading::cleanup_terminated();
 
     if exit_code != 0 && exit_code != 130 {
         let msg = format!("[exit code: {exit_code}]\r\n");

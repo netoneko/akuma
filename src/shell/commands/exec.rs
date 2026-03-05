@@ -68,7 +68,7 @@ impl Command for ExecCommand {
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
 
             // Check if user threads are available for process execution
-            let available = crate::threading::user_threads_available();
+            let available = akuma_exec::threading::user_threads_available();
             if available == 0 {
                 let _ = embedded_io_async::Write::write_all(
                     stdout,
@@ -79,7 +79,7 @@ impl Command for ExecCommand {
             }
 
             // Execute the binary asynchronously (non-blocking)
-            match crate::process::exec_async(path, args_slice, stdin).await {
+            match akuma_exec::process::exec_async(path, args_slice, stdin).await {
                 Ok((exit_code, process_output)) => {
                     // Convert \n to \r\n for terminal
                     for &byte in &process_output {

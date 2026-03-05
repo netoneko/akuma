@@ -11,7 +11,7 @@ use alloc::format;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
 use crate::config::{PROC_STDIN_MAX_SIZE, PROC_STDOUT_MAX_SIZE};
-use crate::process::{self, Pid};
+use akuma_exec::process::{self, Pid};
 
 // ============================================================================
 // ProcFilesystem
@@ -73,7 +73,7 @@ impl Filesystem for ProcFilesystem {
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = path.trim_matches('/');
-        let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+        let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
 
         if path.is_empty() {
             // Root: list all process PIDs as directories, filtered by box_id
@@ -183,7 +183,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
-        let current_proc = crate::process::current_process();
+        let current_proc = akuma_exec::process::current_process();
         let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
         let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
@@ -219,7 +219,7 @@ impl Filesystem for ProcFilesystem {
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let path = path.trim_start_matches('/');
-        let current_proc = crate::process::current_process();
+        let current_proc = akuma_exec::process::current_process();
         let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
         // Handle /proc/boxes
@@ -259,7 +259,7 @@ impl Filesystem for ProcFilesystem {
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
 
-        let current_proc = crate::process::current_process();
+        let current_proc = akuma_exec::process::current_process();
         let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
         let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
@@ -279,7 +279,7 @@ impl Filesystem for ProcFilesystem {
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         let (target_pid, fd_num) = Self::parse_fd_path(path)?;
-        let caller_proc = crate::process::current_process();
+        let caller_proc = akuma_exec::process::current_process();
         let caller_pid = process::read_current_pid();
         let caller_box_id = caller_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
 
@@ -357,7 +357,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" {
-            let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
             return current_box_id == 0;
         }
 
@@ -409,7 +409,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" {
-            let current_box_id = crate::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
             if current_box_id != 0 {
                 return Err(FsError::NotFound);
             }

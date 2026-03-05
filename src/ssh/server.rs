@@ -38,7 +38,7 @@ pub fn run() -> ! {
         Some(h) => h,
         None => {
             log(&format!("[SSH Server] FATAL: Failed to create listener on port {}\n", crate::config::SSH_PORT));
-            loop { crate::threading::yield_now(); }
+            loop { akuma_exec::threading::yield_now(); }
         }
     };
 
@@ -63,7 +63,7 @@ pub fn run() -> ! {
                 // Hand off the connected socket to a session thread
                 let session_handle = listen_handle;
                 
-                let _ = crate::threading::spawn_system_thread_fn(move || {
+                let _ = akuma_exec::threading::spawn_system_thread_fn(move || {
                     run_session(session_handle);
                 });
 
@@ -88,11 +88,11 @@ pub fn run() -> ! {
         }
 
         smoltcp_net::poll();
-        crate::threading::yield_now();
+        akuma_exec::threading::yield_now();
     }
     
     log("[SSH Server] Server loop exited abnormally\n");
-    loop { crate::threading::yield_now(); }
+    loop { akuma_exec::threading::yield_now(); }
 }
 
 fn create_listener() -> Option<SocketHandle> {
@@ -150,7 +150,7 @@ fn block_on<F: Future>(mut future: F) -> F::Output {
                     core::hint::spin_loop();
                 }
                 if !caught {
-                    crate::threading::yield_now();
+                    akuma_exec::threading::yield_now();
                 }
             }
         }
@@ -167,8 +167,8 @@ fn run_session(handle: SocketHandle) -> ! {
     smoltcp_net::socket_close(handle);
     ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
     
-    crate::threading::mark_current_terminated();
-    loop { crate::threading::yield_now(); }
+    akuma_exec::threading::mark_current_terminated();
+    loop { akuma_exec::threading::yield_now(); }
 }
 
 fn log(msg: &str) {

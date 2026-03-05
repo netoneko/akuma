@@ -15,7 +15,6 @@ mod config;
 #[macro_use]
 mod console;
 mod editor;
-mod elf_loader;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
 // mod embassy_virtio_driver;
@@ -26,10 +25,8 @@ mod fs;
 mod fs_tests;
 mod gic;
 mod irq;
-mod mmu;
 mod network_tests;
 mod pmm;
-mod process;
 mod process_tests;
 mod ramfb;
 mod rng;
@@ -38,7 +35,6 @@ mod shell_tests;
 mod ssh;
 mod syscall;
 mod tests;
-mod threading;
 mod timer;
 mod vfs;
 mod virtio_hal;
@@ -47,6 +43,7 @@ use alloc::format;
 use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
 
+use akuma_exec::{mmu, process, threading};
 use core::panic::PanicInfo;
 
 /// Global poll step counter for debugging hangs.
@@ -433,6 +430,64 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
+    // Initialize exec subsystem (threading, process, mmu, elf_loader)
+    console::print("Initializing exec subsystem...\n");
+    akuma_exec::init(
+        akuma_exec::ExecRuntime {
+            uptime_us: timer::uptime_us,
+            disable_irqs: irq::disable_irqs,
+            enable_irqs: irq::enable_irqs,
+            end_of_interrupt: gic::end_of_interrupt,
+            trigger_sgi: gic::trigger_sgi,
+            alloc_page_zeroed: || pmm::alloc_page_zeroed(),
+            alloc_page: || pmm::alloc_page(),
+            free_page: pmm::free_page,
+            pmm_stats: pmm::stats,
+            track_frame: pmm::track_frame,
+            free_count: pmm::free_count,
+            total_count: pmm::total_count,
+            heap_stats: || {
+                let s = allocator::stats();
+                (s.heap_size, s.allocated)
+            },
+            read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
+            read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
+            resolve_inode: |path| crate::vfs::resolve_inode(path).map_err(|_| -1),
+            read_at_by_inode: |_inode, _off, _buf| Err(-1),
+            on_process_exit: |_pid| {},
+            remove_socket: akuma_net::socket::remove_socket,
+            futex_wake: crate::syscall::futex_wake,
+            pipe_close_write: |_id| {},
+            pipe_close_read: |_id| {},
+            pipe_clone_ref: |_id, _is_read| {},
+            eventfd_close: |_id| {},
+            resolve_symlinks: |path| crate::vfs::resolve_symlinks(path),
+            file_size: |path| crate::fs::file_size(path).map_err(|_| "fs error"),
+            print_str: console::print,
+        },
+        akuma_exec::ExecConfig {
+            max_threads: config::MAX_THREADS,
+            reserved_threads: config::RESERVED_THREADS,
+            kernel_stack_size: config::KERNEL_STACK_SIZE,
+            default_thread_stack_size: config::DEFAULT_THREAD_STACK_SIZE,
+            system_thread_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
+            user_thread_stack_size: config::USER_THREAD_STACK_SIZE,
+            user_stack_size: config::USER_STACK_SIZE,
+            enable_stack_canaries: config::ENABLE_STACK_CANARIES,
+            stack_canary: config::STACK_CANARY,
+            canary_words: config::CANARY_WORDS,
+            network_thread_ratio: config::NETWORK_THREAD_RATIO,
+            deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
+            thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
+            cooperative_main_thread: config::COOPERATIVE_MAIN_THREAD,
+            syscall_debug_info_enabled: config::SYSCALL_DEBUG_INFO_ENABLED,
+            enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
+            proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
+            proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
+        },
+    );
+    console::print("Exec subsystem initialized\n");
+
     // Initialize threading (but don't enable timer yet!)
     console::print("Initializing threading...\n");
     threading::init();
@@ -562,7 +617,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 fn run_async_main_preemptive() -> ! {
     // Use spawn_system_thread_fn - it uses SYSTEM_THREAD_STACK_SIZE (256KB)
     // which equals ASYNC_THREAD_STACK_SIZE, so no custom size needed
-    let thread_result = crate::threading::spawn_system_thread_fn(|| {
+    let thread_result = akuma_exec::threading::spawn_system_thread_fn(|| {
         run_async_main();
     });
 
