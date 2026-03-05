@@ -5,32 +5,32 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use spinning_top::Spinlock;
 
-/// Mode flags for terminal attributes (similar to termios c_lflag)
+/// Mode flags for terminal attributes (similar to termios `c_lflag`)
 pub mod mode_flags {
     /// Enable raw mode (disable canonical, echo, ISIG)
     pub const RAW_MODE_ENABLE: u64 = 0x01;
     /// Disable raw mode (restore canonical, echo, ISIG)
     pub const RAW_MODE_DISABLE: u64 = 0x02;
-    
+
     // Linux-compatible constants for ioctl
     // iflag
-    pub const ICRNL: u32  = 0x00000100;
-    pub const IXON: u32   = 0x00000400;
-    
+    pub const ICRNL: u32  = 0x0000_0100;
+    pub const IXON: u32   = 0x0000_0400;
+
     // oflag
-    pub const OPOST: u32  = 0x00000001;
-    pub const ONLCR: u32  = 0x00000004;
+    pub const OPOST: u32  = 0x0000_0001;
+    pub const ONLCR: u32  = 0x0000_0004;
 
     // lflag
-    pub const ISIG: u32   = 0x00000001;
-    pub const ICANON: u32 = 0x00000002;
-    pub const ECHO: u32   = 0x00000008;
-    pub const ECHOE: u32  = 0x00000010;
-    pub const ECHOK: u32  = 0x00000020;
-    pub const ECHONL: u32 = 0x00000040;
+    pub const ISIG: u32   = 0x0000_0001;
+    pub const ICANON: u32 = 0x0000_0002;
+    pub const ECHO: u32   = 0x0000_0008;
+    pub const ECHOE: u32  = 0x0000_0010;
+    pub const ECHOK: u32  = 0x0000_0020;
+    pub const ECHONL: u32 = 0x0000_0040;
 }
 
-/// c_cc indices (Linux-compatible)
+/// `c_cc` indices (Linux-compatible)
 pub mod cc_index {
     pub const VINTR: usize  = 0;
     pub const VQUIT: usize  = 1;
@@ -47,7 +47,7 @@ pub mod cc_index {
 pub struct TerminalState {
     /// Current terminal mode flags (custom Akuma flags)
     pub mode_flags: u64,
-    
+
     // Linux-compatible termios flags
     pub iflag: u32,
     pub oflag: u32,
@@ -78,7 +78,7 @@ pub struct TerminalState {
     /// Canonical mode ready buffer (completed lines awaiting read)
     pub canon_ready: VecDeque<u8>,
 
-    /// Flags saved before the last RAW_MODE_ENABLE call, for exact restoration.
+    /// Flags saved before the last `RAW_MODE_ENABLE` call, for exact restoration.
     pub saved_iflag: Option<u32>,
     pub saved_oflag: Option<u32>,
     pub saved_lflag: Option<u32>,
@@ -90,15 +90,15 @@ impl Default for TerminalState {
         cc[cc_index::VMIN] = 1;
         cc[cc_index::VTIME] = 0;
         cc[cc_index::VERASE] = 0x7F;
-        cc[cc_index::VEOF] = 0x04; // Ctrl+D
-        cc[cc_index::VINTR] = 0x03; // Ctrl+C
-        cc[cc_index::VQUIT] = 0x1C; // Ctrl+backslash
-        cc[cc_index::VKILL] = 0x15; // Ctrl+U
-        
-        TerminalState {
+        cc[cc_index::VEOF] = 0x04;
+        cc[cc_index::VINTR] = 0x03;
+        cc[cc_index::VQUIT] = 0x1C;
+        cc[cc_index::VKILL] = 0x15;
+
+        Self {
             mode_flags: 0,
             iflag: mode_flags::ICRNL | mode_flags::IXON,
-            oflag: mode_flags::OPOST | mode_flags::ONLCR, // Enable CRLF translation by default
+            oflag: mode_flags::OPOST | mode_flags::ONLCR,
             cflag: 0,
             lflag: mode_flags::ICANON | mode_flags::ECHO | mode_flags::ISIG | mode_flags::ECHOE | mode_flags::ECHOK,
             cc,
@@ -134,8 +134,10 @@ impl TerminalState {
         for &byte in data {
             buffer.push_back(byte);
         }
-        if let Some(waker) = self.input_waker.lock().take() {
-            waker.wake();
+        drop(buffer);
+        let waker = self.input_waker.lock().take();
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
@@ -144,9 +146,9 @@ impl TerminalState {
     pub fn read_input(&self, buf: &mut [u8]) -> usize {
         let mut buffer = self.input_buffer.lock();
         let mut bytes_read = 0;
-        for i in 0..buf.len() {
+        for slot in buf.iter_mut() {
             if let Some(byte) = buffer.pop_front() {
-                buf[i] = byte;
+                *slot = byte;
                 bytes_read += 1;
             } else {
                 break;
@@ -160,11 +162,13 @@ impl TerminalState {
         *self.input_waker.lock() = Some(waker);
     }
 
-    pub fn is_canonical(&self) -> bool {
+    #[must_use]
+    pub const fn is_canonical(&self) -> bool {
         (self.lflag & mode_flags::ICANON) != 0
     }
 
-    pub fn needs_onlcr(&self) -> bool {
+    #[must_use]
+    pub const fn needs_onlcr(&self) -> bool {
         (self.oflag & mode_flags::ONLCR) != 0
     }
 
@@ -210,11 +214,11 @@ impl TerminalState {
                     }
                 }
             } else if byte == veof && veof != 0 {
-                if !self.canon_buffer.is_empty() {
+                if self.canon_buffer.is_empty() {
+                    eof = true;
+                } else {
                     let line: alloc::vec::Vec<u8> = self.canon_buffer.drain(..).collect();
                     self.canon_ready.extend(line);
-                } else {
-                    eof = true;
                 }
             } else if byte == b'\n' {
                 self.canon_buffer.push(byte);
@@ -240,6 +244,7 @@ impl TerminalState {
 
     /// Generate echo bytes for non-canonical mode input.
     /// Returns `None` if echo is disabled.
+    #[must_use]
     pub fn echo_noncanon(&self, data: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         if (self.lflag & mode_flags::ECHO) == 0 {
             return None;
@@ -269,7 +274,7 @@ impl TerminalState {
         result
     }
 
-    /// Move whatever is in the canonical edit buffer into canon_ready.
+    /// Move whatever is in the canonical edit buffer into `canon_ready`.
     /// Used when the channel closes so partial input isn't lost.
     pub fn flush_canon_buffer(&mut self) {
         if !self.canon_buffer.is_empty() {
@@ -278,8 +283,9 @@ impl TerminalState {
         }
     }
 
-    /// Apply ONLCR translation to output data (\n -> \r\n).
+    /// Apply ONLCR translation to output data (`\n` -> `\r\n`).
     /// If ONLCR is not set, returns a copy unchanged.
+    #[must_use]
     pub fn translate_output(&self, data: &[u8]) -> alloc::vec::Vec<u8> {
         if !self.needs_onlcr() {
             return data.to_vec();
@@ -296,16 +302,18 @@ impl TerminalState {
     }
 
     /// Enter raw mode: save current flags and disable ICRNL, OPOST, ECHO, ICANON.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn enter_raw_mode(&mut self) {
         self.saved_iflag = Some(self.iflag);
         self.saved_oflag = Some(self.oflag);
         self.saved_lflag = Some(self.lflag);
-        self.iflag &= !(mode_flags::ICRNL | 0x00000040);
+        self.iflag &= !(mode_flags::ICRNL | mode_flags::ECHONL);
         self.oflag &= !mode_flags::OPOST;
         self.lflag &= !(mode_flags::ECHO | mode_flags::ICANON);
     }
 
     /// Exit raw mode: restore previously saved flags, or fall back to sane defaults.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn exit_raw_mode(&mut self) {
         if let Some(saved) = self.saved_iflag.take() {
             self.iflag = saved;
