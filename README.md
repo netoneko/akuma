@@ -49,7 +49,7 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 
 | Feature | Details |
 |---|---|
-| **Preemptive multitasking** | 32-thread pool, 10ms round-robin scheduling, hybrid threads + embassy async executor |
+| **Preemptive multitasking** | 32-thread pool, 10ms round-robin scheduling, hybrid threads |
 | **Memory management** | MMU-based address space isolation per process, demand paging, physical memory manager, talc heap allocator (~63 MB) |
 | **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables, `CLONE_VM` threads |
 | **Linux syscall ABI** | ~140 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |

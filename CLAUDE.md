@@ -36,7 +36,7 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 
 ## Kernel Architecture
 
-**Execution model:** Fixed 32-thread pool with preemptive 10ms round-robin scheduling. Hybrid model: threads + embassy async executor.
+**Execution model:** Fixed 32-thread pool with preemptive 10ms round-robin scheduling. Hybrid model: threads + processes
 
 **Key kernel modules:**
 - `src/main.rs` — Entry point and kernel init
