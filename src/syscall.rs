@@ -1899,7 +1899,7 @@ fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         crate::process::FileDescriptor::Stdout | crate::process::FileDescriptor::Stderr => {
-            {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 let display_len = count.min(64);
                 let mut snippet = [0u8; 64];
                 let n = display_len.min(snippet.len());
@@ -4599,11 +4599,12 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
             }
             proc.memory.free_regions.push((freed_start, freed_pages * 4096));
         }
+        return 0;
     }
 
-    // Clear stale PTEs for demand-paged pages in the range that aren't
-    // backed by any tracked eager region. Without this, orphaned PTEs from
-    // demand paging survive munmap and can cause stale data reads.
+    // No tracked region matched — clear stale PTEs for demand-paged pages
+    // that aren't backed by any tracked eager region. Without this, orphaned
+    // PTEs from demand paging survive munmap and can cause stale data reads.
     let total_pages = unmap_len / 4096;
     for i in 0..total_pages {
         let va = addr + i * 4096;
