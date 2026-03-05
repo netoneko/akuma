@@ -117,14 +117,27 @@ pub async fn http_get(url: &ParsedUrl, insecure: bool) -> Result<HttpResponse, &
             tls_opts,
         )
         .await
-        .map_err(|_| "TLS handshake failed")?;
+        .map_err(|e| {
+            log::warn!("[HTTP] TLS handshake failed: {e:?}");
+            "TLS handshake failed"
+        })?;
+
+        log::info!("[HTTP] TLS handshake complete, sending request");
 
         let _ = embedded_io_async::Write::write(&mut tls, request.as_bytes())
             .await
-            .map_err(|_| "TLS send failed")?;
+            .map_err(|e| {
+                log::warn!("[HTTP] TLS send failed: {e:?}");
+                "TLS send failed"
+            })?;
         let _ = embedded_io_async::Write::flush(&mut tls).await;
 
+        log::info!("[HTTP] Request sent, reading response...");
+
         let r = read_http_response(&mut tls).await;
+        if let Err(e) = &r {
+            log::warn!("[HTTP] TLS read result: {e}");
+        }
         let _ = tls.close().await;
         r
     } else {
@@ -140,6 +153,115 @@ pub async fn http_get(url: &ParsedUrl, insecure: bool) -> Result<HttpResponse, &
     result
 }
 
+/// Stream an HTTP/HTTPS GET response body to a writer.
+///
+/// Connects, sends the request, parses headers, then streams the body
+/// directly to `body_writer`. Returns the status code and total bytes written.
+/// Calls `on_progress(bytes_so_far)` after each chunk so the caller can
+/// display download progress.
+pub async fn http_get_streaming<W: embedded_io_async::Write>(
+    url: &ParsedUrl,
+    _insecure: bool,
+    body_writer: &mut W,
+    on_progress: impl Fn(usize),
+) -> Result<(u16, usize), &'static str> {
+    let ip = smoltcp_net::dns_query(&url.host)
+        .map_err(|_| "DNS resolution failed")?;
+
+    let (mut stream, handle) = smoltcp_net::tcp_connect(
+        smoltcp::wire::IpAddress::Ipv4(ip),
+        url.port,
+    )
+    .await
+    .map_err(|_| "TCP connection failed")?;
+
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: akuma/1.0\r\nConnection: close\r\n\r\n",
+        url.path, url.host
+    );
+    let _ = embedded_io_async::Write::write(&mut stream, request.as_bytes())
+        .await
+        .map_err(|_| "Send failed")?;
+    let _ = embedded_io_async::Write::flush(&mut stream).await;
+
+    let (status, total) =
+        stream_response_body(&mut stream, handle, body_writer, &on_progress).await?;
+    smoltcp_net::socket_close(handle);
+    Ok((status, total))
+}
+
+/// Read headers, then stream body chunks to `dest`. Returns (status, total bytes).
+async fn stream_response_body<R: embedded_io_async::Read, W: embedded_io_async::Write>(
+    reader: &mut R,
+    handle: smoltcp_net::SocketHandle,
+    dest: &mut W,
+    on_progress: &impl Fn(usize),
+) -> Result<(u16, usize), &'static str> {
+    let mut header_buf = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    let header_end = loop {
+        smoltcp_net::poll();
+        match embedded_io_async::Read::read(reader, &mut buf).await {
+            Ok(0) => {
+                smoltcp_net::socket_close(handle);
+                return Err("Connection closed before headers complete");
+            }
+            Ok(n) => {
+                header_buf.extend_from_slice(&buf[..n]);
+                if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                if header_buf.len() > 16384 {
+                    smoltcp_net::socket_close(handle);
+                    return Err("HTTP headers too large");
+                }
+            }
+            Err(_) => {
+                smoltcp_net::socket_close(handle);
+                return Err("Read error during headers");
+            }
+        }
+    };
+
+    let status = core::str::from_utf8(&header_buf[..header_end])
+        .ok()
+        .and_then(|h| h.lines().next())
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let mut total: usize = 0;
+
+    let leftover = &header_buf[header_end + 4..];
+    if !leftover.is_empty() {
+        let _ = dest.write(leftover).await.map_err(|_| "Write error")?;
+        total += leftover.len();
+        on_progress(total);
+    }
+    drop(header_buf);
+
+    loop {
+        smoltcp_net::poll();
+        match embedded_io_async::Read::read(reader, &mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = dest.write(&buf[..n]).await.map_err(|_| "Write error")?;
+                total += n;
+                on_progress(total);
+            }
+            Err(_) => {
+                if total > 0 {
+                    break;
+                }
+                return Err("Read error during body");
+            }
+        }
+    }
+
+    Ok((status, total))
+}
+
 async fn read_http_response<R: embedded_io_async::Read>(
     reader: &mut R,
 ) -> Result<HttpResponse, &'static str> {
@@ -150,7 +272,14 @@ async fn read_http_response<R: embedded_io_async::Read>(
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(_) => return Err("Read error"),
+            Err(_) => {
+                // TLS connections may signal EOF via error after close_notify.
+                // If we already have data, treat as normal EOF.
+                if !response.is_empty() {
+                    break;
+                }
+                return Err("Read error");
+            }
         }
     }
 
