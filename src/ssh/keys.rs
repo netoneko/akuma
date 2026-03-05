@@ -3,15 +3,12 @@
 //! Re-exports pure key-format functions from `akuma_ssh_crypto::keys` and
 //! provides async host-key persistence (filesystem I/O).
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
 
-pub use akuma_ssh_crypto::keys::{
-    base64_decode, base64_encode, encode_public_key_ssh, parse_public_key_ssh,
-};
+pub use akuma_ssh_crypto::keys::{encode_public_key_ssh, parse_public_key_ssh};
 
 use super::crypto::SimpleRng;
 use crate::async_fs;

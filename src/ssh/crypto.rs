@@ -6,9 +6,9 @@
 use alloc::vec::Vec;
 
 pub use akuma_ssh_crypto::crypto::{
-    AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
-    build_packet, derive_key, read_string, read_u32, split_first_word, trim_bytes, write_namelist,
-    write_string, write_u32,
+    Aes128Ctr, MAC_KEY_SIZE,
+    read_string, read_u32, split_first_word, trim_bytes,
+    write_u32,
 };
 
 use crate::rng;
@@ -20,11 +20,7 @@ pub struct SimpleRng(akuma_ssh_crypto::crypto::SimpleRng);
 
 impl SimpleRng {
     pub fn new() -> Self {
-        let mut seed_bytes = [0u8; 8];
-        if rng::fill_bytes(&mut seed_bytes).is_err() {
-            seed_bytes = (timer::uptime_us() ^ 0xDEAD_BEEF_CAFE_BABE).to_le_bytes();
-        }
-        Self(akuma_ssh_crypto::crypto::SimpleRng::from_seed(seed_bytes))
+        Self(create_seeded_rng())
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -34,6 +30,15 @@ impl SimpleRng {
     pub fn fill_bytes(&mut self, dest: &mut [u8]) {
         self.0.fill_bytes(dest);
     }
+}
+
+/// Create a hardware-seeded `SimpleRng` suitable for the `akuma-ssh` crate.
+pub fn create_seeded_rng() -> akuma_ssh_crypto::crypto::SimpleRng {
+    let mut seed_bytes = [0u8; 8];
+    if rng::fill_bytes(&mut seed_bytes).is_err() {
+        seed_bytes = (timer::uptime_us() ^ 0xDEAD_BEEF_CAFE_BABE).to_le_bytes();
+    }
+    akuma_ssh_crypto::crypto::SimpleRng::from_seed(seed_bytes)
 }
 
 /// Kernel wrapper that auto-creates an RNG from hardware entropy.

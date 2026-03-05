@@ -66,3 +66,57 @@ ssh -p 2222 akuma
 vi
 :!hello
 ```
+
+---
+
+## Logging Strategy for Extracted Crates
+
+When extracting kernel modules into standalone crates, logging requires special
+handling because crate code cannot use `safe_print!` or `crate::console`
+directly.
+
+### Rules
+
+1. **Crate code must not depend on kernel logging.** No `safe_print!`, no
+   `crate::console::print`, no direct UART writes. These are kernel-internal
+   and create a hard dependency on the kernel binary.
+
+2. **Use the `log` crate** (`log = { version = "0.4", default-features = false }`)
+   in all extracted crates. Call `log::info!`, `log::debug!`, `log::warn!`,
+   `log::error!` for diagnostics. The `log` crate is `no_std`-compatible and
+   provides a facade — it emits nothing unless a logger backend is registered.
+
+3. **The kernel provides the logger backend.** The kernel registers a global
+   `log::Log` implementation (backed by `console::print` / `safe_print!`) at
+   boot. All `log::*!` calls from any crate in the workspace then route
+   through this single backend. This means crate log output appears in the
+   same UART/SSH console stream as kernel logs, with no extra wiring.
+
+4. **Kernel wrapper modules can still use `safe_print!`.** The thin glue code
+   that stays in `src/` (e.g. `src/ssh/server.rs`, `src/ssh/keys.rs`) is part
+   of the kernel binary and can continue using `safe_print!` directly. Only
+   code that lives under `crates/` must use the `log` facade.
+
+5. **Include the subsystem tag in log messages.** Use a consistent prefix so
+   log output is filterable:
+   ```rust
+   log::info!("[SSH] Host key loaded from filesystem");
+   log::debug!("[ext2] Reading inode {} from block group {}", ino, bg);
+   ```
+
+6. **Prefer `debug!` for high-frequency messages.** Packet-level tracing,
+   per-syscall logs, and similar high-volume output should use `log::debug!`
+   or `log::trace!` so they can be compiled out or filtered without code
+   changes.
+
+### Conformance Checklist
+
+After the `akuma-ssh` extraction is working, verify that the other extracted
+crates follow this strategy:
+
+- [ ] `akuma-ssh-crypto` — currently has no logging (pure crypto, OK as-is)
+- [ ] `akuma-terminal` — currently has no logging (pure data, OK as-is)
+- [ ] `akuma-vfs` — check for any stray `safe_print!` or direct console use
+- [ ] `akuma-ext2` — check for any stray `safe_print!` or direct console use
+- [ ] Kernel registers a `log::Log` backend at boot (required for any of the
+      above to actually produce output)

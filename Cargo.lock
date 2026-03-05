@@ -43,6 +43,7 @@ version = "0.0.4"
 dependencies = [
  "aes",
  "akuma-ext2",
+ "akuma-ssh",
  "akuma-ssh-crypto",
  "akuma-terminal",
  "akuma-vfs",
@@ -77,6 +78,20 @@ version = "0.1.0"
 dependencies = [
  "akuma-vfs",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-ssh"
+version = "0.1.0"
+dependencies = [
+ "akuma-ssh-crypto",
+ "ctr",
+ "ed25519-dalek",
+ "embedded-io-async",
+ "hmac",
+ "log",
+ "sha2",
+ "x25519-dalek",
 ]
 
 [[package]]

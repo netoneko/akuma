@@ -2,18 +2,31 @@
 //!
 //! Re-exports types from `akuma_ssh_crypto::auth` and provides the async
 //! `handle_userauth_request` that loads authorized keys from the filesystem.
+//! Also implements `akuma_ssh::message::AuthProvider` for the kernel.
 
 use alloc::vec::Vec;
 
 pub use akuma_ssh_crypto::auth::{
-    AuthResult, SSH_MSG_USERAUTH_FAILURE, SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS,
-    build_failure_response, build_pk_ok_response, build_success_response,
+    AuthResult, build_failure_response, build_success_response,
 };
 
 use super::config::SshdConfig;
 use super::crypto::read_string;
 use super::keys::load_authorized_keys;
-use crate::console;
+
+/// Kernel-side auth provider that loads authorized keys from the filesystem.
+pub struct KernelAuthProvider;
+
+impl akuma_ssh::message::AuthProvider for KernelAuthProvider {
+    async fn authenticate(
+        &self,
+        payload: &[u8],
+        session_id: &[u8; 32],
+        config: &SshdConfig,
+    ) -> (AuthResult, Vec<u8>) {
+        handle_userauth_request(payload, session_id, config).await
+    }
+}
 
 /// Handle a userauth request (async — loads authorized keys from disk).
 pub async fn handle_userauth_request(
@@ -69,7 +82,7 @@ pub async fn handle_userauth_request(
             (AuthResult::Failure, build_failure_response())
         }
         _ => {
-            safe_print!(256, 
+            safe_print!(256,
                 "[SSH Auth] Unknown auth method: {:?}\n",
                 core::str::from_utf8(method)
             );

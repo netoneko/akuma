@@ -3,13 +3,11 @@
 //! Implements the SSH server loop using smoltcp sockets.
 //! Runs on a dedicated system thread.
 
-use alloc::boxed::Box;
 use alloc::format;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp;
 use crate::smoltcp_net::{self, SocketHandle, with_network};
-use crate::console;
 use super::protocol;
 
 // ============================================================================
