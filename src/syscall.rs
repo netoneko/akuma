@@ -791,7 +791,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
     let start_time = crate::timer::uptime_us();
 
     loop {
-        crate::smoltcp_net::poll();
+        akuma_net::smoltcp_net::poll();
         let mut ready_count: u64 = 0;
         let mut out_read = [0u64; MAX_FDS / 64];
         let mut out_write = [0u64; MAX_FDS / 64];
@@ -818,7 +818,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
                     crate::process::current_channel().map_or(false, |ch| ch.has_stdin_data())
                 } else if let Some(idx) = socket_idx {
                     if socket::is_udp_socket(idx) {
-                        socket_get_udp_handle(idx).map_or(false, |h| crate::smoltcp_net::udp_can_recv(h))
+                        socket_get_udp_handle(idx).map_or(false, |h| akuma_net::smoltcp_net::udp_can_recv(h))
                     } else {
                         socket_can_recv_tcp(idx)
                     }
@@ -831,7 +831,7 @@ fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr
             if in_write {
                 let writable = if let Some(idx) = socket_idx {
                     if socket::is_udp_socket(idx) {
-                        socket_get_udp_handle(idx).map_or(false, |h| crate::smoltcp_net::udp_can_send(h))
+                        socket_get_udp_handle(idx).map_or(false, |h| akuma_net::smoltcp_net::udp_can_send(h))
                     } else {
                         socket_can_send_tcp(idx)
                     }
@@ -874,7 +874,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
     let start_time = crate::timer::uptime_us();
 
     loop {
-        crate::smoltcp_net::poll();
+        akuma_net::smoltcp_net::poll();
         let mut ready_count = 0;
         unsafe {
             let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
@@ -913,7 +913,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
                     } else if let Some(idx) = socket_idx {
                         if socket::is_udp_socket(idx) {
                             if let Some(handle) = socket_get_udp_handle(idx) {
-                                if crate::smoltcp_net::udp_can_recv(handle) {
+                                if akuma_net::smoltcp_net::udp_can_recv(handle) {
                                     fd.revents |= 1;
                                 }
                             }
@@ -934,7 +934,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 
                     } else if let Some(idx) = socket_idx {
                         if socket::is_udp_socket(idx) {
                             if let Some(handle) = socket_get_udp_handle(idx) {
-                                if crate::smoltcp_net::udp_can_send(handle) {
+                                if akuma_net::smoltcp_net::udp_can_send(handle) {
                                     fd.revents |= 4;
                                 }
                             }
@@ -2242,7 +2242,7 @@ fn sys_close(fd: u32) -> u64 {
         if let Some(entry) = proc.remove_fd(fd) {
             proc.clear_cloexec(fd);
             match entry {
-                crate::process::FileDescriptor::Socket(idx) => { crate::socket::remove_socket(idx); }
+                crate::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 crate::process::FileDescriptor::ChildStdout(child_pid) => {
                     crate::process::remove_child_channel(child_pid);
                 }
@@ -2743,7 +2743,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         match entry {
             crate::process::FileDescriptor::PipeWrite(pipe_id) => pipe_close_write(pipe_id),
             crate::process::FileDescriptor::PipeRead(pipe_id) => pipe_close_read(pipe_id),
-            crate::process::FileDescriptor::Socket(idx) => crate::socket::remove_socket(idx),
+            crate::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
             crate::process::FileDescriptor::ChildStdout(child_pid) => {
                 crate::process::remove_child_channel(child_pid);
             }
@@ -3163,7 +3163,7 @@ fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     }
 }
 
-use crate::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
+use akuma_net::socket::{self, SocketAddrV4, SockAddrIn, libc_errno};
 
 fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF; // mask off SOCK_CLOEXEC (0x80000) and SOCK_NONBLOCK (0x800)
@@ -3283,7 +3283,7 @@ fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         None => return (-libc_errno::EBADF as i64) as u64,
     };
     let port = socket::with_socket(idx, |s| s.bind_port.unwrap_or(0)).unwrap_or(0);
-    let local_ip = crate::smoltcp_net::get_local_ip();
+    let local_ip = akuma_net::smoltcp_net::get_local_ip();
     let sa = SockAddrIn {
         sin_family: 2,
         sin_port: port.to_be(),
@@ -3310,7 +3310,7 @@ fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     let remote = socket::with_socket(idx, |sock| {
         match &sock.inner {
             socket::SocketType::Stream(h) => {
-                crate::smoltcp_net::with_network(|net| {
+                akuma_net::smoltcp_net::with_network(|net| {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                     s.remote_endpoint().map(|ep| {
                         let ip = if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr {
@@ -3435,7 +3435,7 @@ fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -
                 if let Some(idx) = get_socket_from_fd(fd) {
                     socket::with_socket(idx, |sock| {
                         if let socket::SocketType::Stream(h) = &sock.inner {
-                            crate::smoltcp_net::with_network(|net| {
+                            akuma_net::smoltcp_net::with_network(|net| {
                                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                                 if s.is_active() || s.may_send() { 0 }
                                 else { libc_errno::ECONNREFUSED }
@@ -3588,7 +3588,7 @@ fn fd_is_nonblock(fd: u32) -> bool {
     crate::process::current_process().map_or(false, |p| p.is_nonblock(fd))
 }
 
-fn socket_get_udp_handle(idx: usize) -> Option<crate::smoltcp_net::SocketHandle> {
+fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net::SocketHandle> {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Datagram { handle, .. } = &sock.inner {
             Some(*handle)
@@ -3601,7 +3601,7 @@ fn socket_get_udp_handle(idx: usize) -> Option<crate::smoltcp_net::SocketHandle>
 fn socket_can_recv_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
-            crate::smoltcp_net::with_network(|net| {
+            akuma_net::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                 s.can_recv() || !s.is_active()
             }).unwrap_or(false)
@@ -3614,7 +3614,7 @@ fn socket_can_recv_tcp(idx: usize) -> bool {
 fn socket_can_send_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
-            crate::smoltcp_net::with_network(|net| {
+            akuma_net::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                 s.can_send()
             }).unwrap_or(false)
@@ -3930,10 +3930,10 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
         crate::process::FileDescriptor::Socket(idx) => {
             if socket::is_udp_socket(idx) {
                 if let Some(handle) = socket_get_udp_handle(idx) {
-                    if requested & EPOLLIN != 0 && crate::smoltcp_net::udp_can_recv(handle) {
+                    if requested & EPOLLIN != 0 && akuma_net::smoltcp_net::udp_can_recv(handle) {
                         ready |= EPOLLIN;
                     }
-                    if requested & EPOLLOUT != 0 && crate::smoltcp_net::udp_can_send(handle) {
+                    if requested & EPOLLOUT != 0 && akuma_net::smoltcp_net::udp_can_send(handle) {
                         ready |= EPOLLOUT;
                     }
                 }
@@ -4011,7 +4011,7 @@ fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -
     let start_time = crate::timer::uptime_us();
 
     loop {
-        crate::smoltcp_net::poll();
+        akuma_net::smoltcp_net::poll();
 
         let interest_snapshot: Vec<(u32, u32, u64)> = {
             let table = EPOLL_TABLE.lock();
@@ -4546,7 +4546,7 @@ fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     if !validate_user_ptr(res_ptr, 4) { return EFAULT; }
     let host = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    match crate::dns::resolve_host_blocking(host) {
+    match akuma_net::dns::resolve_host_blocking(host) {
         Ok(ipv4) => {
             unsafe { *(res_ptr as *mut [u8; 4]) = ipv4.octets(); }
             0

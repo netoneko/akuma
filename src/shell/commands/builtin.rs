@@ -12,7 +12,7 @@ use core::pin::Pin;
 use embedded_io_async::Write;
 
 use crate::akuma::AKUMA_79;
-use crate::network;
+use akuma_net::stats as network;
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 
 // ============================================================================

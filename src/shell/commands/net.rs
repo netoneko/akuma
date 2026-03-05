@@ -14,123 +14,8 @@ use embedded_io_async::Write;
 
 use crate::async_fs::{AsyncFile, OpenMode};
 use crate::shell::{execute_external_streaming, Command, ShellContext, ShellError, VecWriter};
-use crate::smoltcp_net;
-
-// ============================================================================
-// URL Parsing Helper
-// ============================================================================
-
-struct ParsedUrl {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_url(url: &str) -> Option<ParsedUrl> {
-    let rest = if let Some(rest) = url.strip_prefix("http://") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("https://") {
-        // HTTPS not supported in kernel shell, treat as HTTP
-        rest
-    } else {
-        url
-    };
-
-    let (host_port, path) = if let Some(pos) = rest.find('/') {
-        (&rest[..pos], &rest[pos..])
-    } else {
-        (rest, "/")
-    };
-
-    let (host, port) = if let Some(pos) = host_port.rfind(':') {
-        let port_str = &host_port[pos + 1..];
-        if let Ok(p) = port_str.parse::<u16>() {
-            (&host_port[..pos], p)
-        } else {
-            (host_port, 80)
-        }
-    } else {
-        (host_port, 80)
-    };
-
-    if host.is_empty() {
-        return None;
-    }
-
-    Some(ParsedUrl {
-        host: String::from(host),
-        port,
-        path: String::from(path),
-    })
-}
-
-// ============================================================================
-// HTTP GET Helper
-// ============================================================================
-
-/// Perform an HTTP GET request and return the HTTP status code and response body.
-async fn http_get(url: &ParsedUrl) -> Result<(u16, Vec<u8>), &'static str> {
-    // Resolve hostname
-    let ip = smoltcp_net::dns_query(&url.host)
-        .map_err(|_| "DNS resolution failed")?;
-
-    // Connect
-    let (mut stream, handle) = smoltcp_net::tcp_connect(
-        smoltcp::wire::IpAddress::Ipv4(ip),
-        url.port,
-    ).await.map_err(|_| "TCP connection failed")?;
-
-    // Send HTTP/1.0 GET request
-    let request = format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: akuma/1.0\r\nConnection: close\r\n\r\n",
-        url.path, url.host
-    );
-    let _ = stream.write(request.as_bytes()).await.map_err(|_| "Send failed")?;
-    let _ = stream.flush().await;
-
-    // Read the full response
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        smoltcp_net::poll();
-        match embedded_io_async::Read::read(&mut stream, &mut buf).await {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(_) => {
-                smoltcp_net::socket_close(handle);
-                return Err("TCP read error");
-            }
-        }
-    }
-    smoltcp_net::socket_close(handle);
-
-    if response.is_empty() {
-        return Err("Empty response");
-    }
-
-    // Parse HTTP response: find end of headers (\r\n\r\n)
-    let pos = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(p) => p,
-        None => return Err("Malformed HTTP response"),
-    };
-
-    let header_bytes = &response[..pos];
-    let body = response[pos + 4..].to_vec();
-
-    // Parse status code from "HTTP/1.1 200 OK"
-    let status_code = if let Ok(header_str) = core::str::from_utf8(header_bytes) {
-        header_str
-            .lines()
-            .next()
-            .and_then(|status_line| status_line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    Ok((status_code, body))
-}
+use akuma_net::smoltcp_net;
+use akuma_net::http::{self, ParsedUrl, parse_url};
 
 /// Stream an HTTP GET response body directly to a file on disk, avoiding
 /// holding the entire payload in memory. Returns the HTTP status code and
@@ -247,8 +132,8 @@ pub struct CurlCommand;
 
 impl Command for CurlCommand {
     fn name(&self) -> &'static str { "curl" }
-    fn description(&self) -> &'static str { "HTTP GET request" }
-    fn usage(&self) -> &'static str { "curl <url>" }
+    fn description(&self) -> &'static str { "HTTP/HTTPS GET request" }
+    fn usage(&self) -> &'static str { "curl [-k] [-L] [-v] <url>" }
 
     fn execute<'a>(
         &'a self,
@@ -260,34 +145,90 @@ impl Command for CurlCommand {
         Box::pin(async move {
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
             if args_str.is_empty() {
-                let _ = stdout.write(b"Usage: curl <url>\r\n").await;
+                let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] <url>\r\n").await;
                 return Ok(());
             }
 
-            let url = match parse_url(args_str) {
+            let mut insecure = false;
+            let mut follow_redirects = false;
+            let mut verbose = false;
+            let mut url_str = None;
+
+            for token in args_str.split_whitespace() {
+                match token {
+                    "-k" | "--insecure" => insecure = true,
+                    "-L" | "--location" => follow_redirects = true,
+                    "-v" | "--verbose" => verbose = true,
+                    "-Lv" | "-vL" => { follow_redirects = true; verbose = true; }
+                    "-Lk" | "-kL" => { follow_redirects = true; insecure = true; }
+                    "-kv" | "-vk" => { insecure = true; verbose = true; }
+                    "-Lkv" | "-Lvk" | "-kLv" | "-kvL" | "-vLk" | "-vkL" => {
+                        follow_redirects = true; insecure = true; verbose = true;
+                    }
+                    _ if !token.starts_with('-') => url_str = Some(token),
+                    _ => {}
+                }
+            }
+
+            let raw_url = match url_str {
                 Some(u) => u,
                 None => {
-                    let _ = stdout.write(b"Error: Invalid URL\r\n").await;
+                    let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] <url>\r\n").await;
                     return Ok(());
                 }
             };
 
-            let msg = format!("Connecting to {}:{}...\r\n", url.host, url.port);
-            let _ = stdout.write(msg.as_bytes()).await;
+            let max_redirects = if follow_redirects { 10 } else { 0 };
+            let mut current_url_string = String::from(raw_url);
 
-            match http_get(&url).await {
-                Ok((status, body)) => {
-                    let msg = format!("HTTP Status: {}\r\n", status);
+            for redirect_count in 0..=max_redirects {
+                let url = match parse_url(&current_url_string) {
+                    Some(u) => u,
+                    None => {
+                        let _ = stdout.write(b"Error: Invalid URL\r\n").await;
+                        return Ok(());
+                    }
+                };
+
+                if verbose {
+                    let scheme = if url.is_https { "https" } else { "http" };
+                    let msg = format!("* Connecting to {}:{} ({})\r\n", url.host, url.port, scheme);
                     let _ = stdout.write(msg.as_bytes()).await;
-                    let _ = stdout.write(&body).await;
-                    if !body.ends_with(b"\n") {
-                        let _ = stdout.write(b"\r\n").await;
+                }
+
+                match http::http_get(&url, insecure).await {
+                    Ok(resp) => {
+                        if verbose {
+                            let msg = format!("< HTTP/1.0 {}\r\n", resp.status);
+                            let _ = stdout.write(msg.as_bytes()).await;
+                        }
+
+                        if follow_redirects && (301..=308).contains(&resp.status) {
+                            if redirect_count >= max_redirects {
+                                let _ = stdout.write(b"Error: Too many redirects\r\n").await;
+                                return Ok(());
+                            }
+                            if let Some(location) = resp.location() {
+                                if verbose {
+                                    let msg = format!("* Redirecting to {}\r\n", location);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                }
+                                current_url_string = String::from(location);
+                                continue;
+                            }
+                        }
+
+                        let _ = stdout.write(&resp.body).await;
+                        if !resp.body.ends_with(b"\n") {
+                            let _ = stdout.write(b"\r\n").await;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("Error: {}\r\n", e);
+                        let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
-                Err(e) => {
-                    let msg = format!("Error: {}\r\n", e);
-                    let _ = stdout.write(msg.as_bytes()).await;
-                }
+                break;
             }
             Ok(())
         })
@@ -362,10 +303,11 @@ impl PkgCommand {
         let msg = format!("pkg: downloading {}...\r\n", url_str);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        http_get(&url).await.map_err(|e| {
+        let resp = http::http_get(&url, false).await.map_err(|e| {
             let _ = stdout.write_all(format!("pkg: download error: {}\r\n", e).as_bytes());
             ShellError::ExecutionFailed("Download failed")
-        })
+        })?;
+        Ok((resp.status, resp.body))
     }
 
     async fn try_install_binary_w<W: embedded_io_async::Write>(

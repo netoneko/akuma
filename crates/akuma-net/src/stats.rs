@@ -1,7 +1,7 @@
 //! Network Statistics
 //!
 //! Provides network statistics tracking for the async network stack.
-//! The actual networking is handled by async_net module.
+//! The actual networking is handled by `async_net` module.
 
 use spinning_top::Spinlock;
 
@@ -46,7 +46,7 @@ pub fn add_bytes_tx(bytes: u64) {
     NET_STATS.lock().bytes_tx += bytes;
 }
 
-/// Get network statistics: (connections, bytes_rx, bytes_tx)
+/// Get network statistics: (connections, `bytes_rx`, `bytes_tx`)
 pub fn get_stats() -> (u64, u64, u64) {
     let s = NET_STATS.lock();
     (s.connections, s.bytes_rx, s.bytes_tx)

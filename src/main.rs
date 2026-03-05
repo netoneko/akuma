@@ -8,14 +8,12 @@ mod akuma;
 mod allocator;
 mod async_fs;
 // mod async_net;
-mod smoltcp_net;
 mod async_tests;
 mod block;
 mod boot;
 mod config;
 #[macro_use]
 mod console;
-mod dns;
 mod editor;
 mod elf_loader;
 // mod embassy_net_driver;
@@ -29,7 +27,6 @@ mod fs_tests;
 mod gic;
 mod irq;
 mod mmu;
-mod network;
 mod network_tests;
 mod pmm;
 mod process;
@@ -38,15 +35,11 @@ mod ramfb;
 mod rng;
 mod shell;
 mod shell_tests;
-mod socket;
 mod ssh;
 mod syscall;
 mod tests;
 mod threading;
 mod timer;
-mod tls;
-mod tls_rng;
-mod tls_verifier;
 mod vfs;
 mod virtio_hal;
 
@@ -673,8 +666,31 @@ fn run_async_main() -> ! {
     // =========================================================================
     console::print("\n--- Network Initialization ---\n");
 
-    // Initialize the smoltcp network stack
-    if let Err(e) = smoltcp_net::init() {
+    // Initialize the akuma-net networking stack
+    let mmio_addrs: [usize; 8] = [
+        mmu::DEV_VIRTIO_VA,
+        mmu::DEV_VIRTIO_VA + 0x200,
+        mmu::DEV_VIRTIO_VA + 0x400,
+        mmu::DEV_VIRTIO_VA + 0x600,
+        mmu::DEV_VIRTIO_VA + 0x800,
+        mmu::DEV_VIRTIO_VA + 0xa00,
+        mmu::DEV_VIRTIO_VA + 0xc00,
+        mmu::DEV_VIRTIO_VA + 0xe00,
+    ];
+    if let Err(e) = akuma_net::init(
+        akuma_net::NetRuntime {
+            virt_to_phys: mmu::virt_to_phys,
+            phys_to_virt: |pa| mmu::phys_to_virt(pa),
+            uptime_us: timer::uptime_us,
+            utc_seconds: timer::utc_seconds,
+            yield_now: threading::yield_now,
+            current_box_id: || process::current_process().map(|p| p.box_id).unwrap_or(0),
+            is_current_interrupted: process::is_current_interrupted,
+            rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
+        },
+        &mmio_addrs,
+        config::ENABLE_DHCP,
+    ) {
         console::print("[Net] Network init failed: ");
         console::print(e);
         console::print("\n");
@@ -783,7 +799,7 @@ fn run_async_main() -> ! {
         let mut net_progress = false;
         {
             let mut polls = 0u32;
-            while smoltcp_net::poll() {
+            while akuma_net::smoltcp_net::poll() {
                 net_progress = true;
                 polls += 1;
                 if polls >= 64 {

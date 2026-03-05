@@ -2467,7 +2467,7 @@ fn cleanup_process_fds(proc: &Process) {
     for fd in fds {
         match fd {
             FileDescriptor::Socket(idx) => {
-                crate::socket::remove_socket(idx);
+                akuma_net::socket::remove_socket(idx);
             }
             FileDescriptor::ChildStdout(child_pid) => {
                 crate::process::remove_child_channel(child_pid);

@@ -6,8 +6,8 @@
 //! # Certificate Verification
 //!
 //! Two modes are supported:
-//! - Secure mode (default): Uses X509Verifier for certificate validation
-//! - Insecure mode (-k flag): Uses NoVerify, skips certificate validation
+//! - Secure mode (default): Uses `X509Verifier` for certificate validation
+//! - Insecure mode (-k flag): Uses `NoVerify`, skips certificate validation
 
 use embedded_io_async::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext, TlsError};
@@ -33,18 +33,21 @@ pub struct TlsOptions {
 
 impl TlsOptions {
     /// Create default options (secure, non-verbose)
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Enable insecure mode (skip certificate verification)
-    pub fn insecure(mut self) -> Self {
+    #[must_use] 
+    pub const fn insecure(mut self) -> Self {
         self.insecure = true;
         self
     }
 
     /// Enable verbose logging
-    pub fn verbose(mut self) -> Self {
+    #[must_use] 
+    pub const fn verbose(mut self) -> Self {
         self.verbose = true;
         self
     }

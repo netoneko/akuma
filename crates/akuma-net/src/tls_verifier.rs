@@ -1,6 +1,6 @@
 //! Custom X.509 Certificate Verifier for TLS
 //!
-//! Implements the `TlsVerifier` trait using RustCrypto's `x509-cert` for certificate parsing
+//! Implements the `TlsVerifier` trait using `RustCrypto`'s `x509-cert` for certificate parsing
 //! and `p256`/`ed25519-dalek` for signature verification.
 //!
 //! Supports:
@@ -25,7 +25,7 @@ use embedded_tls::{Certificate, TlsCipherSuite, TlsError, TlsVerifier};
 use sha2::Digest;
 use x509_cert::Certificate as X509Certificate;
 
-use crate::timer;
+use crate::runtime::runtime;
 
 // ============================================================================
 // X.509 Verifier
@@ -75,25 +75,24 @@ where
 
         let cert_der = match &cert.entries[0] {
             CertificateEntryRef::X509(der) => *der,
-            _ => return Err(TlsError::InvalidCertificate),
+            CertificateEntryRef::RawPublicKey(_) => return Err(TlsError::InvalidCertificate),
         };
 
         // Parse the X.509 certificate
         let x509 = X509Certificate::from_der(cert_der).map_err(|_| TlsError::InvalidCertificate)?;
 
         // Check validity dates if we have system time
-        if let Some(now_secs) = timer::utc_seconds() {
+        if let Some(now_secs) = (runtime().utc_seconds)() {
             let validity = &x509.tbs_certificate.validity;
             // Note: Proper time comparison would require parsing ASN.1 time
             let _ = (validity, now_secs); // TODO: Implement proper time comparison
         }
 
         // Verify hostname if provided
-        if let Some(expected_host) = self.host {
-            if !verify_hostname(&x509, expected_host) {
+        if let Some(expected_host) = self.host
+            && !verify_hostname(&x509, expected_host) {
                 return Err(TlsError::InvalidCertificate);
             }
-        }
 
         // Store certificate and transcript for signature verification
         self.certificate_der = Some(cert_der.to_vec());
@@ -129,26 +128,26 @@ where
         // Verify based on signature scheme
         match verify.signature_scheme {
             SignatureScheme::EcdsaSecp256r1Sha256 => {
-                verify_ecdsa_p256(&x509, &message, &verify.signature)
+                verify_ecdsa_p256(&x509, &message, verify.signature)
             }
-            SignatureScheme::Ed25519 => verify_ed25519(&x509, &message, &verify.signature),
+            SignatureScheme::Ed25519 => verify_ed25519(&x509, &message, verify.signature),
             SignatureScheme::RsaPkcs1Sha256 => {
-                verify_rsa_pkcs1_sha256(&x509, &message, &verify.signature)
+                verify_rsa_pkcs1_sha256(&x509, &message, verify.signature)
             }
             SignatureScheme::RsaPkcs1Sha384 => {
-                verify_rsa_pkcs1_sha384(&x509, &message, &verify.signature)
+                verify_rsa_pkcs1_sha384(&x509, &message, verify.signature)
             }
             SignatureScheme::RsaPkcs1Sha512 => {
-                verify_rsa_pkcs1_sha512(&x509, &message, &verify.signature)
+                verify_rsa_pkcs1_sha512(&x509, &message, verify.signature)
             }
             SignatureScheme::RsaPssRsaeSha256 => {
-                verify_rsa_pss_sha256(&x509, &message, &verify.signature)
+                verify_rsa_pss_sha256(&x509, &message, verify.signature)
             }
             SignatureScheme::RsaPssRsaeSha384 => {
-                verify_rsa_pss_sha384(&x509, &message, &verify.signature)
+                verify_rsa_pss_sha384(&x509, &message, verify.signature)
             }
             SignatureScheme::RsaPssRsaeSha512 => {
-                verify_rsa_pss_sha512(&x509, &message, &verify.signature)
+                verify_rsa_pss_sha512(&x509, &message, verify.signature)
             }
             _ => Err(TlsError::InvalidSignatureScheme),
         }
@@ -166,11 +165,11 @@ fn verify_hostname(cert: &X509Certificate, hostname: &str) -> bool {
 
     // Try to get Subject Alternative Names extension
     if let Some(extensions) = &cert.tbs_certificate.extensions {
-        for ext in extensions.iter() {
+        for ext in extensions {
             // Check if this is the SAN extension (OID 2.5.29.17)
-            if ext.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME {
-                if let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
-                    for name in san.0.iter() {
+            if ext.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME
+                && let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
+                    for name in &san.0 {
                         match name {
                             GeneralName::DnsName(dns_name) => {
                                 if matches_hostname(dns_name.as_str(), hostname) {
@@ -196,21 +195,18 @@ fn verify_hostname(cert: &X509Certificate, hostname: &str) -> bool {
                         }
                     }
                 }
-            }
         }
     }
 
     // Fall back to Common Name (CN) in subject
-    for rdn in cert.tbs_certificate.subject.0.iter() {
+    for rdn in &cert.tbs_certificate.subject.0 {
         for atv in rdn.0.iter() {
             // Check for Common Name OID (2.5.4.3)
-            if atv.oid == const_oid::db::rfc4519::CN {
-                if let Ok(cn) = core::str::from_utf8(atv.value.value()) {
-                    if matches_hostname(cn, hostname) {
+            if atv.oid == const_oid::db::rfc4519::CN
+                && let Ok(cn) = core::str::from_utf8(atv.value.value())
+                    && matches_hostname(cn, hostname) {
                         return true;
                     }
-                }
-            }
         }
     }
 
@@ -218,13 +214,12 @@ fn verify_hostname(cert: &X509Certificate, hostname: &str) -> bool {
 }
 
 /// Check if a certificate name matches the hostname (supports wildcards)
-fn matches_hostname(cert_name: &str, hostname: &str) -> bool {
+pub(crate) fn matches_hostname(cert_name: &str, hostname: &str) -> bool {
     let cert_lower = to_lowercase(cert_name);
     let host_lower = to_lowercase(hostname);
 
-    if cert_lower.starts_with("*.") {
+    if let Some(suffix) = cert_lower.strip_prefix("*.") {
         // Wildcard match: *.example.com matches foo.example.com
-        let suffix = &cert_lower[2..];
         if let Some(pos) = host_lower.find('.') {
             return &host_lower[pos + 1..] == suffix;
         }
@@ -234,7 +229,7 @@ fn matches_hostname(cert_name: &str, hostname: &str) -> bool {
     }
 }
 
-/// Convert to lowercase (no_std compatible)
+/// Convert to lowercase (`no_std` compatible)
 fn to_lowercase(s: &str) -> String {
     s.chars()
         .map(|c| {

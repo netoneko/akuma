@@ -12,7 +12,7 @@ use smoltcp::wire::{IpAddress, Ipv4Address};
 // ============================================================================
 
 /// Loopback IP address
-pub const LOOPBACK_IP: Ipv4Address = Ipv4Address::new(127, 0, 0, 1);
+pub const LOOPBACK_IP: Ipv4Address = Ipv4Address::LOCALHOST;
 
 // ============================================================================
 // Error Types
@@ -36,6 +36,7 @@ pub enum DnsError {
 // ============================================================================
 
 /// Check if a host is a loopback address
+#[must_use] 
 pub fn is_loopback(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
@@ -43,9 +44,7 @@ pub fn is_loopback(host: &str) -> bool {
 /// Resolve a hostname to an IP address.
 ///
 /// Handles localhost, IPv4 literals, and real DNS queries via smoltcp.
-pub async fn resolve_host(
-    host: &str,
-) -> Result<IpAddress, DnsError> {
+pub fn resolve_host(host: &str) -> Result<IpAddress, DnsError> {
     // "localhost" resolves to 127.0.0.1
     if host == "localhost" {
         return Ok(IpAddress::Ipv4(LOOPBACK_IP));
@@ -83,12 +82,13 @@ pub fn resolve_host_blocking(host: &str) -> Result<Ipv4Address, DnsError> {
 // ============================================================================
 
 impl DnsError {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use] 
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            DnsError::LookupFailed => "DNS lookup failed",
-            DnsError::NoConfig => "Network not configured",
-            DnsError::InvalidHost => "Invalid hostname",
-            DnsError::Timeout => "DNS query timed out",
+            Self::LookupFailed => "DNS lookup failed",
+            Self::NoConfig => "Network not configured",
+            Self::InvalidHost => "Invalid hostname",
+            Self::Timeout => "DNS query timed out",
         }
     }
 }

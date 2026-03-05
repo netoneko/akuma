@@ -1,13 +1,11 @@
 //! Smoltcp Network Stack (Thread-Safe)
 //!
-//! Replaces embassy-net with a direct smoltcp integration protected by a kernel Spinlock.
-//! This allows any thread (kernel or userspace via syscall) to drive the network stack,
-//! eliminating the need for a dedicated network thread and complex preemption management.
+//! Provides the core networking stack using smoltcp, protected by a Spinlock.
+//! This allows any thread (kernel or userspace via syscall) to drive the network stack.
 
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::safe_print;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
@@ -21,8 +19,8 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
-use crate::console;
-use crate::virtio_hal::VirtioHal;
+use crate::hal::NetHal;
+use crate::runtime::runtime;
 
 // ============================================================================
 // Constants
@@ -32,11 +30,12 @@ const MAX_SOCKETS: usize = 256;
 const TCP_RX_BUFFER_SIZE: usize = 65535;
 const TCP_TX_BUFFER_SIZE: usize = 65535;
 const EPHEMERAL_PORT_START: u16 = 49152;
+const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);
 
 fn alloc_ephemeral_port() -> u16 {
     let port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
-    if port >= 65535 {
+    if port == 65535 {
         NEXT_EPHEMERAL_PORT.store(EPHEMERAL_PORT_START, Ordering::Relaxed);
         EPHEMERAL_PORT_START
     } else {
@@ -44,17 +43,8 @@ fn alloc_ephemeral_port() -> u16 {
     }
 }
 
-/// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
-const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    crate::mmu::DEV_VIRTIO_VA,
-    crate::mmu::DEV_VIRTIO_VA + 0x200,
-    crate::mmu::DEV_VIRTIO_VA + 0x400,
-    crate::mmu::DEV_VIRTIO_VA + 0x600,
-    crate::mmu::DEV_VIRTIO_VA + 0x800,
-    crate::mmu::DEV_VIRTIO_VA + 0xa00,
-    crate::mmu::DEV_VIRTIO_VA + 0xc00,
-    crate::mmu::DEV_VIRTIO_VA + 0xe00,
-];
+/// Whether DHCP is enabled. Set during `init()`.
+static DHCP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Global Network State
@@ -66,7 +56,7 @@ static NETWORK_READY: AtomicBool = AtomicBool::new(false);
 /// Atomic counter incremented when progress is made (e.g. packets processed)
 static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Counter for silently dropped TX packets (VirtIO send failures)
+/// Counter for silently dropped TX packets (`VirtIO` send failures)
 static TX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn is_ready() -> bool {
@@ -82,7 +72,7 @@ pub fn tx_drop_count() -> usize {
 static DHCP_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_dhcp_configured() -> bool {
-    if !crate::config::ENABLE_DHCP {
+    if !DHCP_ENABLED.load(Ordering::Relaxed) {
         return true;
     }
     DHCP_CONFIGURED.load(Ordering::Acquire)
@@ -101,7 +91,7 @@ pub struct NetworkState {
     pub device: LoopbackAwareDevice,
     pub dhcp_handle: Option<SocketHandle>,
     pub dns_handle: SocketHandle,
-    /// Sockets closed by the user, waiting for TCP teardown. Tuple: (handle, close_timestamp_us).
+    /// Sockets closed by the user, waiting for TCP teardown. Tuple: (handle, `close_timestamp_us`).
     pub pending_removal: Vec<(SocketHandle, u64)>,
 }
 
@@ -116,18 +106,19 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 // ============================================================================
 
 pub struct VirtioSmoltcpDevice {
-    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<NetHal, MmioTransport, 16>,
     rx_buffer: [u8; 2048],
     tx_buffer: [u8; 2048],
-    /// Token for a pending VirtIO receive buffer that has been submitted to the device.
-    /// VirtIO requires buffers to be posted via receive_begin() before the device can
-    /// DMA received packets into them. We track the token so we can call receive_complete()
-    /// once poll_receive() indicates the device has filled the buffer.
+    /// Token for a pending `VirtIO` receive buffer that has been submitted to the device.
+    /// `VirtIO` requires buffers to be posted via `receive_begin()` before the device can
+    /// DMA received packets into them. We track the token so we can call `receive_complete()`
+    /// once `poll_receive()` indicates the device has filled the buffer.
     rx_token: Option<u16>,
 }
 
 impl VirtioSmoltcpDevice {
-    pub fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
+    #[must_use] 
+    pub const fn new(inner: VirtIONetRaw<NetHal, MmioTransport, 16>) -> Self {
         Self {
             inner,
             rx_buffer: [0u8; 2048],
@@ -136,11 +127,13 @@ impl VirtioSmoltcpDevice {
         }
     }
 
+    #[must_use] 
     pub fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
 }
 
+#[allow(clippy::deref_addrof)]
 impl Device for VirtioSmoltcpDevice {
     type RxToken<'a> = VirtioRxToken<'a>;
     type TxToken<'a> = VirtioTxToken<'a>;
@@ -171,7 +164,7 @@ impl Device for VirtioSmoltcpDevice {
                         buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
                     };
                     let tx = VirtioTxToken {
-                        inner: unsafe { &mut *(&mut self.inner as *mut _) },
+                        inner: unsafe { &mut *(&raw mut self.inner) },
                         buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
                     };
                     return Some((rx, tx));
@@ -184,7 +177,7 @@ impl Device for VirtioSmoltcpDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(VirtioTxToken {
-            inner: unsafe { &mut *(&mut self.inner as *mut _) },
+            inner: unsafe { &mut *(&raw mut self.inner) },
             buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
         })
     }
@@ -200,7 +193,7 @@ pub struct VirtioRxToken<'a> {
     buffer: &'a mut [u8],
 }
 
-impl<'a> smoltcp::phy::RxToken for VirtioRxToken<'a> {
+impl smoltcp::phy::RxToken for VirtioRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -210,11 +203,11 @@ impl<'a> smoltcp::phy::RxToken for VirtioRxToken<'a> {
 }
 
 pub struct VirtioTxToken<'a> {
-    inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    inner: &'a mut VirtIONetRaw<NetHal, MmioTransport, 16>,
     buffer: &'a mut [u8],
 }
 
-impl<'a> smoltcp::phy::TxToken for VirtioTxToken<'a> {
+impl smoltcp::phy::TxToken for VirtioTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -233,7 +226,7 @@ impl<'a> smoltcp::phy::TxToken for VirtioTxToken<'a> {
 
 /// Check if an Ethernet frame is destined for loopback (127.x.x.x).
 ///
-/// Inspects the EtherType and the relevant IP address field:
+/// Inspects the `EtherType` and the relevant IP address field:
 /// - ARP (0x0806): target protocol address at bytes [38:42]
 /// - IPv4 (0x0800): destination IP at bytes [30:34]
 fn is_loopback_frame(frame: &[u8]) -> bool {
@@ -250,29 +243,34 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
     }
 }
 
-/// A composite device that wraps VirtIO for external traffic and an internal
-/// queue for loopback (127.x.x.x) traffic. Outgoing frames destined for
+/// A composite device that wraps `VirtIO` for external traffic and an internal
+/// queue for loopback (127.x.x.x) traffic.
+///
+/// Outgoing frames destined for
 /// loopback addresses are intercepted in `TxToken::consume()` and queued
-/// internally rather than being sent through VirtIO. `receive()` checks
-/// the loopback queue first, then falls back to VirtIO.
+/// internally rather than being sent through `VirtIO`. `receive()` checks
+/// the loopback queue first, then falls back to `VirtIO`.
 pub struct LoopbackAwareDevice {
     virtio: VirtioSmoltcpDevice,
     pub loopback_queue: VecDeque<Vec<u8>>,
 }
 
 impl LoopbackAwareDevice {
-    pub fn new(virtio: VirtioSmoltcpDevice) -> Self {
+    #[must_use] 
+    pub const fn new(virtio: VirtioSmoltcpDevice) -> Self {
         Self {
             virtio,
             loopback_queue: VecDeque::new(),
         }
     }
 
+    #[must_use] 
     pub fn mac_address(&self) -> [u8; 6] {
         self.virtio.mac_address()
     }
 }
 
+#[allow(clippy::deref_addrof)]
 impl Device for LoopbackAwareDevice {
     type RxToken<'a> = LoopbackAwareRxToken<'a>;
     type TxToken<'a> = LoopbackAwareTxToken<'a>;
@@ -282,11 +280,11 @@ impl Device for LoopbackAwareDevice {
         if let Some(frame) = self.loopback_queue.pop_front() {
             let rx = LoopbackAwareRxToken::Loopback(frame);
             let tx = LoopbackAwareTxToken {
-                virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
+                virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
                 virtio_buffer: unsafe {
                     core::slice::from_raw_parts_mut(self.virtio.tx_buffer.as_mut_ptr(), 2048)
                 },
-                loopback_queue: unsafe { &mut *(&mut self.loopback_queue as *mut _) },
+                loopback_queue: unsafe { &mut *(&raw mut self.loopback_queue) },
             };
             return Some((rx, tx));
         }
@@ -320,7 +318,7 @@ impl Device for LoopbackAwareDevice {
                         )
                     });
                     let tx = LoopbackAwareTxToken {
-                        virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
+                        virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
                         virtio_buffer: unsafe {
                             core::slice::from_raw_parts_mut(
                                 self.virtio.tx_buffer.as_mut_ptr(),
@@ -328,7 +326,7 @@ impl Device for LoopbackAwareDevice {
                             )
                         },
                         loopback_queue: unsafe {
-                            &mut *(&mut self.loopback_queue as *mut _)
+                            &mut *(&raw mut self.loopback_queue)
                         },
                     };
                     return Some((rx, tx));
@@ -341,11 +339,11 @@ impl Device for LoopbackAwareDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackAwareTxToken {
-            virtio_inner: unsafe { &mut *(&mut self.virtio.inner as *mut _) },
+            virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
             virtio_buffer: unsafe {
                 core::slice::from_raw_parts_mut(self.virtio.tx_buffer.as_mut_ptr(), 2048)
             },
-            loopback_queue: unsafe { &mut *(&mut self.loopback_queue as *mut _) },
+            loopback_queue: unsafe { &mut *(&raw mut self.loopback_queue) },
         })
     }
 
@@ -357,11 +355,11 @@ impl Device for LoopbackAwareDevice {
 pub enum LoopbackAwareRxToken<'a> {
     /// An owned frame that was looped back internally.
     Loopback(Vec<u8>),
-    /// A borrowed frame received from VirtIO.
+    /// A borrowed frame received from `VirtIO`.
     Virtio(&'a mut [u8]),
 }
 
-impl<'a> smoltcp::phy::RxToken for LoopbackAwareRxToken<'a> {
+impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -374,12 +372,12 @@ impl<'a> smoltcp::phy::RxToken for LoopbackAwareRxToken<'a> {
 }
 
 pub struct LoopbackAwareTxToken<'a> {
-    virtio_inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    virtio_inner: &'a mut VirtIONetRaw<NetHal, MmioTransport, 16>,
     virtio_buffer: &'a mut [u8],
     loopback_queue: &'a mut VecDeque<Vec<u8>>,
 }
 
-impl<'a> smoltcp::phy::TxToken for LoopbackAwareTxToken<'a> {
+impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -392,10 +390,8 @@ impl<'a> smoltcp::phy::TxToken for LoopbackAwareTxToken<'a> {
             let mut frame = vec![0u8; len];
             frame.copy_from_slice(&self.virtio_buffer[..len]);
             self.loopback_queue.push_back(frame);
-        } else {
-            if let Err(_e) = self.virtio_inner.send(&self.virtio_buffer[..len]) {
-                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
+        } else if let Err(_e) = self.virtio_inner.send(&self.virtio_buffer[..len]) {
+            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         }
 
         res
@@ -406,31 +402,26 @@ impl<'a> smoltcp::phy::TxToken for LoopbackAwareTxToken<'a> {
 // Initialization
 // ============================================================================
 
-pub fn init() -> Result<(), &'static str> {
-    log("[SmolNet] Initializing network stack...\n");
+#[allow(clippy::cast_possible_wrap)]
+pub fn init(mmio_addrs: &[usize], enable_dhcp: bool) -> Result<(), &'static str> {
+    log::info!("[SmolNet] Initializing network stack...");
+    DHCP_ENABLED.store(enable_dhcp, Ordering::Relaxed);
 
-    let mut found_device: Option<VirtIONetRaw<VirtioHal, MmioTransport, 16>> = None;
+    let mut found_device: Option<VirtIONetRaw<NetHal, MmioTransport, 16>> = None;
 
-    for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
+    for (i, &addr) in mmio_addrs.iter().enumerate() {
         let device_id = unsafe { core::ptr::read_volatile((addr + 0x008) as *const u32) };
         if device_id != 1 { continue; }
 
-        log("[SmolNet] Found virtio-net at slot ");
-        crate::safe_print!(32, "{}\n", i);
+        log::info!("[SmolNet] Found virtio-net at slot {i}");
 
-        let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
-            Some(p) => p,
-            None => continue,
-        };
+        let Some(header_ptr) = core::ptr::NonNull::new(addr as *mut VirtIOHeader) else { continue };
 
         let transport = unsafe { MmioTransport::new(header_ptr) }.map_err(|_| "Transport init failed")?;
         
-        match VirtIONetRaw::new(transport) {
-            Ok(dev) => {
-                found_device = Some(dev);
-                break;
-            }
-            Err(_) => continue,
+        if let Ok(dev) = VirtIONetRaw::new(transport) {
+            found_device = Some(dev);
+            break;
         }
     }
 
@@ -438,23 +429,18 @@ pub fn init() -> Result<(), &'static str> {
         VirtioSmoltcpDevice::new(found_device.ok_or("No virtio-net device found")?)
     );
     let mac = device.mac_address();
-    log("[SmolNet] MAC: ");
-    for (i, b) in mac.iter().enumerate() {
-        if i > 0 { console::print(":"); }
-        crate::safe_print!(32, "{:02x}", b);
-    }
-    log("\n");
+    log::info!(
+        "[SmolNet] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
 
-    let timestamp = Instant::from_micros(crate::timer::uptime_us() as i64);
+    let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
 
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    config.random_seed = crate::timer::uptime_us();
+    config.random_seed = (runtime().uptime_us)();
     
     let mut iface = Interface::new(config, &mut device, timestamp);
     
-    // Set static IP fallback (standard QEMU user networking) + loopback.
-    // Loopback works via LoopbackAwareDevice which intercepts 127.x.x.x frames
-    // at the device layer and queues them internally instead of sending via VirtIO.
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
         ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
@@ -463,20 +449,18 @@ pub fn init() -> Result<(), &'static str> {
 
     let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
 
-    // Initialize DHCP if enabled
-    let dhcp_handle = if crate::config::ENABLE_DHCP {
-        log("[SmolNet] DHCP enabled\n");
+    let dhcp_handle = if enable_dhcp {
+        log::info!("[SmolNet] DHCP enabled");
         let dhcp_socket = dhcpv4::Socket::new();
         Some(sockets.add(dhcp_socket))
     } else {
         None
     };
 
-    // Initialize DNS socket with QEMU's DNS server (10.0.2.3)
     let dns_servers = &[QEMU_DNS_SERVER];
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
     let dns_handle = sockets.add(dns_socket);
-    log("[SmolNet] DNS socket initialized (server: 10.0.2.3)\n");
+    log::info!("[SmolNet] DNS socket initialized (server: 10.0.2.3)");
 
     *NETWORK.lock() = Some(NetworkState {
         iface,
@@ -488,7 +472,7 @@ pub fn init() -> Result<(), &'static str> {
     });
 
     NETWORK_READY.store(true, Ordering::Release);
-    log("[SmolNet] Initialized successfully (VirtIO + Loopback)\n");
+    log::info!("[SmolNet] Initialized successfully (VirtIO + Loopback)");
     Ok(())
 }
 
@@ -496,9 +480,10 @@ pub fn init() -> Result<(), &'static str> {
 // Public API
 // ============================================================================
 
+#[allow(clippy::cast_possible_wrap)]
 pub fn poll() -> bool {
     if let Some(net) = NETWORK.lock().as_mut() {
-        let timestamp = Instant::from_micros(crate::timer::uptime_us() as i64);
+        let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
         
         let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         
@@ -509,7 +494,7 @@ pub fn poll() -> bool {
             if let Some(event) = event {
                 match event {
                     dhcpv4::Event::Configured(config) => {
-                        log("[SmolNet] DHCP configured\n");
+                        log::info!("[SmolNet] DHCP configured");
                         net.iface.update_ip_addrs(|addrs| {
                             addrs.clear();
                             addrs.push(IpCidr::Ipv4(config.address)).unwrap();
@@ -518,23 +503,22 @@ pub fn poll() -> bool {
                         if let Some(router) = config.router {
                             let _ = net.iface.routes_mut().add_default_ipv4_route(router);
                         }
-                        
-                        safe_print!(256, "[SmolNet] IP: {}\n", config.address);
+
+                        log::info!("[SmolNet] IP: {}", config.address);
                         DHCP_CONFIGURED.store(true, Ordering::Release);
-                        dhcp_changed = true;
                     }
                     dhcpv4::Event::Deconfigured => {
                         DHCP_CONFIGURED.store(false, Ordering::Release);
-                        log("[SmolNet] DHCP deconfigured - reverting to static fallback\n");
+                        log::info!("[SmolNet] DHCP deconfigured - reverting to static fallback");
                         net.iface.update_ip_addrs(|addrs| {
                             addrs.clear();
                             addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
                             addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
                         });
                         let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
-                        dhcp_changed = true;
                     }
                 }
+                dhcp_changed = true;
             }
         }
 
@@ -544,24 +528,19 @@ pub fn poll() -> bool {
         // until the next external poll() call, which can cause loopback TCP
         // connections to stall (server stuck in SynReceived).
         if dhcp_changed {
-            let timestamp = Instant::from_micros(crate::timer::uptime_us() as i64);
+            let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
             net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
         }
 
         // Garbage collect pending removals.
         // Force-abort sockets stuck in non-Closed states for longer than
         // SOCKET_GC_TIMEOUT_US to prevent slot exhaustion.
-        const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
-        let now_us = crate::timer::uptime_us();
+        let now_us = (runtime().uptime_us)();
         let mut i = 0;
         while i < net.pending_removal.len() {
             let (handle, added_at) = net.pending_removal[i];
             if !is_valid_handle(handle) {
-                crate::safe_print!(
-                    128,
-                    "[NET] CORRUPT HANDLE in poll GC: handle={}\n",
-                    handle
-                );
+                log::warn!("[NET] CORRUPT HANDLE in poll GC: handle={handle}");
                 net.pending_removal.swap_remove(i);
                 continue;
             }
@@ -582,10 +561,8 @@ pub fn poll() -> bool {
             POLL_COUNT.fetch_add(1, Ordering::Release);
             return true;
         }
-        false
-    } else {
-        false
     }
+    false
 }
 
 pub fn with_network<F, R>(f: F) -> Option<R>
@@ -601,6 +578,7 @@ where
 // ============================================================================
 
 /// Blocking DNS query - resolves a hostname to an IPv4 address.
+///
 /// Polls the network stack and yields the current thread until a result is available.
 /// Used by the syscall handler for userspace programs and by kernel services.
 pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryError> {
@@ -609,7 +587,7 @@ pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryE
         return Ok(ip);
     }
     if hostname == "localhost" {
-        return Ok(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1));
+        return Ok(smoltcp::wire::Ipv4Address::LOCALHOST);
     }
 
     // Start a DNS query
@@ -620,7 +598,7 @@ pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryE
     }).flatten().ok_or(DnsQueryError::StartFailed)?;
 
     // Poll until we get a result or timeout (10 seconds)
-    let start = crate::timer::uptime_us();
+    let start = (runtime().uptime_us)();
     let timeout_us = 10_000_000u64;
 
     loop {
@@ -630,12 +608,12 @@ pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryE
             let dns_socket = net.sockets.get_mut::<dns::Socket>(net.dns_handle);
             match dns_socket.get_query_result(query_handle) {
                 Ok(addrs) => {
-                    for addr in addrs.iter() {
-                        if let IpAddress::Ipv4(v4) = addr {
-                            return Some(Ok(*v4));
-                        }
-                    }
-                    Some(Err(DnsQueryError::NoRecords))
+                    Some(
+                        addrs.first().map_or(Err(DnsQueryError::NoRecords), |addr| {
+                            let IpAddress::Ipv4(v4) = addr;
+                            Ok(*v4)
+                        }),
+                    )
                 }
                 Err(dns::GetQueryResultError::Pending) => None,
                 Err(dns::GetQueryResultError::Failed) => Some(Err(DnsQueryError::QueryFailed)),
@@ -646,10 +624,10 @@ pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryE
             Some(Ok(addr)) => return Ok(addr),
             Some(Err(e)) => return Err(e),
             None => {
-                if crate::timer::uptime_us() - start > timeout_us {
+                if (runtime().uptime_us)() - start > timeout_us {
                     return Err(DnsQueryError::Timeout);
                 }
-                crate::threading::yield_now();
+                (runtime().yield_now)();
             }
         }
     }
@@ -667,8 +645,8 @@ pub enum DnsQueryError {
 // Async TCP Connect
 // ============================================================================
 
-/// Async TCP connect - creates a socket, connects to the remote, and returns a TcpStream.
-/// Suitable for use from async shell commands running in block_on contexts.
+/// Async TCP connect - creates a socket, connects to the remote, and returns a `TcpStream`.
+/// Suitable for use from async shell commands running in `block_on` contexts.
 pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, SocketHandle), TcpError> {
     let handle = socket_create().ok_or(TcpError::WriteError)?;
     let local_port = alloc_ephemeral_port();
@@ -713,6 +691,7 @@ pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, Socke
 // Socket API (Wrappers)
 // ============================================================================
 
+#[must_use] 
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
         if net.sockets.iter().count() >= MAX_SOCKETS {
@@ -736,6 +715,7 @@ pub fn socket_create() -> Option<SocketHandle> {
 const UDP_PACKET_COUNT: usize = 8;
 const UDP_PAYLOAD_SIZE: usize = 512;
 
+#[must_use] 
 pub fn udp_socket_create() -> Option<SocketHandle> {
     with_network(|net| {
         if net.sockets.iter().count() >= MAX_SOCKETS {
@@ -756,6 +736,7 @@ pub fn udp_socket_create() -> Option<SocketHandle> {
     }).flatten()
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
     with_network(|net| {
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
@@ -763,6 +744,7 @@ pub fn udp_socket_bind(handle: SocketHandle, port: u16) -> Result<(), ()> {
     }).unwrap_or(Err(()))
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn udp_socket_send(handle: SocketHandle, buf: &[u8], remote: smoltcp::wire::IpEndpoint) -> Result<usize, ()> {
     with_network(|net| {
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
@@ -770,6 +752,7 @@ pub fn udp_socket_send(handle: SocketHandle, buf: &[u8], remote: smoltcp::wire::
     }).unwrap_or(Err(()))
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), ()> {
     with_network(|net| {
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
@@ -780,28 +763,30 @@ pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, s
     }).unwrap_or(Err(()))
 }
 
+#[must_use] 
 pub fn udp_can_recv(handle: SocketHandle) -> bool {
     with_network(|net| {
         net.sockets.get::<udp::Socket>(handle).can_recv()
     }).unwrap_or(false)
 }
 
+#[must_use] 
 pub fn udp_can_send(handle: SocketHandle) -> bool {
     with_network(|net| {
         net.sockets.get::<udp::Socket>(handle).can_send()
     }).unwrap_or(false)
 }
 
+#[must_use] 
 pub fn get_local_ip() -> [u8; 4] {
     with_network(|net| {
-        for cidr in net.iface.ip_addrs() {
-            if let IpCidr::Ipv4(v4) = cidr {
+            for cidr in net.iface.ip_addrs() {
+                let IpCidr::Ipv4(v4) = cidr;
                 let octets = v4.address().octets();
                 if octets != [127, 0, 0, 1] {
                     return octets;
                 }
             }
-        }
         [10, 0, 2, 15]
     }).unwrap_or([10, 0, 2, 15])
 }
@@ -816,23 +801,16 @@ pub fn udp_socket_close(handle: SocketHandle) {
 
 pub fn socket_close(handle: SocketHandle) {
     if !is_valid_handle(handle) {
-        crate::safe_print!(
-            128,
-            "[NET] CORRUPT HANDLE in socket_close: handle={}\n",
-            handle
-        );
+        log::warn!("[NET] CORRUPT HANDLE in socket_close: handle={handle}");
         return;
     }
     with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
-        net.pending_removal.push((handle, crate::timer::uptime_us()));
+        net.pending_removal.push((handle, (runtime().uptime_us)()));
     });
 }
 
-fn log(msg: &str) {
-    console::print(msg);
-}
 
 // ============================================================================
 // Async TCP Stream (embedded-io-async)
@@ -854,15 +832,15 @@ impl embedded_io_async::Error for TcpError {
 
 pub struct TcpStream {
     handle: SocketHandle,
-    /// Cached socket index for corruption detection. Must always be < MAX_SOCKETS.
+    /// Cached socket index for corruption detection. Must always be < `MAX_SOCKETS`.
     handle_index: usize,
 }
 
-/// Extract the internal index from a SocketHandle.
+/// Extract the internal index from a `SocketHandle`.
 ///
-/// SocketHandle is a newtype wrapper around a single `usize` field (the socket
+/// `SocketHandle` is a newtype wrapper around a single `usize` field (the socket
 /// set index). Since it has no public accessor, we use transmute to read it.
-/// This is safe because SocketHandle contains exactly one usize and both types
+/// This is safe because `SocketHandle` contains exactly one usize and both types
 /// have identical size and alignment.
 fn socket_handle_index(handle: SocketHandle) -> usize {
     // Safety: SocketHandle(usize) is a single-field struct with the same
@@ -873,12 +851,13 @@ fn socket_handle_index(handle: SocketHandle) -> usize {
     unsafe { core::mem::transmute::<SocketHandle, usize>(handle) }
 }
 
-/// Check if a SocketHandle index is within the valid range for our socket set.
+/// Check if a `SocketHandle` index is within the valid range for our socket set.
 fn is_valid_handle(handle: SocketHandle) -> bool {
     socket_handle_index(handle) < MAX_SOCKETS
 }
 
 impl TcpStream {
+    #[must_use] 
     pub fn new(handle: SocketHandle) -> Self {
         Self {
             handle,
@@ -898,9 +877,8 @@ impl embedded_io_async::Read for TcpStream {
             // async state machine could overwrite handle_index with garbage;
             // catch it here instead of panicking inside smoltcp's get_mut.
             if self.handle_index >= MAX_SOCKETS {
-                crate::safe_print!(
-                    128,
-                    "[NET] CORRUPT HANDLE in TcpStream::read: index={}, handle={}\n",
+                log::warn!(
+                    "[NET] CORRUPT HANDLE in TcpStream::read: index={}, handle={}",
                     self.handle_index,
                     self.handle
                 );
@@ -909,14 +887,13 @@ impl embedded_io_async::Read for TcpStream {
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_recv() {
-                    match socket.recv(|data| {
-                        let len = data.len().min(buf.len());
-                        buf[..len].copy_from_slice(&data[..len]);
-                        (len, len)
-                    }) {
-                        Ok(n) => Poll::Ready(Ok(n)),
-                        Err(_) => Poll::Ready(Err(TcpError::ReadError)),
-                    }
+                    socket
+                        .recv(|data| {
+                            let len = data.len().min(buf.len());
+                            buf[..len].copy_from_slice(&data[..len]);
+                            (len, len)
+                        })
+                        .map_or(Poll::Ready(Err(TcpError::ReadError)), |n| Poll::Ready(Ok(n)))
                 } else if socket.state() == tcp::State::Closed || socket.state() == tcp::State::CloseWait {
                     Poll::Ready(Ok(0)) // EOF
                 } else {
@@ -932,9 +909,8 @@ impl embedded_io_async::Write for TcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         core::future::poll_fn(|cx| {
             if self.handle_index >= MAX_SOCKETS {
-                crate::safe_print!(
-                    128,
-                    "[NET] CORRUPT HANDLE in TcpStream::write: index={}, handle={}\n",
+                log::warn!(
+                    "[NET] CORRUPT HANDLE in TcpStream::write: index={}, handle={}",
                     self.handle_index,
                     self.handle
                 );
@@ -943,10 +919,9 @@ impl embedded_io_async::Write for TcpStream {
             with_network(|net| {
                 let socket = net.sockets.get_mut::<tcp::Socket>(self.handle);
                 if socket.can_send() {
-                    match socket.send_slice(buf) {
-                        Ok(n) => Poll::Ready(Ok(n)),
-                        Err(_) => Poll::Ready(Err(TcpError::WriteError)),
-                    }
+                    socket
+                        .send_slice(buf)
+                        .map_or(Poll::Ready(Err(TcpError::WriteError)), |n| Poll::Ready(Ok(n)))
                 } else if socket.state() == tcp::State::Closed || socket.state() == tcp::State::CloseWait {
                     Poll::Ready(Err(TcpError::WriteError)) // Broken pipe
                 } else {
@@ -960,9 +935,8 @@ impl embedded_io_async::Write for TcpStream {
     async fn flush(&mut self) -> Result<(), Self::Error> {
         core::future::poll_fn(|cx| {
             if self.handle_index >= MAX_SOCKETS {
-                crate::safe_print!(
-                    128,
-                    "[NET] CORRUPT HANDLE in TcpStream::flush: index={}, handle={}\n",
+                log::warn!(
+                    "[NET] CORRUPT HANDLE in TcpStream::flush: index={}, handle={}",
                     self.handle_index,
                     self.handle
                 );

@@ -43,6 +43,7 @@ version = "0.0.4"
 dependencies = [
  "aes",
  "akuma-ext2",
+ "akuma-net",
  "akuma-shell",
  "akuma-ssh",
  "akuma-ssh-crypto",
@@ -79,6 +80,26 @@ version = "0.1.0"
 dependencies = [
  "akuma-vfs",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-net"
+version = "0.1.0"
+dependencies = [
+ "const-oid",
+ "der",
+ "ed25519-dalek",
+ "embedded-io-async",
+ "embedded-tls",
+ "log",
+ "p256",
+ "rand_core",
+ "rsa",
+ "sha2",
+ "smoltcp",
+ "spinning_top",
+ "virtio-drivers",
+ "x509-cert",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ use super::crypto::{
     SimpleRng, read_string, read_u32, trim_bytes, write_u32,
 };
 use super::keys;
-use crate::smoltcp_net::{TcpError, TcpStream};
+use akuma_net::smoltcp_net::{TcpError, TcpStream};
 use crate::shell::ShellContext;
 use crate::shell::{self, commands::create_default_registry};
 use crate::process::{self, Pid};
@@ -329,7 +329,7 @@ impl Write for SshChannelStream<'_> {
             return Err(SshStreamError);
         }
 
-        let _tx_drops_before = crate::smoltcp_net::tx_drop_count();
+        let _tx_drops_before = akuma_net::smoltcp_net::tx_drop_count();
 
         let mut sent = 0;
         while sent < buf.len() {
@@ -347,7 +347,7 @@ impl Write for SshChannelStream<'_> {
                 self.flush()
             ).await;
         } else {
-            crate::smoltcp_net::poll();
+            akuma_net::smoltcp_net::poll();
         }
 
         Ok(buf.len())

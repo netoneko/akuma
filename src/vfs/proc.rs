@@ -240,7 +240,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "net/tcp" {
-            let sockets = crate::socket::list_sockets();
+            let sockets = akuma_net::socket::list_sockets();
             let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
             for s in sockets {
                 out.push_str(&format!("{},{}:{},{},{}\n", 

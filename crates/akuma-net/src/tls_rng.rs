@@ -1,21 +1,21 @@
 //! TLS RNG Adapter
 //!
-//! Wraps the VirtIO RNG for use with embedded-tls.
-//! Implements rand_core::RngCore and CryptoRng traits required by TLS.
+//! Wraps the `VirtIO` RNG for use with embedded-tls.
+//! Implements `rand_core::RngCore` and `CryptoRng` traits required by TLS.
 
 use rand_core::{CryptoRng, RngCore};
 
-use crate::rng;
+use crate::runtime::runtime;
 
 /// RNG adapter for TLS operations
 ///
-/// This wraps our hardware VirtIO RNG to provide the traits
-/// required by embedded-tls for cryptographic operations.
+/// Dispatches to the kernel's RNG via registered runtime function pointers.
 pub struct TlsRng;
 
 impl TlsRng {
     /// Create a new TLS RNG adapter
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -40,10 +40,7 @@ impl RngCore for TlsRng {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        // Use hardware RNG; panic if unavailable (TLS requires RNG)
-        if let Err(e) = rng::fill_bytes(dest) {
-            panic!("TLS requires working RNG: {}", e);
-        }
+        (runtime().rng_fill)(dest);
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {

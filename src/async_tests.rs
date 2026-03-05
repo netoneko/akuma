@@ -28,7 +28,7 @@ where
         match future.as_mut().poll(&mut cx) {
             core::task::Poll::Ready(val) => return val,
             core::task::Poll::Pending => {
-                crate::smoltcp_net::poll();
+                akuma_net::smoltcp_net::poll();
                 crate::threading::yield_now();
             }
         }

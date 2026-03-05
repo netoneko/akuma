@@ -7,7 +7,7 @@ use alloc::format;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp;
-use crate::smoltcp_net::{self, SocketHandle, with_network};
+use akuma_net::smoltcp_net::{self, SocketHandle, with_network};
 use super::protocol;
 
 // ============================================================================

@@ -2,7 +2,7 @@
 //!
 //! Verifies loopback connectivity and basic TCP state transitions.
 
-use crate::smoltcp_net::{self, with_network};
+use akuma_net::smoltcp_net::{self, with_network};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpAddress;
 use crate::console;
