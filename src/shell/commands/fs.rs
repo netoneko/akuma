@@ -13,7 +13,7 @@ use embedded_io_async::Write;
 
 use crate::async_fs;
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
-use crate::ssh::crypto::split_first_word;
+use crate::shell::split_first_word;
 
 // ============================================================================
 // Ls Command

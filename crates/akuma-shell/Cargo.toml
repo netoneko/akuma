@@ -1,0 +1,11 @@
+[package]
+name = "akuma-shell"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+embedded-io-async = { version = "0.6", default-features = false }
+log = { version = "0.4", default-features = false }

@@ -10,7 +10,7 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
-use crate::ssh::crypto::{split_first_word, trim_bytes};
+use crate::shell::{split_first_word, trim_bytes};
 
 /// Static instance of the exec command
 pub static EXEC_CMD: ExecCommand = ExecCommand;

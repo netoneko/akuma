@@ -456,7 +456,7 @@ async fn run_shell_session(
     let initial_width = session.term_width;
     let initial_height = session.term_height;
 
-    let mut ctx = ShellContext::new();
+    let mut ctx = crate::shell::new_shell_context();
     let mut channel_stream = SshChannelStream::new(stream, session);
 
     let terminal_state = Arc::new(Spinlock::new(terminal::TerminalState::default()));
@@ -586,14 +586,14 @@ async fn run_shell_session(
                                             }
 
                                             let result = if let Some(streaming_result) =
-                                                shell::execute_command_streaming(
+                                                shell::execute_command_streaming_interactive(
                                                     trimmed, &registry, &mut ctx, &mut channel_stream, None,
                                                 ).await
                                             {
                                                 streaming_result
                                             } else {
                                                 shell::execute_command_chain(
-                                                    trimmed, &registry, &mut ctx,
+                                                    trimmed, &registry, &mut ctx, &shell::KernelShellBackend,
                                                 ).await
                                             };
 
@@ -846,7 +846,7 @@ async fn handle_exec(
     cmd_bytes: &[u8],
 ) {
     crate::console::print("[SSH-EXEC] Got exec request!\n");
-    let mut exec_ctx = ShellContext::new();
+    let mut exec_ctx = crate::shell::new_shell_context();
     crate::safe_print!(64,
         "[SSH-EXEC] Command: {:?}\n",
         core::str::from_utf8(cmd_bytes)
@@ -859,7 +859,7 @@ async fn handle_exec(
         let mut channel_stream = SshChannelStream::new(stream, session);
 
         if let Some(_streaming_result) =
-            shell::execute_command_streaming(
+            shell::execute_command_streaming_interactive(
                 trimmed, &registry, &mut exec_ctx, &mut channel_stream, None,
             ).await
         {
@@ -867,7 +867,7 @@ async fn handle_exec(
         } else {
             let _ = channel_stream.write(b"[DEBUG] Using buffered path\r\n").await;
             let result =
-                shell::execute_command_chain(trimmed, &registry, &mut exec_ctx).await;
+                shell::execute_command_chain(trimmed, &registry, &mut exec_ctx, &shell::KernelShellBackend).await;
 
             if !result.output.is_empty() {
                 let _ = channel_stream.write(&result.output).await;

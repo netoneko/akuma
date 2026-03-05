@@ -43,6 +43,7 @@ version = "0.0.4"
 dependencies = [
  "aes",
  "akuma-ext2",
+ "akuma-shell",
  "akuma-ssh",
  "akuma-ssh-crypto",
  "akuma-terminal",
@@ -78,6 +79,14 @@ version = "0.1.0"
 dependencies = [
  "akuma-vfs",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-shell"
+version = "0.1.0"
+dependencies = [
+ "embedded-io-async",
+ "log",
 ]
 
 [[package]]
