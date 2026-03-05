@@ -684,6 +684,27 @@ permissions.
 
 **Files changed:** `src/syscall.rs`, `src/process.rs`
 
+### Performance Regression from Bug 12 Fix
+
+**Symptom:** Bun startup regressed from 178s to 282s (+58%) after the Bug 12 fix.
+
+**Root cause:** The fallback PTE clearing loop (`O(pages × mmap_regions)` per page)
+was running unconditionally on EVERY `munmap`, not just when no tracked region
+matched. For a typical `munmap(128MB)` of a PROT_NONE lazy region:
+- 32,768 pages × 7 eager regions = 229K comparisons
+- Plus 32K page-table walks for `unmap_page`
+- All completely redundant: the lazy handler already cleared those PTEs
+
+Additionally, `[OUT]` stdout/stderr logging was unconditional — every `write(1/2)`
+did format+print even without the debug flag.
+
+**Fix:**
+1. Added `return 0;` after the lazy region handler so the fallback only runs when
+   no tracked region matched (the case it was designed for)
+2. Put `[OUT]` logging back behind `SYSCALL_DEBUG_INFO_ENABLED`
+
+**Result:** Bun startup back to 171.70s (within the original ~178s range).
+
 ### Kernel Tests
 
 **File:** `src/tests.rs`
@@ -711,3 +732,22 @@ regressions in the exact scenarios that caused the Node.js/Bun crashes:
 - `eager_munmap_full_removes_all` — full-length munmap correctly removes entire region
 - `munmap_fallback_clears_stale_ptes` — **Bug 12**: fallback clears orphaned PTEs but protects eager regions
 - `mprotect_updates_lazy_flags` — **Bug 13**: mprotect updates lazy region flags for demand paging
+
+### Current Status
+
+**Bun** (`bun run /public/cgi-bin/akuma.js`): exits cleanly (code 0) in ~172s.
+
+**Bugs fixed:** 13 total (Bugs 1-13), spanning CLONE_VM thread handling,
+memory syscall owner resolution, demand paging, partial munmap, mprotect
+flag propagation, and performance.
+
+**Remaining `[MMU] WARN`:** Harmless race condition — two CLONE_VM threads
+fault on the same page simultaneously, both allocate a frame, one wins the
+PTE update, the other's frame is leaked (tracked but unmapped). Does not
+cause corruption; the leaked frame is freed on process exit.
+
+**Known limitations:**
+- Bun startup is slow (~172s) due to demand paging of its ~90MB binary
+  through synchronous ext2 I/O on virtio-blk (one page fault per 4KB page)
+- QuickJS runs the same script in ~130ms — for simple scripts, the
+  interpreter is the right tool on Akuma
