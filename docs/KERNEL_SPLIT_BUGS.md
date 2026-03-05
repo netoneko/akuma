@@ -114,9 +114,85 @@ directly.
 After the `akuma-ssh` extraction is working, verify that the other extracted
 crates follow this strategy:
 
+- [x] `akuma-ssh` — uses `log` crate throughout (confirmed working)
 - [ ] `akuma-ssh-crypto` — currently has no logging (pure crypto, OK as-is)
 - [ ] `akuma-terminal` — currently has no logging (pure data, OK as-is)
 - [ ] `akuma-vfs` — check for any stray `safe_print!` or direct console use
 - [ ] `akuma-ext2` — check for any stray `safe_print!` or direct console use
 - [ ] Kernel registers a `log::Log` backend at boot (required for any of the
       above to actually produce output)
+
+---
+
+## `akuma-ssh` Crate Extraction (completed)
+
+Extracted the SSH-2 protocol engine from `src/ssh/protocol.rs` (~1840 lines)
+into `crates/akuma-ssh/`, leaving kernel-coupled glue in `src/ssh/`.
+
+### What moved to the crate
+
+| Module | Contents |
+|--------|----------|
+| `constants.rs` | SSH message type constants (`SSH_MSG_*`), algorithm names, version string |
+| `config.rs` | `SshdConfig` struct with `parse(content)` and `parse_line()` |
+| `session.rs` | `SshState` enum, `SshSession` struct (all fields `pub`) |
+| `kex.rs` | `build_kexinit()`, `handle_kex_ecdh_init()` |
+| `packet.rs` | `process_encrypted_packet()`, `process_unencrypted_packet()` |
+| `transport.rs` | `send_raw`, `send_packet`, `send_channel_data` — all generic over `T: embedded_io_async::Write` |
+| `message.rs` | `handle_message()` generic over transport + `AuthProvider` trait, `MessageResult` enum |
+| `util.rs` | `translate_input_keys()`, `RESIZE_SIGNAL_BYTE` |
+| `tests.rs` | 11 host-runnable tests (config parsing, packet round-trips, key translation) |
+
+### What stayed in the kernel `src/ssh/`
+
+- `server.rs` — TCP listener, thread spawning (unchanged)
+- `protocol.rs` — Reduced to ~650 lines: connection loop with timeouts,
+  `SshChannelStream`, `run_shell_session`, `bridge_process`, `handle_exec`
+- `crypto.rs` — Kernel RNG wrapper + `create_seeded_rng()` helper
+- `keys.rs` — Filesystem host key management (unchanged)
+- `auth.rs` — Filesystem-backed auth + `KernelAuthProvider` implementing
+  `akuma_ssh::message::AuthProvider`
+- `config.rs` — Filesystem loading/caching, delegates parsing to
+  `akuma_ssh::config::SshdConfig::parse()`
+
+### Key design decisions
+
+1. **Generic transport.** Transport functions (`send_packet`, `send_raw`, etc.)
+   are generic over `T: embedded_io_async::Write`, making the crate testable
+   with mock I/O and independent of `TcpStream`.
+
+2. **`AuthProvider` trait.** The crate defines a trait for pluggable auth:
+   ```rust
+   pub trait AuthProvider {
+       fn authenticate(&self, payload: &[u8], session_id: &[u8; 32],
+           config: &SshdConfig)
+           -> impl Future<Output = (AuthResult, Vec<u8>)>;
+   }
+   ```
+   The kernel implements this with `KernelAuthProvider` which loads authorized
+   keys from the filesystem via `async_fs`.
+
+3. **`MessageResult::ExecCommand`.** The old `handle_message` executed shell
+   commands inline. The crate version returns `ExecCommand(Vec<u8>)` and the
+   kernel handles execution, then sends the EOF packet.
+
+4. **Session fields are `pub`.** `SshSession` fields are public because the
+   kernel's `SshChannelStream` and `handle_connection` access them directly.
+   This is intentional for an internal kernel crate.
+
+5. **RNG injection.** `SshSession::new()` takes a pre-seeded
+   `akuma_ssh_crypto::crypto::SimpleRng` instead of creating one from hardware
+   entropy. The kernel's `crypto.rs` provides `create_seeded_rng()` for this.
+
+6. **`send_encrypted_packet` uses session RNG.** Instead of creating a new
+   hardware-seeded RNG for every packet (as the old kernel wrapper did), the
+   crate passes `&mut session.rng` to `build_encrypted_packet`. This is both
+   more efficient and avoids the kernel dependency.
+
+### Verification
+
+- `cargo clippy -p akuma-ssh -- -D warnings` — clean
+- `cargo build --release` — succeeds
+- `cargo test -p akuma-ssh --target aarch64-apple-darwin` — 11 tests pass
+- End-to-end SSH exec in QEMU: `ssh user@localhost -p 2222 "echo hello"` returns
+  correctly with full protocol flow (kex, auth, channel open, exec, EOF, close)
