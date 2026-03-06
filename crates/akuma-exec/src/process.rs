@@ -1843,6 +1843,7 @@ impl Process {
         clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+        self.clear_child_tid = 0;
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
@@ -1900,6 +1901,7 @@ impl Process {
         clear_lazy_regions(self.pid);
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
+        self.clear_child_tid = 0;
 
         for seg in &deferred_segments {
             let source = match &seg.file_source {
@@ -2382,10 +2384,13 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 
     // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake futex.
     // Must happen while user address space is still active.
+    // Verify the page is actually mapped before writing — the address may
+    // point to a lazily-mapped page that was never faulted in, and writing
+    // from EL1 won't trigger demand paging (only EL0 faults do).
     if !already_terminated {
         if let Some(proc) = lookup_process(pid.unwrap_or(0)) {
             let tid_addr = proc.clear_child_tid;
-            if tid_addr != 0 {
+            if tid_addr != 0 && crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
                 unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
                 (runtime().futex_wake)(tid_addr as usize, i32::MAX);
             }

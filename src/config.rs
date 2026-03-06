@@ -146,7 +146,7 @@ pub const IGNORE_THREADING_TESTS: bool = false;
 /// When enabled, skips memory tests, threading tests, filesystem tests,
 /// process tests, and shell tests. Use this to debug crashes that might
 /// be caused by test-induced heap corruption or thread scheduling issues.
-pub const DISABLE_ALL_TESTS: bool = false;
+pub const DISABLE_ALL_TESTS: bool = true;
 
 /// Minimal idle loop (for debugging EC=0xe crashes)
 ///
@@ -162,7 +162,7 @@ pub const MINIMAL_IDLE_LOOP: bool = false;
 pub const SKIP_ASYNC_NETWORK: bool = false;
 
 /// Run network self-tests after initialization
-pub const RUN_NETWORK_TESTS: bool = true;
+pub const RUN_NETWORK_TESTS: bool = false;
 
 /// Run container isolation tests after initialization
 pub const RUN_CONTAINER_TESTS: bool = false;

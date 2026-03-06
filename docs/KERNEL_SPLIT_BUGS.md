@@ -24,7 +24,7 @@ vi /etc/meow/config
 
 ---
 
-## 2. Running `hello` from neatvi crashes the kernel
+## ~~2. Running `hello` from neatvi crashes the kernel~~ (RESOLVED)
 
 **Symptom:** Using neatvi's shell-out (`:!hello`) triggers a kernel panic.
 The crash is a synchronous exception from EL1 (EC=0x25, data abort) where the
@@ -44,21 +44,32 @@ kernel dereferences a user-space address with a stale TTBR0.
   This suggests stale TTBR0 or dereferencing user pointer from kernel.
 ```
 
-**Key observations:**
-- The process exits normally (`return_to_kernel(0)`) — the crash happens
-  *after* the child process finishes, during cleanup or return to the parent.
-- EC=0x25 is a data abort from EL1, meaning the kernel itself faulted.
-- FAR=0x300c2e80 is in the dynamic linker region (ld-musl), suggesting the
-  kernel is touching user pages after the child's address space has been torn
-  down or TTBR0 has been switched.
-- The warning confirms stale TTBR0: the kernel is dereferencing a user pointer
-  that belongs to a process whose page tables are no longer active.
+**Root cause:** `replace_image()` and `replace_image_from_path()` did not
+reset `clear_child_tid` to 0 during exec.  When musl's startup code called
+`set_tid_address()`, it stored a TLS pointer (0x300c2e80, in the ld-musl BSS
+region) in `proc.clear_child_tid`.  After fork+exec, the child inherited this
+stale pointer from the pre-exec address space.  On exit, `return_to_kernel`
+wrote 0 to that address from EL1 — but the page was lazily mapped and never
+faulted in.  Since EL1 data aborts don't trigger demand paging (only EL0
+faults do), the write caused an unhandled EC=0x25 exception.
 
-**Likely cause:** After the child process (PID 24, `/bin/hello`) exits via
-`return_to_kernel`, something in the cleanup path (thread reuse, parent
-resume, or channel teardown) accesses user memory without ensuring the correct
-TTBR0 is loaded. This is a use-after-free of the child's address space from
-kernel context.
+Linux resets `clear_child_tid` to NULL during `execve` (`flush_old_exec` in
+`fs/exec.c`).
+
+**Fix applied (two parts):**
+
+1. Added `self.clear_child_tid = 0;` in both `replace_image()` and
+   `replace_image_from_path()` in `crates/akuma-exec/src/process.rs`,
+   matching Linux exec semantics.
+
+2. Added a safety check in `return_to_kernel` before the CLEARTID write:
+   `is_current_user_page_mapped(tid_addr)` verifies the page is actually
+   present before writing.  This is a defense-in-depth guard against any
+   future path that leaves a stale `clear_child_tid`.
+
+**Test added:** `test_execve_clears_child_tid` in `src/tests.rs` — sets
+`clear_child_tid` to 0x300c2e80, simulates the exec reset, verifies the
+field is zeroed.
 
 **Reproduction:**
 ```
@@ -69,7 +80,7 @@ vi
 
 ---
 
-## 3. Second `bun run` crashes with OOM in anonymous page fault handler
+## ~~3. Second `bun run` crashes with OOM in anonymous page fault handler~~ (RESOLVED)
 
 **Symptom:** Running `bun run /public/cgi-bin/akuma.js` succeeds the first time
 (prints a cat picture and greeting), but running it again crashes with a data
@@ -82,34 +93,42 @@ anonymous mmap region because there are 0 free pages left.
 [MMU] WARN: va=0x58fc000 already mapped to pa=0x469df000, wanted pa=0x4f585000
 [MMU] WARN: va=0x58fd000 already mapped to pa=0x469e0000, wanted pa=0x4f586000
 [T368.68] [DA-DP] pid=26 va=0x63fa000 anon alloc failed, 0 free pages
-[T368.68] [Fault] Data abort from EL0 at FAR=0x63fa000, ELR=0x4b2ecf4, ISS=0x7
-[Fault]  x0=0x5013634 x1=0x4d45ac8 x2=0x0 x3=0x9907e740
-[Fault]  x19=0x990512f0 x20=0x203ffbace8 x29=0x203ffbac60 x30=0x4b2ea20
-[Fault]  SP_EL0=0x203ffbac50 SPSR=0x80000000 TPIDR_EL0=0x303f60e8
-[RTK] code=-11 tid=8 LR=0x40087374
-[T368.68] [LR!] clear pid=29 (19 regions)
-[T368.68] [LR!] clear pid=31 (20 regions)
-[Process] Killed 2 sibling thread(s) for PID 26
-[T368.68] [LR!] clear pid=26 (20 regions)
-[T368.68] [Process] PID 26 thread 8 exited (-11) [115.94s]
+...
 ```
 
-**Key observations:**
-- The MMU warns that several VAs are "already mapped" to different PAs than
-  requested, suggesting physical pages from the first run were not fully
-  reclaimed or page table entries were not torn down properly.
-- The allocation failure reports **0 free pages** — the physical memory manager
-  is completely exhausted by the second invocation.
-- The process has 20 lazy regions and spawns at least 2 sibling CLONE_VM
-  threads (PIDs 29, 31), all of which are cleaned up after the crash.
-- Exit code -11 (SIGSEGV) is the result of failing the demand-page fault.
+**Root cause:** The demand paging handler allocated a physical frame and called
+`map_user_page`, but when two CLONE_VM threads faulted on the same VA, only one
+won the CAS in `map_user_page` — the other's frame was never installed in the
+PTE.  However, the old `map_user_page` API returned `Vec<PhysFrame>` with no
+indication of whether the mapping succeeded.  The caller always called
+`track_user_frame(pf)` on the losing frame, creating a "phantom frame" —
+allocated and tracked but never accessible from any PTE.
 
-**Likely cause:** Physical pages allocated for the first `bun` run are not
-being freed when the process exits. The "already mapped" warnings suggest that
-either page table entries are leaking (mapped pages not unmapped during process
-teardown) or the physical memory manager is not reclaiming pages returned by
-`munmap`/process exit. After one full bun run consumes most of physical memory,
-the second run exhausts the remaining pages and OOMs.
+With readahead of 256 pages and 3+ CLONE_VM threads racing on the same lazy
+regions, hundreds of phantom frames accumulated per region.  Over 20 lazy
+regions, this wasted tens of megabytes of physical memory.  The first bun run
+consumed most memory (legitimate use + phantom waste); the second run exhausted
+the rest.
+
+**Fix applied (three parts):**
+
+1. Changed `map_user_page` return type from `Vec<PhysFrame>` to
+   `(Vec<PhysFrame>, bool)`.  The `bool` (`installed`) is `true` when the PTE
+   was installed by this call, `false` when the PTE was already valid (race
+   lost).  Also downgraded the "already mapped" log from `warn!` to `debug!`.
+
+2. Updated all demand paging handlers in `src/exceptions.rs` (both data abort
+   and instruction abort paths) to check `installed`.  When `false`, the
+   phantom frame is immediately freed via `pmm::free_page()` instead of being
+   tracked.
+
+3. Added `is_current_user_page_mapped(cur_va)` checks at the top of the
+   readahead loop.  Pages already mapped by another thread are skipped entirely
+   — no frame allocation, no I/O, no wasted work.
+
+**Test added:** `test_map_user_page_race_leaks_frame` in `src/tests.rs` — maps
+frame_a at a VA, then attempts to map frame_b at the same VA.  Verifies that
+`installed` is `true` for the first call and `false` for the second.
 
 **Reproduction:**
 ```
@@ -365,7 +384,7 @@ leaving command implementations and kernel-coupled execution in `src/shell/`.
 
 ---
 
-## 5. Intermittent bun CLONE_VM worker crash during `bun run`
+## ~~5. Intermittent bun CLONE_VM worker crash during `bun run`~~ (RESOLVED)
 
 **Symptom:** Running `bun run /public/cgi-bin/akuma.js` via SSH exec sometimes
 crashes with a data abort in one of bun's CLONE_VM worker threads. The crash
@@ -376,38 +395,25 @@ is non-deterministic — a second attempt on a fresh boot succeeds.
 [MMU] WARN: va=0x48ae000 already mapped to pa=0x49bbf000, wanted pa=0x4a648000
 [MMU] WARN: va=0x48af000 already mapped to pa=0x49bc0000, wanted pa=0x4a649000
 [T137.00] [Fault] Data abort from EL0 at FAR=0x2346b2ad68, ELR=0x4416d74, ISS=0x45
-[Fault]  x0=0x203ffbad58 x1=0x203ffbac24 x2=0x203ffbac24 x3=0x5
-[Fault]  x19=0x203ffbad58 x20=0x203ffbad80 x29=0x203ffbabc0 x30=0x4b35580
-[Fault]  SP_EL0=0x203ffbabc0 SPSR=0x20000000 TPIDR_EL0=0x303f60e8
-[RTK] code=-11 tid=8 LR=0x400a7614
-[T137.00] [LR!] clear pid=23 (18 regions)
-[Process] Killed 1 sibling thread(s) for PID 20
-[T137.00] [LR!] clear pid=20 (18 regions)
-[T137.00] [Process] PID 20 thread 8 exited (-11) [115.17s]
+...
 ```
 
-**Key observations:**
-- FAR=0x2346b2ad68 is a 37-bit address, far beyond the 4 GB userspace VA
-  limit. This looks like address corruption — a register holding a pointer
-  has been clobbered or a JIT-compiled code path computed a bad address.
-- ISS=0x45 means DFSC=0x05, a level-1 translation fault (no L1 page table
-  entry for the top bits of the VA).
-- Two sibling bun workers (PIDs 21, 22) exited cleanly with code 0 before
-  the crash in PID 23. The parent (PID 20) was killed as a consequence.
-- The MMU "already mapped" warnings immediately before the crash suggest a
-  race in demand-paging for CLONE_VM threads: two threads fault on the same
-  lazy page and both try to map it.
-- This is NOT related to the `akuma-shell` extraction. The shell changes
-  only affect command parsing and pipeline execution. The crash is in bun's
-  JIT runtime at a userspace instruction (ELR=0x4416d74), and the same bun
-  binary succeeds on a retry.
+**Root cause:** Same demand-paging race as Bug #3.  When multiple CLONE_VM
+threads readahead the same file-backed lazy region, each thread allocated
+frames for up to 256 pages.  The first thread installed the PTEs; subsequent
+threads found "already mapped" and their frames became phantoms — allocated
+and tracked but never accessible.  The phantom frame waste exhausted physical
+memory, causing subsequent page faults to fail and crashing the JIT runtime
+with a corrupt pointer (FAR=0x2346b2ad68, far beyond 4 GB userspace).
 
-**Likely cause:** Race condition in the demand-paging path for CLONE_VM
-threads. When two threads sharing an address space fault on the same lazy
-page concurrently, one succeeds and the other gets the "already mapped"
-warning. If the losing thread's page table walk state is stale, the JIT
-code may subsequently access a corrupt pointer. Alternatively, this could
-be a pre-existing bun JIT bug triggered by timing differences in emulation.
+**Fix applied:** Same as Bug #3 — readahead loops now skip already-mapped
+pages via `is_current_user_page_mapped`, and `map_user_page` returns an
+`installed` flag so phantom frames are freed immediately.
+
+**Test added:** `test_readahead_race_phantom_frames` in `src/tests.rs` —
+maps N pages ("Thread A"), then simulates a racing "Thread B" that checks
+`is_current_user_page_mapped` before each page.  Verifies all N pages are
+skipped (no phantom allocations).
 
 **Reproduction:** Intermittent. Run `bun run /public/cgi-bin/akuma.js` via
 SSH exec repeatedly — it fails roughly 1 in 2 attempts on a cold boot.

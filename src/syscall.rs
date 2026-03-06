@@ -694,7 +694,7 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                             }
                         }
                     }
-                    let table_frames = unsafe {
+                    let (table_frames, _) = unsafe {
                         akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
                     };
                     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -3696,7 +3696,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     for i in 0..pages {
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             frames.push(frame);
-            unsafe { akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
+            unsafe { let _ = akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
             proc.address_space.track_user_frame(frame);
         } else {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -3776,7 +3776,7 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         for i in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
-                unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC); }
+                unsafe { let _ = akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC); }
                 proc.address_space.track_user_frame(frame);
             } else { return ENOMEM; }
         }

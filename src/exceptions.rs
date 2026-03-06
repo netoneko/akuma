@@ -1115,6 +1115,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let mut pages_mapped = 0u64;
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
+                            if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
+                                cur_va += 0x1000;
+                                continue;
+                            }
                             if let Some(pf) = crate::pmm::alloc_page_zeroed() {
                                 let pg_data_start = core::cmp::max(cur_va, segment_va);
                                 let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
@@ -1143,17 +1147,26 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 }
 
-                                let table_frames = unsafe {
+                                let (table_frames, installed) = unsafe {
                                     akuma_exec::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                    owner.address_space.track_user_frame(pf);
-                                    for tf in table_frames {
-                                        owner.address_space.track_page_table_frame(tf);
+                                if installed {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        owner.address_space.track_user_frame(pf);
+                                        for tf in table_frames {
+                                            owner.address_space.track_page_table_frame(tf);
+                                        }
+                                    }
+                                    any_mapped = true;
+                                    pages_mapped += 1;
+                                } else {
+                                    crate::pmm::free_page(pf);
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        for tf in table_frames {
+                                            owner.address_space.track_page_table_frame(tf);
+                                        }
                                     }
                                 }
-                                any_mapped = true;
-                                pages_mapped += 1;
                             } else {
                                 break;
                             }
@@ -1177,13 +1190,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                            let table_frames = unsafe {
+                            let (table_frames, installed) = unsafe {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                owner.address_space.track_user_frame(page_frame);
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
+                            if installed {
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(page_frame);
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                            } else {
+                                crate::pmm::free_page(page_frame);
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
                                 }
                             }
                             return unsafe { (*frame).x0 };
@@ -1211,7 +1233,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
                                     pid, page_va, phys.addr);
                                 unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                                    let _ = akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                                 }
                                 recovered = true;
                                 break;
@@ -1291,6 +1313,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let mut pages_mapped = 0u64;
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
+                            if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
+                                cur_va += 0x1000;
+                                continue;
+                            }
                             if let Some(pf) = crate::pmm::alloc_page_zeroed() {
                                 let pg_data_start = core::cmp::max(cur_va, segment_va);
                                 let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
@@ -1317,17 +1343,26 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 }
 
-                                let table_frames = unsafe {
+                                let (table_frames, installed) = unsafe {
                                     akuma_exec::mmu::map_user_page(cur_va, pf.addr, map_flags)
                                 };
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                    owner.address_space.track_user_frame(pf);
-                                    for tf in table_frames {
-                                        owner.address_space.track_page_table_frame(tf);
+                                if installed {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        owner.address_space.track_user_frame(pf);
+                                        for tf in table_frames {
+                                            owner.address_space.track_page_table_frame(tf);
+                                        }
+                                    }
+                                    any_mapped = true;
+                                    pages_mapped += 1;
+                                } else {
+                                    crate::pmm::free_page(pf);
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        for tf in table_frames {
+                                            owner.address_space.track_page_table_frame(tf);
+                                        }
                                     }
                                 }
-                                any_mapped = true;
-                                pages_mapped += 1;
                             } else {
                                 break;
                             }
@@ -1349,13 +1384,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
                     } else {
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                            let table_frames = unsafe {
+                            let (table_frames, installed) = unsafe {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
-                            if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                owner.address_space.track_user_frame(page_frame);
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
+                            if installed {
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    owner.address_space.track_user_frame(page_frame);
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
+                                }
+                            } else {
+                                crate::pmm::free_page(page_frame);
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
                                 }
                             }
                             return unsafe { (*frame).x0 };

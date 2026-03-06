@@ -581,7 +581,14 @@ pub mod user_flags {
     }
 }
 
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<PhysFrame> { unsafe {
+/// Map a user page at `va` to physical address `pa`.
+///
+/// Returns `(table_frames, installed)`:
+/// - `table_frames`: any intermediate page table frames allocated during the walk.
+/// - `installed`: `true` if this call installed the PTE, `false` if the PTE was
+///   already valid (another thread won the race).  When `false`, the caller's
+///   data frame was NOT mapped and should be freed.
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) { unsafe {
     let _irq_guard = IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
@@ -606,16 +613,16 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> Vec<Ph
     if existing & flags::VALID != 0 {
         let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
         if existing_pa != pa {
-            log::warn!("[MMU] va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}",
+            log::debug!("[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}",
                 va, existing_pa, pa);
         }
-        return allocated_tables;
+        return (allocated_tables, false);
     }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
     let _ = pte_atomic.compare_exchange(existing, entry,
         core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
-    allocated_tables
+    (allocated_tables, true)
 }}
 
 /// Atomically get or create a page table at `table_ptr[idx]`.

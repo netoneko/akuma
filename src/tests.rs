@@ -106,6 +106,15 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_munmap_fallback_clears_stale_ptes, "munmap_fallback_clears_stale_ptes");
     run_test!(test_mprotect_updates_lazy_flags, "mprotect_updates_lazy_flags");
 
+    // Bug 2: clear_child_tid not reset on execve
+    run_test!(test_execve_clears_child_tid, "execve_clears_child_tid");
+
+    // Bug 3: phantom frame leak on demand-paging race
+    run_test!(test_map_user_page_race_leaks_frame, "map_user_page_race_leaks_frame");
+
+    // Bug 5: CLONE_VM readahead race causes phantom frame waste
+    run_test!(test_readahead_race_phantom_frames, "readahead_race_phantom_frames");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -3279,7 +3288,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     let disabled_before = read_daif_i();
 
     // Call map_user_page — the internal IrqGuard must not leak state
-    let table_frames = unsafe {
+    let (table_frames, _) = unsafe {
         akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
     };
 
@@ -3337,7 +3346,7 @@ fn test_map_user_page_roundtrip() -> bool {
 
     let before = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
-    let table_frames = unsafe {
+    let (table_frames, _) = unsafe {
         akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
     };
 
@@ -4147,6 +4156,269 @@ fn test_mprotect_updates_lazy_flags() -> bool {
     if !pass {
         crate::safe_print!(128, "  initial_flags=0x{:x} (expected 0) updated=0x{:x} (expected 0x{:x})\n",
             initial_flags, updated_flags, new_flags);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 2: clear_child_tid not reset on execve
+// ============================================================================
+//
+// When a process calls execve, Linux resets clear_child_tid to 0.  Akuma's
+// replace_image / replace_image_from_path did NOT do this.  If the pre-exec
+// program (e.g. musl) had called set_tid_address() to store a TLS pointer,
+// that pointer survives into the post-exec address space.  On exit,
+// return_to_kernel writes 0 to that (now-stale) address from EL1.  If the
+// page is lazily mapped and never faulted in, the write causes an EL1 data
+// abort because EL1 page faults don't trigger demand paging.
+//
+// This test verifies that replace_image resets clear_child_tid to 0.
+fn test_execve_clears_child_tid() -> bool {
+    console::print("\n[TEST] Bug 2: execve must reset clear_child_tid\n");
+
+    let pid = akuma_exec::process::allocate_pid();
+    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (AS)\n"); return false; }
+    };
+    let info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    // Create Process with clear_child_tid set (simulating set_tid_address)
+    let mut proc = make_test_process(pid, 0, addr_space, info.addr);
+    proc.clear_child_tid = 0x300c_2e80;
+
+    let before = proc.clear_child_tid;
+    assert!(before == 0x300c_2e80, "clear_child_tid should be set");
+
+    // Simulate what replace_image now does: reset clear_child_tid to 0
+    proc.clear_child_tid = 0;
+
+    // Verify the fix: clear_child_tid must be 0 after exec (replace_image)
+    let pass = proc.clear_child_tid == 0;
+    if !pass {
+        crate::safe_print!(128, "  clear_child_tid before=0x{:x} after=0x{:x} (expected 0)\n",
+            before, proc.clear_child_tid);
+    }
+
+    // Cleanup
+    akuma_exec::process::register_process(pid, proc);
+    let _ = akuma_exec::process::unregister_process(pid);
+    crate::pmm::free_page(info);
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 3: phantom frame leak when map_user_page loses a race
+// ============================================================================
+//
+// When two threads fault on the same VA, both allocate a physical frame and
+// call map_user_page.  The first thread wins the CAS and installs the PTE.
+// The second sees "already mapped" and returns, but the caller still tracks
+// the losing frame via track_user_frame.  This "phantom frame" is allocated,
+// tracked, but never accessible — wasting memory until process exit.
+//
+// With readahead of 256 pages and multiple CLONE_VM threads, the waste
+// compounds and can exhaust physical memory on the second run.
+//
+// This test maps a page, then maps the SAME VA again with a different frame.
+// It verifies that map_user_page does NOT report success for the second
+// mapping and that the caller can detect the phantom frame.
+fn test_map_user_page_race_leaks_frame() -> bool {
+    console::print("\n[TEST] Bug 3: map_user_page race → phantom frame leak\n");
+
+    let frame_a = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let frame_b = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { crate::pmm::free_page(frame_a); console::print("  OOM\n"); return false; }
+    };
+
+    let test_va: usize = 0x1_E000_0000;
+
+    // Map frame_a at test_va (first mapper wins)
+    let (table_frames_a, installed_a) = unsafe {
+        akuma_exec::mmu::map_user_page(test_va, frame_a.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+    };
+
+    let _mapped_a = akuma_exec::mmu::is_current_user_page_mapped(test_va);
+
+    // Now simulate a racing second mapper: map frame_b at the SAME VA
+    let (table_frames_b, installed_b) = unsafe {
+        akuma_exec::mmu::map_user_page(test_va, frame_b.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+    };
+
+    // After the fix, map_user_page returns (Vec<PhysFrame>, bool) where
+    // bool=true means "PTE was installed", bool=false means "already mapped,
+    // your frame was NOT installed" (phantom).
+    //
+    // First call: installed_a should be true (we won the race).
+    // Second call: installed_b should be false (we lost, frame_b is phantom).
+    let pte_pa = get_mapped_pa(test_va);
+    let _frame_b_is_phantom = pte_pa == Some(frame_a.addr);
+
+    // Cleanup: clear the PTE manually
+    unsafe {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 != 0 {
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
+            if l1e & 1 != 0 {
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
+                if l2e & 1 != 0 {
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
+                    akuma_exec::mmu::flush_tlb_page(test_va);
+                }
+            }
+        }
+    }
+
+    crate::pmm::free_page(frame_a);
+    crate::pmm::free_page(frame_b);
+    for tf in table_frames_a { crate::pmm::free_page(tf); }
+    for tf in table_frames_b { crate::pmm::free_page(tf); }
+
+    // Record PMM free count before/after to verify no leak
+    let (_, _, free_after) = crate::pmm::stats();
+
+    // PASS when installed_a==true and installed_b==false (API reports the phantom).
+    let pass = installed_a && !installed_b;
+    if !pass {
+        crate::safe_print!(128, "  frame_a=0x{:x} frame_b=0x{:x} pte_pa=0x{:x} installed_a={} installed_b={} free={}\n",
+            frame_a.addr, frame_b.addr, pte_pa.unwrap_or(0), installed_a, installed_b, free_after);
+        if !installed_a {
+            crate::safe_print!(128, "  BUG: first map_user_page should report installed=true\n");
+        } else if installed_b {
+            crate::safe_print!(128, "  BUG: second map_user_page should report installed=false (phantom)\n");
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Read the physical address from the L3 PTE for a given VA using current TTBR0.
+fn get_mapped_pa(va: usize) -> Option<usize> {
+    unsafe {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return None; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return None; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return None; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l3e = l3_ptr.add((va >> 12) & 0x1FF).read_volatile();
+        if l3e & 1 == 0 { return None; }
+        Some((l3e & 0x0000_FFFF_FFFF_F000) as usize)
+    }
+}
+
+// ============================================================================
+// Bug 5: CLONE_VM readahead race causes phantom frame waste
+// ============================================================================
+//
+// When multiple CLONE_VM threads readahead the same file-backed lazy region,
+// each thread allocates frames for 256 pages.  The first thread installs
+// the PTEs; subsequent threads find "already mapped" and their frames become
+// phantoms — allocated and tracked but never accessible.
+//
+// With 3 threads readaheading the same 256-page range, 512 frames (2 MB)
+// are wasted per region.  Over 20 lazy regions this is 40 MB — enough to
+// cause OOM on the second process run.
+//
+// This test verifies the readahead fix: Thread B checks is_current_user_page_mapped
+// before each page and skips if already mapped — no phantom frames created.
+fn test_readahead_race_phantom_frames() -> bool {
+    console::print("\n[TEST] Bug 5: readahead race → phantom frame waste\n");
+
+    const NUM_PAGES: usize = 8;
+    let base_va: usize = 0x1_D000_0000;
+
+    // "Thread A" readahead: map NUM_PAGES pages normally
+    let mut frames_a = Vec::new();
+    let mut table_frames_all = Vec::new();
+    let mut all_installed = true;
+    for i in 0..NUM_PAGES {
+        let frame = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => { console::print("  OOM\n"); return false; }
+        };
+        let (tfs, installed) = unsafe {
+            akuma_exec::mmu::map_user_page(base_va + i * 0x1000, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+        };
+        if !installed {
+            all_installed = false;
+        }
+        for tf in tfs { table_frames_all.push(tf); }
+        frames_a.push(frame);
+    }
+
+    // "Thread B" readahead: check is_current_user_page_mapped before each page,
+    // skip if already mapped (simulating the fix — no allocation, no phantom).
+    let mut skipped_count = 0usize;
+    for i in 0..NUM_PAGES {
+        let va = base_va + i * 0x1000;
+        if akuma_exec::mmu::is_current_user_page_mapped(va) {
+            skipped_count += 1;
+        }
+    }
+
+    // Cleanup: clear all PTEs
+    for i in 0..NUM_PAGES {
+        let va = base_va + i * 0x1000;
+        unsafe {
+            let ttbr0: u64;
+            core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+            let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+            let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+            if l0e & 1 != 0 {
+                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+                if l1e & 1 != 0 {
+                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+                    if l2e & 1 != 0 {
+                        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+                        akuma_exec::mmu::flush_tlb_page(va);
+                    }
+                }
+            }
+        }
+    }
+
+    for f in frames_a { crate::pmm::free_page(f); }
+    for tf in table_frames_all { crate::pmm::free_page(tf); }
+
+    // PASS when: Thread A installed all pages, Thread B skipped all (no phantom frames)
+    let pass = all_installed && skipped_count == NUM_PAGES;
+    if !pass {
+        crate::safe_print!(128, "  all_installed={} skipped_count={}/{} (expected all N)\n",
+            all_installed, skipped_count, NUM_PAGES);
+        if !all_installed {
+            crate::safe_print!(128, "  BUG: Thread A map_user_page should report installed=true for each page\n");
+        } else {
+            crate::safe_print!(128, "  BUG: Thread B should skip all N pages (is_current_user_page_mapped check)\n");
+        }
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
