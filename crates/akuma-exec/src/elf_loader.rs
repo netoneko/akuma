@@ -81,6 +81,33 @@ pub mod auxv {
     pub const AT_RANDOM: u64 = 25;
     pub const AT_HWCAP: u64 = 16;
     pub const AT_CLKTCK: u64 = 17;
+    pub const AT_HWCAP2: u64 = 26;
+
+    // AArch64 HWCAP bits — matches Linux kernel asm/hwcap.h
+    pub const HWCAP_FP: u64 = 1 << 0;
+    pub const HWCAP_ASIMD: u64 = 1 << 1;
+    pub const HWCAP_AES: u64 = 1 << 3;
+    pub const HWCAP_PMULL: u64 = 1 << 4;
+    pub const HWCAP_SHA1: u64 = 1 << 5;
+    pub const HWCAP_SHA2: u64 = 1 << 6;
+    pub const HWCAP_CRC32: u64 = 1 << 7;
+    pub const HWCAP_ATOMICS: u64 = 1 << 8;
+    pub const HWCAP_FPHP: u64 = 1 << 9;
+    pub const HWCAP_ASIMDHP: u64 = 1 << 10;
+    pub const HWCAP_ASIMDRDM: u64 = 1 << 12;
+    pub const HWCAP_JSCVT: u64 = 1 << 13;
+    pub const HWCAP_FCMA: u64 = 1 << 14;
+    pub const HWCAP_LRCPC: u64 = 1 << 15;
+    pub const HWCAP_DCPOP: u64 = 1 << 16;
+    pub const HWCAP_ASIMDDP: u64 = 1 << 20;
+    pub const HWCAP_SVE: u64 = 1 << 22;
+
+    pub const AARCH64_HWCAP: u64 =
+        HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL |
+        HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_ATOMICS |
+        HWCAP_FPHP | HWCAP_ASIMDHP | HWCAP_ASIMDRDM |
+        HWCAP_JSCVT | HWCAP_FCMA | HWCAP_LRCPC | HWCAP_DCPOP |
+        HWCAP_ASIMDDP;
 }
 
 #[repr(C)]
@@ -710,6 +737,8 @@ pub fn load_elf_with_stack(
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EUID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_GID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EGID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP, a_val: auxv::AARCH64_HWCAP });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP2, a_val: 0 });
     if let Some(ref interp) = loaded.interp {
         auxv_vec.push(AuxEntry { a_type: auxv::AT_BASE, a_val: interp.base_addr as u64 });
     }
@@ -1043,6 +1072,8 @@ pub fn load_elf_with_stack_from_path(
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EUID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_GID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EGID, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP, a_val: auxv::AARCH64_HWCAP });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP2, a_val: 0 });
     if let Some(ref interp) = loaded.interp {
         auxv_vec.push(AuxEntry { a_type: auxv::AT_BASE, a_val: interp.base_addr as u64 });
     }
