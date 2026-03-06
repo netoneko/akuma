@@ -132,6 +132,9 @@ pub fn run_memory_tests() -> bool {
 
     // mprotect IC IALLU optimization
     run_test!(test_mprotect_flag_update_with_cache_maintenance, "mprotect_flag_update_cache_maint");
+
+    // Bun crash reproduction: mimalloc arena trim sequence
+    run_test!(test_arena_trim_crash_pattern, "arena_trim_crash_pattern");
     run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
 
     // Common memory allocation patterns
@@ -4967,4 +4970,117 @@ fn test_mprotect_large_region_completes() -> bool {
     // If we got here, it completed without hanging
     crate::safe_print!(64, "  Result: PASS\n");
     true
+}
+
+/// Reproduce the mimalloc arena trim pattern that crashes bun.
+///
+/// Sequence observed in bun boot log (T180-T181):
+///   1. mmap 8GB (MAP_NORESERVE) → base=0xbc85d000, lazy region
+///   2. munmap entire 8GB         → lazy region removed, VA recycled
+///   3. mmap 0x851000 (small)     → first-fit returns same base
+///   4. access(base + 4GB)        → gap has no lazy region → SIGSEGV
+///
+/// This test verifies steps 1-3 at the metadata level, then asserts
+/// that lazy_region_lookup returns None for addresses in the gap
+/// (confirming the SIGSEGV is expected kernel behavior, not a bug).
+fn test_arena_trim_crash_pattern() -> bool {
+    console::print("\n[TEST] Bun crash: mimalloc arena trim (mmap 8GB → munmap → re-mmap small)\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+
+    const LARGE_SIZE: usize = 0x2_0000_0000; // 8 GB
+    const SMALL_SIZE: usize = 0x851000;       // ~8.3 MB (matches bun trace)
+
+    // ProcessMemory with enough VA space: next_mmap at 0x8000_0000,
+    // stack/limit at 0x10_0000_0000 (64 GB ceiling).
+    let mut mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000,       // code_end
+        0x10_0000_0000,    // stack_bottom (64 GB)
+        0x10_0001_0000,    // stack_top
+        0x8000_0000,       // next_mmap start
+    );
+
+    // Step 1: alloc_mmap(8GB) — simulates bun's MAP_NORESERVE mmap
+    let base = match mem.alloc_mmap(LARGE_SIZE) {
+        Some(a) => a,
+        None => {
+            crate::safe_print!(128, "  alloc_mmap(8GB) returned None\n");
+            return false;
+        }
+    };
+    akuma_exec::process::push_lazy_region(test_pid, base, LARGE_SIZE, 0);
+
+    // Verify midpoint is covered by the lazy region
+    let mid = base + LARGE_SIZE / 2;
+    let mid_covered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_some();
+
+    // Step 2: munmap entire 8GB — removes lazy region, recycles VA
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base, LARGE_SIZE);
+    let fully_removed = results.len() == 1;
+    mem.free_regions.push((base, LARGE_SIZE));
+
+    // Verify midpoint is now uncovered
+    let mid_gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_none();
+
+    // Step 3: alloc_mmap(0x851000) — first-fit should return same base
+    let small_base = match mem.alloc_mmap(SMALL_SIZE) {
+        Some(a) => a,
+        None => {
+            crate::safe_print!(128, "  alloc_mmap(small) returned None\n");
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            return false;
+        }
+    };
+    let reused_base = small_base == base;
+    akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
+
+    // Step 4: verify coverage — small region is covered, gap is not
+    let small_covered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, small_base,
+    ).is_some();
+
+    // Address just past the small region — in the gap, would SIGSEGV
+    let gap_near = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, small_base + SMALL_SIZE + 0x1000,
+    ).is_none();
+
+    // Address near the far end of the old 8GB region — also in the gap
+    let gap_far = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, base + LARGE_SIZE - 0x1000,
+    ).is_none();
+
+    // The crash address from the boot log: base + ~4GB offset
+    let crash_analog = base + 0x1_0000_0000; // +4GB
+    let crash_addr_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, crash_analog,
+    ).is_none();
+
+    // Verify the remainder is in free_regions (available for future allocs)
+    let remainder_in_free = mem.free_regions.iter().any(|&(start, size)| {
+        start == base + SMALL_SIZE && size == LARGE_SIZE - SMALL_SIZE
+    });
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = mid_covered && fully_removed && mid_gone
+        && reused_base && small_covered
+        && gap_near && gap_far && crash_addr_uncovered
+        && remainder_in_free;
+
+    if !pass {
+        crate::safe_print!(256,
+            "  base=0x{:x} small_base=0x{:x}\n\
+             mid_covered={} fully_removed={} mid_gone={}\n\
+             reused_base={} small_covered={}\n\
+             gap_near={} gap_far={} crash_uncovered={}\n\
+             remainder_in_free={}\n",
+            base, small_base,
+            mid_covered, fully_removed, mid_gone,
+            reused_base, small_covered,
+            gap_near, gap_far, crash_addr_uncovered,
+            remainder_in_free,
+        );
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
 }
