@@ -203,6 +203,9 @@ pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
 
+/// Emit per-process syscall stats on exit (total + breakdown by category).
+pub const PROCESS_SYSCALL_STATS: bool = true;
+
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 

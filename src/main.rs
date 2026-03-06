@@ -407,6 +407,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
         },
     );
+    akuma_exec::process::enable_process_syscall_stats(config::PROCESS_SYSCALL_STATS);
     console::print("Exec subsystem initialized\n");
 
     mmu::init_shared_device_tables();

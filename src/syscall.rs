@@ -694,15 +694,24 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                             }
                         }
                     }
-                    let (table_frames, _) = unsafe {
+                    let (table_frames, installed) = unsafe {
                         akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
                     };
                     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
                     if let Some(owner) = akuma_exec::process::lookup_process(owner_pid) {
-                        owner.address_space.track_user_frame(page_frame);
+                        if installed {
+                            owner.address_space.track_user_frame(page_frame);
+                        } else {
+                            crate::pmm::free_page(page_frame);
+                        }
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
                         }
+                    } else {
+                        if installed {
+                            crate::pmm::free_page(page_frame);
+                        }
+                        for tf in table_frames { crate::pmm::free_page(tf); }
                     }
                 } else {
                     return false;
@@ -1008,6 +1017,30 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETPID => { syscall_counters::inc_getpid(); }
         nr::FCNTL => { syscall_counters::inc_fcntl(); }
         _ => { syscall_counters::inc_other(syscall_num); }
+    }
+
+    if crate::config::PROCESS_SYSCALL_STATS {
+        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+            let s = &proc.syscall_stats;
+            s.inc_total();
+            match syscall_num {
+                nr::MMAP => { s.mmap.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::MUNMAP => { s.munmap.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::BRK => { s.brk.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::READ | nr::READV | nr::PREAD64 => { s.read.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::WRITE | nr::WRITEV | nr::PWRITE64 => { s.write.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::OPENAT => { s.openat.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::CLOSE => { s.close.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::MPROTECT => { s.mprotect.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::FUTEX => { s.futex.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::CLOCK_GETTIME => { s.clock.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::IOCTL => { s.ioctl.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::FSTAT | nr::NEWFSTATAT => { s.fstat.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                nr::CLONE | nr::CLONE3 => { s.clone.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                _ => { s.other.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+            }
+        }
     }
 
     let result = match syscall_num {
@@ -3696,8 +3729,11 @@ fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usi
     for i in 0..pages {
         if let Some(frame) = crate::pmm::alloc_page_zeroed() {
             frames.push(frame);
-            unsafe { let _ = akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags); }
+            let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags) };
             proc.address_space.track_user_frame(frame);
+            for tf in table_frames {
+                proc.address_space.track_page_table_frame(tf);
+            }
         } else {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
@@ -3776,8 +3812,11 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
         for i in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
-                unsafe { let _ = akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC); }
+                let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC) };
                 proc.address_space.track_user_frame(frame);
+                for tf in table_frames {
+                    proc.address_space.track_page_table_frame(tf);
+                }
             } else { return ENOMEM; }
         }
 

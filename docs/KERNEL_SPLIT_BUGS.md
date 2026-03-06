@@ -6,13 +6,13 @@ not regressions.
 
 ---
 
-## 1. neatvi shows garbage characters at end of newlines
+## ~~1. neatvi shows garbage characters at end of newlines~~ (RESOLVED)
 
 **Symptom:** Opening `/etc/meow/config` in neatvi shows weird symbols at the
 end of each line (visible as trailing garbage after the newline).
 
-**Likely cause:** Output translation (ONLCR `\n` -> `\r\n`) may be applied
-twice, or neatvi's raw-mode setup isn't fully suppressing OPOST. Could also be
+**Root cause:** Output translation (ONLCR `\n` -> `\r\n`) was applied
+twice — neatvi's raw-mode setup wasn't fully suppressing OPOST, combined with
 a mismatch between what neatvi expects from the terminal and what the SSH
 bridge delivers.
 
@@ -183,11 +183,17 @@ directly.
    `log::error!` for diagnostics. The `log` crate is `no_std`-compatible and
    provides a facade — it emits nothing unless a logger backend is registered.
 
-3. **The kernel provides the logger backend.** The kernel registers a global
-   `log::Log` implementation (backed by `console::print` / `safe_print!`) at
-   boot. All `log::*!` calls from any crate in the workspace then route
+3. **The kernel must provide the logger backend.** The kernel should register a
+   global `log::Log` implementation (backed by `console::print` / `safe_print!`)
+   at boot. All `log::*!` calls from any crate in the workspace then route
    through this single backend. This means crate log output appears in the
    same UART/SSH console stream as kernel logs, with no extra wiring.
+
+   **BUG: As of this writing, no `log::Log` backend is registered.** All
+   `log::info!`, `log::debug!`, etc. calls from extracted crates are silently
+   dropped. Crate code that needs guaranteed output must use
+   `(runtime().print_str)()` instead. This needs to be fixed by implementing
+   and registering a `log::Log` backend in `src/main.rs` during boot.
 
 4. **Kernel wrapper modules can still use `safe_print!`.** The thin glue code
    that stays in `src/` (e.g. `src/ssh/server.rs`, `src/ssh/keys.rs`) is part
@@ -218,8 +224,10 @@ crates follow this strategy:
 - [ ] `akuma-terminal` — currently has no logging (pure data, OK as-is)
 - [ ] `akuma-vfs` — check for any stray `safe_print!` or direct console use
 - [ ] `akuma-ext2` — check for any stray `safe_print!` or direct console use
-- [ ] Kernel registers a `log::Log` backend at boot (required for any of the
-      above to actually produce output)
+- [ ] **BROKEN** — Kernel does NOT register a `log::Log` backend at boot.
+      All `log::*!` calls from crates are silently dropped. Must implement
+      `log::Log` for a console-backed struct and call `log::set_logger()` in
+      `kernel_main()`.
 
 ---
 

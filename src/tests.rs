@@ -3502,6 +3502,7 @@ fn make_test_process(
         signal_actions: [akuma_exec::process::SignalAction::default(); akuma_exec::process::MAX_SIGNALS],
         start_time_us: 0,
         last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
     })
 }
 

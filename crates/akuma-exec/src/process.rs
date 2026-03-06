@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use core::future::Future;
 use core::pin::Pin;
@@ -98,6 +98,17 @@ const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 
 /// Process ID type
 pub type Pid = u32;
+
+static PROCESS_SYSCALL_STATS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_process_syscall_stats(enabled: bool) {
+    PROCESS_SYSCALL_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn process_syscall_stats_enabled() -> bool {
+    PROCESS_SYSCALL_STATS_ENABLED.load(Ordering::Relaxed)
+}
 
 // ============================================================================
 // Box Registry (for container management)
@@ -1642,6 +1653,93 @@ pub struct Process {
 
     /// Last syscall number (for debugging stuck processes)
     pub last_syscall: core::sync::atomic::AtomicU64,
+
+    /// Per-process syscall stats (emitted on exit when enabled)
+    pub syscall_stats: ProcessSyscallStats,
+}
+
+/// Per-process syscall counters, emitted on exit for performance profiling.
+/// All fields are AtomicU64 for lock-free concurrent updates from CLONE_VM threads.
+pub struct ProcessSyscallStats {
+    pub total: AtomicU64,
+    pub pagefaults: AtomicU64,
+    pub pagefault_pages: AtomicU64,
+    pub mmap: AtomicU64,
+    pub munmap: AtomicU64,
+    pub brk: AtomicU64,
+    pub read: AtomicU64,
+    pub write: AtomicU64,
+    pub openat: AtomicU64,
+    pub close: AtomicU64,
+    pub fstat: AtomicU64,
+    pub mprotect: AtomicU64,
+    pub futex: AtomicU64,
+    pub clock: AtomicU64,
+    pub ioctl: AtomicU64,
+    pub clone: AtomicU64,
+    pub other: AtomicU64,
+}
+
+impl ProcessSyscallStats {
+    pub const fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            pagefaults: AtomicU64::new(0),
+            pagefault_pages: AtomicU64::new(0),
+            mmap: AtomicU64::new(0),
+            munmap: AtomicU64::new(0),
+            brk: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+            write: AtomicU64::new(0),
+            openat: AtomicU64::new(0),
+            close: AtomicU64::new(0),
+            fstat: AtomicU64::new(0),
+            mprotect: AtomicU64::new(0),
+            futex: AtomicU64::new(0),
+            clock: AtomicU64::new(0),
+            ioctl: AtomicU64::new(0),
+            clone: AtomicU64::new(0),
+            other: AtomicU64::new(0),
+        }
+    }
+
+    pub fn inc_total(&self) { self.total.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_pagefault(&self, pages: u64) {
+        self.pagefaults.fetch_add(1, Ordering::Relaxed);
+        self.pagefault_pages.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub fn dump(&self, pid: Pid, name: &str, elapsed_us: u64) {
+        use alloc::format;
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 { return; }
+        let secs = elapsed_us / 1_000_000;
+        let frac = (elapsed_us % 1_000_000) / 10_000;
+        let rate = if elapsed_us > 0 { total * 1_000_000 / elapsed_us } else { 0 };
+        let (pmm_total, _pmm_alloc, pmm_free) = (runtime().pmm_stats)();
+        let msg = format!(
+            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) pmm={}free/{}tot | pgfault={}({}pg) mmap={} brk={} read={} write={} open={} close={} futex={} fstat={} mprot={} clk={} ioctl={} clone={} munmap={} other={}\n",
+            pid, name, secs, frac, total, rate,
+            pmm_free, pmm_total,
+            self.pagefaults.load(Ordering::Relaxed),
+            self.pagefault_pages.load(Ordering::Relaxed),
+            self.mmap.load(Ordering::Relaxed),
+            self.brk.load(Ordering::Relaxed),
+            self.read.load(Ordering::Relaxed),
+            self.write.load(Ordering::Relaxed),
+            self.openat.load(Ordering::Relaxed),
+            self.close.load(Ordering::Relaxed),
+            self.futex.load(Ordering::Relaxed),
+            self.fstat.load(Ordering::Relaxed),
+            self.mprotect.load(Ordering::Relaxed),
+            self.clock.load(Ordering::Relaxed),
+            self.ioctl.load(Ordering::Relaxed),
+            self.clone.load(Ordering::Relaxed),
+            self.munmap.load(Ordering::Relaxed),
+            self.other.load(Ordering::Relaxed),
+        );
+        (runtime().print_str)(&msg);
+    }
 }
 
 
@@ -1736,6 +1834,7 @@ impl Process {
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
 })
     }
 
@@ -1829,6 +1928,7 @@ impl Process {
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
 })
     }
 
@@ -2443,10 +2543,18 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
-        let start_us = lookup_process(pid).map(|p| p.start_time_us).unwrap_or(0);
+        let (start_us, proc_name) = lookup_process(pid)
+            .map(|p| (p.start_time_us, p.name.clone()))
+            .unwrap_or((0, alloc::string::String::from("?")));
         let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000; // centiseconds
+
+        if process_syscall_stats_enabled() {
+            if let Some(proc) = lookup_process(pid) {
+                proc.syscall_stats.dump(pid, &proc_name, elapsed_us);
+            }
+        }
 
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
@@ -2662,6 +2770,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         signal_actions: parent.signal_actions,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
 });
     
     // 4. Perform memory copy
@@ -2881,6 +2990,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         signal_actions: parent.signal_actions,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
 });
 
     let parent_tid = crate::threading::current_thread_id();
