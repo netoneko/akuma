@@ -463,6 +463,7 @@ pub mod nr {
     pub const EXIT_GROUP: u64 = 94;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGACTION: u64 = 134; // Linux arm64 rt_sigaction
+    pub const RT_SIGRETURN: u64 = 139; // Linux arm64 rt_sigreturn
     pub const RT_SIGSUSPEND: u64 = 133;
     pub const GETRANDOM: u64 = 278;  // Linux arm64 getrandom
     pub const GETCWD: u64 = 17;      // Linux arm64 getcwd
@@ -1098,6 +1099,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT_GROUP => sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => 0,  // Success (do nothing)
         nr::RT_SIGSUSPEND => 0,   // Success (do nothing)
+        nr::RT_SIGRETURN => 0,    // Handled in exceptions.rs before reaching here
         nr::RT_SIGACTION => sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
         nr::GETCWD => sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
@@ -1133,7 +1135,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MADVISE => sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         nr::MPROTECT => sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::FUTEX => sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, args[3], args[4] as usize, args[5] as u32),
-        nr::SET_ROBUST_LIST => 0,
+        nr::SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1] as usize),
         nr::SIGALTSTACK => 0,
         nr::GETRLIMIT => sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
@@ -1141,7 +1143,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PREAD64 => sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::PWRITE64 => sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::SETITIMER => 0,
-        nr::MEMBARRIER => 0,
+        nr::MEMBARRIER => membarrier_cmd(args[0] as u32),
         nr::PRCTL => 0,
         nr::TIMES => sys_times(args[0] as usize),
         nr::GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as usize),
@@ -1331,6 +1333,16 @@ fn sys_set_tid_address(tidptr: u64) -> u64 {
         return proc.pid as u64;
     }
     1
+}
+
+fn sys_set_robust_list(head: u64, len: usize) -> u64 {
+    if len != 24 { return EINVAL; } // sizeof(struct robust_list_head) on aarch64
+    if let Some(proc) = akuma_exec::process::current_process() {
+        proc.robust_list_head = head;
+        proc.robust_list_len = len;
+        return 0;
+    }
+    ENOSYS
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -3780,7 +3792,19 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
     }
 
     if flags & MREMAP_MAYMOVE == 0 {
-        return ENOMEM;
+        // Distinguish EFAULT (address not mapped at all) from ENOMEM (mapped
+        // but cannot grow in-place). JSC's conservative GC probes the VA space
+        // with mremap(addr,0x1000,0x2000,0) and uses the error to distinguish
+        // mapped vs unmapped ranges.
+        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
+            || akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, old_addr).is_some()
+            || akuma_exec::process::lookup_process(owner_pid)
+                .map(|p| p.mmap_regions.iter().any(|(start, frames)| {
+                    old_addr >= *start && old_addr < *start + frames.len() * 4096
+                }))
+                .unwrap_or(false);
+        return if is_mapped { ENOMEM } else { EFAULT };
     }
 
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -3810,7 +3834,8 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
 
         proc.mmap_regions.push((new_addr, new_frames));
 
-        // Remove old region from owner's mmap_regions (inline, not via helper)
+        // Remove old region: try eager first, then lazy
+        let mut found_eager = false;
         if let Some(idx) = proc.mmap_regions.iter().position(|(va, _)| *va == old_addr) {
             let (_, old_frames) = proc.mmap_regions.remove(idx);
             let freed_size = old_frames.len() * 4096;
@@ -3820,6 +3845,27 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
                 crate::pmm::free_page(frame);
             }
             proc.memory.free_regions.push((old_addr, freed_size));
+            found_eager = true;
+        }
+
+        if !found_eager {
+            // Handle lazy region: remove metadata and free any demand-faulted pages
+            let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(owner_pid, old_addr, old_pages * 4096);
+            for &(freed_start, freed_pages) in &lazy_results {
+                for i in 0..freed_pages {
+                    if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
+                        crate::pmm::free_page(frame);
+                    }
+                }
+            }
+            // Also unmap any demand-faulted pages not covered by lazy region metadata
+            for i in 0..old_pages {
+                let va = old_addr + i * 4096;
+                if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                    crate::pmm::free_page(frame);
+                }
+            }
+            proc.memory.free_regions.push((old_addr, old_pages * 4096));
         }
 
         new_addr as u64
@@ -3851,6 +3897,27 @@ fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         }
         MADV_FREE => 0, // hint only — kernel may reclaim later, no-op for now
         _ => 0,
+    }
+}
+
+pub fn membarrier_cmd(cmd: u32) -> u64 {
+    const CMD_QUERY: u32 = 0;
+    const CMD_PRIVATE_EXPEDITED: u32 = 8;
+    const CMD_REGISTER_PRIVATE_EXPEDITED: u32 = 16;
+    // Supported bitmask: PRIVATE_EXPEDITED (1<<3) | REGISTER_PRIVATE_EXPEDITED (1<<4)
+    const SUPPORTED: u64 = 0x18;
+
+    match cmd {
+        CMD_QUERY => SUPPORTED,
+        CMD_REGISTER_PRIVATE_EXPEDITED => 0,
+        CMD_PRIVATE_EXPEDITED => {
+            unsafe {
+                core::arch::asm!("dsb ish");
+                core::arch::asm!("isb");
+            }
+            0
+        }
+        _ => EINVAL,
     }
 }
 

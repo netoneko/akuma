@@ -1645,6 +1645,11 @@ pub struct Process {
     /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID)
     pub clear_child_tid: u64,
 
+    /// Robust futex list head pointer (set by set_robust_list syscall)
+    pub robust_list_head: u64,
+    /// Robust futex list entry size (from set_robust_list len argument)
+    pub robust_list_len: usize,
+
     /// Per-process signal action table (sigaction storage)
     pub signal_actions: [SignalAction; MAX_SIGNALS],
 
@@ -1868,6 +1873,8 @@ impl Process {
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
@@ -1962,6 +1969,8 @@ impl Process {
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
@@ -2538,6 +2547,56 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                 unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
                 (runtime().futex_wake)(tid_addr as usize, i32::MAX);
             }
+
+            // Robust futex list cleanup: walk the list and mark owned futexes
+            // with FUTEX_OWNER_DIED so waiters don't deadlock.
+            let robust_head = proc.robust_list_head;
+            if robust_head != 0 {
+                const FUTEX_OWNER_DIED: u32 = 0x40000000;
+                const ROBUST_LIST_LIMIT: usize = 2048;
+                let my_tid = proc.pid;
+                // robust_list_head layout: { next: *mut robust_list, futex_offset: long, list_op_pending: *mut robust_list }
+                if crate::mmu::is_current_user_page_mapped(robust_head as usize) {
+                    let futex_offset = unsafe {
+                        core::ptr::read((robust_head as usize + 8) as *const i64)
+                    };
+                    let pending_ptr = unsafe {
+                        core::ptr::read((robust_head as usize + 16) as *const u64)
+                    };
+
+                    // Walk the linked list
+                    let mut entry = unsafe { core::ptr::read(robust_head as *const u64) };
+                    let mut count = 0usize;
+                    while entry != robust_head && entry != 0 && count < ROBUST_LIST_LIMIT {
+                        if crate::mmu::is_current_user_page_mapped(entry as usize) {
+                            let futex_addr = (entry as i64 + futex_offset) as usize;
+                            if crate::mmu::is_current_user_page_mapped(futex_addr) {
+                                let word = unsafe { core::ptr::read(futex_addr as *const u32) };
+                                if (word & 0x3FFFFFFF) == my_tid {
+                                    unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
+                                    (runtime().futex_wake)(futex_addr, 1);
+                                }
+                            }
+                            entry = unsafe { core::ptr::read(entry as *const u64) };
+                        } else {
+                            break;
+                        }
+                        count += 1;
+                    }
+
+                    // Handle pending operation
+                    if pending_ptr != 0 && crate::mmu::is_current_user_page_mapped(pending_ptr as usize) {
+                        let futex_addr = (pending_ptr as i64 + futex_offset) as usize;
+                        if crate::mmu::is_current_user_page_mapped(futex_addr) {
+                            let word = unsafe { core::ptr::read(futex_addr as *const u32) };
+                            if (word & 0x3FFFFFFF) == my_tid {
+                                unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
+                                (runtime().futex_wake)(futex_addr, 1);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2804,6 +2863,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
         signal_actions: parent.signal_actions,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
@@ -3024,6 +3085,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
+        robust_list_head: 0,
+        robust_list_len: 0,
         signal_actions: parent.signal_actions,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),

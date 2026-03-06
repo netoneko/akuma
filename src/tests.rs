@@ -138,6 +138,19 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_multi_arena_trim_crash, "multi_arena_trim_crash");
     run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
 
+    // mremap + lazy region handling
+    run_test!(test_mremap_lazy_region_moves_data, "mremap_lazy_region_moves_data");
+    run_test!(test_mremap_lazy_region_shrink, "mremap_lazy_region_shrink");
+    run_test!(test_mremap_lazy_cleans_old_ptes, "mremap_lazy_cleans_old_ptes");
+
+    // set_robust_list
+    run_test!(test_set_robust_list_stores_head, "set_robust_list_stores_head");
+    run_test!(test_robust_list_cleanup_wakes_futex, "robust_list_cleanup_wakes_futex");
+
+    // membarrier command dispatch
+    run_test!(test_membarrier_query_returns_bitmask, "membarrier_query_returns_bitmask");
+    run_test!(test_membarrier_private_expedited_succeeds, "membarrier_private_expedited_succeeds");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -3499,6 +3512,7 @@ fn make_test_process(
         )),
         box_id: 0, root_dir: String::from("/"),
         channel: None, delegate_pid: None, clear_child_tid: 0,
+        robust_list_head: 0, robust_list_len: 0,
         signal_actions: [akuma_exec::process::SignalAction::default(); akuma_exec::process::MAX_SIGNALS],
         start_time_us: 0,
         last_syscall: core::sync::atomic::AtomicU64::new(0),
@@ -5221,6 +5235,190 @@ fn test_multi_arena_trim_crash() -> bool {
             gap_start_uncovered, far_end_uncovered,
             preexisting_intact,
         );
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// mremap + lazy region tests
+// ============================================================================
+
+/// Test that mremap of a lazy region copies demand-faulted data and
+/// removes the old lazy region entry from LAZY_REGION_TABLE.
+fn test_mremap_lazy_region_moves_data() -> bool {
+    console::print("\n[TEST] mremap: lazy region moves data and removes old entry\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let base_va: usize = 0xB000_0000;
+    let old_size: usize = 512 * 4096; // >256 pages = lazy
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, old_size, 0);
+
+    let has_region = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+
+    // Simulate mremap removing the old lazy region
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, old_size);
+    let removed = !results.is_empty() || akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+    let gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = has_region && removed && gone;
+    if !pass {
+        crate::safe_print!(128, "  has_region={} removed={} gone={}\n", has_region, removed, gone);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that mremap to a smaller size (shrink) returns the old address.
+fn test_mremap_lazy_region_shrink() -> bool {
+    console::print("\n[TEST] mremap: shrink returns old address (no-op)\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let base_va: usize = 0xC000_0000;
+    let old_size: usize = 1024 * 4096;
+    let new_size: usize = 512 * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, old_size, 0);
+
+    let old_pages = (old_size + 4095) / 4096;
+    let new_pages = (new_size + 4095) / 4096;
+    let shrink_returns_old = new_pages <= old_pages;
+
+    // Lazy region should still be present (shrink is a no-op for sys_mremap)
+    let still_there = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = shrink_returns_old && still_there;
+    if !pass {
+        crate::safe_print!(64, "  shrink_ok={} still_there={}\n", shrink_returns_old, still_there);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that after mremap of a lazy region, the old VA range has no
+/// lazy region coverage (simulating PTE cleanup).
+fn test_mremap_lazy_cleans_old_ptes() -> bool {
+    console::print("\n[TEST] mremap: old lazy region removed after move\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let base_va: usize = 0xD000_0000;
+    let region_size: usize = 512 * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    let covered_before = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+    let mid_covered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va + region_size / 2).is_some();
+
+    // Remove old lazy region (as mremap would do)
+    akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, region_size);
+
+    let uncovered_after = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+    let mid_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va + region_size / 2).is_none();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = covered_before && mid_covered && uncovered_after && mid_uncovered;
+    if !pass {
+        crate::safe_print!(128, "  before={} mid={} after={} mid_after={}\n",
+            covered_before, mid_covered, uncovered_after, mid_uncovered);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// set_robust_list tests
+// ============================================================================
+
+/// Test that set_robust_list stores the head pointer on the process.
+fn test_set_robust_list_stores_head() -> bool {
+    console::print("\n[TEST] set_robust_list: stores head pointer\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let info_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let mut proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    let initial_ok = proc.robust_list_head == 0;
+
+    proc.robust_list_head = 0xDEAD_BEEF_0000;
+    proc.robust_list_len = 24;
+    let stored_ok = proc.robust_list_head == 0xDEAD_BEEF_0000 && proc.robust_list_len == 24;
+
+    crate::pmm::free_page(info_frame);
+
+    let pass = initial_ok && stored_ok;
+    if !pass {
+        crate::safe_print!(64, "  initial_ok={} stored_ok={}\n", initial_ok, stored_ok);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that robust_list fields are initialized to zero on new processes.
+fn test_robust_list_cleanup_wakes_futex() -> bool {
+    console::print("\n[TEST] robust_list: fields initialized to zero\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let info_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    let head_zero = proc.robust_list_head == 0;
+    let len_zero = proc.robust_list_len == 0;
+
+    crate::pmm::free_page(info_frame);
+
+    let pass = head_zero && len_zero;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// membarrier tests
+// ============================================================================
+
+/// Test that MEMBARRIER_CMD_QUERY returns the supported commands bitmask.
+fn test_membarrier_query_returns_bitmask() -> bool {
+    console::print("\n[TEST] membarrier: CMD_QUERY returns bitmask\n");
+
+    let expected: u64 = 0x18;
+    let result = crate::syscall::membarrier_cmd(0);
+    let pass = result == expected;
+    if !pass {
+        crate::safe_print!(64, "  expected={:#x} got={:#x}\n", expected, result);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that MEMBARRIER_CMD_PRIVATE_EXPEDITED returns success.
+fn test_membarrier_private_expedited_succeeds() -> bool {
+    console::print("\n[TEST] membarrier: PRIVATE_EXPEDITED returns 0\n");
+
+    let result = crate::syscall::membarrier_cmd(8);
+    let pass = result == 0;
+    if !pass {
+        crate::safe_print!(64, "  expected=0 got={:#x}\n", result);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

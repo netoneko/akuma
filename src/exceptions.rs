@@ -568,6 +568,179 @@ mod esr {
     pub const EC_BRK_AARCH64: u64 = 0b111100; // BRK instruction from AArch64
 }
 
+// Signal frame layout constants (Linux AArch64 compatible)
+const SA_SIGINFO: u64 = 4;
+// siginfo_t: 128 bytes
+// ucontext_t header (uc_flags..uc_sigmask + __unused): 168 bytes
+// sigcontext (fault_address + regs[31] + sp + pc + pstate): 280 bytes
+// __reserved (null terminator for aarch64_ctx): 16 bytes
+const SIGFRAME_SIZE: usize = 128 + 168 + 280 + 16; // 592 bytes
+const SIGFRAME_SIGINFO: usize = 0;
+const SIGFRAME_UCONTEXT: usize = 128;
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168;
+
+/// Try to deliver a signal to a userspace handler by setting up an
+/// rt_sigframe on the user stack and redirecting ELR to the handler.
+/// Returns true if delivery succeeded (caller should return signal number as x0).
+fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -> bool {
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let proc = match akuma_exec::process::lookup_process(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let idx = (signal as usize).wrapping_sub(1);
+    if idx >= akuma_exec::process::MAX_SIGNALS {
+        return false;
+    }
+
+    let action = proc.signal_actions[idx];
+    let handler_addr = match action.handler {
+        akuma_exec::process::SignalHandler::UserFn(addr) => addr,
+        _ => return false,
+    };
+
+    let restorer = action.restorer;
+    let frame_ref = unsafe { &*frame };
+    let user_sp = frame_ref.sp_el0 as usize;
+
+    let new_sp = (user_sp - SIGFRAME_SIZE) & !0xF;
+
+    // Validate stack pages are mapped (signal frame may span 2 pages)
+    let first_page = new_sp & !0xFFF;
+    let last_page = (new_sp + SIGFRAME_SIZE - 1) & !0xFFF;
+    if !akuma_exec::mmu::is_current_user_page_mapped(first_page) {
+        return false;
+    }
+    if last_page != first_page && !akuma_exec::mmu::is_current_user_page_mapped(last_page) {
+        return false;
+    }
+
+    unsafe {
+        let base = new_sp as *mut u8;
+        core::ptr::write_bytes(base, 0, SIGFRAME_SIZE);
+
+        // siginfo_t
+        let si = base.add(SIGFRAME_SIGINFO);
+        core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
+        core::ptr::write(si.add(8) as *mut i32, 1);               // si_code = SEGV_MAPERR
+        core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
+
+        // mcontext_t (sigcontext): fault_address, regs[31], sp, pc, pstate
+        let mc = base.add(SIGFRAME_MCONTEXT);
+        core::ptr::write(mc as *mut u64, fault_addr);
+        let regs_base = mc.add(8) as *mut u64;
+        core::ptr::write(regs_base.add(0), frame_ref.x0);
+        core::ptr::write(regs_base.add(1), frame_ref.x1);
+        core::ptr::write(regs_base.add(2), frame_ref.x2);
+        core::ptr::write(regs_base.add(3), frame_ref.x3);
+        core::ptr::write(regs_base.add(4), frame_ref.x4);
+        core::ptr::write(regs_base.add(5), frame_ref.x5);
+        core::ptr::write(regs_base.add(6), frame_ref.x6);
+        core::ptr::write(regs_base.add(7), frame_ref.x7);
+        core::ptr::write(regs_base.add(8), frame_ref.x8);
+        core::ptr::write(regs_base.add(9), frame_ref.x9);
+        core::ptr::write(regs_base.add(10), frame_ref.x10);
+        core::ptr::write(regs_base.add(11), frame_ref.x11);
+        core::ptr::write(regs_base.add(12), frame_ref.x12);
+        core::ptr::write(regs_base.add(13), frame_ref.x13);
+        core::ptr::write(regs_base.add(14), frame_ref.x14);
+        core::ptr::write(regs_base.add(15), frame_ref.x15);
+        core::ptr::write(regs_base.add(16), frame_ref.x16);
+        core::ptr::write(regs_base.add(17), frame_ref.x17);
+        core::ptr::write(regs_base.add(18), frame_ref.x18);
+        core::ptr::write(regs_base.add(19), frame_ref.x19);
+        core::ptr::write(regs_base.add(20), frame_ref.x20);
+        core::ptr::write(regs_base.add(21), frame_ref.x21);
+        core::ptr::write(regs_base.add(22), frame_ref.x22);
+        core::ptr::write(regs_base.add(23), frame_ref.x23);
+        core::ptr::write(regs_base.add(24), frame_ref.x24);
+        core::ptr::write(regs_base.add(25), frame_ref.x25);
+        core::ptr::write(regs_base.add(26), frame_ref.x26);
+        core::ptr::write(regs_base.add(27), frame_ref.x27);
+        core::ptr::write(regs_base.add(28), frame_ref.x28);
+        core::ptr::write(regs_base.add(29), frame_ref.x29);
+        core::ptr::write(regs_base.add(30), frame_ref.x30);
+        core::ptr::write(mc.add(256) as *mut u64, frame_ref.sp_el0);   // sp
+        core::ptr::write(mc.add(264) as *mut u64, frame_ref.elr_el1);  // pc
+        core::ptr::write(mc.add(272) as *mut u64, frame_ref.spsr_el1); // pstate
+
+        // Redirect execution to the signal handler
+        (*frame).elr_el1 = handler_addr as u64;
+        (*frame).sp_el0 = new_sp as u64;
+        (*frame).x30 = restorer as u64;
+
+        if action.flags & SA_SIGINFO != 0 {
+            (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
+            (*frame).x2 = (new_sp + SIGFRAME_UCONTEXT) as u64;
+        }
+    }
+
+    crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
+        signal, handler_addr, restorer);
+    true
+}
+
+/// Restore saved context from a signal frame on the user stack (rt_sigreturn).
+/// Returns the saved x0 value, or None if the frame is invalid.
+fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
+    let frame_ref = unsafe { &*frame };
+    let sigframe_sp = frame_ref.sp_el0 as usize;
+
+    let first_page = sigframe_sp & !0xFFF;
+    let last_page = (sigframe_sp + SIGFRAME_SIZE - 1) & !0xFFF;
+    if !akuma_exec::mmu::is_current_user_page_mapped(first_page) {
+        return None;
+    }
+    if last_page != first_page && !akuma_exec::mmu::is_current_user_page_mapped(last_page) {
+        return None;
+    }
+
+    unsafe {
+        let mc = (sigframe_sp + SIGFRAME_MCONTEXT) as *const u8;
+        let regs_base = mc.add(8) as *const u64;
+
+        (*frame).x0 = core::ptr::read(regs_base.add(0));
+        (*frame).x1 = core::ptr::read(regs_base.add(1));
+        (*frame).x2 = core::ptr::read(regs_base.add(2));
+        (*frame).x3 = core::ptr::read(regs_base.add(3));
+        (*frame).x4 = core::ptr::read(regs_base.add(4));
+        (*frame).x5 = core::ptr::read(regs_base.add(5));
+        (*frame).x6 = core::ptr::read(regs_base.add(6));
+        (*frame).x7 = core::ptr::read(regs_base.add(7));
+        (*frame).x8 = core::ptr::read(regs_base.add(8));
+        (*frame).x9 = core::ptr::read(regs_base.add(9));
+        (*frame).x10 = core::ptr::read(regs_base.add(10));
+        (*frame).x11 = core::ptr::read(regs_base.add(11));
+        (*frame).x12 = core::ptr::read(regs_base.add(12));
+        (*frame).x13 = core::ptr::read(regs_base.add(13));
+        (*frame).x14 = core::ptr::read(regs_base.add(14));
+        (*frame).x15 = core::ptr::read(regs_base.add(15));
+        (*frame).x16 = core::ptr::read(regs_base.add(16));
+        (*frame).x17 = core::ptr::read(regs_base.add(17));
+        (*frame).x18 = core::ptr::read(regs_base.add(18));
+        (*frame).x19 = core::ptr::read(regs_base.add(19));
+        (*frame).x20 = core::ptr::read(regs_base.add(20));
+        (*frame).x21 = core::ptr::read(regs_base.add(21));
+        (*frame).x22 = core::ptr::read(regs_base.add(22));
+        (*frame).x23 = core::ptr::read(regs_base.add(23));
+        (*frame).x24 = core::ptr::read(regs_base.add(24));
+        (*frame).x25 = core::ptr::read(regs_base.add(25));
+        (*frame).x26 = core::ptr::read(regs_base.add(26));
+        (*frame).x27 = core::ptr::read(regs_base.add(27));
+        (*frame).x28 = core::ptr::read(regs_base.add(28));
+        (*frame).x29 = core::ptr::read(regs_base.add(29));
+        (*frame).x30 = core::ptr::read(regs_base.add(30));
+
+        (*frame).sp_el0 = core::ptr::read(mc.add(256) as *const u64);
+        (*frame).elr_el1 = core::ptr::read(mc.add(264) as *const u64);
+        (*frame).spsr_el1 = core::ptr::read(mc.add(272) as *const u64);
+
+        let saved_x0 = (*frame).x0;
+        Some(saved_x0)
+    }
+}
+
 /// Install exception vector table
 pub fn init() {
     // Initialize exception stack before enabling exceptions
@@ -1012,6 +1185,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            // rt_sigreturn (NR 139): restore saved context from signal frame
+            if syscall_num == 139 {
+                if let Some(saved_x0) = do_rt_sigreturn(frame) {
+                    return saved_x0;
+                }
+                akuma_exec::process::return_to_kernel(-11);
+            }
+
             // Save trap frame pointer so fork/clone can read full register state
             akuma_exec::threading::set_current_trap_frame(frame as *const _);
             let args = [
@@ -1327,6 +1508,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            // Try delivering SIGSEGV to a registered userspace handler
+            if try_deliver_signal(frame, 11, far) {
+                return 11; // signal number in x0 for the handler
+            }
+
             let frame_ref = unsafe { &*frame };
             crate::tprint!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
@@ -1508,6 +1694,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                 }
+            }
+
+            // Try delivering SIGSEGV to a registered userspace handler
+            if try_deliver_signal(frame, 11, far) {
+                return 11;
             }
 
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
