@@ -275,14 +275,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/8 of RAM, 32MB) - kernel binary and stack
-    // - Heap: 1/2 of RAM - dynamic allocations
+    // - Heap: fixed 32MB - kernel data structures (page tables, PCBs, VFS, networking)
     // - User pages: remaining - for user processes
     // Note: See docs/MEMORY_LAYOUT.md for details on sizing constraints
+    const KERNEL_HEAP_SIZE: usize = 32 * 1024 * 1024;
 
-    // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
     let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = core::cmp::max(ram_size / 4, MIN_CODE_AND_STACK); // 1/4 RAM (min 32MB) for demand paging bookkeeping
+    let heap_size = KERNEL_HEAP_SIZE;
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
