@@ -6,7 +6,6 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
@@ -17,13 +16,44 @@ use crate::shell::{execute_external_streaming, Command, ShellContext, ShellError
 use akuma_net::http::{self, ParsedUrl, parse_url};
 use akuma_net::smoltcp_net;
 
-/// Download an HTTP GET response to a file. Returns status code and bytes written.
+/// Async writer that appends chunks to a file on disk.
+///
+/// Keeps only a fixed-size buffer on the heap (~4 KB read buf in the HTTP
+/// layer) instead of buffering the entire download.
+struct FileWriter<'a> {
+    path: &'a str,
+}
+
+impl<'a> FileWriter<'a> {
+    async fn create(path: &'a str) -> Result<Self, &'static str> {
+        async_fs::write_file(path, &[])
+            .await
+            .map_err(|_| "Failed to create destination file")?;
+        Ok(Self { path })
+    }
+}
+
+impl embedded_io_async::ErrorType for FileWriter<'_> {
+    type Error = embedded_io_async::ErrorKind;
+}
+
+impl embedded_io_async::Write for FileWriter<'_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        async_fs::append_file(self.path, buf)
+            .await
+            .map_err(|_| embedded_io_async::ErrorKind::Other)?;
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Stream an HTTP GET response directly to a file. Returns status code and bytes written.
 async fn http_get_to_file(url: &ParsedUrl, dest_path: &str) -> Result<(u16, usize), &'static str> {
-    let resp = http::http_get(url, false).await.map_err(|_| "HTTP request failed")?;
-    async_fs::write_file(dest_path, &resp.body)
-        .await
-        .map_err(|_| "Failed to write destination file")?;
-    Ok((resp.status, resp.body.len()))
+    let mut writer = FileWriter::create(dest_path).await?;
+    http::http_get_streaming(url, false, &mut writer, |_| {}).await
 }
 
 // ============================================================================
@@ -194,56 +224,54 @@ const PKG_SERVER: &str = "http://10.0.2.2:8000";
 pub struct PkgCommand;
 
 impl PkgCommand {
-    async fn download_file_w<W: embedded_io_async::Write>(
-        &self,
-        path: &str,
-        stdout: &mut W,
-    ) -> Result<(u16, Vec<u8>), ShellError> {
-        let url_str = format!("{}{}", PKG_SERVER, path);
-        let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
-
-        let msg = format!("pkg: downloading {}...\r\n", url_str);
-        let _ = stdout.write(msg.as_bytes()).await;
-
-        let resp = http::http_get(&url, false).await.map_err(|e| {
-            let _ = stdout.write_all(format!("pkg: download error: {}\r\n", e).as_bytes());
-            ShellError::ExecutionFailed("Download failed")
-        })?;
-        Ok((resp.status, resp.body))
-    }
-
     async fn try_install_binary_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
         stdout: &mut W,
     ) -> Result<bool, ShellError> {
         let bin_path = format!("/bin/{}", package);
-        match self.download_file_w(&bin_path, stdout).await {
-            Ok((200, body)) => {
-                if body.is_empty() {
+        let url_str = format!("{}{}", PKG_SERVER, bin_path);
+        let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
+
+        let msg = format!("pkg: downloading {}...\r\n", url_str);
+        let _ = stdout.write(msg.as_bytes()).await;
+
+        let mut writer = match FileWriter::create(&bin_path).await {
+            Ok(w) => w,
+            Err(_) => return Err(ShellError::ExecutionFailed("Failed to create file")),
+        };
+
+        match http::http_get_streaming(&url, false, &mut writer, |_| {}).await {
+            Ok((200, size)) => {
+                if size == 0 {
                     let _ = stdout.write(b"pkg: warning: downloaded binary is empty.\r\n").await;
+                    let _ = crate::async_fs::remove_file(&bin_path).await;
                     return Ok(false);
                 }
-                
-                let _ = crate::async_fs::write_file(&bin_path, &body).await;
-                let msg = format!("pkg: installed {} to {}\r\n", package, bin_path);
+                let msg = format!("pkg: installed {} ({} KB) to {}\r\n", package, size / 1024, bin_path);
                 let _ = stdout.write(msg.as_bytes()).await;
                 Ok(true)
             }
-            Ok((404, _)) => Ok(false),
+            Ok((404, _)) => {
+                let _ = crate::async_fs::remove_file(&bin_path).await;
+                Ok(false)
+            }
             Ok((status, _)) => {
+                let _ = crate::async_fs::remove_file(&bin_path).await;
                 let msg = format!("pkg: failed to download binary (status: {})\r\n", status);
                 let _ = stdout.write(msg.as_bytes()).await;
                 Err(ShellError::ExecutionFailed("Binary download failed"))
             }
-            Err(e) => Err(e),
+            Err(_) => {
+                let _ = crate::async_fs::remove_file(&bin_path).await;
+                Err(ShellError::ExecutionFailed("Download failed"))
+            }
         }
     }
 
     async fn try_install_archive_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
-        streaming: bool,
         stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<bool, ShellError> {
@@ -258,62 +286,41 @@ impl PkgCommand {
             let ext = extensions[i];
             let tmp_path = format!("/tmp/{}{}", package, ext);
 
-            if streaming {
-                let url_str = format!("{}{}", PKG_SERVER, path);
-                let url = match parse_url(&url_str) {
-                    Some(u) => u,
-                    None => continue,
-                };
+            let url_str = format!("{}{}", PKG_SERVER, path);
+            let url = match parse_url(&url_str) {
+                Some(u) => u,
+                None => continue,
+            };
 
-                let msg = format!("pkg: streaming download {}...\r\n", url_str);
-                let _ = stdout.write(msg.as_bytes()).await;
+            let msg = format!("pkg: downloading {}...\r\n", url_str);
+            let _ = stdout.write(msg.as_bytes()).await;
 
-                match http_get_to_file(&url, &tmp_path).await {
-                    Ok((200, size)) => {
-                        if size == 0 {
-                            let _ = crate::async_fs::remove_file(&tmp_path).await;
-                            continue;
-                        }
-                        let msg = format!("pkg: downloaded {} KB to {}\r\n", size / 1024, tmp_path);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                        let success = self.extract_and_cleanup_w(&tmp_path, stdout, ctx).await?;
-                        return Ok(success);
-                    }
-                    Ok((404, _)) => {
+            match http_get_to_file(&url, &tmp_path).await {
+                Ok((200, size)) => {
+                    if size == 0 {
                         let _ = crate::async_fs::remove_file(&tmp_path).await;
                         continue;
                     }
-                    Ok((status, _)) => {
-                        let _ = crate::async_fs::remove_file(&tmp_path).await;
-                        let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                        return Err(ShellError::ExecutionFailed("Archive download failed"));
-                    }
-                    Err(e) => {
-                        let _ = crate::async_fs::remove_file(&tmp_path).await;
-                        let msg = format!("pkg: streaming download error: {}\r\n", e);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                        return Err(ShellError::ExecutionFailed("Archive download failed"));
-                    }
+                    let msg = format!("pkg: downloaded {} KB to {}\r\n", size / 1024, tmp_path);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    let success = self.extract_and_cleanup_w(&tmp_path, stdout, ctx).await?;
+                    return Ok(success);
                 }
-            } else {
-                match self.download_file_w(path, stdout).await {
-                    Ok((200, body)) => {
-                        if body.is_empty() {
-                            continue;
-                        }
-                        
-                        let _ = crate::async_fs::write_file(&tmp_path, &body).await;
-                        let success = self.extract_and_cleanup_w(&tmp_path, stdout, ctx).await?;
-                        return Ok(success);
-                    }
-                    Ok((404, _)) => continue,
-                    Ok((status, _)) => {
-                        let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
-                        let _ = stdout.write(msg.as_bytes()).await;
-                        return Err(ShellError::ExecutionFailed("Archive download failed"));
-                    }
-                    Err(_) => return Err(ShellError::ExecutionFailed("Archive download failed")),
+                Ok((404, _)) => {
+                    let _ = crate::async_fs::remove_file(&tmp_path).await;
+                    continue;
+                }
+                Ok((status, _)) => {
+                    let _ = crate::async_fs::remove_file(&tmp_path).await;
+                    let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Err(ShellError::ExecutionFailed("Archive download failed"));
+                }
+                Err(e) => {
+                    let _ = crate::async_fs::remove_file(&tmp_path).await;
+                    let msg = format!("pkg: download error: {}\r\n", e);
+                    let _ = stdout.write(msg.as_bytes()).await;
+                    return Err(ShellError::ExecutionFailed("Archive download failed"));
                 }
             }
         }
@@ -353,19 +360,17 @@ impl PkgCommand {
         }
     }
 
-    /// Install packages with streaming output to any writer.
     pub async fn install_streaming<W: embedded_io_async::Write>(
         &self,
         packages: &str,
         stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<(), ShellError> {
-        let streaming = packages.split_whitespace().any(|a| a == "--streaming");
         for package in packages.split_whitespace() {
             if package.starts_with("--") {
                 continue;
             }
-            self.install_package_w(package, streaming, stdout, ctx).await?;
+            self.install_package_w(package, stdout, ctx).await?;
         }
         Ok(())
     }
@@ -373,7 +378,6 @@ impl PkgCommand {
     async fn install_package_w<W: embedded_io_async::Write>(
         &self,
         package: &str,
-        streaming: bool,
         stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<(), ShellError> {
@@ -388,7 +392,7 @@ impl PkgCommand {
             return Ok(());
         }
 
-        if self.try_install_archive_w(package, streaming, stdout, ctx).await? {
+        if self.try_install_archive_w(package, stdout, ctx).await? {
             return Ok(());
         }
 
@@ -402,7 +406,7 @@ impl PkgCommand {
 impl Command for PkgCommand {
     fn name(&self) -> &'static str { "pkg" }
     fn description(&self) -> &'static str { "Package manager" }
-    fn usage(&self) -> &'static str { "pkg install [--streaming] <package1> [package2] ..." }
+    fn usage(&self) -> &'static str { "pkg install <package1> [package2] ..." }
 
     fn execute<'a>(
         &'a self,
