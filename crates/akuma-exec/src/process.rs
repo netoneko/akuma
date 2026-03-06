@@ -2550,6 +2550,10 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // eventually runs, but if it's blocked in a syscall it may not run soon.
     // For safety, we rely on the thread to deactivate its own TTBR0.
     
+    // Clear lazy region metadata before dropping the process.
+    // Without this, the LAZY_REGION_TABLE BTreeMap entry leaks.
+    clear_lazy_regions(pid);
+
     // Unregister from process table and DROP the Box<Process>
     // This calls Process::drop() -> UserAddressSpace::drop() which frees:
     // - All user pages (code, data, stack, heap, mmap)

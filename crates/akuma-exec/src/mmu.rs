@@ -497,6 +497,37 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Unmap a page and return its physical frame, also removing it from user_frames.
+    /// Returns `Some(PhysFrame)` if the page was mapped, `None` if it wasn't.
+    /// The caller is responsible for freeing the returned frame via PMM.
+    pub fn unmap_and_free_page(&mut self, va: usize) -> Option<PhysFrame> {
+        let _irq_guard = IrqGuard::new();
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        let pa = unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 { return None; }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 { return None; }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 { return None; }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            if l3_entry & flags::VALID == 0 { return None; }
+            l3_ptr.add(l3_idx).write_volatile(0);
+            (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
+        };
+        flush_tlb_page(va);
+        let frame = PhysFrame::new(pa);
+        self.remove_user_frame(frame);
+        Some(frame)
+    }
+
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {

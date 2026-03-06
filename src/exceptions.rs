@@ -1111,6 +1111,36 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
+                        // Count how many pages actually need allocation (skip mapped)
+                        let mut needed = 0usize;
+                        {
+                            let mut va = page_va;
+                            while va < ra_end {
+                                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
+                                    needed += 1;
+                                }
+                                va += 0x1000;
+                            }
+                        }
+
+                        // Batch-allocate all needed frames in one lock acquisition
+                        let frame_pool = if needed > 0 {
+                            crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
+                                // Fallback: allocate what we can one at a time
+                                let mut v = alloc::vec::Vec::new();
+                                for _ in 0..needed {
+                                    match crate::pmm::alloc_page_zeroed() {
+                                        Some(f) => v.push(f),
+                                        None => break,
+                                    }
+                                }
+                                v
+                            })
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
+                        let mut pool_idx = 0usize;
+
                         let mut any_mapped = false;
                         let mut pages_mapped = 0u64;
                         let mut cur_va = page_va;
@@ -1119,7 +1149,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 cur_va += 0x1000;
                                 continue;
                             }
-                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                            if pool_idx >= frame_pool.len() {
+                                break;
+                            }
+                            let pf = frame_pool[pool_idx];
+                            pool_idx += 1;
+
+                            {
                                 let pg_data_start = core::cmp::max(cur_va, segment_va);
                                 let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
                                 if pg_data_start < pg_data_end {
@@ -1136,6 +1172,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                         let _ = crate::vfs::read_at(path, file_off, page_buf);
                                     }
                                 }
+                            }
 
                                 if is_exec {
                                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
@@ -1167,10 +1204,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                         }
                                     }
                                 }
-                            } else {
-                                break;
-                            }
                             cur_va += 0x1000;
+                        }
+
+                        // Return unused frames from the batch back to PMM
+                        while pool_idx < frame_pool.len() {
+                            crate::pmm::free_page(frame_pool[pool_idx]);
+                            pool_idx += 1;
                         }
 
                         if is_exec {

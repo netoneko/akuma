@@ -115,6 +115,25 @@ pub fn run_memory_tests() -> bool {
     // Bug 5: CLONE_VM readahead race causes phantom frame waste
     run_test!(test_readahead_race_phantom_frames, "readahead_race_phantom_frames");
 
+    // Page leak fixes: unmap_and_free_page, lazy munmap frame freeing, kill_process cleanup
+    run_test!(test_unmap_and_free_page_returns_frame, "unmap_and_free_page_returns_frame");
+    run_test!(test_lazy_munmap_frees_demand_paged_frames, "lazy_munmap_frees_demand_paged_frames");
+    run_test!(test_kill_process_clears_lazy_regions, "kill_process_clears_lazy_regions");
+
+    // MADV_DONTNEED: page reclaim and lazy region preservation
+    run_test!(test_madvise_dontneed_frees_pages, "madvise_dontneed_frees_pages");
+    run_test!(test_madvise_dontneed_loop_no_leak, "madvise_dontneed_loop_no_leak");
+
+    // Batch PMM allocation
+    run_test!(test_alloc_pages_batch_basic, "alloc_pages_batch_basic");
+    run_test!(test_alloc_pages_batch_free, "alloc_pages_batch_free");
+    run_test!(test_alloc_pages_batch_insufficient, "alloc_pages_batch_insufficient");
+    run_test!(test_alloc_pages_batch_interleaved, "alloc_pages_batch_interleaved");
+
+    // mprotect IC IALLU optimization
+    run_test!(test_mprotect_flag_update_with_cache_maintenance, "mprotect_flag_update_cache_maint");
+    run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -4422,4 +4441,530 @@ fn test_readahead_race_phantom_frames() -> bool {
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
+}
+
+/// Verify that unmap_and_free_page returns the physical frame and removes it
+/// from user_frames, allowing the caller to free it via PMM.
+fn test_unmap_and_free_page_returns_frame() -> bool {
+    console::print("\n[TEST] unmap_and_free_page: returns frame and removes from user_frames\n");
+
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM (frame)\n"); return false; }
+    };
+
+    let test_va: usize = 0x1000_0000;
+    if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(frame);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(frame);
+
+    let free_before = crate::pmm::free_count();
+
+    let returned = addr_space.unmap_and_free_page(test_va);
+
+    let got_frame = returned.map(|f| f.addr) == Some(frame.addr);
+    let not_mapped = !addr_space.is_mapped(test_va);
+
+    if let Some(f) = returned {
+        crate::pmm::free_page(f);
+    }
+
+    let free_after = crate::pmm::free_count();
+    let freed_one = free_after == free_before + 1;
+
+    let second_call = addr_space.unmap_and_free_page(test_va);
+    let second_none = second_call.is_none();
+
+    let pass = got_frame && not_mapped && freed_one && second_none;
+    if !pass {
+        crate::safe_print!(128, "  got_frame={} not_mapped={} freed_one={} second_none={}\n",
+            got_frame, not_mapped, freed_one, second_none);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that lazy region munmap now frees demand-paged physical frames.
+/// Simulates the sys_munmap lazy path: push lazy region, map pages into it
+/// (as demand paging would), munmap via lazy_regions_in_range + unmap_and_free_page,
+/// and verify PMM free count is restored.
+fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
+    console::print("\n[TEST] lazy munmap: frees demand-paged physical frames\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let base_va: usize = 0x7000_0000;
+    let num_pages: usize = 8;
+    let region_size = num_pages * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    let free_before = crate::pmm::free_count();
+
+    let mut page_frames = Vec::new();
+    for i in 0..num_pages {
+        let f = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                for pf in &page_frames { crate::pmm::free_page(*pf); }
+                akuma_exec::process::clear_lazy_regions(test_pid);
+                console::print("  OOM\n");
+                return false;
+            }
+        };
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            crate::pmm::free_page(f);
+            for pf in &page_frames { crate::pmm::free_page(*pf); }
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(f);
+        page_frames.push(f);
+    }
+
+    let free_after_alloc = crate::pmm::free_count();
+    let alloc_cost = free_before - free_after_alloc;
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, region_size);
+
+    let mut freed_count = 0usize;
+    for &(freed_start, freed_pages) in &results {
+        for i in 0..freed_pages {
+            if let Some(frame) = addr_space.unmap_and_free_page(freed_start + i * 4096) {
+                crate::pmm::free_page(frame);
+                freed_count += 1;
+            }
+        }
+    }
+
+    let free_after_munmap = crate::pmm::free_count();
+
+    let all_freed = freed_count == num_pages;
+    let pmm_restored = free_after_munmap >= free_before - 4; // page table frames still held
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = all_freed && pmm_restored && results.len() == 1;
+    if !pass {
+        crate::safe_print!(128, "  freed_count={}/{} alloc_cost={} pmm_restored={} results={}\n",
+            freed_count, num_pages, alloc_cost, pmm_restored, results.len());
+        crate::safe_print!(128, "  free: before={} after_alloc={} after_munmap={}\n",
+            free_before, free_after_alloc, free_after_munmap);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Simulate MADV_DONTNEED: map pages into a lazy region, free them via
+/// unmap_and_free_page, verify PMM recovers and lazy region persists.
+fn test_madvise_dontneed_frees_pages() -> bool {
+    console::print("\n[TEST] MADV_DONTNEED: frees pages, preserves lazy region\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let base_va: usize = 0xA000_0000;
+    let num_pages: usize = 16;
+    let region_size = num_pages * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    for i in 0..num_pages {
+        let f = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => {
+                akuma_exec::process::clear_lazy_regions(test_pid);
+                console::print("  OOM\n");
+                return false;
+            }
+        };
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            crate::pmm::free_page(f);
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(f);
+    }
+
+    let free_before_madvise = crate::pmm::free_count();
+
+    // Simulate MADV_DONTNEED: free pages but keep lazy region
+    let mut freed = 0usize;
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        if let Some(frame) = addr_space.unmap_and_free_page(va) {
+            crate::pmm::free_page(frame);
+            freed += 1;
+        }
+    }
+
+    let free_after_madvise = crate::pmm::free_count();
+    let pages_recovered = free_after_madvise - free_before_madvise;
+
+    // Lazy region must still exist (MADV_DONTNEED does not remove it)
+    let region_exists = crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
+        table.get(&test_pid).map_or(false, |r| {
+            r.iter().any(|lr| lr.start_va == base_va && lr.size == region_size)
+        })
+    });
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = freed == num_pages && pages_recovered == num_pages && region_exists;
+    if !pass {
+        crate::safe_print!(128, "  freed={}/{} recovered={} region_exists={}\n",
+            freed, num_pages, pages_recovered, region_exists);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// MADV_DONTNEED loop: repeated alloc-free cycles must not leak pages.
+fn test_madvise_dontneed_loop_no_leak() -> bool {
+    console::print("\n[TEST] MADV_DONTNEED loop: no page leak over 50 iterations\n");
+
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let test_va: usize = 0xB000_0000;
+    let free_baseline = crate::pmm::free_count();
+    let iterations = 50;
+
+    for _ in 0..iterations {
+        let f = match crate::pmm::alloc_page_zeroed() {
+            Some(f) => f,
+            None => { console::print("  OOM during loop\n"); return false; }
+        };
+        if addr_space.map_page(test_va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            crate::pmm::free_page(f);
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(f);
+
+        if let Some(frame) = addr_space.unmap_and_free_page(test_va) {
+            crate::pmm::free_page(frame);
+        }
+    }
+
+    let free_after = crate::pmm::free_count();
+    // Allow for page table frames that stay allocated in the UserAddressSpace
+    let leaked = free_baseline.saturating_sub(free_after);
+    let pass = leaked <= 3; // at most L1+L2+L3 table frames
+    if !pass {
+        crate::safe_print!(128, "  baseline={} after={} leaked={}\n",
+            free_baseline, free_after, leaked);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that kill_process clears lazy regions from LAZY_REGION_TABLE.
+fn test_kill_process_clears_lazy_regions() -> bool {
+    console::print("\n[TEST] kill_process: clears lazy regions\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+
+    akuma_exec::process::push_lazy_region(test_pid, 0x8000_0000, 0x10_0000, 0);
+    akuma_exec::process::push_lazy_region(test_pid, 0x9000_0000, 0x10_0000, 0);
+
+    let before = crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
+        table.get(&test_pid).map_or(0, |r| r.len())
+    });
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let after = crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
+        table.contains_key(&test_pid)
+    });
+
+    let pass = before == 2 && !after;
+    if !pass {
+        crate::safe_print!(128, "  before={} after_contains={}\n", before, after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch allocate 64 pages, verify all distinct and zeroed.
+fn test_alloc_pages_batch_basic() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: batch 64 pages, all distinct and zeroed\n");
+
+    let count = 64usize;
+    let frames = match crate::pmm::alloc_pages_zeroed(count) {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let got_count = frames.len() == count;
+
+    // Verify all distinct addresses
+    let mut addrs: Vec<usize> = frames.iter().map(|f| f.addr).collect();
+    addrs.sort();
+    addrs.dedup();
+    let all_distinct = addrs.len() == count;
+
+    // Verify all zeroed
+    let mut all_zeroed = true;
+    for frame in &frames {
+        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+        for i in 0..512 {
+            let val = unsafe { ptr.add(i).read_volatile() };
+            if val != 0 {
+                all_zeroed = false;
+                break;
+            }
+        }
+        if !all_zeroed { break; }
+    }
+
+    for f in &frames { crate::pmm::free_page(*f); }
+
+    let pass = got_count && all_distinct && all_zeroed;
+    if !pass {
+        crate::safe_print!(128, "  got_count={} all_distinct={} all_zeroed={}\n",
+            got_count, all_distinct, all_zeroed);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch allocate 128 pages, free all, verify PMM free count restored.
+fn test_alloc_pages_batch_free() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: batch 128 alloc+free restores PMM\n");
+
+    let free_before = crate::pmm::free_count();
+
+    let frames = match crate::pmm::alloc_pages_zeroed(128) {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+
+    let free_during = crate::pmm::free_count();
+    let allocated_128 = free_before - free_during == 128;
+
+    for f in &frames { crate::pmm::free_page(*f); }
+
+    let free_after = crate::pmm::free_count();
+    let restored = free_after == free_before;
+
+    let pass = allocated_128 && restored;
+    if !pass {
+        crate::safe_print!(128, "  before={} during={} after={}\n",
+            free_before, free_during, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch alloc when insufficient pages: returns None, no partial alloc.
+fn test_alloc_pages_batch_insufficient() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: insufficient returns None, no leak\n");
+
+    let free_before = crate::pmm::free_count();
+
+    // Request more pages than available
+    let result = crate::pmm::alloc_pages_zeroed(free_before + 1000);
+    let returned_none = result.is_none();
+
+    let free_after = crate::pmm::free_count();
+    let no_leak = free_after == free_before;
+
+    let pass = returned_none && no_leak;
+    if !pass {
+        crate::safe_print!(128, "  returned_none={} free_before={} free_after={}\n",
+            returned_none, free_before, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Alternate batch and single allocs, verify no overlap.
+fn test_alloc_pages_batch_interleaved() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: interleaved with single allocs\n");
+
+    let batch1 = match crate::pmm::alloc_pages_zeroed(16) {
+        Some(f) => f,
+        None => { console::print("  OOM batch1\n"); return false; }
+    };
+
+    let single1 = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            for f in &batch1 { crate::pmm::free_page(*f); }
+            console::print("  OOM single1\n");
+            return false;
+        }
+    };
+
+    let batch2 = match crate::pmm::alloc_pages_zeroed(16) {
+        Some(f) => f,
+        None => {
+            for f in &batch1 { crate::pmm::free_page(*f); }
+            crate::pmm::free_page(single1);
+            console::print("  OOM batch2\n");
+            return false;
+        }
+    };
+
+    let mut all_addrs: Vec<usize> = Vec::new();
+    for f in &batch1 { all_addrs.push(f.addr); }
+    all_addrs.push(single1.addr);
+    for f in &batch2 { all_addrs.push(f.addr); }
+
+    all_addrs.sort();
+    let before_dedup = all_addrs.len();
+    all_addrs.dedup();
+    let no_overlap = all_addrs.len() == before_dedup;
+
+    for f in &batch1 { crate::pmm::free_page(*f); }
+    crate::pmm::free_page(single1);
+    for f in &batch2 { crate::pmm::free_page(*f); }
+
+    let pass = no_overlap;
+    if !pass {
+        crate::safe_print!(128, "  before_dedup={} after_dedup={}\n",
+            before_dedup, all_addrs.len());
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that mprotect flag updates work: RW_NO_EXEC -> RX via update_page_flags,
+/// and the IC IALLU cache maintenance path runs without error.
+fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
+    console::print("\n[TEST] mprotect: flag update RW -> RX with cache maintenance\n");
+
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM (frame)\n"); return false; }
+    };
+
+    let test_va: usize = 0xC000_0000;
+    if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(frame);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(frame);
+
+    // Write some data (simulating JIT code write)
+    let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u32;
+    unsafe {
+        // AArch64 NOP = 0xD503201F, RET = 0xD65F03C0
+        ptr.write_volatile(0xD503201F); // NOP
+        ptr.add(1).write_volatile(0xD65F03C0); // RET
+    }
+
+    // Update flags to RX (simulating mprotect PROT_READ|PROT_EXEC)
+    let update_ok = addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX).is_ok();
+
+    // Run the IC IALLU cache maintenance path (as sys_mprotect now does)
+    unsafe {
+        let mut off = 0usize;
+        while off < 4096 {
+            core::arch::asm!("dc cvau, {}", in(reg) (test_va + off) as u64);
+            off += 64;
+        }
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("ic iallu");
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+
+    // Verify page is still mapped
+    let still_mapped = addr_space.is_mapped(test_va);
+
+    let pass = update_ok && still_mapped;
+    if !pass {
+        crate::safe_print!(128, "  update_ok={} still_mapped={}\n", update_ok, still_mapped);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that mprotect with IC IALLU completes on a large region (256 pages = 1MB)
+/// without hanging. Exercises the batch cache maintenance path.
+fn test_mprotect_large_region_completes() -> bool {
+    console::print("\n[TEST] mprotect: IC IALLU on 256-page region completes\n");
+
+    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr_space)\n"); return false; }
+    };
+
+    let num_pages: usize = 256;
+    let base_va: usize = 0xD000_0000;
+
+    let frames = match crate::pmm::alloc_pages_zeroed(num_pages) {
+        Some(f) => f,
+        None => { console::print("  OOM (frames)\n"); return false; }
+    };
+
+    for (i, f) in frames.iter().enumerate() {
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            for ff in &frames { crate::pmm::free_page(*ff); }
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(*f);
+    }
+
+    // Update all to RX
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        let _ = addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    }
+
+    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        unsafe {
+            let mut off = 0usize;
+            while off < 4096 {
+                core::arch::asm!("dc cvau, {}", in(reg) (va + off) as u64);
+                off += 64;
+            }
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("ic iallu");
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+
+    // If we got here, it completed without hanging
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
 }

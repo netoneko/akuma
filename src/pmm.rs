@@ -290,6 +290,57 @@ impl BitmapAllocator {
         None
     }
 
+    /// Allocate multiple pages in a single bitmap scan.
+    /// Pages are not necessarily contiguous. Returns None if fewer than
+    /// `count` pages are available.
+    fn alloc_pages(&mut self, count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
+        if count == 0 { return Some(alloc::vec::Vec::new()); }
+        if self.free_pages < count { return None; }
+
+        let mut result = alloc::vec::Vec::with_capacity(count);
+        let start_word = self.next_free_hint / 64;
+
+        // First pass: from hint to end
+        for word_idx in start_word..self.bitmap.len() {
+            while self.bitmap[word_idx] != 0 {
+                let bit_idx = self.bitmap[word_idx].trailing_zeros() as usize;
+                let page_idx = word_idx * 64 + bit_idx;
+                if page_idx >= self.total_pages { break; }
+                self.mark_used(page_idx);
+                self.free_pages -= 1;
+                result.push(PhysFrame::new(self.base_addr + page_idx * PAGE_SIZE));
+                if result.len() == count {
+                    self.next_free_hint = page_idx + 1;
+                    return Some(result);
+                }
+            }
+        }
+
+        // Second pass: wrap around from beginning
+        for word_idx in 0..start_word {
+            while self.bitmap[word_idx] != 0 {
+                let bit_idx = self.bitmap[word_idx].trailing_zeros() as usize;
+                let page_idx = word_idx * 64 + bit_idx;
+                if page_idx >= self.total_pages { break; }
+                self.mark_used(page_idx);
+                self.free_pages -= 1;
+                result.push(PhysFrame::new(self.base_addr + page_idx * PAGE_SIZE));
+                if result.len() == count {
+                    self.next_free_hint = page_idx + 1;
+                    return Some(result);
+                }
+            }
+        }
+
+        // Not enough pages — roll back
+        for frame in &result {
+            let page_idx = (frame.addr - self.base_addr) / PAGE_SIZE;
+            self.mark_free(page_idx);
+            self.free_pages += 1;
+        }
+        None
+    }
+
     /// Free a single page
     fn free_page(&mut self, frame: PhysFrame) {
         if frame.addr < self.base_addr {
@@ -407,5 +458,36 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
         core::arch::asm!("dsb ish"); // Data synchronization barrier
     }
     Some(frame)
+}
+
+/// Allocate multiple zeroed pages in a single lock acquisition.
+/// All pages are zeroed and cache-cleaned with a single DSB at the end.
+/// Returns None (without partial allocation) if `count` pages aren't available.
+pub fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
+    use akuma_exec::mmu::phys_to_virt;
+
+    let frames = crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        let result = pmm.alloc_pages(count)?;
+        ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
+        Some(result)
+    })?;
+
+    unsafe {
+        const CACHE_LINE_SIZE: usize = 64;
+        for frame in &frames {
+            let virt_addr = phys_to_virt(frame.addr);
+            core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
+
+            let mut addr = virt_addr as usize;
+            let end = addr + PAGE_SIZE;
+            while addr < end {
+                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr);
+                addr += CACHE_LINE_SIZE;
+            }
+        }
+        core::arch::asm!("dsb ish");
+    }
+    Some(frames)
 }
 

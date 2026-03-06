@@ -3804,12 +3804,30 @@ fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> 
     } else { ENOMEM }
 }
 
-fn sys_madvise(_addr: usize, _len: usize, _advice: i32) -> u64 {
-    // No-op: MADV_DONTNEED/MADV_FREE/etc. are hints only.
-    // We cannot safely zero pages here because lazy-mapped regions
-    // may not have physical pages yet (causes EL1 data abort).
-    // Demand paging provides fresh zero pages on first access anyway.
-    0
+fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_FREE: i32 = 8;
+
+    match advice {
+        MADV_DONTNEED | MADV_FREE => {
+            let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let proc = match akuma_exec::process::lookup_process(owner_pid) {
+                Some(p) => p,
+                None => return 0,
+            };
+            let aligned_addr = addr & !0xFFF;
+            let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
+            let pages = aligned_len / 4096;
+            for i in 0..pages {
+                let va = aligned_addr + i * 4096;
+                if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                    crate::pmm::free_page(frame);
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
 }
 
 fn sys_sysinfo(info_ptr: usize) -> u64 {
@@ -4415,23 +4433,23 @@ fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
             }
         }
         if adding_exec {
-            // Flush data cache and invalidate instruction cache for JIT code.
-            // AArch64 has non-coherent I/D caches; without this, the CPU may
-            // execute stale instructions from before the code was written.
+            // Flush data cache to Point of Unification, then invalidate the
+            // entire instruction cache. Using IC IALLU instead of per-line
+            // IC IVAU is much cheaper for large JIT regions on single-core
+            // QEMU (also triggers tb_flush() for translated blocks).
             for i in 0..pages {
                 let va = addr + i * 4096;
                 unsafe {
-                    // Clean each cache line in the page (64-byte lines typical)
                     let mut off = 0usize;
                     while off < 4096 {
-                        let line = (va + off) as u64;
-                        core::arch::asm!("dc cvau, {}", in(reg) line);
-                        core::arch::asm!("ic ivau, {}", in(reg) line);
+                        core::arch::asm!("dc cvau, {}", in(reg) (va + off) as u64);
                         off += 64;
                     }
                 }
             }
             unsafe {
+                core::arch::asm!("dsb ish");
+                core::arch::asm!("ic iallu");
                 core::arch::asm!("dsb ish");
                 core::arch::asm!("isb");
             }
@@ -4496,7 +4514,9 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
             for i in 0..freed_pages {
-                let _ = proc.address_space.unmap_page(freed_start + i * 4096);
+                if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
+                    crate::pmm::free_page(frame);
+                }
             }
             proc.memory.free_regions.push((freed_start, freed_pages * 4096));
         }
@@ -4513,7 +4533,9 @@ fn sys_munmap(addr: usize, len: usize) -> u64 {
             va >= *start && va < *start + frames.len() * 4096
         });
         if !in_eager {
-            let _ = proc.address_space.unmap_page(va);
+            if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                crate::pmm::free_page(frame);
+            }
         }
     }
     0
