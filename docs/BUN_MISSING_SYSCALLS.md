@@ -257,94 +257,139 @@ for child process status collection.
 
 ## `bun run` Crash Analysis (March 2026)
 
-### Observed behavior
+### Root Cause: Missing Signal Delivery
 
-`bun --version` completes successfully (exit 0). `bun run <script>` crashes
-with SIGSEGV (-11) during JS engine initialization. The crash occurs after
-bun's event loop setup (epoll, timerfd, eventfd created) and after it spawns
-worker threads via clone.
-
-### Startup syscall sequence (from instrumented run)
+The crash is **100% reproducible** with identical fault address, instruction
+pointer, and register state on every run:
 
 ```
-rt_sigaction × 10   (SIGPIPE, SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGXFSZ, SIGTERM, SIGINT, SIGUSR1)
-close_range(4, UINT32_MAX, CLOSE_RANGE_CLOEXEC)
-clone pid 17→18     (child exits 0 — likely a pre-fork helper)
-clone pid 17→19     (child exits 0)
-epoll_create1()     → fd 13
-timerfd_create × 3  → fd 14, 16, 17
-timerfd_settime(id=3, 1s initial, 1s interval)
-epoll_ctl(ADD fd 15 eventfd, ADD fd 17 timerfd)
-munmap 0xbd0ae000 + 1.07GB   (mimalloc arena trim)
-munmap 0x200000000 + 3.0GB   (mimalloc arena trim)
-clone pid 17→20     (worker thread)
-CRASH: FAR=0x2346b2ad68  ELR=0x4416d74  ISS=0x45
+FAR=0x2346b2ad68  ELR=0x4416d74  ISS=0x45
+x19=0x203ffbad58  x20=0x203ffbad68  SP_EL0=0x203ffbabc0
 ```
 
-### Crash details
+The root cause is **not** a munmap bug, pointer corruption, or memory leak.
+It is the kernel's **failure to deliver SIGSEGV to the process's registered
+signal handler**.
 
-The faulting address `0x2346b2ad68` falls inside a region that was
-munmapped during mimalloc's arena trimming (`munmap 0x200000000+3GB`).
-The address is between the munmapped region and the remaining lazy region
-at `0x2bd0ae000`. This suggests either:
+**How it works:** JSC (bun's JS engine) registers a SIGSEGV handler via
+`rt_sigaction` during startup (11 signal handler registrations total). JSC's
+JIT uses SIGSEGV handlers for speculation failure recovery — a standard JIT
+technique where speculative code intentionally triggers faults on bad paths,
+and the signal handler redirects execution to a fallback. On Linux, the kernel
+delivers the signal by setting up a signal frame on the user stack and
+jumping to the handler.
 
-1. The partial munmap implementation has a bug for these giant regions,
-   leaving stale page table entries or failing to properly split lazy regions
-2. A pointer calculated before the munmap points into the now-unmapped
-   trimmed portion
+**What Akuma does:** The kernel stores the signal actions (via
+`sys_rt_sigaction`) but never invokes them. When a data abort from EL0
+cannot be resolved by demand paging, `exceptions.rs` unconditionally calls
+`return_to_kernel(-11)` to kill the process. The comment in `sys_kill`
+confirms: *"True userspace signal delivery not yet implemented."*
 
-Previous runs showed a different crash at `FAR=0x5` (near-null
-dereference). The instability suggests the root cause may be
-nondeterministic — timing-dependent or address-layout-dependent.
+**Evidence:** The faulting address `0x2346b2ad68` has the same lower 12 bits
+(`0xd68`) as x20 (`0x203ffbad68`) but completely different upper bits. This
+is characteristic of a JIT speculation failure — the JIT compiled code
+using a speculative type assumption, and when that assumption was wrong,
+the resulting pointer is garbage. On Linux, JSC's SIGSEGV handler catches
+this and restarts the operation with the correct (slower) path.
 
-### Options for moving forward
+### Performance Bottleneck: 67M mremap Calls
 
-**Option A — Investigate munmap for giant regions (most likely culprit).**
-The crash address falls squarely in a munmapped region. The partial munmap
-implementation (`munmap_lazy_region` in `process.rs`) handles prefix,
-suffix, and middle-split cases but may have an edge case with multi-GB
-regions or regions that span multiple lazy entries. If the lazy region
-table isn't properly updated, a subsequent page fault in the trimmed
-area won't find a backing region and will SIGSEGV.
+Per-process syscall stats revealed that **99.95% of all syscalls are mremap**:
 
-**Option B — Implement `close_range` with `CLOSE_RANGE_CLOEXEC`.**
-Bun calls `close_range(4, UINT32_MAX, 4)` where flag 4 =
-`CLOSE_RANGE_CLOEXEC`. The stub returns success without marking any fds.
-After clone, child processes may inherit fds they shouldn't. Low risk for
-this specific crash but could cause subtle issues.
+```
+[PSTATS] PID 26 (/bin/bun) 177.01s: 67633543 syscalls (382085/s)
+  mremap=67633152  clock_gettime=202  openat=22  mmap=22
+  madvise=19  rt_sigprocmask=16  futex=15  rt_sigaction=11
+```
 
-**Option C — Make epoll aware of timerfd expirations.**
-Bun adds a 1-second timerfd to epoll and expects `epoll_pwait` to return
-an event when it fires. Our stub always returns 0 events. If bun's event
-loop logic makes decisions based on timer events (e.g., triggering GC or
-initialization phases), the missing events could leave data structures
-uninitialized.
+Diagnostic logging showed every single mremap call has the same pattern:
 
-**Option D — Add a syscall ring buffer for crash forensics.**
-Log the last N syscalls (number, args, return value) in a fixed-size ring
-buffer. On SIGSEGV, dump the buffer. This gives the exact sequence leading
-to the crash without the cost of logging every syscall to serial.
+```
+old_sz=0x1000 → new_sz=0x2000, flags=0x0 (no MREMAP_MAYMOVE)
+```
 
-### Recommendation
+Addresses descend monotonically page-by-page from the top of the VA space
+(~129 GB), scanning the entire address space 2-3 times. This is likely
+JSC's conservative garbage collector probing memory pages.
 
-Start with **Option A**. The crash address is in a munmapped region,
-which is the strongest signal. Verify that `sys_munmap` correctly handles
-partial unmaps of regions larger than 4GB and that the lazy region table
-is consistent after the trim. If munmap is correct, proceed to **Option D**
-to capture the exact syscall that produces the bad pointer.
+All 67M calls immediately return ENOMEM (the kernel returns ENOMEM
+whenever `flags & MREMAP_MAYMOVE == 0` and `new_size > old_size`, without
+even checking if the page is mapped). On real Linux, unmapped pages would
+return EFAULT, potentially allowing the GC to skip large unmapped ranges.
+
+At ~2µs per syscall trap on TCG, the mremap overhead alone accounts for
+~134 seconds of the 177-second runtime.
+
+### Previous Crash Analysis (Superseded)
+
+Earlier analysis suspected the crash was caused by `munmap` of giant
+regions, pointer corruption from trimmed arenas, or nondeterministic
+timing. These hypotheses are superseded by the signal delivery finding:
+
+- The crash address is deterministic, not nondeterministic
+- The crash happens AFTER all mmap/munmap activity completes
+- The fault is in JIT-compiled code, not allocator code
+- JSC expects the SIGSEGV to be caught by its signal handler
+
+### Child Process Behavior
+
+Bun spawns 3-4 child processes via fork+exec during initialization:
+- Process 27: runs ~10s, exits 0 (pre-fork helper with JIT compilation)
+- Process 28: runs ~0.6s, exits 0 (short-lived helper)
+- Process 29: runs ~10s, exits 0 (worker thread with JIT compilation)
+- Process 30: runs ~0.5s, exits 0 (short-lived helper)
+
+The 10-second child processes are bun's fork+exec pattern for testing
+environment capabilities. Their JIT compilation overhead on TCG emulation
+explains the long runtime.
 
 ---
 
 ## Implementation Status
 
 timerfd is now functional (timer state tracking, expiration counting,
-read support). epoll and signal handling remain stubs.
+read support). epoll remains a stub. Signal handler storage works but
+delivery does not.
 
-**To make bun fully functional, these still need real implementations:**
+**To make bun fully functional (priority order):**
 
-1. **epoll** — Real I/O multiplexing over socket/pipe/timerfd descriptors
-2. **epoll + timerfd integration** — epoll_pwait should return events when timerfds expire
-3. **eventfd** — Already functional (atomic counter with blocking read)
-4. **clone/futex** — Thread creation and synchronization (partially implemented)
-5. **signal handling** — `rt_sigaction`, `rt_sigprocmask` with proper delivery
-6. **close_range** — Proper implementation with `CLOSE_RANGE_CLOEXEC` flag support
+1. **Signal delivery** (CRITICAL) — The kernel stores signal actions via
+   `rt_sigaction` but never delivers signals to userspace handlers. When an
+   unresolvable fault occurs, it kills the process instead of invoking the
+   registered handler. Must implement: save exception context to a signal
+   frame on the user stack, set ELR to the handler address, return to
+   userspace. Also need `rt_sigreturn` (NR 139) to restore context after
+   the handler returns. **This is the #1 blocker for bun.**
+2. **mremap performance** (HIGH) — Return EFAULT (not ENOMEM) for mremap
+   on unmapped addresses when `flags=0`. Currently all 67M mremap probes
+   return ENOMEM regardless of mapping state, which may prevent JSC's GC
+   from efficiently skipping unmapped VA ranges.
+3. **mremap + lazy regions** (MEDIUM) — `sys_mremap` does not handle lazy
+   (demand-paged) regions. When MREMAP_MAYMOVE is set and old_addr is a
+   lazy region, the old lazy entry leaks. See plan: `fix_memory_syscall_stubs`.
+4. **epoll** — Real I/O multiplexing over socket/pipe/timerfd descriptors
+5. **epoll + timerfd integration** — epoll_pwait should return events when timerfds expire
+6. **set_robust_list** (LOW) — Stores nothing; if a CLONE_VM thread dies
+   holding a futex-based mutex, waiters deadlock.
+7. **membarrier** (LOW) — Returns bare 0; acceptable on single-core but
+   should properly parse CMD_QUERY vs CMD_PRIVATE_EXPEDITED.
+8. **close_range** — Proper implementation with `CLOSE_RANGE_CLOEXEC` flag support
+
+## Known Bugs Found During Investigation
+
+### syscall_name mapping errors (fixed)
+
+The per-process syscall stats name table had incorrect mappings:
+- `233 => "mremap"` was wrong — 233 is `madvise` (`nr::MADVISE = 233`)
+- `216 => "mremap"` was missing — 216 is `mremap` (`nr::MREMAP = 216`)
+- `228 => "madvise"` was wrong — 228 is not used by the kernel
+
+This caused PSTATS to misattribute 67M mremap calls as "unknown" and
+19 madvise calls as "mremap". Fixed in `crates/akuma-exec/src/process.rs`.
+
+### log::Log backend not registered
+
+The kernel never registers a `log::Log` backend at boot. All `log::info!`,
+`log::debug!`, etc. calls from extracted crates (`akuma-exec`) are silently
+dropped. Code that needs guaranteed output must use `(runtime().print_str)()`
+instead. See `docs/KERNEL_SPLIT_BUGS.md` for details.

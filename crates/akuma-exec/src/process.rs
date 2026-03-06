@@ -1659,51 +1659,31 @@ pub struct Process {
 }
 
 /// Per-process syscall counters, emitted on exit for performance profiling.
-/// All fields are AtomicU64 for lock-free concurrent updates from CLONE_VM threads.
+/// Indexed directly by syscall number for zero-overhead tracking.
 pub struct ProcessSyscallStats {
-    pub total: AtomicU64,
+    counts: [AtomicU64; Self::MAX_NR],
     pub pagefaults: AtomicU64,
     pub pagefault_pages: AtomicU64,
-    pub mmap: AtomicU64,
-    pub munmap: AtomicU64,
-    pub brk: AtomicU64,
-    pub read: AtomicU64,
-    pub write: AtomicU64,
-    pub openat: AtomicU64,
-    pub close: AtomicU64,
-    pub fstat: AtomicU64,
-    pub mprotect: AtomicU64,
-    pub futex: AtomicU64,
-    pub clock: AtomicU64,
-    pub ioctl: AtomicU64,
-    pub clone: AtomicU64,
-    pub other: AtomicU64,
 }
 
 impl ProcessSyscallStats {
+    const MAX_NR: usize = 512;
+
     pub const fn new() -> Self {
         Self {
-            total: AtomicU64::new(0),
+            counts: [const { AtomicU64::new(0) }; Self::MAX_NR],
             pagefaults: AtomicU64::new(0),
             pagefault_pages: AtomicU64::new(0),
-            mmap: AtomicU64::new(0),
-            munmap: AtomicU64::new(0),
-            brk: AtomicU64::new(0),
-            read: AtomicU64::new(0),
-            write: AtomicU64::new(0),
-            openat: AtomicU64::new(0),
-            close: AtomicU64::new(0),
-            fstat: AtomicU64::new(0),
-            mprotect: AtomicU64::new(0),
-            futex: AtomicU64::new(0),
-            clock: AtomicU64::new(0),
-            ioctl: AtomicU64::new(0),
-            clone: AtomicU64::new(0),
-            other: AtomicU64::new(0),
         }
     }
 
-    pub fn inc_total(&self) { self.total.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc(&self, nr: u64) {
+        let idx = nr as usize;
+        if idx < Self::MAX_NR {
+            self.counts[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn inc_pagefault(&self, pages: u64) {
         self.pagefaults.fetch_add(1, Ordering::Relaxed);
         self.pagefault_pages.fetch_add(pages, Ordering::Relaxed);
@@ -1711,34 +1691,91 @@ impl ProcessSyscallStats {
 
     pub fn dump(&self, pid: Pid, name: &str, elapsed_us: u64) {
         use alloc::format;
-        let total = self.total.load(Ordering::Relaxed);
+        use alloc::vec::Vec;
+
+        let mut total: u64 = 0;
+        let mut entries: Vec<(usize, u64)> = Vec::new();
+        for i in 0..Self::MAX_NR {
+            let c = self.counts[i].load(Ordering::Relaxed);
+            if c > 0 {
+                total += c;
+                entries.push((i, c));
+            }
+        }
         if total == 0 { return; }
+
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000;
         let rate = if elapsed_us > 0 { total * 1_000_000 / elapsed_us } else { 0 };
         let (pmm_total, _pmm_alloc, pmm_free) = (runtime().pmm_stats)();
+        let pf = self.pagefaults.load(Ordering::Relaxed);
+        let pf_pg = self.pagefault_pages.load(Ordering::Relaxed);
+
+        let mut top = alloc::string::String::new();
+        for (i, (nr, count)) in entries.iter().enumerate() {
+            if i > 0 { top.push(' '); }
+            let name = syscall_name(*nr);
+            if name.is_empty() {
+                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("nr{}={}", nr, count));
+            } else {
+                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("{}={}", name, count));
+            }
+            if i >= 9 { break; }
+        }
+
         let msg = format!(
-            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) pmm={}free/{}tot | pgfault={}({}pg) mmap={} brk={} read={} write={} open={} close={} futex={} fstat={} mprot={} clk={} ioctl={} clone={} munmap={} other={}\n",
+            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) pmm={}free/{}tot pgfault={}({}pg) | {}\n",
             pid, name, secs, frac, total, rate,
-            pmm_free, pmm_total,
-            self.pagefaults.load(Ordering::Relaxed),
-            self.pagefault_pages.load(Ordering::Relaxed),
-            self.mmap.load(Ordering::Relaxed),
-            self.brk.load(Ordering::Relaxed),
-            self.read.load(Ordering::Relaxed),
-            self.write.load(Ordering::Relaxed),
-            self.openat.load(Ordering::Relaxed),
-            self.close.load(Ordering::Relaxed),
-            self.futex.load(Ordering::Relaxed),
-            self.fstat.load(Ordering::Relaxed),
-            self.mprotect.load(Ordering::Relaxed),
-            self.clock.load(Ordering::Relaxed),
-            self.ioctl.load(Ordering::Relaxed),
-            self.clone.load(Ordering::Relaxed),
-            self.munmap.load(Ordering::Relaxed),
-            self.other.load(Ordering::Relaxed),
+            pmm_free, pmm_total, pf, pf_pg, top,
         );
         (runtime().print_str)(&msg);
+    }
+}
+
+fn syscall_name(nr: usize) -> &'static str {
+    match nr {
+        0 => "io_setup", 29 => "ioctl", 46 => "ftruncate",
+        48 => "faccessat", 56 => "openat", 57 => "close",
+        59 => "pipe2", 61 => "getdents64", 62 => "lseek",
+        63 => "read", 64 => "write", 65 => "readv",
+        66 => "writev", 67 => "pread64", 68 => "pwrite64",
+        72 => "pselect6", 73 => "ppoll",
+        78 => "readlinkat", 79 => "fstatat", 80 => "fstat",
+        93 => "exit", 94 => "exit_group",
+        96 => "set_tid_address", 98 => "futex",
+        99 => "set_robust_list",
+        113 => "clock_gettime", 115 => "clock_nanosleep",
+        124 => "sched_yield",
+        130 => "tkill", 131 => "tgkill",
+        134 => "rt_sigaction", 135 => "rt_sigprocmask",
+        160 => "uname", 167 => "prctl",
+        172 => "getpid", 174 => "getuid", 175 => "geteuid",
+        176 => "getgid", 177 => "getegid", 178 => "gettid",
+        198 => "socket", 200 => "bind", 201 => "listen",
+        202 => "accept", 203 => "connect",
+        204 => "getsockname", 205 => "getpeername",
+        206 => "sendto", 207 => "recvfrom",
+        208 => "setsockopt", 209 => "getsockopt",
+        210 => "shutdown",
+        214 => "brk",
+        215 => "munmap", 216 => "mremap", 222 => "mmap",
+        226 => "mprotect", 233 => "madvise",
+        220 => "clone", 221 => "execve",
+        260 => "wait4",
+        261 => "prlimit64",
+        278 => "getrandom",
+        281 => "memfd_create",
+        282 => "membarrier",
+        20 => "epoll_create1", 21 => "epoll_ctl", 22 => "epoll_pwait",
+        25 => "fcntl",
+        26 => "inotify_init1", 27 => "inotify_add_watch",
+        35 => "unlinkat",
+        85 => "timerfd_create", 86 => "timerfd_settime",
+        19 => "eventfd2",
+        435 => "clone3", 439 => "faccessat2",
+        _ => "",
     }
 }
 

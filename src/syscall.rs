@@ -1022,24 +1022,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if crate::config::PROCESS_SYSCALL_STATS {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
-            let s = &proc.syscall_stats;
-            s.inc_total();
-            match syscall_num {
-                nr::MMAP => { s.mmap.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::MUNMAP => { s.munmap.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::BRK => { s.brk.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::READ | nr::READV | nr::PREAD64 => { s.read.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::WRITE | nr::WRITEV | nr::PWRITE64 => { s.write.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::OPENAT => { s.openat.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::CLOSE => { s.close.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::MPROTECT => { s.mprotect.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::FUTEX => { s.futex.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::CLOCK_GETTIME => { s.clock.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::IOCTL => { s.ioctl.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::FSTAT | nr::NEWFSTATAT => { s.fstat.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                nr::CLONE | nr::CLONE3 => { s.clone.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-                _ => { s.other.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-            }
+            proc.syscall_stats.inc(syscall_num);
         }
     }
 
