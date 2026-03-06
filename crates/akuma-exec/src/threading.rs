@@ -1163,9 +1163,9 @@ impl ThreadPool {
 
         // Boot stack info (fixed location from boot.rs)
         // The boot stack was already in use before threading init, starting at
-        // 0x42000000 and growing down. We CANNOT reserve space at the top.
-        let _boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
-        let boot_stack_base = 0x41F00000usize; // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
+        // 0x40800000 and growing down. We CANNOT reserve space at the top.
+        let _boot_stack_top = 0x40800000u64; // STACK_TOP from boot.rs
+        let boot_stack_base = 0x40700000usize; // STACK_TOP - STACK_SIZE = 0x40800000 - 0x100000
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             boot_stack_base,
             config().kernel_stack_size,
@@ -1185,7 +1185,7 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
         
         // CRITICAL: Update TPIDR_EL1 to point to Thread 0's new exception stack!
-        // exceptions::init() set it to 0x42000000 (boot stack top) initially,
+        // exceptions::init() set it to 0x40800000 (boot stack top) initially,
         // but we've now allocated a proper exception stack from the heap.
         // Without this, the first IRQ would use the wrong exception stack pointer.
         set_current_exception_stack(self.slots[IDLE_THREAD_IDX].exception_stack_top);

@@ -17,7 +17,7 @@
 /// Boot/kernel stack size (1MB default)
 ///
 /// Used by thread 0 (boot thread) and exception handlers.
-/// This stack is placed at a fixed address (0x42000000) in boot.rs.
+/// This stack is placed at a fixed address (0x40800000) in boot.rs.
 pub const KERNEL_STACK_SIZE: usize = 1024 * 1024;
 
 /// Default per-thread stack size (32KB)
@@ -34,16 +34,12 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (256KB default)
+/// User process stack size (512KB)
 ///
 /// Stack allocated for user-space ELF processes.
-/// Increased from 64KB due to stack overflow in scratch (git clone)
-/// when using miniz_oxide zlib decompression with deep call stacks.
-/// Increased to 512KB for DOOM which has deep rendering call stacks.
+/// 512KB handles most workloads including git clone (zlib) and rendering.
 /// A guard page is placed below the stack to detect overflow.
-/// Stack size for user processes. 2MB handles heavy workloads like bun/JSC.
-/// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
+pub const USER_STACK_SIZE: usize = 512 * 1024;
 
 /// Maximum kernel threads
 ///
@@ -64,20 +60,18 @@ pub const RESERVED_THREADS: usize = 8;
 /// Maximum number of user processes
 pub const MAX_PROCESSES: usize = 64;
 
-/// Stack size for reserved system threads (512KB)
+/// Stack size for reserved system threads (256KB)
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
-/// Larger stacks to handle deep SSH/HTTP async call chains.
-/// Note: The async main thread (when COOPERATIVE_MAIN_THREAD=false) runs on
-/// a system thread and needs significant stack space for pinned futures.
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
+/// Handles SSH/HTTP async call chains and the async main loop.
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 256 * 1024;
 
-/// Stack size for user process threads (256KB)
+/// Stack size for user process threads (128KB)
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
-/// Increased from 128KB to handle complex syscall chains and nested processing.
-/// User processes have their own user-space stack but kernel syscalls need space.
-pub const USER_THREAD_STACK_SIZE: usize = 256 * 1024;
+/// User processes have their own user-space stack; this is for kernel-side
+/// syscall handling only.
+pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 
 /// Enable stack canary checking
 ///

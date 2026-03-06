@@ -20,7 +20,7 @@ global_asm!(
 // Constants
 .equ KERNEL_PHYS_BASE,  0x40000000
 .equ STACK_SIZE,        0x100000        // 1MB stack
-.equ STACK_TOP,         0x42000000      // 32MB from kernel base (end of Code+Stack region)
+.equ STACK_TOP,         0x40800000      // 8MB from kernel base (end of Code+Stack region)
 
 // Page table constants
 .equ PAGE_SIZE,         4096

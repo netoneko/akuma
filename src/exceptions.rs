@@ -551,9 +551,9 @@ pub fn get_current_exception_stack() -> u64 {
 /// Initialize the exception stack pointer for the boot thread
 /// Must be called before any user mode code runs
 pub fn init_exception_stack() {
-    // Boot thread (thread 0) uses the boot stack at 0x42000000
+    // Boot thread (thread 0) uses the boot stack at 0x40800000
     // Its exception stack is at the very top
-    let boot_stack_top = 0x42000000u64;
+    let boot_stack_top = 0x40800000u64;
     set_current_exception_stack(boot_stack_top);
 }
 
