@@ -29,6 +29,7 @@ MEMBERS=(
     "dash"
     "xbps"
     "apk-tools"
+    "llama-cpp"
 )
 
 for member in "${MEMBERS[@]}"; do
@@ -101,6 +102,7 @@ BINARIES=(
     "tcc"
     "tar"
     "sshd"
+    "llama-cli"
 )
 
 for bin in "${BINARIES[@]}"; do
