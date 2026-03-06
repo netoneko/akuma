@@ -4,7 +4,7 @@
 
 set -e
 
-SIZE_MB=${1:-512}
+SIZE_MB=${1:-1024}
 DISK_IMG="disk.img"
 
 echo "Creating ${SIZE_MB}MB ext2 disk image..."
