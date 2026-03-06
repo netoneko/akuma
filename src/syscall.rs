@@ -3809,7 +3809,11 @@ fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
     const MADV_FREE: i32 = 8;
 
     match advice {
-        MADV_DONTNEED | MADV_FREE => {
+        MADV_DONTNEED => {
+            // Zero mapped pages in place — discards data without unmapping.
+            // Avoids the catastrophic cost of unmap+free → demand-page-on-reuse
+            // that caused a 3x regression (170s→537s) with mimalloc's frequent
+            // arena trimming via MADV_DONTNEED.
             let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
                 Some(p) => p,
@@ -3819,13 +3823,11 @@ fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
             let pages = aligned_len / 4096;
             for i in 0..pages {
-                let va = aligned_addr + i * 4096;
-                if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
-                    crate::pmm::free_page(frame);
-                }
+                proc.address_space.zero_mapped_page(aligned_addr + i * 4096);
             }
             0
         }
+        MADV_FREE => 0, // hint only — kernel may reclaim later, no-op for now
         _ => 0,
     }
 }

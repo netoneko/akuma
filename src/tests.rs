@@ -135,6 +135,7 @@ pub fn run_memory_tests() -> bool {
 
     // Bun crash reproduction: mimalloc arena trim sequence
     run_test!(test_arena_trim_crash_pattern, "arena_trim_crash_pattern");
+    run_test!(test_multi_arena_trim_crash, "multi_arena_trim_crash");
     run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
 
     // Common memory allocation patterns
@@ -4575,7 +4576,7 @@ fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
 /// Simulate MADV_DONTNEED: map pages into a lazy region, free them via
 /// unmap_and_free_page, verify PMM recovers and lazy region persists.
 fn test_madvise_dontneed_frees_pages() -> bool {
-    console::print("\n[TEST] MADV_DONTNEED: frees pages, preserves lazy region\n");
+    console::print("\n[TEST] MADV_DONTNEED: zeroes pages in place, preserves mapping & lazy region\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
     let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
@@ -4606,24 +4607,31 @@ fn test_madvise_dontneed_frees_pages() -> bool {
             return false;
         }
         addr_space.track_user_frame(f);
-    }
 
-    let free_before_madvise = crate::pmm::free_count();
-
-    // Simulate MADV_DONTNEED: free pages but keep lazy region
-    let mut freed = 0usize;
-    for i in 0..num_pages {
-        let va = base_va + i * 4096;
-        if let Some(frame) = addr_space.unmap_and_free_page(va) {
-            crate::pmm::free_page(frame);
-            freed += 1;
+        // Write a non-zero pattern so we can verify zeroing
+        unsafe {
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u8;
+            core::ptr::write_bytes(ptr, 0xAB, 4096);
         }
     }
 
-    let free_after_madvise = crate::pmm::free_count();
-    let pages_recovered = free_after_madvise - free_before_madvise;
+    let free_before = crate::pmm::free_count();
 
-    // Lazy region must still exist (MADV_DONTNEED does not remove it)
+    // Simulate MADV_DONTNEED: zero pages in place (no unmap, no free)
+    let mut zeroed = 0usize;
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        if addr_space.zero_mapped_page(va) {
+            zeroed += 1;
+        }
+    }
+
+    let free_after = crate::pmm::free_count();
+
+    // Pages should NOT be freed — zero in place keeps the mapping
+    let no_pmm_change = free_before == free_after;
+
+    // Lazy region must still exist
     let region_exists = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&test_pid).map_or(false, |r| {
@@ -4633,18 +4641,18 @@ fn test_madvise_dontneed_frees_pages() -> bool {
 
     akuma_exec::process::clear_lazy_regions(test_pid);
 
-    let pass = freed == num_pages && pages_recovered == num_pages && region_exists;
+    let pass = zeroed == num_pages && no_pmm_change && region_exists;
     if !pass {
-        crate::safe_print!(128, "  freed={}/{} recovered={} region_exists={}\n",
-            freed, num_pages, pages_recovered, region_exists);
+        crate::safe_print!(128, "  zeroed={}/{} no_pmm_change={} region_exists={}\n",
+            zeroed, num_pages, no_pmm_change, region_exists);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
 
-/// MADV_DONTNEED loop: repeated alloc-free cycles must not leak pages.
+/// MADV_DONTNEED loop: repeated zero-in-place cycles must not leak pages.
 fn test_madvise_dontneed_loop_no_leak() -> bool {
-    console::print("\n[TEST] MADV_DONTNEED loop: no page leak over 50 iterations\n");
+    console::print("\n[TEST] MADV_DONTNEED loop: zero-in-place 50 iterations, no leak\n");
 
     let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
         Some(a) => a,
@@ -4652,33 +4660,35 @@ fn test_madvise_dontneed_loop_no_leak() -> bool {
     };
 
     let test_va: usize = 0xB000_0000;
+    let f = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    if addr_space.map_page(test_va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(f);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(f);
+
     let free_baseline = crate::pmm::free_count();
     let iterations = 50;
 
     for _ in 0..iterations {
-        let f = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => { console::print("  OOM during loop\n"); return false; }
-        };
-        if addr_space.map_page(test_va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
-            crate::pmm::free_page(f);
-            console::print("  map_page failed\n");
-            return false;
+        // Write dirty data, then zero via MADV_DONTNEED semantics
+        unsafe {
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u8;
+            core::ptr::write_bytes(ptr, 0xCC, 4096);
         }
-        addr_space.track_user_frame(f);
-
-        if let Some(frame) = addr_space.unmap_and_free_page(test_va) {
-            crate::pmm::free_page(frame);
-        }
+        addr_space.zero_mapped_page(test_va);
     }
 
     let free_after = crate::pmm::free_count();
-    // Allow for page table frames that stay allocated in the UserAddressSpace
-    let leaked = free_baseline.saturating_sub(free_after);
-    let pass = leaked <= 3; // at most L1+L2+L3 table frames
+    let no_leak = free_baseline == free_after;
+    let pass = no_leak;
     if !pass {
-        crate::safe_print!(128, "  baseline={} after={} leaked={}\n",
-            free_baseline, free_after, leaked);
+        crate::safe_print!(128, "  baseline={} after={} diff={}\n",
+            free_baseline, free_after, free_baseline.saturating_sub(free_after));
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
@@ -5079,6 +5089,136 @@ fn test_arena_trim_crash_pattern() -> bool {
             reused_base, small_covered,
             gap_near, gap_far, crash_addr_uncovered,
             remainder_in_free,
+        );
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Reproduces the exact bun crash from boot logs:
+///
+///   [mmap] pid=32 len=0x851000 prot=0x0 flags=0x22 = 0xbc85d000 (lazy, 18 regions)
+///   [DP] no lazy region for FAR=0x2346b2ad68 pid=32
+///   [Fault] Data abort from EL0 at FAR=0x2346b2ad68
+///
+/// Simulates 17 pre-existing lazy regions, then the full cycle:
+///   allocate 8 GB arena → munmap → small PROT_NONE re-mmap → verify crash address uncovered.
+fn test_multi_arena_trim_crash() -> bool {
+    console::print("\n[TEST] Bun multi-arena crash (18 regions, FAR=0x2346b2ad68 pattern)\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+
+    let mut mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000,
+        0x10_0000_0000,
+        0x10_0001_0000,
+        0x8000_0000,
+    );
+
+    // Phase 1: create 17 pre-existing lazy regions
+    let region_sizes: [usize; 17] = [
+        0x100000, 0x200000, 0x100000, 0x400000,
+        0x100000, 0x200000, 0x100000, 0x800000,
+        0x100000, 0x200000, 0x100000, 0x400000,
+        0x100000, 0x200000, 0x100000, 0x1000000,
+        0x200000,
+    ];
+    let mut region_bases: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+
+    for &sz in &region_sizes {
+        let base = match mem.alloc_mmap(sz) {
+            Some(a) => a,
+            None => {
+                crate::safe_print!(64, "  alloc_mmap(0x{:x}) failed\n", sz);
+                akuma_exec::process::clear_lazy_regions(test_pid);
+                return false;
+            }
+        };
+        akuma_exec::process::push_lazy_region(test_pid, base, sz, 0);
+        region_bases.push(base);
+    }
+
+    let has_17 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 17;
+
+    // Phase 2: allocate 8 GB arena (becomes region 18)
+    const LARGE_SIZE: usize = 0x2_0000_0000;
+    let arena_base = match mem.alloc_mmap(LARGE_SIZE) {
+        Some(a) => a,
+        None => {
+            crate::safe_print!(64, "  alloc_mmap(8GB) failed\n");
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            return false;
+        }
+    };
+    akuma_exec::process::push_lazy_region(test_pid, arena_base, LARGE_SIZE, 0);
+    let has_18 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 18;
+
+    // The crash address from the log was at ~5.9 GB offset into the arena
+    let crash_offset = 0x1_7800_0000_usize;
+    let crash_analog = arena_base + crash_offset;
+    let covered_before = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, crash_analog,
+    ).is_some();
+
+    // Phase 3: munmap entire 8 GB arena
+    let removed = akuma_exec::process::munmap_lazy_regions_in_range(
+        test_pid, arena_base, LARGE_SIZE,
+    );
+    mem.free_regions.push((arena_base, LARGE_SIZE));
+    let arena_removed = removed.len() == 1;
+    let back_to_17 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 17;
+
+    // Phase 4: small PROT_NONE re-mmap (0x851000, exact value from crash log)
+    const SMALL_SIZE: usize = 0x851000;
+    let small_base = match mem.alloc_mmap(SMALL_SIZE) {
+        Some(a) => a,
+        None => {
+            crate::safe_print!(64, "  alloc_mmap(small) failed\n");
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            return false;
+        }
+    };
+    akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
+    let reused_base = small_base == arena_base;
+    let has_18_again = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 18;
+
+    // Phase 5: verify crash — analog of FAR=0x2346b2ad68 is now uncovered
+    let crash_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, crash_analog,
+    ).is_none();
+    let small_covered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, small_base,
+    ).is_some();
+    let gap_start_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, small_base + SMALL_SIZE + 0x1000,
+    ).is_none();
+    let far_end_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
+        test_pid, arena_base + LARGE_SIZE - 0x1000,
+    ).is_none();
+    let preexisting_intact = region_bases.iter().all(|&base| {
+        akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base).is_some()
+    });
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = has_17 && has_18
+        && covered_before && arena_removed && back_to_17
+        && reused_base && has_18_again
+        && crash_uncovered && small_covered
+        && gap_start_uncovered && far_end_uncovered
+        && preexisting_intact;
+
+    if !pass {
+        crate::safe_print!(512,
+            "  17={} 18={} covered_before={} removed={} back17={}\n\
+             reused={} (arena=0x{:x} small=0x{:x}) 18again={}\n\
+             crash_uncov={} (0x{:x}) small_cov={} gap={} far={}\n\
+             preexist={}\n",
+            has_17, has_18, covered_before, arena_removed, back_to_17,
+            reused_base, arena_base, small_base, has_18_again,
+            crash_uncovered, crash_analog, small_covered,
+            gap_start_uncovered, far_end_uncovered,
+            preexisting_intact,
         );
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });

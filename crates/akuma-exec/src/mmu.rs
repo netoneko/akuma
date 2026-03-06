@@ -528,6 +528,33 @@ impl UserAddressSpace {
         Some(frame)
     }
 
+    /// Zero the physical page backing `va` without unmapping it.
+    /// Returns true if a page was found and zeroed, false if no mapping exists.
+    pub fn zero_mapped_page(&self, va: usize) -> bool {
+        let _irq_guard = IrqGuard::new();
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 { return false; }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 { return false; }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 { return false; }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            if l3_entry & flags::VALID == 0 { return false; }
+            let pa = (l3_entry & 0x0000_FFFF_FFFF_F000) as usize;
+            core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, 4096);
+        }
+        true
+    }
+
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {

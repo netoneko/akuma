@@ -1053,10 +1053,12 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         crate::safe_print!(64, "  frame.x0=0x{:x} (syscall arg)\n", frame_x0);
                     }
                     
-                    // Use stack-only print to avoid heap allocation in exception context
-                    crate::safe_print!(128, "[exception] Process {} ({}) exited, calling return_to_kernel({})\n",
-                        proc.pid, proc.name, exit_code);
-                    // Don't ERET back to user - return to kernel instead
+                    let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
+                        .saturating_sub(proc.start_time_us);
+                    let secs = elapsed_us / 1_000_000;
+                    let frac = (elapsed_us % 1_000_000) / 10_000;
+                    crate::safe_print!(128, "[exception] Process {} ({}) exited (code {}) [{}.{:02}s]\n",
+                        proc.pid, proc.name, exit_code, secs, frac);
                     akuma_exec::process::return_to_kernel(exit_code);
                 }
             } else {
@@ -1310,6 +1312,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
+            if let Some(proc) = akuma_exec::process::current_process() {
+                let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
+                    .saturating_sub(proc.start_time_us);
+                let secs = elapsed_us / 1_000_000;
+                let frac = (elapsed_us % 1_000_000) / 10_000;
+                crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
+                    proc.pid, proc.name, secs, frac);
+            }
             akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
@@ -1465,6 +1475,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} ELR={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.elr_el1, frame_ref.spsr_el1);
+            if let Some(proc) = akuma_exec::process::current_process() {
+                let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
+                    .saturating_sub(proc.start_time_us);
+                let secs = elapsed_us / 1_000_000;
+                let frac = (elapsed_us % 1_000_000) / 10_000;
+                crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
+                    proc.pid, proc.name, secs, frac);
+            }
             akuma_exec::process::return_to_kernel(-11) // never returns
         }
         esr::EC_MSR_MRS_TRAP => {

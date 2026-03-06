@@ -1037,6 +1037,13 @@ pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> 
 }
 
 /// Like lazy_region_lookup but takes an explicit PID (for tests and non-current-process use).
+pub fn lazy_region_count_for_pid(pid: Pid) -> usize {
+    with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        table.get(&pid).map_or(0, |r| r.len())
+    })
+}
+
 pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
     with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
