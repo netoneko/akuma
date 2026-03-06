@@ -146,7 +146,7 @@ pub const IGNORE_THREADING_TESTS: bool = false;
 /// When enabled, skips memory tests, threading tests, filesystem tests,
 /// process tests, and shell tests. Use this to debug crashes that might
 /// be caused by test-induced heap corruption or thread scheduling issues.
-pub const DISABLE_ALL_TESTS: bool = true;
+pub const DISABLE_ALL_TESTS: bool = false;
 
 /// Minimal idle loop (for debugging EC=0xe crashes)
 ///
