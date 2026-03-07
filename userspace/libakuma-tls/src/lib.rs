@@ -28,8 +28,11 @@ pub use http::{download_file, download_file_with_headers, https_fetch, https_get
 pub use rng::TlsRng;
 pub use transport::TcpTransport;
 
-/// TLS read/write buffer sizes (must be >= 16KB for TLS records)
-pub const TLS_RECORD_SIZE: usize = 16384;
+/// TLS read/write buffer sizes.
+/// Must be large enough for the largest TLS 1.3 record on the wire:
+/// 5 (header) + 16384 (max plaintext) + 1 (content type) + 16 (AES-GCM tag) = 16406,
+/// rounded up with headroom.
+pub const TLS_RECORD_SIZE: usize = 17408;
 
 /// Error type for TLS operations
 #[derive(Debug)]
