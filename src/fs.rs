@@ -78,7 +78,7 @@ pub fn init() -> Result<(), FsError> {
     log("[FS] Ext2 filesystem mounted at /\n");
 
     // Mount procfs at /proc
-    let proc_fs = alloc::boxed::Box::new(vfs::proc::ProcFilesystem::new());
+    let proc_fs = alloc::sync::Arc::new(vfs::proc::ProcFilesystem::new());
     vfs::mount("/proc", proc_fs)?;
 
     log("[FS] Procfs mounted at /proc\n");

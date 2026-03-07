@@ -97,6 +97,9 @@ struct ServiceConfig {
     max_retries: u32,
     boxed: bool,
     box_root: String,
+    /// Path to an OCI bundle directory. If set, overrides command/box_root
+    /// with values from the bundle's config.json.
+    bundle: String,
 }
 
 impl Default for ServiceConfig {
@@ -108,8 +111,232 @@ impl Default for ServiceConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             boxed: false,
             box_root: String::from("/"),
+            bundle: String::new(),
         }
     }
+}
+
+// ============================================================================
+// OCI Bundle Config Parser
+// ============================================================================
+
+/// Parsed OCI config.json (subset)
+#[derive(Clone)]
+struct OciConfig {
+    root_path: String,
+    process_args: Vec<String>,
+    process_cwd: String,
+    process_env: Vec<String>,
+    mounts: Vec<OciMount>,
+}
+
+#[derive(Clone)]
+struct OciMount {
+    destination: String,
+    mount_type: String,
+}
+
+impl OciConfig {
+    fn default() -> Self {
+        Self {
+            root_path: String::from("rootfs"),
+            process_args: Vec::new(),
+            process_cwd: String::from("/"),
+            process_env: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+}
+
+/// Minimal JSON string value extractor.
+/// Finds `"key": "value"` and returns value.
+fn json_get_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    // Skip whitespace and colon
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_colon = after_colon.trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let start = 1;
+    let end = after_colon[start..].find('"')?;
+    Some(&after_colon[start..start + end])
+}
+
+/// Extract a JSON array of strings: `"key": ["a", "b", "c"]`
+fn json_get_str_array(json: &str, key: &str) -> Vec<String> {
+    let pattern = format!("\"{}\"", key);
+    let idx = match json.find(&pattern) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = match after_key.trim_start().strip_prefix(':') {
+        Some(s) => s.trim_start(),
+        None => return Vec::new(),
+    };
+    if !after_colon.starts_with('[') {
+        return Vec::new();
+    }
+    let bracket_end = match after_colon.find(']') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let array_content = &after_colon[1..bracket_end];
+
+    let mut result = Vec::new();
+    let mut remaining = array_content;
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        if remaining.starts_with(',') {
+            remaining = &remaining[1..];
+            continue;
+        }
+        if remaining.starts_with('"') {
+            remaining = &remaining[1..];
+            if let Some(end) = remaining.find('"') {
+                result.push(String::from(&remaining[..end]));
+                remaining = &remaining[end + 1..];
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Find a JSON object block by key: `"key": { ... }`
+/// Returns the content between the braces.
+fn json_get_object<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_colon = after_colon.trim_start();
+    if !after_colon.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0;
+    let mut end_idx = 0;
+    for (i, ch) in after_colon.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end_idx > 0 {
+        Some(&after_colon[1..end_idx])
+    } else {
+        None
+    }
+}
+
+/// Extract the `"mounts"` array from config.json.
+/// Each mount is `{ "destination": "...", "type": "...", ... }`
+fn json_get_mounts(json: &str) -> Vec<OciMount> {
+    let pattern = "\"mounts\"";
+    let idx = match json.find(pattern) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = match after_key.trim_start().strip_prefix(':') {
+        Some(s) => s.trim_start(),
+        None => return Vec::new(),
+    };
+    if !after_colon.starts_with('[') {
+        return Vec::new();
+    }
+
+    let mut mounts = Vec::new();
+    let mut remaining = &after_colon[1..]; // skip '['
+
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() || remaining.starts_with(']') {
+            break;
+        }
+        if remaining.starts_with(',') {
+            remaining = &remaining[1..];
+            continue;
+        }
+        if remaining.starts_with('{') {
+            let mut depth = 0;
+            let mut end_idx = 0;
+            for (i, ch) in remaining.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end_idx > 0 {
+                let obj = &remaining[1..end_idx];
+                let dest = json_get_str(obj, "destination")
+                    .map(String::from)
+                    .unwrap_or_default();
+                let mtype = json_get_str(obj, "type")
+                    .map(String::from)
+                    .unwrap_or_default();
+                if !dest.is_empty() && !mtype.is_empty() {
+                    mounts.push(OciMount {
+                        destination: dest,
+                        mount_type: mtype,
+                    });
+                }
+                remaining = &remaining[end_idx + 1..];
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    mounts
+}
+
+/// Parse an OCI config.json string into an OciConfig.
+fn parse_oci_config(json: &str) -> OciConfig {
+    let mut config = OciConfig::default();
+
+    if let Some(root_obj) = json_get_object(json, "root") {
+        if let Some(path) = json_get_str(root_obj, "path") {
+            config.root_path = String::from(path);
+        }
+    }
+
+    if let Some(proc_obj) = json_get_object(json, "process") {
+        config.process_args = json_get_str_array(proc_obj, "args");
+        config.process_env = json_get_str_array(proc_obj, "env");
+        if let Some(cwd) = json_get_str(proc_obj, "cwd") {
+            config.process_cwd = String::from(cwd);
+        }
+    }
+
+    config.mounts = json_get_mounts(json);
+
+    config
 }
 
 // ============================================================================
@@ -319,6 +546,10 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 "box_root" => {
                     config.box_root = String::from(value);
                 }
+                "bundle" => {
+                    config.bundle = String::from(value);
+                    config.boxed = true; // bundles are always boxed
+                }
                 _ => {}
             }
         }
@@ -445,91 +676,178 @@ pub struct SpawnOptions {
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
 
+fn generate_box_id(name: &str) -> u64 {
+    let mut box_id = 0u64;
+    for b in name.as_bytes() {
+        box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64);
+    }
+    if box_id == 0 { box_id = 1; }
+    box_id
+}
+
+fn register_box(name: &str, box_id: u64, root_dir: &str, primary_pid: u32) {
+    libakuma::syscall(
+        SYSCALL_REGISTER_BOX,
+        box_id,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        root_dir.as_ptr() as u64,
+        root_dir.len() as u64,
+        primary_pid as u64,
+    );
+}
+
+fn spawn_in_box(
+    box_id: u64,
+    root_dir: &str,
+    command: &str,
+    args: &[&str],
+) -> Option<SpawnResult> {
+    let mut args_buf = Vec::new();
+    for arg in args {
+        args_buf.extend_from_slice(arg.as_bytes());
+        args_buf.push(0);
+    }
+    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
+    let args_len = args_buf.len();
+
+    let options = SpawnOptions {
+        cwd_ptr: "/".as_ptr() as u64,
+        cwd_len: 1,
+        root_dir_ptr: root_dir.as_ptr() as u64,
+        root_dir_len: root_dir.len(),
+        args_ptr,
+        args_len,
+        stdin_ptr: 0,
+        stdin_len: 0,
+        box_id,
+    };
+
+    let result = libakuma::syscall(
+        SYSCALL_SPAWN_EXT,
+        command.as_ptr() as u64,
+        command.len() as u64,
+        &options as *const _ as u64,
+        0,
+        0,
+        0,
+    );
+
+    if (result as i64) >= 0 {
+        let pid = (result & 0xFFFF_FFFF) as u32;
+        let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+        Some(SpawnResult { pid, stdout_fd })
+    } else {
+        None
+    }
+}
+
+const SYSCALL_MOUNT_IN_NS: u64 = 325;
+
+/// Set up mounts in a box's namespace from OCI config mount entries.
+fn setup_oci_mounts(box_id: u64, mounts: &[OciMount]) {
+    for m in mounts {
+        match m.mount_type.as_str() {
+            "proc" | "tmpfs" => {}
+            _ => continue,
+        };
+
+        let result = libakuma::syscall(
+            SYSCALL_MOUNT_IN_NS,
+            box_id,
+            m.destination.as_ptr() as u64,
+            m.destination.len() as u64,
+            m.mount_type.as_ptr() as u64,
+            m.mount_type.len() as u64,
+            0,
+        );
+
+        if (result as i64) < 0 {
+            print("[herd] Warning: Failed to mount ");
+            print(&m.mount_type);
+            print(" at ");
+            print(&m.destination);
+            print("\n");
+        }
+    }
+}
+
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     print("[herd] Starting service: ");
     print(name);
-    if config.boxed {
+    if !config.bundle.is_empty() {
+        print(" (bundle: ");
+        print(&config.bundle);
+        print(")");
+    } else if config.boxed {
         print(" (boxed)");
     }
     print("\n");
 
-    // Build args
-    let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
-    let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
-
-    // Spawn the process
-    let spawn_res = if config.boxed {
-        // Generate box_id from name
-        let mut box_id = 0u64;
-        for b in name.as_bytes() {
-            box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64);
-        }
-        if box_id == 0 { box_id = 1; }
-
-        // Register box in kernel
-        libakuma::syscall(
-            SYSCALL_REGISTER_BOX,
-            box_id,
-            name.as_ptr() as u64,
-            name.len() as u64,
-            config.box_root.as_ptr() as u64,
-            config.box_root.len() as u64,
-            0,
-        );
-
-        // Build null-separated args string for internal syscall call
-        let mut args_buf = Vec::new();
-        if let Some(args_slice) = args_opt {
-            for arg in args_slice {
-                args_buf.extend_from_slice(arg.as_bytes());
-                args_buf.push(0);
+    let spawn_res = if !config.bundle.is_empty() {
+        // OCI Bundle mode
+        let config_path = format!("{}/config.json", config.bundle);
+        let json = match read_file_string(&config_path) {
+            Some(s) => s,
+            None => {
+                print("[herd] Error: Cannot read ");
+                print(&config_path);
+                print("\n");
+                if let Some(svc) = state.services.get_mut(name) {
+                    svc.state = ServiceState::Failed;
+                }
+                return;
             }
-        }
-        let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
-        let args_len = args_buf.len();
-
-        let options = SpawnOptions {
-            cwd_ptr: "/".as_ptr() as u64,
-            cwd_len: 1,
-            root_dir_ptr: config.box_root.as_ptr() as u64,
-            root_dir_len: config.box_root.len(),
-            args_ptr,
-            args_len,
-            stdin_ptr: 0,
-            stdin_len: 0,
-            box_id,
         };
 
-        let result = libakuma::syscall(
-            SYSCALL_SPAWN_EXT,
-            config.command.as_ptr() as u64,
-            config.command.len() as u64,
-            &options as *const _ as u64,
-            0,
-            0,
-            0,
-        );
+        let oci = parse_oci_config(&json);
 
-        if (result as i64) >= 0 {
-            let pid = (result & 0xFFFF_FFFF) as u32;
-            let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-
-            // Update registry with real primary PID
-            libakuma::syscall(
-                SYSCALL_REGISTER_BOX,
-                box_id,
-                name.as_ptr() as u64,
-                name.len() as u64,
-                config.box_root.as_ptr() as u64,
-                config.box_root.len() as u64,
-                pid as u64,
-            );
-
-            Some(SpawnResult { pid, stdout_fd })
+        let root_dir = if oci.root_path.starts_with('/') {
+            oci.root_path.clone()
         } else {
-            None
+            format!("{}/{}", config.bundle, oci.root_path)
+        };
+
+        let box_id = generate_box_id(name);
+
+        let command = if !oci.process_args.is_empty() {
+            oci.process_args[0].clone()
+        } else if !config.command.is_empty() {
+            config.command.clone()
+        } else {
+            print("[herd] Error: No command in OCI config or service config\n");
+            if let Some(svc) = state.services.get_mut(name) {
+                svc.state = ServiceState::Failed;
+            }
+            return;
+        };
+
+        let args: Vec<&str> = oci.process_args.iter().skip(1).map(|s| s.as_str()).collect();
+
+        // 1. Register box (creates mount namespace in kernel)
+        register_box(name, box_id, &root_dir, 0);
+
+        // 2. Set up OCI mounts in the box's namespace
+        setup_oci_mounts(box_id, &oci.mounts);
+
+        // 3. Spawn the main process
+        let res = spawn_in_box(box_id, &root_dir, &command, &args);
+        if let Some(ref r) = res {
+            register_box(name, box_id, &root_dir, r.pid);
         }
+        res
+    } else if config.boxed {
+        let box_id = generate_box_id(name);
+        let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
+        register_box(name, box_id, &config.box_root, 0);
+        let res = spawn_in_box(box_id, &config.box_root, &config.command, &args);
+        if let Some(ref r) = res {
+            register_box(name, box_id, &config.box_root, r.pid);
+        }
+        res
     } else {
+        let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
+        let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
         spawn(&config.command, args_opt)
     };
 

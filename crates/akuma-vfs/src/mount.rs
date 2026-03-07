@@ -1,8 +1,8 @@
 //! Mount table — maps paths to filesystem implementations.
 
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::types::{DirEntry, Filesystem, FsError, MountInfo};
@@ -11,7 +11,7 @@ const MAX_MOUNTS: usize = 8;
 
 struct MountEntry {
     path: String,
-    fs: Box<dyn Filesystem>,
+    fs: Arc<dyn Filesystem>,
 }
 
 /// A table of mounted filesystems.
@@ -30,7 +30,7 @@ impl MountTable {
         }
     }
 
-    pub fn mount(&mut self, path: &str, fs: Box<dyn Filesystem>) -> Result<(), FsError> {
+    pub fn mount(&mut self, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
         if self.mounts.len() >= MAX_MOUNTS {
             return Err(FsError::NoSpace);
         }

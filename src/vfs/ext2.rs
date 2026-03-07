@@ -1,6 +1,6 @@
 //! Kernel ext2 wrapper — bridges `akuma_ext2` to the kernel block device.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use akuma_vfs::Filesystem;
 pub use akuma_ext2::{BlockDevice, Ext2Filesystem};
 
@@ -18,9 +18,9 @@ impl BlockDevice for KernelBlockDevice {
 }
 
 /// Mount ext2 from the kernel block device.
-pub fn mount() -> Result<Box<dyn Filesystem>, akuma_vfs::FsError> {
+pub fn mount() -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
     let fs = Ext2Filesystem::new(KernelBlockDevice, || {
         crate::timer::utc_time_us().unwrap_or(0)
     })?;
-    Ok(Box::new(fs))
+    Ok(Arc::new(fs))
 }

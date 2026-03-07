@@ -48,14 +48,14 @@ mod path_tests {
 #[cfg(test)]
 mod mount_tests {
     extern crate alloc;
-    use alloc::boxed::Box;
+    use alloc::sync::Arc;
 #[allow(unused_imports)]
     use crate::{MountTable, MemoryFilesystem, Filesystem};
 
     #[test]
     fn mount_and_resolve() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
         let (fs, rel) = mt.resolve("/foo/bar").unwrap();
         assert_eq!(fs.name(), "memfs");
         assert_eq!(rel, "/foo/bar");
@@ -64,8 +64,8 @@ mod mount_tests {
     #[test]
     fn mount_nested() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
-        mt.mount("/tmp", Box::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/tmp", Arc::new(MemoryFilesystem::new())).unwrap();
         let (fs, rel) = mt.resolve("/tmp/file").unwrap();
         assert_eq!(fs.name(), "memfs");
         assert_eq!(rel, "/file");
@@ -74,16 +74,16 @@ mod mount_tests {
     #[test]
     fn mount_duplicate_fails() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
-        let r = mt.mount("/", Box::new(MemoryFilesystem::new()));
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        let r = mt.mount("/", Arc::new(MemoryFilesystem::new()));
         assert!(r.is_err());
     }
 
     #[test]
     fn unmount() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
-        mt.mount("/tmp", Box::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/tmp", Arc::new(MemoryFilesystem::new())).unwrap();
         mt.unmount("/tmp").unwrap();
         let (_, rel) = mt.resolve("/tmp/file").unwrap();
         assert_eq!(rel, "/tmp/file"); // falls through to root
@@ -92,9 +92,9 @@ mod mount_tests {
     #[test]
     fn child_mount_points() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
-        mt.mount("/proc", Box::new(MemoryFilesystem::new())).unwrap();
-        mt.mount("/tmp", Box::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/proc", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/tmp", Arc::new(MemoryFilesystem::new())).unwrap();
         let children = mt.child_mount_points("/");
         assert_eq!(children.len(), 2);
     }
@@ -102,8 +102,8 @@ mod mount_tests {
     #[test]
     fn list_mounts() {
         let mut mt = MountTable::new();
-        mt.mount("/", Box::new(MemoryFilesystem::new())).unwrap();
-        mt.mount("/tmp", Box::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/tmp", Arc::new(MemoryFilesystem::new())).unwrap();
         let mounts = mt.list_mounts();
         assert_eq!(mounts.len(), 2);
     }

@@ -105,6 +105,8 @@ pub mod syscall {
     pub const FB_DRAW: u64 = 322;
     pub const FB_INFO: u64 = 323;
     pub const GETEUID: u64 = 175;
+    pub const MOUNT: u64 = 40;
+    pub const UMOUNT2: u64 = 39;
 }
 
 /// Thread CPU statistics for top command
@@ -1081,6 +1083,34 @@ pub fn unlink(path: &str) -> i32 {
         0, // flags
         0,
         0, 0,
+    ) as i32
+}
+
+/// Mount a filesystem.
+///
+/// Supported fstypes: "proc", "tmpfs".
+pub fn mount(source: &str, target: &str, fstype: &str) -> i32 {
+    let source_c = alloc::format!("{}\0", source);
+    let target_c = alloc::format!("{}\0", target);
+    let fstype_c = alloc::format!("{}\0", fstype);
+    syscall(
+        syscall::MOUNT,
+        source_c.as_ptr() as u64,
+        target_c.as_ptr() as u64,
+        fstype_c.as_ptr() as u64,
+        0, // flags
+        0, 0,
+    ) as i32
+}
+
+/// Unmount a filesystem.
+pub fn umount(target: &str) -> i32 {
+    let target_c = alloc::format!("{}\0", target);
+    syscall(
+        syscall::UMOUNT2,
+        target_c.as_ptr() as u64,
+        0, // flags
+        0, 0, 0, 0,
     ) as i32
 }
 

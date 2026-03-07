@@ -564,6 +564,9 @@ pub mod nr {
     pub const INOTIFY_RM_WATCH: u64 = 28;  // Linux arm64 inotify_rm_watch
     pub const ACCEPT4: u64 = 242;          // Linux arm64 accept4
     pub const TIMES: u64 = 153;            // Linux arm64 times
+    pub const MOUNT: u64 = 40;             // Linux arm64 mount
+    pub const UMOUNT2: u64 = 39;           // Linux arm64 umount2
+    pub const MOUNT_IN_NS: u64 = 325;     // Mount into a specific box's namespace
 }
 
 /// Thread CPU statistics for top command
@@ -616,6 +619,7 @@ fn encode_wait_status(code: i32) -> u32 {
     }
 }
 const EROFS: u64 = (-30i64) as u64;
+const ENODEV: u64 = (-19i64) as u64;
 
 fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     use crate::vfs::FsError;
@@ -1227,6 +1231,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => ENOSYS,
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => ENOSYS,
+        nr::MOUNT => sys_mount(args[0], args[1], args[2], args[3] as u64, args[4]),
+        nr::UMOUNT2 => sys_umount2(args[0], args[1] as i32),
+        nr::MOUNT_IN_NS => sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize),
         _ => {
             crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
                 syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -4657,6 +4664,10 @@ fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root
         creator_pid,
         primary_pid,
     });
+
+    // Create a mount namespace for this box
+    crate::vfs::create_mount_namespace(id);
+
     0
 }
 
@@ -4831,9 +4842,114 @@ fn sys_kill(pid: u32, _sig: u32) -> u64 {
 }
 
 fn sys_kill_box(box_id: u64) -> u64 {
+    // Remove the mount namespace before killing processes
+    crate::vfs::remove_mount_namespace(box_id);
 
     if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
+}
 
+/// mount(source, target, fstype, flags, data)
+///
+/// Mounts a filesystem in the current process's box namespace.
+/// Box 0 mounts go to the global mount table.
+/// Supported fstypes: "proc", "tmpfs".
+fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _flags: u64, _data_ptr: u64) -> u64 {
+    let target = match copy_from_user_str(target_ptr, 256) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let fstype = match copy_from_user_str(fstype_ptr, 64) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype.as_str() {
+        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
+        "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
+        _ => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
+            }
+            return ENODEV;
+        }
+    };
+
+    let box_id = akuma_exec::process::current_process()
+        .map(|p| p.box_id)
+        .unwrap_or(0);
+
+    if box_id == 0 {
+        match crate::vfs::mount(&target, fs) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        }
+    } else {
+        match crate::vfs::mount_in_namespace(box_id, &target, fs) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        }
+    }
+}
+
+/// umount2(target, flags)
+///
+/// Unmounts a filesystem from the current process's box namespace.
+fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
+    let target = match copy_from_user_str(target_ptr, 256) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let box_id = akuma_exec::process::current_process()
+        .map(|p| p.box_id)
+        .unwrap_or(0);
+
+    if box_id == 0 {
+        EPERM
+    } else {
+        match crate::vfs::unmount_in_namespace(box_id, &target) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        }
+    }
+}
+
+/// mount_in_ns(box_id, target_ptr, target_len, fstype_ptr, fstype_len)
+///
+/// Mount a filesystem into a specific box's namespace. Only callable
+/// from box 0 (host). Used by herd to set up container mounts before
+/// spawning the container's main process.
+fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize) -> u64 {
+    // Only host (box 0) can mount into other namespaces
+    let caller_box = akuma_exec::process::current_process()
+        .map(|p| p.box_id)
+        .unwrap_or(0);
+    if caller_box != 0 {
+        return EPERM;
+    }
+
+    if !validate_user_ptr(target_ptr, target_len) { return EFAULT; }
+    if !validate_user_ptr(fstype_ptr, fstype_len) { return EFAULT; }
+
+    let target = unsafe {
+        core::str::from_utf8(core::slice::from_raw_parts(target_ptr as *const u8, target_len))
+            .unwrap_or("")
+    };
+    let fstype = unsafe {
+        core::str::from_utf8(core::slice::from_raw_parts(fstype_ptr as *const u8, fstype_len))
+            .unwrap_or("")
+    };
+
+    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
+        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
+        "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
+        _ => return ENODEV,
+    };
+
+    match crate::vfs::mount_in_namespace(box_id, target, fs) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
 }
 
 
