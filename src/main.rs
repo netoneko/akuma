@@ -223,13 +223,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
     // Stack layout (from boot.rs):
-    //   STACK_TOP    = 0x42000000 (32MB from kernel base)
+    //   STACK_TOP    = 0x40800000 (8MB from kernel base)
     //   STACK_SIZE   = 0x100000   (1MB)
-    //   Stack bottom = 0x41F00000 (31MB from kernel base)
+    //   Stack bottom = 0x40700000 (7MB from kernel base)
     //
-    // Kernel must fit below 0x41F00000 to not corrupt stack!
+    // Kernel must fit below 0x40700000 to not corrupt stack!
     const KERNEL_BASE: usize = 0x4000_0000;
-    const STACK_BOTTOM: usize = 0x41F0_0000; // STACK_TOP - STACK_SIZE
+    const STACK_BOTTOM: usize = 0x4070_0000; // STACK_TOP - STACK_SIZE
 
     unsafe extern "C" {
         static _kernel_phys_end: u8;
@@ -271,18 +271,17 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
     // Memory layout constants
-    const MIN_CODE_AND_STACK: usize = 32 * 1024 * 1024; // Minimum 32MB for kernel binary + stack
+    const MIN_CODE_AND_STACK: usize = 8 * 1024 * 1024; // 8MB for kernel binary (~2MB) + 1MB boot stack
 
     // Memory layout:
-    // - Code + Stack: max(1/8 of RAM, 32MB) - kernel binary and stack
-    // - Heap: 1/2 of RAM - dynamic allocations
+    // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
+    // - Heap: fixed 16MB - kernel data structures (page tables, PCBs, VFS, networking)
     // - User pages: remaining - for user processes
-    // Note: See docs/MEMORY_LAYOUT.md for details on sizing constraints
+    const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 
-    // Calculate code + stack region (at least 32MB to support kernels up to ~24MB)
-    let code_and_stack = core::cmp::max(ram_size / 8, MIN_CODE_AND_STACK);
+    let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = core::cmp::max(ram_size / 4, MIN_CODE_AND_STACK); // 1/4 RAM (min 32MB) for demand paging bookkeeping
+    let heap_size = KERNEL_HEAP_SIZE;
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
@@ -300,7 +299,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(ram_base as u64);
     console::print(" - 0x");
     console::print_hex(heap_start as u64);
-    console::print(") [min 32MB]\n");
+    console::print(") [min 8MB]\n");
 
     console::print("Heap:       ");
     console::print_dec(heap_size / 1024 / 1024);
@@ -308,7 +307,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(heap_start as u64);
     console::print(" - 0x");
     console::print_hex(user_pages_start as u64);
-    console::print(") [1/2 of RAM]\n");
+    console::print(") [fixed 16MB]\n");
 
     console::print("User pages: ");
     console::print_dec(user_pages_size / 1024 / 1024);
@@ -692,7 +691,7 @@ fn run_async_main_preemptive() -> ! {
 /// Runs on thread 0 (boot thread) which has a 1MB stack (config::KERNEL_STACK_SIZE).
 /// This is sufficient for deep async call chains (SSH, HTTP, etc.).
 ///
-/// Note: Thread 0 uses the boot stack at 0x41F00000-0x42000000 which is
+/// Note: Thread 0 uses the boot stack at 0x40700000-0x40800000 which is
 /// protected by stack canaries checked periodically in this loop.
 fn run_async_main() -> ! {
     use core::future::Future;

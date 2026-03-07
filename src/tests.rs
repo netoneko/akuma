@@ -3,7 +3,7 @@
 //! Run with `tests::run_all()` after scheduler initialization.
 //! If tests fail, the kernel should halt.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::config;
 use crate::console;
@@ -214,6 +214,12 @@ pub fn run_threading_tests() -> bool {
     // Waker mechanism tests
     run_test!(test_waker_mechanism, "waker_mechanism");
     run_test!(test_block_on_noop_waker, "block_on_noop_waker");
+
+    // NEON/FP register save/restore tests
+    run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
+    run_test!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
+    run_test!(test_fpcr_fpsr_across_yield, "fpcr_fpsr_across_yield");
+    run_test!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
 
     // Parallel process tests (requires /bin/hello)
     run_test!(test_parallel_processes, "parallel_processes");
@@ -5420,6 +5426,451 @@ fn test_membarrier_private_expedited_succeeds() -> bool {
     if !pass {
         crate::safe_print!(64, "  expected=0 got={:#x}\n", result);
     }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// NEON/FP register save/restore tests
+// ============================================================================
+//
+// These tests verify that NEON/FP registers (Q0-Q31, FPCR, FPSR) are correctly
+// saved and restored across context switches (both preemptive IRQ and voluntary
+// yield). Without this, NEON-heavy userspace (e.g. llama.cpp with -march=armv8.2-a)
+// would get corrupted FP state after being preempted.
+
+static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Test: NEON registers survive voluntary yields.
+///
+/// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
+/// verify the pattern is intact. If the kernel doesn't save/restore NEON across
+/// context switches the patterns will be mixed.
+fn test_neon_regs_across_yield() -> bool {
+    console::print("\n[TEST] NEON registers across voluntary yields\n");
+
+    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
+
+    static DONE_A: AtomicBool = AtomicBool::new(false);
+    static DONE_B: AtomicBool = AtomicBool::new(false);
+    DONE_A.store(false, Ordering::SeqCst);
+    DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: fills Q0-Q3 with 0xAAAA pattern
+    match threading::spawn_fn(|| {
+        let pattern: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let mut errors: u32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "dup v0.2d, {p}",
+                "dup v1.2d, {p}",
+                "dup v2.2d, {p}",
+                "dup v3.2d, {p}",
+                p = in(reg) pattern,
+            );
+        }
+
+        for _ in 0..50 {
+            threading::yield_now();
+
+            let mut lo0: u64;
+            let mut lo1: u64;
+            let mut lo2: u64;
+            let mut lo3: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lo0}, v0.d[0]",
+                    "mov {lo1}, v1.d[0]",
+                    "mov {lo2}, v2.d[0]",
+                    "mov {lo3}, v3.d[0]",
+                    lo0 = out(reg) lo0,
+                    lo1 = out(reg) lo1,
+                    lo2 = out(reg) lo2,
+                    lo3 = out(reg) lo3,
+                );
+            }
+            if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
+                errors += 1;
+            }
+        }
+        if errors > 0 {
+            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+        }
+        DONE_A.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: fills Q0-Q3 with 0x5555 pattern (opposite of A)
+    match threading::spawn_fn(|| {
+        let pattern: u64 = 0x5555_5555_5555_5555;
+        let mut errors: u32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "dup v0.2d, {p}",
+                "dup v1.2d, {p}",
+                "dup v2.2d, {p}",
+                "dup v3.2d, {p}",
+                p = in(reg) pattern,
+            );
+        }
+
+        for _ in 0..50 {
+            threading::yield_now();
+
+            let mut lo0: u64;
+            let mut lo1: u64;
+            let mut lo2: u64;
+            let mut lo3: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lo0}, v0.d[0]",
+                    "mov {lo1}, v1.d[0]",
+                    "mov {lo2}, v2.d[0]",
+                    "mov {lo3}, v3.d[0]",
+                    lo0 = out(reg) lo0,
+                    lo1 = out(reg) lo1,
+                    lo2 = out(reg) lo2,
+                    lo3 = out(reg) lo3,
+                );
+            }
+            if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
+                errors += 1;
+            }
+        }
+        if errors > 0 {
+            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+        }
+        DONE_B.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    // Wait for both threads
+    for _ in 0..200 {
+        threading::yield_now();
+        if DONE_A.load(Ordering::Acquire) && DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
+    let both_done = DONE_A.load(Ordering::Acquire) && DONE_B.load(Ordering::Acquire);
+    let pass = both_done && errors == 0;
+
+    crate::safe_print!(128,
+        "  done_a={} done_b={} errors={} cleaned={}\n",
+        DONE_A.load(Ordering::Acquire), DONE_B.load(Ordering::Acquire), errors, cleaned
+    );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: NEON registers survive preemptive scheduling (busy-loop, no yield).
+///
+/// Two threads busy-loop using NEON registers for a known duration. The timer
+/// IRQ will preempt them. After the loop each thread checks its registers.
+/// This catches missing save/restore in irq_el0_handler / irq_handler.
+fn test_neon_regs_across_preemption() -> bool {
+    console::print("\n[TEST] NEON registers across preemptive scheduling\n");
+
+    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
+
+    static P_DONE_A: AtomicBool = AtomicBool::new(false);
+    static P_DONE_B: AtomicBool = AtomicBool::new(false);
+    P_DONE_A.store(false, Ordering::SeqCst);
+    P_DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: busy-loop with Q4-Q7 = 0x1111 pattern for ~30ms
+    match threading::spawn_fn(|| {
+        let pattern: u64 = 0x1111_1111_1111_1111;
+        let mut errors: u32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "dup v4.2d, {p}",
+                "dup v5.2d, {p}",
+                "dup v6.2d, {p}",
+                "dup v7.2d, {p}",
+                p = in(reg) pattern,
+            );
+        }
+
+        let start = crate::timer::uptime_us();
+        let duration = 30_000; // 30ms — guarantees multiple preemptions at 10ms quantum
+        let mut checks: u32 = 0;
+
+        while crate::timer::uptime_us() - start < duration {
+            let mut lo4: u64;
+            let mut lo5: u64;
+            let mut lo6: u64;
+            let mut lo7: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lo4}, v4.d[0]",
+                    "mov {lo5}, v5.d[0]",
+                    "mov {lo6}, v6.d[0]",
+                    "mov {lo7}, v7.d[0]",
+                    lo4 = out(reg) lo4,
+                    lo5 = out(reg) lo5,
+                    lo6 = out(reg) lo6,
+                    lo7 = out(reg) lo7,
+                );
+            }
+            if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
+                errors += 1;
+            }
+            checks += 1;
+        }
+
+        if errors > 0 {
+            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+        }
+        crate::safe_print!(64, "  A: {} checks, {} errors\n", checks, errors);
+        P_DONE_A.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: busy-loop with Q4-Q7 = 0xEEEE pattern for ~30ms
+    match threading::spawn_fn(|| {
+        let pattern: u64 = 0xEEEE_EEEE_EEEE_EEEE;
+        let mut errors: u32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "dup v4.2d, {p}",
+                "dup v5.2d, {p}",
+                "dup v6.2d, {p}",
+                "dup v7.2d, {p}",
+                p = in(reg) pattern,
+            );
+        }
+
+        let start = crate::timer::uptime_us();
+        let duration = 30_000;
+        let mut checks: u32 = 0;
+
+        while crate::timer::uptime_us() - start < duration {
+            let mut lo4: u64;
+            let mut lo5: u64;
+            let mut lo6: u64;
+            let mut lo7: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lo4}, v4.d[0]",
+                    "mov {lo5}, v5.d[0]",
+                    "mov {lo6}, v6.d[0]",
+                    "mov {lo7}, v7.d[0]",
+                    lo4 = out(reg) lo4,
+                    lo5 = out(reg) lo5,
+                    lo6 = out(reg) lo6,
+                    lo7 = out(reg) lo7,
+                );
+            }
+            if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
+                errors += 1;
+            }
+            checks += 1;
+        }
+
+        if errors > 0 {
+            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+        }
+        crate::safe_print!(64, "  B: {} checks, {} errors\n", checks, errors);
+        P_DONE_B.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    // Wait for both threads (they run for ~30ms each under preemption)
+    for _ in 0..500 {
+        threading::yield_now();
+        if P_DONE_A.load(Ordering::Acquire) && P_DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
+    let both_done = P_DONE_A.load(Ordering::Acquire) && P_DONE_B.load(Ordering::Acquire);
+    let pass = both_done && errors == 0;
+
+    crate::safe_print!(128,
+        "  done_a={} done_b={} errors={} cleaned={}\n",
+        P_DONE_A.load(Ordering::Acquire), P_DONE_B.load(Ordering::Acquire), errors, cleaned
+    );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: FPCR/FPSR are preserved across context switches.
+///
+/// Sets FPCR rounding mode bits in two threads to different values, yields,
+/// and verifies they're still correct. Catches missing FPCR/FPSR save.
+fn test_fpcr_fpsr_across_yield() -> bool {
+    console::print("\n[TEST] FPCR/FPSR across yields\n");
+
+    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
+
+    static F_DONE_A: AtomicBool = AtomicBool::new(false);
+    static F_DONE_B: AtomicBool = AtomicBool::new(false);
+    F_DONE_A.store(false, Ordering::SeqCst);
+    F_DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: FPCR rounding mode = Round to Nearest (RMode=00, bits 23:22)
+    match threading::spawn_fn(|| {
+        let fpcr_val: u64 = 0 << 22; // RN
+        let mut errors: u32 = 0;
+        unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
+
+        for _ in 0..30 {
+            threading::yield_now();
+            let mut read_back: u64;
+            unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
+            if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
+                errors += 1;
+            }
+        }
+        if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
+        F_DONE_A.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(_) => {}
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: FPCR rounding mode = Round towards Plus Infinity (RMode=01)
+    match threading::spawn_fn(|| {
+        let fpcr_val: u64 = 1 << 22; // RP
+        let mut errors: u32 = 0;
+        unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
+
+        for _ in 0..30 {
+            threading::yield_now();
+            let mut read_back: u64;
+            unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
+            if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
+                errors += 1;
+            }
+        }
+        if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
+        F_DONE_B.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(_) => {}
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    for _ in 0..200 {
+        threading::yield_now();
+        if F_DONE_A.load(Ordering::Acquire) && F_DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
+    let both_done = F_DONE_A.load(Ordering::Acquire) && F_DONE_B.load(Ordering::Acquire);
+    let pass = both_done && errors == 0;
+
+    crate::safe_print!(128,
+        "  done_a={} done_b={} errors={} cleaned={}\n",
+        F_DONE_A.load(Ordering::Acquire), F_DONE_B.load(Ordering::Acquire), errors, cleaned
+    );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: FP arithmetic produces correct results across preemption.
+///
+/// Two threads perform floating-point accumulation with known expected results.
+/// If NEON state is corrupted, the floating-point accumulators will diverge.
+fn test_fp_arithmetic_across_preemption() -> bool {
+    console::print("\n[TEST] FP arithmetic across preemptive scheduling\n");
+
+    static FP_RESULT_A: AtomicU64 = AtomicU64::new(0);
+    static FP_RESULT_B: AtomicU64 = AtomicU64::new(0);
+    static FP_DONE_A: AtomicBool = AtomicBool::new(false);
+    static FP_DONE_B: AtomicBool = AtomicBool::new(false);
+    FP_RESULT_A.store(0, Ordering::SeqCst);
+    FP_RESULT_B.store(0, Ordering::SeqCst);
+    FP_DONE_A.store(false, Ordering::SeqCst);
+    FP_DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: sum 1.0 + 2.0 + ... + 1000.0 using FP, busy-looping for preemption
+    match threading::spawn_fn(|| {
+        let mut acc: f64 = 0.0;
+        for i in 1..=1000u64 {
+            acc += i as f64;
+            if i % 100 == 0 {
+                // Spin briefly to allow preemption between batches
+                let t = crate::timer::uptime_us();
+                while crate::timer::uptime_us() - t < 500 {
+                    unsafe { core::arch::asm!("nop"); }
+                }
+            }
+        }
+        FP_RESULT_A.store(acc.to_bits(), Ordering::Release);
+        FP_DONE_A.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: sum 1001.0 + 1002.0 + ... + 2000.0 using FP
+    match threading::spawn_fn(|| {
+        let mut acc: f64 = 0.0;
+        for i in 1001..=2000u64 {
+            acc += i as f64;
+            if i % 100 == 0 {
+                let t = crate::timer::uptime_us();
+                while crate::timer::uptime_us() - t < 500 {
+                    unsafe { core::arch::asm!("nop"); }
+                }
+            }
+        }
+        FP_RESULT_B.store(acc.to_bits(), Ordering::Release);
+        FP_DONE_B.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    for _ in 0..500 {
+        threading::yield_now();
+        if FP_DONE_A.load(Ordering::Acquire) && FP_DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let both_done = FP_DONE_A.load(Ordering::Acquire) && FP_DONE_B.load(Ordering::Acquire);
+
+    let result_a = f64::from_bits(FP_RESULT_A.load(Ordering::Acquire));
+    let result_b = f64::from_bits(FP_RESULT_B.load(Ordering::Acquire));
+    let expected_a: f64 = 500500.0;  // n*(n+1)/2 for n=1000
+    let expected_b: f64 = 1500500.0; // sum(1001..2000) = sum(1..2000) - sum(1..1000)
+
+    let diff_a = if result_a > expected_a { result_a - expected_a } else { expected_a - result_a };
+    let diff_b = if result_b > expected_b { result_b - expected_b } else { expected_b - result_b };
+    let a_ok = diff_a < 0.001;
+    let b_ok = diff_b < 0.001;
+    let pass = both_done && a_ok && b_ok;
+
+    crate::safe_print!(128,
+        "  A={} (expect {}) B={} (expect {}) cleaned={}\n",
+        result_a as u64, expected_a as u64, result_b as u64, expected_b as u64, cleaned
+    );
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

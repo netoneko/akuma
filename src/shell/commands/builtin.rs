@@ -157,37 +157,23 @@ impl Command for FreeCommand {
         _ctx: &'a mut ShellContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
-            let stats = crate::allocator::stats();
+            let heap = crate::allocator::stats();
+            let (pmm_total, pmm_alloc, _) = crate::pmm::stats();
+            let pmm_free = pmm_total.saturating_sub(pmm_alloc);
 
-            let allocated_kb = stats.allocated / 1024;
-            let free_kb = stats.free / 1024;
-            let peak_kb = stats.peak_allocated / 1024;
-            let heap_kb = stats.heap_size / 1024;
-            let heap_mb = stats.heap_size / 1024 / 1024;
-
-            let used_percent = if stats.heap_size > 0 {
-                (stats.allocated * 100) / stats.heap_size
-            } else {
-                0
-            };
+            let total_kb = (pmm_total * 4096) / 1024;
+            let used_kb = (pmm_alloc * 4096) / 1024;
+            let free_kb = (pmm_free * 4096) / 1024;
+            let heap_total_kb = heap.heap_size / 1024;
+            let heap_used_kb = heap.allocated / 1024;
+            let heap_free_kb = heap.free / 1024;
 
             let info = format!(
-                "Memory Statistics:\r\n\
-                 \r\n\
-                              total       used       free\r\n\
-                 Mem:    {:>8} KB {:>8} KB {:>8} KB\r\n\
-                 \r\n\
-                 Usage:       {}%\r\n\
-                 Peak:        {} KB\r\n\
-                 Allocs:      {}\r\n\
-                 Heap size:   {} MB\r\n",
-                heap_kb,
-                allocated_kb,
-                free_kb,
-                used_percent,
-                peak_kb,
-                stats.allocation_count,
-                heap_mb
+"              total      used      free\r\n\
+Mem:      {:>8} KB {:>8} KB {:>8} KB\r\n\
+Heap:     {:>8} KB {:>8} KB {:>8} KB\r\n",
+                total_kb, used_kb, free_kb,
+                heap_total_kb, heap_used_kb, heap_free_kb,
             );
             let _ = stdout.write(info.as_bytes()).await;
             Ok(())

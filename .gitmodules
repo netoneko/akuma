@@ -13,3 +13,6 @@
 [submodule "userspace/xbps/xbps"]
 	path = userspace/xbps/xbps
 	url = https://github.com/void-linux/xbps
+[submodule "userspace/llama.cpp/llama.cpp"]
+	path = userspace/llama.cpp/llama.cpp
+	url = https://github.com/ggerganov/llama.cpp.git

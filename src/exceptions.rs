@@ -96,25 +96,46 @@ sync_el1_handler:
 
 // Synchronous exception from EL0 (user mode)
 // Handles SVC syscalls and user faults
+//
+// Frame layout (832 bytes):
+//   [sp+0..287]:   UserTrapFrame (GPRs, SP_EL0, ELR, SPSR, TPIDR)
+//   [sp+288..303]: kernel SP + padding
+//   [sp+304..831]: NEON/FP state (Q0-Q31, FPCR, FPSR)
 sync_el0_handler:
-    // At this point: SP = SP_EL1 (exception stack, set in run_user_until_exit)
-    // ELR_EL1 = user PC, SPSR_EL1 = user PSTATE
-    // CRITICAL: We must save ALL user registers we're about to clobber!
+    // Allocate full frame: 304 GPR + 528 NEON = 832 bytes
+    sub     sp, sp, #832
     
-    // First, allocate space for the ENTIRE trap frame at once to avoid overlap issues.
-// Trap frame: 288 bytes for user regs + 16 bytes for saved kernel SP = 304 bytes
-    sub     sp, sp, #304
+    // Save x8-x11 first (we'll clobber these for stack/NEON operations)
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
     
-    // Now save user x8-x11 first (we'll clobber these for stack operations)
-    stp     x8, x9, [sp, #64]       // x8, x9 at offset 64, 72
-    stp     x10, x11, [sp, #80]     // x10, x11 at offset 80, 88
+    // Save kernel SP at offset 288 (sp + 832 = original SP)
+    add     x9, sp, #832
+    str     x9, [sp, #288]
     
-    // Save kernel SP (for return_to_kernel) at the top of our frame
-    // Kernel SP = current SP + 304 (the value before we allocated)
-    add     x9, sp, #304
-    str     x9, [sp, #288]          // Saved at offset 288
+    // Save NEON/FP state at [sp+304..831]
+    stp     q0,  q1,  [sp, #304]
+    stp     q2,  q3,  [sp, #336]
+    stp     q4,  q5,  [sp, #368]
+    stp     q6,  q7,  [sp, #400]
+    stp     q8,  q9,  [sp, #432]
+    stp     q10, q11, [sp, #464]
+    stp     q12, q13, [sp, #496]
+    stp     q14, q15, [sp, #528]
+    stp     q16, q17, [sp, #560]
+    stp     q18, q19, [sp, #592]
+    stp     q20, q21, [sp, #624]
+    stp     q22, q23, [sp, #656]
+    stp     q24, q25, [sp, #688]
+    stp     q26, q27, [sp, #720]
+    stp     q28, q29, [sp, #752]
+    stp     q30, q31, [sp, #784]
+    mrs     x10, fpcr
+    mrs     x11, fpsr
+    str     x10, [sp, #816]
+    str     x11, [sp, #824]
     
-    // Save x0-x7 (not clobbered)
+    // Save x0-x7
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -146,13 +167,10 @@ sync_el0_handler:
     mrs     x0, tpidr_el0
     str     x0, [sp, #272]
     
-    // Padding at [sp, #280], kernel SP at [sp, #288]
-    
     // Pass pointer to saved context as first arg
     mov     x0, sp
     
     // Enable IRQs during syscall handling to allow preemption
-    // This is critical for schedule_blocking to work - timer IRQs must fire
     msr     daifclr, #2
     isb
     
@@ -167,9 +185,31 @@ sync_el0_handler:
     // Save it to scratch area while we restore other registers
     str     x0, [sp, #280]
     
+    // Restore NEON/FP state from [sp+304..831]
+    ldr     x0, [sp, #816]
+    ldr     x1, [sp, #824]
+    msr     fpcr, x0
+    msr     fpsr, x1
+    ldp     q0,  q1,  [sp, #304]
+    ldp     q2,  q3,  [sp, #336]
+    ldp     q4,  q5,  [sp, #368]
+    ldp     q6,  q7,  [sp, #400]
+    ldp     q8,  q9,  [sp, #432]
+    ldp     q10, q11, [sp, #464]
+    ldp     q12, q13, [sp, #496]
+    ldp     q14, q15, [sp, #528]
+    ldp     q16, q17, [sp, #560]
+    ldp     q18, q19, [sp, #592]
+    ldp     q20, q21, [sp, #624]
+    ldp     q22, q23, [sp, #656]
+    ldp     q24, q25, [sp, #688]
+    ldp     q26, q27, [sp, #720]
+    ldp     q28, q29, [sp, #752]
+    ldp     q30, q31, [sp, #784]
+    
     // Restore SPSR_EL1 (clear IL bit to prevent EC=0xe)
     ldr     x0, [sp, #264]
-    bic     x0, x0, #0x100000       // Clear IL bit (bit 20)
+    bic     x0, x0, #0x100000
     msr     spsr_el1, x0
     
     // Restore ELR_EL1
@@ -186,57 +226,27 @@ sync_el0_handler:
     
     // Restore x30
     ldr     x30, [sp, #240]
-    
-    // Restore x28-x29
     ldp     x28, x29, [sp, #224]
-    
-    // Restore x26-x27
     ldp     x26, x27, [sp, #208]
-    
-    // Restore x24-x25
     ldp     x24, x25, [sp, #192]
-    
-    // Restore x22-x23
     ldp     x22, x23, [sp, #176]
-    
-    // Restore x20-x21
     ldp     x20, x21, [sp, #160]
-    
-    // Restore x18-x19
     ldp     x18, x19, [sp, #144]
-    
-    // Restore x16-x17
     ldp     x16, x17, [sp, #128]
-    
-    // Restore x14-x15
     ldp     x14, x15, [sp, #112]
-    
-    // Restore x12-x13
     ldp     x12, x13, [sp, #96]
-    
-    // Restore x10-x11
     ldp     x10, x11, [sp, #80]
-    
-    // Restore x8-x9
     ldp     x8, x9, [sp, #64]
-    
-    // Restore x6-x7
     ldp     x6, x7, [sp, #48]
-    
-    // Restore x4-x5
     ldp     x4, x5, [sp, #32]
-    
-    // Restore x2-x3
     ldp     x2, x3, [sp, #16]
-    
-    // Restore x1
     ldr     x1, [sp, #8]
     
     // Load syscall return value into x0
     ldr     x0, [sp, #280]
     
-    // Cleanup stack frame (304 bytes)
-    add     sp, sp, #304
+    // Cleanup stack frame (832 bytes)
+    add     sp, sp, #832
     
     // Return to user mode
     eret
@@ -245,34 +255,42 @@ sync_el0_handler:
 // UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 // 
-// EL0 IRQ frame layout (304 bytes total):
-//   [sp+0]:   x30 + padding
-//   [sp+16]:  x28, x29
-//   [sp+32]:  x26, x27
-//   [sp+48]:  x24, x25
-//   [sp+64]:  x22, x23
-//   [sp+80]:  x20, x21
-//   [sp+96]:  x18, x19
-//   [sp+112]: x16, x17
-//   [sp+128]: x14, x15
-//   [sp+144]: x12, x13
-//   [sp+160]: x8, x9
-//   [sp+176]: x6, x7
-//   [sp+192]: x4, x5
-//   [sp+208]: x2, x3
-//   [sp+224]: x0, x1
-//   [sp+240]: ELR_EL1, SPSR_EL1
-//   [sp+256]: SP_EL0 + padding
-//   [sp+272]: TPIDR_EL0 + padding
+// EL0 IRQ frame layout (832 bytes total):
+//   [sp+0]:   x30 + padding           (GPR block: 304 bytes)
+//   ...
 //   [sp+288]: x10, x11
+//   [sp+304]: Q0-Q31, FPCR, FPSR      (NEON block: 528 bytes)
 irq_el0_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
-    // EL0 IRQ frame: 304 bytes (includes SP_EL0, TPIDR_EL0)
+    // EL0 IRQ frame: 832 bytes (GPR + NEON/FP)
     // ============================================================
     
     // First save x10, x11 (need them for system registers)
     stp     x10, x11, [sp, #-16]!
+
+    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
+    sub     sp, sp, #528
+    stp     q0,  q1,  [sp, #0]
+    stp     q2,  q3,  [sp, #32]
+    stp     q4,  q5,  [sp, #64]
+    stp     q6,  q7,  [sp, #96]
+    stp     q8,  q9,  [sp, #128]
+    stp     q10, q11, [sp, #160]
+    stp     q12, q13, [sp, #192]
+    stp     q14, q15, [sp, #224]
+    stp     q16, q17, [sp, #256]
+    stp     q18, q19, [sp, #288]
+    stp     q20, q21, [sp, #320]
+    stp     q22, q23, [sp, #352]
+    stp     q24, q25, [sp, #384]
+    stp     q26, q27, [sp, #416]
+    stp     q28, q29, [sp, #448]
+    stp     q30, q31, [sp, #480]
+    mrs     x10, fpcr
+    mrs     x11, fpsr
+    str     x10, [sp, #512]
+    str     x11, [sp, #520]
 
     // Save TPIDR_EL0 (TLS thread pointer)
     mrs     x10, tpidr_el0
@@ -361,6 +379,29 @@ irq_el0_handler:
     // Restore TPIDR_EL0 (TLS thread pointer)
     ldr     x10, [sp], #16
     msr     tpidr_el0, x10
+
+    // Restore NEON/FP state
+    ldr     x10, [sp, #512]
+    ldr     x11, [sp, #520]
+    msr     fpcr, x10
+    msr     fpsr, x11
+    ldp     q0,  q1,  [sp, #0]
+    ldp     q2,  q3,  [sp, #32]
+    ldp     q4,  q5,  [sp, #64]
+    ldp     q6,  q7,  [sp, #96]
+    ldp     q8,  q9,  [sp, #128]
+    ldp     q10, q11, [sp, #160]
+    ldp     q12, q13, [sp, #192]
+    ldp     q14, q15, [sp, #224]
+    ldp     q16, q17, [sp, #256]
+    ldp     q18, q19, [sp, #288]
+    ldp     q20, q21, [sp, #320]
+    ldp     q22, q23, [sp, #352]
+    ldp     q24, q25, [sp, #384]
+    ldp     q26, q27, [sp, #416]
+    ldp     q28, q29, [sp, #448]
+    ldp     q30, q31, [sp, #480]
+    add     sp, sp, #528
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16
@@ -371,34 +412,41 @@ irq_el0_handler:
 // UNIFIED: Stack-based save/restore, same frame layout as EL0 IRQ handler.
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 //
-// UNIFIED IRQ frame layout (304 bytes total) - same as EL0:
-//   [sp+0]:   x30 + padding
-//   [sp+16]:  x28, x29
-//   [sp+32]:  x26, x27
-//   [sp+48]:  x24, x25
-//   [sp+64]:  x22, x23
-//   [sp+80]:  x20, x21
-//   [sp+96]:  x18, x19
-//   [sp+112]: x16, x17
-//   [sp+128]: x14, x15
-//   [sp+144]: x12, x13
-//   [sp+160]: x8, x9
-//   [sp+176]: x6, x7
-//   [sp+192]: x4, x5
-//   [sp+208]: x2, x3
-//   [sp+224]: x0, x1
-//   [sp+240]: ELR_EL1, SPSR_EL1
-//   [sp+256]: SP_EL0 + padding
-//   [sp+272]: TPIDR_EL0 + padding
-//   [sp+288]: x10, x11
+// UNIFIED IRQ frame layout (832 bytes total) - same as EL0:
+//   [sp+0..303]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
+//   [sp+304..831]: NEON block (Q0-Q31, FPCR, FPSR)
+//   [sp+832..847]: x10, x11 (scratch, outermost)
 irq_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
-    // IRQ frame: 304 bytes total (unified with EL0 handler)
+    // IRQ frame: 832 bytes total (unified with EL0 handler)
     // ============================================================
     
     // First save x10, x11 (need them for system registers)
     stp     x10, x11, [sp, #-16]!
+
+    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
+    sub     sp, sp, #528
+    stp     q0,  q1,  [sp, #0]
+    stp     q2,  q3,  [sp, #32]
+    stp     q4,  q5,  [sp, #64]
+    stp     q6,  q7,  [sp, #96]
+    stp     q8,  q9,  [sp, #128]
+    stp     q10, q11, [sp, #160]
+    stp     q12, q13, [sp, #192]
+    stp     q14, q15, [sp, #224]
+    stp     q16, q17, [sp, #256]
+    stp     q18, q19, [sp, #288]
+    stp     q20, q21, [sp, #320]
+    stp     q22, q23, [sp, #352]
+    stp     q24, q25, [sp, #384]
+    stp     q26, q27, [sp, #416]
+    stp     q28, q29, [sp, #448]
+    stp     q30, q31, [sp, #480]
+    mrs     x10, fpcr
+    mrs     x11, fpsr
+    str     x10, [sp, #512]
+    str     x11, [sp, #520]
 
     // Save TPIDR_EL0 (TLS thread pointer)
     mrs     x10, tpidr_el0
@@ -488,6 +536,29 @@ irq_handler:
     // Restore TPIDR_EL0 (TLS thread pointer)
     ldr     x10, [sp], #16
     msr     tpidr_el0, x10
+
+    // Restore NEON/FP state
+    ldr     x10, [sp, #512]
+    ldr     x11, [sp, #520]
+    msr     fpcr, x10
+    msr     fpsr, x11
+    ldp     q0,  q1,  [sp, #0]
+    ldp     q2,  q3,  [sp, #32]
+    ldp     q4,  q5,  [sp, #64]
+    ldp     q6,  q7,  [sp, #96]
+    ldp     q8,  q9,  [sp, #128]
+    ldp     q10, q11, [sp, #160]
+    ldp     q12, q13, [sp, #192]
+    ldp     q14, q15, [sp, #224]
+    ldp     q16, q17, [sp, #256]
+    ldp     q18, q19, [sp, #288]
+    ldp     q20, q21, [sp, #320]
+    ldp     q22, q23, [sp, #352]
+    ldp     q24, q25, [sp, #384]
+    ldp     q26, q27, [sp, #416]
+    ldp     q28, q29, [sp, #448]
+    ldp     q30, q31, [sp, #480]
+    add     sp, sp, #528
     
     // Restore original x10, x11
     ldp     x10, x11, [sp], #16
@@ -551,9 +622,9 @@ pub fn get_current_exception_stack() -> u64 {
 /// Initialize the exception stack pointer for the boot thread
 /// Must be called before any user mode code runs
 pub fn init_exception_stack() {
-    // Boot thread (thread 0) uses the boot stack at 0x42000000
+    // Boot thread (thread 0) uses the boot stack at 0x40800000
     // Its exception stack is at the very top
-    let boot_stack_top = 0x42000000u64;
+    let boot_stack_top = 0x40800000u64;
     set_current_exception_stack(boot_stack_top);
 }
 

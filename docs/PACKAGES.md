@@ -4,22 +4,23 @@ This document describes the package management system in Akuma for userspace bin
 
 ## Overview
 
-Akuma includes a simple package manager (`pkg`) that downloads and installs userspace binaries from an HTTP server. Packages are ELF binaries built for the `aarch64-unknown-none` target and installed to `/bin/`.
+Akuma includes a simple package manager (`pkg`) that downloads and installs userspace binaries from an HTTP server. Packages are ELF binaries or tar archives served over HTTP and installed to `/bin/`.
+
+All downloads use **streaming I/O** — data is written to disk in 4 KB chunks as it arrives from the network, so the kernel heap footprint stays constant regardless of file size. This allows installing multi-megabyte binaries (e.g. `llama-cli`) without OOM panics on the 32 MB kernel heap.
 
 ## Architecture
 
 ```
-┌─────────────────────┐     HTTP GET      ┌─────────────────────┐
-│     Akuma Shell     │ ───────────────▶  │   Python HTTP       │
-│     (pkg install)   │                   │   Server (port 8000)│
-└─────────────────────┘                   └─────────────────────┘
-         │                                          │
-         │                                          │
-         ▼                                          ▼
-┌─────────────────────┐                   ┌─────────────────────┐
-│      /bin/<pkg>     │                   │ userspace/target/   │
-│   (installed ELF)   │                   │ aarch64-.../release │
-└─────────────────────┘                   └─────────────────────┘
+┌─────────────────────┐   HTTP GET (streaming)   ┌─────────────────────┐
+│     Akuma Shell     │ ──────────────────────▶  │   Python HTTP       │
+│     (pkg install)   │   4 KB chunks → disk     │   Server (port 8000)│
+└─────────────────────┘                          └─────────────────────┘
+         │                                                │
+         ▼                                                ▼
+┌─────────────────────┐                          ┌─────────────────────┐
+│      /bin/<pkg>     │                          │   Served directory  │
+│   (installed ELF)   │                          │   (bin/, archives/) │
+└─────────────────────┘                          └─────────────────────┘
 ```
 
 ## Using the Package Manager
@@ -30,25 +31,19 @@ Akuma includes a simple package manager (`pkg`) that downloads and installs user
 pkg install <package1> [package2] ...
 ```
 
-This downloads binaries from `http://10.0.2.2:8000/target/aarch64-unknown-none/release/<package>` and saves them to `/bin/<package>`. Multiple packages can be specified in a single command, and they will be installed one by one. If one package fails to install, the process will continue with the remaining packages.
+The package manager tries two strategies in order:
+
+1. **Binary**: downloads `http://10.0.2.2:8000/bin/<package>` and saves to `/bin/<package>`
+2. **Archive**: downloads `http://10.0.2.2:8000/archives/<package>.tar.gz` (or `.tar`), extracts to `/`
+
+Multiple packages can be specified in a single command. If one package fails to install, the process continues with the remaining packages.
 
 ### Examples
 
 ```
-pkg install stdcheck
+pkg install dash
+pkg install tar
 pkg install echo2 hello
-```
-
-### Running Without Arguments
-
-Running `pkg` without arguments shows usage information:
-
-```
-Usage: pkg install <package1> [package2] ...
-
-Examples:
-  pkg install stdcheck
-  pkg install echo2 hello
 ```
 
 ## Userspace Package Structure
@@ -90,10 +85,19 @@ Binaries are output to `userspace/target/aarch64-unknown-none/release/`.
 
 ## Serving Packages
 
-To make packages available for `pkg install`, run a web server from the userspace directory:
+To make packages available for `pkg install`, run a web server from a directory containing `bin/` and/or `archives/` subdirectories:
 
 ```bash
-cd userspace
+# Example layout:
+# packages/
+# ├── bin/
+# │   ├── dash
+# │   ├── tar
+# │   └── llama-cli
+# └── archives/
+#     └── sbase.tar.gz
+
+cd packages
 python3 -m http.server 8000
 ```
 
@@ -168,15 +172,11 @@ pkg install mypackage
 
 ### "Error downloading" or connection refused
 
-Ensure the Python HTTP server is running on port 8000 from the `userspace/` directory.
+Ensure the Python HTTP server is running on port 8000 and is accessible from QEMU via `10.0.2.2`.
 
 ### "Empty response"
 
-The package binary may not exist. Verify the package is built:
-
-```bash
-ls userspace/target/aarch64-unknown-none/release/
-```
+The package binary may not exist on the server. Verify the file is present in the served directory.
 
 ### Package not found after install
 
@@ -185,4 +185,8 @@ Check that the binary was written to `/bin/`:
 ```
 ls /bin
 ```
+
+### Historical: OOM on large downloads
+
+Prior to the streaming download fix, `pkg install` buffered entire HTTP responses in a kernel-heap `Vec<u8>`. Downloads larger than ~10 MB would trigger OOM panics like `memory allocation of 13475840 bytes failed`. This was fixed by streaming data through a `FileWriter` that appends 4 KB chunks to disk.
 

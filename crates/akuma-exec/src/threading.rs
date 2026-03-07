@@ -785,9 +785,13 @@ unsafe extern "C" {
 /// Magic value for Context integrity check
 pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
 
-/// Size of the UNIFIED IRQ frame saved on stack (304 bytes)
+/// Size of the UNIFIED IRQ frame saved on stack (832 bytes)
 /// Both EL0 and EL1 IRQ handlers now use this same layout.
-pub const IRQ_FRAME_SIZE: usize = 304;
+/// Layout: 288 bytes GPR (x0-x30, ELR, SPSR, SP_EL0, TPIDR, x10/x11)
+///       + 16 bytes padding/alignment (total GPR block = 304)
+///       + 528 bytes NEON/FP (Q0-Q31 + FPCR + FPSR)
+/// The NEON block sits between the TPIDR push and x10/x11 in the frame.
+pub const IRQ_FRAME_SIZE: usize = 304 + 528;
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
@@ -813,7 +817,8 @@ pub const IRQ_FRAME_SIZE: usize = 304;
 ///   [sp+240]: ELR, SPSR
 ///   [sp+256]: SP_EL0 + padding
 ///   [sp+272]: TPIDR_EL0 + padding
-///   [sp+288]: x10, x11
+///   [sp+288..815]: NEON/FP (Q0-Q31, FPCR, FPSR) — 528 bytes, zeroed
+///   [sp+816]: x10, x11
 /// 
 /// Returns the SP value pointing to the fake IRQ frame
 pub fn setup_fake_irq_frame(
@@ -827,30 +832,22 @@ pub fn setup_fake_irq_frame(
     let frame = frame_base as *mut u64;
     
     unsafe {
-        // Zero the frame first
+        // Zero the entire frame (GPR + NEON + x10/x11)
         core::ptr::write_bytes(frame as *mut u8, 0, IRQ_FRAME_SIZE);
         
-        // Write registers at their offsets (offset / 8 = index)
+        // GPR block at [sp+0..287] — offsets unchanged from before
         // [sp+0]: x30 - return address after thread_start_closure returns
         frame.add(0).write_volatile(thread_exit_stub as *const () as u64);
-        
-        // [sp+16]: x28, x29 - frame pointer and x28
-        frame.add(2).write_volatile(0);  // x28
-        frame.add(3).write_volatile(0);  // x29 (frame pointer)
         
         // [sp+80]: x20, x21
         frame.add(10).write_volatile(x20);  // x20 - closure data
         frame.add(11).write_volatile(x21);  // x21 - IRQ enable flag
         
         // [sp+96]: x18, x19
-        frame.add(12).write_volatile(0);    // x18
         frame.add(13).write_volatile(x19);  // x19 - trampoline
         
         // [sp+240]: ELR, SPSR
         frame.add(30).write_volatile(entry_point);  // ELR - where to jump
-        // SPSR bits: [9:7]=DAI masks, [6]=F mask, [3:0]=M (EL1h=5)
-        // 0x345 = F=1, I=0 (IRQ enabled), A=1, D=1
-        // 0x3C5 = F=1, I=1 (IRQ disabled), A=1, D=1
         let spsr = if x21 != 0 {
             0x000003C5  // EL1h, IRQs DISABLED
         } else {
@@ -858,15 +855,7 @@ pub fn setup_fake_irq_frame(
         };
         frame.add(31).write_volatile(spsr);
         
-        // [sp+256]: SP_EL0 + padding (user stack pointer, 0 for new threads)
-        frame.add(32).write_volatile(0);  // SP_EL0
-
-        // [sp+272]: TPIDR_EL0 + padding (user thread pointer, 0 for new threads)
-        frame.add(34).write_volatile(0);  // TPIDR_EL0
-        
-        // [sp+288]: x10, x11
-        frame.add(36).write_volatile(0);  // x10
-        frame.add(37).write_volatile(0);  // x11
+        // NEON block at [sp+288..815] and x10/x11 at [sp+816] are all zero from write_bytes
     }
     
     frame_base
@@ -1163,9 +1152,9 @@ impl ThreadPool {
 
         // Boot stack info (fixed location from boot.rs)
         // The boot stack was already in use before threading init, starting at
-        // 0x42000000 and growing down. We CANNOT reserve space at the top.
-        let _boot_stack_top = 0x42000000u64; // STACK_TOP from boot.rs
-        let boot_stack_base = 0x41F00000usize; // STACK_TOP - STACK_SIZE = 0x42000000 - 0x100000
+        // 0x40800000 and growing down. We CANNOT reserve space at the top.
+        let _boot_stack_top = 0x40800000u64; // STACK_TOP from boot.rs
+        let boot_stack_base = 0x40700000usize; // STACK_TOP - STACK_SIZE = 0x40800000 - 0x100000
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             boot_stack_base,
             config().kernel_stack_size,
@@ -1185,7 +1174,7 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
         
         // CRITICAL: Update TPIDR_EL1 to point to Thread 0's new exception stack!
-        // exceptions::init() set it to 0x42000000 (boot stack top) initially,
+        // exceptions::init() set it to 0x40800000 (boot stack top) initially,
         // but we've now allocated a proper exception stack from the heap.
         // Without this, the first IRQ would use the wrong exception stack pointer.
         set_current_exception_stack(self.slots[IDLE_THREAD_IDX].exception_stack_top);
