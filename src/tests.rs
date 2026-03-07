@@ -3516,7 +3516,7 @@ fn make_test_process(
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_terminal::TerminalState::default(),
         )),
-        box_id: 0, root_dir: String::from("/"),
+        box_id: 0, namespace: akuma_isolation::global_namespace(),
         channel: None, delegate_pid: None, clear_child_tid: 0,
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: [akuma_exec::process::SignalAction::default(); akuma_exec::process::MAX_SIGNALS],

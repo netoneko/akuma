@@ -1633,8 +1633,8 @@ pub struct Process {
     // ========== Isolation Context ==========
     /// Box ID (0 = Host, >0 = Isolated Box)
     pub box_id: u64,
-    /// Virtual Root Directory (host path that acts as / for this process)
-    pub root_dir: String,
+    /// Per-process namespace (mount + network isolation)
+    pub namespace: Arc<akuma_isolation::Namespace>,
 
     /// I/O Channel for async/interactive communication
     pub channel: Option<Arc<ProcessChannel>>,
@@ -1882,9 +1882,8 @@ impl Process {
             // Terminal State - default for new processes
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
 
-            // Isolation defaults: Host context (Box 0, root at /)
             box_id: 0,
-            root_dir: String::from("/"),
+            namespace: akuma_isolation::global_namespace(),
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
@@ -1980,7 +1979,7 @@ impl Process {
             spawner_pid: None,
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
             box_id: 0,
-            root_dir: String::from("/"),
+            namespace: akuma_isolation::global_namespace(),
             channel: None,
             delegate_pid: None,
             clear_child_tid: 0,
@@ -1995,7 +1994,7 @@ impl Process {
 
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let interp_prefix = if self.root_dir != "/" { Some(self.root_dir.as_str()) } else { None };
+        let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)
             .map_err(|_| "Failed to load ELF")?;
@@ -2054,7 +2053,7 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let interp_prefix = if self.root_dir != "/" { Some(self.root_dir.as_str()) } else { None };
+        let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)
             .map_err(|_| "Failed to load ELF")?;
@@ -2876,7 +2875,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         spawner_pid: parent.spawner_pid,
         terminal_state: parent.terminal_state.clone(),
         box_id: parent.box_id,
-        root_dir: parent.root_dir.clone(),
+        namespace: parent.namespace.clone(),
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: 0,
@@ -3098,7 +3097,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         spawner_pid: parent.spawner_pid,
         terminal_state: parent.terminal_state.clone(),
         box_id: parent.box_id,
-        root_dir: parent.root_dir.clone(),
+        namespace: parent.namespace.clone(),
         channel: parent.channel.clone(),
         delegate_pid: None,
         clear_child_tid: child_tid_ptr,
@@ -3309,7 +3308,7 @@ pub fn spawn_process_with_channel_cwd(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    spawn_process_with_channel_ext(path, args, env, stdin, cwd, None, 0)
+    spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0)
 }
 
 /// Extended version of spawn_process_with_channel
@@ -3319,29 +3318,27 @@ pub fn spawn_process_with_channel_ext(
     env: Option<&[String]>,
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
-    root_dir: Option<&str>,
     box_id: u64,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    // Check if user threads are available
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
     }
 
-    // When root_dir is set (container context), resolve the binary path
-    // within the container's rootfs, but keep argv[0] as the original path
-    // so multi-call binaries (e.g. busybox) can identify the applet.
-    let actual_path = match root_dir {
-        Some(root) if root != "/" => {
-            let mut p = String::from(root);
-            if !p.ends_with('/') && !path.starts_with('/') {
-                p.push('/');
-            }
-            p.push_str(path);
-            p
-        }
-        _ => String::from(path),
+    // If the box has a namespace with mounts (SubdirFs at /), activate a
+    // per-thread namespace override so that runtime().read_file and
+    // resolve_symlinks go through the container's mount table.
+    let container_ns = if box_id != 0 {
+        (runtime().get_box_namespace)(box_id)
+    } else {
+        None
     };
-    let resolved = (runtime().resolve_symlinks)(&actual_path);
+    let use_ns_override = container_ns.as_ref().is_some_and(|ns| !ns.mount.lock().is_empty());
+
+    if use_ns_override {
+        (runtime().set_spawn_namespace)(container_ns.as_ref().unwrap().clone());
+    }
+
+    let resolved = (runtime().resolve_symlinks)(path);
     let elf_path = &resolved;
 
     let mut full_args = Vec::new();
@@ -3357,22 +3354,21 @@ pub fn spawn_process_with_channel_ext(
         _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
     };
 
-    // Try to read the ELF file; for large files that exceed the in-memory
-    // limit, fall back to on-demand loading via read_at().
-    let interp_prefix = match root_dir {
-        Some(r) if r != "/" => Some(r),
-        _ => None,
-    };
     let mut process = match (runtime().read_file)(elf_path) {
         Ok(elf_data) => {
-            Process::from_elf(elf_path, &full_args, &full_env, &elf_data, interp_prefix)
-                .map_err(|e| format!("Failed to load ELF: {}", e))?
+            let result = Process::from_elf(elf_path, &full_args, &full_env, &elf_data, None);
+            if use_ns_override { (runtime().clear_spawn_namespace)(); }
+            result.map_err(|e| format!("Failed to load ELF: {}", e))?
         }
         Err(_) => {
             let file_size = (runtime().file_size)(elf_path)
-                .map_err(|e| format!("Failed to stat {}: {}", elf_path, e))? as usize;
-            Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, interp_prefix)
-                .map_err(|e| format!("Failed to load ELF: {}", e))?
+                .map_err(|e| {
+                    if use_ns_override { (runtime().clear_spawn_namespace)(); }
+                    format!("Failed to stat {}: {}", elf_path, e)
+                })? as usize;
+            let result = Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, None);
+            if use_ns_override { (runtime().clear_spawn_namespace)(); }
+            result.map_err(|e| format!("Failed to load ELF: {}", e))?
         }
     };
 
@@ -3429,33 +3425,31 @@ pub fn spawn_process_with_channel_ext(
     }
 
     // Set up isolation context (Inherit from caller by default)
-    let (caller_box_id, caller_root_dir) = match read_current_pid() {
+    let (caller_box_id, caller_namespace) = match read_current_pid() {
         Some(pid) => {
             if let Some(proc) = lookup_process(pid) {
-                (proc.box_id, proc.root_dir.clone())
+                (proc.box_id, proc.namespace.clone())
             } else {
-                (0, String::from("/"))
+                (0, akuma_isolation::global_namespace())
             }
         }
-        None => (0, String::from("/")), // Kernel context
+        None => (0, akuma_isolation::global_namespace()),
     };
-
-    if let Some(root) = root_dir {
-        process.root_dir = String::from(root);
-    } else {
-        process.root_dir = caller_root_dir;
-    }
 
     if box_id != 0 {
         process.box_id = box_id;
+        if let Some(ns) = (runtime().get_box_namespace)(box_id) {
+            process.namespace = ns;
+        } else {
+            process.namespace = caller_namespace;
+        }
     } else {
-        // Note: box_id 0 means "unspecified" in the arg, 
-        // so we inherit unless it's explicitly 0 from a non-boxed caller.
         process.box_id = caller_box_id;
+        process.namespace = caller_namespace;
     }
 
     if config().syscall_debug_info_enabled {
-        log::debug!("[Process] Spawning {} (box_id={}, root_dir={})", path, process.box_id, process.root_dir);
+        log::debug!("[Process] Spawning {} (box_id={}, ns_id={})", path, process.box_id, process.namespace.id);
     }
 
     // Set spawner PID (the process that called spawn, if any)

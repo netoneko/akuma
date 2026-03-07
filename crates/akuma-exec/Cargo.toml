@@ -11,4 +11,5 @@ spinning_top = "0.3"
 log = { version = "0.4", default-features = false }
 elf = { version = "0.7", default-features = false }
 akuma-terminal = { path = "../akuma-terminal" }
+akuma-isolation = { path = "../akuma-isolation" }
 embedded-io-async = { version = "0.6", default-features = false }

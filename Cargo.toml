@@ -46,6 +46,7 @@ akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
 akuma-net = { path = "crates/akuma-net" }
 akuma-exec = { path = "crates/akuma-exec" }
+akuma-isolation = { path = "crates/akuma-isolation" }
 talc = "4"
 spinning_top = "0.3"
 # hashbrown without ahash (ahash requires CPU crypto extensions)

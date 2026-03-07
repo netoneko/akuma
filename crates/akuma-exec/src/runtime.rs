@@ -86,6 +86,11 @@ pub struct ExecRuntime {
     pub resolve_symlinks: fn(&str) -> alloc::string::String,
     pub file_size: fn(&str) -> Result<u64, &'static str>,
 
+    // Namespace lookup (for container spawn)
+    pub get_box_namespace: fn(u64) -> Option<alloc::sync::Arc<akuma_isolation::Namespace>>,
+    pub set_spawn_namespace: fn(alloc::sync::Arc<akuma_isolation::Namespace>),
+    pub clear_spawn_namespace: fn(),
+
     // Console fallback
     pub print_str: fn(&str),
 }

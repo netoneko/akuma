@@ -383,6 +383,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             eventfd_close: |_id| {},
             resolve_symlinks: |path| crate::vfs::resolve_symlinks(path),
             file_size: |path| crate::fs::file_size(path).map_err(|_| "fs error"),
+            get_box_namespace: |box_id| crate::vfs::get_box_namespace(box_id),
+            set_spawn_namespace: crate::vfs::set_spawn_namespace,
+            clear_spawn_namespace: crate::vfs::clear_spawn_namespace,
             print_str: console::print,
         },
         akuma_exec::ExecConfig {

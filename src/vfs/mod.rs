@@ -19,6 +19,8 @@ pub use akuma_vfs::{
     canonicalize_path, resolve_path, split_path,
 };
 
+pub use akuma_isolation::Namespace;
+
 // ============================================================================
 // Mount Table (kernel-side global)
 // ============================================================================
@@ -26,123 +28,73 @@ pub use akuma_vfs::{
 static MOUNT_TABLE: Spinlock<Option<akuma_vfs::MountTable>> = Spinlock::new(None);
 
 // ============================================================================
-// Per-box Mount Namespaces
+// Per-box Namespaces
 // ============================================================================
 
-static MOUNT_NAMESPACES: Spinlock<BTreeMap<u64, MountNamespace>> = Spinlock::new(BTreeMap::new());
+static BOX_NAMESPACES: Spinlock<BTreeMap<u64, Arc<Namespace>>> = Spinlock::new(BTreeMap::new());
 
-const MAX_NS_MOUNTS: usize = 8;
+/// Per-thread namespace override for ELF loading during spawn.
+/// When set, `with_fs` uses this namespace instead of the calling process's.
+static SPAWN_NS_OVERRIDE: Spinlock<BTreeMap<usize, Arc<Namespace>>> = Spinlock::new(BTreeMap::new());
 
-/// Per-box mount namespace. Each box can have its own set of mounts
-/// (e.g., /proc, /tmp) that override the global mount table for processes
-/// in that box. Paths are box-local (pre-root_dir-scoping).
-pub struct MountNamespace {
-    mounts: Vec<NsMountEntry>,
+/// Set a namespace override for the current thread. All `with_fs` calls
+/// on this thread will resolve through the given namespace until cleared.
+pub fn set_spawn_namespace(ns: Arc<Namespace>) {
+    let tid = akuma_exec::threading::current_thread_id();
+    SPAWN_NS_OVERRIDE.lock().insert(tid, ns);
 }
 
-struct NsMountEntry {
-    path: String,
-    fs: Arc<dyn Filesystem>,
+/// Clear the namespace override for the current thread.
+pub fn clear_spawn_namespace() {
+    let tid = akuma_exec::threading::current_thread_id();
+    SPAWN_NS_OVERRIDE.lock().remove(&tid);
 }
 
-impl MountNamespace {
-    pub fn new() -> Self {
-        Self {
-            mounts: Vec::with_capacity(MAX_NS_MOUNTS),
+/// Create a new namespace for a box and return a shared reference.
+/// If `root_dir` is non-"/" and the global root filesystem is available,
+/// a `SubdirFs` scoped to `root_dir` is mounted at `/` in the new namespace.
+pub fn create_box_namespace(box_id: u64, root_dir: &str) -> Arc<Namespace> {
+    let ns = Arc::new(Namespace::new(box_id));
+    if root_dir != "/" {
+        if let Some(root_fs) = get_root_fs() {
+            let subdir = Arc::new(akuma_isolation::subdir_fs::SubdirFs::new(root_fs, root_dir));
+            let _ = ns.mount.lock().mount("/", subdir);
         }
     }
-
-    pub fn mount(&mut self, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
-        if self.mounts.len() >= MAX_NS_MOUNTS {
-            return Err(FsError::NoSpace);
-        }
-        if self.mounts.iter().any(|m| m.path == path) {
-            return Err(FsError::AlreadyExists);
-        }
-        self.mounts.push(NsMountEntry {
-            path: String::from(path),
-            fs,
-        });
-        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
-        Ok(())
-    }
-
-    pub fn unmount(&mut self, path: &str) -> Result<(), FsError> {
-        let idx = self
-            .mounts
-            .iter()
-            .position(|m| m.path == path)
-            .ok_or(FsError::NotFound)?;
-        self.mounts.remove(idx);
-        Ok(())
-    }
-
-    fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a dyn Filesystem, &'a str)> {
-        let normalized = path.trim_end_matches('/');
-        let normalized = if normalized.is_empty() { "/" } else { normalized };
-
-        for mount in &self.mounts {
-            if mount.path == "/" {
-                return Some((mount.fs.as_ref(), normalized));
-            }
-            if normalized == mount.path {
-                return Some((mount.fs.as_ref(), "/"));
-            }
-            if normalized.starts_with(&mount.path[..]) {
-                let rest = &normalized[mount.path.len()..];
-                if rest.is_empty() {
-                    return Some((mount.fs.as_ref(), "/"));
-                }
-                if rest.starts_with('/') {
-                    return Some((mount.fs.as_ref(), rest));
-                }
-            }
-        }
-
-        None
-    }
-
-    #[allow(dead_code)]
-    pub fn list_mounts(&self) -> Vec<MountInfo> {
-        self.mounts
-            .iter()
-            .map(|m| MountInfo {
-                path: m.path.clone(),
-                fs_type: String::from(m.fs.name()),
-            })
-            .collect()
-    }
+    BOX_NAMESPACES.lock().insert(box_id, ns.clone());
+    ns
 }
 
-/// Create a new mount namespace for a box.
-pub fn create_mount_namespace(box_id: u64) {
-    MOUNT_NAMESPACES.lock().insert(box_id, MountNamespace::new());
+/// Remove a box's namespace from the registry.
+pub fn remove_box_namespace(box_id: u64) {
+    BOX_NAMESPACES.lock().remove(&box_id);
 }
 
-/// Remove a box's mount namespace.
-pub fn remove_mount_namespace(box_id: u64) {
-    MOUNT_NAMESPACES.lock().remove(&box_id);
+/// Look up a box's namespace.
+pub fn get_box_namespace(box_id: u64) -> Option<Arc<Namespace>> {
+    BOX_NAMESPACES.lock().get(&box_id).cloned()
 }
 
 /// Mount a filesystem into a specific box's namespace.
 pub fn mount_in_namespace(box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
-    let mut namespaces = MOUNT_NAMESPACES.lock();
-    let ns = namespaces.get_mut(&box_id).ok_or(FsError::NotFound)?;
-    ns.mount(path, fs)
+    let namespaces = BOX_NAMESPACES.lock();
+    let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
+    ns.mount.lock().mount(path, fs)
 }
 
 /// Unmount a path from a specific box's namespace.
+#[allow(dead_code)]
 pub fn unmount_in_namespace(box_id: u64, path: &str) -> Result<(), FsError> {
-    let mut namespaces = MOUNT_NAMESPACES.lock();
-    let ns = namespaces.get_mut(&box_id).ok_or(FsError::NotFound)?;
-    ns.unmount(path)
+    let namespaces = BOX_NAMESPACES.lock();
+    let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
+    ns.mount.lock().unmount(path)
 }
 
 /// List mounts in a specific box's namespace.
 #[allow(dead_code)]
 pub fn list_namespace_mounts(box_id: u64) -> Vec<MountInfo> {
-    let namespaces = MOUNT_NAMESPACES.lock();
-    namespaces.get(&box_id).map_or_else(Vec::new, |ns| ns.list_mounts())
+    let namespaces = BOX_NAMESPACES.lock();
+    namespaces.get(&box_id).map_or_else(Vec::new, |ns| ns.mount.lock().list_mounts())
 }
 
 /// Normalize path with allocation (adds leading / if missing)
@@ -176,6 +128,12 @@ pub fn mount(path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
     table.mount(path, fs)
 }
 
+/// Get the `Arc<dyn Filesystem>` for a global mount point (e.g., "/" for ext2).
+pub fn get_root_fs() -> Option<Arc<dyn Filesystem>> {
+    let table = MOUNT_TABLE.lock();
+    table.as_ref().and_then(|t| t.get_fs("/"))
+}
+
 // ============================================================================
 // Public API - File Operations (delegates to mounted filesystems)
 // ============================================================================
@@ -183,42 +141,42 @@ pub fn mount(path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
 /// Helper to get filesystem for a path.
 ///
 /// Resolution order:
-/// 1. Resolve relative path against CWD to get an absolute path
-/// 2. If the process is in a box (box_id > 0), check the box-local mount
-///    namespace first (using the pre-scoped absolute path)
-/// 3. Apply root_dir scoping (prepend root_dir to path)
-/// 4. Resolve against the global (host) mount table
+/// 1. Check per-thread spawn namespace override (used during ELF loading)
+/// 2. Resolve relative path against CWD to get an absolute path
+/// 3. Try the process's mount namespace
+/// 4. Fall back to the global mount table
 fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
+    // Check spawn namespace override (set during container ELF loading)
+    {
+        let tid = akuma_exec::threading::current_thread_id();
+        let overrides = SPAWN_NS_OVERRIDE.lock();
+        if let Some(ns) = overrides.get(&tid) {
+            let cwd = akuma_exec::process::current_process()
+                .map_or_else(|| String::from("/"), |p| p.cwd.clone());
+            let absolute = resolve_path(&cwd, path);
+            let ns_mount = ns.mount.lock();
+            if let Some((fs, rel)) = ns_mount.resolve(&absolute) {
+                return f(fs, rel);
+            }
+        }
+    }
+
     if let Some(proc) = akuma_exec::process::current_process() {
         let absolute = resolve_path(&proc.cwd, path);
 
-        // Check box-local mount namespace before root_dir scoping
-        if proc.box_id > 0 {
-            let namespaces = MOUNT_NAMESPACES.lock();
-            if let Some(ns) = namespaces.get(&proc.box_id) {
-                if let Some((fs, rel)) = ns.resolve(&absolute) {
-                    return f(fs, rel);
-                }
+        {
+            let ns_mount = proc.namespace.mount.lock();
+            if let Some((fs, rel)) = ns_mount.resolve(&absolute) {
+                return f(fs, rel);
             }
         }
 
-        // Fall through to root_dir scoping + global mount table
-        let normalized = if proc.root_dir != "/" {
-            if proc.root_dir.ends_with('/') {
-                format!("{}{}", proc.root_dir, &absolute[1..])
-            } else {
-                format!("{}{}", proc.root_dir, absolute)
-            }
-        } else {
-            absolute
-        };
-
         let table = MOUNT_TABLE.lock();
         let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-        let (fs, relative_path) = table.resolve(&normalized).ok_or(FsError::NotFound)?;
+        let (fs, relative_path) = table.resolve(&absolute).ok_or(FsError::NotFound)?;
         f(fs, relative_path)
     } else {
         let normalized = normalize_path_owned(path);
@@ -325,19 +283,10 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.chmod(rel, mode))
 }
 
-/// Resolve a path to its fully-scoped form (applies CWD + root_dir).
-fn scope_path(path: &str) -> String {
+/// Resolve a path to its absolute form through the process's CWD.
+fn resolve_absolute(path: &str) -> String {
     if let Some(proc) = akuma_exec::process::current_process() {
-        let abs = resolve_path(&proc.cwd, path);
-        if proc.root_dir != "/" {
-            if proc.root_dir.ends_with('/') {
-                format!("{}{}", proc.root_dir, &abs[1..])
-            } else {
-                format!("{}{}", proc.root_dir, abs)
-            }
-        } else {
-            abs
-        }
+        resolve_path(&proc.cwd, path)
     } else {
         normalize_path_owned(path)
     }
@@ -345,14 +294,24 @@ fn scope_path(path: &str) -> String {
 
 /// Rename/move a file or directory
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
-    let old_full = scope_path(old_path);
-    let new_full = scope_path(new_path);
+    let old_abs = resolve_absolute(old_path);
+    let new_abs = resolve_absolute(new_path);
+
+    // Try process namespace first
+    if let Some(proc) = akuma_exec::process::current_process() {
+        let ns_mount = proc.namespace.mount.lock();
+        if let (Some((old_fs, old_rel)), Some((_, new_rel))) =
+            (ns_mount.resolve(&old_abs), ns_mount.resolve(&new_abs))
+        {
+            return old_fs.rename(old_rel, new_rel);
+        }
+    }
 
     let table = MOUNT_TABLE.lock();
     let table = table.as_ref().ok_or(FsError::NotInitialized)?;
 
-    let (old_fs, old_rel) = table.resolve(&old_full).ok_or(FsError::NotFound)?;
-    let (new_fs, new_rel) = table.resolve(&new_full).ok_or(FsError::NotFound)?;
+    let (old_fs, old_rel) = table.resolve(&old_abs).ok_or(FsError::NotFound)?;
+    let (new_fs, new_rel) = table.resolve(&new_abs).ok_or(FsError::NotFound)?;
 
     if old_fs.name() != new_fs.name() {
         return Err(FsError::NotSupported);
@@ -454,44 +413,13 @@ pub fn resolve_symlinks(path: &str) -> String {
 fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
     let mut entries = Vec::new();
 
-    // If the current process is in a box, include mount points from its namespace
     if let Some(proc) = akuma_exec::process::current_process() {
-        if proc.box_id > 0 {
-            let namespaces = MOUNT_NAMESPACES.lock();
-            if let Some(ns) = namespaces.get(&proc.box_id) {
-                let parent = parent_path.trim_end_matches('/');
-                let parent = if parent.is_empty() { "/" } else { parent };
-                for m in &ns.mounts {
-                    if m.path == "/" || m.path == parent {
-                        continue;
-                    }
-                    if parent == "/" {
-                        if m.path.starts_with('/') && !m.path[1..].contains('/') {
-                            entries.push(DirEntry {
-                                name: String::from(&m.path[1..]),
-                                is_dir: true,
-                                size: 0,
-                            });
-                        }
-                    } else {
-                        let prefix = format!("{}/", parent);
-                        if m.path.starts_with(&prefix) {
-                            let rest = &m.path[prefix.len()..];
-                            if !rest.contains('/') {
-                                entries.push(DirEntry {
-                                    name: String::from(rest),
-                                    is_dir: true,
-                                    size: 0,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+        let ns_mount = proc.namespace.mount.lock();
+        for entry in ns_mount.child_mount_points(parent_path) {
+            entries.push(entry);
         }
     }
 
-    // Also include global mount table entries
     let table = MOUNT_TABLE.lock();
     if let Some(t) = table.as_ref() {
         for entry in t.child_mount_points(parent_path) {

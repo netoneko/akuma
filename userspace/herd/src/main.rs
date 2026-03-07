@@ -699,7 +699,6 @@ fn register_box(name: &str, box_id: u64, root_dir: &str, primary_pid: u32) {
 
 fn spawn_in_box(
     box_id: u64,
-    root_dir: &str,
     command: &str,
     args: &[&str],
 ) -> Option<SpawnResult> {
@@ -714,8 +713,8 @@ fn spawn_in_box(
     let options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
         cwd_len: 1,
-        root_dir_ptr: root_dir.as_ptr() as u64,
-        root_dir_len: root_dir.len(),
+        root_dir_ptr: 0,
+        root_dir_len: 0,
         args_ptr,
         args_len,
         stdin_ptr: 0,
@@ -830,8 +829,8 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         // 2. Set up OCI mounts in the box's namespace
         setup_oci_mounts(box_id, &oci.mounts);
 
-        // 3. Spawn the main process
-        let res = spawn_in_box(box_id, &root_dir, &command, &args);
+        // 3. Spawn the main process (namespace handles path resolution)
+        let res = spawn_in_box(box_id, &command, &args);
         if let Some(ref r) = res {
             register_box(name, box_id, &root_dir, r.pid);
         }
@@ -840,7 +839,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let box_id = generate_box_id(name);
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         register_box(name, box_id, &config.box_root, 0);
-        let res = spawn_in_box(box_id, &config.box_root, &config.command, &args);
+        let res = spawn_in_box(box_id, &config.command, &args);
         if let Some(ref r) = res {
             register_box(name, box_id, &config.box_root, r.pid);
         }

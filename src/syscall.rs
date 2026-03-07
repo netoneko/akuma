@@ -4665,8 +4665,7 @@ fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root
         primary_pid,
     });
 
-    // Create a mount namespace for this box
-    crate::vfs::create_mount_namespace(id);
+    crate::vfs::create_box_namespace(id, root);
 
     0
 }
@@ -4804,12 +4803,6 @@ fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, 
         None
     };
 
-    let root_dir = if o.root_dir_ptr != 0 {
-        Some(unsafe { core::str::from_utf8(core::slice::from_raw_parts(o.root_dir_ptr as *const u8, o.root_dir_len)).unwrap_or("/") })
-    } else {
-        None
-    };
-
     let args_vec = parse_argv_array(o.args_ptr);
     let args_refs: Vec<&str> = if args_vec.len() > 1 {
         args_vec.iter().skip(1).map(|s| s.as_str()).collect()
@@ -4824,8 +4817,7 @@ fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, 
         None
     };
 
-    // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin, cwd, o.box_id) {
         if let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
@@ -4842,8 +4834,7 @@ fn sys_kill(pid: u32, _sig: u32) -> u64 {
 }
 
 fn sys_kill_box(box_id: u64) -> u64 {
-    // Remove the mount namespace before killing processes
-    crate::vfs::remove_mount_namespace(box_id);
+    crate::vfs::remove_box_namespace(box_id);
 
     if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
 }
@@ -4874,20 +4865,20 @@ fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _flags: u64, _d
         }
     };
 
-    let box_id = akuma_exec::process::current_process()
-        .map(|p| p.box_id)
-        .unwrap_or(0);
-
-    if box_id == 0 {
-        match crate::vfs::mount(&target, fs) {
-            Ok(()) => 0,
-            Err(_) => EINVAL,
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if proc.box_id == 0 {
+            match crate::vfs::mount(&target, fs) {
+                Ok(()) => 0,
+                Err(_) => EINVAL,
+            }
+        } else {
+            match proc.namespace.mount.lock().mount(&target, fs) {
+                Ok(()) => 0,
+                Err(_) => EINVAL,
+            }
         }
     } else {
-        match crate::vfs::mount_in_namespace(box_id, &target, fs) {
-            Ok(()) => 0,
-            Err(_) => EINVAL,
-        }
+        EPERM
     }
 }
 
@@ -4900,17 +4891,17 @@ fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
         Err(e) => return e,
     };
 
-    let box_id = akuma_exec::process::current_process()
-        .map(|p| p.box_id)
-        .unwrap_or(0);
-
-    if box_id == 0 {
-        EPERM
-    } else {
-        match crate::vfs::unmount_in_namespace(box_id, &target) {
-            Ok(()) => 0,
-            Err(_) => EINVAL,
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if proc.box_id == 0 {
+            EPERM
+        } else {
+            match proc.namespace.mount.lock().unmount(&target) {
+                Ok(()) => 0,
+                Err(_) => EINVAL,
+            }
         }
+    } else {
+        EPERM
     }
 }
 

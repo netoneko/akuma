@@ -1,48 +1,40 @@
-//! Mount table — maps paths to filesystem implementations.
-
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::types::{DirEntry, Filesystem, FsError, MountInfo};
+use akuma_vfs::{DirEntry, Filesystem, FsError, MountInfo};
 
-const MAX_MOUNTS: usize = 8;
+const MAX_NS_MOUNTS: usize = 16;
 
-struct MountEntry {
+pub struct MountNamespace {
+    mounts: Vec<NsMountEntry>,
+}
+
+struct NsMountEntry {
     path: String,
     fs: Arc<dyn Filesystem>,
 }
 
-/// A table of mounted filesystems.
-///
-/// Not global — the kernel owns the singleton and provides process-aware
-/// path resolution on top.
-pub struct MountTable {
-    mounts: Vec<MountEntry>,
-}
-
-impl MountTable {
+impl MountNamespace {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            mounts: Vec::with_capacity(MAX_MOUNTS),
+            mounts: Vec::with_capacity(MAX_NS_MOUNTS),
         }
     }
 
     pub fn mount(&mut self, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
-        if self.mounts.len() >= MAX_MOUNTS {
+        if self.mounts.len() >= MAX_NS_MOUNTS {
             return Err(FsError::NoSpace);
         }
         if self.mounts.iter().any(|m| m.path == path) {
             return Err(FsError::AlreadyExists);
         }
-        self.mounts.push(MountEntry {
+        self.mounts.push(NsMountEntry {
             path: String::from(path),
             fs,
         });
-        self.mounts
-            .sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
         Ok(())
     }
 
@@ -56,10 +48,14 @@ impl MountTable {
         Ok(())
     }
 
-    /// Resolve an **absolute** path to `(filesystem, relative_path)`.
-    #[must_use] 
+    #[must_use]
     pub fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a dyn Filesystem, &'a str)> {
-        let normalized = normalize_path(path);
+        let normalized = path.trim_end_matches('/');
+        let normalized = if normalized.is_empty() {
+            "/"
+        } else {
+            normalized
+        };
 
         for mount in &self.mounts {
             if mount.path == "/" {
@@ -68,7 +64,7 @@ impl MountTable {
             if normalized == mount.path {
                 return Some((mount.fs.as_ref(), "/"));
             }
-            if normalized.starts_with(&mount.path) {
+            if normalized.starts_with(&mount.path[..]) {
                 let rest = &normalized[mount.path.len()..];
                 if rest.is_empty() {
                     return Some((mount.fs.as_ref(), "/"));
@@ -82,7 +78,6 @@ impl MountTable {
         None
     }
 
-    /// List all mounted filesystems.
     #[must_use]
     pub fn list_mounts(&self) -> Vec<MountInfo> {
         self.mounts
@@ -94,30 +89,28 @@ impl MountTable {
             .collect()
     }
 
-    /// Get mount points that are direct children of a directory.
     #[must_use]
     pub fn child_mount_points(&self, parent_path: &str) -> Vec<DirEntry> {
-        let parent = normalize_path(parent_path);
         let mut entries = Vec::new();
+        let parent = parent_path.trim_end_matches('/');
+        let parent = if parent.is_empty() { "/" } else { parent };
 
-        for mount in &self.mounts {
-            if mount.path == "/" || mount.path == parent {
+        for m in &self.mounts {
+            if m.path == "/" || m.path == parent {
                 continue;
             }
-            let mount_path = mount.path.as_str();
-
             if parent == "/" {
-                if mount_path.starts_with('/') && !mount_path[1..].contains('/') {
+                if m.path.starts_with('/') && !m.path[1..].contains('/') {
                     entries.push(DirEntry {
-                        name: String::from(&mount_path[1..]),
+                        name: String::from(&m.path[1..]),
                         is_dir: true,
                         size: 0,
                     });
                 }
             } else {
-                let prefix = format!("{parent}/");
-                if mount_path.starts_with(&prefix) {
-                    let rest = &mount_path[prefix.len()..];
+                let prefix = alloc::format!("{parent}/");
+                if m.path.starts_with(&prefix) {
+                    let rest = &m.path[prefix.len()..];
                     if !rest.contains('/') {
                         entries.push(DirEntry {
                             name: String::from(rest),
@@ -132,29 +125,14 @@ impl MountTable {
         entries
     }
 
-    /// Get the `Arc<dyn Filesystem>` mounted at a specific path.
     #[must_use]
-    pub fn get_fs(&self, path: &str) -> Option<Arc<dyn Filesystem>> {
-        let normalized = normalize_path(path);
-        self.mounts.iter().find(|m| m.path == normalized).map(|m| m.fs.clone())
-    }
-
-    /// Sync all mounted filesystems.
-    pub fn sync_all(&self) -> Result<(), FsError> {
-        for mount in &self.mounts {
-            mount.fs.sync()?;
-        }
-        Ok(())
+    pub const fn is_empty(&self) -> bool {
+        self.mounts.is_empty()
     }
 }
 
-impl Default for MountTable {
+impl Default for MountNamespace {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn normalize_path(path: &str) -> &str {
-    let path = path.trim_end_matches('/');
-    if path.is_empty() { "/" } else { path }
 }

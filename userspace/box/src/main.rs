@@ -296,7 +296,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
     if let Some(path) = cmd_path {
         let mut options = SpawnOptions {
             cwd_ptr: working_dir.as_ptr() as u64, cwd_len: working_dir.len(),
-            root_dir_ptr: directory.as_ptr() as u64, root_dir_len: directory.len(),
+            root_dir_ptr: 0, root_dir_len: 0,
             args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
         };
 
@@ -372,7 +372,7 @@ fn cmd_use(args: libakuma::Args) -> ! {
 
     let mut options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
-        root_dir_ptr: target_root.as_ptr() as u64, root_dir_len: target_root.len(),
+        root_dir_ptr: 0, root_dir_len: 0,
         args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: target_id,
     };
 

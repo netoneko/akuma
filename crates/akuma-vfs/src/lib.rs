@@ -17,5 +17,7 @@ pub use mount::MountTable;
 pub use path::{canonicalize_path, path_components, resolve_path, split_path};
 pub use types::{DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo};
 
+pub const FS_MAX_PATH_SIZE: usize = 512;
+
 #[cfg(test)]
 mod tests;

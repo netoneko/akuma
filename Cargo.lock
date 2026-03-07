@@ -44,6 +44,7 @@ dependencies = [
  "aes",
  "akuma-exec",
  "akuma-ext2",
+ "akuma-isolation",
  "akuma-net",
  "akuma-shell",
  "akuma-ssh",
@@ -78,6 +79,7 @@ dependencies = [
 name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
+ "akuma-isolation",
  "akuma-terminal",
  "elf",
  "embedded-io-async",
@@ -87,6 +89,14 @@ dependencies = [
 
 [[package]]
 name = "akuma-ext2"
+version = "0.1.0"
+dependencies = [
+ "akuma-vfs",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-isolation"
 version = "0.1.0"
 dependencies = [
  "akuma-vfs",
