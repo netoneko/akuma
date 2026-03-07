@@ -1667,6 +1667,7 @@ pub struct Process {
 /// Indexed directly by syscall number for zero-overhead tracking.
 pub struct ProcessSyscallStats {
     counts: [AtomicU64; Self::MAX_NR],
+    times_us: [AtomicU64; Self::MAX_NR],
     pub pagefaults: AtomicU64,
     pub pagefault_pages: AtomicU64,
 }
@@ -1677,6 +1678,7 @@ impl ProcessSyscallStats {
     pub const fn new() -> Self {
         Self {
             counts: [const { AtomicU64::new(0) }; Self::MAX_NR],
+            times_us: [const { AtomicU64::new(0) }; Self::MAX_NR],
             pagefaults: AtomicU64::new(0),
             pagefault_pages: AtomicU64::new(0),
         }
@@ -1686,6 +1688,13 @@ impl ProcessSyscallStats {
         let idx = nr as usize;
         if idx < Self::MAX_NR {
             self.counts[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_time_us(&self, nr: u64, us: u64) {
+        let idx = nr as usize;
+        if idx < Self::MAX_NR {
+            self.times_us[idx].fetch_add(us, Ordering::Relaxed);
         }
     }
 
@@ -1699,17 +1708,21 @@ impl ProcessSyscallStats {
         use alloc::vec::Vec;
 
         let mut total: u64 = 0;
-        let mut entries: Vec<(usize, u64)> = Vec::new();
+        let mut total_time_us: u64 = 0;
+        let mut entries: Vec<(usize, u64, u64)> = Vec::new();
         for i in 0..Self::MAX_NR {
             let c = self.counts[i].load(Ordering::Relaxed);
             if c > 0 {
+                let t = self.times_us[i].load(Ordering::Relaxed);
                 total += c;
-                entries.push((i, c));
+                total_time_us += t;
+                entries.push((i, c, t));
             }
         }
         if total == 0 { return; }
 
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by time spent (descending) — shows the slowest syscalls first
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
 
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000;
@@ -1719,20 +1732,22 @@ impl ProcessSyscallStats {
         let pf_pg = self.pagefault_pages.load(Ordering::Relaxed);
 
         let mut top = alloc::string::String::new();
-        for (i, (nr, count)) in entries.iter().enumerate() {
+        for (i, (nr, count, time)) in entries.iter().enumerate() {
             if i > 0 { top.push(' '); }
-            let name = syscall_name(*nr);
-            if name.is_empty() {
-                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("nr{}={}", nr, count));
+            let sname = syscall_name(*nr);
+            let time_ms = *time / 1000;
+            if sname.is_empty() {
+                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("nr{}={}({}ms)", nr, count, time_ms));
             } else {
-                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("{}={}", name, count));
+                let _ = core::fmt::Write::write_fmt(&mut top, format_args!("{}={}({}ms)", sname, count, time_ms));
             }
             if i >= 9 { break; }
         }
 
+        let total_time_ms = total_time_us / 1000;
         let msg = format!(
-            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) pmm={}free/{}tot pgfault={}({}pg) | {}\n",
-            pid, name, secs, frac, total, rate,
+            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) in_kernel={}ms pmm={}free/{}tot pgfault={}({}pg) | {}\n",
+            pid, name, secs, frac, total, rate, total_time_ms,
             pmm_free, pmm_total, pf, pf_pg, top,
         );
         (runtime().print_str)(&msg);

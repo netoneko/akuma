@@ -26,6 +26,8 @@ fn main() {
         .arg(&src_dir)
         .arg("-DCMAKE_C_COMPILER=aarch64-linux-musl-gcc")
         .arg("-DCMAKE_CXX_COMPILER=aarch64-linux-musl-g++")
+        .arg("-DCMAKE_C_FLAGS=-march=armv8.2-a+fp16+dotprod")
+        .arg("-DCMAKE_CXX_FLAGS=-march=armv8.2-a+fp16+dotprod")
         .arg("-DCMAKE_EXE_LINKER_FLAGS=-static -Wl,--entry=_start")
         .arg("-DCMAKE_SYSTEM_NAME=Linux")
         .arg("-DCMAKE_SYSTEM_PROCESSOR=aarch64")

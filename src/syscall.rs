@@ -1020,12 +1020,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         _ => { syscall_counters::inc_other(syscall_num); }
     }
 
-    if crate::config::PROCESS_SYSCALL_STATS {
+    let track_time = crate::config::PROCESS_SYSCALL_STATS;
+    if track_time {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
             proc.syscall_stats.inc(syscall_num);
         }
     }
+
+    let t0 = if track_time { crate::timer::uptime_us() } else { 0 };
 
     let result = match syscall_num {
         nr::EXIT => sys_exit(args[0] as i32),
@@ -1230,6 +1233,14 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
     };
+
+    if track_time {
+        let elapsed = crate::timer::uptime_us().saturating_sub(t0);
+        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+            proc.syscall_stats.add_time_us(syscall_num, elapsed);
+        }
+    }
 
     result
 }
