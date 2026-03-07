@@ -1094,7 +1094,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => sys_clear_screen(),
         nr::POLL_INPUT_EVENT => sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => sys_get_cpu_stats(args[0], args[1] as usize),
-        nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1] as usize, args[2], args[3], args[4], args[5]),
+        nr::SPAWN_EXT => sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
         nr::REGISTER_BOX => sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         nr::KILL_BOX => sys_kill_box(args[0] as u64),
         nr::REATTACH => sys_reattach(args[0] as u32),
@@ -4773,17 +4773,16 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_
     !0u64
 }
 
-fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
-    if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
-    
-    let path = unsafe { core::str::from_utf8(core::slice::from_raw_parts(path_ptr as *const u8, path_len)).unwrap_or("") };
-    
-    let options = if options_ptr != 0 {
-        Some(unsafe { &*(options_ptr as *const SpawnOptions) })
-    } else {
-        None
+fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
     };
+
+    if options_ptr == 0 { return !0u64; }
+    if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
+
+    let options = Some(unsafe { &*(options_ptr as *const SpawnOptions) });
 
     if options.is_none() { return !0u64; }
     let o = options.unwrap();
@@ -4815,7 +4814,7 @@ fn sys_spawn_ext(path_ptr: u64, path_len: usize, options_ptr: u64, _a3: u64, _a4
     };
 
     // Call internal helper with extended options
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin, cwd, root_dir, o.box_id) {
         if let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);

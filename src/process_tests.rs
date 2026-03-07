@@ -167,7 +167,7 @@ fn test_echo2() {
             );
 
             // Try to create a process from the ELF
-            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &[], &data) {
+            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &[], &data, None) {
                 Ok(proc) => {
                     crate::safe_print!(96, 
                         "[Test] Process created: PID={}, entry={:#x}\n",

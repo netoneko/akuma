@@ -157,8 +157,10 @@ const R_AARCH64_GLOB_DAT: u32 = 1025;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE: u32 = 1027;
 
-/// Load an ELF binary from memory
-pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
+/// Load an ELF binary from memory.
+/// `interp_prefix` is prepended to the PT_INTERP path when loading the dynamic
+/// linker (used for container rootfs where the interpreter lives under a prefix).
+pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
     // Parse ELF header
     let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
         .map_err(|_| ElfError::InvalidFormat("Parse failed"))?;
@@ -348,11 +350,20 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             entry_point, brk, mapped_pages.len());
     }
 
-    let interp = if let Some(ref path) = interp_path {
+    let interp = if let Some(ref ipath) = interp_path {
+        let resolved_interp = match interp_prefix {
+            Some(prefix) => {
+                let mut p = String::from(prefix);
+                if !p.ends_with('/') && !ipath.starts_with('/') { p.push('/'); }
+                p.push_str(ipath);
+                p
+            }
+            None => ipath.clone(),
+        };
         if DEBUG_ELF_LOADING {
-            log::debug!("[ELF] Loading interpreter: {}", path);
+            log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        let interp_data = (runtime().read_file)(path)
+        let interp_data = (runtime().read_file)(&resolved_interp)
             .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
         let interp_info = load_interpreter(&interp_data, &mut address_space)?;
         if DEBUG_ELF_LOADING {
@@ -696,8 +707,9 @@ pub fn load_elf_with_stack(
     args: &[String],
     env: &[String],
     stack_size: usize,
+    interp_prefix: Option<&str>,
 ) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
-    let mut loaded = load_elf(elf_data)?;
+    let mut loaded = load_elf(elf_data, interp_prefix)?;
     let has_interp = loaded.interp.is_some();
     let stack_top = compute_stack_top(loaded.brk, has_interp);
     let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
@@ -853,7 +865,7 @@ fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, Elf
 /// Load an ELF binary on demand from a file path, reading segment data
 /// page-by-page via read_at() instead of buffering the entire file.
 /// Supports PIE (ET_DYN) and non-PIE (ET_EXEC) without relocations.
-pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, ElfError> {
+pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
     let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
     let ehdr = parse_elf64_ehdr(&hdr_buf)?;
 
@@ -998,10 +1010,19 @@ pub fn load_elf_from_path(path: &str, file_size: usize) -> Result<LoadedElf, Elf
     }
 
     let interp = if let Some(ref ipath) = interp_path {
+        let resolved_interp = match interp_prefix {
+            Some(prefix) => {
+                let mut p = String::from(prefix);
+                if !p.ends_with('/') && !ipath.starts_with('/') { p.push('/'); }
+                p.push_str(ipath);
+                p
+            }
+            None => ipath.clone(),
+        };
         if DEBUG_ELF_LOADING {
-            log::debug!("[ELF] Loading interpreter: {}", ipath);
+            log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        let interp_data = (runtime().read_file)(ipath)
+        let interp_data = (runtime().read_file)(&resolved_interp)
             .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
         let interp_info = load_interpreter(&interp_data, &mut address_space)?;
         if DEBUG_ELF_LOADING {
@@ -1031,8 +1052,9 @@ pub fn load_elf_with_stack_from_path(
     args: &[String],
     env: &[String],
     stack_size: usize,
+    interp_prefix: Option<&str>,
 ) -> Result<(usize, UserAddressSpace, usize, usize, usize, usize, usize, Vec<DeferredLazySegment>), ElfError> {
-    let mut loaded = load_elf_from_path(path, file_size)?;
+    let mut loaded = load_elf_from_path(path, file_size, interp_prefix)?;
     let has_interp = loaded.interp.is_some();
     let stack_top = compute_stack_top(loaded.brk, has_interp);
     let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };

@@ -1813,9 +1813,9 @@ fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
 
 impl Process {
     /// Create a new process from ELF data
-    pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8]) -> Result<Self, ElfError> {
+    pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
-            elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size)?;
+            elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
@@ -1898,7 +1898,7 @@ impl Process {
     }
 
     /// Create a process from a large ELF file on disk, loading segments on demand.
-    pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<Self, ElfError> {
+    pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         {
             let (allocated, heap_size) = (runtime().heap_stats)();
             log::debug!("[Process] heap before ELF load: {}MB / {}MB ({}%)",
@@ -1906,7 +1906,7 @@ impl Process {
                 if heap_size > 0 { allocated * 100 / heap_size } else { 0 });
         }
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
-            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size)?;
+            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)?;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
@@ -1995,8 +1995,9 @@ impl Process {
 
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
-        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) = 
-            crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size)
+        let interp_prefix = if self.root_dir != "/" { Some(self.root_dir.as_str()) } else { None };
+        let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
+            crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)
             .map_err(|_| "Failed to load ELF")?;
             
         mmu::UserAddressSpace::deactivate();
@@ -2053,8 +2054,9 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
+        let interp_prefix = if self.root_dir != "/" { Some(self.root_dir.as_str()) } else { None };
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
-            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size)
+            crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)
             .map_err(|_| "Failed to load ELF")?;
 
         mmu::UserAddressSpace::deactivate();
@@ -3325,11 +3327,23 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
-    let resolved = (runtime().resolve_symlinks)(path);
+    // When root_dir is set (container context), resolve the binary path
+    // within the container's rootfs, but keep argv[0] as the original path
+    // so multi-call binaries (e.g. busybox) can identify the applet.
+    let actual_path = match root_dir {
+        Some(root) if root != "/" => {
+            let mut p = String::from(root);
+            if !p.ends_with('/') && !path.starts_with('/') {
+                p.push('/');
+            }
+            p.push_str(path);
+            p
+        }
+        _ => String::from(path),
+    };
+    let resolved = (runtime().resolve_symlinks)(&actual_path);
     let elf_path = &resolved;
 
-    // Prepare full arguments (argv[0] = original path so busybox-style
-    // multi-call binaries can identify which applet to run)
     let mut full_args = Vec::new();
     full_args.push(path.to_string());
     if let Some(arg_slice) = args {
@@ -3345,15 +3359,19 @@ pub fn spawn_process_with_channel_ext(
 
     // Try to read the ELF file; for large files that exceed the in-memory
     // limit, fall back to on-demand loading via read_at().
+    let interp_prefix = match root_dir {
+        Some(r) if r != "/" => Some(r),
+        _ => None,
+    };
     let mut process = match (runtime().read_file)(elf_path) {
         Ok(elf_data) => {
-            Process::from_elf(elf_path, &full_args, &full_env, &elf_data)
+            Process::from_elf(elf_path, &full_args, &full_env, &elf_data, interp_prefix)
                 .map_err(|e| format!("Failed to load ELF: {}", e))?
         }
         Err(_) => {
             let file_size = (runtime().file_size)(elf_path)
                 .map_err(|e| format!("Failed to stat {}: {}", elf_path, e))? as usize;
-            Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env)
+            Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, interp_prefix)
                 .map_err(|e| format!("Failed to load ELF: {}", e))?
         }
     };

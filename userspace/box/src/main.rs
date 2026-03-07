@@ -1,7 +1,7 @@
 //! box - Container management utility
 //!
 //! Usage:
-//!   box open <name> [--root <dir>] [--image <name>] [-i] [-d] [cmd] [args...]
+//!   box open <name> [--root <dir>] [-i/--image <name>] [-I] [-d] [cmd] [args...]
 //!   box pull <image>
 //!   box images
 //!   box cp <source> <destination>
@@ -114,7 +114,7 @@ pub extern "C" fn main() {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box open <name> [-i] [-d] [--root <dir>] [--image <img>] [cmd] [args...]  Start a box\n");
+    print("  box open <name> [-i <img>] [-d] [--root <dir>] [cmd] [args...]             Start a box\n");
     print("  box pull <image>                                          Pull an OCI image\n");
     print("  box images                                                List pulled images\n");
     print("  box use <name|id> [-i] [-d] <cmd> [args...]               Run in box\n");
@@ -208,7 +208,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
     let mut args = args.peekable();
     let name = match args.next() {
         Some(n) => n,
-        None => { print("Usage: box open <name> [-i] [-d] [--root <dir>] [--image <img>] [cmd] [args...]\n"); exit(1); }
+        None => { print("Usage: box open <name> [-i <img>] [-d] [--root <dir>] [cmd] [args...]\n"); exit(1); }
     };
 
     let mut directory = String::from("/");
@@ -222,11 +222,11 @@ fn cmd_open(args: libakuma::Args) -> ! {
     while let Some(arg) = args.next() {
         if arg == "--root" || arg == "-r" {
             directory = String::from(args.next().unwrap_or("/"));
-        } else if arg == "--image" {
+        } else if arg == "--image" || arg == "-i" {
             image_name = Some(String::from(args.next().unwrap_or_else(|| {
                 print("box open: --image requires a value\n"); exit(1);
             })));
-        } else if arg == "-i" || arg == "--interactive" {
+        } else if arg == "-I" || arg == "--interactive" {
             interactive = true;
         } else if arg == "-d" || arg == "--detached" {
             detached = true;
@@ -288,6 +288,10 @@ fn cmd_open(args: libakuma::Args) -> ! {
     if box_id == 0 { box_id = 1; }
 
     libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
+
+    if cmd_path.is_some() && !detached {
+        interactive = true;
+    }
 
     if let Some(path) = cmd_path {
         let mut options = SpawnOptions {
