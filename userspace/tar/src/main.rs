@@ -7,9 +7,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::{self, exit, args, print, println, print_dec, eprintln, open, close, read_fd, write_fd, mkdir_p, open_flags};
+use libakuma::{self, exit, args, print, println, print_dec, eprintln, open, close, read_fd, write_fd, mkdir_p, open_flags, symlink};
 use miniz_oxide::inflate;
-use tar_no_std::TarArchiveRef;
 
 #[no_mangle]
 pub extern "C" fn main() {

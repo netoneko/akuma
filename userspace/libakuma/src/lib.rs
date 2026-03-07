@@ -66,6 +66,7 @@ pub mod syscall {
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
+    pub const SYMLINKAT: u64 = 36;
     pub const RENAMEAT: u64 = 38;
     pub const GETRANDOM: u64 = 278;
     // Custom syscalls
@@ -1080,6 +1081,19 @@ pub fn unlink(path: &str) -> i32 {
         0, // flags
         0,
         0, 0,
+    ) as i32
+}
+
+/// Create a symbolic link
+pub fn symlink(target: &str, link_path: &str) -> i32 {
+    let target_c = alloc::format!("{}\0", target);
+    let link_c = alloc::format!("{}\0", link_path);
+    syscall(
+        syscall::SYMLINKAT,
+        target_c.as_ptr() as u64,
+        -100i32 as u64, // AT_FDCWD
+        link_c.as_ptr() as u64,
+        0, 0, 0,
     ) as i32
 }
 
