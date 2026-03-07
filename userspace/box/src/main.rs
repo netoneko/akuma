@@ -1,7 +1,9 @@
 //! box - Container management utility
 //!
 //! Usage:
-//!   box open <name> [--root <dir>] [-i] [-d] [cmd] [args...]
+//!   box open <name> [--root <dir>] [--image <name>] [-i] [-d] [cmd] [args...]
+//!   box pull <image>
+//!   box images
 //!   box cp <source> <destination>
 //!   box ps
 //!   box use <name|id> [-i] [-d] <cmd> [args...]
@@ -17,11 +19,15 @@
 
 extern crate alloc;
 
+mod json;
+mod oci;
+mod images;
+mod tests;
+
 use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
-use core::iter::Peekable;
 
 #[repr(C)]
 pub struct SpawnOptions {
@@ -88,13 +94,15 @@ pub extern "C" fn main() {
 
     match command {
         "open" | "run" => cmd_open(args_iter),
+        "pull" => cmd_pull(args_iter),
+        "images" => cmd_images(),
         "cp" => cmd_cp(args_iter),
         "ps" => cmd_ps(),
         "use" | "exec" => cmd_use(args_iter),
         "grab" | "attach" => cmd_grab(args_iter),
         "close" | "stop" | "rm" => cmd_close(args_iter),
         "show" | "inspect" => cmd_show(args_iter),
-        "test" => cmd_test(),
+        "test" => cmd_test(args_iter),
         "help" | "--help" | "-h" => { print_usage(); exit(0); }
         _ => {
             print("box: unknown command '"); print(command); print("'\n");
@@ -106,14 +114,16 @@ pub extern "C" fn main() {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box open <name> [-i] [-d] [--root <dir>] [cmd] [args...]  Start a box\n");
+    print("  box open <name> [-i] [-d] [--root <dir>] [--image <img>] [cmd] [args...]  Start a box\n");
+    print("  box pull <image>                                          Pull an OCI image\n");
+    print("  box images                                                List pulled images\n");
     print("  box use <name|id> [-i] [-d] <cmd> [args...]               Run in box\n");
     print("  box grab <name|id> [pid]                                  Reattach to process\n");
     print("  box cp <source> <dest>                                    Copy directory\n");
     print("  box ps                                                    List active boxes\n");
     print("  box close <name|id>                                       Stop a box\n");
     print("  box show <name|id>                                        Display details\n");
-    print("  box test                                                  Run isolation tests\n");
+    print("  box test [--net]                                           Run tests (--net for network)\n");
 }
 
 fn resolve_target_id(target: &str) -> Option<u64> {
@@ -198,18 +208,24 @@ fn cmd_open(args: libakuma::Args) -> ! {
     let mut args = args.peekable();
     let name = match args.next() {
         Some(n) => n,
-        None => { print("Usage: box open <name> [-i] [-d] [--root <dir>] [cmd] [args...]\n"); exit(1); }
+        None => { print("Usage: box open <name> [-i] [-d] [--root <dir>] [--image <img>] [cmd] [args...]\n"); exit(1); }
     };
 
     let mut directory = String::from("/");
     let mut interactive = false;
     let mut detached = false;
+    let mut image_name: Option<String> = None;
     let mut cmd_path = None;
     let mut cmd_args = Vec::new();
+    let mut working_dir = String::from("/");
 
     while let Some(arg) = args.next() {
         if arg == "--root" || arg == "-r" {
             directory = String::from(args.next().unwrap_or("/"));
+        } else if arg == "--image" {
+            image_name = Some(String::from(args.next().unwrap_or_else(|| {
+                print("box open: --image requires a value\n"); exit(1);
+            })));
         } else if arg == "-i" || arg == "--interactive" {
             interactive = true;
         } else if arg == "-d" || arg == "--detached" {
@@ -221,6 +237,52 @@ fn cmd_open(args: libakuma::Args) -> ! {
         }
     }
 
+    if let Some(ref img) = image_name {
+        let store = images::sanitize_name(img);
+        if !images::image_exists(&store) {
+            print("box open: image '"); print(img); print("' not found. Run 'box pull "); print(img); print("' first.\n");
+            exit(1);
+        }
+        directory = images::rootfs_dir(&store);
+
+        if cmd_path.is_none() {
+            if let Some(config_json) = images::load_config(&store) {
+                if let Some(config_obj) = json::extract_object(&config_json, "config") {
+                    let entrypoint = json::extract_string_array(config_obj, "Entrypoint");
+                    let cmd = json::extract_string_array(config_obj, "Cmd");
+
+                    if let Some(wd) = json::extract_string(config_obj, "WorkingDir") {
+                        if !wd.is_empty() {
+                            working_dir = wd;
+                        }
+                    }
+
+                    let mut full_cmd: Vec<String> = Vec::new();
+                    if let Some(ep) = entrypoint {
+                        full_cmd.extend(ep);
+                    }
+                    if let Some(c) = cmd {
+                        full_cmd.extend(c);
+                    }
+
+                    if !full_cmd.is_empty() {
+                        cmd_path = None;
+                        let leaked: Vec<&'static str> = full_cmd.iter().map(|s| {
+                            let boxed = alloc::boxed::Box::leak(s.clone().into_boxed_str());
+                            &*boxed
+                        }).collect();
+                        if let Some((first, rest)) = leaked.split_first() {
+                            cmd_path = Some(*first);
+                            for r in rest {
+                                cmd_args.push(*r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut box_id = 0u64;
     for b in name.as_bytes() { box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64); }
     if box_id == 0 { box_id = 1; }
@@ -229,7 +291,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
 
     if let Some(path) = cmd_path {
         let mut options = SpawnOptions {
-            cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
+            cwd_ptr: working_dir.as_ptr() as u64, cwd_len: working_dir.len(),
             root_dir_ptr: directory.as_ptr() as u64, root_dir_len: directory.len(),
             args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
         };
@@ -538,112 +600,60 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
     exit(0);
 }
 
-fn cmd_test() -> ! {
-    println("--- Running Box Isolation Tests (Userspace) ---");
-
-    print("[Test 1] Blind Root Redirection... ");
-    let test_dir = "/tmp/boxtest";
-    let _ = mkdir_p(test_dir);
-    let _ = mkdir(&format!("{}/bin", test_dir));
-    
-    if !copy_file("/bin/cat", &format!("{}/bin/cat", test_dir)) {
-        println("FAILED: Could not copy /bin/cat to test dir"); exit(1);
+fn cmd_test(args: libakuma::Args) -> ! {
+    let mut network = false;
+    for arg in args {
+        if arg == "--net" || arg == "--network" {
+            network = true;
+        }
     }
 
-    let test_file = format!("{}/test.txt", test_dir);
-    let test_content = "Akuma Container Test 123";
-    let fd = open(&test_file, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd >= 0 { let _ = write_fd(fd, test_content.as_bytes()); close(fd); }
+    println("=== box test suite ===\n");
+    let ok = tests::run_all(network);
+    if ok {
+        println("\nAll tests passed.");
+        exit(0);
+    } else {
+        println("\nSome tests failed.");
+        exit(1);
+    }
+}
 
-    let box_id = 0x7E571;
-    let mut options = SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
-        root_dir_ptr: test_dir.as_ptr() as u64, root_dir_len: test_dir.len(),
-        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
+fn cmd_pull(mut args: libakuma::Args) -> ! {
+    let image = match args.next() {
+        Some(i) => i,
+        None => { print("Usage: box pull <image>\n"); exit(1); }
     };
 
-    let args = ["/test.txt"];
-    match spawn_ext("/bin/cat", Some(&args), None, &mut options) {
-        Some(res) => {
-            let mut output = Vec::new();
-            loop {
-                let mut buf = [0u8; 256];
-                let n = read_fd(res.stdout_fd as i32, &mut buf);
-                if n > 0 { output.extend_from_slice(&buf[..n as usize]); }
-                if let Some((_, _)) = waitpid(res.pid) { 
-                    loop {
-                        let n = read_fd(res.stdout_fd as i32, &mut buf);
-                        if n <= 0 { break; }
-                        output.extend_from_slice(&buf[..n as usize]);
-                    }
-                    break; 
-                }
-                libakuma::sleep_ms(10);
-            }
-            if core::str::from_utf8(&output).unwrap_or("").contains(test_content) { println("PASSED"); }
-            else {
-                println("FAILED: Output did not match");
-                print("Got: "); println(core::str::from_utf8(&output).unwrap_or("")); exit(1);
-            }
+    match oci::pull_image(image) {
+        Ok(()) => {
+            println("Done.");
+            exit(0);
         }
-        None => { println("FAILED: Could not spawn test process"); exit(1); }
-    }
-
-    print("[Test 2] ProcFS Isolation... ");
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd >= 0 { println("PASSED"); close(fd); }
-    else { println("FAILED: Cannot read /proc/boxes from host"); exit(1); }
-
-    print("[Test 3] Stdin/Stdout Pipeline... ");
-    let pipe_test_dir = "/tmp/pipetest";
-    let _ = mkdir_p(pipe_test_dir);
-    let _ = mkdir(&format!("{}/bin", pipe_test_dir));
-    if !copy_file("/bin/cat", &format!("{}/bin/cat", pipe_test_dir)) {
-        println("FAILED: Could not copy /bin/cat"); exit(1);
-    }
-
-    let mut pipe_options = SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
-        root_dir_ptr: pipe_test_dir.as_ptr() as u64, root_dir_len: pipe_test_dir.len(),
-        args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0,
-        box_id: 0x919E,
-    };
-
-    let pipe_input = "Hello through the pipe!";
-    match spawn_ext("/bin/cat", None, Some(pipe_input.as_bytes()), &mut pipe_options) {
-        Some(res) => {
-            let mut output = Vec::new();
-            let start_time = libakuma::uptime();
-            loop {
-                let mut buf = [0u8; 256];
-                let n = read_fd(res.stdout_fd as i32, &mut buf);
-                if n > 0 { output.extend_from_slice(&buf[..n as usize]); }
-                
-                if let Some((_, _)) = waitpid(res.pid) { 
-                    loop {
-                        let n = read_fd(res.stdout_fd as i32, &mut buf);
-                        if n <= 0 { break; }
-                        output.extend_from_slice(&buf[..n as usize]);
-                    }
-                    break; 
-                }
-
-                if libakuma::uptime() - start_time > 2_000_000 {
-                    println("FAILED: Timeout (2s)");
-                    libakuma::kill(res.pid);
-                    exit(1);
-                }
-                libakuma::sleep_ms(10);
-            }
-            if core::str::from_utf8(&output).unwrap_or("").contains(pipe_input) { println("PASSED"); }
-            else {
-                println("FAILED: Output did not match");
-                print("Got: "); println(core::str::from_utf8(&output).unwrap_or("")); exit(1);
-            }
+        Err(e) => {
+            print("box pull: ");
+            println(&e);
+            exit(1);
         }
-        None => { println("FAILED: Could not spawn"); exit(1); }
+    }
+}
+
+fn cmd_images() -> ! {
+    let imgs = images::list_images();
+    if imgs.is_empty() {
+        println("No images pulled. Use 'box pull <image>' to pull one.");
+        exit(0);
     }
 
-    println("--- All Tests Passed ---");
+    println("IMAGES");
+    println("------");
+    for name in &imgs {
+        let rootfs = images::rootfs_dir(name);
+        print("  ");
+        print(name);
+        print("  (");
+        print(&rootfs);
+        println(")");
+    }
     exit(0);
 }

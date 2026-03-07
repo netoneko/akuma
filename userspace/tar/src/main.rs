@@ -301,7 +301,10 @@ fn untar_in_memory(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
         println(" bytes");
     }
 
-    let decompressed_data = inflate::decompress_to_vec(&raw_data)
+    let deflate_data = strip_gzip_header(&raw_data)
+        .ok_or(TarError::GzipDecompressionError("invalid gzip header"))?;
+
+    let decompressed_data = inflate::decompress_to_vec(deflate_data)
         .map_err(|_| TarError::GzipDecompressionError("decompression failed"))?;
     drop(raw_data);
 
@@ -367,6 +370,39 @@ fn untar_in_memory(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
     println(" entries");
 
     Ok(())
+}
+
+/// Strip the gzip header to get raw DEFLATE data.
+/// Gzip format: 10-byte header + optional extras + DEFLATE stream + 8-byte trailer.
+fn strip_gzip_header(data: &[u8]) -> Option<&[u8]> {
+    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
+        return None;
+    }
+    let flg = data[3];
+    let mut pos: usize = 10;
+
+    if flg & 0x04 != 0 {
+        if pos + 2 > data.len() { return None; }
+        let xlen = data[pos] as usize | (data[pos + 1] as usize) << 8;
+        pos += 2 + xlen;
+    }
+    if flg & 0x08 != 0 {
+        while pos < data.len() && data[pos] != 0 { pos += 1; }
+        pos += 1;
+    }
+    if flg & 0x10 != 0 {
+        while pos < data.len() && data[pos] != 0 { pos += 1; }
+        pos += 1;
+    }
+    if flg & 0x02 != 0 {
+        pos += 2;
+    }
+
+    if pos >= data.len() { return None; }
+    // Strip the 8-byte trailer (CRC32 + ISIZE)
+    let end = if data.len() >= 8 { data.len() - 8 } else { data.len() };
+    if pos >= end { return None; }
+    Some(&data[pos..end])
 }
 
 // ============================================================================

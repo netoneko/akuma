@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libakuma = { path = "../libakuma" }
+libakuma-tls = { path = "../libakuma-tls" }
 
 [[bin]]
 name = "box"

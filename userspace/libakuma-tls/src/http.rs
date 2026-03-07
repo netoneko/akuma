@@ -965,3 +965,237 @@ impl<'a> HttpStreamTls<'a> {
         self.headers_parsed
     }
 }
+
+// ============================================================================
+// Download with Headers + Redirect Support
+// ============================================================================
+
+fn extract_location_header(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let lower: Vec<u8> = line.as_bytes().iter().take(9).map(|b| b.to_ascii_lowercase()).collect();
+        if lower.starts_with(b"location:") {
+            let value = line[9..].trim();
+            return Some(String::from(value));
+        }
+    }
+    None
+}
+
+fn parse_status_line(headers: &str) -> u16 {
+    headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_cl_header(headers: &str) -> Option<usize> {
+    headers.lines()
+        .find(|line| {
+            let lower: Vec<u8> = line.as_bytes().iter().take(16)
+                .map(|b| b.to_ascii_lowercase()).collect();
+            lower.starts_with(b"content-length:")
+        })
+        .and_then(|line| line.split(':').nth(1)?.trim().parse().ok())
+}
+
+/// Download a file from an HTTP/HTTPS URL with custom headers and redirect support.
+///
+/// Follows up to 5 HTTP 3xx redirects. Auth headers are stripped on redirect
+/// (the redirect target typically has its own auth via query parameters).
+pub fn download_file_with_headers(url: &str, dest_path: &str, headers: &HttpHeaders) -> Result<(), Error> {
+    download_with_redirects(url, dest_path, headers, 5)
+}
+
+fn download_with_redirects(url: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
+    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
+    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
+    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+    let stream = TcpStream::connect(&addr_str)
+        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
+
+    if parsed.is_https {
+        download_redirects_tls(stream, parsed.host, parsed.path, dest_path, headers, max_redirects)
+    } else {
+        download_redirects_tcp(stream, parsed.host, parsed.path, dest_path, headers, max_redirects)
+    }
+}
+
+fn read_until_headers_tls(tls: &mut TlsStream<'_>, hdr_buf: &mut Vec<u8>) -> Result<(), Error> {
+    let mut tmp = [0u8; 16384];
+    let mut retries = 0u32;
+    loop {
+        match tls.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                retries = 0;
+                hdr_buf.extend_from_slice(&tmp[..n]);
+                if find_headers_end(hdr_buf).is_some() { break; }
+                if hdr_buf.len() > MAX_HEADERS_BUFFER_SIZE {
+                    return Err(Error::HttpError(String::from("Headers too large")));
+                }
+            }
+            Err(Error::IoError) => {
+                retries += 1;
+                if retries >= 200 { return Err(Error::IoError); }
+                libakuma::sleep_ms(1);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn stream_body_to_fd_tls(tls: &mut TlsStream<'_>, fd: i32, initial: &[u8], content_length: Option<usize>) {
+    let mut written: usize = 0;
+    if !initial.is_empty() {
+        libakuma::write_fd(fd, initial);
+        written += initial.len();
+    }
+    if let Some(cl) = content_length {
+        if written >= cl { return; }
+    }
+    let mut tmp = [0u8; 16384];
+    let mut errors = 0u32;
+    loop {
+        match tls.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                errors = 0;
+                libakuma::write_fd(fd, &tmp[..n]);
+                written += n;
+                if let Some(cl) = content_length {
+                    if written >= cl { break; }
+                }
+            }
+            Err(Error::IoError) => {
+                errors += 1;
+                if errors >= 200 { break; }
+                libakuma::sleep_ms(1);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn download_redirects_tls(stream: TcpStream, host: &str, path: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
+    let transport = TcpTransport::new(stream);
+    let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+    let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+    let mut tls = TlsStream::connect(transport, host, &mut read_buf, &mut write_buf)?;
+
+    let request = build_get_request_with_headers(host, path, headers);
+    tls.write_all(request.as_bytes())?;
+    tls.flush()?;
+
+    let mut hdr_buf = Vec::new();
+    read_until_headers_tls(&mut tls, &mut hdr_buf)?;
+
+    let end = find_headers_end(&hdr_buf)
+        .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
+    let header_str = core::str::from_utf8(&hdr_buf[..end])
+        .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
+    let status = parse_status_line(header_str);
+
+    if status >= 300 && status < 400 && max_redirects > 0 {
+        if let Some(location) = extract_location_header(header_str) {
+            let _ = tls.close();
+            return download_with_redirects(&location, dest_path, &HttpHeaders::new(), max_redirects - 1);
+        }
+    }
+
+    if status < 200 || status >= 300 {
+        let _ = tls.close();
+        return Err(Error::HttpError(format!("HTTP error: {}", status)));
+    }
+
+    let content_length = parse_cl_header(header_str);
+    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
+    if fd < 0 { let _ = tls.close(); return Err(Error::IoError); }
+
+    stream_body_to_fd_tls(&mut tls, fd, &hdr_buf[end..], content_length);
+    libakuma::close(fd);
+    let _ = tls.close();
+    Ok(())
+}
+
+fn download_redirects_tcp(stream: TcpStream, host: &str, path: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
+    let request = build_get_request_with_headers(host, path, headers);
+    stream.write_all(request.as_bytes()).map_err(|_| Error::IoError)?;
+
+    let mut hdr_buf = Vec::new();
+    let mut tmp = [0u8; 16384];
+    let mut retries = 0u32;
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                retries = 0;
+                hdr_buf.extend_from_slice(&tmp[..n]);
+                if find_headers_end(&hdr_buf).is_some() { break; }
+                if hdr_buf.len() > MAX_HEADERS_BUFFER_SIZE {
+                    return Err(Error::HttpError(String::from("Headers too large")));
+                }
+            }
+            Err(_) => {
+                retries += 1;
+                if retries >= 200 { return Err(Error::IoError); }
+                libakuma::sleep_ms(1);
+            }
+        }
+    }
+
+    let end = find_headers_end(&hdr_buf)
+        .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
+    let header_str = core::str::from_utf8(&hdr_buf[..end])
+        .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
+    let status = parse_status_line(header_str);
+
+    if status >= 300 && status < 400 && max_redirects > 0 {
+        if let Some(location) = extract_location_header(header_str) {
+            return download_with_redirects(&location, dest_path, &HttpHeaders::new(), max_redirects - 1);
+        }
+    }
+
+    if status < 200 || status >= 300 {
+        return Err(Error::HttpError(format!("HTTP error: {}", status)));
+    }
+
+    let content_length = parse_cl_header(header_str);
+    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
+    if fd < 0 { return Err(Error::IoError); }
+
+    let body_start = &hdr_buf[end..];
+    let mut written: usize = 0;
+    if !body_start.is_empty() {
+        libakuma::write_fd(fd, body_start);
+        written += body_start.len();
+    }
+    if let Some(cl) = content_length {
+        if written >= cl { libakuma::close(fd); return Ok(()); }
+    }
+
+    let mut errors = 0u32;
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                errors = 0;
+                libakuma::write_fd(fd, &tmp[..n]);
+                written += n;
+                if let Some(cl) = content_length {
+                    if written >= cl { break; }
+                }
+            }
+            Err(_) => {
+                errors += 1;
+                if errors >= 200 { break; }
+                libakuma::sleep_ms(1);
+            }
+        }
+    }
+
+    libakuma::close(fd);
+    Ok(())
+}
