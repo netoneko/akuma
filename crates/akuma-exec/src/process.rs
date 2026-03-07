@@ -156,6 +156,13 @@ pub fn find_box_by_name(name: &str) -> Option<u64> {
     })
 }
 
+/// Get a box's name by ID
+pub fn get_box_name(id: u64) -> Option<String> {
+    with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().get(&id).map(|b| b.name.clone())
+    })
+}
+
 /// Initialize the box registry with Box 0 (Host)
 pub fn init_box_registry() {
     register_box(BoxInfo {
@@ -3349,10 +3356,20 @@ pub fn spawn_process_with_channel_ext(
         }
     }
 
-    let full_env = match env {
+    let mut full_env = match env {
         Some(e) if !e.is_empty() => e.to_vec(),
         _ => DEFAULT_ENV.iter().map(|s| String::from(*s)).collect(),
     };
+
+    if box_id != 0 && !full_env.iter().any(|e| e.starts_with("HOSTNAME=")) {
+        if let Some(name) = get_box_name(box_id) {
+            let hostname: String = core::iter::once("box-")
+                .flat_map(|s| s.chars())
+                .chain(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }))
+                .collect();
+            full_env.push(format!("HOSTNAME={hostname}"));
+        }
+    }
 
     let mut process = match (runtime().read_file)(elf_path) {
         Ok(elf_data) => {
