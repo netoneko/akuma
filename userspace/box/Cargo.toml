@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libakuma = { path = "../libakuma" }
+libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }
 
 [[bin]]

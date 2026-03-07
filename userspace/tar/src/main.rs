@@ -102,9 +102,6 @@ pub extern "C" fn main() {
                 TarError::GzipDecompressionError(msg) => {
                     eprintln(&format!("tar: error: Gzip decompression failed: {}", msg));
                 }
-                TarError::TarArchiveError(msg) => {
-                    eprintln(&format!("tar: error: Invalid tar archive: {}", msg));
-                }
             }
             exit(1);
         }
@@ -115,7 +112,6 @@ pub extern "C" fn main() {
 enum TarError {
     LibakumaError(i32, String),
     GzipDecompressionError(&'static str),
-    TarArchiveError(&'static str),
 }
 
 fn read_file_to_vec(path: &str) -> Result<Vec<u8>, TarError> {
@@ -221,9 +217,8 @@ fn untar_streaming(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
         // '5' = directory, or path ends with /
         if typeflag == b'5' || path.ends_with('/') {
             if verbose {
-                print("Extracting: ");
-                print(path);
-                println("/");
+                print("d ");
+                println(path);
             }
             if !mkdir_p(&full_path) && verbose {
                 eprintln(&format!("tar: warning: failed to create directory {}", full_path));
@@ -232,22 +227,55 @@ fn untar_streaming(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
             continue;
         }
 
+        // '2' = symbolic link
+        if typeflag == b'2' {
+            let link_target = extract_str(&header[157..257]);
+            if verbose {
+                print("l ");
+                print(path);
+                print(" -> ");
+                println(&link_target);
+            }
+            ensure_parent(&full_path);
+            let ret = symlink(&link_target, &full_path);
+            if ret < 0 && verbose {
+                eprintln(&format!("tar: warning: symlink {} -> {}: errno {}", full_path, link_target, -ret));
+            }
+            read_skip(fd, padded_size(size));
+            continue;
+        }
+
+        // '1' = hard link — create as symlink (kernel linkat does full copy)
+        if typeflag == b'1' {
+            let mut link_target = extract_str(&header[157..257]);
+            if link_target.starts_with("./") {
+                link_target = String::from(&link_target[2..]);
+            }
+            let rel = relative_symlink_target(path, &link_target);
+            if verbose {
+                print("h ");
+                print(path);
+                print(" -> ");
+                println(&rel);
+            }
+            ensure_parent(&full_path);
+            let ret = symlink(&rel, &full_path);
+            if ret < 0 && verbose {
+                eprintln(&format!("tar: warning: hardlink symlink {} -> {}: errno {}", full_path, rel, -ret));
+            }
+            read_skip(fd, padded_size(size));
+            continue;
+        }
+
         if verbose {
-            print("Extracting: ");
+            print("x ");
             print(path);
             print(" (");
             print_dec(size);
-            print(" bytes) -> ");
-            println(&full_path);
+            println(" bytes)");
         }
 
-        // Ensure parent directory exists
-        if let Some(last_slash) = full_path.rfind('/') {
-            let parent = &full_path[..last_slash];
-            if !parent.is_empty() {
-                mkdir_p(parent);
-            }
-        }
+        ensure_parent(&full_path);
 
         // Stream file data to disk in chunks
         let out_fd = open(&full_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
@@ -292,76 +320,148 @@ fn untar_streaming(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
 }
 
 /// In-memory tar extraction for gzip archives (decompression requires full data).
+/// Parses tar headers directly (same logic as streaming path) to handle symlinks/hardlinks.
 fn untar_in_memory(archive_path: &str, target_dir: &str, verbose: bool) -> Result<(), TarError> {
     let raw_data = read_file_to_vec(archive_path)?;
     if verbose {
         print("tar: read ");
         print_dec(raw_data.len());
-        println(" bytes");
+        println(" bytes (compressed)");
     }
 
     let deflate_data = strip_gzip_header(&raw_data)
         .ok_or(TarError::GzipDecompressionError("invalid gzip header"))?;
 
-    let decompressed_data = inflate::decompress_to_vec(deflate_data)
+    let data = inflate::decompress_to_vec(deflate_data)
         .map_err(|_| TarError::GzipDecompressionError("decompression failed"))?;
     drop(raw_data);
 
-    let archive = TarArchiveRef::new(&decompressed_data)
-        .map_err(|_| TarError::TarArchiveError("invalid tar archive"))?;
+    if verbose {
+        print("tar: decompressed to ");
+        print_dec(data.len());
+        println(" bytes");
+    }
 
-    let mut entry_count = 0;
-    for entry in archive.entries() {
-        entry_count += 1;
-        let filename = entry.filename();
-        let mut path = filename.as_str().unwrap_or("unknown");
+    let mut pos: usize = 0;
+    let mut entry_count: usize = 0;
+    let mut zero_blocks = 0;
 
+    while pos + 512 <= data.len() {
+        let header: &[u8] = &data[pos..pos + 512];
+        pos += 512;
+
+        if header.iter().all(|&b| b == 0) {
+            zero_blocks += 1;
+            if zero_blocks >= 2 { break; }
+            continue;
+        }
+        zero_blocks = 0;
+
+        let mut hdr = [0u8; 512];
+        hdr.copy_from_slice(header);
+        if !verify_header_checksum(&hdr) {
+            if verbose { eprintln("tar: warning: bad header checksum, stopping"); }
+            break;
+        }
+
+        let path_raw = parse_tar_path(&hdr);
+        let size = parse_octal(&hdr[124..136]);
+        let typeflag = hdr[156];
+
+        if typeflag == b'x' || typeflag == b'g' || typeflag == b'L' || typeflag == b'K' {
+            pos += padded_size(size);
+            continue;
+        }
+
+        let mut path = path_raw.as_str();
         if path.is_empty() || path == "." {
+            pos += padded_size(size);
             continue;
         }
         if path.starts_with("./") {
             path = &path[2..];
         }
         if path.is_empty() {
+            pos += padded_size(size);
             continue;
         }
 
         let full_path = join_path(target_dir, path);
+        entry_count += 1;
 
-        if verbose {
-            print("Extracting: ");
-            print(path);
-            print(" (");
-            print_dec(entry.size());
-            print(" bytes) -> ");
-            println(&full_path);
-        }
-
-        if path.ends_with('/') {
-            if !mkdir_p(&full_path) && verbose {
-                eprintln(&format!("tar: warning: failed to create directory {}", full_path));
-            }
+        if typeflag == b'5' || path.ends_with('/') {
+            if verbose { print("d "); println(path); }
+            mkdir_p(&full_path);
+            pos += padded_size(size);
             continue;
         }
 
-        if let Some(last_slash) = full_path.rfind('/') {
-            let parent = &full_path[..last_slash];
-            if !parent.is_empty() {
-                mkdir_p(parent);
+        if typeflag == b'2' {
+            let link_target = extract_str(&hdr[157..257]);
+            if verbose {
+                print("l ");
+                print(path);
+                print(" -> ");
+                println(&link_target);
             }
+            ensure_parent(&full_path);
+            let ret = symlink(&link_target, &full_path);
+            if ret < 0 && verbose {
+                eprintln(&format!("tar: warning: symlink {} -> {}: errno {}", full_path, link_target, -ret));
+            }
+            pos += padded_size(size);
+            continue;
         }
 
-        let data = entry.data();
+        if typeflag == b'1' {
+            let mut link_target = extract_str(&hdr[157..257]);
+            if link_target.starts_with("./") {
+                link_target = String::from(&link_target[2..]);
+            }
+            let rel = relative_symlink_target(path, &link_target);
+            if verbose {
+                print("h ");
+                print(path);
+                print(" -> ");
+                println(&rel);
+            }
+            ensure_parent(&full_path);
+            let ret = symlink(&rel, &full_path);
+            if ret < 0 && verbose {
+                eprintln(&format!("tar: warning: hardlink symlink {} -> {}: errno {}", full_path, rel, -ret));
+            }
+            pos += padded_size(size);
+            continue;
+        }
+
+        if verbose {
+            print("x ");
+            print(path);
+            print(" (");
+            print_dec(size);
+            println(" bytes)");
+        }
+
+        ensure_parent(&full_path);
+
+        let end = pos + size;
+        if end > data.len() {
+            eprintln(&format!("tar: error: truncated entry {}", path));
+            break;
+        }
+
+        let file_data = &data[pos..end];
         let fd = open(&full_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
         if fd >= 0 {
-            let written = write_fd(fd, data);
-            close(fd);
-            if written < 0 {
-                eprintln(&format!("tar: error: failed to write file {}: errno {}", full_path, -written));
+            if !file_data.is_empty() {
+                write_fd(fd, file_data);
             }
-        } else {
+            close(fd);
+        } else if verbose {
             eprintln(&format!("tar: error: failed to create file {}: errno {}", full_path, -fd));
         }
+
+        pos += padded_size(size);
     }
 
     print("tar: extracted ");
@@ -407,6 +507,66 @@ fn strip_gzip_header(data: &[u8]) -> Option<&[u8]> {
 // ============================================================================
 // Tar format helpers
 // ============================================================================
+
+fn ensure_parent(full_path: &str) {
+    if let Some(last_slash) = full_path.rfind('/') {
+        let parent = &full_path[..last_slash];
+        if !parent.is_empty() {
+            mkdir_p(parent);
+        }
+    }
+}
+
+/// Compute a relative symlink target from `link_path` to `target_path`.
+/// Both paths are relative to the tar root (e.g., "bin/sh" and "bin/busybox").
+/// Returns a relative path like "busybox" or "../lib/foo".
+fn relative_symlink_target(link_path: &str, target_path: &str) -> String {
+    let link_dir = match link_path.rfind('/') {
+        Some(i) => &link_path[..i],
+        None => "",
+    };
+    let target_dir_part = match target_path.rfind('/') {
+        Some(i) => &target_path[..i],
+        None => "",
+    };
+    let target_name = match target_path.rfind('/') {
+        Some(i) => &target_path[i + 1..],
+        None => target_path,
+    };
+
+    if link_dir == target_dir_part {
+        return String::from(target_name);
+    }
+
+    let link_parts: Vec<&str> = if link_dir.is_empty() {
+        Vec::new()
+    } else {
+        link_dir.split('/').collect()
+    };
+    let target_parts: Vec<&str> = if target_dir_part.is_empty() {
+        Vec::new()
+    } else {
+        target_dir_part.split('/').collect()
+    };
+
+    let mut common = 0;
+    while common < link_parts.len() && common < target_parts.len()
+        && link_parts[common] == target_parts[common]
+    {
+        common += 1;
+    }
+
+    let mut result = String::new();
+    for _ in common..link_parts.len() {
+        result.push_str("../");
+    }
+    for i in common..target_parts.len() {
+        result.push_str(target_parts[i]);
+        result.push('/');
+    }
+    result.push_str(target_name);
+    result
+}
 
 fn join_path(target_dir: &str, path: &str) -> String {
     let mut full_path = String::from(target_dir);
