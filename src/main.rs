@@ -129,11 +129,14 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 
 /// Fixed address where we tell QEMU to load the DTB via loader device
 /// Use: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on
+#[cfg(not(feature = "firecracker"))]
 const DTB_FIXED_ADDR: usize = 0x4ff00000;
 
-/// Check for DTB at fixed address, or scan if not found
+/// Scan the fixed QEMU-loaded DTB address as a fallback when x0 is zero.
+/// Not used under the `firecracker` feature — Firecracker always passes the
+/// FDT address in x0 per the ARM64 boot protocol.
+#[cfg(not(feature = "firecracker"))]
 fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
-    // First check the fixed address where we ask QEMU to load DTB
     let magic = unsafe { core::ptr::read_volatile(DTB_FIXED_ADDR as *const u32) };
     if magic == 0xedfe0dd0 {
         console::print("[DTB] Found DTB at fixed address 0x");
@@ -141,7 +144,7 @@ fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
         console::print("\n");
         return DTB_FIXED_ADDR;
     }
-    
+
     console::print("[DTB] No DTB at fixed address 0x");
     console::print_hex(DTB_FIXED_ADDR as u64);
     console::print("\n");
@@ -151,24 +154,32 @@ fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
 
 /// Detect memory from Device Tree Blob
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
-    const DEFAULT_RAM_BASE: usize = 0x40000000;
-    const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024; // Must match QEMU -m setting
-    // Reserve space at end of RAM for QEMU's DTB and other internal data
-    // QEMU places the DTB somewhere in RAM but doesn't tell bare-metal ELFs where
-    const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2MB should be plenty
+    // RAM base differs between hypervisors
+    #[cfg(not(feature = "firecracker"))]
+    const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
+    #[cfg(feature = "firecracker")]
+    const DEFAULT_RAM_BASE: usize = 0x8000_0000; // Firecracker: 2 GB
 
-    // If no DTB pointer provided, try to find it by scanning memory
-    // Use kernel_phys_end as scan start (DTB won't be in kernel area)
-    unsafe extern "C" {
-        static _kernel_phys_end: u8;
-    }
-    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
-    
-    let actual_dtb_ptr = if dtb_ptr == 0 {
-        find_dtb(DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE, kernel_end)
-    } else {
-        dtb_ptr
+    const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
+    const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
+
+    // Under Firecracker, the FDT address is always in x0 (ARM64 boot protocol).
+    // Under QEMU, x0 may be 0 if the DTB was loaded via the loader device;
+    // fall back to scanning the fixed load address in that case.
+    #[cfg(not(feature = "firecracker"))]
+    let actual_dtb_ptr = {
+        unsafe extern "C" {
+            static _kernel_phys_end: u8;
+        }
+        let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+        if dtb_ptr == 0 {
+            find_dtb(DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE, kernel_end)
+        } else {
+            dtb_ptr
+        }
     };
+    #[cfg(feature = "firecracker")]
+    let actual_dtb_ptr = dtb_ptr;
 
     if actual_dtb_ptr == 0 {
         console::print("[Memory] No DTB found, reserving last 2MB for QEMU data\n");
@@ -222,14 +233,18 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
-    // Stack layout (from boot.rs):
-    //   STACK_TOP    = 0x40800000 (8MB from kernel base)
-    //   STACK_SIZE   = 0x100000   (1MB)
-    //   Stack bottom = 0x40700000 (7MB from kernel base)
-    //
-    // Kernel must fit below 0x40700000 to not corrupt stack!
+    // Stack layout: STACK_TOP = KERNEL_BASE + 8 MB, STACK_SIZE = 1 MB
+    //   QEMU:        KERNEL_BASE=0x40000000, STACK_BOTTOM=0x40700000
+    //   Firecracker: KERNEL_BASE=0x80000000, STACK_BOTTOM=0x80700000
+    #[cfg(not(feature = "firecracker"))]
     const KERNEL_BASE: usize = 0x4000_0000;
-    const STACK_BOTTOM: usize = 0x4070_0000; // STACK_TOP - STACK_SIZE
+    #[cfg(feature = "firecracker")]
+    const KERNEL_BASE: usize = 0x8000_0000;
+
+    #[cfg(not(feature = "firecracker"))]
+    const STACK_BOTTOM: usize = 0x4070_0000;
+    #[cfg(feature = "firecracker")]
+    const STACK_BOTTOM: usize = 0x8070_0000;
 
     unsafe extern "C" {
         static _kernel_phys_end: u8;

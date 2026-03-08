@@ -34,6 +34,9 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[features]
+firecracker = []
+
 [lints]
 workspace = true
 

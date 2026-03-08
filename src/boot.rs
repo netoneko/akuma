@@ -12,15 +12,29 @@
 
 use core::arch::global_asm;
 
+// Physical base address differs between hypervisors:
+//   QEMU virt:   0x40000000 (1 GB)
+//   Firecracker: 0x80000000 (2 GB)
+#[cfg(not(feature = "firecracker"))]
+const PHYS_BASE: usize = 0x4000_0000;
+#[cfg(feature = "firecracker")]
+const PHYS_BASE: usize = 0x8000_0000;
+
+// Boot stack top = kernel base + 8 MB
+#[cfg(not(feature = "firecracker"))]
+const BOOT_STACK_TOP: usize = 0x4080_0000;
+#[cfg(feature = "firecracker")]
+const BOOT_STACK_TOP: usize = 0x8080_0000;
+
 global_asm!(
     r#"
 .section .text._boot
 .global _boot
 
-// Constants
-.equ KERNEL_PHYS_BASE,  0x40000000
+// Constants (values injected by Rust feature flags at compile time)
+.equ KERNEL_PHYS_BASE,  {phys_base}
 .equ STACK_SIZE,        0x100000        // 1MB stack
-.equ STACK_TOP,         0x40800000      // 8MB from kernel base (end of Code+Stack region)
+.equ STACK_TOP,         {stack_top}     // 8MB from kernel base (end of Code+Stack region)
 
 // Page table constants
 .equ PAGE_SIZE,         4096
@@ -266,5 +280,7 @@ boot_x0_at_entry:
 .global boot_page_tables
 boot_page_tables:
     .space  4096 * 6
-"#
+"#,
+    phys_base = const PHYS_BASE,
+    stack_top = const BOOT_STACK_TOP,
 );
