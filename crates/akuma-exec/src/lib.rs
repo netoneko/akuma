@@ -87,6 +87,7 @@ pub mod mmu;
 pub mod elf_loader;
 pub mod threading;
 pub mod process;
+pub mod box_registry;
 
 pub use runtime::{ExecRuntime, ExecConfig, PhysFrame, FrameSource};
 
