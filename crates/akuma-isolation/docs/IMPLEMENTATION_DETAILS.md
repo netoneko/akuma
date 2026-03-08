@@ -57,6 +57,24 @@ The `/` path is handled specially — when the input path is `/`, only the prefi
 
 Currently a single-variant enum (`Shared`). All processes use the global smoltcp network stack. The enum exists so that future network isolation (Phase 5 of the proposal) can add an `Isolated` variant without changing the `Namespace` struct.
 
+## Box Registry (`crates/akuma-exec/src/box_registry.rs`)
+
+Box (container) metadata is managed by a dedicated module extracted from `process.rs`. The registry is a global `BTreeMap<u64, BoxInfo>` protected by a spinlock. It tracks:
+
+- `id` — unique box identifier (0 = host)
+- `name` — human-readable name
+- `root_dir` — host path used to create the `SubdirFs`
+- `creator_pid` — PID that registered the box (used for access control)
+- `primary_pid` — main process; when it exits, the box is torn down
+
+The registry is flat — all boxes are peers with no parent/child hierarchy. See "Nested Boxes" under Limitations for implications.
+
+Process-level operations that touch the box registry (`kill_box`, `reattach_process_ext`) remain in `process.rs` and call into `box_registry` via public helpers (`get_box_info`, `find_primary_box`, `unregister_box`). The registry functions are re-exported from `process` for backward compatibility.
+
+## Container Environment
+
+When a process is spawned inside a box (`box_id != 0`), the spawn path automatically sets `HOSTNAME=box-{name}` in the environment. Non-alphanumeric characters in the box name are replaced with dashes (e.g., box name `my_app` becomes `HOSTNAME=box-my-app`). This is skipped if the caller already provides a `HOSTNAME` in the environment.
+
 ## Kernel Integration
 
 ### VFS (`src/vfs/mod.rs`)
@@ -118,3 +136,18 @@ The `interp_prefix` parameter was removed from all ELF loading functions. Dynami
 - **No private `/dev`** — Phase 4 of the proposal. Containers currently see host `/dev` if it exists.
 - **No network isolation** — `NetworkNamespace::Shared` is the only variant. Phase 5 would add per-container virtual interfaces.
 - **No `unshare` semantics** — all processes in a container share the same namespace `Arc`. Creating a modified copy (like Linux `unshare(CLONE_NEWNS)`) is not yet supported.
+
+### Nested Boxes
+
+The box registry is a flat global map — there is no parent/child hierarchy. Additionally, `create_box_namespace` always wraps the global host ext2 filesystem via `get_root_fs()`, regardless of which box the caller is in. This means:
+
+1. A process inside Box A that creates Box B would scope Box B's `SubdirFs` against the host filesystem, not against Box A's scoped view. The child could reference host paths outside its parent's root.
+2. `kill_box` does not cascade — killing a parent box does not automatically kill child boxes.
+3. Access control in `reattach_process_ext` checks `creator_pid` but has no concept of box ancestry.
+
+To support nested boxes properly:
+
+- Add `parent_box_id: Option<u64>` to `BoxInfo` for hierarchy tracking.
+- `create_box_namespace` should resolve `root_dir` through the caller's namespace, wrapping the parent's `SubdirFs` (or whatever filesystem the parent sees at `/`) instead of the global root. This ensures a container can only carve out sub-views within what it can already see.
+- `kill_box` should cascade to child boxes (walk the tree).
+- Access control should walk the ancestry chain, not just check direct creator.

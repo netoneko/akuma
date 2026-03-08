@@ -64,6 +64,12 @@ let ns = Namespace::new(1); // id=1
 
 The global host namespace (id=0) is available via `global_namespace()`.
 
+## Box Registry
+
+Box (container) metadata lives in `akuma-exec/src/box_registry.rs` (separate from this crate, but closely related). The registry maps box IDs to `BoxInfo` structs tracking name, root directory, creator PID, and primary PID. The registry is currently flat — nested boxes are not yet supported. See [Implementation Details](docs/IMPLEMENTATION_DETAILS.md#nested-boxes) for the planned approach.
+
+When spawning a process inside a box, the environment automatically includes `HOSTNAME=box-{name}` (with non-alphanumeric characters replaced by dashes).
+
 ## Dependencies
 
 - `akuma-vfs` — `Filesystem` trait, `FsError`, `DirEntry`, `FS_MAX_PATH_SIZE`
