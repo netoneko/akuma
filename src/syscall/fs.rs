@@ -1,0 +1,1359 @@
+use super::*;
+use akuma_net::socket::{self, libc_errno};
+
+const EROFS: u64 = (-30i64) as u64;
+
+fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
+    use crate::vfs::FsError;
+    match e {
+        FsError::NotFound => ENOENT,
+        FsError::PermissionDenied => EPERM,
+        FsError::AlreadyExists => EEXIST,
+        FsError::NotADirectory => ENOTDIR,
+        FsError::NotAFile => EISDIR,
+        FsError::DirectoryNotEmpty => ENOTEMPTY,
+        FsError::NoSpace => ENOSPC,
+        FsError::ReadOnly => EROFS,
+        FsError::InvalidPath => EINVAL,
+        _ => EPERM,
+    }
+}
+
+pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
+    if raw_path.starts_with('/') {
+        return crate::vfs::canonicalize_path(raw_path);
+    }
+    let base = if dirfd == -100 {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            proc.cwd.clone()
+        } else {
+            String::from("/")
+        }
+    } else if dirfd >= 0 {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                f.path.clone()
+            } else {
+                String::from("/")
+            }
+        } else {
+            String::from("/")
+        }
+    } else {
+        String::from("/")
+    };
+    if raw_path == "." || raw_path.is_empty() {
+        base
+    } else {
+        crate::vfs::resolve_path(&base, raw_path)
+    }
+}
+
+#[repr(C)]
+pub(super) struct IoVec {
+    pub(super) iov_base: u64,
+    pub(super) iov_len: usize,
+}
+
+#[repr(C)] #[derive(Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
+
+const fn makedev(major: u64, minor: u64) -> u64 {
+    (major << 8) | minor
+}
+
+pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
+        crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
+    }
+
+    match fd {
+        akuma_exec::process::FileDescriptor::Stdin => {
+            let ch = match akuma_exec::process::current_channel() {
+                Some(c) => c,
+                None => {
+                    let mut temp = alloc::vec![0u8; count];
+                    let n = proc.read_stdin(&mut temp);
+                    if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
+                    }
+                    return n as u64;
+                }
+            };
+
+            let mut kernel_buf = alloc::vec![0u8; count];
+            
+            loop {
+                let is_pipe = ch.is_stdin_closed();
+
+                if !is_pipe {
+                    let term_state_lock = akuma_exec::process::current_terminal_state();
+                    if let Some(ref ts_lock) = term_state_lock {
+                        let mut ts = ts_lock.lock();
+                        if ts.is_canonical() && !ts.canon_ready.is_empty() {
+                            let ready = ts.drain_canon_ready(count);
+                            let to_read = ready.len();
+                            kernel_buf[..to_read].copy_from_slice(&ready);
+                            drop(ts);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    kernel_buf.as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    to_read,
+                                );
+                            }
+                            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes from canon_ready\n", to_read);
+                            }
+                            return to_read as u64;
+                        }
+                    }
+                }
+
+                let n = ch.read_stdin(&mut kernel_buf);
+                if n > 0 {
+                    if !is_pipe {
+                        let term_state_lock = akuma_exec::process::current_terminal_state();
+                        if let Some(ref ts_lock) = term_state_lock {
+                            let mut ts = ts_lock.lock();
+
+                            ts.map_cr_to_nl(&mut kernel_buf[..n]);
+
+                            if ts.is_canonical() {
+                                let result = ts.process_canon_input(&kernel_buf[..n]);
+                                if !result.echo.is_empty() {
+                                    ch.write(&result.echo);
+                                }
+                                if result.eof {
+                                    drop(ts);
+                                    return 0;
+                                }
+
+                                if !ts.canon_ready.is_empty() {
+                                    let ready = ts.drain_canon_ready(count);
+                                    let to_read = ready.len();
+                                    kernel_buf[..to_read].copy_from_slice(&ready);
+                                    drop(ts);
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            kernel_buf.as_ptr(),
+                                            buf_ptr as *mut u8,
+                                            to_read,
+                                        );
+                                    }
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
+                                    }
+                                    return to_read as u64;
+                                }
+                                continue;
+                            } else {
+                                if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
+                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
+                                    }
+                                    ch.write(&echo_buf);
+                                }
+                            }
+                        }
+                    }
+
+                    unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        let mut snippet = [0u8; 32];
+                        let sn_len = n.min(32);
+                        snippet[..sn_len].copy_from_slice(&kernel_buf[..sn_len]);
+                        for byte in &mut snippet[..sn_len] {
+                            if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                        }
+                        let snippet_str = core::str::from_utf8(&snippet[..sn_len]).unwrap_or("...");
+                        crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes \"{}\"\n", n, snippet_str);
+                    }
+                    return n as u64;
+                }
+
+                if ch.is_stdin_closed() {
+                    if !is_pipe {
+                        let term_state_lock = akuma_exec::process::current_terminal_state();
+                        if let Some(ref ts_lock) = term_state_lock {
+                            let mut ts = ts_lock.lock();
+                            if ts.is_canonical() && !ts.canon_buffer.is_empty() {
+                                ts.flush_canon_buffer();
+                                let ready = ts.drain_canon_ready(count);
+                                let to_read = ready.len();
+                                kernel_buf[..to_read].copy_from_slice(&ready);
+                                drop(ts);
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        kernel_buf.as_ptr(),
+                                        buf_ptr as *mut u8,
+                                        to_read,
+                                    );
+                                }
+                                return to_read as u64;
+                            }
+                        }
+                    }
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) returned 0 (EOF)\n");
+                    }
+                    return 0;
+                }
+
+                if akuma_exec::process::is_current_interrupted() {
+                    return EINTR;
+                }
+
+                let term_state_lock = match akuma_exec::process::current_terminal_state() {
+                    Some(state) => state,
+                    None => {
+                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                            crate::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
+                        }
+                        return 0;
+                    }
+                };
+
+                {
+                    akuma_exec::threading::disable_preemption();
+                    let term_state = term_state_lock.lock();
+                    let thread_id = akuma_exec::threading::current_thread_id();
+                    term_state.set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
+                    akuma_exec::threading::enable_preemption();
+                }
+
+                akuma_exec::threading::schedule_blocking(u64::MAX);
+
+                {
+                    akuma_exec::threading::disable_preemption();
+                    let term_state = term_state_lock.lock();
+                    term_state.input_waker.lock().take();
+                    akuma_exec::threading::enable_preemption();
+                }
+            }
+        }
+        akuma_exec::process::FileDescriptor::File(ref f) => {
+            let limit = 64 * 1024;
+            let to_read = count.min(limit);
+            let mut temp = alloc::vec![0u8; to_read];
+
+            match crate::fs::read_at(&f.path, f.position, &mut temp) {
+                Ok(n) => {
+                    if n > 0 {
+                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    }
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
+                    }
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
+        }
+        akuma_exec::process::FileDescriptor::Socket(idx) => {
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
+            let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+            let result = if socket::is_udp_socket(idx) {
+                socket::socket_recv_udp(idx, buf, nonblock).map(|(n, _)| n)
+            } else {
+                socket::socket_recv(idx, buf, nonblock)
+            };
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                match &result {
+                    Ok(n) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = {}\n", fd_num, count, n),
+                    Err(e) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                }
+            }
+            match result {
+                Ok(n) => n as u64,
+                Err(e) => (-(e as i64)) as u64,
+            }
+        }
+        akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+            if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
+                let mut temp = alloc::vec![0u8; count];
+                let n = ch.read(&mut temp);
+                if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                n as u64
+            } else {
+                !0u64
+            }
+        }
+        akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
+            let mut temp = alloc::vec![0u8; count];
+            loop {
+                let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
+                if n > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                    return n as u64;
+                }
+                if eof {
+                    return 0;
+                }
+                if akuma_exec::process::is_current_interrupted() {
+                    return EINTR;
+                }
+                let tid = akuma_exec::threading::current_thread_id();
+                super::pipe::pipe_set_reader_thread(pipe_id, tid);
+                akuma_exec::threading::schedule_blocking(u64::MAX);
+            }
+        }
+        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+            if count < 8 { return EINVAL; }
+            let nonblock = super::eventfd::eventfd_is_nonblock(efd_id) || super::net::fd_is_nonblock(fd_num as u32);
+            loop {
+                match super::eventfd::eventfd_read(efd_id) {
+                    Ok(val) => {
+                        unsafe { core::ptr::write(buf_ptr as *mut u64, val); }
+                        return 8;
+                    }
+                    Err(_) => {
+                        if nonblock { return EAGAIN; }
+                        if akuma_exec::process::is_current_interrupted() { return EINTR; }
+                        let tid = akuma_exec::threading::current_thread_id();
+                        super::eventfd::eventfd_set_reader_thread(efd_id, tid);
+                        akuma_exec::threading::schedule_blocking(u64::MAX);
+                    }
+                }
+            }
+        }
+        akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevUrandom => {
+            super::proc::fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
+        akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
+            let result = super::timerfd::timerfd_read(timer_id);
+            if result == EAGAIN { return EAGAIN; }
+            if count >= 8 && validate_user_ptr(buf_ptr, 8) {
+                unsafe { core::ptr::write(buf_ptr as *mut u64, result); }
+                8
+            } else { EINVAL }
+        }
+        akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
+        _ => !0u64
+    }
+}
+
+pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+    if offset < 0 { return EINVAL; }
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+
+    match fd {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
+            let limit = 64 * 1024;
+            let to_read = count.min(limit);
+            let mut temp = alloc::vec![0u8; to_read];
+            match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
+                Ok(n) => {
+                    if n > 0 {
+                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                    }
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
+                    }
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
+        }
+        akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevUrandom => {
+            super::proc::fill_random_bytes(buf_ptr as *mut u8, count);
+            count as u64
+        }
+        akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
+        akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
+        _ => EBADF
+    }
+}
+
+pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+    if offset < 0 { return EINVAL; }
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+
+    match fd {
+        akuma_exec::process::FileDescriptor::File(ref f) => {
+            let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+            match crate::fs::write_at(&f.path, offset as usize, buf) {
+                Ok(n) => n as u64,
+                Err(_) => !0u64
+            }
+        }
+        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
+        _ => EBADF
+    }
+}
+
+pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+    match fd {
+        akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                let display_len = count.min(64);
+                let mut snippet = [0u8; 64];
+                let n = display_len.min(snippet.len());
+                snippet[..n].copy_from_slice(&buf[..n]);
+                for byte in &mut snippet[..n] {
+                    if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                }
+                let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+                crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
+            }
+
+            if let Some(ch) = akuma_exec::process::current_channel() {
+                if ch.is_stdin_closed() {
+                    ch.write(buf);
+                } else {
+                    let term_state_opt = akuma_exec::process::current_terminal_state();
+                    if let Some(ts_lock) = term_state_opt {
+                        let translated = ts_lock.lock().translate_output(buf);
+                        ch.write(&translated);
+                    } else {
+                        ch.write(buf);
+                    }
+                }
+            }
+            
+            if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
+                proc.write_stdout(buf);
+            }
+            
+            count as u64
+        }
+        akuma_exec::process::FileDescriptor::File(ref f) => {
+            match crate::fs::write_at(&f.path, f.position, buf) {
+                Ok(n) => {
+                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                    n as u64
+                }
+                Err(_) => !0u64
+            }
+        }
+        akuma_exec::process::FileDescriptor::Socket(idx) => {
+            let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+            let result = if socket::is_udp_socket(idx) {
+                match socket::udp_default_peer(idx) {
+                    Some(peer) => socket::socket_send_udp(idx, buf, peer),
+                    None => Err(libc_errno::EDESTADDRREQ),
+                }
+            } else {
+                socket::socket_send(idx, buf, nonblock)
+            };
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                match &result {
+                    Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
+                    Err(e) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                }
+            }
+            match result {
+                Ok(n) => n as u64,
+                Err(e) => (-(e as i64)) as u64,
+            }
+        }
+        akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+            super::pipe::pipe_write(pipe_id, buf) as u64
+        }
+        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+            if count < 8 { return EINVAL; }
+            let val = unsafe { core::ptr::read(buf_ptr as *const u64) };
+            if val == u64::MAX { return EINVAL; }
+            match super::eventfd::eventfd_write(efd_id, val) {
+                Ok(()) => 8,
+                Err(e) => (-(e as i64)) as u64,
+            }
+        }
+        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
+        _ => !0u64
+    }
+}
+
+pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let mut total_read: u64 = 0;
+    for i in 0..iov_cnt {
+        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        if iov.iov_len == 0 { continue; }
+        let n = sys_read(fd_num, iov.iov_base, iov.iov_len);
+        if (n as i64) < 0 {
+            if total_read == 0 { return n; }
+            break;
+        }
+        total_read += n;
+        if (n as usize) < iov.iov_len { break; }
+    }
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[syscall] readv(fd={}, cnt={}) = {}\n", fd_num, iov_cnt, total_read);
+    }
+    total_read
+}
+
+pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let mut total_written: u64 = 0;
+    for i in 0..iov_cnt {
+        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
+        if (written as i64) < 0 {
+            if total_written == 0 { return written; }
+            break;
+        }
+        total_written += written;
+    }
+    total_written
+}
+
+pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
+    if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if proc.get_fd(fd).is_none() { return EBADF; }
+    } else { return ENOSYS; }
+    #[repr(C)]
+    struct Statfs {
+        f_type: i64,
+        f_bsize: i64,
+        f_blocks: i64,
+        f_bfree: i64,
+        f_bavail: i64,
+        f_files: i64,
+        f_ffree: i64,
+        f_fsid: [i32; 2],
+        f_namelen: i64,
+        f_frsize: i64,
+        f_flags: i64,
+        f_spare: [i64; 4],
+    }
+    let st = Statfs {
+        f_type: 0xEF53,
+        f_bsize: 4096,
+        f_blocks: 65536,
+        f_bfree: 32768,
+        f_bavail: 32768,
+        f_files: 16384,
+        f_ffree: 8192,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    unsafe { core::ptr::copy_nonoverlapping(&st as *const Statfs as *const u8, buf_ptr as *mut u8, core::mem::size_of::<Statfs>()); }
+    0
+}
+
+pub(super) fn sys_dup(oldfd: u32) -> u64 {
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let entry = match proc.get_fd(oldfd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+    match &entry {
+        akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
+        akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+        _ => {}
+    }
+    let newfd = proc.alloc_fd(entry);
+    proc.clear_cloexec(newfd);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
+    }
+    newfd as u64
+}
+
+pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
+    if oldfd == newfd { return EINVAL; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let entry = match proc.get_fd(oldfd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let pid = proc.pid;
+        crate::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}, flags=0x{:x}) PID {}\n", oldfd, newfd, flags, pid);
+    }
+
+    if let Some(old_entry) = proc.get_fd(newfd) {
+        match old_entry {
+            akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_close_write(id),
+            akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_close_read(id),
+            _ => {}
+        }
+    }
+
+    match &entry {
+        akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
+        akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+        _ => {}
+    }
+
+    proc.set_fd(newfd, entry);
+
+    if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(newfd);
+    } else {
+        proc.clear_cloexec(newfd);
+    }
+
+    newfd as u64
+}
+
+pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let path = if raw_path.starts_with('/') {
+        crate::vfs::canonicalize_path(&raw_path)
+    } else {
+        let base = if dirfd == -100 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                String::from("/")
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                        crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
+                    }
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            String::from("/")
+        };
+        if raw_path == "." || raw_path.is_empty() {
+            base
+        } else {
+            crate::vfs::resolve_path(&base, &raw_path)
+        }
+    };
+
+    let path = crate::vfs::resolve_symlinks(&path);
+
+    if path == "/dev/null" {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat(/dev/null) = fd {} flags=0x{:x}\n", fd, flags);
+            }
+            return fd as u64;
+        }
+        return !0u64;
+    }
+
+    if path == "/dev/urandom" || path == "/dev/random" {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevUrandom);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return fd as u64;
+        }
+        return !0u64;
+    }
+
+    let path = if path == "/proc/self/exe" {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            proc.name.clone()
+        } else {
+            return ENOENT;
+        }
+    } else {
+        path
+    };
+
+    if !crate::fs::exists(&path) {
+        let is_creat = flags & akuma_exec::process::open_flags::O_CREAT != 0;
+        if !is_creat {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
+            }
+            return ENOENT;
+        }
+
+        let (parent_raw, _) = crate::vfs::split_path(&path);
+        if !parent_raw.is_empty() {
+            let parent_path = if parent_raw.starts_with('/') {
+                String::from(parent_raw)
+            } else {
+                format!("/{}", parent_raw)
+            };
+            if parent_path != "/" && !crate::fs::exists(&parent_path) {
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    crate::safe_print!(256, "[syscall] openat({}) parent {} not found flags=0x{:x}\n", &path, &parent_path, flags);
+                }
+                return ENOENT;
+            }
+        }
+    }
+
+    if let Some(proc) = akuma_exec::process::current_process() {
+        let file_existed = crate::fs::exists(&path);
+        if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
+            let _ = crate::fs::write_file(&path, &[]);
+            if mode & 0o7777 != 0 {
+                let _ = crate::vfs::chmod(&path, mode & 0o7777);
+            }
+        } else if file_existed && (flags & akuma_exec::process::open_flags::O_TRUNC != 0) {
+            let _ = crate::fs::write_file(&path, &[]);
+        }
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(akuma_exec::process::KernelFile::new(path.clone(), flags)));
+        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        }
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+        }
+        fd as u64
+    } else { !0u64 }
+}
+
+pub(crate) fn sys_close(fd: u32) -> u64 {
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(entry) = proc.remove_fd(fd) {
+            proc.clear_cloexec(fd);
+            match entry {
+                akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+                akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                    akuma_exec::process::remove_child_channel(child_pid);
+                }
+                akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+                    super::pipe::pipe_close_write(pipe_id);
+                }
+                akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
+                    super::pipe::pipe_close_read(pipe_id);
+                }
+                akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                    super::eventfd::eventfd_close(efd_id);
+                }
+                _ => {}
+            }
+            proc.clear_nonblock(fd);
+            0
+        } else { !0u64 }
+    } else { !0u64 }
+}
+
+pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    let fds: Vec<u32> = crate::irq::with_irqs_disabled(|| {
+        proc.fd_table.lock().range(first..=last).map(|(&fd, _)| fd).collect()
+    });
+
+    for fd in fds {
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        } else {
+            if let Some(entry) = proc.remove_fd(fd) {
+                proc.clear_cloexec(fd);
+                match entry {
+                    akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+                    akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                        akuma_exec::process::remove_child_channel(child_pid);
+                    }
+                    akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+                        super::pipe::pipe_close_write(pipe_id);
+                    }
+                    akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
+                        super::pipe::pipe_close_read(pipe_id);
+                    }
+                    akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                        super::eventfd::eventfd_close(efd_id);
+                    }
+                    _ => {}
+                }
+                proc.clear_nonblock(fd);
+            }
+        }
+    }
+    0
+}
+
+pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(akuma_exec::process::FileDescriptor::DevNull) = proc.get_fd(fd) {
+            return 0;
+        }
+        let mut new_pos = 0i64;
+        let mut success = false;
+        proc.update_fd(fd, |entry| {
+            if let akuma_exec::process::FileDescriptor::File(f) = entry {
+                let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
+                new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
+                if new_pos >= 0 { f.position = new_pos as usize; success = true; }
+            }
+        });
+        if success { new_pos as u64 } else { !0u64 }
+    } else { !0u64 }
+}
+
+pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            if let Ok(meta) = crate::vfs::metadata(&f.path) {
+                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
+                }
+                return 0;
+            }
+            !0u64
+        }
+        Some(akuma_exec::process::FileDescriptor::DevNull) => {
+            let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::DevUrandom) => {
+            let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::TimerFd(_)) | Some(akuma_exec::process::FileDescriptor::EpollFd(_)) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::Stdin) | Some(akuma_exec::process::FileDescriptor::Stdout) | Some(akuma_exec::process::FileDescriptor::Stderr) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::PipeRead(_)) | Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
+            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+        _ => !0u64,
+    }
+}
+
+pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+
+    let resolved_path = if path.starts_with('/') {
+         String::from(&path)
+    } else {
+        let base_path = if dirfd == -100 {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64;
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     f.path.clone()
+                 } else {
+                     return !0u64;
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64;
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+    
+    if resolved_path == "/dev/null" {
+        let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
+
+    if !follow && crate::vfs::is_symlink(&resolved_path) {
+        let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
+        let stat = Stat {
+            st_dev: 1,
+            st_ino: 1,
+            st_size: target.len() as i64,
+            st_mode: 0o120777,
+            st_nlink: 1,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
+    let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
+
+    if let Ok(meta) = crate::vfs::metadata(&final_path) {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
+        }
+        let stat = Stat { 
+            st_dev: 1,
+            st_ino: meta.inode,
+            st_size: meta.size as i64, 
+            st_mode: meta.mode, 
+            st_nlink: if meta.is_dir { 2 } else { 1 },
+            st_blksize: 4096,
+            st_blocks: ((meta.size as i64) + 511) / 512,
+            st_atime: meta.accessed.unwrap_or(0) as i64,
+            st_mtime: meta.modified.unwrap_or(0) as i64,
+            st_ctime: meta.created.unwrap_or(0) as i64,
+            ..Default::default() 
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+
+    if crate::vfs::is_symlink(&final_path) {
+        let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
+        let stat = Stat {
+            st_dev: 1,
+            st_ino: 1,
+            st_size: target.len() as i64,
+            st_mode: 0o120777,
+            st_nlink: 1,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+        return 0;
+    }
+    
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[syscall] newfstatat: ENOENT {}\n", final_path);
+    }
+    ENOENT
+}
+
+pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            match crate::vfs::chmod(&f.path, mode) {
+                Ok(()) => 0,
+                Err(e) => fs_error_to_errno(e),
+            }
+        }
+        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
+        _ => 0,
+    }
+}
+
+pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let path = if raw_path.starts_with('/') {
+        crate::vfs::canonicalize_path(&raw_path)
+    } else {
+        let base = if dirfd == -100 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        };
+        crate::vfs::resolve_path(&base, &raw_path)
+    };
+
+    let path = crate::vfs::resolve_symlinks(&path);
+
+    if path == "/dev/null" {
+        return 0;
+    }
+
+    match crate::vfs::chmod(&path, mode) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
+}
+
+pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    let resolved_path = if path.starts_with('/') {
+         path
+    } else {
+        let base_path = if dirfd == -100 {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 proc.cwd.clone()
+             } else {
+                 return !0u64;
+             }
+        } else if dirfd >= 0 {
+             if let Some(proc) = akuma_exec::process::current_process() {
+                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                     f.path.clone()
+                 } else {
+                     return !0u64;
+                 }
+             } else {
+                 return !0u64;
+             }
+        } else {
+            return !0u64;
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+    
+    let final_path = crate::vfs::resolve_symlinks(&resolved_path);
+    if crate::fs::exists(&final_path) || crate::vfs::is_symlink(&resolved_path) {
+        0
+    } else {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] faccessat: ENOENT {}\n", final_path);
+        }
+        ENOENT
+    }
+}
+
+pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
+    if let Some(proc) = akuma_exec::process::current_process() {
+        let cwd_bytes = proc.cwd.as_bytes();
+        if cwd_bytes.len() + 1 > size {
+            return (-libc_errno::ERANGE as i64) as u64;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf_ptr as *mut u8, cwd_bytes.len());
+            *(buf_ptr as *mut u8).add(cwd_bytes.len()) = 0;
+        }
+        return (cwd_bytes.len() + 1) as u64;
+    }
+    ENOENT
+}
+
+pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    const F_GETFL: u32 = 3;
+    const F_SETFL: u32 = 4;
+    const FD_CLOEXEC: u64 = 1;
+    const O_NONBLOCK: u64 = 0x800;
+
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+
+    if proc.get_fd(fd).is_none() {
+        return EBADF;
+    }
+
+    match cmd {
+        F_GETFD => {
+            if proc.is_cloexec(fd) { FD_CLOEXEC } else { 0 }
+        }
+        F_SETFD => {
+            if arg & FD_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            } else {
+                proc.clear_cloexec(fd);
+            }
+            0
+        }
+        F_GETFL => {
+            if proc.is_nonblock(fd) { O_NONBLOCK } else { 0 }
+        }
+        F_SETFL => {
+            if arg & O_NONBLOCK != 0 {
+                proc.set_nonblock(fd);
+            } else {
+                proc.clear_nonblock(fd);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let path = if raw_path.starts_with('/') {
+        crate::vfs::canonicalize_path(&raw_path)
+    } else {
+        let base = if dirfd == -100 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        };
+        crate::vfs::resolve_path(&base, &raw_path)
+    };
+
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(256, "[syscall] mkdirat({}) dirfd={}\n", &path, dirfd);
+    }
+
+    match crate::fs::create_dir(&path) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
+}
+
+pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let resolved = if path.starts_with('/') {
+        crate::vfs::canonicalize_path(&path)
+    } else {
+        let base = if dirfd == -100 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        };
+        crate::vfs::resolve_path(&base, &path)
+    };
+
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(256, "[syscall] unlinkat({}) flags=0x{:x}\n", &resolved, flags);
+    }
+
+    const AT_REMOVEDIR: u32 = 0x200;
+    if flags & AT_REMOVEDIR != 0 {
+        match crate::fs::remove_dir(&resolved) {
+            Ok(()) => 0,
+            Err(e) => fs_error_to_errno(e),
+        }
+    } else {
+        crate::vfs::remove_symlink(&resolved);
+        match crate::fs::remove_file(&resolved) {
+            Ok(()) => 0,
+            Err(e) => fs_error_to_errno(e),
+        }
+    }
+}
+
+pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> u64 {
+    let raw_old = match copy_from_user_str(oldpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let raw_new = match copy_from_user_str(newpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let oldpath = resolve_path_at(olddirfd, &raw_old);
+    let newpath = resolve_path_at(newdirfd, &raw_new);
+    crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
+    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
+}
+
+pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
+    let target = match copy_from_user_str(target_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let raw_link = match copy_from_user_str(linkpath_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let link_path = resolve_path_at(newdirfd, &raw_link);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
+    }
+    match crate::vfs::create_symlink(&link_path, &target) {
+        Ok(_) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
+}
+
+pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> u64 {
+    let oldpath = match copy_from_user_str(oldpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
+    let newpath = match copy_from_user_str(newpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
+    let src = resolve_path_at(_olddirfd, &oldpath);
+    let dst = resolve_path_at(_newdirfd, &newpath);
+    if let Ok(data) = crate::fs::read_file(&src) {
+        if crate::fs::write_file(&dst, &data).is_ok() { return 0; }
+    }
+    !0u64
+}
+
+pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u64 {
+    let raw_path = match copy_from_user_str(path_ptr, 1024) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path = resolve_path_at(dirfd, &raw_path);
+
+    if path == "/proc/self/exe" {
+        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        let exe = if let Some(proc) = akuma_exec::process::current_process() {
+            proc.name.clone()
+        } else {
+            String::from("/bin/unknown")
+        };
+        let bytes = exe.as_bytes();
+        let copy_len = bytes.len().min(bufsize);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        return copy_len as u64;
+    }
+
+    if let Some(target) = crate::vfs::read_symlink(&path) {
+        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        let bytes = target.as_bytes();
+        let copy_len = bytes.len().min(bufsize);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        return copy_len as u64;
+    }
+    EINVAL
+}
+
+pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
+    if !validate_user_ptr(ptr, size) { return EFAULT; }
+    if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
+            if let Ok(entries) = crate::fs::list_dir(&f.path) {
+                if f.position >= entries.len() { return 0; }
+                let mut written = 0;
+                for entry in entries.iter().skip(f.position) {
+                    let reclen = (19 + entry.name.len() + 1 + 7) & !7;
+                    if written + reclen > size { break; }
+                    unsafe {
+                        let p = (ptr as *mut u8).add(written);
+                        core::ptr::write_unaligned(p as *mut u64, 1);
+                        core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
+                        core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
+                        p.add(18).write(if entry.is_dir { 4 } else { 8 });
+                        core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
+                        p.add(19 + entry.name.len()).write(0);
+                    }
+                    written += reclen;
+                    proc.update_fd(fd, |e| if let akuma_exec::process::FileDescriptor::File(file) = e { file.position += 1; });
+                }
+                return written as u64;
+            }
+        }
+    }
+    !0u64
+}
+
+pub(super) fn sys_fchdir(fd: u32) -> u64 {
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let entry = match proc.get_fd(fd) {
+        Some(e) => e,
+        None => return EBADF,
+    };
+    let path = match entry {
+        akuma_exec::process::FileDescriptor::File(f) => f.path.clone(),
+        _ => return ENOTDIR,
+    };
+    if let Ok(meta) = crate::vfs::metadata(&path) {
+        if meta.is_dir {
+            proc.set_cwd(&path);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
+            }
+            return 0;
+        }
+    }
+    ENOTDIR
+}
+
+pub(super) fn sys_chdir(ptr: u64) -> u64 {
+    let path = match copy_from_user_str(ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    
+    if let Some(proc) = akuma_exec::process::current_process() {
+        let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
+        
+        if crate::fs::exists(&new_cwd) {
+            if let Ok(meta) = crate::vfs::metadata(&new_cwd) {
+                if meta.is_dir {
+                    proc.set_cwd(&new_cwd);
+                    return 0;
+                }
+            }
+        }
+        return ENOENT;
+    }
+    !0u64
+}
