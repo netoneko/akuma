@@ -143,6 +143,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_mremap_lazy_region_shrink, "mremap_lazy_region_shrink");
     run_test!(test_mremap_lazy_cleans_old_ptes, "mremap_lazy_cleans_old_ptes");
 
+    // Large mmap limit (Bun Gigacage support)
+    run_test!(test_large_mmap_limit, "large_mmap_limit");
+
+    // close_range syscall
+    run_test!(test_close_range, "close_range");
+
     // set_robust_list
     run_test!(test_set_robust_list_stores_head, "set_robust_list_stores_head");
     run_test!(test_robust_list_cleanup_wakes_futex, "robust_list_cleanup_wakes_futex");
@@ -5871,6 +5877,123 @@ fn test_fp_arithmetic_across_preemption() -> bool {
         "  A={} (expect {}) B={} (expect {}) cleaned={}\n",
         result_a as u64, expected_a as u64, result_b as u64, expected_b as u64, cleaned
     );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test large mmap limit expansion (for Bun Gigacage support)
+/// Verifies that a ProcessMemory configured with large limits can allocate 128GB
+fn test_large_mmap_limit() -> bool {
+    console::print("\n[TEST] Large mmap limit (Bun Gigacage)\n");
+    
+    // Simulate limits for a large binary (from elf_loader.rs)
+    const MIN_MMAP_SPACE: usize = 0x40_0000_0000; // 256GB
+    const MAX_STACK_TOP: usize = 0x80_0000_0000;  // 512GB
+    const USER_STACK_SIZE: usize = 512 * 1024;
+    
+    let brk = 0x2000_0000; // Simulate some heap usage
+    let stack_top = MAX_STACK_TOP;
+    let stack_bottom = stack_top - USER_STACK_SIZE;
+    let mmap_floor = brk + MIN_MMAP_SPACE;
+    
+    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+    
+    crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n", 
+        mem.next_mmap, mem.mmap_limit);
+    
+    // Attempt to allocate 128GB (JSC Gigacage)
+    let gigacage_size = 128usize * 1024 * 1024 * 1024;
+    let addr = mem.alloc_mmap(gigacage_size);
+    
+    match addr {
+        Some(a) => {
+            crate::safe_print!(128, "  Successfully allocated 128GB at {:#x}\n", a);
+            console::print("  Result: PASS\n");
+            true
+        }
+        None => {
+            crate::safe_print!(128, "  FAILED to allocate 128GB (limit={:#x})\n", mem.mmap_limit);
+            console::print("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+/// Test: sys_close_range implementation
+///
+/// Creates a temporary test process and registers it so that current_process()
+/// works inside sys_close_range. This is necessary because memory tests run
+/// during early boot before any user process exists.
+fn test_close_range() -> bool {
+    console::print("\n[TEST] sys_close_range\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (addr space)\n"); return false; }
+    };
+    let info_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM (info frame)\n"); return false; }
+    };
+
+    let test_proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    akuma_exec::process::register_process(test_pid, test_proc);
+
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::process::register_thread_pid(tid, test_pid);
+
+    let proc = akuma_exec::process::lookup_process(test_pid).unwrap();
+
+    // 1. Setup a few FDs
+    let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd2 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd3 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd4 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+
+    crate::safe_print!(128, "  Allocated FDs: {}, {}, {}, {}\n", fd1, fd2, fd3, fd4);
+
+    // 2. Test CLOSE_RANGE_CLOEXEC
+    crate::safe_print!(128, "  Testing CLOSE_RANGE_CLOEXEC on {}-{}\n", fd1, fd2);
+    crate::syscall::sys_close_range(fd1, fd2, 4); // 4 = CLOSE_RANGE_CLOEXEC
+
+    let cloexec1 = proc.is_cloexec(fd1);
+    let cloexec2 = proc.is_cloexec(fd2);
+    let cloexec3 = proc.is_cloexec(fd3);
+
+    crate::safe_print!(128, "  CLOEXEC states: {}={}, {}={}, {}={}\n",
+        fd1, cloexec1, fd2, cloexec2, fd3, cloexec3);
+
+    if !cloexec1 || !cloexec2 || cloexec3 {
+        console::print("  CLOEXEC state mismatch\n");
+        akuma_exec::process::unregister_thread_pid(tid);
+        akuma_exec::process::unregister_process(test_pid);
+        crate::pmm::free_page(info_frame);
+        return false;
+    }
+
+    // 3. Test actual close
+    crate::safe_print!(128, "  Testing actual close on {}-{}\n", fd1, fd3);
+    crate::syscall::sys_close_range(fd1, fd3, 0);
+
+    let exists1 = proc.get_fd(fd1).is_some();
+    let exists2 = proc.get_fd(fd2).is_some();
+    let exists3 = proc.get_fd(fd3).is_some();
+    let exists4 = proc.get_fd(fd4).is_some();
+
+    crate::safe_print!(128, "  FD exists: {}={}, {}={}, {}={}, {}={}\n",
+        fd1, exists1, fd2, exists2, fd3, exists3, fd4, exists4);
+
+    let pass = !exists1 && !exists2 && !exists3 && exists4;
+    if !pass {
+        console::print("  FD existence mismatch after close\n");
+    }
+
+    // Cleanup
+    akuma_exec::process::unregister_thread_pid(tid);
+    akuma_exec::process::unregister_process(test_pid);
+    crate::pmm::free_page(info_frame);
+
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

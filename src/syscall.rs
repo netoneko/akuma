@@ -4,6 +4,7 @@
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
 
 use crate::config;
+use crate::irq::with_irqs_disabled;
 use akuma_terminal::mode_flags;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -1192,8 +1193,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         nr::CLOSE_RANGE => {
-            crate::safe_print!(96, "[stub] close_range(lo={}, hi={}, flags={})\n", args[0], args[1], args[2]);
-            0
+            sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
         nr::CAPGET => {
             let data_ptr = args[1] as usize;
@@ -2279,7 +2279,7 @@ fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
     } else { !0u64 }
 }
 
-fn sys_close(fd: u32) -> u64 {
+pub(crate) fn sys_close(fd: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         if let Some(entry) = proc.remove_fd(fd) {
             proc.clear_cloexec(fd);
@@ -2303,6 +2303,48 @@ fn sys_close(fd: u32) -> u64 {
             0
         } else { !0u64 }
     } else { !0u64 }
+}
+
+pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    // Collect FDs in the range to avoid holding the lock while performing cleanup
+    let fds: Vec<u32> = with_irqs_disabled(|| {
+        proc.fd_table.lock().range(first..=last).map(|(&fd, _)| fd).collect()
+    });
+
+    for fd in fds {
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        } else {
+            // Actual close - use same logic as sys_close
+            if let Some(entry) = proc.remove_fd(fd) {
+                proc.clear_cloexec(fd);
+                match entry {
+                    akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+                    akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                        akuma_exec::process::remove_child_channel(child_pid);
+                    }
+                    akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+                        pipe_close_write(pipe_id);
+                    }
+                    akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
+                        pipe_close_read(pipe_id);
+                    }
+                    akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                        eventfd_close(efd_id);
+                    }
+                    _ => {}
+                }
+                proc.clear_nonblock(fd);
+            }
+        }
+    }
+    0
 }
 
 fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {

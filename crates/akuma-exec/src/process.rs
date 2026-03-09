@@ -471,6 +471,18 @@ pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     })
 }
 
+pub fn register_thread_pid(tid: usize, pid: Pid) {
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(tid, pid);
+    });
+}
+
+pub fn unregister_thread_pid(tid: usize) {
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().remove(&tid);
+    });
+}
+
 // ============================================================================
 // Process Channel - Inter-thread communication for process I/O
 // ============================================================================
