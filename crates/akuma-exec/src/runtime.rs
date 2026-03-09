@@ -59,9 +59,12 @@ pub struct ExecRuntime {
     pub track_frame: fn(PhysFrame, FrameSource),
     pub free_count: fn() -> usize,
     pub total_count: fn() -> usize,
+    pub alloc_pages_contiguous_zeroed: fn(usize) -> Option<PhysFrame>,
+    pub free_pages_contiguous: fn(PhysFrame, usize),
 
     // Allocator
     pub heap_stats: fn() -> (usize, usize),
+    pub is_memory_low: fn() -> bool,
 
     // VFS (for elf_loader)
     pub read_file: fn(&str) -> Result<alloc::vec::Vec<u8>, i32>,

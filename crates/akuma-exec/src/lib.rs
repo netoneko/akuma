@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(never_type)]
+#![feature(allocator_api)]
 #![allow(
     clippy::future_not_send,
     clippy::must_use_candidate,

@@ -2758,6 +2758,9 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
 /// Fork the current process (deep copy)
 /// Returns the new PID to the parent
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot fork");
+    }
     let parent = current_process().ok_or("No current process")?;
     let parent_pid = parent.pid;
     
@@ -2777,8 +2780,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         .map_err(|_| "Failed to map process info")?;
     new_address_space.track_user_frame(process_info_frame);
 
-    // 3. Create Process struct
-    let mut new_proc = Box::new(Process {
+    // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
+    let mut new_proc = Box::try_new(Process {
         pid: child_pid,
         pgid: parent.pgid,
         name: parent.name.clone(),
@@ -2825,10 +2828,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         robust_list_head: 0,
         robust_list_len: 0,
         signal_actions: parent.signal_actions,
-            start_time_us: (runtime().uptime_us)(),
-            last_syscall: core::sync::atomic::AtomicU64::new(0),
-            syscall_stats: ProcessSyscallStats::new(),
-});
+        start_time_us: (runtime().uptime_us)(),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: ProcessSyscallStats::new(),
+    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
     
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top;
@@ -2992,6 +2995,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
 pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot clone thread");
+    }
     let parent = current_process().ok_or("No current process")?;
     let parent_pid = parent.pid;
     let child_pid = allocate_pid();
@@ -3000,7 +3006,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
         .ok_or("Failed to create shared address space")?;
 
-    let mut new_proc = Box::new(Process {
+    let mut new_proc = Box::try_new(Process {
         pid: child_pid,
         pgid: parent.pgid,
         name: parent.name.clone(),
@@ -3047,10 +3053,10 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         robust_list_head: 0,
         robust_list_len: 0,
         signal_actions: parent.signal_actions,
-            start_time_us: (runtime().uptime_us)(),
-            last_syscall: core::sync::atomic::AtomicU64::new(0),
-            syscall_stats: ProcessSyscallStats::new(),
-});
+        start_time_us: (runtime().uptime_us)(),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: ProcessSyscallStats::new(),
+    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
 
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
@@ -3267,6 +3273,11 @@ pub fn spawn_process_with_channel_ext(
         return Err("No available user threads for process execution".into());
     }
 
+    // Reject new processes under memory pressure to prevent OOM cascade
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot spawn new process".into());
+    }
+
     // If the box has a namespace with mounts (SubdirFs at /), activate a
     // per-thread namespace override so that runtime().read_file and
     // resolve_symlinks go through the container's mount table.
@@ -3412,8 +3423,9 @@ pub fn spawn_process_with_channel_ext(
     // Get the PID before boxing
     let pid = process.pid;
 
-    // Box the process for heap allocation
-    let boxed_process = Box::new(process);
+    // Box the process for heap allocation (fallible to avoid kernel panic on OOM)
+    let boxed_process = Box::try_new(process)
+        .map_err(|_| format!("Failed to allocate Process struct for {path}"))?;
 
     // CRITICAL: Register the process in the table immediately.
     // This ensures that lookup_process(pid) works as soon as this function returns,

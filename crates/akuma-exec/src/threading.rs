@@ -1163,12 +1163,13 @@ impl ThreadPool {
         // Allocate a SEPARATE exception stack for thread 0 (boot thread).
         // Unlike spawned threads which reserve space at the top of their stack,
         // the boot stack was already in use before we could reserve space.
-        // We allocate from heap to get a clean, separate area.
-        let boot_exception_stack: Vec<u8> = alloc::vec![0u8; EXCEPTION_STACK_SIZE];
-        let boot_exception_stack_box = boot_exception_stack.into_boxed_slice();
-        let boot_exception_stack_ptr = Box::into_raw(boot_exception_stack_box);
-        let boot_exception_stack_top = unsafe { 
-            (boot_exception_stack_ptr as *const u8).add(EXCEPTION_STACK_SIZE) as u64 
+        // Allocate from PMM to avoid using kernel heap for stacks.
+        let exc_pages = (EXCEPTION_STACK_SIZE + 4095) / 4096;
+        let exc_frame = (runtime().alloc_pages_contiguous_zeroed)(exc_pages)
+            .expect("Failed to allocate boot exception stack from PMM");
+        let boot_exception_stack_ptr = crate::mmu::phys_to_virt(exc_frame.addr);
+        let boot_exception_stack_top = unsafe {
+            (boot_exception_stack_ptr as *const u8).add(EXCEPTION_STACK_SIZE) as u64
         };
         // Align to 16 bytes
         self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
@@ -1199,8 +1200,8 @@ impl ThreadPool {
         self.initialized = true;
     }
 
-    /// Allocate a stack for a specific slot
-    /// 
+    /// Allocate a stack for a specific slot using PMM contiguous pages.
+    ///
     /// Stack layout (stack grows downward):
     /// ```text
     /// |------------------| <- stack_top (highest address)
@@ -1210,10 +1211,15 @@ impl ThreadPool {
     /// |------------------| <- stack_base (lowest address)
     /// ```
     fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) {
-        let stack_vec: Vec<u8> = alloc::vec![0u8; size];
-        let stack_box = stack_vec.into_boxed_slice();
-        let stack_ptr = Box::into_raw(stack_box) as *mut u8;
-        let stack_info = StackInfo::new(stack_ptr as usize, size);
+        let page_size = 4096;
+        let pages = (size + page_size - 1) / page_size;
+        let alloc_size = pages * page_size;
+
+        // Allocate contiguous physical pages from PMM (bypasses kernel heap)
+        let frame = (runtime().alloc_pages_contiguous_zeroed)(pages)
+            .expect("Failed to allocate thread stack from PMM");
+        let stack_ptr = crate::mmu::phys_to_virt(frame.addr) as usize;
+        let stack_info = StackInfo::new(stack_ptr, alloc_size);
 
         // Initialize canary at bottom of stack
         if config().enable_stack_canaries {
@@ -1221,10 +1227,23 @@ impl ThreadPool {
         }
 
         self.stacks[slot_idx] = stack_info;
-        
+
         // Set exception stack top (top of the reserved 1KB area)
         // The exception stack is at the very top of the kernel stack
         self.slots[slot_idx].exception_stack_top = (stack_info.top & !0xF) as u64;
+    }
+
+    /// Free a PMM-backed stack for a specific slot.
+    fn free_stack_for_slot(&mut self, slot_idx: usize) {
+        let stack = &self.stacks[slot_idx];
+        if stack.is_allocated() {
+            let page_size = 4096;
+            let pages = (stack.size + page_size - 1) / page_size;
+            let phys_addr = crate::mmu::virt_to_phys(stack.base);
+            let frame = crate::PhysFrame::new(phys_addr);
+            (runtime().free_pages_contiguous)(frame, pages);
+            self.stacks[slot_idx] = StackInfo::empty();
+        }
     }
 
     /// Reallocate stack for a slot with new size (only if slot is Free)
@@ -1239,28 +1258,11 @@ impl ThreadPool {
             return Err("Can only reallocate stack for free slot");
         }
 
-        let old_stack = &self.stacks[slot_idx];
+        // Free old PMM-backed stack
+        self.free_stack_for_slot(slot_idx);
 
-        // Free old stack if allocated
-        if old_stack.is_allocated() {
-            unsafe {
-                let ptr = old_stack.base as *mut u8;
-                let slice = core::slice::from_raw_parts_mut(ptr, old_stack.size);
-                let _ = Box::from_raw(slice as *mut [u8]);
-            }
-        }
-
-        // Allocate new stack
+        // Allocate new stack from PMM
         self.allocate_stack_for_slot(slot_idx, new_size);
-
-        // Check for overlaps with other stacks
-        let new_stack = &self.stacks[slot_idx];
-        for i in 0..MAX_THREADS {
-            if i != slot_idx && new_stack.overlaps(&self.stacks[i]) {
-                // This shouldn't happen with heap allocation, but check anyway
-                return Err("New stack overlaps with existing stack");
-            }
-        }
 
         Ok(())
     }

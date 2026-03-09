@@ -5,6 +5,13 @@ use ed25519_dalek::SigningKey;
 use crate::config::SshdConfig;
 use crate::constants::SSH_VERSION;
 
+/// Maximum size for the SSH input buffer (pending undecoded data).
+/// Protects against a malicious or misbehaving client flooding the kernel.
+pub const INPUT_BUFFER_MAX: usize = 256 * 1024; // 256 KB
+
+/// Maximum size for the channel data buffer (decoded terminal input).
+pub const CHANNEL_DATA_BUFFER_MAX: usize = 64 * 1024; // 64 KB
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshState {
     AwaitingVersion,
@@ -39,6 +46,29 @@ pub struct SshSession {
 }
 
 impl SshSession {
+    /// Append data to the input buffer, enforcing the size limit.
+    /// Returns false if the buffer is full and data was dropped.
+    pub fn feed_input(&mut self, data: &[u8]) -> bool {
+        if self.input_buffer.len() + data.len() > INPUT_BUFFER_MAX {
+            log::warn!("[SSH] Input buffer overflow ({} + {} > {}), dropping data",
+                self.input_buffer.len(), data.len(), INPUT_BUFFER_MAX);
+            return false;
+        }
+        self.input_buffer.extend_from_slice(data);
+        true
+    }
+
+    /// Append data to the channel data buffer, enforcing the size limit.
+    /// Returns false if the buffer is full and data was dropped.
+    pub fn feed_channel_data(&mut self, data: &[u8]) -> bool {
+        if self.channel_data_buffer.len() + data.len() > CHANNEL_DATA_BUFFER_MAX {
+            log::warn!("[SSH] Channel data buffer overflow, dropping data");
+            return false;
+        }
+        self.channel_data_buffer.extend_from_slice(data);
+        true
+    }
+
     #[must_use]
     pub fn new(config: SshdConfig, host_key: Option<SigningKey>, rng: SimpleRng) -> Self {
         Self {

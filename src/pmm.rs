@@ -341,6 +341,57 @@ impl BitmapAllocator {
         None
     }
 
+    /// Allocate `count` contiguous pages. Returns the first frame's address.
+    /// Scans the bitmap for a run of `count` consecutive free pages.
+    fn alloc_pages_contiguous(&mut self, count: usize) -> Option<PhysFrame> {
+        if count == 0 { return None; }
+        if count == 1 { return self.alloc_page(); }
+        if self.free_pages < count { return None; }
+
+        // Scan for a contiguous run of `count` free pages
+        let mut run_start = 0;
+        let mut run_len = 0;
+
+        for page_idx in 0..self.total_pages {
+            if self.is_free(page_idx) {
+                if run_len == 0 {
+                    run_start = page_idx;
+                }
+                run_len += 1;
+                if run_len == count {
+                    // Found a run — mark all pages as used
+                    for i in run_start..run_start + count {
+                        self.mark_used(i);
+                    }
+                    self.free_pages -= count;
+                    self.next_free_hint = run_start + count;
+                    let addr = self.base_addr + run_start * PAGE_SIZE;
+                    return Some(PhysFrame::new(addr));
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+
+        None
+    }
+
+    /// Free `count` contiguous pages starting from `frame`.
+    fn free_pages_contiguous(&mut self, frame: PhysFrame, count: usize) {
+        if frame.addr < self.base_addr { return; }
+        let start_page = (frame.addr - self.base_addr) / PAGE_SIZE;
+        for i in 0..count {
+            let page_idx = start_page + i;
+            if page_idx < self.total_pages && !self.is_free(page_idx) {
+                self.mark_free(page_idx);
+                self.free_pages += 1;
+            }
+        }
+        if start_page < self.next_free_hint {
+            self.next_free_hint = start_page;
+        }
+    }
+
     /// Free a single page
     fn free_page(&mut self, frame: PhysFrame) {
         if frame.addr < self.base_addr {
@@ -409,6 +460,43 @@ pub fn free_page(frame: PhysFrame) {
         let mut pmm = PMM.lock();
         pmm.free_page(frame);
         ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+    })
+}
+
+/// Allocate `count` contiguous zeroed physical pages.
+/// Returns the first frame if successful. Pages are physically contiguous.
+pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<PhysFrame> {
+    use akuma_exec::mmu::phys_to_virt;
+
+    let frame = crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        let result = pmm.alloc_pages_contiguous(count)?;
+        ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
+        Some(result)
+    })?;
+
+    unsafe {
+        let virt_addr = phys_to_virt(frame.addr);
+        core::ptr::write_bytes(virt_addr, 0, count * PAGE_SIZE);
+
+        const CACHE_LINE_SIZE: usize = 64;
+        let mut addr = virt_addr as usize;
+        let end = addr + count * PAGE_SIZE;
+        while addr < end {
+            core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr);
+            addr += CACHE_LINE_SIZE;
+        }
+        core::arch::asm!("dsb ish");
+    }
+    Some(frame)
+}
+
+/// Free `count` contiguous physical pages starting from `frame`.
+pub fn free_pages_contiguous(frame: PhysFrame, count: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        pmm.free_pages_contiguous(frame, count);
+        ALLOCATED_PAGES.fetch_sub(count, Ordering::Relaxed);
     })
 }
 

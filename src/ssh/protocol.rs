@@ -112,7 +112,7 @@ impl<'a> SshChannelStream<'a> {
                 }
                 Ok(Err(e)) => return Err(e),
                 Ok(Ok(n)) => {
-                    self.session.input_buffer.extend_from_slice(&buf[..n]);
+                    self.session.feed_input(&buf[..n]);
 
                     loop {
                         let packet = akuma_ssh::packet::process_encrypted_packet(self.session);
@@ -158,7 +158,7 @@ impl<'a> SshChannelStream<'a> {
             }
             Ok(Err(e)) => Err(e),
             Ok(Ok(n)) => {
-                self.session.input_buffer.extend_from_slice(&tcp_buf[..n]);
+                self.session.feed_input(&tcp_buf[..n]);
 
                 loop {
                     let packet = akuma_ssh::packet::process_encrypted_packet(self.session);
@@ -192,7 +192,7 @@ impl<'a> SshChannelStream<'a> {
                 let mut offset = 0;
                 let _recipient = read_u32(payload, &mut offset);
                 if let Some(data) = read_string(payload, &mut offset) {
-                    self.session.channel_data_buffer.extend_from_slice(data);
+                    self.session.feed_channel_data(data);
                     return Ok(true);
                 }
             }
@@ -384,7 +384,7 @@ async fn bridge_process(
 
         match read_res {
             Ok(Ok(n)) if n > 0 => {
-                session.input_buffer.extend_from_slice(&ssh_buf[..n]);
+                session.feed_input(&ssh_buf[..n]);
                 while let Some((msg_type, payload)) = akuma_ssh::packet::process_encrypted_packet(session) {
                     if msg_type == SSH_MSG_CHANNEL_DATA {
                         let mut offset = 0;
@@ -876,6 +876,12 @@ async fn handle_exec(
 // ============================================================================
 
 pub async fn handle_connection(mut stream: TcpStream) {
+    // Reject new connections under memory pressure
+    if crate::allocator::is_memory_low() {
+        log("[SSH] Rejecting connection: kernel memory low\n");
+        return;
+    }
+
     log("[SSH] New SSH connection\n");
 
     let config = super::config::get_config();
@@ -913,7 +919,7 @@ pub async fn handle_connection(mut stream: TcpStream) {
                 break;
             }
             Ok(Ok(n)) => {
-                session.input_buffer.extend_from_slice(&buf[..n]);
+                session.feed_input(&buf[..n]);
 
                 if session.state == SshState::AwaitingVersion {
                     if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {

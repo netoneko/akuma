@@ -214,6 +214,18 @@ pub fn stats() -> MemoryStats {
     }
 }
 
+/// Heap low watermark - when free heap drops below this, memory is considered low.
+const HEAP_LOW_WATERMARK: usize = 2 * 1024 * 1024; // 2 MB
+
+/// Returns true if the kernel heap is running low on free space.
+/// Used by subsystems to reject new work before hitting OOM.
+pub fn is_memory_low() -> bool {
+    let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
+    let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let free = heap_size.saturating_sub(allocated);
+    free < HEAP_LOW_WATERMARK
+}
+
 /// No-op for backwards compatibility - IRQs are now always disabled during allocation
 pub fn enable_preemption_safe_alloc() {}
 

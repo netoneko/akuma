@@ -290,9 +290,10 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: fixed 16MB - kernel data structures (page tables, PCBs, VFS, networking)
+    // - Heap: fixed 8MB - kernel data structures (page tables, PCBs, VFS, networking)
+    //   Thread stacks are now PMM-backed, so the heap only holds metadata.
     // - User pages: remaining - for user processes
-    const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
+    const KERNEL_HEAP_SIZE: usize = 8 * 1024 * 1024;
 
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
@@ -322,7 +323,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(heap_start as u64);
     console::print(" - 0x");
     console::print_hex(user_pages_start as u64);
-    console::print(") [fixed 16MB]\n");
+    console::print(") [fixed 8MB]\n");
 
     console::print("User pages: ");
     console::print_dec(user_pages_size / 1024 / 1024);
@@ -381,10 +382,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             track_frame: pmm::track_frame,
             free_count: pmm::free_count,
             total_count: pmm::total_count,
+            alloc_pages_contiguous_zeroed: pmm::alloc_pages_contiguous_zeroed,
+            free_pages_contiguous: pmm::free_pages_contiguous,
             heap_stats: || {
                 let s = allocator::stats();
                 (s.heap_size, s.allocated)
             },
+            is_memory_low: allocator::is_memory_low,
             read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
             read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
             resolve_inode: |path| crate::vfs::resolve_inode(path).map_err(|_| -1),
