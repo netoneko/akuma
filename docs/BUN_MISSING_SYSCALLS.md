@@ -509,9 +509,23 @@ larger heap provides headroom for peak allocations.
 With all fixes applied, `bun install express` now:
 1. Initializes successfully (epoll, timerfd, eventfd)
 2. Resolves DNS via QEMU forwarder (10.0.2.3:53)
-3. Opens 40+ TCP connections to npm registry (104.16.x.34:443)
+3. Opens TCP connections to npm registry (104.16.x.34:443)
 4. Creates cache directories and temp files
-5. Performs TLS handshakes (BoringSSL)
+
+**Remaining crash:** SIGSEGV at `0x452524940` (~18.6 GB), immediately
+after TCP sockets are created but BEFORE any epoll_wait. This address
+is completely outside the process's VA space:
+
+- Max lazy region: ~2.7 GB
+- Crash address: ~18.6 GB
+- All mapped regions are below 3 GB
+
+The crash is deterministic and occurs within 70ms of TCP connect calls.
+This appears to be a bun/JSC internal issue (wild pointer, corrupted
+vtable, or JIT bug) rather than a kernel bug. The kernel correctly:
+1. Delivers SIGSEGV to bun's signal handler at `0x2ceca60`
+2. Reports the faulting address accurately
+3. Has no lazy region covering the address (correct behavior)
 
 ---
 
