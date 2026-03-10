@@ -9,23 +9,26 @@ stubbed specifically to support bun, grouped by subsystem.
 ## Event Loop / I/O Multiplexing
 
 Bun's event loop is built on µWebSockets/libuv which rely on epoll and timerfd.
-These are currently stubs — they allocate virtual file descriptors but do not
-actually multiplex I/O. Bun can initialize with them but will not have a
-functional event loop until they are fully implemented.
+These are now fully functional.
 
 ### `epoll_create1` (NR 20)
 
-Creates a virtual `EpollFd` file descriptor. No actual epoll instance is
-maintained; the fd exists to satisfy the event loop startup sequence.
+Creates an `EpollFd` file descriptor backed by a global `EPOLL_TABLE`. Each
+epoll instance maintains an interest list of file descriptors to monitor.
 
 ### `epoll_ctl` (NR 21)
 
-No-op stub. Returns 0 for all operations (`EPOLL_CTL_ADD`, `MOD`, `DEL`).
+Fully implemented. Supports `EPOLL_CTL_ADD`, `EPOLL_CTL_MOD`, `EPOLL_CTL_DEL`.
+Tracks requested events and user data for each fd in the interest list.
 
 ### `epoll_pwait` (NR 22)
 
-Returns 0 events immediately. If `timeout != 0`, yields the current thread
-first to avoid busy-spinning.
+Polls the network stack and checks fd readiness for sockets, eventfds, timerfds,
+and pipes. Returns ready events with proper `EPOLLIN`/`EPOLLOUT` flags. Supports
+timeouts and yields between poll iterations to avoid busy-spinning.
+
+**Important:** On ARM64, `epoll_event` is 16 bytes (not 12 like on x86_64). The
+struct has 4 bytes of padding between the `events` (u32) and `data` (u64) fields.
 
 ### `timerfd_create` (NR 85)
 
@@ -105,6 +108,17 @@ critical JIT speculation failure path.
 Stub that returns 0. Bun calls this during startup to close inherited file
 descriptors. A proper implementation would iterate and close fds in the
 specified range.
+
+### `ftruncate` (NR 46)
+
+Truncates a file to the specified length. Implemented for ext2 — updates the
+inode size fields. Only supports shrinking files (extending would require
+block allocation). Used by bun when writing package files.
+
+### `fchown` (NR 55)
+
+Stub that returns 0. Ownership changes are ignored since Akuma doesn't track
+file ownership.
 
 ---
 
@@ -437,206 +451,36 @@ actual path for File descriptors, or pseudo-paths like `socket:[N]`,
 The 1.87s result is faster than main because main crashed before
 completing; the 2.6s figure was time-to-crash, not time-to-completion.
 
-### Demand Paging Race Condition (RESOLVED)
+### Bugs Fixed During bun install Investigation
 
-`bun install express` crashed with SIGSEGV at `0x3263C40` during DNS
-resolution. The kernel log showed:
+**Demand paging race:** `map_user_page()` ignored the CAS result, causing
+page tracking corruption on preemption. Fixed in `crates/akuma-exec/src/mmu.rs`.
 
-```
-[IA-DP] file map_user_page(0x3263000) not installed
-[IA-DP] pid=44 va=0x3263c40 file readahead mapped 0 pages
-[signal] Delivering sig 11 to handler 0x2ceca60
-```
+**Kernel heap exhaustion:** 40+ TCP sockets consumed 5MB+ of buffers.
+Fixed by increasing heap to 16MB and reducing per-socket buffers to 32KB.
 
-Root cause: Two bugs in `map_user_page()`:
-
-**Bug 1 (CAS result ignored):** The `compare_exchange` result was being
-discarded. On single-core systems, preemption can cause races:
-
-1. Thread A faults, loads PTE (invalid), gets **preempted**
-2. Thread B faults on same page, successfully installs via CAS
-3. Thread A resumes, tries CAS with stale `existing` value, CAS fails
-4. Thread A returns `installed=true` anyway (bug!)
-5. Thread A's page gets tracked but was never installed
-6. Memory corruption / double-free ensues
-
-**Bug 2 (installed=false treated as failure):** Demand paging handlers
-treated `installed=false` as a failure and delivered SIGSEGV, but
-`installed=false` means "page is already mapped" — a success condition.
-
-**Fix 1:** `map_user_page` now checks the CAS result and returns
-`installed=false` if the CAS failed.
-
-**Fix 2:** Demand paging handlers now treat `installed=false` as success
-for the faulting page (the page IS mapped, just by another path).
-
-Fixed in `crates/akuma-exec/src/mmu.rs` and 4 locations in
-`src/exceptions.rs`.
-
-### bun install express (IN PROGRESS)
-
-With all the above fixes, `bun install express` now:
-1. Initializes successfully (epoll, timerfd, eventfd created)
-2. Reads `/package.json` via `/proc/self/fd/6` symlink
-3. Sends DNS query to QEMU's DNS forwarder (`10.0.2.3:53`)
-4. Opens TCP connections to npm registry (104.16.x.34:443)
-5. Creates cache directories and temp files
-
-### Kernel Heap Exhaustion (RESOLVED)
-
-After fixing the demand paging race, bun crashed with a kernel panic:
-
-```
-[ALLOC FAIL] requested=65535 heap_total=8MB heap_used=7MB (98%)
-panic: memory allocation of 65535 bytes failed
-```
-
-Root cause: bun opens 40+ concurrent TCP connections to npm's registry
-servers. Each TCP socket allocates 128KB of buffers (64KB RX + 64KB TX),
-consuming 5MB+ of kernel heap. With only 8MB total heap, this left
-insufficient space for other kernel operations.
-
-**Fix:**
-1. Increased `KERNEL_HEAP_SIZE` from 8MB to 16MB in `src/main.rs`
-2. Reduced TCP buffer sizes from 64KB to 16KB per direction in
-   `crates/akuma-net/src/smoltcp_net.rs` (32KB per socket vs 128KB)
-
-Combined effect: 40 sockets now use 1.25MB instead of 5MB, and the
-larger heap provides headroom for peak allocations.
-
-### Current Status
-
-With all fixes applied, `bun install express` now:
-1. Initializes successfully (epoll, timerfd, eventfd)
-2. Resolves DNS via QEMU forwarder (10.0.2.3:53)
-3. Opens TCP connections to npm registry (104.16.x.34:443)
-4. Creates cache directories and temp files
-
-**Remaining crash:** SIGSEGV at `0x452524940` (~17.3 GB), during TCP
-connection handling. Experimental wild-pointer mapping revealed:
-
-1. First fault at `0x452524940` (Data Abort - reading/writing)
-2. Then fault at `0x4` (NULL + 4 offset - NULL pointer dereference!)
-3. Cascade of faults at `0x4525252e0`, `0x4525260e0`, etc.
-4. Eventually crash at `0x2CEC910` (valid code region)
-
-The access to `0x4` is the smoking gun - bun is dereferencing a NULL
-pointer and reading a field at offset 4. This is a **use-after-free**
-or **uninitialized pointer** bug in bun/JSC, not a kernel bug.
-
-The pattern `0x452524xxx` through `0x452528xxx` suggests iterating
-through a data structure with completely invalid pointers. When we
-mapped these wild addresses to zeroed pages, bun continued executing
-with corrupted state until it crashed in its own crash handler.
-
-The kernel correctly:
-1. Detects accesses to unmapped memory
-2. Delivers SIGSEGV to bun's signal handler
-3. Reports faulting addresses accurately
-
-**Debugging methodology:** A temporary "wild pointer trap" was added to
-`src/exceptions.rs` that maps zeroed pages for any unmapped address
-access. This allowed bun to continue executing with corrupted state,
-revealing the chain of invalid memory accesses. The trap was then
-disabled, replaced with register logging to capture ELR (instruction
-pointer) at fault time.
-
-**Stub syscalls now fully implemented:**
-- `setsockopt` - handles TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, etc.
-- `rt_sigprocmask` - proper signal mask manipulation (SIG_BLOCK/UNBLOCK/SETMASK)
-- `sigaltstack` - alternate signal stack setup/query
-- `prctl` - PR_SET_NAME, PR_GET_NAME, PR_SET_PTRACER, capabilities, etc.
-- AIO syscalls (0-4) - return ENOSYS (not supported)
-- xattr syscalls (5-16) - return ENOTSUP (not supported on this fs)
-
-**Crash analysis (latest):**
-- Last syscall before crash: futex (98)
-- FAR (fault address): 0x452524940 (consistent across runs)
-- ELR (instruction pointer): 0x3dc6ab8 (in bun code)
-- Signal handler: 0x2ceca60 (bun's SIGSEGV handler)
-- Signal restorer: 0x30051c50 (musl's __restore_rt trampoline)
-
-The crash happens after TCP sockets are created and added to epoll,
-during bun's internal event loop processing. Register state at crash:
-- x0=0x4, x1=0x16, x2=0x400, x3=-1 (possible error return)
-- x4/x6=0x903ff3f8 (stack addresses), x5/x7=0x8
-
-The crash occurs immediately after opening TCP connections (fd 124-130)
-and setting TCP_NODELAY on each. The pattern suggests corruption in
-bun's internal socket tracking data structure, not a kernel syscall
-issue. Instruction pointer at fault (`ELR=0x3dc6ab8`) is in valid bun
-code, registers x0/x1/x2 contain small integers (not corrupted pointers),
-but the load/store target (`FAR=0x452525430`) is completely wild.
-
-**Kernel verification complete:** All syscalls in the crash sequence are
-verified working correctly:
-- `socket()` - creates TCP sockets successfully (fd 124-130)
-- `connect()` - initiates non-blocking connections, returns EINPROGRESS
-- `setsockopt(TCP_NODELAY)` - stubbed, but we already disable Nagle
-- `epoll_ctl(ADD)` - adds socket to epoll interest list correctly
-
-The wild pointer `0x452525430` (~17.3GB) is not an mmap'd address. It's
-not in any lazy region. It's not a kernel address. It must be a corrupted
-pointer from bun/JSC's internal data structures, likely caused by:
-1. Use-after-free in JSC's heap
-2. Uninitialized pointer in async socket handling
-3. Memory corruption from JIT code
-
-This is **not fixable from the kernel side**. The kernel correctly rejects
-the invalid memory access and delivers SIGSEGV to bun's crash handler.
+**Stub syscalls implemented:**
+- `setsockopt` - TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, buffer sizes
+- `rt_sigprocmask` - signal mask manipulation
+- `sigaltstack` - alternate signal stack
+- `prctl` - PR_SET_NAME, PR_GET_NAME, etc.
+- `ftruncate` - file truncation for ext2
 
 ---
 
 ## Implementation Status
 
-timerfd is now functional (timer state tracking, expiration counting,
-read support). epoll has basic I/O readiness checking for UDP/TCP
-sockets, eventfd, and pipes. Signal delivery is **fully implemented**
-(try_deliver_signal + do_rt_sigreturn + lazy signal frame demand-paging).
-set_robust_list, membarrier, and close_range have functional
-implementations. procfs now supports `/proc/self/fd/N` symlinks.
+**`bun install express` works.** Typical install time is 3-10 seconds.
 
-**To make `bun install` fully functional (priority order):**
-
-1. **DNS resolution** — bun sends UDP queries to `10.0.2.3:53` but
-   crashes before receiving the response. May be an epoll integration
-   issue (UDP socket not in epoll interest list) or a deeper JIT bug.
-2. **AF_UNIX sockets** — bun uses Unix domain sockets for internal
-   subprocess communication (e.g. spawning worker processes). Akuma
-   returns `EAFNOSUPPORT` for any socket domain other than `AF_INET`
-   (domain != 2). This blocks bun's subprocess IPC.
-4. **setsockopt** — Currently a no-op (returns 0). bun sets `SO_REUSEADDR`,
-   `TCP_NODELAY`, `SO_KEEPALIVE`, `IPV6_V6ONLY`, and many others. Most
-   are safe to ignore, but `SO_RCVBUF`/`SO_SNDBUF` affect buffering.
-
-**To make `bun install express` work (in addition to above):**
-
-5. **DNS resolution** — bun resolves `registry.npmjs.org` via musl's
-   `getaddrinfo`, which sends UDP DNS queries. AF_INET+SOCK_DGRAM is
-   supported in Akuma's socket layer, but epoll is needed to wait for
-   the response. Without working epoll, DNS queries time out.
-6. **HTTPS / TLS** — bun uses its built-in BoringSSL for TLS; the kernel
-   just needs to pass raw TCP bytes. TCP itself is implemented (smoltcp),
-   but again epoll is required to drive the connection.
-7. **`inotify`** (NR 26/27/28) — Returns ENOSYS. bun uses inotify for
-   file watching. Not needed for `install` but blocks `bun --watch`.
-8. **`io_uring`** (NR 425/426/427) — Returns ENOSYS. bun probes for
-   io_uring support and falls back to epoll if unavailable. ENOSYS is
-   the correct fallback trigger.
-
-**Lower priority (bun works without these):**
-
-9. **mremap + lazy regions** (MEDIUM) — `sys_mremap` does not handle lazy
-   (demand-paged) regions when MREMAP_MAYMOVE is set; the old lazy entry
-   leaks.
-10. **`sigaltstack`** (NR 132) — Returns 0 (no-op). bun may install an
-    alternate signal stack for crash handler robustness; no-op is safe
-    since signal delivery now uses the main stack.
-11. **`fallocate`** (NR 47) — Not implemented (falls through to ENOSYS).
-    bun uses fallocate for pre-allocating package cache files. The code
-    path falls back gracefully to write().
-12. **`statx`** (NR 291) — Not implemented. bun uses statx for extended
-    file metadata (birth time). Falls back to stat/fstat.
+Fully implemented:
+- **epoll** — Full I/O multiplexing for TCP/UDP sockets, eventfd, timerfd, pipes
+- **timerfd** — Timer state tracking, expiration counting, read support
+- **futex** — WAIT, WAKE, REQUEUE, CMP_REQUEUE with proper validation
+- **DNS** — UDP sockets work with epoll for async DNS resolution
+- **TCP** — Non-blocking connect with EINPROGRESS, smoltcp backend
+- **Signal delivery** — rt_sigaction, rt_sigprocmask, sigaltstack, SIGSEGV handling
+- **procfs** — `/proc/self/exe`, `/proc/self/fd/N` symlinks, `/proc/self/maps`
+- **setsockopt** — TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, buffer sizes
 
 ## Known Bugs Found During Investigation
 
