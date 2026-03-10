@@ -34,12 +34,13 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (512KB)
+/// User process stack size (2MB)
 ///
 /// Stack allocated for user-space ELF processes.
-/// 512KB handles most workloads including git clone (zlib) and rendering.
-/// A guard page is placed below the stack to detect overflow.
-pub const USER_STACK_SIZE: usize = 512 * 1024;
+/// 2MB is needed for heavy runtimes like bun/JSC whose initialization
+/// uses ~600KB of stack. A guard page is placed below the stack to
+/// detect overflow.
+pub const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum kernel threads
 ///

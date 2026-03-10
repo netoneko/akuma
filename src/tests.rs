@@ -5913,9 +5913,9 @@ fn test_large_mmap_limit() -> bool {
     console::print("\n[TEST] Large mmap limit (Bun Gigacage)\n");
     
     // Simulate limits for a large binary (from elf_loader.rs)
-    const MIN_MMAP_SPACE: usize = 0x40_0000_0000; // 256GB
-    const MAX_STACK_TOP: usize = 0x80_0000_0000;  // 512GB
-    const USER_STACK_SIZE: usize = 512 * 1024;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128GB
+    const MAX_STACK_TOP: usize = 0x40_0000_0000;  // 256GB
+    const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
     
     let brk = 0x2000_0000; // Simulate some heap usage
     let stack_top = MAX_STACK_TOP;
@@ -5927,18 +5927,22 @@ fn test_large_mmap_limit() -> bool {
     crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n", 
         mem.next_mmap, mem.mmap_limit);
     
-    // Attempt to allocate 128GB (JSC Gigacage)
-    let gigacage_size = 128usize * 1024 * 1024 * 1024;
-    let addr = mem.alloc_mmap(gigacage_size);
-    
-    match addr {
-        Some(a) => {
-            crate::safe_print!(128, "  Successfully allocated 128GB at {:#x}\n", a);
+    // Bun allocates a 1GB arena + 64GB Gigacage (not 128GB contiguous)
+    let arena_size = 1usize * 1024 * 1024 * 1024;
+    let gigacage_size = 64usize * 1024 * 1024 * 1024;
+
+    let arena_addr = mem.alloc_mmap(arena_size);
+    let gigacage_addr = mem.alloc_mmap(gigacage_size);
+
+    match (arena_addr, gigacage_addr) {
+        (Some(a1), Some(a2)) => {
+            crate::safe_print!(128, "  1GB arena at {:#x}, 64GB gigacage at {:#x}\n", a1, a2);
             console::print("  Result: PASS\n");
             true
         }
-        None => {
-            crate::safe_print!(128, "  FAILED to allocate 128GB (limit={:#x})\n", mem.mmap_limit);
+        (a1, a2) => {
+            crate::safe_print!(128, "  FAILED: arena={:?} gigacage={:?} (limit={:#x})\n",
+                a1, a2, mem.mmap_limit);
             console::print("  Result: FAIL\n");
             false
         }
