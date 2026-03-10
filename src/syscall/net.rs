@@ -505,7 +505,7 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
             socket::SocketType::Stream(h) => {
                 akuma_net::smoltcp_net::with_network(|net| {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
-                    s.can_recv() || !s.is_active()
+                    s.can_recv() || !s.is_active() || !s.may_recv()
                 }).unwrap_or(false)
             }
             socket::SocketType::Listener { handles, .. } => {
@@ -528,6 +528,21 @@ pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
             akuma_net::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                 s.can_send()
+            }).unwrap_or(false)
+        } else {
+            false
+        }
+    }).unwrap_or(false)
+}
+
+/// Returns true when the remote peer has closed its write side (sent FIN).
+/// Used to report EPOLLRDHUP — signals to libuv that recv() will return EOF.
+pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Stream(h) = &sock.inner {
+            akuma_net::smoltcp_net::with_network(|net| {
+                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                !s.may_recv()
             }).unwrap_or(false)
         } else {
             false

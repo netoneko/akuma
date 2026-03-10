@@ -17,6 +17,7 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -133,6 +134,9 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                 }
                 if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) {
                     ready |= EPOLLOUT;
+                }
+                if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
+                    ready |= EPOLLRDHUP;
                 }
             }
         }

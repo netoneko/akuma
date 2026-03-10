@@ -641,3 +641,37 @@ timer activity visible), then exited with code 0.
 `Result` and return `(-e as i64) as u64` for errors, properly encoding EAGAIN as
 -11 so libuv breaks its accept loop normally.
 ```
+
+#### Bug 4: EPOLLIN not reported after remote peer closes connection (FIXED 2026-03-11)
+
+**Symptom:** After bun sends an HTTP response and the client closes the connection
+(sends FIN), bun's event loop hung indefinitely. `socket_can_recv_tcp()` for a
+`SocketType::Stream` socket checked `can_recv() || !is_active()`, but neither
+condition is true in TCP `CloseWait` state (remote sent FIN, no more buffered data,
+but socket is still "active"). So epoll never reported `EPOLLIN`, and libuv never
+called `recv()` to get the EOF. Also, `EPOLLRDHUP` (0x2000) was silently ignored —
+libuv registers this flag specifically to detect half-close events.
+
+**Root cause files:**
+- `src/syscall/net.rs` — `socket_can_recv_tcp()` missing `|| !s.may_recv()`
+- `src/syscall/poll.rs` — `EPOLLRDHUP` not defined or handled in `epoll_check_fd_readiness`
+
+**Fix:**
+
+1. `socket_can_recv_tcp()` now includes `!s.may_recv()`:
+```rust
+socket::SocketType::Stream(h) => {
+    akuma_net::smoltcp_net::with_network(|net| {
+        let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+        s.can_recv() || !s.is_active() || !s.may_recv()
+    }).unwrap_or(false)
+}
+```
+
+2. Added `EPOLLRDHUP` constant and `socket_peer_closed_tcp()` helper, wired into
+`epoll_check_fd_readiness()`:
+```rust
+if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
+    ready |= EPOLLRDHUP;
+}
+```
