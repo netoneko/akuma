@@ -623,3 +623,21 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<...> {
     // ... extract handle and create Stream socket
 }
 ```
+
+---
+
+#### Bug 3: `accept4`/`accept` returned -1 (EPERM) instead of -EAGAIN
+
+**Root cause:** When `socket_accept` returned `Err(EAGAIN)`, both `sys_accept`
+and `sys_accept4` fell through to the generic `!0u64` return at the end of the
+function, which is -1 = errno=EPERM. libuv treats EPERM from `accept4` as a fatal
+error (not a "no more connections" signal), causing it to close the server and
+eventually exit bun with code 0.
+
+**Symptom:** bun handled the first few requests successfully, then got stuck (only
+timer activity visible), then exited with code 0.
+
+**Fix:** Both `sys_accept` and `sys_accept4` now match on `socket_accept`'s
+`Result` and return `(-e as i64) as u64` for errors, properly encoding EAGAIN as
+-11 so libuv breaks its accept loop normally.
+```

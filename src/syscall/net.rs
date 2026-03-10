@@ -52,11 +52,14 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         let nonblock = fd_is_nonblock(fd);
-        if let Ok((new_idx, addr)) = socket::socket_accept(idx, nonblock) {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                if addr_ptr != 0 { unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); } }
-                return proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64;
+        match socket::socket_accept(idx, nonblock) {
+            Ok((new_idx, addr)) => {
+                if let Some(proc) = akuma_exec::process::current_process() {
+                    if addr_ptr != 0 { unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); } }
+                    return proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64;
+                }
             }
+            Err(e) => return (-e as i64) as u64,
         }
     }
     !0u64
@@ -67,22 +70,21 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
         let nonblock = fd_is_nonblock(fd);
-        if let Ok((new_idx, addr)) = socket::socket_accept(idx, nonblock) {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                if addr_ptr != 0 {
-                    unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
+        match socket::socket_accept(idx, nonblock) {
+            Ok((new_idx, addr)) => {
+                if let Some(proc) = akuma_exec::process::current_process() {
+                    if addr_ptr != 0 {
+                        unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
+                    }
+                    let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
+                    const SOCK_CLOEXEC: u32 = 0x80000;
+                    const SOCK_NONBLOCK: u32 = 0x800;
+                    if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
+                    if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
+                    return new_fd as u64;
                 }
-                let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
-                const SOCK_CLOEXEC: u32 = 0x80000;
-                const SOCK_NONBLOCK: u32 = 0x800;
-                if flags & SOCK_CLOEXEC != 0 {
-                    proc.set_cloexec(new_fd);
-                }
-                if flags & SOCK_NONBLOCK != 0 {
-                    proc.set_nonblock(new_fd);
-                }
-                return new_fd as u64;
             }
+            Err(e) => return (-e as i64) as u64,
         }
     }
     !0u64
