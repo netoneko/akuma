@@ -194,6 +194,7 @@ pub fn run_memory_tests() -> bool {
 
     // Bun install fixes (improve-dash-compatibility branch)
     run_test!(test_user_stack_size_is_2mb, "user_stack_size_is_2mb");
+    run_test!(test_kernel_heap_size_is_16mb, "kernel_heap_size_is_16mb");
     run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
@@ -6504,6 +6505,25 @@ fn test_user_stack_size_is_2mb() -> bool {
     pass
 }
 
+/// Test: Kernel heap is at least 16MB (required for bun's 40+ TCP sockets)
+///
+/// Bun opens 40+ concurrent TCP connections to npm registry. Each socket
+/// uses 32KB of buffers (16KB RX + 16KB TX), totaling 1.25MB+ just for
+/// socket buffers. The 8MB heap was insufficient.
+fn test_kernel_heap_size_is_16mb() -> bool {
+    console::print("\n[TEST] Kernel heap is at least 16MB\n");
+
+    let heap_stats = crate::allocator::stats();
+    let heap_size = heap_stats.heap_size;
+    let min_expected = 16 * 1024 * 1024; // 16MB
+
+    let pass = heap_size >= min_expected;
+    crate::safe_print!(128, "  heap_size = {} bytes ({} MB), min expected {} MB\n",
+        heap_size, heap_size / 1024 / 1024, min_expected / 1024 / 1024);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 /// Test: DirEntry struct has is_symlink field
 ///
 /// getdents64 must report DT_LNK (10) for symlinks. This requires the
@@ -6568,11 +6588,14 @@ fn test_procfs_fd_symlink_resolution() -> bool {
 
 /// Test: map_user_page returns (frames, false) when page already mapped
 ///
-/// When two CPUs race to map the same page, one wins (installed=true) and
-/// one loses (installed=false). The loser must NOT treat this as a failure.
-/// This test verifies that map_user_page correctly returns installed=false
-/// for an already-mapped page, which the demand paging handler relies on
-/// to avoid delivering spurious SIGSEGV.
+/// When two paths race to map the same page (via preemption on single-core),
+/// one wins (installed=true) and one loses (installed=false). The loser must
+/// NOT treat this as a failure. This test verifies:
+/// 1. First map_user_page returns installed=true
+/// 2. Second map_user_page to same VA returns installed=false
+/// 3. The page IS mapped after both calls
+///
+/// This behavior is critical for demand paging to avoid spurious SIGSEGV.
 fn test_map_user_page_already_mapped() -> bool {
     console::print("\n[TEST] map_user_page returns installed=false for already-mapped page\n");
 
@@ -6584,7 +6607,7 @@ fn test_map_user_page_already_mapped() -> bool {
         return true;
     };
 
-    // Allocate a test page
+    // Allocate test pages
     let Some(page1) = crate::pmm::alloc_page_zeroed() else {
         crate::safe_print!(64, "  SKIP: failed to allocate page\n");
         return true;
@@ -6610,15 +6633,17 @@ fn test_map_user_page_already_mapped() -> bool {
     }
 
     // Page should now be mapped
-    let is_mapped = is_current_user_page_mapped(test_va);
+    let is_mapped_after_first = is_current_user_page_mapped(test_va);
 
-    // Second map to same VA should return installed=false
+    // Second map to same VA should return installed=false (page already there)
     let (frames2, installed2) = unsafe {
         map_user_page(test_va, page2.addr, user_flags::RW)
     };
 
-    // frames2 may have table frames even if page wasn't installed
-    // (the tables were already created by first call)
+    // Page should still be mapped
+    let is_mapped_after_second = is_current_user_page_mapped(test_va);
+
+    // Track any table frames from second call
     for f in frames2 {
         addr_space.track_page_table_frame(f);
     }
@@ -6630,9 +6655,9 @@ fn test_map_user_page_already_mapped() -> bool {
 
     UserAddressSpace::deactivate();
 
-    let pass = installed1 && is_mapped && !installed2;
-    crate::safe_print!(128, "  first_map: installed={}, is_mapped={}, second_map: installed={}\n",
-        installed1, is_mapped, installed2);
+    let pass = installed1 && !installed2 && is_mapped_after_first && is_mapped_after_second;
+    crate::safe_print!(128, "  first: installed={}, mapped={}\n", installed1, is_mapped_after_first);
+    crate::safe_print!(128, "  second: installed={}, mapped={}\n", installed2, is_mapped_after_second);
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

@@ -290,10 +290,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: fixed 8MB - kernel data structures (page tables, PCBs, VFS, networking)
+    // - Heap: fixed 16MB - kernel data structures (page tables, PCBs, VFS, networking)
     //   Thread stacks are now PMM-backed, so the heap only holds metadata.
+    //   16MB needed for bun's 40+ concurrent TCP sockets (128KB buffers each = 5MB+).
     // - User pages: remaining - for user processes
-    const KERNEL_HEAP_SIZE: usize = 8 * 1024 * 1024;
+    const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;

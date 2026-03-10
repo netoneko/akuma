@@ -27,8 +27,11 @@ use crate::runtime::runtime;
 // ============================================================================
 
 const MAX_SOCKETS: usize = 256;
-const TCP_RX_BUFFER_SIZE: usize = 65535;
-const TCP_TX_BUFFER_SIZE: usize = 65535;
+// Reduced from 64KB to 16KB per direction to save heap memory.
+// 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.
+// 16KB is still plenty for TLS handshakes and HTTP requests.
+const TCP_RX_BUFFER_SIZE: usize = 16384;
+const TCP_TX_BUFFER_SIZE: usize = 16384;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);

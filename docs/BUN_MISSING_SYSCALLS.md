@@ -448,29 +448,30 @@ resolution. The kernel log showed:
 [signal] Delivering sig 11 to handler 0x2ceca60
 ```
 
-Root cause: race condition in demand paging. When two CPUs fault on the
-same page simultaneously:
+Root cause: Two bugs in `map_user_page()`:
 
-1. CPU A checks `is_current_user_page_mapped(page_va)` → false
-2. CPU B checks `is_current_user_page_mapped(page_va)` → false
-3. CPU A calls `map_user_page()` → `installed=true`
-4. CPU B calls `map_user_page()` → `installed=false` (already mapped)
-5. CPU B treated `installed=false` as failure → delivered SIGSEGV
+**Bug 1 (CAS result ignored):** The `compare_exchange` result was being
+discarded. On single-core systems, preemption can cause races:
 
-The bug was that `installed=false` means "someone else already mapped
-this page" — the page IS now valid, not a failure condition.
+1. Thread A faults, loads PTE (invalid), gets **preempted**
+2. Thread B faults on same page, successfully installs via CAS
+3. Thread A resumes, tries CAS with stale `existing` value, CAS fails
+4. Thread A returns `installed=true` anyway (bug!)
+5. Thread A's page gets tracked but was never installed
+6. Memory corruption / double-free ensues
 
-**Fix:** When `map_user_page` returns `installed=false`, the kernel now:
-1. Frees the unused physical page
-2. Tracks any page table frames that were allocated
-3. Sets `any_mapped=true` if this was the faulting page (not readahead)
-4. Returns successfully instead of delivering SIGSEGV
+**Bug 2 (installed=false treated as failure):** Demand paging handlers
+treated `installed=false` as a failure and delivered SIGSEGV, but
+`installed=false` means "page is already mapped" — a success condition.
 
-Fixed in 4 locations in `src/exceptions.rs`:
-- DA handler for file-backed regions (readahead loop)
-- DA handler for anonymous regions
-- IA handler for file-backed regions (readahead loop)
-- IA handler for anonymous regions
+**Fix 1:** `map_user_page` now checks the CAS result and returns
+`installed=false` if the CAS failed.
+
+**Fix 2:** Demand paging handlers now treat `installed=false` as success
+for the faulting page (the page IS mapped, just by another path).
+
+Fixed in `crates/akuma-exec/src/mmu.rs` and 4 locations in
+`src/exceptions.rs`.
 
 ### bun install express (IN PROGRESS)
 
@@ -481,23 +482,36 @@ With all the above fixes, `bun install express` now:
 4. Opens TCP connections to npm registry (104.16.x.34:443)
 5. Creates cache directories and temp files
 
-Currently crashes with SIGSEGV at `0x452524940` (~18.6 GB). This address
-is completely outside any mapped region:
+### Kernel Heap Exhaustion (RESOLVED)
+
+After fixing the demand paging race, bun crashed with a kernel panic:
 
 ```
-[DP] lazy miss: pid=44 va=0x452524940 regions=19
-[DP] no lazy region for FAR=0x452524940 pid=44
+[ALLOC FAIL] requested=65535 heap_total=8MB heap_used=7MB (98%)
+panic: memory allocation of 65535 bytes failed
 ```
 
-Analysis:
-- Address `0x452524940` = 18.6 GB, far above the mmap ceiling (~2.7 GB)
-- File-backed segment: `0x2a24000` to `0x58fd8c0` (~44-89 MB)
-- Largest lazy region: `0x50000000+0x40000000` (1.25-2.25 GB)
+Root cause: bun opens 40+ concurrent TCP connections to npm's registry
+servers. Each TCP socket allocates 128KB of buffers (64KB RX + 64KB TX),
+consuming 5MB+ of kernel heap. With only 8MB total heap, this left
+insufficient space for other kernel operations.
 
-This is NOT a demand paging issue — bun is accessing a wild pointer,
-likely due to corrupted JIT code or a stale pointer in the conservative
-GC. The crash happens after DNS resolution initiates and TCP connections
-are opened to npm's registry servers.
+**Fix:**
+1. Increased `KERNEL_HEAP_SIZE` from 8MB to 16MB in `src/main.rs`
+2. Reduced TCP buffer sizes from 64KB to 16KB per direction in
+   `crates/akuma-net/src/smoltcp_net.rs` (32KB per socket vs 128KB)
+
+Combined effect: 40 sockets now use 1.25MB instead of 5MB, and the
+larger heap provides headroom for peak allocations.
+
+### Current Status
+
+With all fixes applied, `bun install express` now:
+1. Initializes successfully (epoll, timerfd, eventfd)
+2. Resolves DNS via QEMU forwarder (10.0.2.3:53)
+3. Opens 40+ TCP connections to npm registry (104.16.x.34:443)
+4. Creates cache directories and temp files
+5. Performs TLS handshakes (BoringSSL)
 
 ---
 
