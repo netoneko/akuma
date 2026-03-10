@@ -156,6 +156,23 @@ Bun reads `/proc/self/exe` to locate its own binary for:
 Both `sys_openat` and `sys_readlinkat` intercept this path and redirect to the
 current process's binary name (e.g., `/bin/bun`).
 
+### `/proc/self/fd/N` and `/proc/<pid>/fd/N` (via `readlinkat`)
+
+Bun calls `readlinkat("/proc/self/fd/N")` to resolve file descriptor N to its
+underlying file path. This is a standard Linux pattern for discovering what
+file an fd refers to.
+
+Procfs now implements `read_symlink()` and `is_symlink()` for these paths:
+- `File` fd → actual file path (e.g., `/package.json`)
+- `Socket` fd → `socket:[N]`
+- `PipeRead`/`PipeWrite` fd → `pipe:[N]`
+- `EpollFd` → `anon_inode:[eventpoll]`
+- `TimerFd` → `anon_inode:[timerfd]`
+- `EventFd` → `anon_inode:[eventfd]`
+- `DevNull` → `/dev/null`
+- `DevUrandom` → `/dev/urandom`
+- `Stdin`/`Stdout`/`Stderr` → `/dev/stdin`, `/dev/stdout`, `/dev/stderr`
+
 ### `/dev/urandom` and `/dev/random`
 
 Bun requires `/dev/urandom` for cryptographic randomization (JavaScriptCore's
@@ -163,9 +180,33 @@ Bun requires `/dev/urandom` for cryptographic randomization (JavaScriptCore's
 crashes at `FAR=0xBBADBEEF`. Implemented as a virtual `DevUrandom` file
 descriptor. See `docs/DEV_RANDOM.md`.
 
+### `readlinkat` errno handling (NR 78)
+
+`sys_readlinkat` now returns the correct errno:
+- `ENOENT` (-2) when the path doesn't exist
+- `EINVAL` (-22) when the path exists but is not a symlink
+
+Previously returned `EINVAL` for all failures, which bun's Zig runtime
+mapped to `error.NotLink` (fatal). The fix allows bun to gracefully
+handle missing cache paths during `install` setup.
+
+### `getdents64` symlink d_type (NR 61)
+
+`sys_getdents64` now reports `DT_LNK` (10) for symlinks instead of
+`DT_REG` (8). Added `is_symlink` field to the VFS `DirEntry` struct
+and wired ext2's `FT_SYMLINK` file type through `read_dir`.
+
 ---
 
 ## Memory Management
+
+### User stack size (config)
+
+Increased `USER_STACK_SIZE` from 512 KB to 2 MB. Bun's initialization
+(JSC setup, JIT compilation) uses ~596 KB of stack, which overflowed
+the 512 KB limit. The access jumped 80 KB past the single 4 KB guard
+page, so the guard never triggered — the fault address was simply
+unmapped. Updated in `src/config.rs`, `userspace/libakuma/src/lib.rs`.
 
 ### `madvise` (NR 233)
 
@@ -365,6 +406,23 @@ the wrong errno caused a hard failure.
 **Fix:** `sys_readlinkat` now checks `vfs::exists()` and returns
 `ENOENT` for missing paths, `EINVAL` for existing non-symlinks.
 
+### /proc/self/fd/N symlinks (RESOLVED)
+
+After the readlinkat fix, `bun install express` failed with
+`error: An internal error occurred (NotDir)`.
+
+Root cause: Bun calls `readlinkat("/proc/self/fd/6")` to resolve
+fd 6 to its underlying file path. This is a standard Linux pattern —
+`/proc/self/fd/N` entries are symlinks to the actual file paths.
+Akuma's procfs didn't implement these symlinks; `read_symlink`
+returned `NotFound` which mapped to `ENOENT`, then bun tried to
+open the path as a directory and got `ENOTDIR`.
+
+**Fix:** Implemented `read_symlink()` and `is_symlink()` in procfs
+for `/proc/<pid>/fd/<n>` and `/proc/self/fd/<n>`. Returns the
+actual path for File descriptors, or pseudo-paths like `socket:[N]`,
+`pipe:[N]`, `anon_inode:[eventfd]` for other fd types.
+
 ### Current Performance
 
 `bun run /public/cgi-bin/akuma.js` execution time progression:
@@ -379,27 +437,37 @@ the wrong errno caused a hard failure.
 The 1.87s result is faster than main because main crashed before
 completing; the 2.6s figure was time-to-crash, not time-to-completion.
 
+### bun install express (IN PROGRESS)
+
+With all the above fixes, `bun install express` now:
+1. Initializes successfully (epoll, timerfd, eventfd created)
+2. Reads `/package.json` via `/proc/self/fd/6` symlink
+3. Sends DNS query to QEMU's DNS forwarder (`10.0.2.3:53`)
+4. Creates cache directories and temp files
+
+Currently crashes during DNS resolution with a segfault at
+`0x3263C40`. The signal handler runs but bun's crash reporter
+triggers, suggesting either a second fault or an unrecoverable
+JIT speculation failure. The DNS response may not be arriving
+in time, or epoll integration with UDP sockets may need work.
+
 ---
 
 ## Implementation Status
 
 timerfd is now functional (timer state tracking, expiration counting,
-read support). epoll remains a stub. Signal delivery is **fully
-implemented** (try_deliver_signal + do_rt_sigreturn + lazy signal frame
-demand-paging). set_robust_list, membarrier, and close_range have
-functional implementations.
+read support). epoll has basic I/O readiness checking for UDP/TCP
+sockets, eventfd, and pipes. Signal delivery is **fully implemented**
+(try_deliver_signal + do_rt_sigreturn + lazy signal frame demand-paging).
+set_robust_list, membarrier, and close_range have functional
+implementations. procfs now supports `/proc/self/fd/N` symlinks.
 
-**To make `bun run` fully functional (priority order):**
+**To make `bun install` fully functional (priority order):**
 
-1. **epoll** (CRITICAL for `bun run` network) — Real I/O multiplexing
-   over socket/pipe/timerfd descriptors. Currently returns 0 events
-   immediately regardless of what file descriptors are registered.
-   bun's libuv event loop depends on epoll to know when TCP sockets are
-   readable/writable. Without it, `bun run` can execute JS from disk but
-   cannot do any network I/O.
-2. **epoll + timerfd integration** — epoll_pwait should return events
-   when timerfds expire. Needed for libuv's timer-driven callbacks.
-3. **AF_UNIX sockets** — bun uses Unix domain sockets for internal
+1. **DNS resolution** — bun sends UDP queries to `10.0.2.3:53` but
+   crashes before receiving the response. May be an epoll integration
+   issue (UDP socket not in epoll interest list) or a deeper JIT bug.
+2. **AF_UNIX sockets** — bun uses Unix domain sockets for internal
    subprocess communication (e.g. spawning worker processes). Akuma
    returns `EAFNOSUPPORT` for any socket domain other than `AF_INET`
    (domain != 2). This blocks bun's subprocess IPC.

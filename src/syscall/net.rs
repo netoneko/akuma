@@ -225,6 +225,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
         None => return (-libc_errno::EBADF as i64) as u64,
     };
     let nonblock = fd_is_nonblock(fd);
+    crate::safe_print!(128, "[syscall] recvfrom(fd={}, len={}, nonblock={})\n", fd, len, nonblock);
 
     if socket::is_udp_socket(idx) {
         match socket::socket_recv_udp(idx, buf, nonblock) {
