@@ -1637,6 +1637,27 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // Log register state for debugging wild pointer accesses
                     let frame_ref = unsafe { &*frame };
                     let last_sc = crate::syscall::current_syscall_nr();
+                    
+                    // Check if FAR looks like a negative errno (syscall error used as pointer)
+                    // Errno values are small negatives: -1 (EPERM) to -133 (EHWPOISON)
+                    // As unsigned: 0xFFFFFFFFFFFFFFFF (-1) to 0xFFFFFFFFFFFFFF7B (-133)
+                    let far_signed = far as i64;
+                    if far_signed >= -200 && far_signed < 0 {
+                        let errno = -far_signed;
+                        let errno_name = match errno {
+                            1 => "EPERM", 2 => "ENOENT", 3 => "ESRCH", 4 => "EINTR",
+                            9 => "EBADF", 11 => "EAGAIN", 12 => "ENOMEM", 13 => "EACCES",
+                            14 => "EFAULT", 17 => "EEXIST", 19 => "ENODEV", 20 => "ENOTDIR",
+                            21 => "EISDIR", 22 => "EINVAL", 28 => "ENOSPC", 38 => "ENOSYS",
+                            95 => "ENOTSUP", 97 => "EAFNOSUPPORT", 110 => "ETIMEDOUT",
+                            115 => "EINPROGRESS",
+                            _ => "???",
+                        };
+                        crate::tprint!(256, "[WILD-DA] *** FAR={:#x} is -{} ({}) - syscall error used as pointer! ***\n",
+                            far, errno, errno_name);
+                        crate::tprint!(128, "[WILD-DA] This means a syscall returned error -{} and userspace used it as a pointer\n", errno);
+                    }
+                    
                     crate::tprint!(384, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} last_sc={}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n  x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n",
                         pid, far_usize, frame_ref.elr_el1, last_sc,
                         frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3,
