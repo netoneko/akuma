@@ -91,9 +91,10 @@ Returns 0.
 
 ### `tkill` (NR 130)
 
-Sends a signal to a specific thread. Currently calls `return_to_kernel(-sig)`
-to terminate the process with the given signal number. Used by bun's crash
-handler and assertion failures.
+No-op stub (returns 0). Bun uses `tkill` for crash handling and assertion
+failures. Full per-thread signal delivery is not implemented, but
+process-level SIGSEGV delivery via `try_deliver_signal` handles the
+critical JIT speculation failure path.
 
 ---
 
@@ -204,8 +205,9 @@ tables are freed.
 
 Previously called `return_to_kernel(-sig)` on the *calling* thread,
 completely ignoring the target TID. This meant any `tkill` call would kill
-the caller. Changed to a no-op stub (returns 0) since signal delivery is
-not implemented.
+the caller. Changed to a no-op stub (returns 0). Per-thread signal
+delivery (targeting a specific TID) is not yet implemented; process-level
+signal delivery handles the critical SIGSEGV path.
 
 ### `nanosleep` (NR 101) — fix
 
@@ -255,93 +257,80 @@ for child process status collection.
 
 ---
 
-## `bun run` Crash Analysis (March 2026)
+## `bun run` Performance History
 
-### Root Cause: Missing Signal Delivery
+### Signal Delivery (RESOLVED)
 
-The crash is **100% reproducible** with identical fault address, instruction
-pointer, and register state on every run:
+The original `bun run` crash was **100% reproducible** with identical fault
+address, instruction pointer, and register state on every run:
 
 ```
 FAR=0x2346b2ad68  ELR=0x4416d74  ISS=0x45
 x19=0x203ffbad58  x20=0x203ffbad68  SP_EL0=0x203ffbabc0
 ```
 
-The root cause is **not** a munmap bug, pointer corruption, or memory leak.
-It is the kernel's **failure to deliver SIGSEGV to the process's registered
-signal handler**.
+The root cause was the kernel's failure to deliver SIGSEGV to the process's
+registered signal handler. JSC's JIT uses SIGSEGV handlers for speculation
+failure recovery — speculative code intentionally triggers faults on bad
+paths, and the signal handler redirects execution to a fallback.
 
-**How it works:** JSC (bun's JS engine) registers a SIGSEGV handler via
-`rt_sigaction` during startup (11 signal handler registrations total). JSC's
-JIT uses SIGSEGV handlers for speculation failure recovery — a standard JIT
-technique where speculative code intentionally triggers faults on bad paths,
-and the signal handler redirects execution to a fallback. On Linux, the kernel
-delivers the signal by setting up a signal frame on the user stack and
-jumping to the handler.
+**Fix:** Full signal delivery implemented via `try_deliver_signal` +
+`do_rt_sigreturn` + lazy signal frame demand-paging. The kernel now sets
+up an `rt_sigframe` on the user stack and redirects ELR to the registered
+handler. `bun run` survives JIT speculation faults and executes JS correctly.
 
-**What Akuma does:** The kernel stores the signal actions (via
-`sys_rt_sigaction`) but never invokes them. When a data abort from EL0
-cannot be resolved by demand paging, `exceptions.rs` unconditionally calls
-`return_to_kernel(-11)` to kill the process. The comment in `sys_kill`
-confirms: *"True userspace signal delivery not yet implemented."*
+### VA Space Regression (RESOLVED)
 
-**Evidence:** The faulting address `0x2346b2ad68` has the same lower 12 bits
-(`0xd68`) as x20 (`0x203ffbad68`) but completely different upper bits. This
-is characteristic of a JIT speculation failure — the JIT compiled code
-using a speculative type assumption, and when that assumption was wrong,
-the resulting pointer is garbage. On Linux, JSC's SIGSEGV handler catches
-this and restarts the operation with the correct (slower) path.
+An attempt to fix `bun install` by doubling `compute_stack_top` constants
+(`MIN_MMAP_SPACE` 128GB→256GB, `MAX_STACK_TOP` 256GB→512GB) pushed the
+user stack from ~130 GB to ~274 GB. This caused two problems:
 
-### Performance Bottleneck: 67M mremap Calls
+1. **SIGSEGV on stack access** — The stack at L1[256] (~274 GB) suffered
+   L3 translation faults at runtime. Signal delivery failed because the
+   stack page was not in any lazy/mmap region (it was eagerly mapped by
+   the ELF loader). Process killed with `FAR=0x403ff6bbb4`.
+2. **~2x performance regression** — JSC's conservative GC scans the VA
+   space from `stack_top` downward via mremap probes. Doubling the VA
+   space doubled the number of mremap syscalls and increased page table
+   cache pressure.
 
-Per-process syscall stats revealed that **99.95% of all syscalls are mremap**:
+**Fix:** Reverted constants to 128GB/256GB. The original `bun install`
+crash was actually caused by missing signal delivery, not insufficient VA
+space.
 
-```
-[PSTATS] PID 26 (/bin/bun) 177.01s: 67633543 syscalls (382085/s)
-  mremap=67633152  clock_gettime=202  openat=22  mmap=22
-  madvise=19  rt_sigprocmask=16  futex=15  rt_sigaction=11
-```
+### mremap GC Scanning
 
-Diagnostic logging showed every single mremap call has the same pattern:
+JSC's conservative GC probes the VA space via mremap:
 
 ```
 old_sz=0x1000 → new_sz=0x2000, flags=0x0 (no MREMAP_MAYMOVE)
 ```
 
 Addresses descend monotonically page-by-page from the top of the VA space
-(~129 GB), scanning the entire address space 2-3 times. This is likely
-JSC's conservative garbage collector probing memory pages.
+(~129 GB). The kernel now distinguishes mapped pages (returns ENOMEM) from
+unmapped pages (returns EFAULT), which allows the GC to skip large
+unmapped ranges more efficiently.
 
-All 67M calls immediately return ENOMEM (the kernel returns ENOMEM
-whenever `flags & MREMAP_MAYMOVE == 0` and `new_size > old_size`, without
-even checking if the page is mapped). On real Linux, unmapped pages would
-return EFAULT, potentially allowing the GC to skip large unmapped ranges.
+### Heap Optimization
 
-At ~2µs per syscall trap on TCG, the mremap overhead alone accounts for
-~134 seconds of the 177-second runtime.
+Moving kernel thread stacks from the talc heap to PMM-backed contiguous
+pages freed ~5 MB of heap, allowing the heap to shrink from 16 MB to 8 MB.
+This gives 8 MB more physical RAM to userspace, reducing demand-paging
+overhead during bun's initialization.
 
-### Previous Crash Analysis (Superseded)
+### Current Performance
 
-Earlier analysis suspected the crash was caused by `munmap` of giant
-regions, pointer corruption from trimmed arenas, or nondeterministic
-timing. These hypotheses are superseded by the signal delivery finding:
+`bun run /public/cgi-bin/akuma.js` execution time progression:
 
-- The crash address is deterministic, not nondeterministic
-- The crash happens AFTER all mmap/munmap activity completes
-- The fault is in JIT-compiled code, not allocator code
-- JSC expects the SIGSEGV to be caught by its signal handler
+| State | Time |
+|-------|------|
+| main branch (before signal delivery) | 2.6s (crashed) |
+| After signal delivery + doubled VA space | 7.0s |
+| + heap optimization (16→8 MB) | 4.6s |
+| + VA space revert (256→128 GB) | **1.87s** |
 
-### Child Process Behavior
-
-Bun spawns 3-4 child processes via fork+exec during initialization:
-- Process 27: runs ~10s, exits 0 (pre-fork helper with JIT compilation)
-- Process 28: runs ~0.6s, exits 0 (short-lived helper)
-- Process 29: runs ~10s, exits 0 (worker thread with JIT compilation)
-- Process 30: runs ~0.5s, exits 0 (short-lived helper)
-
-The 10-second child processes are bun's fork+exec pattern for testing
-environment capabilities. Their JIT compilation overhead on TCG emulation
-explains the long runtime.
+The 1.87s result is faster than main because main crashed before
+completing; the 2.6s figure was time-to-crash, not time-to-completion.
 
 ---
 
