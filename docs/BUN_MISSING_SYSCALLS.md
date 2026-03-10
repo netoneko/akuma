@@ -552,3 +552,74 @@ In `src/syscall/poll.rs`:
 1. **AF_UNIX sockets** — Returns EAFNOSUPPORT. Needed for bun subprocess IPC.
 2. **process_vm_readv** (NR 270) — Returns ENOSYS. Used by crash handler only.
 3. **Performance** — TCP buffer sizes and epoll polling could be optimized.
+
+---
+
+## Bun HTTP Server (FIXED 2026-03-10)
+
+`bun run http.js` (Node.js `http.createServer`) now accepts connections and
+responds to HTTP requests.
+
+### Two Bugs Fixed
+
+#### Bug 1: epoll never reported EPOLLIN for a listening TCP socket
+
+**Root cause:** `socket_can_recv_tcp()` in `src/syscall/net.rs` only handled
+`SocketType::Stream`, returning `false` for `SocketType::Listener`. So when bun
+registered its listening socket with epoll (EPOLLIN), epoll_pwait never fired —
+even after curl connected. Bun's event loop blocked in epoll_pwait indefinitely.
+
+**Symptom:** Connection established (TCP handshake succeeded), request sent, no
+response. `ps` showed bun threads running normally.
+
+**Fix:** Extended `socket_can_recv_tcp()` with a `Listener` branch that scans
+the backlog handles for any in `tcp::State::Established`. When one exists, the
+listener reports EPOLLIN, waking bun to call `accept4`.
+
+```rust
+socket::SocketType::Listener { handles, .. } => {
+    handles.iter().any(|&h| {
+        akuma_net::smoltcp_net::with_network(|net| {
+            net.sockets.get::<smoltcp::socket::tcp::Socket>(h).state()
+                == smoltcp::socket::tcp::State::Established
+        }).unwrap_or(false)
+    })
+}
+```
+
+---
+
+#### Bug 2: `accept4` / `accept` blocked instead of returning EAGAIN
+
+**Root cause:** `socket_accept()` in `crates/akuma-net/src/socket.rs` always
+called `wait_until()` regardless of whether the listening socket was non-blocking.
+libuv (bun's I/O layer) always sets listening sockets to non-blocking and calls
+`accept4` in a loop until `EAGAIN`, draining all pending connections before
+returning to the event loop. Since our `accept4` blocked on the second call
+(after the first connection was accepted and the backlog was empty), bun's
+event loop thread was stuck in `accept4` and never processed the accepted socket.
+
+**Symptom:** Bun accepted the first connection (fd visible in epoll logs), then
+silenced — no read from the accepted socket, no response.
+
+**Fix:** `socket_accept()` now takes a `nonblock: bool` parameter. When
+`nonblock` is true and no established connection is pending, it returns
+`Err(EAGAIN)` immediately. Both `sys_accept` and `sys_accept4` now pass
+`fd_is_nonblock(fd)` for the listening socket fd.
+
+Added `has_pending_connection(idx)` as a shared helper:
+
+```rust
+fn has_pending_connection(idx: usize) -> bool {
+    // scans backlog handles for any in Established state
+}
+
+pub fn socket_accept(idx: usize, nonblock: bool) -> Result<...> {
+    if nonblock {
+        if !has_pending_connection(idx) { return Err(libc_errno::EAGAIN); }
+    } else {
+        wait_until(|| has_pending_connection(idx), None)?;
+    }
+    // ... extract handle and create Stream socket
+}
+```

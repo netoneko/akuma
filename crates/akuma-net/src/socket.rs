@@ -369,22 +369,30 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
     })
 }
 
-pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
-    wait_until(|| {
-        let mut result = false;
-        with_table(|table| {
-            if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, .. }, .. })) = table.get(idx) {
-                for &handle in handles {
-                    let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
-                    if state == Some(tcp::State::Established) {
-                        result = true;
-                        break;
-                    }
+fn has_pending_connection(idx: usize) -> bool {
+    let mut result = false;
+    with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, .. }, .. })) = table.get(idx) {
+            for &handle in handles {
+                let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
+                if state == Some(tcp::State::Established) {
+                    result = true;
+                    break;
                 }
             }
-        });
-        result
-    }, None)?;
+        }
+    });
+    result
+}
+
+pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
+    if nonblock {
+        if !has_pending_connection(idx) {
+            return Err(libc_errno::EAGAIN);
+        }
+    } else {
+        wait_until(|| has_pending_connection(idx), None)?;
+    }
 
     let (handle, addr) = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port }, .. })) = table.get_mut(idx) {

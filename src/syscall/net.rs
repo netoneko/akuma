@@ -51,7 +51,8 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
-        if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
+        let nonblock = fd_is_nonblock(fd);
+        if let Ok((new_idx, addr)) = socket::socket_accept(idx, nonblock) {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if addr_ptr != 0 { unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); } }
                 return proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64;
@@ -65,7 +66,8 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     if let Some(idx) = get_socket_from_fd(fd) {
-        if let Ok((new_idx, addr)) = socket::socket_accept(idx) {
+        let nonblock = fd_is_nonblock(fd);
+        if let Ok((new_idx, addr)) = socket::socket_accept(idx, nonblock) {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if addr_ptr != 0 {
                     unsafe { core::ptr::write(addr_ptr as *mut SockAddrIn, SockAddrIn::from_addr(&addr)); }
@@ -497,13 +499,23 @@ pub(super) fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net
 
 pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
-        if let socket::SocketType::Stream(h) = &sock.inner {
-            akuma_net::smoltcp_net::with_network(|net| {
-                let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
-                s.can_recv() || !s.is_active()
-            }).unwrap_or(false)
-        } else {
-            false
+        match &sock.inner {
+            socket::SocketType::Stream(h) => {
+                akuma_net::smoltcp_net::with_network(|net| {
+                    let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
+                    s.can_recv() || !s.is_active()
+                }).unwrap_or(false)
+            }
+            socket::SocketType::Listener { handles, .. } => {
+                // Report readable when any backlog handle has an established connection
+                handles.iter().any(|&h| {
+                    akuma_net::smoltcp_net::with_network(|net| {
+                        net.sockets.get::<smoltcp::socket::tcp::Socket>(h).state()
+                            == smoltcp::socket::tcp::State::Established
+                    }).unwrap_or(false)
+                })
+            }
+            _ => false,
         }
     }).unwrap_or(false)
 }
