@@ -437,19 +437,67 @@ actual path for File descriptors, or pseudo-paths like `socket:[N]`,
 The 1.87s result is faster than main because main crashed before
 completing; the 2.6s figure was time-to-crash, not time-to-completion.
 
+### Demand Paging Race Condition (RESOLVED)
+
+`bun install express` crashed with SIGSEGV at `0x3263C40` during DNS
+resolution. The kernel log showed:
+
+```
+[IA-DP] file map_user_page(0x3263000) not installed
+[IA-DP] pid=44 va=0x3263c40 file readahead mapped 0 pages
+[signal] Delivering sig 11 to handler 0x2ceca60
+```
+
+Root cause: race condition in demand paging. When two CPUs fault on the
+same page simultaneously:
+
+1. CPU A checks `is_current_user_page_mapped(page_va)` → false
+2. CPU B checks `is_current_user_page_mapped(page_va)` → false
+3. CPU A calls `map_user_page()` → `installed=true`
+4. CPU B calls `map_user_page()` → `installed=false` (already mapped)
+5. CPU B treated `installed=false` as failure → delivered SIGSEGV
+
+The bug was that `installed=false` means "someone else already mapped
+this page" — the page IS now valid, not a failure condition.
+
+**Fix:** When `map_user_page` returns `installed=false`, the kernel now:
+1. Frees the unused physical page
+2. Tracks any page table frames that were allocated
+3. Sets `any_mapped=true` if this was the faulting page (not readahead)
+4. Returns successfully instead of delivering SIGSEGV
+
+Fixed in 4 locations in `src/exceptions.rs`:
+- DA handler for file-backed regions (readahead loop)
+- DA handler for anonymous regions
+- IA handler for file-backed regions (readahead loop)
+- IA handler for anonymous regions
+
 ### bun install express (IN PROGRESS)
 
 With all the above fixes, `bun install express` now:
 1. Initializes successfully (epoll, timerfd, eventfd created)
 2. Reads `/package.json` via `/proc/self/fd/6` symlink
 3. Sends DNS query to QEMU's DNS forwarder (`10.0.2.3:53`)
-4. Creates cache directories and temp files
+4. Opens TCP connections to npm registry (104.16.x.34:443)
+5. Creates cache directories and temp files
 
-Currently crashes during DNS resolution with a segfault at
-`0x3263C40`. The signal handler runs but bun's crash reporter
-triggers, suggesting either a second fault or an unrecoverable
-JIT speculation failure. The DNS response may not be arriving
-in time, or epoll integration with UDP sockets may need work.
+Currently crashes with SIGSEGV at `0x452524940` (~18.6 GB). This address
+is completely outside any mapped region:
+
+```
+[DP] lazy miss: pid=44 va=0x452524940 regions=19
+[DP] no lazy region for FAR=0x452524940 pid=44
+```
+
+Analysis:
+- Address `0x452524940` = 18.6 GB, far above the mmap ceiling (~2.7 GB)
+- File-backed segment: `0x2a24000` to `0x58fd8c0` (~44-89 MB)
+- Largest lazy region: `0x50000000+0x40000000` (1.25-2.25 GB)
+
+This is NOT a demand paging issue — bun is accessing a wild pointer,
+likely due to corrupted JIT code or a stale pointer in the conservative
+GC. The crash happens after DNS resolution initiates and TCP connections
+are opened to npm's registry servers.
 
 ---
 

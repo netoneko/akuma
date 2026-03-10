@@ -196,6 +196,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_user_stack_size_is_2mb, "user_stack_size_is_2mb");
     run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
+    run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -6561,6 +6562,77 @@ fn test_procfs_fd_symlink_resolution() -> bool {
     let pass = self_fd_0 && self_fd_1 && pid_fd_5 && self_is_symlink && net_not_symlink;
     crate::safe_print!(128, "  self/fd/0={} self/fd/1={} 123/fd/5={} self={} net={}\n",
         self_fd_0, self_fd_1, pid_fd_5, self_is_symlink, !net_not_symlink);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: map_user_page returns (frames, false) when page already mapped
+///
+/// When two CPUs race to map the same page, one wins (installed=true) and
+/// one loses (installed=false). The loser must NOT treat this as a failure.
+/// This test verifies that map_user_page correctly returns installed=false
+/// for an already-mapped page, which the demand paging handler relies on
+/// to avoid delivering spurious SIGSEGV.
+fn test_map_user_page_already_mapped() -> bool {
+    console::print("\n[TEST] map_user_page returns installed=false for already-mapped page\n");
+
+    use akuma_exec::mmu::{UserAddressSpace, user_flags, map_user_page, is_current_user_page_mapped};
+
+    // Create a test address space
+    let Some(mut addr_space) = UserAddressSpace::new() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate address space\n");
+        return true;
+    };
+
+    // Allocate a test page
+    let Some(page1) = crate::pmm::alloc_page_zeroed() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate page\n");
+        return true;
+    };
+    let Some(page2) = crate::pmm::alloc_page_zeroed() else {
+        crate::pmm::free_page(page1);
+        crate::safe_print!(64, "  SKIP: failed to allocate second page\n");
+        return true;
+    };
+
+    let test_va = 0x1000_0000usize; // Arbitrary user VA
+
+    // Activate this address space
+    addr_space.activate();
+
+    // First map should succeed with installed=true
+    let (frames1, installed1) = unsafe {
+        map_user_page(test_va, page1.addr, user_flags::RW)
+    };
+    addr_space.track_user_frame(page1);
+    for f in frames1 {
+        addr_space.track_page_table_frame(f);
+    }
+
+    // Page should now be mapped
+    let is_mapped = is_current_user_page_mapped(test_va);
+
+    // Second map to same VA should return installed=false
+    let (frames2, installed2) = unsafe {
+        map_user_page(test_va, page2.addr, user_flags::RW)
+    };
+
+    // frames2 may have table frames even if page wasn't installed
+    // (the tables were already created by first call)
+    for f in frames2 {
+        addr_space.track_page_table_frame(f);
+    }
+
+    // Free the unused page2 since it wasn't installed
+    if !installed2 {
+        crate::pmm::free_page(page2);
+    }
+
+    UserAddressSpace::deactivate();
+
+    let pass = installed1 && is_mapped && !installed2;
+    crate::safe_print!(128, "  first_map: installed={}, is_mapped={}, second_map: installed={}\n",
+        installed1, is_mapped, installed2);
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

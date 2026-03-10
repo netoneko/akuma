@@ -677,10 +677,16 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
         return (allocated_tables, false);
     }
     let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
-    let _ = pte_atomic.compare_exchange(existing, entry,
+    let cas_result = pte_atomic.compare_exchange(existing, entry,
         core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
-    core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
-    (allocated_tables, true)
+    if cas_result.is_ok() {
+        core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
+        (allocated_tables, true)
+    } else {
+        // CAS failed: another path installed a page between our check and CAS.
+        // Return false so caller knows to free their unused page.
+        (allocated_tables, false)
+    }
 }}
 
 /// Atomically get or create a page table at `table_ptr[idx]`.
