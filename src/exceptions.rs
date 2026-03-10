@@ -1502,6 +1502,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     any_mapped = true;
                                     pages_mapped += 1;
                                 } else {
+                                    // Race: another CPU mapped this page between our check and
+                                    // the atomic install. The page IS mapped now - don't SIGSEGV!
                                     crate::pmm::free_page(pf);
                                     if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                         for tf in table_frames {
@@ -1509,6 +1511,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                         }
                                     } else {
                                         for tf in table_frames { crate::pmm::free_page(tf); }
+                                    }
+                                    // Critical: if this is the faulting page, it's now mapped!
+                                    if cur_va == page_va {
+                                        any_mapped = true;
                                     }
                                 }
                             cur_va += 0x1000;
@@ -1555,7 +1561,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     crate::pmm::free_page(page_frame);
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
+                                crate::syscall::syscall_counters::inc_pagefault(1);
+                                if crate::config::PROCESS_SYSCALL_STATS {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        owner.syscall_stats.inc_pagefault(1);
+                                    }
+                                }
                             } else {
+                                // Race: another CPU mapped this page. Free our frame and continue.
                                 crate::pmm::free_page(page_frame);
                                 if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                     for tf in table_frames {
@@ -1565,12 +1578,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
                             }
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            if crate::config::PROCESS_SYSCALL_STATS {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                    owner.syscall_stats.inc_pagefault(1);
-                                }
-                            }
+                            // Page is mapped (by us or another CPU) - success
                             return unsafe { (*frame).x0 };
                         } else {
                             let (_, _, free) = crate::pmm::stats();
@@ -1685,6 +1693,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     };
 
                     if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
+                        crate::tprint!(256, "[IA-DP] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
+                            far_usize, segment_va, filesz, file_offset);
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
@@ -1739,6 +1749,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     any_mapped = true;
                                     pages_mapped += 1;
                                 } else {
+                                    // Race: another CPU mapped this page between our check and
+                                    // the atomic install. The page IS mapped now - don't SIGSEGV!
+                                    // We just need to free our unused page and track table frames.
                                     crate::pmm::free_page(pf);
                                     if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                         for tf in table_frames {
@@ -1746,6 +1759,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                         }
                                     } else {
                                         for tf in table_frames { crate::pmm::free_page(tf); }
+                                    }
+                                    // Critical: if this is the faulting page, it's now mapped!
+                                    if cur_va == page_va {
+                                        any_mapped = true;
                                     }
                                 }
                             } else {
@@ -1787,7 +1804,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     crate::pmm::free_page(page_frame);
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
+                                crate::syscall::syscall_counters::inc_pagefault(1);
+                                if crate::config::PROCESS_SYSCALL_STATS {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                        owner.syscall_stats.inc_pagefault(1);
+                                    }
+                                }
                             } else {
+                                // Race: another CPU mapped this page. Free our frame and continue.
                                 crate::pmm::free_page(page_frame);
                                 if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                                     for tf in table_frames {
@@ -1797,12 +1821,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
                             }
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            if crate::config::PROCESS_SYSCALL_STATS {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                    owner.syscall_stats.inc_pagefault(1);
-                                }
-                            }
+                            // Page is mapped (by us or another CPU) - success
                             return unsafe { (*frame).x0 };
                         } else {
                             let (_, _, free) = crate::pmm::stats();
