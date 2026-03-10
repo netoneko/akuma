@@ -4,6 +4,14 @@
 //! Mounted at /proc, provides:
 //! - /proc/<pid>/fd/0 - stdin (readable by all, writable by spawner/kernel)
 //! - /proc/<pid>/fd/1 - stdout (readable by all, writable by owning process)
+//!
+//! # TODO: Rewrite without allocations
+//!
+//! The current implementation uses `format!`, `String`, and `Vec` allocations
+//! in `read_symlink()` and `is_symlink()`. These can deadlock if called while
+//! the allocator lock is held (e.g., during exception handling or with
+//! preemption disabled). Should be rewritten to use fixed-size stack buffers
+//! or return references to static strings where possible.
 
 use alloc::string::String;
 use alloc::vec::Vec;

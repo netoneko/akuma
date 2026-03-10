@@ -192,6 +192,11 @@ pub fn run_memory_tests() -> bool {
     // run_test!(test_temporary_buffers, "temporary_buffers");
     // run_test!(test_linked_structure, "linked_structure");
 
+    // Bun install fixes (improve-dash-compatibility branch)
+    run_test!(test_user_stack_size_is_2mb, "user_stack_size_is_2mb");
+    run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
+    run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -6474,5 +6479,88 @@ fn test_lazy_region_lookup_pid_consistency() -> bool {
     let pass = miss_with_zero && hit_with_pid;
     crate::safe_print!(64, "  miss_with_zero={} hit_with_pid={} => {}\n",
         miss_with_zero, hit_with_pid, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bun install fixes (improve-dash-compatibility branch)
+// ============================================================================
+
+/// Test: USER_STACK_SIZE is 2MB (required for bun's ~596KB stack usage)
+///
+/// Bun's JSC initialization uses ~596KB of stack, which overflowed the
+/// previous 512KB limit. The stack fault jumped 80KB past the guard page.
+fn test_user_stack_size_is_2mb() -> bool {
+    console::print("\n[TEST] USER_STACK_SIZE is 2MB\n");
+
+    let stack_size = crate::config::USER_STACK_SIZE;
+    let expected = 2 * 1024 * 1024; // 2MB
+
+    let pass = stack_size == expected;
+    crate::safe_print!(128, "  USER_STACK_SIZE = {} bytes (expected {})\n",
+        stack_size, expected);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: DirEntry struct has is_symlink field
+///
+/// getdents64 must report DT_LNK (10) for symlinks. This requires the
+/// VFS DirEntry struct to have an is_symlink field.
+fn test_direntry_has_is_symlink_field() -> bool {
+    console::print("\n[TEST] DirEntry has is_symlink field\n");
+
+    use akuma_vfs::DirEntry;
+
+    // Create a DirEntry with is_symlink = true
+    let symlink_entry = DirEntry {
+        name: alloc::string::String::from("test_link"),
+        is_dir: false,
+        is_symlink: true,
+        size: 0,
+    };
+
+    // Create a DirEntry with is_symlink = false
+    let file_entry = DirEntry {
+        name: alloc::string::String::from("test_file"),
+        is_dir: false,
+        is_symlink: false,
+        size: 100,
+    };
+
+    let pass = symlink_entry.is_symlink && !file_entry.is_symlink;
+    crate::safe_print!(64, "  symlink_entry.is_symlink={} file_entry.is_symlink={}\n",
+        symlink_entry.is_symlink, file_entry.is_symlink);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: procfs /proc/<pid>/fd/<n> symlink resolution
+///
+/// Bun calls readlinkat("/proc/self/fd/N") to resolve fd to path.
+/// This test verifies that procfs correctly identifies these as symlinks.
+fn test_procfs_fd_symlink_resolution() -> bool {
+    console::print("\n[TEST] procfs /proc/<pid>/fd/<n> symlink resolution\n");
+
+    use crate::vfs::proc::ProcFilesystem;
+    use akuma_vfs::Filesystem;
+
+    let procfs = ProcFilesystem::new();
+
+    // Test is_symlink for various fd paths
+    let self_fd_0 = procfs.is_symlink("self/fd/0");
+    let self_fd_1 = procfs.is_symlink("self/fd/1");
+    let pid_fd_5 = procfs.is_symlink("123/fd/5");
+
+    // "self" is a symlink to the current PID in Linux, our impl marks it too
+    let self_is_symlink = procfs.is_symlink("self");
+
+    // Non-fd paths should not be symlinks
+    let net_not_symlink = !procfs.is_symlink("net");
+
+    let pass = self_fd_0 && self_fd_1 && pid_fd_5 && self_is_symlink && net_not_symlink;
+    crate::safe_print!(128, "  self/fd/0={} self/fd/1={} 123/fd/5={} self={} net={}\n",
+        self_fd_0, self_fd_1, pid_fd_5, self_is_symlink, !net_not_symlink);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
