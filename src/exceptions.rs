@@ -650,6 +650,51 @@ const SIGFRAME_SIGINFO: usize = 0;
 const SIGFRAME_UCONTEXT: usize = 128;
 const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168;
 
+/// Ensure a userspace page is mapped. If it's in a lazy anonymous region and
+/// not yet mapped, allocates and maps a zeroed page. Returns true if the page
+/// is mapped after this call (either was already mapped, or was just demand-paged).
+fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
+    if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
+        return true;
+    }
+    // Check if the page is in a lazy anonymous region
+    if let Some((flags, source, _region_start, _region_size)) =
+        akuma_exec::process::lazy_region_lookup_for_pid(pid, page_va)
+    {
+        // Only demand-page anonymous regions here; file-backed pages handled by the fault path
+        if matches!(source, akuma_exec::process::LazySource::Zero) {
+            let map_flags = if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW };
+            if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                let (table_frames, installed) = unsafe {
+                    akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                };
+                if installed {
+                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        owner.address_space.track_user_frame(page_frame);
+                        for tf in table_frames {
+                            owner.address_space.track_page_table_frame(tf);
+                        }
+                    } else {
+                        crate::pmm::free_page(page_frame);
+                        for tf in table_frames { crate::pmm::free_page(tf); }
+                    }
+                } else {
+                    crate::pmm::free_page(page_frame);
+                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        for tf in table_frames {
+                            owner.address_space.track_page_table_frame(tf);
+                        }
+                    } else {
+                        for tf in table_frames { crate::pmm::free_page(tf); }
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
@@ -677,13 +722,16 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
 
     let new_sp = (user_sp - SIGFRAME_SIZE) & !0xF;
 
-    // Validate stack pages are mapped (signal frame may span 2 pages)
+    // Ensure stack pages are mapped (signal frame may span 2 pages).
+    // Demand-page lazy anonymous stack pages if not yet mapped.
     let first_page = new_sp & !0xFFF;
     let last_page = (new_sp + SIGFRAME_SIZE - 1) & !0xFFF;
-    if !akuma_exec::mmu::is_current_user_page_mapped(first_page) {
+    if !ensure_user_page_mapped(pid, first_page) {
+        crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, first_page);
         return false;
     }
-    if last_page != first_page && !akuma_exec::mmu::is_current_user_page_mapped(last_page) {
+    if last_page != first_page && !ensure_user_page_mapped(pid, last_page) {
+        crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, last_page);
         return false;
     }
 
@@ -1340,7 +1388,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
+                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                         let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
@@ -1350,7 +1398,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
@@ -1574,8 +1622,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     } else {
                         crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
                     }
+                    let lazy_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     akuma_exec::process::lazy_region_debug(far_usize);
-                    crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={}\n", far, pid);
+                    crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={} (pid has {} lazy regions)\n", far, pid, lazy_count);
                 }
             }
 
@@ -1616,7 +1665,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
+                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                         let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
@@ -1626,7 +1675,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup(far_usize) {
+                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {

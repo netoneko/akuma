@@ -1,6 +1,7 @@
 [workspace]
 members = [".", "crates/*"]
 default-members = [
+    ".",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",

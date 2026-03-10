@@ -176,6 +176,14 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_stack_top_within_48bit_va, "stack_top_within_48bit_va");
     run_test!(test_mmap_space_covers_jsc_gigacage, "mmap_space_covers_jsc_gigacage");
 
+    // Regression: demand-pager/instruction-abort handler used lazy_region_lookup()
+    // (calls read_current_pid() internally) instead of lazy_region_lookup_for_pid(pid, va)
+    // with the PID captured once at handler entry. A second call to read_current_pid()
+    // inside the same exception handler could race or return 0 (boot TTBR0 still active),
+    // causing the lazy region to be missed and the process killed with "no lazy region".
+    run_test!(test_lazy_region_lookup_for_pid_explicit, "lazy_region_lookup_for_pid_explicit");
+    run_test!(test_lazy_region_lookup_pid_consistency, "lazy_region_lookup_pid_consistency");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -6376,5 +6384,82 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
             mem.mmap_limit);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: demand-pager used lazy_region_lookup() which calls read_current_pid()
+/// a second time inside the same exception handler. The outer handler captures `pid`
+/// once; if the two calls return different values (e.g. pid=0 race) the lazy region
+/// would not be found. Fixed by switching to lazy_region_lookup_for_pid(pid, va).
+///
+/// This test verifies that lazy_region_lookup_for_pid with an explicit PID finds
+/// the region that was registered under that PID, even when read_current_pid()
+/// would return 0 (e.g. no process info page mapped).
+fn test_lazy_region_lookup_for_pid_explicit() -> bool {
+    console::print("\n[TEST] lazy_region_lookup_for_pid: explicit PID finds region\n");
+
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    use akuma_exec::mmu::user_flags;
+
+    // Use a synthetic PID that won't collide with real processes
+    let test_pid: u32 = 0xDEAD;
+    let va: usize = 0x2000_0000;
+    let size: usize = 0x10_0000_0000; // 64 GB (Gigacage-like)
+
+    // Clean up any prior state
+    clear_lazy_regions(test_pid);
+
+    // Register a lazy region under the test PID
+    push_lazy_region(test_pid, va, size, user_flags::RW);
+
+    // lazy_region_lookup_for_pid with the correct explicit PID must find it
+    let found = lazy_region_lookup_for_pid(test_pid, va + 0x1000).is_some();
+
+    // lazy_region_lookup_for_pid with the wrong PID must NOT find it
+    let not_found = lazy_region_lookup_for_pid(test_pid + 1, va + 0x1000).is_none();
+
+    // A VA outside the region must not be found
+    let out_of_range = lazy_region_lookup_for_pid(test_pid, va + size + 0x1000).is_none();
+
+    clear_lazy_regions(test_pid);
+
+    let pass = found && not_found && out_of_range;
+    crate::safe_print!(64, "  found={} not_found={} out_of_range={} => {}\n",
+        found, not_found, out_of_range, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: instruction abort path in exceptions.rs used lazy_region_lookup()
+/// (reads PID internally) rather than lazy_region_lookup_for_pid(pid, va) with
+/// the PID captured once at handler entry. Verify that looking up by explicit PID
+/// is consistent with a single read_current_pid call.
+///
+/// This test registers a region under PID 0xBEEF and verifies that passing PID=0
+/// (what read_current_pid returns when no process is active) misses the region,
+/// while the explicit PID hits.
+fn test_lazy_region_lookup_pid_consistency() -> bool {
+    console::print("\n[TEST] lazy_region_lookup_for_pid: PID=0 misses, explicit PID hits\n");
+
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    use akuma_exec::mmu::user_flags;
+
+    let test_pid: u32 = 0xBEEF;
+    let va: usize = 0x6000_0000;
+    let size: usize = 0x1000_0000;
+
+    clear_lazy_regions(test_pid);
+    push_lazy_region(test_pid, va, size, user_flags::RW);
+
+    // With PID=0 (what a racy/missing read_current_pid returns) -- must miss
+    let miss_with_zero = lazy_region_lookup_for_pid(0, va + 0x2000).is_none();
+
+    // With explicit correct PID -- must hit
+    let hit_with_pid = lazy_region_lookup_for_pid(test_pid, va + 0x2000).is_some();
+
+    clear_lazy_regions(test_pid);
+
+    let pass = miss_with_zero && hit_with_pid;
+    crate::safe_print!(64, "  miss_with_zero={} hit_with_pid={} => {}\n",
+        miss_with_zero, hit_with_pid, if pass { "PASS" } else { "FAIL" });
     pass
 }

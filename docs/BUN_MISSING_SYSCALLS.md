@@ -348,32 +348,57 @@ explains the long runtime.
 ## Implementation Status
 
 timerfd is now functional (timer state tracking, expiration counting,
-read support). epoll remains a stub. Signal handler storage works but
-delivery does not.
+read support). epoll remains a stub. Signal delivery is **fully
+implemented** (try_deliver_signal + do_rt_sigreturn + lazy signal frame
+demand-paging). set_robust_list, membarrier, and close_range have
+functional implementations.
 
-**To make bun fully functional (priority order):**
+**To make `bun run` fully functional (priority order):**
 
-1. **Signal delivery** (CRITICAL) — The kernel stores signal actions via
-   `rt_sigaction` but never delivers signals to userspace handlers. When an
-   unresolvable fault occurs, it kills the process instead of invoking the
-   registered handler. Must implement: save exception context to a signal
-   frame on the user stack, set ELR to the handler address, return to
-   userspace. Also need `rt_sigreturn` (NR 139) to restore context after
-   the handler returns. **This is the #1 blocker for bun.**
-2. **mremap performance** (HIGH) — Return EFAULT (not ENOMEM) for mremap
-   on unmapped addresses when `flags=0`. Currently all 67M mremap probes
-   return ENOMEM regardless of mapping state, which may prevent JSC's GC
-   from efficiently skipping unmapped VA ranges.
-3. **mremap + lazy regions** (MEDIUM) — `sys_mremap` does not handle lazy
-   (demand-paged) regions. When MREMAP_MAYMOVE is set and old_addr is a
-   lazy region, the old lazy entry leaks. See plan: `fix_memory_syscall_stubs`.
-4. **epoll** — Real I/O multiplexing over socket/pipe/timerfd descriptors
-5. **epoll + timerfd integration** — epoll_pwait should return events when timerfds expire
-6. **set_robust_list** (LOW) — Stores nothing; if a CLONE_VM thread dies
-   holding a futex-based mutex, waiters deadlock.
-7. **membarrier** (LOW) — Returns bare 0; acceptable on single-core but
-   should properly parse CMD_QUERY vs CMD_PRIVATE_EXPEDITED.
-8. **close_range** — Proper implementation with `CLOSE_RANGE_CLOEXEC` flag support
+1. **epoll** (CRITICAL for `bun run` network) — Real I/O multiplexing
+   over socket/pipe/timerfd descriptors. Currently returns 0 events
+   immediately regardless of what file descriptors are registered.
+   bun's libuv event loop depends on epoll to know when TCP sockets are
+   readable/writable. Without it, `bun run` can execute JS from disk but
+   cannot do any network I/O.
+2. **epoll + timerfd integration** — epoll_pwait should return events
+   when timerfds expire. Needed for libuv's timer-driven callbacks.
+3. **AF_UNIX sockets** — bun uses Unix domain sockets for internal
+   subprocess communication (e.g. spawning worker processes). Akuma
+   returns `EAFNOSUPPORT` for any socket domain other than `AF_INET`
+   (domain != 2). This blocks bun's subprocess IPC.
+4. **setsockopt** — Currently a no-op (returns 0). bun sets `SO_REUSEADDR`,
+   `TCP_NODELAY`, `SO_KEEPALIVE`, `IPV6_V6ONLY`, and many others. Most
+   are safe to ignore, but `SO_RCVBUF`/`SO_SNDBUF` affect buffering.
+
+**To make `bun install express` work (in addition to above):**
+
+5. **DNS resolution** — bun resolves `registry.npmjs.org` via musl's
+   `getaddrinfo`, which sends UDP DNS queries. AF_INET+SOCK_DGRAM is
+   supported in Akuma's socket layer, but epoll is needed to wait for
+   the response. Without working epoll, DNS queries time out.
+6. **HTTPS / TLS** — bun uses its built-in BoringSSL for TLS; the kernel
+   just needs to pass raw TCP bytes. TCP itself is implemented (smoltcp),
+   but again epoll is required to drive the connection.
+7. **`inotify`** (NR 26/27/28) — Returns ENOSYS. bun uses inotify for
+   file watching. Not needed for `install` but blocks `bun --watch`.
+8. **`io_uring`** (NR 425/426/427) — Returns ENOSYS. bun probes for
+   io_uring support and falls back to epoll if unavailable. ENOSYS is
+   the correct fallback trigger.
+
+**Lower priority (bun works without these):**
+
+9. **mremap + lazy regions** (MEDIUM) — `sys_mremap` does not handle lazy
+   (demand-paged) regions when MREMAP_MAYMOVE is set; the old lazy entry
+   leaks.
+10. **`sigaltstack`** (NR 132) — Returns 0 (no-op). bun may install an
+    alternate signal stack for crash handler robustness; no-op is safe
+    since signal delivery now uses the main stack.
+11. **`fallocate`** (NR 47) — Not implemented (falls through to ENOSYS).
+    bun uses fallocate for pre-allocating package cache files. The code
+    path falls back gracefully to write().
+12. **`statx`** (NR 291) — Not implemented. bun uses statx for extended
+    file metadata (birth time). Falls back to stat/fstat.
 
 ## Known Bugs Found During Investigation
 

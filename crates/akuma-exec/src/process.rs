@@ -1028,21 +1028,49 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
     })
 }
 
+/// Stack-local writer for visible kernel output without heap allocation.
+struct LazyDebugWriter<const N: usize> {
+    buf: [u8; N],
+    pos: usize,
+}
+impl<const N: usize> LazyDebugWriter<N> {
+    const fn new() -> Self { Self { buf: [0; N], pos: 0 } }
+    fn flush(&mut self) {
+        if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
+            (runtime().print_str)(s);
+        }
+        self.pos = 0;
+    }
+}
+impl<const N: usize> core::fmt::Write for LazyDebugWriter<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = N - self.pos;
+        let len = core::cmp::min(bytes.len(), remaining);
+        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
+        self.pos += len;
+        Ok(())
+    }
+}
+
 pub fn lazy_region_debug(va: usize) {
     let pid = read_current_pid().unwrap_or(0);
     with_irqs_disabled(|| {
+        use core::fmt::Write;
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            let mut s = alloc::format!("[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
-            for (i, r) in regions.iter().enumerate() {
-                if i > 0 { s.push(','); }
-                use core::fmt::Write;
-                let _ = write!(s, "{:#x}-{:#x}", r.start_va, r.start_va + r.size);
+            let mut w = LazyDebugWriter::<256>::new();
+            let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
+            for (i, r) in regions.iter().enumerate().take(8) {
+                if i > 0 { let _ = w.write_str(","); }
+                let _ = write!(w, "{:#x}+{:#x}", r.start_va, r.size);
             }
-            s.push(']');
-            log::debug!("{}", s);
+            let _ = w.write_str("]\n");
+            w.flush();
         } else {
-            log::debug!("[DP] lazy miss: pid={} va={:#x} no entry in table", pid, va);
+            let mut w = LazyDebugWriter::<128>::new();
+            let _ = writeln!(w, "[DP] lazy miss: pid={} va={:#x} no entry in table", pid, va);
+            w.flush();
         }
     });
 }
