@@ -318,6 +318,39 @@ pages freed ~5 MB of heap, allowing the heap to shrink from 16 MB to 8 MB.
 This gives 8 MB more physical RAM to userspace, reducing demand-paging
 overhead during bun's initialization.
 
+### Stack Overflow (RESOLVED)
+
+`bun install express` crashed with SIGSEGV at a deterministic address
+~596 KB below `stack_top`:
+
+```
+FAR=0x203ff6bbb4  SP_EL0=0x203ff6ba80  stack_top=0x20_4000_0000
+```
+
+The kernel's `USER_STACK_SIZE` was 512 KB, but bun's initialization
+(JSC setup, JIT compilation) uses ~596 KB of stack. The access at
+596 KB jumped 80 KB past the single 4 KB guard page, so the guard
+page never triggered — the fault address was simply unmapped.
+
+**Fix:** Increased `USER_STACK_SIZE` from 512 KB to 2 MB (matching
+Linux's typical default of 8 MB, but conservatively sized since Akuma
+eagerly maps all stack pages). Updated in `src/config.rs`,
+`userspace/libakuma/src/lib.rs`, and tests.
+
+### Symlink d_type in getdents64 (RESOLVED)
+
+After the stack overflow fix, `bun install express` ran to completion
+but exited with `error: An internal error occurred (NotLink)`.
+
+Root cause: `sys_getdents64` reported all non-directory entries as
+`DT_REG=8`, including symlinks. Bun checks `d_type` to identify
+symlinks in `node_modules` and fails with `NotLink` when a symlink
+is reported as a regular file.
+
+**Fix:** Added `is_symlink` field to the VFS `DirEntry` struct, wired
+ext2's `FT_SYMLINK` file type through `read_dir`, and updated
+`sys_getdents64` to emit `DT_LNK=10` for symlinks.
+
 ### Current Performance
 
 `bun run /public/cgi-bin/akuma.js` execution time progression:

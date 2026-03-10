@@ -111,6 +111,7 @@ impl MountTable {
                     entries.push(DirEntry {
                         name: String::from(&mount_path[1..]),
                         is_dir: true,
+                        is_symlink: false,
                         size: 0,
                     });
                 }
@@ -122,6 +123,7 @@ impl MountTable {
                         entries.push(DirEntry {
                             name: String::from(rest),
                             is_dir: true,
+                            is_symlink: false,
                             size: 0,
                         });
                     }

@@ -104,6 +104,7 @@ impl MountNamespace {
                     entries.push(DirEntry {
                         name: String::from(&m.path[1..]),
                         is_dir: true,
+                        is_symlink: false,
                         size: 0,
                     });
                 }
@@ -115,6 +116,7 @@ impl MountNamespace {
                         entries.push(DirEntry {
                             name: String::from(rest),
                             is_dir: true,
+                            is_symlink: false,
                             size: 0,
                         });
                     }

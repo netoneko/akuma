@@ -1257,6 +1257,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             .filter(|(inode, name, _)| *inode != 0 && name != "." && name != "..")
             .map(|(inode_num, name, file_type)| {
                 let is_dir = file_type == FT_DIR;
+                let is_symlink = file_type == FT_SYMLINK;
                 let size = if is_dir {
                     0
                 } else {
@@ -1264,7 +1265,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                         .map(|i| i.size_lower as u64)
                         .unwrap_or(0)
                 };
-                DirEntry { name, is_dir, size }
+                DirEntry { name, is_dir, is_symlink, size }
             })
             .collect();
 

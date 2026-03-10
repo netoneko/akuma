@@ -95,6 +95,7 @@ impl Filesystem for ProcFilesystem {
                 .map(|p| DirEntry {
                     name: format!("{}", p.pid),
                     is_dir: true,
+                    is_symlink: false,
                     size: 0,
                 })
                 .collect();
@@ -104,7 +105,8 @@ impl Filesystem for ProcFilesystem {
                 entries.push(DirEntry {
                     name: String::from("boxes"),
                     is_dir: false,
-                    size: 0, // Dynamic
+                    is_symlink: false,
+                    size: 0,
                 });
             }
 
@@ -112,6 +114,7 @@ impl Filesystem for ProcFilesystem {
             entries.push(DirEntry {
                 name: String::from("net"),
                 is_dir: true,
+                is_symlink: false,
                 size: 0,
             });
 
@@ -123,8 +126,8 @@ impl Filesystem for ProcFilesystem {
         if parts.len() == 1 {
             if parts[0] == "net" {
                 return Ok(alloc::vec![
-                    DirEntry { name: String::from("tcp"), is_dir: false, size: 0 },
-                    DirEntry { name: String::from("udp"), is_dir: false, size: 0 },
+                    DirEntry { name: String::from("tcp"), is_dir: false, is_symlink: false, size: 0 },
+                    DirEntry { name: String::from("udp"), is_dir: false, is_symlink: false, size: 0 },
                 ]);
             }
 
@@ -136,6 +139,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(alloc::vec![DirEntry {
                 name: String::from("fd"),
                 is_dir: true,
+                is_symlink: false,
                 size: 0,
             }]);
         }
@@ -155,11 +159,13 @@ impl Filesystem for ProcFilesystem {
                 DirEntry {
                     name: String::from("0"),
                     is_dir: false,
+                    is_symlink: false,
                     size: stdin_len,
                 },
                 DirEntry {
                     name: String::from("1"),
                     is_dir: false,
+                    is_symlink: false,
                     size: stdout_len,
                 },
             ]);

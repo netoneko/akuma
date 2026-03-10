@@ -165,6 +165,7 @@ impl Filesystem for MemoryFilesystem {
                     .map(|(name, child)| DirEntry {
                         name: name.clone(),
                         is_dir: child.is_dir(),
+                        is_symlink: false,
                         size: match child {
                             FsNode::File { data, .. } => data.len() as u64,
                             FsNode::Directory { .. } => 0,

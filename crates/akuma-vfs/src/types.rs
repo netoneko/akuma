@@ -59,6 +59,7 @@ impl core::fmt::Display for FsError {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub size: u64,
 }
 

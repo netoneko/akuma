@@ -1300,7 +1300,8 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
                         core::ptr::write_unaligned(p as *mut u64, 1);
                         core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
                         core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
-                        p.add(18).write(if entry.is_dir { 4 } else { 8 });
+                        let d_type: u8 = if entry.is_dir { 4 } else if entry.is_symlink { 10 } else { 8 };
+                        p.add(18).write(d_type);
                         core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
                         p.add(19 + entry.name.len()).write(0);
                     }
