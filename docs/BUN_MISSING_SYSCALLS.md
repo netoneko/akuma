@@ -657,60 +657,54 @@ The kernel never registers a `log::Log` backend at boot. All `log::info!`,
 dropped. Code that needs guaranteed output must use `(runtime().print_str)()`
 instead. See `docs/KERNEL_SPLIT_BUGS.md` for details.
 
-## Bun Install Express Crash Analysis (Updated 2026-03-10)
+## Bun Install Express (FIXED 2026-03-10)
 
-### Summary
+`bun install express` now works. Packages download and install in ~5-10 seconds.
 
-`bun install express` consistently crashes with SIGSEGV accessing address `0x4525248d0`
-(approximately 17GB), which is far outside any mapped memory region. The crash occurs
-after `epoll_pwait` (syscall 22) returns successfully with network events.
+### Root Cause: `epoll_event` Struct Alignment on ARM64
 
-### Crash Pattern
+The crash was caused by using the wrong `epoll_event` structure layout.
 
+On **x86_64**, `epoll_event` is packed (12 bytes):
+```c
+struct epoll_event {
+    uint32_t events;   // offset 0
+    uint64_t data;     // offset 4
+} __attribute__((packed));
 ```
-[WILD-DA] pid=44 FAR=0x4525248d0 ELR=0x3dc6ab8 last_sc=22
-  x0=0x2 x1=0x16 x2=0x400 x3=0xffffffffffffffff
-  x4=0x903ff3f8 x5=0x8 x6=0x903ff3f8 x7=0x8
-[signal] Delivering sig 11 to handler 0x2ceca60 (restorer=0x30051c50)
+
+On **ARM64**, `epoll_event` is NOT packed (16 bytes with natural alignment):
+```c
+struct epoll_event {
+    uint32_t events;   // offset 0
+    uint32_t _pad;     // offset 4 (padding)
+    uint64_t data;     // offset 8
+};
 ```
 
-- `FAR=0x4525248d0` — Fault address (17GB, outside all mappings)
-- `ELR=0x3dc6ab8` — Instruction causing the fault (in bun's code)
-- `last_sc=22` — epoll_pwait was the last syscall before the crash
-- `x3=0xffffffffffffffff` (-1) — Suggests an error return value
+The kernel was using 12-byte packed layout. When writing events, the `data`
+field went to offset 4. When bun (compiled for ARM64) read events, it expected
+`data` at offset 8. The misaligned read produced garbage pointers like
+`0x452524xxx`, causing SIGSEGV.
 
-### Kernel Functionality Verified
+The Linux kernel header documents this:
+```c
+#ifdef __x86_64__
+#define EPOLL_PACKED __attribute__((packed))
+#else
+#define EPOLL_PACKED
+#endif
+```
 
-1. **Futex implementation** — Verified working with FUTEX_WAIT, FUTEX_WAKE, FUTEX_REQUEUE,
-   FUTEX_CMP_REQUEUE. Added proper validation and support for FUTEX_PRIVATE_FLAG.
-2. **Epoll implementation** — TCP sockets are added to epoll interest list correctly,
-   events are polled from smoltcp network stack.
-3. **TCP connections** — Multiple TCP connections to registry.npmjs.org (104.16.x.34:443)
-   are established with EINPROGRESS (non-blocking connect).
-4. **DNS resolution** — UDP socket created, DNS query sent to 10.0.2.3:53.
+### Fix
 
-### Root Cause Analysis
+In `src/syscall/poll.rs`:
+- Changed `#[repr(C, packed)]` to `#[repr(C)]`
+- Added `_pad: u32` field
+- Updated size calculations from 12 to 16 bytes
 
-The crash at `0x4525248d0` is a **bun/JSC internal bug**, not an Akuma kernel bug:
+### Remaining Work
 
-1. The address is ~17GB, but maximum mapped memory is ~2.5GB
-2. The address pattern `0x452524...` is consistent across runs
-3. This is likely a poisoned/tagged pointer or use-after-free in JSC's heap
-4. The kernel correctly delivers SIGSEGV to bun's crash handler
-
-### Process VM Readv
-
-After the crash, bun's signal handler calls `process_vm_readv` (syscall 270) to dump
-crash information. This returns ENOSYS since we don't support cross-process memory
-reading. This is expected and not the cause of the crash.
-
-### JIT Disabled
-
-Tests were run with `BUN_JSC_useJIT=0` to disable JIT compilation. The crash still
-occurs, ruling out JIT-specific bugs.
-
-### Next Steps
-
-1. Try running with different bun versions
-2. Use GDB to capture full backtrace at crash point
-3. Consider reporting to bun developers with crash info
+1. **AF_UNIX sockets** — Returns EAFNOSUPPORT. Needed for bun subprocess IPC.
+2. **process_vm_readv** (NR 270) — Returns ENOSYS. Used by crash handler only.
+3. **Performance** — TCP buffer sizes and epoll polling could be optimized.

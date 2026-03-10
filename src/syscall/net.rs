@@ -149,10 +149,8 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
                 akuma_net::smoltcp_net::with_network(|net| {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                     s.remote_endpoint().map(|ep| {
-                        let ip = if let smoltcp::wire::IpAddress::Ipv4(addr) = ep.addr {
-                            addr.octets()
-                        } else {
-                            [0; 4]
+                        let ip = match ep.addr {
+                            smoltcp::wire::IpAddress::Ipv4(addr) => addr.octets(),
                         };
                         (ip, ep.port)
                     })

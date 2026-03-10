@@ -29,10 +29,13 @@ struct PollFd {
     revents: i16,
 }
 
-#[repr(C, packed)]
+// On ARM64, epoll_event is NOT packed (unlike x86_64).
+// Layout: events (4 bytes) + padding (4 bytes) + data (8 bytes) = 16 bytes total
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct EpollEvent {
     events: u32,
+    _pad: u32,  // ARM64 ABI padding
     data: u64,
 }
 
@@ -62,9 +65,11 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
         None => return EBADF,
     };
 
+    const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
+
     match op {
         EPOLL_CTL_ADD => {
-            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
             if instance.interest_list.contains_key(&fd) {
                 return EEXIST;
@@ -79,7 +84,7 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
             0
         }
         EPOLL_CTL_MOD => {
-            if !validate_user_ptr(event_ptr as u64, 12) { return EFAULT; }
+            if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
             let ev_events = { ev.events };
             let ev_data = { ev.data };
@@ -178,9 +183,11 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
 }
 
 pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+    const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
+    
     if maxevents <= 0 { return EINVAL; }
     let maxevents = maxevents as usize;
-    let out_size = maxevents * 12;
+    let out_size = maxevents * EPOLL_EVENT_SIZE;
     if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
 
     let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
@@ -214,10 +221,10 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
 
             let revents = epoll_check_fd_readiness(fd, requested_events);
             if revents != 0 {
-                let out_event = EpollEvent { events: revents, data };
+                let out_event = EpollEvent { events: revents, _pad: 0, data };
                 unsafe {
                     core::ptr::write_unaligned(
-                        (events_ptr + ready_count * 12) as *mut EpollEvent,
+                        (events_ptr + ready_count * EPOLL_EVENT_SIZE) as *mut EpollEvent,
                         out_event,
                     );
                 }

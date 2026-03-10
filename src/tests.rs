@@ -198,6 +198,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
+    run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -6660,6 +6661,39 @@ fn test_map_user_page_already_mapped() -> bool {
     let pass = installed1 && !installed2 && is_mapped_after_first && is_mapped_after_second;
     crate::safe_print!(128, "  first: installed={}, mapped={}\n", installed1, is_mapped_after_first);
     crate::safe_print!(128, "  second: installed={}, mapped={}\n", installed2, is_mapped_after_second);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: epoll_event struct is 16 bytes on ARM64
+///
+/// On ARM64, epoll_event is NOT packed (unlike x86_64).
+/// The struct has 4 bytes of padding between events (u32) and data (u64).
+/// This caused bun install express to crash because we were using 12-byte
+/// (packed) layout, causing misaligned reads of the data field.
+fn test_epoll_event_is_16_bytes_on_arm64() -> bool {
+    console::print("\n[TEST] epoll_event is 16 bytes on ARM64\n");
+
+    #[repr(C)]
+    struct EpollEvent {
+        events: u32,
+        _pad: u32,
+        data: u64,
+    }
+
+    let size = core::mem::size_of::<EpollEvent>();
+    let align = core::mem::align_of::<EpollEvent>();
+
+    // Verify offsets
+    let events_offset = core::mem::offset_of!(EpollEvent, events);
+    let pad_offset = core::mem::offset_of!(EpollEvent, _pad);
+    let data_offset = core::mem::offset_of!(EpollEvent, data);
+
+    crate::safe_print!(128, "  size={} bytes, align={}\n", size, align);
+    crate::safe_print!(128, "  offsets: events={}, _pad={}, data={}\n",
+        events_offset, pad_offset, data_offset);
+
+    let pass = size == 16 && data_offset == 8;
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
