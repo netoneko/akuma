@@ -500,4 +500,70 @@ impl Filesystem for ProcFilesystem {
             free_blocks: 0,
         })
     }
+
+    fn read_symlink(&self, path: &str) -> Result<String, FsError> {
+        let path = path.trim_start_matches('/');
+
+        // Handle "self/fd/<n>" -> resolve to current process
+        if let Some(rest) = path.strip_prefix("self/") {
+            let pid = process::current_process().map(|p| p.pid).ok_or(FsError::NotFound)?;
+            let new_path = format!("{}/{}", pid, rest);
+            return self.read_symlink(&new_path);
+        }
+
+        // Handle "<pid>/fd/<n>" -> symlink to the file path
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() == 3 && parts[1] == "fd" {
+            let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
+            let fd: u32 = parts[2].parse().map_err(|_| FsError::NotFound)?;
+
+            let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+            if let Some(fd_entry) = proc.get_fd(fd) {
+                use akuma_exec::process::FileDescriptor;
+                let target = match fd_entry {
+                    FileDescriptor::File(f) => f.path.clone(),
+                    FileDescriptor::Socket(_) => format!("socket:[{}]", fd),
+                    FileDescriptor::PipeRead(id) => format!("pipe:[{}]", id),
+                    FileDescriptor::PipeWrite(id) => format!("pipe:[{}]", id),
+                    FileDescriptor::EpollFd(_) => format!("anon_inode:[eventpoll]"),
+                    FileDescriptor::TimerFd(_) => format!("anon_inode:[timerfd]"),
+                    FileDescriptor::EventFd(_) => format!("anon_inode:[eventfd]"),
+                    FileDescriptor::DevNull => String::from("/dev/null"),
+                    FileDescriptor::DevUrandom => String::from("/dev/urandom"),
+                    FileDescriptor::Stdin => String::from("/dev/stdin"),
+                    FileDescriptor::Stdout => String::from("/dev/stdout"),
+                    FileDescriptor::Stderr => String::from("/dev/stderr"),
+                    FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{}]", child_pid),
+                };
+                return Ok(target);
+            }
+            return Err(FsError::NotFound);
+        }
+
+        Err(FsError::NotFound)
+    }
+
+    fn is_symlink(&self, path: &str) -> bool {
+        let path = path.trim_start_matches('/');
+
+        // "self" is a symlink to the current PID
+        if path == "self" {
+            return true;
+        }
+
+        // "self/fd/<n>" and "<pid>/fd/<n>" are symlinks
+        if let Some(rest) = path.strip_prefix("self/") {
+            if rest.starts_with("fd/") {
+                let fd_part = &rest[3..];
+                return fd_part.parse::<u32>().is_ok();
+            }
+        }
+
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() == 3 && parts[1] == "fd" {
+            return parts[0].parse::<Pid>().is_ok() && parts[2].parse::<u32>().is_ok();
+        }
+
+        false
+    }
 }

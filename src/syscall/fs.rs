@@ -1280,9 +1280,15 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        crate::safe_print!(256, "[readlinkat] {} -> {} (ok)\n", path, target);
         return copy_len as u64;
     }
-    EINVAL
+
+    let exists = crate::vfs::exists(&path);
+    let is_symlink = crate::vfs::is_symlink(&path);
+    let ret = if exists { EINVAL } else { ENOENT };
+    crate::safe_print!(256, "[readlinkat] {} exists={} is_symlink={} ret={}\n", path, exists, is_symlink, ret as i64);
+    ret
 }
 
 pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {

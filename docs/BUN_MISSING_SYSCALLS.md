@@ -339,17 +339,31 @@ eagerly maps all stack pages). Updated in `src/config.rs`,
 
 ### Symlink d_type in getdents64 (RESOLVED)
 
-After the stack overflow fix, `bun install express` ran to completion
-but exited with `error: An internal error occurred (NotLink)`.
-
-Root cause: `sys_getdents64` reported all non-directory entries as
-`DT_REG=8`, including symlinks. Bun checks `d_type` to identify
-symlinks in `node_modules` and fails with `NotLink` when a symlink
-is reported as a regular file.
+`sys_getdents64` reported all non-directory entries as `DT_REG=8`,
+including symlinks. Bun checks `d_type` to identify symlinks in
+`node_modules` and would fail if a symlink is reported as a regular
+file.
 
 **Fix:** Added `is_symlink` field to the VFS `DirEntry` struct, wired
 ext2's `FT_SYMLINK` file type through `read_dir`, and updated
 `sys_getdents64` to emit `DT_LNK=10` for symlinks.
+
+### readlinkat ENOENT vs EINVAL (RESOLVED)
+
+`bun install express` exited with `error: An internal error occurred
+(NotLink)` during startup, before any directory listing.
+
+Root cause: `sys_readlinkat` returned `EINVAL` for all non-symlink
+paths, including paths that don't exist. On Linux, `readlinkat`
+returns `ENOENT` for missing paths and `EINVAL` only when the path
+exists but is not a symlink. Bun's Zig runtime maps `EINVAL` from
+`readlinkat` to `error.NotLink` (fatal), but maps `ENOENT` to
+`error.FileNotFound` (handled gracefully). Bun calls `readlinkat`
+on cache paths during install setup; when the cache doesn't exist,
+the wrong errno caused a hard failure.
+
+**Fix:** `sys_readlinkat` now checks `vfs::exists()` and returns
+`ENOENT` for missing paths, `EINVAL` for existing non-symlinks.
 
 ### Current Performance
 
