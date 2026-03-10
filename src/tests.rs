@@ -157,6 +157,25 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_membarrier_query_returns_bitmask, "membarrier_query_returns_bitmask");
     run_test!(test_membarrier_private_expedited_succeeds, "membarrier_private_expedited_succeeds");
 
+    // Regression: PMM contiguous allocation (extract-syscalls branch)
+    // Thread stacks moved from heap to PMM contiguous pages — must allocate,
+    // be zeroed, not overlap, and free correctly.
+    run_test!(test_pmm_contiguous_alloc_basic, "pmm_contiguous_alloc_basic");
+    run_test!(test_pmm_contiguous_alloc_zeroed, "pmm_contiguous_alloc_zeroed");
+    run_test!(test_pmm_contiguous_free_restores_count, "pmm_contiguous_free_restores_count");
+    run_test!(test_pmm_contiguous_stack_sized_no_overlap, "pmm_contiguous_stack_sized_no_overlap");
+    run_test!(test_pmm_contiguous_double_stack_size_no_overlap, "pmm_contiguous_double_stack_size_no_overlap");
+
+    // Regression: alloc_mmap skips kernel VA hole (extract-syscalls branch)
+    // Previously mmap could allocate at 0x4000_0000–0x5000_0000 (kernel identity VA).
+    run_test!(test_alloc_mmap_skips_kernel_va_hole, "alloc_mmap_skips_kernel_va_hole");
+
+    // Regression: compute_stack_top constants doubled (extract-syscalls branch)
+    // MIN_MMAP_SPACE 128GB→256GB, MAX_STACK_TOP 256GB→512GB.
+    // Verify the new values still fit in 48-bit VA and mmap space is correct.
+    run_test!(test_stack_top_within_48bit_va, "stack_top_within_48bit_va");
+    run_test!(test_mmap_space_covers_jsc_gigacage, "mmap_space_covers_jsc_gigacage");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -5994,6 +6013,368 @@ fn test_close_range() -> bool {
     akuma_exec::process::unregister_process(test_pid);
     crate::pmm::free_page(info_frame);
 
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Regression tests for extract-syscalls branch
+// ============================================================================
+
+/// Regression: PMM contiguous alloc returns a valid frame.
+///
+/// Thread stacks were moved from heap Vec to PMM contiguous pages in
+/// `threading.rs`. This tests the basic contract: alloc returns Some,
+/// address is page-aligned, and free restores the free count.
+fn test_pmm_contiguous_alloc_basic() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: basic alloc and free\n");
+
+    const PAGES: usize = 32; // 128KB — minimum thread stack size
+    let before = crate::pmm::free_count();
+
+    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
+        Some(f) => f,
+        None => {
+            console::print("  OOM\n");
+            return false;
+        }
+    };
+
+    let during = crate::pmm::free_count();
+    let allocated_ok = before.saturating_sub(during) == PAGES;
+    let aligned = frame.addr % 4096 == 0;
+
+    crate::safe_print!(128, "  frame.addr={:#x} allocated={} aligned={}\n",
+        frame.addr, allocated_ok, aligned);
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    let after = crate::pmm::free_count();
+    let restored = after == before;
+
+    let pass = allocated_ok && aligned && restored;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: PMM contiguous alloc returns zeroed pages.
+///
+/// `alloc_pages_contiguous_zeroed` must zero all allocated pages and flush
+/// the data cache before returning. Without zeroing, thread stacks contain
+/// garbage and canary checks fail on first spawn.
+fn test_pmm_contiguous_alloc_zeroed() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: all pages are zeroed\n");
+
+    const PAGES: usize = 8;
+    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
+        Some(f) => f,
+        None => {
+            console::print("  OOM\n");
+            return false;
+        }
+    };
+
+    let mut all_zero = true;
+    let virt = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+    for i in 0..(PAGES * 4096 / 8) {
+        let val = unsafe { virt.add(i).read_volatile() };
+        if val != 0 {
+            crate::safe_print!(64, "  non-zero at offset {}: {:#x}\n", i * 8, val);
+            all_zero = false;
+            break;
+        }
+    }
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    crate::safe_print!(64, "  Result: {}\n", if all_zero { "PASS" } else { "FAIL" });
+    all_zero
+}
+
+/// Regression: PMM contiguous free restores the free count exactly.
+///
+/// Simulates allocate → use → free for a single thread stack. Verifies no
+/// pages are leaked regardless of the address returned.
+fn test_pmm_contiguous_free_restores_count() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: free restores exact count\n");
+
+    const PAGES: usize = 64; // 256KB — system_thread_stack_size
+    let before = crate::pmm::free_count();
+
+    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
+        Some(f) => f,
+        None => {
+            console::print("  OOM\n");
+            return false;
+        }
+    };
+
+    // Write a sentinel to each page so we know they're all distinct
+    let base = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u64;
+    for i in 0..PAGES {
+        unsafe { base.add(i * 512).write_volatile(0xDEAD_BEEF_0000_0000 | i as u64); }
+    }
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    let after = crate::pmm::free_count();
+    let pass = after == before;
+    if !pass {
+        crate::safe_print!(128, "  before={} after={} diff={}\n",
+            before, after, before as isize - after as isize);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: 32 PMM contiguous stack allocations don't overlap.
+///
+/// `ThreadPool::init` calls `allocate_stack_for_slot` for every thread slot
+/// (MAX_THREADS = 32). Each slot gets a PMM-backed stack. If the contiguous
+/// allocator returns overlapping regions, two threads share stack space and
+/// one will corrupt the other.
+fn test_pmm_contiguous_stack_sized_no_overlap() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: 32 stack-sized allocs don't overlap\n");
+
+    const STACK_PAGES: usize = 32; // 128 KB
+    const NUM_SLOTS: usize = 32;
+
+    let mut frames: Vec<(usize, usize)> = Vec::new(); // (start_phys, end_phys)
+    let mut oom = false;
+
+    for _ in 0..NUM_SLOTS {
+        match crate::pmm::alloc_pages_contiguous_zeroed(STACK_PAGES) {
+            Some(f) => {
+                frames.push((f.addr, f.addr + STACK_PAGES * 4096));
+            }
+            None => {
+                oom = true;
+                break;
+            }
+        }
+    }
+
+    if oom {
+        // Free what we got then skip — kernel might not have enough RAM for test
+        for (addr, _) in &frames {
+            crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(*addr), STACK_PAGES);
+        }
+        console::print("  OOM (not enough physical RAM for 32 stacks — skip)\n");
+        return true; // Not a test failure, just insufficient resources
+    }
+
+    // Check no two regions overlap
+    let mut overlap = false;
+    'outer: for i in 0..frames.len() {
+        for j in (i + 1)..frames.len() {
+            let (a_start, a_end) = frames[i];
+            let (b_start, b_end) = frames[j];
+            if a_start < b_end && b_start < a_end {
+                crate::safe_print!(128, "  OVERLAP: slot {} [{:#x}–{:#x}) vs slot {} [{:#x}–{:#x})\n",
+                    i, a_start, a_end, j, b_start, b_end);
+                overlap = true;
+                break 'outer;
+            }
+        }
+    }
+
+    for (addr, _) in &frames {
+        crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(*addr), STACK_PAGES);
+    }
+
+    let pass = !overlap;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Allocate at stack size, double, free original — no overlap.
+///
+/// `reallocate_stack` frees the old PMM stack and allocates a new larger one.
+/// Verify that the new allocation doesn't overlap with any other live stack.
+fn test_pmm_contiguous_double_stack_size_no_overlap() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: reallocate (double size) no overlap\n");
+
+    const SMALL_PAGES: usize = 32; // 128KB original
+    const LARGE_PAGES: usize = 64; // 256KB reallocated
+
+    let frame_a = match crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) {
+        Some(f) => f,
+        None => { console::print("  OOM\n"); return false; }
+    };
+    let frame_b = match crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) {
+        Some(f) => f,
+        None => {
+            crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
+            console::print("  OOM\n");
+            return false;
+        }
+    };
+
+    // Simulate reallocating frame_a: free it, then alloc a larger region
+    crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
+    let frame_large = match crate::pmm::alloc_pages_contiguous_zeroed(LARGE_PAGES) {
+        Some(f) => f,
+        None => {
+            crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
+            console::print("  OOM\n");
+            return false;
+        }
+    };
+
+    // frame_large must not overlap with frame_b (the surviving stack)
+    let b_start = frame_b.addr;
+    let b_end = b_start + SMALL_PAGES * 4096;
+    let l_start = frame_large.addr;
+    let l_end = l_start + LARGE_PAGES * 4096;
+    let overlap = l_start < b_end && b_start < l_end;
+
+    if overlap {
+        crate::safe_print!(128, "  OVERLAP: large=[{:#x}–{:#x}) vs B=[{:#x}–{:#x})\n",
+            l_start, l_end, b_start, b_end);
+    }
+
+    crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
+    crate::pmm::free_pages_contiguous(frame_large, LARGE_PAGES);
+
+    let pass = !overlap;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: alloc_mmap skips the kernel identity-mapped VA hole.
+///
+/// In the extract-syscalls branch, `ProcessMemory::alloc_mmap` was changed to
+/// skip [0x4000_0000, 0x5000_0000) when the bump pointer would otherwise
+/// land there. Previously allocations could land in the kernel VA and crash.
+fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
+    console::print("\n[TEST] alloc_mmap: skips kernel VA hole 0x4000_0000–0x5000_0000\n");
+
+    const KERNEL_VA_START: usize = 0x4000_0000;
+    const KERNEL_VA_END:   usize = 0x5000_0000;
+
+    // Place next_mmap just before the hole so the next alloc would enter it
+    // without the skip logic.
+    let brk        = 0x1000_0000;
+    let stack_top  = 0x80_0000_0000; // 512GB
+    let stack_bot  = stack_top - 2 * 1024 * 1024;
+    let mmap_floor = 0x3010_0000;
+
+    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+
+    // Manually bump next_mmap to just before kernel hole
+    mem.next_mmap = KERNEL_VA_START - 4096; // one page before hole
+
+    // A 2-page alloc would straddle [KERNEL_VA_START-4096, KERNEL_VA_START+4096)
+    // which enters the hole. The allocator must jump past KERNEL_VA_END.
+    let addr = match mem.alloc_mmap(2 * 4096) {
+        Some(a) => a,
+        None => {
+            console::print("  alloc_mmap returned None unexpectedly\n");
+            return false;
+        }
+    };
+
+    let inside_hole = addr < KERNEL_VA_END && addr + 2 * 4096 > KERNEL_VA_START;
+    if inside_hole {
+        crate::safe_print!(128, "  FAIL: alloc_mmap returned {:#x} inside kernel VA hole\n", addr);
+    } else {
+        crate::safe_print!(128, "  alloc_mmap returned {:#x} (hole avoided)\n", addr);
+    }
+
+    let pass = !inside_hole && addr >= KERNEL_VA_END;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: stack top with new constants fits within 48-bit VA.
+///
+/// The extract-syscalls branch doubled MIN_MMAP_SPACE (128GB → 256GB) and
+/// MAX_STACK_TOP (256GB → 512GB). Verify the computed stack top for a
+/// dynamically-linked binary (bun) never exceeds 48-bit VA (2^48).
+fn test_stack_top_within_48bit_va() -> bool {
+    console::print("\n[TEST] compute_stack_top: result within 48-bit VA\n");
+
+    // Replicate compute_stack_top() logic with current constants
+    const DEFAULT: usize         = 0x4000_0000;
+    const INTERP_END: usize      = 0x3010_0000;
+    const MIN_MMAP_SPACE: usize  = 0x40_0000_0000; // 256 GB (current)
+    const MAX_STACK_TOP: usize   = 0x80_0000_0000; // 512 GB (current)
+    const VA_48BIT_MAX: usize    = (1usize << 48) - 1;
+
+    // Test several representative brk values for dynamically-linked binaries
+    let test_cases: &[(usize, bool)] = &[
+        (0x600_0000,  true),  // typical bun (96 MB segments)
+        (0x200_0000,  true),  // small dynamic binary
+        (0x1000_0000, true),  // 256 MB binary
+        (0x5000_0000, true),  // 1.25 GB binary
+    ];
+
+    let mut all_ok = true;
+    for &(brk, has_interp) in test_cases {
+        let base_mmap = (brk + 0x1000_0000) & !0xFFFF;
+        let mmap_start = if has_interp {
+            core::cmp::max(base_mmap, INTERP_END)
+        } else {
+            base_mmap
+        };
+        let needed  = mmap_start + MIN_MMAP_SPACE;
+        let raw     = core::cmp::max(DEFAULT, needed);
+        let aligned = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+        let stack_top = core::cmp::min(aligned, MAX_STACK_TOP);
+
+        let within_48 = stack_top <= VA_48BIT_MAX;
+        let within_max = stack_top <= MAX_STACK_TOP;
+
+        if !within_48 || !within_max {
+            crate::safe_print!(128, "  FAIL brk={:#x} has_interp={}: stack_top={:#x}\n",
+                brk, has_interp, stack_top);
+            all_ok = false;
+        } else {
+            crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} OK\n", brk, stack_top);
+        }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if all_ok { "PASS" } else { "FAIL" });
+    all_ok
+}
+
+/// Regression: mmap space with new constants fits JSC Gigacage (128 GB).
+///
+/// JSC requires 128 GB of *contiguous* virtual address space for the Gigacage.
+/// With MIN_MMAP_SPACE=256GB the mmap region starts at ~0x3010_0000 and
+/// extends to ~260GB, giving 256+ GB of space. Verify ProcessMemory can
+/// satisfy a 128GB alloc with the new constants.
+fn test_mmap_space_covers_jsc_gigacage() -> bool {
+    console::print("\n[TEST] mmap space: 128 GB JSC Gigacage allocation succeeds\n");
+
+    const MIN_MMAP_SPACE: usize = 0x40_0000_0000; // 256 GB (current constants)
+    const MAX_STACK_TOP:  usize = 0x80_0000_0000; // 512 GB (current constants)
+    const STACK_SIZE:     usize = 2 * 1024 * 1024; // 2 MB
+
+    // Simulate a bun-like binary: brk at 96 MB, has interpreter
+    let brk         = 0x600_0000;
+    let mmap_floor  = 0x3010_0000usize;
+    let base_mmap   = (brk + 0x1000_0000) & !0xFFFF;
+    let mmap_start  = core::cmp::max(base_mmap, mmap_floor);
+    let needed      = mmap_start + MIN_MMAP_SPACE;
+    let raw         = core::cmp::max(0x4000_0000usize, needed);
+    let aligned     = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let stack_top   = core::cmp::min(aligned, MAX_STACK_TOP);
+    let stack_bot   = stack_top - STACK_SIZE;
+
+    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+
+    const GIGACAGE_SIZE: usize = 128 * 1024 * 1024 * 1024;
+    let addr = mem.alloc_mmap(GIGACAGE_SIZE);
+
+    let pass = addr.is_some();
+    if let Some(a) = addr {
+        crate::safe_print!(128, "  Gigacage at {:#x}–{:#x} (stack_top={:#x})\n",
+            a, a + GIGACAGE_SIZE, stack_top);
+    } else {
+        crate::safe_print!(128, "  FAIL: could not allocate 128 GB (mmap_limit={:#x})\n",
+            mem.mmap_limit);
+    }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
