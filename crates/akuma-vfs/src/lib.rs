@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! Virtual Filesystem (VFS) Layer
 //!
 //! Provides the `Filesystem` trait, common types (`FsError`, `DirEntry`, `Metadata`,

@@ -116,7 +116,15 @@ The kernel handles several AArch64 exception classes from EL0:
 
 ## Testing
 
-In-kernel tests live in `src/*_tests.rs`. Run with standard cargo test mechanisms. Userspace tests are in their respective `userspace/` subdirectories.
+In-kernel tests live in `src/*_tests.rs`. Userspace tests are in their respective `userspace/` subdirectories.
+
+The extracted crates in `crates/` have host-runnable unit tests (~165 tests across 7 crates). Because `.cargo/config.toml` sets `target = "aarch64-unknown-none"` globally, you must pass the host target explicitly:
+
+```bash
+cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+```
+
+The pre-commit hook runs both clippy and these tests automatically. `akuma-exec` is excluded from `default-members` in `Cargo.toml` because it contains kernel-only inline assembly that cannot compile on the host.
 
 ## Current Branch
 

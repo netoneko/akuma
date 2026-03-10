@@ -151,6 +151,16 @@ userspace/build.sh           # Build all userspace binaries
 scripts/populate_disk.sh     # Populate disk with binaries
 ```
 
+### Run Tests
+
+The extracted crates in `crates/` have host-runnable test suites (~165 tests). Since the kernel build target is `aarch64-unknown-none`, pass the host target explicitly:
+
+```bash
+cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+```
+
+Tests run automatically as a pre-commit hook (along with clippy).
+
 ### Connect via SSH
 
 ```bash

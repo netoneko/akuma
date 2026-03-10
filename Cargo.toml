@@ -1,5 +1,15 @@
 [workspace]
 members = [".", "crates/*"]
+default-members = [
+    "crates/akuma-ext2",
+    "crates/akuma-isolation",
+    "crates/akuma-net",
+    "crates/akuma-shell",
+    "crates/akuma-ssh",
+    "crates/akuma-ssh-crypto",
+    "crates/akuma-terminal",
+    "crates/akuma-vfs",
+]
 exclude = ["userspace"]
 
 [workspace.lints.clippy]

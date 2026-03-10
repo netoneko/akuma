@@ -343,34 +343,45 @@ impl BitmapAllocator {
 
     /// Allocate `count` contiguous pages. Returns the first frame's address.
     /// Scans the bitmap for a run of `count` consecutive free pages.
+    ///
+    /// Starts the scan from `next_free_hint` to avoid re-scanning already-used
+    /// kernel pages. Falls back to scanning from 0 if no run found after hint.
     fn alloc_pages_contiguous(&mut self, count: usize) -> Option<PhysFrame> {
         if count == 0 { return None; }
         if count == 1 { return self.alloc_page(); }
         if self.free_pages < count { return None; }
 
-        // Scan for a contiguous run of `count` free pages
-        let mut run_start = 0;
-        let mut run_len = 0;
+        let hint = self.next_free_hint;
 
-        for page_idx in 0..self.total_pages {
-            if self.is_free(page_idx) {
-                if run_len == 0 {
-                    run_start = page_idx;
-                }
-                run_len += 1;
-                if run_len == count {
-                    // Found a run — mark all pages as used
-                    for i in run_start..run_start + count {
-                        self.mark_used(i);
+        // Try two passes: start from hint, then wrap around from 0.
+        // In the common boot case (32 thread stacks, large free block after kernel)
+        // the run is found in the first pass near the hint position.
+        for &start in &[hint, 0usize] {
+            let mut run_start = 0;
+            let mut run_len = 0;
+
+            for page_idx in start..self.total_pages {
+                if self.is_free(page_idx) {
+                    if run_len == 0 {
+                        run_start = page_idx;
                     }
-                    self.free_pages -= count;
-                    self.next_free_hint = run_start + count;
-                    let addr = self.base_addr + run_start * PAGE_SIZE;
-                    return Some(PhysFrame::new(addr));
+                    run_len += 1;
+                    if run_len == count {
+                        // Found a run — mark all pages as used
+                        for i in run_start..run_start + count {
+                            self.mark_used(i);
+                        }
+                        self.free_pages -= count;
+                        self.next_free_hint = run_start + count;
+                        let addr = self.base_addr + run_start * PAGE_SIZE;
+                        return Some(PhysFrame::new(addr));
+                    }
+                } else {
+                    run_len = 0;
                 }
-            } else {
-                run_len = 0;
             }
+
+            if start == 0 { break; } // second pass already started from 0
         }
 
         None

@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! Ext2 Filesystem Implementation
 //!
 //! A full ext2 filesystem driver for `no_std` environments with read/write support.

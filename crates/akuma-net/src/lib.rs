@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::future_not_send)]
 
 extern crate alloc;
@@ -14,6 +14,9 @@ pub mod tls_rng;
 pub mod tls_verifier;
 pub mod http;
 
+
+#[cfg(test)]
+mod tests;
 
 pub use runtime::NetRuntime;
 
