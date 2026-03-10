@@ -283,6 +283,11 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.chmod(rel, mode))
 }
 
+/// Truncate a file to a specified length
+pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
+    with_fs(path, |fs, rel| fs.truncate(rel, length))
+}
+
 /// Resolve a path to its absolute form through the process's CWD.
 fn resolve_absolute(path: &str) -> String {
     if let Some(proc) = akuma_exec::process::current_process() {

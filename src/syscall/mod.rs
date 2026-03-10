@@ -237,6 +237,8 @@ pub mod nr {
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const FCHOWNAT: u64 = 54;
+    pub const FCHOWN: u64 = 55;
+    pub const FTRUNCATE: u64 = 46;
     pub const MADVISE: u64 = 233;
     pub const MPROTECT: u64 = 226;
     pub const FUTEX: u64 = 98;
@@ -599,6 +601,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCHMOD => fs::sys_fchmod(args[0] as u32, args[1] as u32),
         nr::FCHMODAT => fs::sys_fchmodat(args[0] as i32, args[1], args[2] as u32),
         nr::FCHOWNAT => 0,
+        nr::FCHOWN => 0,
+        nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
         nr::MADVISE => mem::sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         nr::MPROTECT => mem::sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::FUTEX => sync::sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, args[3], args[4] as usize, args[5] as u32),

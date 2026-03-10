@@ -159,6 +159,10 @@ pub trait Filesystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    fn truncate(&self, _path: &str, _length: u64) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
     fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }

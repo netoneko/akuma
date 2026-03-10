@@ -1020,6 +1020,20 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     }
 }
 
+pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            match crate::vfs::truncate(&f.path, length as u64) {
+                Ok(()) => 0,
+                Err(e) => fs_error_to_errno(e),
+            }
+        }
+        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
+        _ => EBADF,
+    }
+}
+
 pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
