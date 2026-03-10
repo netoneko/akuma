@@ -1636,8 +1636,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     
                     // Log register state for debugging wild pointer accesses
                     let frame_ref = unsafe { &*frame };
-                    crate::tprint!(256, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
-                        pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
+                    let last_sc = crate::syscall::current_syscall_nr();
+                    crate::tprint!(384, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} last_sc={}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n  x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n",
+                        pid, far_usize, frame_ref.elr_el1, last_sc,
+                        frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3,
+                        frame_ref.x4, frame_ref.x5, frame_ref.x6, frame_ref.x7);
                 }
             }
 

@@ -118,6 +118,10 @@ pub struct KernelSocket {
     pub inner: SocketType,
     pub bind_port: Option<u16>,
     pub box_id: u64,
+    /// `TCP_NODELAY` option (disable Nagle's algorithm)
+    pub tcp_nodelay: bool,
+    /// `SO_KEEPALIVE` option
+    pub keepalive: bool,
 }
 
 impl KernelSocket {
@@ -129,6 +133,8 @@ impl KernelSocket {
             inner: SocketType::Stream(handle),
             bind_port: None,
             box_id,
+            tcp_nodelay: true,  // We disable Nagle by default
+            keepalive: false,
         })
     }
 
@@ -140,6 +146,8 @@ impl KernelSocket {
             inner: SocketType::Datagram { handle, peer: None },
             bind_port: None,
             box_id,
+            tcp_nodelay: false,
+            keepalive: false,
         })
     }
 
@@ -168,6 +176,8 @@ impl KernelSocket {
             inner: SocketType::Listener { local_port: port, handles },
             bind_port: Some(port),
             box_id,
+            tcp_nodelay: true,
+            keepalive: false,
         })
     }
 }
@@ -251,6 +261,28 @@ pub fn remove_socket(idx: usize) {
                     SocketType::Datagram { handle, .. } => smoltcp_net::udp_socket_close(handle),
                 }
             }
+    });
+}
+
+// ============================================================================
+// Socket Option Setters
+// ============================================================================
+
+/// Set `TCP_NODELAY` option on a socket
+pub fn set_tcp_nodelay(idx: usize, enabled: bool) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            sock.tcp_nodelay = enabled;
+        }
+    });
+}
+
+/// Set `SO_KEEPALIVE` option on a socket
+pub fn set_socket_keepalive(idx: usize, enabled: bool) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            sock.keepalive = enabled;
+        }
     });
 }
 
@@ -384,6 +416,8 @@ pub fn socket_accept(idx: usize) -> Result<(usize, SocketAddrV4), i32> {
         inner: SocketType::Stream(handle), 
         bind_port: None,
         box_id: current_box_id,
+        tcp_nodelay: true,
+        keepalive: false,
     };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {

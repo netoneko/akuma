@@ -65,8 +65,9 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             let now = crate::timer::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
-            us_to_timespec(remaining, old_value);
-            us_to_timespec(state.interval_us, old_value + 16);
+            // struct itimerspec { it_interval at 0, it_value at 16 }
+            us_to_timespec(state.interval_us, old_value);      // it_interval
+            us_to_timespec(remaining, old_value + 16);         // it_value (remaining time)
         } else {
             unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
         }
@@ -74,8 +75,10 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 
     if !validate_user_ptr(new_value as u64, 32) { return EFAULT; }
 
-    let initial_us = timespec_to_us(new_value + 16);
-    let interval_us = timespec_to_us(new_value);
+    // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
+    // it_interval is at offset 0, it_value (initial) is at offset 16
+    let interval_us = timespec_to_us(new_value);       // it_interval
+    let initial_us = timespec_to_us(new_value + 16);   // it_value (initial expiration)
 
     const TFD_TIMER_ABSTIME: i32 = 1;
     let now = crate::timer::uptime_us();

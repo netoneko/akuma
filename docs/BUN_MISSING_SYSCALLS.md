@@ -541,13 +541,11 @@ revealing the chain of invalid memory accesses. The trap was then
 disabled, replaced with register logging to capture ELR (instruction
 pointer) at fault time.
 
-**Stub syscall analysis:** Added logging to stub syscalls that return
-success without doing anything:
-- `setsockopt(level=6, optname=1)` - TCP_NODELAY, we already disable
-  Nagle by default, safe to stub
-- `rt_sigprocmask` - signal mask manipulation; only called AFTER the
-  crash as part of bun's crash handler, not a cause
-- `prctl`, `setitimer`, `sigaltstack` - not called during crash sequence
+**Stub syscalls now fully implemented:**
+- `setsockopt` - handles TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, etc.
+- `rt_sigprocmask` - proper signal mask manipulation (SIG_BLOCK/UNBLOCK/SETMASK)
+- `sigaltstack` - alternate signal stack setup/query
+- `prctl` - PR_SET_NAME, PR_GET_NAME, capability operations, etc.
 
 The crash occurs immediately after opening TCP connections (fd 124-130)
 and setting TCP_NODELAY on each. The pattern suggests corruption in

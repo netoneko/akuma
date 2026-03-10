@@ -61,6 +61,121 @@ fn signal_is_fatal_default(sig: u32) -> bool {
     matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
 }
 
+/// rt_sigprocmask - change the signal mask
+/// how: SIG_BLOCK (0), SIG_UNBLOCK (1), SIG_SETMASK (2)
+/// set: pointer to new signal mask
+/// oldset: pointer to store old signal mask
+/// sigsetsize: size of signal set (must be 8)
+pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: usize) -> u64 {
+    const SIG_BLOCK: u32 = 0;
+    const SIG_UNBLOCK: u32 = 1;
+    const SIG_SETMASK: u32 = 2;
+
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return ENOSYS,
+    };
+
+    // Return old mask if requested
+    if oldset_ptr != 0 {
+        if !validate_user_ptr(oldset_ptr, 8) {
+            return EFAULT;
+        }
+        unsafe {
+            core::ptr::write(oldset_ptr as *mut u64, proc.signal_mask);
+        }
+    }
+
+    // Apply new mask if provided
+    if set_ptr != 0 {
+        if !validate_user_ptr(set_ptr, 8) {
+            return EFAULT;
+        }
+        let new_mask = unsafe { core::ptr::read(set_ptr as *const u64) };
+
+        // SIGKILL (9) and SIGSTOP (19) cannot be blocked
+        let allowed_mask = new_mask & !((1u64 << 8) | (1u64 << 18));
+
+        match how {
+            SIG_BLOCK => {
+                proc.signal_mask |= allowed_mask;
+            }
+            SIG_UNBLOCK => {
+                proc.signal_mask &= !new_mask;
+            }
+            SIG_SETMASK => {
+                proc.signal_mask = allowed_mask;
+            }
+            _ => return EINVAL,
+        }
+    }
+
+    0
+}
+
+/// sigaltstack - set/get alternate signal stack
+/// ss: pointer to new stack_t structure
+/// old_ss: pointer to store old stack_t structure
+pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+    // stack_t structure:
+    // void *ss_sp;     // Base address of stack (8 bytes)
+    // int ss_flags;    // Flags (4 bytes)
+    // size_t ss_size;  // Size of stack (8 bytes)
+    const STACK_T_SIZE: usize = 24;
+    const SS_DISABLE: i32 = 2;
+
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return ENOSYS,
+    };
+
+    // Return old stack if requested
+    if old_ss_ptr != 0 {
+        if !validate_user_ptr(old_ss_ptr, STACK_T_SIZE) {
+            return EFAULT;
+        }
+        unsafe {
+            // Write old stack_t (currently we don't track this, so return disabled)
+            core::ptr::write((old_ss_ptr) as *mut u64, proc.sigaltstack_sp);
+            core::ptr::write((old_ss_ptr + 8) as *mut i32, proc.sigaltstack_flags);
+            core::ptr::write((old_ss_ptr + 16) as *mut u64, proc.sigaltstack_size);
+        }
+    }
+
+    // Set new stack if provided
+    if ss_ptr != 0 {
+        if !validate_user_ptr(ss_ptr, STACK_T_SIZE) {
+            return EFAULT;
+        }
+        unsafe {
+            let sp = core::ptr::read(ss_ptr as *const u64);
+            let flags = core::ptr::read((ss_ptr + 8) as *const i32);
+            let size = core::ptr::read((ss_ptr + 16) as *const u64);
+
+            // SS_DISABLE disables the alternate stack
+            if flags & SS_DISABLE != 0 {
+                proc.sigaltstack_sp = 0;
+                proc.sigaltstack_flags = SS_DISABLE;
+                proc.sigaltstack_size = 0;
+            } else {
+                // Minimum stack size check (MINSIGSTKSZ = 2048 on most systems)
+                if size < 2048 {
+                    return ENOMEM;
+                }
+                proc.sigaltstack_sp = sp;
+                proc.sigaltstack_flags = flags;
+                proc.sigaltstack_size = size;
+            }
+        }
+    }
+
+    0
+}
+
 pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }

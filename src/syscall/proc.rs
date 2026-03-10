@@ -652,3 +652,92 @@ pub(super) fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     }
     0
 }
+
+/// prctl - process control
+pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+    const PR_SET_DUMPABLE: i32 = 4;
+    const PR_GET_DUMPABLE: i32 = 3;
+    const PR_SET_SECCOMP: i32 = 22;
+    const PR_GET_SECCOMP: i32 = 21;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    const PR_SET_VMA: i32 = 0x53564d41; // "SVMA"
+    const PR_CAPBSET_READ: i32 = 23;
+    const PR_CAPBSET_DROP: i32 = 24;
+    const PR_CAP_AMBIENT: i32 = 47;
+    const PR_SET_PTRACER: i32 = 42;
+
+    match option {
+        PR_SET_NAME => {
+            // Set process name (up to 16 chars including null)
+            if arg2 != 0 && validate_user_ptr(arg2, 16) {
+                let name_bytes = unsafe { core::slice::from_raw_parts(arg2 as *const u8, 16) };
+                let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+                if let Ok(name) = core::str::from_utf8(&name_bytes[..end]) {
+                    if let Some(proc) = akuma_exec::process::current_process() {
+                        proc.name = alloc::string::String::from(name);
+                    }
+                }
+            }
+            0
+        }
+        PR_GET_NAME => {
+            // Get process name
+            if arg2 != 0 && validate_user_ptr(arg2, 16) {
+                if let Some(proc) = akuma_exec::process::current_process() {
+                    let name = proc.name.as_bytes();
+                    let len = name.len().min(15);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, len);
+                        core::ptr::write((arg2 as *mut u8).add(len), 0);
+                    }
+                }
+            }
+            0
+        }
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_VMA => {
+            // Accept but ignore these settings
+            0
+        }
+        PR_GET_PDEATHSIG => {
+            // Return 0 (no signal set)
+            if arg2 != 0 && validate_user_ptr(arg2, 4) {
+                unsafe { core::ptr::write(arg2 as *mut i32, 0); }
+            }
+            0
+        }
+        PR_GET_DUMPABLE => {
+            // Return 1 (dumpable)
+            1
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            // Return 0 (not set)
+            0
+        }
+        PR_SET_SECCOMP | PR_GET_SECCOMP => {
+            // Return -EINVAL for seccomp (not supported)
+            EINVAL
+        }
+        PR_CAPBSET_READ => {
+            // Return 1 for all capabilities (we have all caps)
+            1
+        }
+        PR_CAPBSET_DROP | PR_CAP_AMBIENT => {
+            // Accept but ignore capability operations
+            0
+        }
+        PR_SET_PTRACER => {
+            // Accept but ignore - allows process to be traced by specific PID
+            0
+        }
+        _ => {
+            crate::tprint!(128, "[prctl] unsupported option={} arg2={:#x} arg3={:#x} arg4={:#x} arg5={:#x}\n",
+                option, arg2, arg3, arg4, arg5);
+            0
+        }
+    }
+}

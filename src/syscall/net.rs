@@ -294,7 +294,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 _ => {
-                    log::debug!("[setsockopt] SOL_SOCKET optname={} ignored", optname);
+                    crate::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
                     0
                 }
             }
@@ -311,13 +311,13 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 _ => {
-                    log::debug!("[setsockopt] IPPROTO_TCP optname={} ignored", optname);
+                    crate::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
                     0
                 }
             }
         }
         _ => {
-            log::debug!("[setsockopt] level={} optname={} ignored", level, optname);
+            crate::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
             0
         }
     }

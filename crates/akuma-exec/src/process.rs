@@ -1640,6 +1640,17 @@ pub struct Process {
     /// Per-process signal action table (sigaction storage)
     pub signal_actions: [SignalAction; MAX_SIGNALS],
 
+    /// Blocked signal mask (bits 0-63 for signals 1-64)
+    /// Bit N is set if signal N+1 is blocked
+    pub signal_mask: u64,
+
+    /// Alternate signal stack base address
+    pub sigaltstack_sp: u64,
+    /// Alternate signal stack flags
+    pub sigaltstack_flags: i32,
+    /// Alternate signal stack size
+    pub sigaltstack_size: u64,
+
     /// Monotonic timestamp (us) when the process was created
     pub start_time_us: u64,
 
@@ -1877,6 +1888,10 @@ impl Process {
             robust_list_head: 0,
             robust_list_len: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            signal_mask: 0,
+            sigaltstack_sp: 0,
+            sigaltstack_flags: 2, // SS_DISABLE
+            sigaltstack_size: 0,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
             syscall_stats: ProcessSyscallStats::new(),
@@ -1973,6 +1988,10 @@ impl Process {
             robust_list_head: 0,
             robust_list_len: 0,
             signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            signal_mask: 0,
+            sigaltstack_sp: 0,
+            sigaltstack_flags: 2, // SS_DISABLE
+            sigaltstack_size: 0,
             start_time_us: (runtime().uptime_us)(),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
             syscall_stats: ProcessSyscallStats::new(),
@@ -2868,6 +2887,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         robust_list_head: 0,
         robust_list_len: 0,
         signal_actions: parent.signal_actions,
+        signal_mask: parent.signal_mask,
+        sigaltstack_sp: parent.sigaltstack_sp,
+        sigaltstack_flags: parent.sigaltstack_flags,
+        sigaltstack_size: parent.sigaltstack_size,
         start_time_us: (runtime().uptime_us)(),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: ProcessSyscallStats::new(),
@@ -3093,6 +3116,10 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         robust_list_head: 0,
         robust_list_len: 0,
         signal_actions: parent.signal_actions,
+        signal_mask: parent.signal_mask,
+        sigaltstack_sp: parent.sigaltstack_sp,
+        sigaltstack_flags: parent.sigaltstack_flags,
+        sigaltstack_size: parent.sigaltstack_size,
         start_time_us: (runtime().uptime_us)(),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: ProcessSyscallStats::new(),
