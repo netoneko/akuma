@@ -1634,38 +1634,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={} (pid has {} lazy regions)\n", far, pid, lazy_count);
                     
-                    // EXPERIMENTAL: Map wild pointers to see what bun is trying to do
-                    const ENABLE_WILD_POINTER_TRAP: bool = true;
-                    if ENABLE_WILD_POINTER_TRAP && far_usize < 0x80_0000_0000 {
-                        let page_va = far_usize & !0xFFF;
-                        if let Some(pf) = crate::pmm::alloc_page_zeroed() {
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RW)
-                            };
-                            if installed || akuma_exec::mmu::is_current_user_page_mapped(page_va) {
-                                crate::tprint!(128, "[WILD-TRAP] Mapped zeroed page at {:#x} for wild DA fault\n", page_va);
-                                if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                        owner.address_space.track_user_frame(pf);
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    }
-                                } else {
-                                    crate::pmm::free_page(pf);
-                                    for tf in table_frames {
-                                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    }
-                                }
-                                return unsafe { (*frame).x0 };
-                            } else {
-                                crate::pmm::free_page(pf);
-                                for tf in table_frames { crate::pmm::free_page(tf); }
-                            }
-                        }
-                    }
+                    // Log register state for debugging wild pointer accesses
+                    let frame_ref = unsafe { &*frame };
+                    crate::tprint!(256, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
+                        pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
                 }
             }
 
@@ -1866,40 +1838,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                     
-                    // EXPERIMENTAL: Map wild pointers to see what bun is trying to do
-                    // This helps debug where corrupted pointers come from
-                    const ENABLE_WILD_POINTER_TRAP: bool = true;
-                    if ENABLE_WILD_POINTER_TRAP && far_usize < 0x80_0000_0000 {
-                        // Try to map a zeroed page at this address (RX for instruction fetch)
-                        let page_va = far_usize & !0xFFF;
-                        if let Some(pf) = crate::pmm::alloc_page_zeroed() {
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RX)
-                            };
-                            if installed || akuma_exec::mmu::is_current_user_page_mapped(page_va) {
-                                crate::tprint!(128, "[WILD-TRAP] Mapped zeroed page at {:#x} for wild IA fault\n", page_va);
-                                if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                        owner.address_space.track_user_frame(pf);
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    }
-                                } else {
-                                    crate::pmm::free_page(pf);
-                                    for tf in table_frames {
-                                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    }
-                                }
-                                return unsafe { (*frame).x0 };
-                            } else {
-                                crate::pmm::free_page(pf);
-                                for tf in table_frames { crate::pmm::free_page(tf); }
-                            }
-                        }
-                    }
+                    // Log register state for debugging wild pointer accesses
+                    let frame_ref = unsafe { &*frame };
+                    crate::tprint!(256, "[WILD-IA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
+                        pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
                 }
             }
 

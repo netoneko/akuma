@@ -521,7 +521,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RECVFROM => net::sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
         nr::GETSOCKNAME => net::sys_getsockname(args[0] as u32, args[1], args[2]),
         nr::GETPEERNAME => net::sys_getpeername(args[0] as u32, args[1], args[2]),
-        nr::SETSOCKOPT => 0,
+        nr::SETSOCKOPT => {
+            // Log TCP_NODELAY (level=6/IPPROTO_TCP, optname=1)
+            if args[1] == 6 && args[2] == 1 {
+                // TCP_NODELAY - we already disable Nagle, safe to stub
+            } else {
+                crate::tprint!(128, "[stub] setsockopt(fd={}, level={}, optname={}, optval={:#x}, optlen={})\n",
+                    args[0], args[1], args[2], args[3], args[4]);
+            }
+            0
+        }
         nr::GETSOCKOPT => net::sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => net::sys_shutdown(args[0] as u32, args[1] as i32),
         nr::SENDMSG => net::sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
@@ -564,7 +573,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::REATTACH => container::sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
         nr::EXIT_GROUP => proc::sys_exit_group(args[0] as i32),
-        nr::RT_SIGPROCMASK => 0,
+        nr::RT_SIGPROCMASK => {
+            crate::tprint!(128, "[stub] rt_sigprocmask(how={}, set={:#x}, oldset={:#x})\n",
+                args[0], args[1], args[2]);
+            0
+        }
         nr::RT_SIGSUSPEND => 0,
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
@@ -603,15 +616,26 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MPROTECT => mem::sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::FUTEX => sync::sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, args[3], args[4] as usize, args[5] as u32),
         nr::SET_ROBUST_LIST => proc::sys_set_robust_list(args[0], args[1] as usize),
-        nr::SIGALTSTACK => 0,
+        nr::SIGALTSTACK => {
+            crate::tprint!(128, "[stub] sigaltstack(ss={:#x}, old_ss={:#x})\n", args[0], args[1]);
+            0
+        }
         nr::GETRLIMIT => proc::sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => proc::sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         nr::EVENTFD2 => eventfd::sys_eventfd2(args[0] as u32, args[1] as u32),
         nr::PREAD64 => fs::sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
-        nr::SETITIMER => 0,
+        nr::SETITIMER => {
+            crate::tprint!(128, "[stub] setitimer(which={}, new_value={:#x}, old_value={:#x})\n",
+                args[0], args[1], args[2]);
+            0
+        }
         nr::MEMBARRIER => mem::membarrier_cmd(args[0] as u32),
-        nr::PRCTL => 0,
+        nr::PRCTL => {
+            crate::tprint!(128, "[stub] prctl(option={}, arg2={:#x}, arg3={:#x}, arg4={:#x}, arg5={:#x})\n",
+                args[0], args[1], args[2], args[3], args[4]);
+            0
+        }
         nr::TIMES => time::sys_times(args[0] as usize),
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => 0,

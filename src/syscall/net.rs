@@ -252,6 +252,77 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 
 pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
+pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
+    const SOL_SOCKET: i32 = 1;
+    const IPPROTO_TCP: i32 = 6;
+    const SO_REUSEADDR: i32 = 2;
+    const SO_KEEPALIVE: i32 = 9;
+    const SO_RCVBUF: i32 = 8;
+    const SO_SNDBUF: i32 = 7;
+    const SO_REUSEPORT: i32 = 15;
+    const TCP_NODELAY: i32 = 1;
+    const TCP_KEEPIDLE: i32 = 4;
+    const TCP_KEEPINTVL: i32 = 5;
+    const TCP_KEEPCNT: i32 = 6;
+
+    // Read the value if provided
+    let val: i32 = if optval != 0 && optlen >= 4 && validate_user_ptr(optval, 4) {
+        unsafe { core::ptr::read(optval as *const i32) }
+    } else {
+        0
+    };
+
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    match level {
+        SOL_SOCKET => {
+            match optname {
+                SO_REUSEADDR | SO_REUSEPORT => {
+                    // We always allow address reuse - nothing to do
+                    0
+                }
+                SO_KEEPALIVE => {
+                    // Store keepalive setting (we don't actually use it yet)
+                    socket::set_socket_keepalive(idx, val != 0);
+                    0
+                }
+                SO_RCVBUF | SO_SNDBUF => {
+                    // Buffer sizes are fixed at socket creation, ignore
+                    0
+                }
+                _ => {
+                    log::debug!("[setsockopt] SOL_SOCKET optname={} ignored", optname);
+                    0
+                }
+            }
+        }
+        IPPROTO_TCP => {
+            match optname {
+                TCP_NODELAY => {
+                    // We already disable Nagle by default, but track the setting
+                    socket::set_tcp_nodelay(idx, val != 0);
+                    0
+                }
+                TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT => {
+                    // Keepalive parameters - store but don't use yet
+                    0
+                }
+                _ => {
+                    log::debug!("[setsockopt] IPPROTO_TCP optname={} ignored", optname);
+                    0
+                }
+            }
+        }
+        _ => {
+            log::debug!("[setsockopt] level={} optname={} ignored", level, optname);
+            0
+        }
+    }
+}
+
 pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
     const SOL_SOCKET: i32 = 1;
     const SO_ERROR: i32 = 4;
