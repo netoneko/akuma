@@ -127,11 +127,48 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     kernel_main(dtb_ptr)
 }
 
+/// Scan RAM for a QEMU-generated DTB when x0 is zero.
+///
+/// QEMU places the DTB after the kernel binary, aligned to a 2 MB boundary
+/// (aarch64 convention). We scan 2 MB boundaries within the boot page table's
+/// identity-mapped RAM region (L1[1]: 0x40000000-0x7FFFFFFF).
+#[cfg(not(feature = "firecracker"))]
+fn scan_for_dtb() -> usize {
+    const FDT_MAGIC_LE: u32 = 0xedfe0dd0; // big-endian 0xd00dfeed read as little-endian
+    const ALIGN_2MB: usize = 2 * 1024 * 1024;
+    // Stay within the L1[1] identity-mapped block (0x40000000-0x7FFFFFFF)
+    const SCAN_END: usize = 0x8000_0000;
+
+    unsafe extern "C" {
+        static _kernel_phys_end: u8;
+    }
+    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+
+    let start = (kernel_end + ALIGN_2MB - 1) & !(ALIGN_2MB - 1);
+    let mut addr = start;
+    while addr < SCAN_END {
+        let magic = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        if magic == FDT_MAGIC_LE {
+            let total_size = u32::from_be(unsafe { core::ptr::read_volatile((addr + 4) as *const u32) });
+            if total_size >= 64 && total_size <= 16 * 1024 * 1024 {
+                console::print("[DTB] Found at 0x");
+                console::print_hex(addr as u64);
+                console::print(" (scanned)\n");
+                return addr;
+            }
+        }
+        addr += ALIGN_2MB;
+    }
+
+    console::print("[DTB] Not found by scan\n");
+    0
+}
+
 /// Detect memory from Device Tree Blob.
 ///
-/// Both QEMU and Firecracker pass the FDT address in x0 per the ARM64 boot
-/// protocol. If x0 is zero (should not happen with `-kernel`), fall back to
-/// conservative defaults.
+/// Firecracker passes the FDT address in x0 per the ARM64 boot protocol.
+/// QEMU does NOT set x0 for ELF kernels, so we scan RAM for the
+/// QEMU-generated DTB when x0 is zero.
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     #[cfg(not(feature = "firecracker"))]
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
@@ -141,6 +178,9 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
+    #[cfg(not(feature = "firecracker"))]
+    let actual_dtb_ptr = if dtb_ptr != 0 { dtb_ptr } else { scan_for_dtb() };
+    #[cfg(feature = "firecracker")]
     let actual_dtb_ptr = dtb_ptr;
 
     if actual_dtb_ptr == 0 {
@@ -161,26 +201,14 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     let memory = fdt.memory();
     if let Some(region) = memory.regions().next() {
         let base = region.starting_address as usize;
-        let dtb_size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
-        
-        // Reserve memory from DTB location to end of RAM
-        // DTB is at actual_dtb_ptr, so usable RAM ends there
-        let usable_size = if actual_dtb_ptr > base {
-            actual_dtb_ptr - base
-        } else {
-            dtb_size
-        };
+        let ram_size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
         
         console::print("[Memory] Detected from DTB: base=0x");
         console::print_hex(base as u64);
-        console::print(", total=");
-        console::print_dec(dtb_size / 1024 / 1024);
-        console::print(" MB, usable=");
-        console::print_dec(usable_size / 1024 / 1024);
-        console::print(" MB (DTB at 0x");
-        console::print_hex(actual_dtb_ptr as u64);
-        console::print(")\n");
-        (base, usable_size)
+        console::print(", size=");
+        console::print_dec(ram_size / 1024 / 1024);
+        console::print(" MB\n");
+        (base, ram_size)
     } else {
         console::print("[Memory] No memory region in DTB, using defaults\n");
         (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE)
@@ -397,17 +425,19 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     mmu::init_shared_device_tables();
     console::print("MMU enabled with identity mapping\n");
 
-    // Log kernel section boundaries (for future read-only protection)
-    mmu::protect_kernel_code();
+    // TODO: protect_kernel_code() crashes with >256MB RAM — the L2 table
+    // rebuild assumes exactly the L1[1] 1GB block layout. Disabled until fixed.
+    // mmu::protect_kernel_code();
 
-    // Print PMM stats (now that allocator is ready for format!)
+    // Print PMM stats
     let (total, allocated, free) = pmm::stats();
-    crate::safe_print!(128, 
-        "PMM stats: {} total pages, {} allocated, {} free\n",
-        total,
-        allocated,
-        free
-    );
+    console::print("PMM stats: ");
+    console::print_dec(total);
+    console::print(" total, ");
+    console::print_dec(allocated);
+    console::print(" allocated, ");
+    console::print_dec(free);
+    console::print(" free\n");
 
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
@@ -428,9 +458,8 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         Ok(()) => {
             console::print("[RNG] Hardware RNG initialized\n");
         }
-        Err(e) => {
-            console::print("[RNG] Hardware RNG not available: ");
-            crate::safe_print!(32, "{}\n", e);
+        Err(_e) => {
+            console::print("[RNG] Hardware RNG not available\n");
         }
     }
 
@@ -500,7 +529,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
-
     // Run memory tests (no filesystem dependency)
     if !config::DISABLE_ALL_TESTS {
         if !tests::run_memory_tests() {

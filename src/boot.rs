@@ -59,7 +59,22 @@ global_asm!(
 .equ DEVICE_PAGE, (PT_VALID | PT_TABLE | PT_AF | PT_SH_OUTER | PT_ATTR_DEVICE | PT_PXN | PT_UXN)
 
 _boot:
-    // DEBUG: Store x0 immediately at entry (before ANY modification)
+    // ARM64 Linux Image header (64 bytes).
+    // QEMU checks for the magic at offset 0x38 even when loading ELF.
+    // If found, QEMU sets x0 = DTB address before jumping to entry.
+    b       _boot_code          // code0: branch past header
+    .word   0                   // code1
+    .quad   0                   // text_offset
+    .quad   0                   // image_size (0 = unspecified)
+    .quad   0                   // flags: LE, unspecified page size
+    .quad   0                   // res2
+    .quad   0                   // res3
+    .quad   0                   // res4
+    .word   0x644d5241          // magic: "ARM\x64"
+    .word   0                   // res5
+
+_boot_code:
+    // Store x0 (DTB pointer from QEMU) before any modification
     adrp    x1, boot_x0_at_entry
     add     x1, x1, :lo12:boot_x0_at_entry
     str     x0, [x1]

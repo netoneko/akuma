@@ -1,10 +1,16 @@
 #!/bin/bash
-# QEMU runner for `cargo run`. Accepts the kernel binary path as $1.
+# QEMU runner for `cargo run`. Accepts the kernel ELF path as $1.
 # Set MEMORY env var to override RAM size (default: 256M).
 #   MEMORY=512M cargo run --release
 set -e
 
 MEMORY="${MEMORY:-256M}"
+ELF="$1"
+BIN="${ELF}.bin"
+
+# Convert ELF to flat binary so QEMU sees the ARM64 Image header
+# and passes the DTB address in x0.
+rust-objcopy -O binary "$ELF" "$BIN"
 
 exec qemu-system-aarch64 \
   -semihosting \
@@ -21,4 +27,4 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -kernel "$1"
+  -kernel "$BIN"

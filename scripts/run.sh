@@ -1,15 +1,19 @@
 #!/bin/bash
 set -e
 
-KERNEL_PATH="target/aarch64-unknown-none/release/akuma"
+KERNEL_ELF="target/aarch64-unknown-none/release/akuma"
 
-if [ ! -f "$KERNEL_PATH" ]; then
-    echo "Kernel not found at $KERNEL_PATH"
+if [ ! -f "$KERNEL_ELF" ]; then
+    echo "Kernel not found at $KERNEL_ELF"
     echo "Run 'cargo build --release' first"
     exit 1
 fi
 
 MEMORY="${MEMORY:-256M}"
+KERNEL_BIN="${KERNEL_ELF}.bin"
+
+# Convert ELF to flat binary so QEMU sees the ARM64 Image header
+rust-objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN"
 
 EXTRA_ARGS=""
 if [ "$1" == "--test" ]; then
@@ -34,5 +38,5 @@ qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -kernel $KERNEL_PATH \
+  -kernel $KERNEL_BIN \
   $EXTRA_ARGS
