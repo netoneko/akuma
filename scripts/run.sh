@@ -9,6 +9,8 @@ if [ ! -f "$KERNEL_PATH" ]; then
     exit 1
 fi
 
+MEMORY="${MEMORY:-256M}"
+
 EXTRA_ARGS=""
 if [ "$1" == "--test" ]; then
     EXTRA_ARGS="-append TEST=1"
@@ -21,7 +23,7 @@ qemu-system-aarch64 \
   -accel hvf \
   -machine virt \
   -cpu max \
-  -m 256M \
+  -m "$MEMORY" \
   -L qemu-roms \
   -serial mon:stdio \
   -display none \
@@ -32,6 +34,5 @@ qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on \
   -kernel $KERNEL_PATH \
   $EXTRA_ARGS

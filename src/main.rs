@@ -127,34 +127,12 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     kernel_main(dtb_ptr)
 }
 
-/// Fixed address where we tell QEMU to load the DTB via loader device
-/// Use: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on
-#[cfg(not(feature = "firecracker"))]
-const DTB_FIXED_ADDR: usize = 0x4ff00000;
-
-/// Scan the fixed QEMU-loaded DTB address as a fallback when x0 is zero.
-/// Not used under the `firecracker` feature — Firecracker always passes the
-/// FDT address in x0 per the ARM64 boot protocol.
-#[cfg(not(feature = "firecracker"))]
-fn find_dtb(_ram_base: usize, _ram_size: usize, _kernel_end: usize) -> usize {
-    let magic = unsafe { core::ptr::read_volatile(DTB_FIXED_ADDR as *const u32) };
-    if magic == 0xedfe0dd0 {
-        console::print("[DTB] Found DTB at fixed address 0x");
-        console::print_hex(DTB_FIXED_ADDR as u64);
-        console::print("\n");
-        return DTB_FIXED_ADDR;
-    }
-
-    console::print("[DTB] No DTB at fixed address 0x");
-    console::print_hex(DTB_FIXED_ADDR as u64);
-    console::print("\n");
-    console::print("[DTB] Add to QEMU: -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on\n");
-    0
-}
-
-/// Detect memory from Device Tree Blob
+/// Detect memory from Device Tree Blob.
+///
+/// Both QEMU and Firecracker pass the FDT address in x0 per the ARM64 boot
+/// protocol. If x0 is zero (should not happen with `-kernel`), fall back to
+/// conservative defaults.
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
-    // RAM base differs between hypervisors
     #[cfg(not(feature = "firecracker"))]
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
     #[cfg(feature = "firecracker")]
@@ -163,22 +141,6 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
-    // Under Firecracker, the FDT address is always in x0 (ARM64 boot protocol).
-    // Under QEMU, x0 may be 0 if the DTB was loaded via the loader device;
-    // fall back to scanning the fixed load address in that case.
-    #[cfg(not(feature = "firecracker"))]
-    let actual_dtb_ptr = {
-        unsafe extern "C" {
-            static _kernel_phys_end: u8;
-        }
-        let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
-        if dtb_ptr == 0 {
-            find_dtb(DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE, kernel_end)
-        } else {
-            dtb_ptr
-        }
-    };
-    #[cfg(feature = "firecracker")]
     let actual_dtb_ptr = dtb_ptr;
 
     if actual_dtb_ptr == 0 {

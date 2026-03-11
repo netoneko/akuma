@@ -45,7 +45,6 @@ if [ -w /dev/kvm ]; then
       -drive file=disk.img,if=none,format=raw,id=hd0,cache=none,aio=io_uring \
       -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
       -device virtio-rng-device,bus=virtio-mmio-bus.2 \
-      -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on \
       -kernel $KERNEL_PATH \
       $EXTRA_ARGS
 else
@@ -65,7 +64,6 @@ else
       -drive file=disk.img,if=none,format=raw,id=hd0 \
       -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
       -device virtio-rng-device,bus=virtio-mmio-bus.2 \
-      -device loader,file=virt.dtb,addr=0x4ff00000,force-raw=on \
       -kernel $KERNEL_PATH \
       $EXTRA_ARGS
 fi
