@@ -2,6 +2,7 @@
 members = [".", "crates/*"]
 default-members = [
     ".",
+    "crates/akuma-editor",
     "crates/akuma-exec",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
@@ -53,6 +54,7 @@ firecracker = []
 workspace = true
 
 [dependencies]
+akuma-editor = { path = "crates/akuma-editor" }
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-ssh-crypto = { path = "crates/akuma-ssh-crypto" }
 akuma-ssh = { path = "crates/akuma-ssh" }

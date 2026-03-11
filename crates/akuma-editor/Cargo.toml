@@ -1,0 +1,11 @@
+[package]
+name = "akuma-editor"
+version = "0.1.0"
+edition = "2024"
+description = "Nano-like terminal text editor for no_std kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+embedded-io-async = { version = "0.6", default-features = false }
