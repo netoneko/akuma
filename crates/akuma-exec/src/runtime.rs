@@ -155,29 +155,36 @@ pub fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
 
 /// RAII guard that saves DAIF on creation and restores on drop.
 ///
-/// Unlike a simple disable/enable pair, this correctly handles nesting and
-/// exception contexts where IRQs are already disabled — dropping the guard
-/// restores the *previous* state rather than unconditionally enabling.
+/// On non-aarch64 targets (host testing), this is a no-op.
 pub struct IrqGuard {
+    #[cfg(target_os = "none")]
     saved_daif: u64,
 }
 
 impl IrqGuard {
     #[inline]
     pub fn new() -> Self {
-        let daif: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-            core::arch::asm!("isb", options(nomem, nostack));
+        #[cfg(target_os = "none")]
+        {
+            let daif: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+                core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+                core::arch::asm!("isb", options(nomem, nostack));
+            }
+            Self { saved_daif: daif }
         }
-        Self { saved_daif: daif }
+        #[cfg(not(target_os = "none"))]
+        {
+            Self {}
+        }
     }
 }
 
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(target_os = "none")]
         unsafe {
             core::arch::asm!("msr daif, {}", in(reg) self.saved_daif, options(nomem, nostack));
         }

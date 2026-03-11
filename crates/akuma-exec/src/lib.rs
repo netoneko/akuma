@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![feature(never_type)]
 #![feature(allocator_api)]
 #![allow(
@@ -85,10 +85,14 @@ extern crate alloc;
 
 pub mod runtime;
 pub mod mmu;
+#[path = "elf/mod.rs"]
 pub mod elf_loader;
 pub mod threading;
 pub mod process;
+#[path = "box_mod/mod.rs"]
 pub mod box_registry;
+#[cfg(target_os = "none")]
+pub mod kernel_tests;
 
 pub use runtime::{ExecRuntime, ExecConfig, PhysFrame, FrameSource};
 

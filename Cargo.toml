@@ -2,6 +2,7 @@
 members = [".", "crates/*"]
 default-members = [
     ".",
+    "crates/akuma-exec",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",

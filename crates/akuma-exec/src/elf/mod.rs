@@ -1,7 +1,10 @@
 //! ELF Loader
 //!
 //! Parses and loads ELF binaries into user address space.
-//! Uses the `elf` crate for parsing.
+
+pub mod types;
+
+pub use types::*;
 
 use elf::ElfBytes;
 use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
@@ -11,151 +14,19 @@ use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
 use crate::runtime::runtime;
 use alloc::vec::Vec;
 use alloc::string::String;
-
-/// Enable debug output for ELF loading
-/// Set to false to reduce boot verbosity
-pub const DEBUG_ELF_LOADING: bool = true;
-
-/// File-backed source for a deferred lazy segment.
-pub struct FileSegmentSource {
-    pub path: String,
-    pub inode: u32,
-    pub file_offset: usize,
-    pub filesz: usize,
-    pub segment_va: usize,
-}
-
-/// Segment whose pages will be allocated on first access (demand paging).
-pub struct DeferredLazySegment {
-    pub start_va: usize,
-    pub size: usize,
-    pub page_flags: u64,
-    pub file_source: Option<FileSegmentSource>,
-}
+use alloc::collections::BTreeMap;
 
 /// Result of loading an ELF binary
 pub struct LoadedElf {
-    /// Entry point virtual address (program's own entry)
     pub entry_point: usize,
-    /// User address space with mapped pages
     pub address_space: UserAddressSpace,
-    /// Highest mapped address (for stack placement)
     pub brk: usize,
-    /// Address of program headers in user memory
     pub phdr_addr: usize,
-    /// Number of program headers
     pub phnum: usize,
-    /// Size of each program header
     pub phent: usize,
-    /// If a dynamic linker was loaded: its entry point and base address
     pub interp: Option<InterpInfo>,
-    /// Segments to register as lazy regions after PID allocation
     pub deferred_segments: Vec<DeferredLazySegment>,
 }
-
-/// Information about a loaded interpreter (dynamic linker)
-pub struct InterpInfo {
-    /// Entry point of the interpreter (execution starts here)
-    pub entry_point: usize,
-    /// Base address where the interpreter was loaded
-    pub base_addr: usize,
-}
-
-/// Auxiliary Vector entry types
-pub mod auxv {
-    pub const AT_NULL: u64 = 0;
-    pub const AT_IGNORE: u64 = 1;
-    pub const AT_EXECFD: u64 = 2;
-    pub const AT_PHDR: u64 = 3;
-    pub const AT_PHENT: u64 = 4;
-    pub const AT_PHNUM: u64 = 5;
-    pub const AT_PAGESZ: u64 = 6;
-    pub const AT_BASE: u64 = 7;
-    pub const AT_FLAGS: u64 = 8;
-    pub const AT_ENTRY: u64 = 9;
-    pub const AT_NOTELF: u64 = 10;
-    pub const AT_UID: u64 = 11;
-    pub const AT_EUID: u64 = 12;
-    pub const AT_GID: u64 = 13;
-    pub const AT_EGID: u64 = 14;
-    pub const AT_RANDOM: u64 = 25;
-    pub const AT_HWCAP: u64 = 16;
-    pub const AT_CLKTCK: u64 = 17;
-    pub const AT_HWCAP2: u64 = 26;
-
-    // AArch64 HWCAP bits — matches Linux kernel asm/hwcap.h
-    pub const HWCAP_FP: u64 = 1 << 0;
-    pub const HWCAP_ASIMD: u64 = 1 << 1;
-    pub const HWCAP_AES: u64 = 1 << 3;
-    pub const HWCAP_PMULL: u64 = 1 << 4;
-    pub const HWCAP_SHA1: u64 = 1 << 5;
-    pub const HWCAP_SHA2: u64 = 1 << 6;
-    pub const HWCAP_CRC32: u64 = 1 << 7;
-    pub const HWCAP_ATOMICS: u64 = 1 << 8;
-    pub const HWCAP_FPHP: u64 = 1 << 9;
-    pub const HWCAP_ASIMDHP: u64 = 1 << 10;
-    pub const HWCAP_ASIMDRDM: u64 = 1 << 12;
-    pub const HWCAP_JSCVT: u64 = 1 << 13;
-    pub const HWCAP_FCMA: u64 = 1 << 14;
-    pub const HWCAP_LRCPC: u64 = 1 << 15;
-    pub const HWCAP_DCPOP: u64 = 1 << 16;
-    pub const HWCAP_ASIMDDP: u64 = 1 << 20;
-    pub const HWCAP_SVE: u64 = 1 << 22;
-
-    pub const AARCH64_HWCAP: u64 =
-        HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL |
-        HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_ATOMICS |
-        HWCAP_FPHP | HWCAP_ASIMDHP | HWCAP_ASIMDRDM |
-        HWCAP_JSCVT | HWCAP_FCMA | HWCAP_LRCPC | HWCAP_DCPOP |
-        HWCAP_ASIMDDP;
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct AuxEntry {
-    pub a_type: u64,
-    pub a_val: u64,
-}
-
-/// Error during ELF loading
-#[derive(Debug)]
-pub enum ElfError {
-    /// Invalid ELF format
-    InvalidFormat(&'static str),
-    /// Wrong architecture (not AArch64)
-    WrongArchitecture,
-    /// Not an executable
-    NotExecutable,
-    /// Binary requires a dynamic linker (not statically linked)
-    DynamicallyLinked,
-    /// Out of memory
-    OutOfMemory,
-    /// Address space creation failed
-    AddressSpaceFailed,
-    /// Mapping failed
-    MappingFailed(&'static str),
-}
-
-impl core::fmt::Display for ElfError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ElfError::InvalidFormat(msg) => write!(f, "Invalid ELF format: {}", msg),
-            ElfError::WrongArchitecture => write!(f, "Not an AArch64 binary"),
-            ElfError::NotExecutable => write!(f, "Not an executable"),
-            ElfError::DynamicallyLinked => write!(f, "Dynamically linked binary requires interpreter (recompile with -static)"),
-            ElfError::OutOfMemory => write!(f, "Out of memory"),
-            ElfError::AddressSpaceFailed => write!(f, "Failed to create address space"),
-            ElfError::MappingFailed(msg) => write!(f, "Mapping failed: {}", msg),
-        }
-    }
-}
-
-use alloc::collections::BTreeMap;
-
-const R_AARCH64_ABS64: u32 = 257;
-const R_AARCH64_GLOB_DAT: u32 = 1025;
-const R_AARCH64_JUMP_SLOT: u32 = 1026;
-const R_AARCH64_RELATIVE: u32 = 1027;
 
 /// Load an ELF binary from memory.
 /// `interp_prefix` is prepended to the PT_INTERP path when loading the dynamic
@@ -386,8 +257,6 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
         deferred_segments: Vec::new(),
     })
 }
-
-const INTERP_BASE: usize = 0x3000_0000;
 
 /// Load the dynamic linker (interpreter) ELF into an existing address space.
 fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
@@ -779,45 +648,7 @@ pub fn load_elf_with_stack(
 // On-demand ELF loading from file path (for large binaries)
 // ============================================================================
 
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64: u8 = 2;
-const ELFDATA2LSB: u8 = 1;
-const ELF64_EHDR_SIZE: usize = 64;
-
-fn read_u16_le(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
-fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-fn read_u64_le(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        buf[off], buf[off+1], buf[off+2], buf[off+3],
-        buf[off+4], buf[off+5], buf[off+6], buf[off+7],
-    ])
-}
-
-struct Elf64Ehdr {
-    e_type: u16,
-    e_machine: u16,
-    e_entry: u64,
-    e_phoff: u64,
-    e_phentsize: u16,
-    e_phnum: u16,
-}
-
-struct Elf64Phdr {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-}
-
-fn parse_elf64_ehdr(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
+fn parse_elf64_ehdr_checked(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
     if buf.len() < ELF64_EHDR_SIZE {
         return Err(ElfError::InvalidFormat("Header too short"));
     }
@@ -840,16 +671,6 @@ fn parse_elf64_ehdr(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
     })
 }
 
-fn parse_elf64_phdr(buf: &[u8]) -> Elf64Phdr {
-    Elf64Phdr {
-        p_type: read_u32_le(buf, 0),
-        p_flags: read_u32_le(buf, 4),
-        p_offset: read_u64_le(buf, 8),
-        p_vaddr: read_u64_le(buf, 16),
-        p_filesz: read_u64_le(buf, 32),
-        p_memsz: read_u64_le(buf, 40),
-    }
-}
 
 /// Read exactly `len` bytes from a file at `offset`, returning an error on short reads.
 fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, ElfError> {
@@ -867,7 +688,7 @@ fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, Elf
 /// Supports PIE (ET_DYN) and non-PIE (ET_EXEC) without relocations.
 pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
     let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
-    let ehdr = parse_elf64_ehdr(&hdr_buf)?;
+    let ehdr = parse_elf64_ehdr_checked(&hdr_buf)?;
 
     if ehdr.e_machine != EM_AARCH64 as u16 {
         return Err(ElfError::WrongArchitecture);
@@ -894,7 +715,9 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
     let mut phdrs = Vec::with_capacity(ehdr.e_phnum as usize);
     for i in 0..ehdr.e_phnum as usize {
         let off = i * ehdr.e_phentsize as usize;
-        phdrs.push(parse_elf64_phdr(&phdr_buf[off..]));
+        if let Some(phdr) = parse_elf64_phdr(&phdr_buf[off..]) {
+            phdrs.push(phdr);
+        }
     }
 
     for phdr in &phdrs {

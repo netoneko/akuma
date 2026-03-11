@@ -3,41 +3,29 @@
 
 #![allow(dead_code)]
 
+pub mod types;
+
+pub use types::*;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use alloc::format;
+#[cfg(target_os = "none")]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
 
-/// Compile-time constant for static array sizes (must match ExecConfig::max_threads).
-pub const MAX_THREADS: usize = 32;
-
 /// Set the current exception stack pointer (TPIDR_EL1).
+#[cfg(target_os = "none")]
 #[inline]
 pub fn set_current_exception_stack(stack_top: u64) {
     unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top); }
 }
 
-/// User trap frame saved by the EL0 sync/IRQ handler.
-#[repr(C)]
-pub struct UserTrapFrame {
-    pub x0: u64, pub x1: u64, pub x2: u64, pub x3: u64,
-    pub x4: u64, pub x5: u64, pub x6: u64, pub x7: u64,
-    pub x8: u64, pub x9: u64, pub x10: u64, pub x11: u64,
-    pub x12: u64, pub x13: u64, pub x14: u64, pub x15: u64,
-    pub x16: u64, pub x17: u64, pub x18: u64, pub x19: u64,
-    pub x20: u64, pub x21: u64, pub x22: u64, pub x23: u64,
-    pub x24: u64, pub x25: u64, pub x26: u64, pub x27: u64,
-    pub x28: u64, pub x29: u64, pub x30: u64,
-    pub sp_el0: u64,
-    pub elr_el1: u64,
-    pub spsr_el1: u64,
-    pub tpidr_el0: u64,
-    pub _padding: u64,
-}
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn set_current_exception_stack(_stack_top: u64) {}
 
 /// Stack-based writer for formatting without heap allocation.
 struct StackWriter<const N: usize> {
@@ -81,16 +69,6 @@ macro_rules! safe_print {
 // Lock-Free Thread State Management
 // ============================================================================
 
-/// Thread state values for lock-free atomic operations
-pub mod thread_state {
-    pub const FREE: u8 = 0;
-    pub const READY: u8 = 1;
-    pub const RUNNING: u8 = 2;
-    pub const TERMINATED: u8 = 3;
-    pub const INITIALIZING: u8 = 4; // Thread claimed but context not yet set up
-    pub const WAITING: u8 = 5; // Thread blocked on wait queue (e.g., nanosleep)
-}
-
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
 static THREAD_STATES: [AtomicU8; MAX_THREADS] = {
@@ -131,6 +109,7 @@ static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
 /// need to modify its own thread ID directly.
 
 /// Set the current thread ID in TPIDRRO_EL0
+#[cfg(target_os = "none")]
 #[inline]
 fn set_current_thread_register(tid: usize) {
     unsafe {
@@ -138,9 +117,12 @@ fn set_current_thread_register(tid: usize) {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+#[inline]
+fn set_current_thread_register(_tid: usize) {}
+
 /// Get the current thread ID from TPIDRRO_EL0
-/// Halts the system if the register contains an invalid value (>= MAX_THREADS)
-/// since this indicates serious corruption that cannot be recovered from.
+#[cfg(target_os = "none")]
 #[inline]
 fn get_current_thread_register() -> usize {
     let val: u64;
@@ -148,9 +130,7 @@ fn get_current_thread_register() -> usize {
         core::arch::asm!("mrs {}, tpidrro_el0", out(reg) val);
     }
     let tid = val as usize;
-    // Bounds check - if corrupted, halt immediately
     if tid >= MAX_THREADS {
-        // Log corruption and halt - we cannot safely continue
         safe_print!(256, "[FATAL] TPIDRRO_EL0 CORRUPT: tid=0x{:x} >= MAX_THREADS ({})\nSystem halted - cannot determine current thread\n", 
             val, MAX_THREADS);
         loop {
@@ -159,6 +139,10 @@ fn get_current_thread_register() -> usize {
     }
     tid
 }
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+fn get_current_thread_register() -> usize { 0 }
 
 /// Atomically claim a free slot in the given range
 /// Returns the slot index if successful, None if no free slots
@@ -483,16 +467,6 @@ static PREEMPTION_DISABLED_SINCE: [AtomicU64; MAX_THREADS] = {
 /// Track last time we ran the watchdog check (for detecting time jumps)
 static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum time preemption can be disabled before watchdog warning (100ms)
-const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;
-
-/// Maximum time preemption can be disabled before watchdog panic (5 seconds)
-const PREEMPTION_WATCHDOG_PANIC_US: u64 = 5_000_000;
-
-/// Maximum expected gap between watchdog checks (100ms).
-/// If we see a gap larger than this, the host likely slept.
-const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
-
 /// Disable preemption for the current thread.
 ///
 /// Can be nested - must call `enable_preemption()` the same number of times.
@@ -583,14 +557,8 @@ pub fn check_preemption_watchdog() -> Option<u64> {
 // Thread Constants
 // ============================================================================
 
-/// Default timeout for cooperative threads in microseconds (100ms)
-/// Reduced from 5 seconds to ensure network loop runs frequently
-pub const COOPERATIVE_TIMEOUT_US: u64 = 100_000;
-
-/// Thread 0 is the boot/idle thread - always protected, never terminated
-const IDLE_THREAD_IDX: usize = 0;
-
 // Assembly context switch implementation
+#[cfg(target_os = "none")]
 global_asm!(
     r#"
 .section .text
@@ -775,23 +743,20 @@ thread_exit_asm:
 "#
 );
 
-// External assembly functions
+#[cfg(target_os = "none")]
 unsafe extern "C" {
     fn switch_context(old: *mut Context, new: *const Context);
     fn thread_start() -> !;
     fn thread_start_closure() -> !;
 }
 
-/// Magic value for Context integrity check
-pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
+#[cfg(not(target_os = "none"))]
+unsafe extern "C" fn switch_context(_old: *mut Context, _new: *const Context) {}
+#[cfg(not(target_os = "none"))]
+unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal") }
+#[cfg(not(target_os = "none"))]
+unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal") }
 
-/// Size of the UNIFIED IRQ frame saved on stack (832 bytes)
-/// Both EL0 and EL1 IRQ handlers now use this same layout.
-/// Layout: 288 bytes GPR (x0-x30, ELR, SPSR, SP_EL0, TPIDR, x10/x11)
-///       + 16 bytes padding/alignment (total GPR block = 304)
-///       + 528 bytes NEON/FP (Q0-Q31 + FPCR + FPSR)
-/// The NEON block sits between the TPIDR push and x10/x11 in the frame.
-pub const IRQ_FRAME_SIZE: usize = 304 + 528;
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
@@ -871,70 +836,6 @@ extern "C" fn thread_exit_stub() -> ! {
     }
 }
 
-/// CPU context saved during context switch
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Context {
-    // Magic value FIRST for easy detection of corruption
-    pub magic: u64,
-    // Callee-saved registers
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64,  // Frame pointer
-    pub x30: u64,  // Link register (return address)
-    pub sp: u64,   // Stack pointer
-    pub daif: u64, // Interrupt mask
-    pub elr: u64,  // Exception Link Register
-    pub spsr: u64, // Saved Program Status Register
-    pub ttbr0: u64, // User address space (TTBR0_EL1)
-    // User process fields (unified context architecture)
-    pub user_entry: u64,     // User PC for first ERET (0 for kernel threads)
-    pub user_sp: u64,        // User SP for first ERET (0 for kernel threads)
-    pub user_tls: u64,       // User TPIDR_EL0 for TLS
-    pub is_user_process: u64, // 1 if this is a user process thread, 0 for kernel threads
-}
-
-impl Context {
-    pub const fn zero() -> Self {
-        Self {
-            magic: CONTEXT_MAGIC,
-            x19: 0,
-            x20: 0,
-            x21: 0,
-            x22: 0,
-            x23: 0,
-            x24: 0,
-            x25: 0,
-            x26: 0,
-            x27: 0,
-            x28: 0,
-            x29: 0,
-            x30: 0,
-            sp: 0,
-            daif: 0,
-            elr: 0,
-            spsr: 0,
-            ttbr0: 0, // Will be initialized to boot TTBR0
-            user_entry: 0,
-            user_sp: 0,
-            user_tls: 0,
-            is_user_process: 0,
-        }
-    }
-    
-    /// Check if the context magic is intact
-    pub fn is_valid(&self) -> bool {
-        self.magic == CONTEXT_MAGIC
-    }
-}
 
 // ============================================================================
 // Thread Contexts - Separate Static Array for Lock-Free Access
@@ -996,100 +897,6 @@ fn get_context(idx: usize) -> *const Context {
     THREAD_CONTEXTS[idx].get()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadState {
-    Free,       // Slot is available
-    Ready,      // Ready to run
-    Running,    // Currently running
-    Terminated, // Finished, slot can be reclaimed
-}
-
-/// Stack information for a thread
-#[derive(Debug, Clone, Copy)]
-pub struct StackInfo {
-    /// Stack base address (lowest address)
-    pub base: usize,
-    /// Stack size in bytes
-    pub size: usize,
-    /// Stack top address (highest address, where SP starts)
-    pub top: usize,
-}
-
-impl StackInfo {
-    /// Create empty/unallocated stack info
-    pub const fn empty() -> Self {
-        Self {
-            base: 0,
-            size: 0,
-            top: 0,
-        }
-    }
-
-    /// Create new stack info
-    pub fn new(base: usize, size: usize) -> Self {
-        Self {
-            base,
-            size,
-            top: base + size,
-        }
-    }
-
-    /// Check if this stack overlaps with another
-    pub fn overlaps(&self, other: &StackInfo) -> bool {
-        if self.base == 0 || other.base == 0 {
-            return false; // Unallocated stacks don't overlap
-        }
-        self.base < other.top && other.base < self.top
-    }
-
-    /// Check if an address is within this stack
-    pub fn contains(&self, addr: usize) -> bool {
-        self.base != 0 && addr >= self.base && addr < self.top
-    }
-
-    /// Check if this stack is allocated
-    pub fn is_allocated(&self) -> bool {
-        self.base != 0
-    }
-}
-
-/// Size of per-thread exception stack area (reserved at top of kernel stack)
-/// This area holds:
-/// - sync_el0_handler trap frame (296 bytes) at top
-/// - irq_el0_handler frame (272 bytes) at top-768
-/// - Function call stack for syscall handlers (console, FS, etc.)
-/// 
-/// IMPORTANT: Syscall handlers can call deep functions. 16KB provides enough
-/// headroom to prevent overlap with kernel code (like execute()) below.
-pub const EXCEPTION_STACK_SIZE: usize = 16384*2;
-
-/// Thread slot in the pool
-/// 
-/// Note: Thread state is stored in the global THREAD_STATES atomic array,
-/// NOT in this struct. This allows lock-free state checks during scheduling.
-#[repr(C)]
-pub struct ThreadSlot {
-    // NOTE: state removed - use THREAD_STATES[idx] instead for lock-free access
-    // NOTE: context removed - use THREAD_CONTEXTS[idx] instead for lock-free access
-    pub cooperative: bool,
-    pub start_time_us: u64,
-    pub timeout_us: u64,
-    /// Per-thread exception stack top (for syscall trap frames)
-    /// This is the top of the reserved 1KB area at the top of the kernel stack.
-    /// To move exception stacks elsewhere, allocate separate memory and update this pointer.
-    pub exception_stack_top: u64,
-}
-
-impl ThreadSlot {
-    pub const fn empty() -> Self {
-        Self {
-            cooperative: false,
-            start_time_us: 0,
-            timeout_us: 0,
-            exception_stack_top: 0,
-        }
-    }
-}
 
 /// Fixed-size thread pool with per-thread stack sizes
 pub struct ThreadPool {
@@ -1611,6 +1418,7 @@ impl ThreadPool {
         }
         // Send event to wake any threads in WFI
         if woke_any {
+            #[cfg(target_os = "none")]
             unsafe { core::arch::asm!("sev"); }
         }
 
@@ -1846,6 +1654,7 @@ where
 /// 
 /// Kept for reference and potential fallback.
 #[allow(dead_code)]
+#[cfg(target_os = "none")]
 pub fn sgi_scheduler_handler(irq: u32) {
     (runtime().end_of_interrupt)(irq);
 
@@ -2055,6 +1864,7 @@ pub fn yield_now() {
 /// Takes current SP from assembly, returns new SP if switch needed (or 0).
 /// The assembly does the actual SP switch AFTER this function returns.
 /// This avoids the problem of switching SP in the middle of Rust code.
+#[cfg(target_os = "none")]
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
     
@@ -2315,6 +2125,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
         }
         
         // Wait for interrupt - timer IRQ will fire within 10ms
+        #[cfg(target_os = "none")]
         unsafe { core::arch::asm!("wfi"); }
     }
 
@@ -2340,15 +2151,6 @@ pub fn thread_stats() -> (usize, usize, usize) {
     (ready, running, terminated)
 }
 
-/// Thread state counts for all states
-pub struct ThreadStatsFull {
-    pub free: usize,
-    pub ready: usize,
-    pub running: usize,
-    pub terminated: usize,
-    pub initializing: usize,
-    pub waiting: usize,
-}
 
 /// Get counts for all thread states (lock-free)
 pub fn thread_stats_full() -> ThreadStatsFull {
@@ -2820,9 +2622,12 @@ pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
 /// Validate current stack pointer is within bounds
 pub fn validate_current_sp() -> bool {
     let sp: usize;
+    #[cfg(target_os = "none")]
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp);
     }
+    #[cfg(not(target_os = "none"))]
+    { sp = 0; }
 
     with_irqs_disabled(|| {
         let pool = POOL.lock();
@@ -2865,34 +2670,6 @@ pub fn has_ready_threads() -> bool {
 // Kernel Thread Info for kthreads command
 // ============================================================================
 
-/// Information about a kernel thread for display
-#[derive(Debug, Clone)]
-pub struct KernelThreadInfo {
-    /// Thread ID (0-31)
-    pub tid: usize,
-    /// Thread state as string
-    pub state: &'static str,
-    /// Whether thread is cooperative
-    pub cooperative: bool,
-    /// Stack base address
-    pub stack_base: usize,
-    /// Stack size in bytes
-    pub stack_size: usize,
-    /// Estimated stack usage (based on SP)
-    pub stack_used: usize,
-    /// Stack canary status (true = intact, false = corrupted)
-    pub canary_ok: bool,
-    /// Thread description/name
-    pub name: &'static str,
-}
-
-/// Snapshot data copied from thread pool (to minimize IRQ-disabled time)
-struct ThreadPoolSnapshot {
-    states: [ThreadState; MAX_THREADS],
-    cooperative: [bool; MAX_THREADS],
-    sps: [u64; MAX_THREADS],
-    stacks: [StackInfo; MAX_THREADS],
-}
 
 /// Get list of all kernel threads with their info
 pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
@@ -3006,122 +2783,25 @@ pub fn dump_stack_info() {
 // Stack Memory Verification
 // ============================================================================
 
-/// Stack allocation summary for verification
-#[derive(Debug, Clone)]
-pub struct StackAllocationSummary {
-    /// Total stack memory required (bytes)
-    pub total_bytes: usize,
-    /// Boot stack size (thread 0)
-    pub boot_stack: usize,
-    /// Number of system threads (1..RESERVED_THREADS)
-    pub system_thread_count: usize,
-    /// Size per system thread stack
-    pub system_stack_size: usize,
-    /// Total system thread stack memory
-    pub system_total: usize,
-    /// Number of user threads (RESERVED_THREADS..MAX_THREADS)  
-    pub user_thread_count: usize,
-    /// Size per user thread stack
-    pub user_stack_size: usize,
-    /// Total user thread stack memory
-    pub user_total: usize,
-    /// Exception stack size per thread (reserved at top of each stack)
-    pub exception_stack_size: usize,
-    /// Usable kernel stack per thread (total - exception area)
-    pub usable_kernel_stack: usize,
-}
-
 /// Calculate the total stack memory required based on kernel config
-/// 
-/// This function computes the expected stack allocation based on:
-/// - Thread 0: KERNEL_STACK_SIZE (boot stack, fixed location)
-/// - Threads 1 to RESERVED_THREADS-1: SYSTEM_THREAD_STACK_SIZE each
-/// - Threads RESERVED_THREADS to MAX_THREADS-1: USER_THREAD_STACK_SIZE each
-///
-/// Each stack is divided into:
-/// - Exception area (EXCEPTION_STACK_SIZE) at top: for IRQ/syscall handlers
-/// - Usable kernel stack below: for normal kernel code (execute(), etc.)
-///
-/// Note: Thread 0's boot stack is at a fixed address and doesn't count
-/// against heap memory, but is included for completeness.
 pub fn calculate_stack_requirements() -> StackAllocationSummary {
-    let system_thread_count = config().reserved_threads - 1; // Threads 1 to RESERVED_THREADS-1
-    let user_thread_count = MAX_THREADS - config().reserved_threads;
-    
-    let system_total = system_thread_count * config().system_thread_stack_size;
-    let user_total = user_thread_count * config().user_thread_stack_size;
-    
-    // Boot stack is at fixed location, not from heap
-    let heap_allocated = system_total + user_total;
-    
-    // Calculate usable kernel stack (smallest of the stack types minus exception area)
-    let min_stack = config().system_thread_stack_size.min(config().user_thread_stack_size);
-    let usable_kernel_stack = min_stack.saturating_sub(EXCEPTION_STACK_SIZE);
-    
-    StackAllocationSummary {
-        total_bytes: config().kernel_stack_size + heap_allocated,
-        boot_stack: config().kernel_stack_size,
-        system_thread_count,
-        system_stack_size: config().system_thread_stack_size,
-        system_total,
-        user_thread_count,
-        user_stack_size: config().user_thread_stack_size,
-        user_total,
-        exception_stack_size: EXCEPTION_STACK_SIZE,
-        usable_kernel_stack,
-    }
+    types::calculate_stack_requirements(
+        config().reserved_threads,
+        config().kernel_stack_size,
+        config().system_thread_stack_size,
+        config().user_thread_stack_size,
+    )
 }
 
 /// Verify that stack allocations fit within available heap memory
-///
-/// Returns Ok(summary) if stacks fit, Err with message if not.
-///
-/// # Arguments
-/// * `available_heap` - Total heap memory available (bytes)
 pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSummary, alloc::string::String> {
-    let summary = calculate_stack_requirements();
-    
-    // Check that exception stack doesn't consume the entire stack
-    // We need at least 8KB of usable kernel stack for execute() and other kernel code
-    const MIN_USABLE_KERNEL_STACK: usize = 8 * 1024;
-    if summary.usable_kernel_stack < MIN_USABLE_KERNEL_STACK {
-        return Err(format!(
-            "Exception stack too large! Usable kernel stack: {} KB < {} KB minimum\n\
-             Stack layout per thread:\n\
-             - Total stack: {} KB\n\
-             - Exception area (at top): {} KB\n\
-             - Usable kernel stack: {} KB\n\
-             Reduce EXCEPTION_STACK_SIZE or increase thread stack sizes.",
-            summary.usable_kernel_stack / 1024,
-            MIN_USABLE_KERNEL_STACK / 1024,
-            summary.system_stack_size.min(summary.user_stack_size) / 1024,
-            summary.exception_stack_size / 1024,
-            summary.usable_kernel_stack / 1024,
-        ));
-    }
-    
-    // Only system and user thread stacks come from heap
-    // Boot stack is at fixed location
-    let heap_required = summary.system_total + summary.user_total;
-    
-    if heap_required > available_heap {
-        return Err(format!(
-            "Stack memory exceeds heap! Required: {} KB, Available: {} KB\n\
-             Breakdown:\n\
-             - {} system threads × {} KB = {} KB\n\
-             - {} user threads × {} KB = {} KB",
-            heap_required / 1024,
-            available_heap / 1024,
-            summary.system_thread_count,
-            summary.system_stack_size / 1024,
-            summary.system_total / 1024,
-            summary.user_thread_count,
-            summary.user_stack_size / 1024,
-            summary.user_total / 1024,
-        ));
-    }
-    
-    Ok(summary)
+    types::verify_stack_memory_params(
+        available_heap,
+        config().reserved_threads,
+        config().kernel_stack_size,
+        config().system_thread_stack_size,
+        config().user_thread_stack_size,
+    )
 }
 
 /// Print stack allocation summary to console

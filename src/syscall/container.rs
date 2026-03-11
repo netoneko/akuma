@@ -13,6 +13,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
         root_dir: String::from(root),
         creator_pid,
         primary_pid,
+        parent_box_id: None,
     });
 
     crate::vfs::create_box_namespace(id, root);

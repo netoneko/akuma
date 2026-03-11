@@ -2,99 +2,16 @@
 //!
 //! Implements page table management for virtual memory.
 //! Uses 4KB granule with 4-level page tables (L0-L3).
-//!
-//! Memory layout:
-//! - TTBR0_EL1: User space (0x0000_0000_0000_0000 - 0x0000_FFFF_FFFF_FFFF)
-//! - TTBR1_EL1: Kernel space (0xFFFF_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF)
-//!
-//! The kernel runs in the upper half (TTBR1) so that TTBR0 can be switched
-//! per-process for user space mappings.
 
 #![allow(dead_code)]
 
+pub mod types;
+pub mod asid;
+
+pub use types::*;
+
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::runtime::{PhysFrame, FrameSource, runtime, with_irqs_disabled, IrqGuard};
-
-/// Page size: 4KB
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_SHIFT: usize = 12;
-
-/// Page table entry count per level
-pub const ENTRIES_PER_TABLE: usize = 512;
-
-/// Virtual address bits per level
-pub const BITS_PER_LEVEL: usize = 9;
-
-/// Remapped device MMIO virtual addresses.
-/// Devices are mapped via L0[1] (VA 0x80_0000_0000+) so they never conflict
-/// with user heap/mmap/stack in L0[0].  Physical addresses are unchanged;
-/// only the VAs used by driver code differ from the identity mapping.
-pub const DEV_GIC_DIST_VA: usize = 0x80_0000_0000;
-pub const DEV_GIC_CPU_VA: usize  = 0x80_0000_1000;
-pub const DEV_UART_VA: usize     = 0x80_0000_2000;
-pub const DEV_FW_CFG_VA: usize   = 0x80_0000_3000;
-pub const DEV_VIRTIO_VA: usize   = 0x80_0000_4000;
-
-/// Memory attribute indices (configured in MAIR_EL1)
-pub const MAIR_DEVICE_NGNRNE: u64 = 0; // Device memory, non-Gathering, non-Reordering, non-Early Write Acknowledgement
-pub const MAIR_NORMAL_NC: u64 = 1; // Normal memory, non-cacheable
-pub const MAIR_NORMAL_WT: u64 = 2; // Normal memory, write-through
-pub const MAIR_NORMAL_WB: u64 = 3; // Normal memory, write-back
-
-/// Page table entry flags
-pub mod flags {
-    /// Entry is valid
-    pub const VALID: u64 = 1 << 0;
-    /// Table descriptor (vs block descriptor)
-    pub const TABLE: u64 = 1 << 1;
-    /// Block descriptor for L1/L2 (1GB/2MB blocks)
-    pub const BLOCK: u64 = 0 << 1;
-    /// Access flag (must be set or access fault)
-    pub const AF: u64 = 1 << 10;
-    /// Shareability: Inner shareable
-    pub const SH_INNER: u64 = 3 << 8;
-    /// Shareability: Outer shareable
-    pub const SH_OUTER: u64 = 2 << 8;
-    /// AP[2:1] - Access permissions
-    pub const AP_RW_EL1: u64 = 0 << 6; // R/W at EL1, no access at EL0
-    pub const AP_RW_ALL: u64 = 1 << 6; // R/W at EL1 and EL0
-    pub const AP_RO_EL1: u64 = 2 << 6; // R/O at EL1, no access at EL0
-    pub const AP_RO_ALL: u64 = 3 << 6; // R/O at EL1 and EL0
-    /// User accessible (EL0)
-    pub const USER: u64 = 1 << 6;
-    /// Execute never at EL1
-    pub const PXN: u64 = 1 << 53;
-    /// Execute never at EL0
-    pub const UXN: u64 = 1 << 54;
-    /// Non-global (uses ASID)
-    pub const NG: u64 = 1 << 11;
-}
-
-/// Memory attribute index in entry (bits 4:2)
-#[inline]
-pub const fn attr_index(idx: u64) -> u64 {
-    (idx & 0x7) << 2
-}
-
-/// 1GB block size
-pub const BLOCK_1GB: usize = 1 << 30;
-/// 2MB block size
-pub const BLOCK_2MB: usize = 1 << 21;
-
-/// Kernel page tables (L0, L1) - statically allocated
-/// We use 1GB blocks at L1 level for kernel identity mapping
-#[repr(C, align(4096))]
-pub struct PageTable {
-    entries: [u64; ENTRIES_PER_TABLE],
-}
-
-impl PageTable {
-    pub const fn new() -> Self {
-        Self {
-            entries: [0; ENTRIES_PER_TABLE],
-        }
-    }
-}
 
 /// MMU initialization state
 static MMU_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -167,12 +84,17 @@ pub fn virt_to_phys(vaddr: usize) -> usize {
     vaddr
 }
 
+#[cfg(target_os = "none")]
 pub fn flush_tlb_all() {
     unsafe {
         core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
     }
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn flush_tlb_all() {}
+
+#[cfg(target_os = "none")]
 pub fn get_boot_ttbr0() -> u64 {
     unsafe {
         let addr: u64;
@@ -187,6 +109,10 @@ pub fn get_boot_ttbr0() -> u64 {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn get_boot_ttbr0() -> u64 { 0 }
+
+#[cfg(target_os = "none")]
 pub fn flush_tlb_asid(asid: u16) {
     unsafe {
         let asid_val = (asid as u64) << 48;
@@ -200,6 +126,10 @@ pub fn flush_tlb_asid(asid: u16) {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn flush_tlb_asid(_asid: u16) {}
+
+#[cfg(target_os = "none")]
 pub fn flush_tlb_page(va: usize) {
     unsafe {
         let va_shifted = (va >> 12) as u64;
@@ -213,6 +143,9 @@ pub fn flush_tlb_page(va: usize) {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn flush_tlb_page(_va: usize) {}
+
 // ============================================================================
 // User Address Space Management
 // ============================================================================
@@ -221,46 +154,9 @@ use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 
-const MAX_ASID: u16 = 256;
+use asid::AsidAllocator;
+
 static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::new());
-
-struct AsidAllocator {
-    next_asid: u16,
-    used: [u64; 4],
-}
-
-impl AsidAllocator {
-    const fn new() -> Self {
-        Self {
-            next_asid: 1,
-            used: [0; 4],
-        }
-    }
-
-    fn alloc(&mut self) -> Option<u16> {
-        let start = self.next_asid;
-        let mut asid = start;
-        loop {
-            let word = (asid / 64) as usize;
-            let bit = asid % 64;
-            if word < self.used.len() && (self.used[word] & (1 << bit)) == 0 {
-                self.used[word] |= 1 << bit;
-                self.next_asid = if asid + 1 >= MAX_ASID { 1 } else { asid + 1 };
-                return Some(asid);
-            }
-            asid = if asid + 1 >= MAX_ASID { 1 } else { asid + 1 };
-            if asid == start { return None; }
-        }
-    }
-
-    fn free(&mut self, asid: u16) {
-        if asid > 0 && asid < MAX_ASID {
-            let word = (asid / 64) as usize;
-            let bit = asid % 64;
-            if word < self.used.len() { self.used[word] &= !(1 << bit); }
-        }
-    }
-}
 
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
@@ -591,19 +487,21 @@ impl UserAddressSpace {
     }
 
     pub fn activate(&self) {
-        let ttbr0 = self.ttbr0();
+        let _ttbr0 = self.ttbr0();
         flush_tlb_all();
+        #[cfg(target_os = "none")]
         unsafe {
-            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) ttbr0);
+            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
         }
         flush_tlb_all();
     }
 
     pub fn deactivate() {
-        let boot_ttbr0 = get_boot_ttbr0();
+        let _boot_ttbr0 = get_boot_ttbr0();
         flush_tlb_all();
+        #[cfg(target_os = "none")]
         unsafe {
-            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) boot_ttbr0);
+            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
         }
         flush_tlb_all();
     }
@@ -622,22 +520,6 @@ impl Drop for UserAddressSpace {
     }
 }
 
-pub mod user_flags {
-    use super::flags;
-    pub const RO: u64 = flags::AP_RO_ALL;
-    pub const RW: u64 = flags::AP_RW_ALL;
-    pub const EXEC: u64 = flags::AP_RO_ALL;
-    pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
-    pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
-
-    pub fn from_prot(prot: u32) -> u64 {
-        match (prot & 0x2 != 0, prot & 0x4 != 0) {
-            (true, _)      => RW_NO_EXEC,
-            (false, true)  => RX,
-            (false, false) => RO,
-        }
-    }
-}
 
 /// Map a user page at `va` to physical address `pa`.
 ///
@@ -650,7 +532,10 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
     let _irq_guard = IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
-    core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+    #[cfg(target_os = "none")]
+    { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
@@ -680,7 +565,8 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
     let cas_result = pte_atomic.compare_exchange(existing, entry,
         core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     if cas_result.is_ok() {
-        core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12);
+        #[cfg(target_os = "none")]
+        { core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
         (allocated_tables, true)
     } else {
         // CAS failed: another path installed a page between our check and CAS.
@@ -800,17 +686,23 @@ pub fn protect_kernel_code() {
     let l0_table = get_boot_ttbr0() as *mut u64;
     unsafe {
         let l1_table = ((*l0_table) & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        #[cfg(target_os = "none")]
         core::arch::asm!("dsb ishst");
         l1_table.add(1).write_volatile((l2_table as u64) | flags::VALID | flags::TABLE);
+        #[cfg(target_os = "none")]
         core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
     }
 }
 
+#[cfg(target_os = "none")]
 pub fn get_current_ttbr0() -> usize {
     let ttbr0: u64;
     unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
     ttbr0 as usize
 }
+
+#[cfg(not(target_os = "none"))]
+pub fn get_current_ttbr0() -> usize { 0 }
 
 pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     let ttbr0 = get_current_ttbr0();

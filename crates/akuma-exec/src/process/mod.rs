@@ -2,45 +2,15 @@
 //!
 //! Manages user processes including creation, execution, and termination.
 
+pub mod types;
+
+pub use types::*;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-
-/// Default environment variables for new processes when none are provided.
-pub const DEFAULT_ENV: &[&str] = &[
-    "PATH=/usr/bin:/bin",
-    "HOME=/",
-    "TERM=xterm",
-];
-
-/// A future that yields once then completes
-/// This allows proper async yielding in poll_fn contexts
-pub struct YieldOnce(bool);
-
-impl YieldOnce {
-    pub fn new() -> Self {
-        YieldOnce(false)
-    }
-}
-
-impl Future for YieldOnce {
-    type Output = ();
-    
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            Poll::Pending
-        }
-    }
-}
 use spinning_top::Spinlock;
 
 use crate::elf_loader::{self, ElfError};
@@ -48,56 +18,6 @@ use crate::mmu::{self, UserAddressSpace};
 use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled};
 use akuma_terminal as terminal;
 
-/// Fixed address for process info page (read-only from userspace)
-///
-/// This page is mapped read-only for the user process but the kernel
-/// writes to it before entering userspace. The kernel can read from
-/// this address during syscalls to identify which process is calling.
-///
-/// WARNING: This struct currently uses only ~8 bytes but we reserve 1KB (1024 bytes).
-/// If ProcessInfo grows beyond 1KB, it will overflow into unmapped memory!
-pub const PROCESS_INFO_ADDR: usize = 0x1000;
-
-/// Maximum size of argument data in ProcessInfo
-pub const ARGV_DATA_SIZE: usize = 744;
-
-/// Maximum size of cwd data in ProcessInfo
-pub const CWD_DATA_SIZE: usize = 256;
-
-/// Process info structure shared between kernel and userspace
-///
-/// The kernel writes this, userspace reads it (read-only mapping).
-///
-/// Layout must match libakuma exactly.
-#[repr(C)]
-pub struct ProcessInfo {
-    /// Process ID
-    pub pid: u32,
-    /// Parent process ID
-    pub ppid: u32,
-    /// Box ID
-    pub box_id: u64,
-    /// Reserved
-    pub _reserved: [u8; 1008],
-}
-
-impl ProcessInfo {
-    /// Create a new ProcessInfo
-    pub const fn new(pid: u32, ppid: u32, box_id: u64) -> Self {
-        Self {
-            pid,
-            ppid,
-            box_id,
-            _reserved: [0u8; 1008],
-        }
-    }
-}
-
-// Compile-time check that ProcessInfo fits in 1KB
-const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
-
-/// Process ID type
-pub type Pid = u32;
 
 static PROCESS_SYSCALL_STATS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -252,156 +172,6 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
 // Stdio Buffer (thread-safe stdin/stdout with size limits)
 // ============================================================================
 
-/// Thread-safe stdio buffer with size limits to prevent OOM
-///
-/// Used for both stdin and stdout. Size limits use "last write wins" policy:
-/// when a write would exceed the limit, the buffer is cleared before writing.
-#[derive(Clone)]
-pub struct StdioBuffer {
-    /// The actual data buffer
-    pub data: Vec<u8>,
-    /// Read position (only meaningful for stdin)
-    pub pos: usize,
-}
-
-impl StdioBuffer {
-    /// Create a new empty buffer
-    pub fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            pos: 0,
-        }
-    }
-
-    /// Get the data length
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if buffer is empty
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Clear the buffer and reset position
-    pub fn clear(&mut self) {
-        self.data.clear();
-        self.pos = 0;
-    }
-
-    /// Write data with size limit ("last write wins" policy)
-    ///
-    /// If adding data would exceed max_size, clears buffer first.
-    /// A single write larger than max_size is still accepted in full.
-    pub fn write_with_limit(&mut self, data: &[u8], max_size: usize) {
-        if self.data.len() + data.len() > max_size {
-            self.data.clear();
-        }
-        self.data.extend_from_slice(data);
-    }
-
-    /// Set data (replaces existing, with size limit)
-    pub fn set_with_limit(&mut self, data: &[u8], max_size: usize) {
-        self.data.clear();
-        self.pos = 0;
-        if data.len() <= max_size {
-            self.data.extend_from_slice(data);
-        } else {
-            // Data exceeds limit - keep last max_size bytes
-            self.data.extend_from_slice(&data[data.len() - max_size..]);
-        }
-    }
-
-    /// Read from buffer (advances position)
-    pub fn read(&mut self, buf: &mut [u8]) -> usize {
-        let remaining = &self.data[self.pos..];
-        let to_read = buf.len().min(remaining.len());
-        buf[..to_read].copy_from_slice(&remaining[..to_read]);
-        self.pos += to_read;
-        to_read
-    }
-
-    /// Clone the data (for procfs reads)
-    pub fn clone_data(&self) -> Vec<u8> {
-        self.data.clone()
-    }
-}
-
-impl Default for StdioBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
-// File Descriptor Table
-// ============================================================================
-
-/// File descriptor types for the per-process FD table
-#[derive(Debug, Clone)]
-pub enum FileDescriptor {
-    /// Standard input (fd 0)
-    Stdin,
-    /// Standard output (fd 1)
-    Stdout,
-    /// Standard error (fd 2)
-    Stderr,
-    /// Socket file descriptor - index into global socket table
-    Socket(usize),
-    /// File file descriptor
-    File(KernelFile),
-    /// Child process stdout - PID of the child process
-    /// Used by parent to read child's stdout via ProcessChannel
-    ChildStdout(Pid),
-    /// Read end of a kernel pipe (pipe_id into global PIPES table)
-    PipeRead(u32),
-    /// Write end of a kernel pipe (pipe_id into global PIPES table)
-    PipeWrite(u32),
-    /// Event file descriptor (eventfd_id into global EVENTFDS table)
-    EventFd(u32),
-    /// /dev/null — reads return EOF, writes are discarded
-    DevNull,
-    /// /dev/urandom — reads return random bytes
-    DevUrandom,
-    /// timerfd — reads return 8-byte expiration count
-    TimerFd(u32),
-    /// epoll instance (epoll_id into global EPOLL_TABLE)
-    EpollFd(u32),
-}
-
-/// Kernel file handle for open files
-#[derive(Debug, Clone)]
-pub struct KernelFile {
-    /// Path to the file
-    pub path: String,
-    /// Current read/write position
-    pub position: usize,
-    /// Open flags (O_RDONLY, O_WRONLY, O_RDWR, etc.)
-    pub flags: u32,
-}
-
-impl KernelFile {
-    /// Create a new kernel file handle
-    pub fn new(path: String, flags: u32) -> Self {
-        Self {
-            path,
-            position: 0,
-            flags,
-        }
-    }
-}
-
-/// File open flags (Linux compatible)
-pub mod open_flags {
-    pub const O_RDONLY: u32 = 0;
-    pub const O_WRONLY: u32 = 1;
-    pub const O_RDWR: u32 = 2;
-    pub const O_CREAT: u32 = 0o100;
-    pub const O_TRUNC: u32 = 0o1000;
-    pub const O_APPEND: u32 = 0o2000;
-    pub const O_CLOEXEC: u32 = 0o2000000;
-}
-
 /// Next available PID
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
@@ -424,29 +194,6 @@ static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> 
 static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
-/// Source of data for a lazy region page.
-#[derive(Clone)]
-pub enum LazySource {
-    /// Zero-filled on demand (anonymous mapping).
-    Zero,
-    /// Backed by file data; pages beyond `filesz` are zero-filled (BSS).
-    File {
-        path: String,
-        inode: u32,
-        file_offset: usize,
-        filesz: usize,
-        segment_va: usize,
-    },
-}
-
-/// A lazily-backed virtual memory region.
-#[derive(Clone)]
-pub struct LazyRegion {
-    pub start_va: usize,
-    pub size: usize,
-    pub flags: u64,
-    pub source: LazySource,
-}
 
 /// Global lazy region table, keyed by PID.
 /// Stored separately from Process to avoid aliasing/corruption issues
@@ -878,9 +625,12 @@ pub fn read_current_pid() -> Option<Pid> {
     // With boot TTBR0, address 0x1000 is in the device memory region (0x0-0x40000000)
     // and reading from it returns garbage, causing FAR=0x5 crashes.
     let ttbr0: u64;
+    #[cfg(target_os = "none")]
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
     }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
     
     // Compare against actual boot TTBR0, not a range check.
     // User page tables are allocated from the same physical memory pool,
@@ -1253,16 +1003,6 @@ pub fn get_stack_bounds() -> (usize, usize) {
     }
 }
 
-/// Process info for display (used by ps command)
-#[derive(Debug, Clone)]
-pub struct ProcessInfo2 {
-    pub pid: Pid,
-    pub ppid: Pid,
-    pub box_id: u64,
-    pub name: String,
-    pub state: &'static str,
-    pub last_syscall: u64,
-}
 
 /// List all running processes
 ///
@@ -1311,225 +1051,13 @@ pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
     })
 }
 
-/// Process state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessState {
-    /// Process is ready to run
-    Ready,
-    /// Process is currently running
-    Running,
-    /// Process is waiting for I/O
-    Blocked,
-    /// Process has terminated
-    Zombie(i32), // Exit code
-}
 
-/// User context saved during kernel entry
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct UserContext {
-    // General purpose registers
-    pub x0: u64,
-    pub x1: u64,
-    pub x2: u64,
-    pub x3: u64,
-    pub x4: u64,
-    pub x5: u64,
-    pub x6: u64,
-    pub x7: u64,
-    pub x8: u64,
-    pub x9: u64,
-    pub x10: u64,
-    pub x11: u64,
-    pub x12: u64,
-    pub x13: u64,
-    pub x14: u64,
-    pub x15: u64,
-    pub x16: u64,
-    pub x17: u64,
-    pub x18: u64,
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64,  // Frame pointer
-    pub x30: u64,  // Link register
-    pub sp: u64,   // Stack pointer (SP_EL0)
-    pub pc: u64,   // Program counter (ELR_EL1)
-    pub spsr: u64, // Saved program status
-    pub tpidr: u64, // Thread pointer for TLS
-    pub ttbr0: u64, // User address space base
-}
-
-impl UserContext {
-    pub fn new(entry_point: usize, stack_pointer: usize) -> Self {
-        Self {
-            x0: 0,
-            x1: 0,
-            x2: 0,
-            x3: 0,
-            x4: 0,
-            x5: 0,
-            x6: 0,
-            x7: 0,
-            x8: 0,
-            x9: 0,
-            x10: 0,
-            x11: 0,
-            x12: 0,
-            x13: 0,
-            x14: 0,
-            x15: 0,
-            x16: 0,
-            x17: 0,
-            x18: 0,
-            x19: 0,
-            x20: 0,
-            x21: 0,
-            x22: 0,
-            x23: 0,
-            x24: 0,
-            x25: 0,
-            x26: 0,
-            x27: 0,
-            x28: 0,
-            x29: 0,
-            x30: 0,
-            sp: stack_pointer as u64,
-            pc: entry_point as u64,
-            spsr: 0, // EL0t, interrupts enabled
-            tpidr: 0,
-            ttbr0: 0,
-        }
-    }
-    
-    pub fn default() -> Self {
-        Self::new(0, 0)
-    }
-}
 
 // ============================================================================
 // Signal Infrastructure
 // ============================================================================
 
-pub const MAX_SIGNALS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SignalHandler {
-    Default,
-    Ignore,
-    UserFn(usize),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SignalAction {
-    pub handler: SignalHandler,
-    pub flags: u64,
-    pub mask: u64,
-    pub restorer: usize,
-}
-
-impl SignalAction {
-    pub const fn default() -> Self {
-        Self {
-            handler: SignalHandler::Default,
-            flags: 0,
-            mask: 0,
-            restorer: 0,
-        }
-    }
-}
-
-/// Memory regions for a process
-#[derive(Debug, Clone)]
-pub struct ProcessMemory {
-    /// Code/data region end (start of heap)
-    pub code_end: usize,
-    /// Current program break (heap grows up from here)
-    pub brk: usize,
-    /// Stack bottom (lowest mapped stack address)
-    pub stack_bottom: usize,
-    /// Stack top (highest mapped stack address + 1)
-    pub stack_top: usize,
-    /// Next mmap address (mmap region between code_end and stack_bottom)
-    pub next_mmap: usize,
-    /// Mmap region limit (must stay below this)
-    pub mmap_limit: usize,
-    /// Freed virtual address regions for reclamation (start_va, size)
-    pub free_regions: Vec<(usize, usize)>,
-}
-
-impl ProcessMemory {
-    pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) -> Self {
-        // Mmap region starts 256MB above code_end to leave room for heap
-        // growth (brk grows upward from code_end). Must be above code_end
-        // so PIE binaries loaded at 0x1000_0000 don't get their code pages
-        // overwritten by mmap allocations.
-        // Also must be above mmap_floor (e.g. above the interpreter region).
-        let base = (code_end + 0x1000_0000) & !0xFFFF;
-        let mmap_start = core::cmp::max(base, mmap_floor);
-        let mmap_limit = stack_bottom.saturating_sub(0x10_0000); // 1MB buffer before stack
-
-        Self {
-            code_end,
-            brk: code_end,
-            stack_bottom,
-            stack_top,
-            next_mmap: mmap_start,
-            mmap_limit,
-            free_regions: Vec::new(),
-        }
-    }
-
-    /// Check if an address range overlaps with stack
-    pub fn overlaps_stack(&self, addr: usize, size: usize) -> bool {
-        let end = addr.saturating_add(size);
-        addr < self.stack_top && end > self.stack_bottom
-    }
-
-    /// Kernel identity-maps VA 0x40000000-0x4FFFFFFF (256MB RAM via 2MB blocks).
-    /// User mmap regions must not overlap this range.
-    const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END: usize   = 0x5000_0000;
-
-    /// Allocate mmap region, returns None if would overlap stack
-    pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
-        // 1. Try to find a hole in free_regions (first-fit)
-        for i in 0..self.free_regions.len() {
-            let (start, f_size) = self.free_regions[i];
-            if f_size >= size {
-                self.free_regions.remove(i);
-                if f_size > size {
-                    self.free_regions.push((start + size, f_size - size));
-                }
-                return Some(start);
-            }
-        }
-
-        // 2. Fall back to bump allocator — skip the kernel identity-mapped VA range
-        let mut addr = self.next_mmap;
-
-        // If we're about to enter the kernel VA hole, jump past it
-        if addr < Self::KERNEL_VA_END && addr + size > Self::KERNEL_VA_START {
-            addr = Self::KERNEL_VA_END;
-        }
-
-        let end = addr.checked_add(size)?;
-
-        if end > self.mmap_limit {
-            return None;
-        }
-
-        self.next_mmap = end;
-        Some(addr)
-    }
-}
 
 /// A user process
 pub struct Process {
@@ -2359,6 +1887,7 @@ impl Drop for Process {
 ///
 /// This sets up the CPU state and performs an ERET to EL0.
 /// Does not return.
+#[cfg(target_os = "none")]
 #[inline(never)]
 #[allow(dead_code)]
 pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
@@ -2398,6 +1927,12 @@ pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
             options(noreturn)
         )
     }
+}
+
+#[cfg(not(target_os = "none"))]
+#[allow(dead_code)]
+pub unsafe fn enter_user_mode(_ctx: &UserContext) -> ! {
+    panic!("not on bare metal")
 }
 
 /// Execute a boxed process - enters user mode and never returns
@@ -2518,7 +2053,10 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let lr: u64;
+    #[cfg(target_os = "none")]
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
+    #[cfg(not(target_os = "none"))]
+    { lr = 0; }
     let tid = crate::threading::current_thread_id();
     log::debug!("[RTK] code={} tid={} LR={:#x}", exit_code, tid, lr);
     

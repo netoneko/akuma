@@ -4,6 +4,9 @@
 //! protected by a spinlock with IRQs disabled for safe access from
 //! syscall and interrupt context.
 
+pub mod hierarchy;
+pub mod access;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -20,6 +23,8 @@ pub struct BoxInfo {
     pub root_dir: String,
     pub creator_pid: Pid,
     pub primary_pid: Pid,
+    /// Parent box ID. None for top-level boxes (direct children of the host).
+    pub parent_box_id: Option<u64>,
 }
 
 static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
@@ -85,5 +90,13 @@ pub fn init_box_registry() {
         root_dir: String::from("/"),
         creator_pid: 0,
         primary_pid: 1,
+        parent_box_id: None,
     });
+}
+
+/// Get a snapshot of the registry (for hierarchy queries without holding the lock)
+pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
+    with_irqs_disabled(|| {
+        BOX_REGISTRY.lock().clone()
+    })
 }
