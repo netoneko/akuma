@@ -111,7 +111,7 @@ mod mount_tests {
 
 #[cfg(test)]
 mod memfs_tests {
-    use crate::{MemoryFilesystem, Filesystem};
+    use crate::{MemoryFilesystem, Filesystem, FsError};
 
     #[test]
     fn write_and_read_file() {
@@ -218,6 +218,47 @@ mod memfs_tests {
         fs.rename("/d/old", "/d/new").unwrap();
         assert!(!fs.exists("/d/old"));
         assert_eq!(fs.read_file("/d/new").unwrap(), b"data");
+    }
+
+    #[test]
+    fn rename_to_existing_fails() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/d/src", b"source").unwrap();
+        fs.write_file("/d/dst", b"destination").unwrap();
+        let r = fs.rename("/d/src", "/d/dst");
+        assert!(matches!(r, Err(FsError::AlreadyExists)));
+        assert_eq!(fs.read_file("/d/src").unwrap(), b"source");
+        assert_eq!(fs.read_file("/d/dst").unwrap(), b"destination");
+    }
+
+    #[test]
+    fn rename_nonexistent_fails() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/d").unwrap();
+        let r = fs.rename("/d/nope", "/d/dst");
+        assert!(matches!(r, Err(FsError::NotFound)));
+    }
+
+    #[test]
+    fn rename_across_directories() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/a").unwrap();
+        fs.create_dir("/b").unwrap();
+        fs.write_file("/a/file", b"moved").unwrap();
+        fs.rename("/a/file", "/b/file").unwrap();
+        assert!(!fs.exists("/a/file"));
+        assert_eq!(fs.read_file("/b/file").unwrap(), b"moved");
+    }
+
+    #[test]
+    fn rename_preserves_content_on_failure() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/d/src", b"important").unwrap();
+        let _ = fs.rename("/d/src", "/nonexistent_dir/dst");
+        assert!(fs.exists("/d/src"));
+        assert_eq!(fs.read_file("/d/src").unwrap(), b"important");
     }
 
     #[test]

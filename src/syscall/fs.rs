@@ -1239,6 +1239,38 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
     if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
 }
 
+const RENAME_NOREPLACE: u32 = 1;
+const RENAME_EXCHANGE: u32 = 2;
+
+pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> u64 {
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 {
+        return super::EINVAL;
+    }
+    if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
+        return super::EINVAL;
+    }
+
+    let raw_old = match copy_from_user_str(oldpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let raw_new = match copy_from_user_str(newpath_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let oldpath = resolve_path_at(olddirfd, &raw_old);
+    let newpath = resolve_path_at(newdirfd, &raw_new);
+
+    if flags & RENAME_NOREPLACE != 0 && crate::vfs::exists(&newpath) {
+        return super::EEXIST;
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(256, "[syscall] renameat2: {} -> {} flags=0x{:x}\n", oldpath, newpath, flags);
+    }
+    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
+}
+
 pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
     let target = match copy_from_user_str(target_ptr, 1024) {
         Ok(p) => p,

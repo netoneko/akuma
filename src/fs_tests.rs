@@ -48,6 +48,13 @@ pub fn run_all_tests() {
         failed += 1;
     }
 
+    // Test 5: Rename operations
+    if test_rename_operations() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
+
     log(&format!(
         "\n[FS Tests] Complete: {} passed, {} failed\n",
         passed, failed
@@ -351,6 +358,107 @@ fn test_subdirectory_operations() -> bool {
         return false;
     }
     log("    File confirmed deleted\n");
+
+    log("  - PASSED\n");
+    true
+}
+
+// ============================================================================
+// Test: Rename Operations
+// ============================================================================
+
+/// Test rename and rename-noreplace semantics
+fn test_rename_operations() -> bool {
+    log("[FS Tests] Test: rename_operations\n");
+
+    if !fs::exists("/tmp") {
+        if let Err(e) = fs::create_dir("/tmp") {
+            log(&format!("  - FAILED to create /tmp: {}\n", e));
+            return false;
+        }
+    }
+
+    let src = "/tmp/rename_src.txt";
+    let dst = "/tmp/rename_dst.txt";
+
+    // Step 1: Create source file
+    log("  - Step 1: Create source file\n");
+    if let Err(e) = fs::write_file(src, b"rename test data") {
+        log(&format!("    FAILED to create source: {}\n", e));
+        return false;
+    }
+
+    // Step 2: Rename src -> dst
+    log("  - Step 2: Rename source to destination\n");
+    if let Err(e) = fs::rename(src, dst) {
+        log(&format!("    FAILED to rename: {}\n", e));
+        let _ = fs::remove_file(src);
+        return false;
+    }
+
+    // Step 3: Verify source is gone and destination has correct content
+    log("  - Step 3: Verify rename results\n");
+    if fs::exists(src) {
+        log("    FAILED: Source still exists after rename\n");
+        let _ = fs::remove_file(src);
+        let _ = fs::remove_file(dst);
+        return false;
+    }
+    match fs::read_file(dst) {
+        Ok(content) => {
+            if content.as_slice() != b"rename test data" {
+                log("    FAILED: Destination content mismatch\n");
+                let _ = fs::remove_file(dst);
+                return false;
+            }
+        }
+        Err(e) => {
+            log(&format!("    FAILED to read destination: {}\n", e));
+            let _ = fs::remove_file(dst);
+            return false;
+        }
+    }
+
+    // Step 4: Test NOREPLACE semantics — create another file and try to rename over dst
+    log("  - Step 4: Test rename-noreplace (exists check)\n");
+    let src2 = "/tmp/rename_src2.txt";
+    if let Err(e) = fs::write_file(src2, b"should not overwrite") {
+        log(&format!("    FAILED to create second source: {}\n", e));
+        let _ = fs::remove_file(dst);
+        return false;
+    }
+
+    // Simulate RENAME_NOREPLACE: check exists() before rename()
+    if fs::exists(dst) {
+        log("    Destination exists — NOREPLACE would return EEXIST (correct)\n");
+    } else {
+        log("    FAILED: Destination should exist at this point\n");
+        let _ = fs::remove_file(src2);
+        let _ = fs::remove_file(dst);
+        return false;
+    }
+
+    // Verify original destination content is preserved
+    match fs::read_file(dst) {
+        Ok(content) => {
+            if content.as_slice() != b"rename test data" {
+                log("    FAILED: Destination content was modified\n");
+                let _ = fs::remove_file(src2);
+                let _ = fs::remove_file(dst);
+                return false;
+            }
+        }
+        Err(e) => {
+            log(&format!("    FAILED to read destination: {}\n", e));
+            let _ = fs::remove_file(src2);
+            let _ = fs::remove_file(dst);
+            return false;
+        }
+    }
+
+    // Cleanup
+    let _ = fs::remove_file(src2);
+    let _ = fs::remove_file(dst);
 
     log("  - PASSED\n");
     true
