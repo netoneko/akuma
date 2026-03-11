@@ -261,8 +261,10 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     const SO_KEEPALIVE: i32 = 9;
     const SO_RCVBUF: i32 = 8;
     const SO_SNDBUF: i32 = 7;
+    const SO_LINGER: i32 = 13;
     const SO_REUSEPORT: i32 = 15;
     const TCP_NODELAY: i32 = 1;
+    const TCP_CORK: i32 = 3;
     const TCP_KEEPIDLE: i32 = 4;
     const TCP_KEEPINTVL: i32 = 5;
     const TCP_KEEPCNT: i32 = 6;
@@ -292,7 +294,9 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 SO_RCVBUF | SO_SNDBUF => {
-                    // Buffer sizes are fixed at socket creation, ignore
+                    0
+                }
+                SO_LINGER => {
                     0
                 }
                 _ => {
@@ -308,8 +312,10 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     socket::set_tcp_nodelay(idx, val != 0);
                     0
                 }
+                TCP_CORK => {
+                    0
+                }
                 TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT => {
-                    // Keepalive parameters - store but don't use yet
                     0
                 }
                 _ => {

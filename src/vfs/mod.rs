@@ -288,6 +288,11 @@ pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
     with_fs(path, |fs, rel| fs.truncate(rel, length))
 }
 
+/// Preallocate disk space for a file
+pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+    with_fs(path, |fs, rel| fs.fallocate(rel, mode, offset, len))
+}
+
 /// Resolve a path to its absolute form through the process's CWD.
 fn resolve_absolute(path: &str) -> String {
     if let Some(proc) = akuma_exec::process::current_process() {

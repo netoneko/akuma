@@ -1020,6 +1020,23 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     }
 }
 
+pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
+    if offset < 0 || len <= 0 {
+        return super::EINVAL;
+    }
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            match crate::vfs::fallocate(&f.path, mode, offset as u64, len as u64) {
+                Ok(()) => 0,
+                Err(e) => fs_error_to_errno(e),
+            }
+        }
+        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
+        _ => EBADF,
+    }
+}
+
 pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {

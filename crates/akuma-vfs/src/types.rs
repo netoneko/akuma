@@ -163,6 +163,10 @@ pub trait Filesystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    fn fallocate(&self, _path: &str, _mode: i32, _offset: u64, _len: u64) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
     fn rename(&self, _old_path: &str, _new_path: &str) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }

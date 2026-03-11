@@ -246,6 +246,53 @@ EL1.
 
 ---
 
+## File Allocation
+
+### `fallocate` (NR 47)
+
+Preallocates disk space for a file without writing data. Bun calls
+`fallocate(fd, 0, 0, size)` before writing downloaded package files to
+ensure contiguous block allocation and early ENOSPC detection.
+
+Implemented with real ext2 block preallocation — iterates logical blocks
+in the `[offset, offset+len)` range and calls `ensure_block()` for each,
+which allocates physical blocks via the ext2 block bitmap. Updates
+`i_size` if `offset + len` exceeds the current file size.
+
+Only `mode == 0` (default preallocation) is supported. Other modes
+(e.g. `FALLOC_FL_PUNCH_HOLE`, `FALLOC_FL_KEEP_SIZE`) return
+`EOPNOTSUPP`.
+
+### `renameat2` (NR 276)
+
+Extended rename with flags. Bun calls `renameat2` with
+`RENAME_NOREPLACE` (flags=0x1) to atomically move downloaded packages
+into the install cache without overwriting existing entries.
+
+Implemented with `RENAME_NOREPLACE` support: checks `vfs::exists()` on
+the target path before calling `fs::rename()`, returning `EEXIST` if the
+target already exists. `RENAME_EXCHANGE` (flags=0x2) is accepted and
+delegated to plain rename. Other flag combinations return `EINVAL`.
+
+---
+
+## Socket Options
+
+### `SO_LINGER` (SOL_SOCKET optname=13)
+
+No-op stub (returns 0). Controls whether `close()` blocks until pending
+data is sent. Akuma's TCP teardown is handled internally by smoltcp;
+linger behavior has no effect on a local virtio-net link.
+
+### `TCP_CORK` (IPPROTO_TCP optname=3)
+
+No-op stub (returns 0). Holds small TCP segments and coalesces them into
+full-sized frames before sending. The opposite of TCP_NODELAY. Bun/libuv
+sets this around HTTP response writes. On a local virtio-net link, the
+extra small packets from not corking have negligible impact.
+
+---
+
 ## Process / Thread Management
 
 ### `exit_group` (NR 94)
@@ -460,11 +507,13 @@ page tracking corruption on preemption. Fixed in `crates/akuma-exec/src/mmu.rs`.
 Fixed by increasing heap to 16MB and reducing per-socket buffers to 32KB.
 
 **Stub syscalls implemented:**
-- `setsockopt` - TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, buffer sizes
+- `setsockopt` - TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, SO_LINGER, TCP_CORK, buffer sizes
 - `rt_sigprocmask` - signal mask manipulation
 - `sigaltstack` - alternate signal stack
 - `prctl` - PR_SET_NAME, PR_GET_NAME, etc.
 - `ftruncate` - file truncation for ext2
+- `fallocate` - ext2 block preallocation
+- `renameat2` - rename with RENAME_NOREPLACE
 
 ---
 
@@ -480,7 +529,7 @@ Fully implemented:
 - **TCP** — Non-blocking connect with EINPROGRESS, smoltcp backend
 - **Signal delivery** — rt_sigaction, rt_sigprocmask, sigaltstack, SIGSEGV handling
 - **procfs** — `/proc/self/exe`, `/proc/self/fd/N` symlinks, `/proc/self/maps`
-- **setsockopt** — TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, buffer sizes
+- **setsockopt** — TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, SO_LINGER, TCP_CORK, buffer sizes
 
 ## Known Bugs Found During Investigation
 

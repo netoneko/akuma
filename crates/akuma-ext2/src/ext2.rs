@@ -1695,6 +1695,41 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         Ok(())
     }
 
+    fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        if mode != 0 {
+            return Err(FsError::NotSupported);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+
+        let inode_num = self.lookup_path(path)?;
+        let mut state = self.state.lock();
+        let mut inode = self.read_inode(&state, inode_num)?;
+
+        if (inode.type_perms & 0xF000) != S_IFREG {
+            return Err(FsError::NotAFile);
+        }
+
+        let block_size = state.block_size as u64;
+        let first_block = offset / block_size;
+        let last_block = (offset + len - 1) / block_size;
+
+        for lb in first_block..=last_block {
+            self.ensure_block(&mut state, &mut inode, lb as u32)?;
+        }
+
+        let end = offset + len;
+        let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
+        if end > current_size {
+            inode.size_lower = end as u32;
+            inode.size_upper = (end >> 32) as u32;
+        }
+        inode.modification_time = self.current_time();
+        self.write_inode(&state, inode_num, &inode)?;
+        Ok(())
+    }
+
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
         let inode_num = self.lookup_path(path)?;
         let state = self.state.lock();
