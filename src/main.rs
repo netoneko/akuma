@@ -39,7 +39,6 @@ mod timer;
 mod vfs;
 mod virtio_hal;
 
-use alloc::string::ToString;
 use core::sync::atomic::AtomicU64;
 
 use akuma_exec::{mmu, process, threading};
@@ -483,7 +482,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Check timer hardware
     let freq = timer::read_frequency();
     console::print("Timer frequency: ");
-    console::print(&freq.to_string());
+    safe_print!(32, "{}", freq);
     console::print(" Hz\n");
 
     // Read UTC time from PL031 RTC hardware
@@ -498,7 +497,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("\n");
 
     console::print("Uptime: ");
-    console::print(&(timer::uptime_us() / 1_000_000).to_string());
+    safe_print!(32, "{}", timer::uptime_us() / 1_000_000);
     console::print(" seconds\n");
 
     // Initialize threading (but don't enable timer yet!)

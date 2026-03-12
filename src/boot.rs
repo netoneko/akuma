@@ -93,6 +93,18 @@ _boot_code:
     ldr     x0, =STACK_TOP
     mov     sp, x0
     
+    // Zero BSS section (required for flat binary loading - QEMU doesn't
+    // zero BSS when loading raw binaries, only when loading ELF)
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
+1:  cmp     x0, x1
+    b.ge    2f
+    str     xzr, [x0], #8
+    b       1b
+2:
+    
     // Set up page tables
     bl      setup_boot_page_tables
     

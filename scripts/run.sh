@@ -10,10 +10,6 @@ if [ ! -f "$KERNEL_ELF" ]; then
 fi
 
 MEMORY="${MEMORY:-256M}"
-KERNEL_BIN="${KERNEL_ELF}.bin"
-
-# Convert ELF to flat binary so QEMU sees the ARM64 Image header
-rust-objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN"
 
 EXTRA_ARGS=""
 if [ "$1" == "--test" ]; then
@@ -38,5 +34,5 @@ qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -kernel $KERNEL_BIN \
+  -kernel "$KERNEL_ELF" \
   $EXTRA_ARGS
