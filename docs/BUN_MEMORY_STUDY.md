@@ -376,6 +376,159 @@ stack_bottom         +---------------------------+
 stack_top (256GB)    +---------------------------+
 ```
 
+## 8. Resolution Phase Memory Threshold (~1050MB)
+
+### Symptom
+
+`bun install @google/gemini-cli` hangs indefinitely during the "resolving"
+phase at 1024MB RAM but works correctly at 1050MB+:
+
+```
+# At 1024MB - hangs after DNS resolution
+akuma:/> bun install @google/gemini-cli
+bun add v1.2.21 (7c45ed97)
+  🔍 @google/gemini-cli
+  <hangs forever>
+
+# At 1050MB+ - proceeds to download
+akuma:/> bun install @google/gemini-cli
+bun add v1.2.21 (7c45ed97)
+  🔍 kleur [132/263]
+  <downloads proceed>
+```
+
+### Investigation
+
+Kernel logs show DNS resolution succeeds in both cases:
+
+```
+[syscall] sendto(fd=14, len=36, dest=10.0.2.3:53)
+[DNS] query sent OK: 36 bytes
+[UDP] recvmsg OK: 228 bytes from 10.0.2.3:53  <- DNS response received
+```
+
+At 1050MB+, bun immediately creates TCP sockets to npm registry:
+
+```
+[syscall] socket(type=TCP) = fd 15
+[syscall] connect(fd=15, ip=104.16.2.34:443)
+[epoll] ctl ADD epfd=11 fd=15 events=0x4
+```
+
+At 1024MB, no TCP sockets are created. Instead:
+1. A worker thread (TID=48) is spawned after DNS response
+2. Both main and worker threads enter `epoll_pwait` with infinite timeout
+3. Worker thread exits after ~11 seconds (bun's internal timeout)
+4. Main thread remains stuck
+
+### Root Cause (Hypothesis)
+
+Bun's internal memory allocator (mimalloc or JSC) fails silently when
+physical memory is below ~1050MB. The exact failure point is within bun's
+userspace code path between receiving the DNS response and creating HTTP
+connections. No kernel errors (ENOMEM, etc.) are returned -- bun simply
+doesn't proceed.
+
+The ~26MB difference (1024MB vs 1050MB) suggests a specific allocation
+size threshold that triggers fallback behavior leading to the internal
+timeout.
+
+### Workaround
+
+Run QEMU with at least 1.1GB RAM for `bun install`:
+
+```bash
+MEMORY=1100M cargo run --release
+```
+
+### Related Crash at Higher Memory
+
+Even at 2GB, bun can crash during resolution with a kernel data abort:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403d22c8, FAR=0x50005000
+  Process PID=45 'HTTP Client'
+```
+
+This is a separate issue where kernel code accesses a lazy mmap page
+that hasn't been demand-paged yet. See issue #9 below.
+
+---
+
+## 9. Kernel Data Abort on Lazy mmap Pages (ONGOING)
+
+### Symptom
+
+During `bun install` at 2GB, the kernel crashes with a data abort from EL1:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403d22c8, FAR=0x50005000, SPSR=0x80002345
+  Thread=9, TTBR0=0x2d0000494cb000, TTBR1=0x40425000
+  SP=0x49202060, SP_EL0=0x903feee0
+  Instruction at ELR: 0xf800852b
+  Likely: Rn(base)=x9, Rt(dest)=x11
+  Process PID=45 'HTTP Client'
+```
+
+Key details:
+- **EC=0x25**: Data abort from EL1 (kernel mode)
+- **FAR=0x50005000**: Within bun's 1GB lazy mmap region (0x50000000-0x90000000)
+- **ELR=0x403d22c8**: In kernel space (above 0x40000000)
+- **ISS=0x47**: Translation fault at level 3 (page not mapped)
+
+### Root Cause
+
+The kernel is attempting to access a userspace lazy mmap page directly
+without first ensuring it's mapped. This happens when:
+
+1. Bun allocates a large lazy mmap region (e.g., 1GB at 0x50000000)
+2. A syscall handler or kernel function dereferences a userspace pointer
+   within this region
+3. The page at FAR hasn't been demand-paged yet (no physical backing)
+4. The kernel MMU faults because the page table entry is empty
+
+The instruction `0xf800852b` is `str x11, [x9], #8` -- a memcpy-like
+store operation. The kernel is likely copying data to/from userspace
+without validating that the destination pages exist.
+
+### Misleading Diagnostic
+
+The crash message includes:
+```
+WARNING: User SP below stack bottom - STACK OVERFLOW!
+```
+
+This is misleading for `CLONE_VM` threads. Worker threads created with
+`clone(CLONE_VM|CLONE_THREAD)` use mmap'd stacks (e.g., at 0x903feee0)
+while `ProcessMemory` still reports the *process's* high stack region
+(0x203fe00000). The comparison is invalid for threads.
+
+### Root Cause Analysis
+
+After investigation, the crash mechanism is:
+
+1. **Syscall entry**: Thread A validates a user buffer via `validate_user_ptr()`
+2. **Demand paging**: `ensure_user_pages_mapped()` maps any lazy pages
+3. **Race condition**: Thread B calls `munmap()` on the region
+4. **Fault**: Thread A's memset/memcpy faults on the now-unmapped page
+5. **Kernel panic**: EL1 data abort handler halts (no recovery path)
+
+The `validate_user_ptr` function already calls `ensure_user_pages_mapped`,
+but there's a TOCTTOU (time-of-check-to-time-of-use) race when another
+thread unmaps the region between validation and use.
+
+### Status
+
+**NOT YET FIXED.** Potential fixes:
+1. Handle EL1 data aborts on user addresses by demand-paging from kernel mode
+2. Pin pages during syscall operations (complex, requires reference counting)
+3. Add per-region locks to prevent concurrent munmap during syscall
+4. Catch EL1 faults and return EFAULT instead of panicking (requires stack unwind)
+
+---
+
 ## Related Documentation
 
 - `docs/DEVICE_MMIO_VA_CONFLICT.md` -- Device MMIO remapping details

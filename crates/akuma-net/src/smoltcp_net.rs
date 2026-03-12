@@ -716,7 +716,10 @@ pub fn socket_create() -> Option<SocketHandle> {
 // ============================================================================
 
 const UDP_PACKET_COUNT: usize = 8;
-const UDP_PAYLOAD_SIZE: usize = 512;
+/// DNS responses can exceed 512 bytes when there are many records (CNAME chains,
+/// multiple A/AAAA records, TXT in additional section). 1500 bytes handles most cases
+/// without exceeding typical MTU.
+const UDP_PAYLOAD_SIZE: usize = 1500;
 
 #[must_use] 
 pub fn udp_socket_create() -> Option<SocketHandle> {
