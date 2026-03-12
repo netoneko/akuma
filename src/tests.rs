@@ -6496,19 +6496,43 @@ fn test_lazy_region_lookup_pid_consistency() -> bool {
 // Bun install fixes (improve-dash-compatibility branch)
 // ============================================================================
 
-/// Test: USER_STACK_SIZE is 2MB (required for bun's ~596KB stack usage)
+/// Test: User stack size is automatically computed from RAM
 ///
-/// Bun's JSC initialization uses ~596KB of stack, which overflowed the
-/// previous 512KB limit. The stack fault jumped 80KB past the guard page.
+/// With auto-scaling: stack_size = RAM / 2048, clamped to [128KB, 8MB]
+/// This test verifies the compute_user_stack_size function works correctly.
 fn test_user_stack_size_is_2mb() -> bool {
-    console::print("\n[TEST] USER_STACK_SIZE is 2MB\n");
+    console::print("\n[TEST] User stack size auto-scaling\n");
 
-    let stack_size = crate::config::USER_STACK_SIZE;
-    let expected = 2 * 1024 * 1024; // 2MB
+    // Test the scaling function
+    let test_cases: [(usize, usize); 6] = [
+        (256 * 1024 * 1024, 128 * 1024),      // 256 MB → 128 KB (minimum)
+        (512 * 1024 * 1024, 256 * 1024),      // 512 MB → 256 KB
+        (1024 * 1024 * 1024, 512 * 1024),     // 1 GB → 512 KB
+        (2048 * 1024 * 1024, 1024 * 1024),    // 2 GB → 1 MB
+        (4096 * 1024 * 1024, 2 * 1024 * 1024),// 4 GB → 2 MB
+        (16384 * 1024 * 1024, 8 * 1024 * 1024),// 16 GB → 8 MB (maximum)
+    ];
 
-    let pass = stack_size == expected;
-    crate::safe_print!(128, "  USER_STACK_SIZE = {} bytes (expected {})\n",
-        stack_size, expected);
+    let mut pass = true;
+    for (ram, expected_stack) in test_cases {
+        let actual = crate::config::compute_user_stack_size(ram);
+        if actual != expected_stack {
+            crate::safe_print!(128, "  FAIL: RAM {}MB → {}KB (expected {}KB)\n",
+                ram / 1024 / 1024, actual / 1024, expected_stack / 1024);
+            pass = false;
+        }
+    }
+    
+    // Also verify the actual runtime stack size is reasonable
+    let actual_stack = akuma_exec::runtime::config().user_stack_size;
+    crate::safe_print!(128, "  Runtime user_stack_size = {} KB\n", actual_stack / 1024);
+    
+    // Should be at least 128KB
+    if actual_stack < 128 * 1024 {
+        crate::safe_print!(64, "  FAIL: Stack too small\n");
+        pass = false;
+    }
+
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

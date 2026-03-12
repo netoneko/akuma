@@ -318,6 +318,17 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex((ram_base + ram_size) as u64);
     console::print(") [remaining]\n");
 
+    // Compute user stack size based on RAM
+    let user_stack_size = config::compute_user_stack_size(ram_size);
+    console::print("User stack: ");
+    console::print_dec(user_stack_size / 1024);
+    console::print(" KB");
+    if config::USER_STACK_SIZE_OVERRIDE == 0 {
+        console::print(" (auto-scaled from RAM)\n");
+    } else {
+        console::print(" (override)\n");
+    }
+
     console::print("=====================\n\n");
 
     // Ensure we have enough for heap
@@ -399,7 +410,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             default_thread_stack_size: config::DEFAULT_THREAD_STACK_SIZE,
             system_thread_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
             user_thread_stack_size: config::USER_THREAD_STACK_SIZE,
-            user_stack_size: config::USER_STACK_SIZE,
+            user_stack_size,
             enable_stack_canaries: config::ENABLE_STACK_CANARIES,
             stack_canary: config::STACK_CANARY,
             canary_words: config::CANARY_WORDS,

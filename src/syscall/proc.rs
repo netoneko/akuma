@@ -476,7 +476,10 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
         }
         const RLIM_INFINITY: u64 = !0u64;
         let (cur, max) = match resource {
-            3 => (crate::config::USER_STACK_SIZE as u64, crate::config::USER_STACK_SIZE as u64),
+            3 => {
+                let stack_size = akuma_exec::runtime::config().user_stack_size as u64;
+                (stack_size, stack_size)
+            },
             7 => (1024, 1024),
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };

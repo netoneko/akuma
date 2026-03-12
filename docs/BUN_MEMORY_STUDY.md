@@ -529,6 +529,120 @@ thread unmaps the region between validation and use.
 
 ---
 
+## 10. Automatic User Stack Sizing
+
+### Symptom
+
+`bun install @google/gemini-cli` crashes with SIGSEGV during package resolution:
+
+```
+[WILD-DA] pid=54 FAR=0x74 ELR=0x5410618 last_sc=56 (openat)
+  x2=0x725c33312e302e33 ("3.0.1\r3")
+  x3=0x6e656d6d6f436e5c ("\nCommon")
+[signal] Delivering sig 11 to handler 0x2ceca60
+```
+
+FAR=0x74 is address 116 -- a null pointer dereference with a small offset.
+This occurs during JSON parsing of the package metadata for gemini-cli's
+263 dependencies. The same binary successfully installs `express` (30 deps).
+
+### Root Cause (Hypothesis)
+
+Bun uses deep recursion for JSON parsing. With a complex dependency tree
+like gemini-cli (263 packages with nested dependencies), the stack depth
+exceeds the allocated user stack size. The previous 2MB fixed stack was
+sufficient for simple packages but may be exhausted by complex ones.
+
+The null pointer dereference is likely a consequence of stack corruption
+from buffer overflow -- the actual data structures are corrupted when
+the stack grows into adjacent memory.
+
+### Fix
+
+Implemented automatic user stack sizing based on available RAM:
+
+```rust
+// src/config.rs
+pub const USER_STACK_SIZE_OVERRIDE: usize = 0;  // 0 = auto
+
+pub const fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
+    if USER_STACK_SIZE_OVERRIDE != 0 {
+        return USER_STACK_SIZE_OVERRIDE;
+    }
+    // Stack = RAM / 2048, clamped to [128KB, 8MB]
+    let computed = ram_size_bytes / 2048;
+    clamp(computed, 128*1024, 8*1024*1024)
+}
+```
+
+Scaling table:
+
+| RAM    | Stack Size |
+|--------|------------|
+| 256 MB | 128 KB     |
+| 512 MB | 256 KB     |
+| 1 GB   | 512 KB     |
+| 2 GB   | 1 MB       |
+| 4 GB   | 2 MB       |
+| 8 GB   | 4 MB       |
+| 16 GB+ | 8 MB (max) |
+
+The kernel logs the computed stack size at boot:
+
+```
+User stack: 1024 KB (auto-scaled from RAM)
+```
+
+Set `USER_STACK_SIZE_OVERRIDE` to a non-zero value in `config.rs` to
+override automatic scaling.
+
+---
+
+## 11. UDP Buffer Size for DNS
+
+### Symptom
+
+DNS responses larger than 512 bytes may be truncated, causing resolution
+failures for packages with many CNAME chains, A/AAAA records, or TXT
+records in the additional section.
+
+### Fix
+
+Increased `UDP_PAYLOAD_SIZE` from 512 to 1500 bytes in
+`crates/akuma-net/src/smoltcp_net.rs`:
+
+```rust
+const UDP_PAYLOAD_SIZE: usize = 1500;
+```
+
+1500 bytes is the standard Ethernet MTU and handles most DNS responses
+without fragmentation.
+
+---
+
+## Memory Requirements Summary
+
+| Package Complexity | Minimum RAM | Notes                           |
+|--------------------|-------------|----------------------------------|
+| Simple (express)   | 256 MB      | 30 packages, basic resolution   |
+| Medium (typescript)| 512 MB-1 GB | More complex dep tree           |
+| Large (gemini-cli) | 1.5-2+ GB   | 263 packages, deep recursion    |
+
+### OOM Crash Signature
+
+When bun runs out of memory during operation, the crash pattern is:
+
+```
+[DA-DP] ... anon alloc failed, 0 free pages
+[signal] sig 11 frame page ... not mappable
+[Fault] Process N (name) SIGSEGV after Xs
+```
+
+This indicates the demand paging handler couldn't allocate a physical
+page for a heap/stack expansion.
+
+---
+
 ## Related Documentation
 
 - `docs/DEVICE_MMIO_VA_CONFLICT.md` -- Device MMIO remapping details

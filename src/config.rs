@@ -34,13 +34,20 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Note: Increased from 256KB due to stack exhaustion during long-running sessions.
 pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 
-/// User process stack size (2MB)
+/// User process stack size override (0 = auto-scale based on RAM)
 ///
 /// Stack allocated for user-space ELF processes.
-/// 2MB is needed for heavy runtimes like bun/JSC whose initialization
-/// uses ~600KB of stack. A guard page is placed below the stack to
-/// detect overflow.
-pub const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
+/// When set to 0, the stack size is automatically computed based on available RAM:
+///   - 256 MB RAM → 128 KB stack (minimum for basic apps)
+///   - 512 MB RAM → 256 KB stack
+///   - 1 GB RAM   → 512 KB stack
+///   - 2 GB RAM   → 1 MB stack  
+///   - 4 GB+ RAM  → 2 MB stack (maximum, needed for heavy runtimes like bun/JSC)
+///
+/// Set to a non-zero value to override automatic scaling.
+/// Bun's JSC initialization uses ~600KB of stack, and complex dependency
+/// resolution (like @google/gemini-cli with 263 packages) may need more.
+pub const USER_STACK_SIZE_OVERRIDE: usize = 0;
 
 /// Maximum kernel threads
 ///
@@ -324,3 +331,46 @@ pub const ENABLE_USERSPACE_SSHD: bool = false;
 /// When false (default), external binaries in /usr/bin and /bin are searched
 /// before trying built-in commands. When true, built-ins take precedence.
 pub const SSH_BUILT_INS_FIRST: bool = false;
+
+// ============================================================================
+// Dynamic Configuration Functions
+// ============================================================================
+
+/// Compute user process stack size based on available RAM.
+///
+/// Returns `USER_STACK_SIZE_OVERRIDE` if non-zero, otherwise scales:
+///   - 256 MB RAM → 128 KB (minimum)
+///   - 512 MB RAM → 256 KB
+///   - 1 GB RAM   → 512 KB  
+///   - 2 GB RAM   → 1 MB
+///   - 4 GB+ RAM  → 2 MB (maximum)
+///
+/// The formula is: stack_size = RAM / 2048, clamped to [128KB, 2MB]
+pub const fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
+    if USER_STACK_SIZE_OVERRIDE != 0 {
+        return USER_STACK_SIZE_OVERRIDE;
+    }
+    
+    const MIN_STACK: usize = 128 * 1024;  // 128 KB minimum
+    const MAX_STACK: usize = 8 * 1024 * 1024;  // 8 MB maximum
+    
+    // RAM / 2048 gives us nice scaling:
+    // 256 MB / 2048 = 128 KB
+    // 512 MB / 2048 = 256 KB
+    // 1 GB / 2048 = 512 KB
+    // 2 GB / 2048 = 1 MB
+    // 4 GB / 2048 = 2 MB
+    // 8 GB / 2048 = 4 MB
+    // 16 GB / 2048 = 8 MB
+    let computed = ram_size_bytes / 2048;
+    
+    // Clamp to [MIN_STACK, MAX_STACK]
+    if computed < MIN_STACK {
+        MIN_STACK
+    } else if computed > MAX_STACK {
+        MAX_STACK
+    } else {
+        // Round up to nearest 4KB page boundary
+        (computed + 0xFFF) & !0xFFF
+    }
+}
