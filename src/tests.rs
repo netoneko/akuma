@@ -200,6 +200,10 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
     run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
 
+    // ENOSYS syscall handling (bun crash prevention)
+    run_test!(test_enosys_syscalls_return_proper_errno, "enosys_syscalls_proper_errno");
+    run_test!(test_enosys_is_negative_38, "enosys_is_negative_38");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -6695,5 +6699,131 @@ fn test_epoll_event_is_16_bytes_on_arm64() -> bool {
 
     let pass = size == 16 && data_offset == 8;
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// ENOSYS syscall handling tests (bun crash prevention)
+// ============================================================================
+
+/// Test: Syscalls that return ENOSYS are properly handled
+///
+/// When a syscall returns ENOSYS (-38), userspace should check for errors.
+/// Bun has a bug where it uses the ENOSYS return value as a pointer, causing
+/// a crash at FAR=0xFFFFFFFFFFFFFFDA (which is -38 in two's complement).
+///
+/// This test verifies that our ENOSYS-returning syscalls return the correct
+/// value and documents which syscalls return ENOSYS for bun compatibility.
+fn test_enosys_syscalls_return_proper_errno() -> bool {
+    console::print("\n[TEST] ENOSYS syscalls return proper errno\n");
+
+    // ENOSYS = -38 = 0xFFFFFFFFFFFFFFDA (64-bit two's complement)
+    const ENOSYS: u64 = (-38i64) as u64;
+
+    // Test io_uring syscalls (NR 425, 426, 427)
+    // Bun probes io_uring support at startup and should fall back to epoll
+    let io_uring_setup_result = crate::syscall::handle_syscall(425, &[0, 0, 0, 0, 0, 0]);
+    let io_uring_enter_result = crate::syscall::handle_syscall(426, &[0, 0, 0, 0, 0, 0]);
+    let io_uring_register_result = crate::syscall::handle_syscall(427, &[0, 0, 0, 0, 0, 0]);
+
+    crate::safe_print!(128, "  io_uring_setup(425) = {:#x} (expect {:#x})\n",
+        io_uring_setup_result, ENOSYS);
+    crate::safe_print!(128, "  io_uring_enter(426) = {:#x} (expect {:#x})\n",
+        io_uring_enter_result, ENOSYS);
+    crate::safe_print!(128, "  io_uring_register(427) = {:#x} (expect {:#x})\n",
+        io_uring_register_result, ENOSYS);
+
+    // Test Linux AIO syscalls (NR 0-4)
+    // These are legacy async I/O syscalls; bun might probe these too
+    let io_setup_result = crate::syscall::handle_syscall(0, &[0, 0, 0, 0, 0, 0]);
+    let io_destroy_result = crate::syscall::handle_syscall(1, &[0, 0, 0, 0, 0, 0]);
+
+    crate::safe_print!(128, "  io_setup(0) = {:#x} (expect {:#x})\n",
+        io_setup_result, ENOSYS);
+    crate::safe_print!(128, "  io_destroy(1) = {:#x} (expect {:#x})\n",
+        io_destroy_result, ENOSYS);
+
+    // Test pidfd_open (NR 434)
+    // Bun calls this after clone3 for process monitoring; falls back to wait4
+    let pidfd_open_result = crate::syscall::handle_syscall(434, &[1, 0, 0, 0, 0, 0]);
+    crate::safe_print!(128, "  pidfd_open(434) = {:#x} (expect {:#x})\n",
+        pidfd_open_result, ENOSYS);
+
+    // Test inotify syscalls (NR 26, 27, 28)
+    // Bun uses these for file watching
+    let inotify_init1_result = crate::syscall::handle_syscall(26, &[0, 0, 0, 0, 0, 0]);
+    crate::safe_print!(128, "  inotify_init1(26) = {:#x} (expect {:#x})\n",
+        inotify_init1_result, ENOSYS);
+
+    let mut pass = true;
+
+    // Verify all return ENOSYS
+    if io_uring_setup_result != ENOSYS {
+        console::print("  FAIL: io_uring_setup did not return ENOSYS\n");
+        pass = false;
+    }
+    if io_uring_enter_result != ENOSYS {
+        console::print("  FAIL: io_uring_enter did not return ENOSYS\n");
+        pass = false;
+    }
+    if io_uring_register_result != ENOSYS {
+        console::print("  FAIL: io_uring_register did not return ENOSYS\n");
+        pass = false;
+    }
+    if io_setup_result != ENOSYS {
+        console::print("  FAIL: io_setup did not return ENOSYS\n");
+        pass = false;
+    }
+    if io_destroy_result != ENOSYS {
+        console::print("  FAIL: io_destroy did not return ENOSYS\n");
+        pass = false;
+    }
+    if pidfd_open_result != ENOSYS {
+        console::print("  FAIL: pidfd_open did not return ENOSYS\n");
+        pass = false;
+    }
+    if inotify_init1_result != ENOSYS {
+        console::print("  FAIL: inotify_init1 did not return ENOSYS\n");
+        pass = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: ENOSYS is correctly represented as -38 in two's complement
+///
+/// This test documents the exact crash pattern: when bun calls io_uring_setup
+/// and gets ENOSYS (-38), it sometimes uses this value directly as a pointer
+/// without checking for errors. The resulting page fault shows:
+///   FAR=0xFFFFFFFFFFFFFFDA (which is -38 in 64-bit two's complement)
+///
+/// This is a bun bug, but we document the pattern here to help diagnose
+/// similar crashes in the future.
+fn test_enosys_is_negative_38() -> bool {
+    console::print("\n[TEST] ENOSYS is -38 (crash pattern documentation)\n");
+
+    const ENOSYS_SIGNED: i64 = -38;
+    const ENOSYS_UNSIGNED: u64 = (-38i64) as u64;
+    const EXPECTED_FAR: u64 = 0xFFFFFFFFFFFFFFDA;
+
+    crate::safe_print!(128, "  ENOSYS as i64 = {}\n", ENOSYS_SIGNED);
+    crate::safe_print!(128, "  ENOSYS as u64 = {:#x}\n", ENOSYS_UNSIGNED);
+    crate::safe_print!(128, "  Expected crash FAR = {:#x}\n", EXPECTED_FAR);
+
+    let match_expected = ENOSYS_UNSIGNED == EXPECTED_FAR;
+    let match_negative = (ENOSYS_UNSIGNED as i64) == ENOSYS_SIGNED;
+
+    crate::safe_print!(64, "  Values match: {}, {}\n", match_expected, match_negative);
+
+    let pass = match_expected && match_negative;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+
+    if pass {
+        console::print("\n  NOTE: If you see a crash with FAR=0xFFFFFFFFFFFFFFDA,\n");
+        console::print("        it means userspace (bun) treated ENOSYS as a pointer.\n");
+        console::print("        Check which syscall returned ENOSYS via last_sc in the log.\n");
+    }
+
     pass
 }

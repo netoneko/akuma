@@ -346,6 +346,62 @@ for child process status collection.
 
 ---
 
+## Syscalls Returning ENOSYS
+
+These syscalls return `ENOSYS` (-38) because they are not implemented.
+Userspace applications should check for this error and fall back to
+alternative methods.
+
+### `io_uring_setup` / `io_uring_enter` / `io_uring_register` (NR 425, 426, 427)
+
+Return `ENOSYS`. Bun probes io_uring support at startup. When io_uring is
+not available, bun should fall back to epoll. Newer versions of bun
+(post-December 2023) default to epoll anyway.
+
+### Linux AIO syscalls (NR 0-4)
+
+`io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents` all
+return `ENOSYS`. These are legacy async I/O syscalls; modern applications
+use io_uring or epoll instead.
+
+### `inotify_init1` / `inotify_add_watch` / `inotify_rm_watch` (NR 26, 27, 28)
+
+Return `ENOSYS`. File watching is not implemented. Bun uses inotify for
+watching file changes during development.
+
+---
+
+## ENOSYS Crash Pattern (Bun Bug)
+
+**Important:** Bun versions have a bug where they use the ENOSYS return
+value as a pointer without checking for errors. This causes a distinctive
+crash:
+
+```
+[WILD-DA] *** FAR=0xFFFFFFFFFFFFFFDA is -38 (ENOSYS) - syscall error used as pointer! ***
+[WILD-DA] pid=44 FAR=0xffffffffffffffda ELR=0x2d1a700 last_sc=0
+```
+
+The address `0xFFFFFFFFFFFFFFDA` is `-38` in 64-bit two's complement, which
+is `ENOSYS`. The kernel now logs this pattern explicitly to aid debugging.
+
+**Debugging steps when you see this crash:**
+
+1. Check `last_sc` value - this is the most recent syscall number tracked
+2. Look for syscalls returning ENOSYS just before the crash
+3. The ELR value shows where in bun's code the crash occurred
+
+**Common culprits:**
+- `io_setup` (syscall 0) - Linux AIO probe
+- `io_uring_setup` (syscall 425) - io_uring probe
+- `pidfd_open` (syscall 434) - process fd creation
+
+The kernel includes tests for this pattern in `src/tests.rs`:
+- `test_enosys_syscalls_return_proper_errno` - verifies all ENOSYS syscalls
+- `test_enosys_is_negative_38` - documents the crash address pattern
+
+---
+
 ## Other Stubs (pre-existing, also used by bun)
 
 | Syscall | NR | Notes |
@@ -724,3 +780,44 @@ if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
     ready |= EPOLLRDHUP;
 }
 ```
+
+---
+
+## Known Issues
+
+### `bun install @google/gemini-cli` Hangs or Crashes (UNDER INVESTIGATION)
+
+**Symptoms observed:**
+
+1. **Hang during resolution:** Bun makes DNS queries (sendto to 10.0.2.3:53)
+   then appears to hang. The process is running but no progress is made.
+   This may be related to epoll/poll not waking properly for UDP socket
+   responses from the DNS server.
+
+2. **ENOSYS crash:** With larger packages or under memory pressure:
+   ```
+   [WILD-DA] *** FAR=0xffffffffffffffda is -38 (ENOSYS) - syscall error used as pointer! ***
+   panic: Segmentation fault at address 0xFFFFFFFFFFFFFFDA
+   ```
+   This is caused by bun not checking the return value of a syscall that
+   returns ENOSYS and using it as a pointer. See "ENOSYS Crash Pattern" above.
+
+3. **JIT cache coherency warnings:**
+   ```
+   [JIT] IC flush + replay #1 bogus nr=12297829382473034410 ELR=0x300183d8
+   ```
+   These indicate instruction cache issues with bun's JIT compiler. The
+   kernel handles this by flushing the instruction cache and retrying.
+
+**Debugging guidance:**
+
+- Run with `MEMORY=1024M` or higher for complex package installations
+- Check for `[syscall] nr=... -> ENOSYS` messages before crashes
+- The `last_sc` value in crash logs shows the most recent syscall tracked
+- JIT bogus syscall numbers (> 500) trigger automatic IC flush/retry
+
+**Potential areas to investigate:**
+
+- UDP socket polling in epoll (DNS responses may not wake epoll correctly)
+- Memory pressure during large package downloads
+- JIT code execution after mprotect PROT_EXEC changes

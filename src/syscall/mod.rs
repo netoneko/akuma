@@ -653,13 +653,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
-        nr::PIDFD_OPEN => {
-            let target_pid = args[0] as u32;
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(64, "[syscall] pidfd_open(pid={})\n", target_pid);
-            }
-            ENOSYS
-        }
+        nr::PIDFD_OPEN => ENOSYS,
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
