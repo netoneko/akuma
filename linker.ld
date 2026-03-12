@@ -3,8 +3,15 @@ ENTRY(_boot)
 /* Kernel virtual address base - upper half of address space */
 KERNEL_VIRT_BASE = 0xFFFF000040000000;
 
-/* Physical load address - where QEMU loads the kernel */
-KERNEL_PHYS_BASE = 0x40000000;
+/* Physical load address - where QEMU loads the kernel.
+ * When using flat binary with ARM64 Image header, QEMU loads at
+ * RAM_BASE + text_offset. With text_offset < 4KB, QEMU adds 2MB,
+ * so we get RAM_BASE + 2MB = 0x40200000.
+ *
+ * Note: The first 2MB of RAM (0x40000000-0x401FFFFF) can be used
+ * for the DTB which QEMU places there for flat binary boots.
+ */
+KERNEL_PHYS_BASE = 0x40200000;
 
 /* Offset to convert between physical and virtual */
 KERNEL_OFFSET = KERNEL_VIRT_BASE - KERNEL_PHYS_BASE;
@@ -82,14 +89,14 @@ SECTIONS
 
 /*
  * Boot stack layout check:
- *   KERNEL_PHYS_BASE = 0x40000000
- *   STACK_TOP        = 0x40800000 (8MB from base)
+ *   KERNEL_PHYS_BASE = 0x40200000
+ *   STACK_TOP        = 0x40A00000 (8MB from kernel base)
  *   STACK_SIZE       = 0x100000   (1MB)
- *   STACK_BOTTOM     = 0x40700000 (7MB from base)
+ *   STACK_BOTTOM     = 0x40900000 (7MB from kernel base)
  *
  * Kernel binary must fit below STACK_BOTTOM.
  * This assertion fails the build if kernel is too large.
  */
-STACK_BOTTOM = 0x40700000;
+STACK_BOTTOM = 0x40900000;
 ASSERT(_kernel_phys_end < STACK_BOTTOM, 
-    "FATAL: Kernel binary overlaps boot stack! Kernel end must be < 0x40700000 (7MB from base). Reduce kernel size or increase STACK_TOP in boot.rs.")
+    "FATAL: Kernel binary overlaps boot stack! Kernel end must be < 0x40900000 (7MB from base). Reduce kernel size or increase STACK_TOP in boot.rs.")

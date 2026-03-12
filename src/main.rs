@@ -128,38 +128,30 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 
 /// Scan RAM for a QEMU-generated DTB when x0 is zero.
 ///
-/// QEMU places the DTB after the kernel binary, aligned to a 2 MB boundary
-/// (aarch64 convention). We scan 2 MB boundaries within the boot page table's
-/// identity-mapped RAM region (L1[1]: 0x40000000-0x7FFFFFFF).
+/// When using ARM64 Image header boot, the kernel is at 0x40200000 and
+/// QEMU places DTB in the first 2MB at 0x40000000.
 #[cfg(not(feature = "firecracker"))]
 fn scan_for_dtb() -> usize {
     const FDT_MAGIC_LE: u32 = 0xedfe0dd0; // big-endian 0xd00dfeed read as little-endian
-    const ALIGN_2MB: usize = 2 * 1024 * 1024;
-    // Stay within the L1[1] identity-mapped block (0x40000000-0x7FFFFFFF)
-    const SCAN_END: usize = 0x8000_0000;
 
-    unsafe extern "C" {
-        static _kernel_phys_end: u8;
-    }
-    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+    // With ARM64 Image header, DTB is placed at RAM_BASE (0x40000000)
+    // before the kernel which is at RAM_BASE + 2MB (0x40200000)
+    const DTB_LOCATION: usize = 0x4000_0000;
 
-    let start = (kernel_end + ALIGN_2MB - 1) & !(ALIGN_2MB - 1);
-    let mut addr = start;
-    while addr < SCAN_END {
-        let magic = unsafe { core::ptr::read_volatile(addr as *const u32) };
-        if magic == FDT_MAGIC_LE {
-            let total_size = u32::from_be(unsafe { core::ptr::read_volatile((addr + 4) as *const u32) });
-            if total_size >= 64 && total_size <= 16 * 1024 * 1024 {
-                console::print("[DTB] Found at 0x");
-                console::print_hex(addr as u64);
-                console::print(" (scanned)\n");
-                return addr;
-            }
+    let magic = unsafe { core::ptr::read_volatile(DTB_LOCATION as *const u32) };
+    if magic == FDT_MAGIC_LE {
+        let total_size = u32::from_be(unsafe { core::ptr::read_volatile((DTB_LOCATION + 4) as *const u32) });
+        if total_size >= 64 && total_size <= 16 * 1024 * 1024 {
+            console::print("[DTB] Found at 0x");
+            console::print_hex(DTB_LOCATION as u64);
+            console::print("\n");
+            return DTB_LOCATION;
         }
-        addr += ALIGN_2MB;
     }
 
-    console::print("[DTB] Not found by scan\n");
+    console::print("[DTB] Not found at expected location 0x");
+    console::print_hex(DTB_LOCATION as u64);
+    console::print("\n");
     0
 }
 
@@ -183,7 +175,7 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     let actual_dtb_ptr = dtb_ptr;
 
     if actual_dtb_ptr == 0 {
-        console::print("[Memory] No DTB found, reserving last 2MB for QEMU data\n");
+        console::print("[Memory] No DTB found, using default 256MB\n");
         return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE);
     }
 
@@ -223,15 +215,18 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
     // Stack layout: STACK_TOP = KERNEL_BASE + 8 MB, STACK_SIZE = 1 MB
-    //   QEMU:        KERNEL_BASE=0x40000000, STACK_BOTTOM=0x40700000
+    //   QEMU:        KERNEL_BASE=0x40200000, STACK_BOTTOM=0x40900000
     //   Firecracker: KERNEL_BASE=0x80000000, STACK_BOTTOM=0x80700000
+    //
+    // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 2MB
+    // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
     #[cfg(not(feature = "firecracker"))]
-    const KERNEL_BASE: usize = 0x4000_0000;
+    const KERNEL_BASE: usize = 0x4020_0000;
     #[cfg(feature = "firecracker")]
     const KERNEL_BASE: usize = 0x8000_0000;
 
     #[cfg(not(feature = "firecracker"))]
-    const STACK_BOTTOM: usize = 0x4070_0000;
+    const STACK_BOTTOM: usize = 0x4090_0000;
     #[cfg(feature = "firecracker")]
     const STACK_BOTTOM: usize = 0x8070_0000;
 

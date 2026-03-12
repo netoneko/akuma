@@ -21,8 +21,9 @@ const PHYS_BASE: usize = 0x4000_0000;
 const PHYS_BASE: usize = 0x8000_0000;
 
 // Boot stack top = kernel base + 8 MB
+// With ARM64 Image header, kernel is at 0x40200000, so stack top is at 0x40A00000
 #[cfg(not(feature = "firecracker"))]
-const BOOT_STACK_TOP: usize = 0x4080_0000;
+const BOOT_STACK_TOP: usize = 0x40A0_0000;
 #[cfg(feature = "firecracker")]
 const BOOT_STACK_TOP: usize = 0x8080_0000;
 
@@ -60,17 +61,26 @@ global_asm!(
 
 _boot:
     // ARM64 Linux Image header (64 bytes).
-    // QEMU checks for the magic at offset 0x38 even when loading ELF.
-    // If found, QEMU sets x0 = DTB address before jumping to entry.
+    // When QEMU detects this header in a flat binary, it:
+    //   1. Checks for "ARM\x64" magic at offset 56
+    //   2. If magic found AND image_size != 0, loads at RAM_BASE + text_offset
+    //   3. If text_offset < 4KB, QEMU adds 2MB to it
+    //
+    // To load at 0x40200000 (RAM_BASE + 2MB), we use:
+    //   - ARM\x64 magic at offset 56
+    //   - image_size != 0 at offset 16
+    //   - text_offset = 0 (QEMU will add 2MB, resulting in RAM_BASE + 2MB)
+    //
+    // The kernel must be linked at 0x40200000 to match.
     b       _boot_code          // code0: branch past header
-    .word   0                   // code1
-    .quad   0                   // text_offset
-    .quad   0                   // image_size (0 = unspecified)
-    .quad   0                   // flags: LE, unspecified page size
+    .word   0                   // code1 (not used)
+    .quad   0                   // text_offset = 0 (QEMU adds 2MB)
+    .quad   0x300000            // image_size = 3MB (non-zero to enable text_offset)
+    .quad   0                   // flags: little-endian, 4K pages
     .quad   0                   // res2
     .quad   0                   // res3
     .quad   0                   // res4
-    .word   0x644d5241          // magic: "ARM\x64"
+    .word   0x644d5241          // magic: "ARM\x64" at offset 56
     .word   0                   // res5
 
 _boot_code:

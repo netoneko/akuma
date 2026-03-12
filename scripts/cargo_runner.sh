@@ -6,6 +6,12 @@ set -e
 
 MEMORY="${MEMORY:-256M}"
 ELF="$1"
+BIN="${ELF}.bin"
+
+# Convert ELF to flat binary.
+# The binary starts with a branch instruction (not ARM64 Image magic),
+# so QEMU loads it at RAM_BASE (0x40000000) without any offset.
+rust-objcopy -O binary "$ELF" "$BIN"
 
 exec qemu-system-aarch64 \
   -semihosting \
@@ -22,4 +28,4 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -kernel "$ELF"
+  -kernel "$BIN"

@@ -2,12 +2,17 @@
 set -e
 
 KERNEL_ELF="target/aarch64-unknown-none/release/akuma"
+KERNEL_BIN="${KERNEL_ELF}.bin"
 
 if [ ! -f "$KERNEL_ELF" ]; then
     echo "Kernel not found at $KERNEL_ELF"
     echo "Run 'cargo build --release' first"
     exit 1
 fi
+
+# Convert ELF to flat binary with ARM64 Image header.
+# This allows QEMU to pass DTB address in x0.
+rust-objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN"
 
 MEMORY="${MEMORY:-256M}"
 
@@ -34,5 +39,5 @@ qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
-  -kernel "$KERNEL_ELF" \
+  -kernel "$KERNEL_BIN" \
   $EXTRA_ARGS
