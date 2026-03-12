@@ -56,8 +56,9 @@ Target: `aarch64-unknown-none` (set in `rust-toolchain.toml`, nightly Rust requi
 - `src/config.rs` — Tunable kernel parameters
 
 **Memory layout:**
-- `0x4000_0000` — Kernel code/data
-- Kernel heap: ~120 MB (talc allocator)
+- `0x4000_0000` — RAM base (DTB placed here by QEMU)
+- `0x4020_0000` — Kernel code/data (loaded at RAM_BASE + 2MB via ARM64 Image header)
+- Kernel heap: dynamically sized (1/4 of RAM, e.g., 256MB with 1GB RAM)
 - Per-process: user stack 2 MB with guard page (configurable in `src/config.rs`)
 - User VA space: up to 4 GB (dynamically sized based on binary requirements)
 - Device MMIO (GIC, UART, fw_cfg) is NOT in user page tables — accessed via `with_boot_ttbr0()` swap. VirtIO (0x0a00_0000) remains in user tables. See `docs/DEVICE_MMIO_VA_CONFLICT.md`.

@@ -132,11 +132,15 @@ Akuma is a bare-metal kernel for AArch64, designed to run on QEMU's virt machine
 
 ### Boot Sequence
 
-1. **Stage 1**: `boot.rs` - Setup stack, MMU, jump to Rust
-2. **Stage 2**: `main.rs:kernel_main` - Initialize subsystems
+1. **Stage 1**: `boot.rs` - ARM64 Image header, save DTB pointer (x0), setup stack, zero BSS, setup MMU, jump to Rust
+2. **Stage 2**: `main.rs:kernel_main` - Detect RAM from DTB, initialize allocator and subsystems
 3. **Stage 3**: Enable preemption, run tests
 4. **Stage 4**: Initialize filesystem and network
 5. **Stage 5**: Enter async main loop
+
+The kernel is loaded as a flat binary with an ARM64 Linux Image header. QEMU
+recognizes this header and passes the DTB address in x0, enabling automatic
+memory detection for any RAM size (256MB to 4GB+).
 
 ### Threading Model
 
@@ -224,15 +228,23 @@ Context Switch            Registered Handler
             │   VirtIO MMIO       │
             │   (8 slots)         │
 0x4000_0000 ├─────────────────────┤
-            │   Kernel Code/Data  │
+            │   DTB (2MB)         │  ← Device Tree from QEMU
+0x4020_0000 ├─────────────────────┤
+            │   Kernel Code/Data  │  ← Entry point (_boot)
             ├─────────────────────┤
             │   Kernel Stack      │
             ├─────────────────────┤
-            │   Heap              │
-            │   (~120 MB)         │
-            │                     │
+            │   Heap (16MB)       │
+            ├─────────────────────┤
+            │   User Pages        │
+            │   (up to 944MB      │
+            │    with 1GB RAM)    │
             └─────────────────────┘
 ```
+
+The kernel is loaded at 0x40200000 via the ARM64 Linux Image header protocol,
+which reserves the first 2MB of RAM for the DTB. This allows QEMU to pass the
+DTB address in register x0, enabling automatic RAM size detection.
 
 ---
 
