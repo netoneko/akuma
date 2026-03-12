@@ -620,6 +620,78 @@ without fragmentation.
 
 ---
 
+## 12. gemini-cli Resolution Freeze (ONGOING)
+
+### Symptom
+
+`bun install @google/gemini-cli` freezes during the "Resolving" phase, even
+with sufficient RAM (2GB) and stack (1MB). The process times out after ~11
+seconds without making progress. Meanwhile, `bun install express` works
+correctly under identical conditions.
+
+### Observed Behavior
+
+**express (works):**
+```
+[syscall] sendto(fd=14, len=36, dest=10.0.2.3:53)  <- DNS query
+[syscall] socket(type=TCP) = fd 15                  <- TCP created
+[syscall] connect(fd=15, ip=104.16.2.34:443)       <- HTTPS to registry
+🔍 Resolving [1/131]
+📦 Installing [15/65]
+installed express@5.2.1 [15.99s]
+```
+
+**gemini-cli (freezes):**
+```
+[syscall] sendto(fd=14, len=36, dest=10.0.2.3:53)  <- DNS query sent
+<no TCP connections>
+<no resolution progress>
+[exception] Process 49 (/bin/bun) exited (code 0) [10.99s]  <- worker timeout
+```
+
+### Key Differences
+
+1. **DNS query is sent** for both packages
+2. **No TCP connections** are created for gemini-cli after DNS
+3. **Worker thread exits** after ~11 seconds (bun's internal timeout)
+4. **No SIGSEGV or crash** - bun silently fails to proceed
+
+### Investigation
+
+The DNS query is sent to 10.0.2.3:53 (QEMU's user-mode networking DNS).
+No `recvmsg` or `recvfrom` syscall appears in logs after the DNS query,
+suggesting bun either:
+- Doesn't receive the DNS response
+- Receives it but fails to parse it
+- Has an internal error before attempting TCP connections
+
+Kernel logs show no errors - bun simply doesn't call the network syscalls
+needed to establish HTTP connections.
+
+### Ruling Out
+
+- **Stack size**: Tested with 1MB (2GB RAM) and 2MB (4GB RAM) - same behavior
+- **UDP buffer size**: Increased to 1500 bytes - same behavior  
+- **DNS truncation**: DNS response for npm registry is typically ~200 bytes
+- **IPv6**: IPv6 socket creation fails with ENOSYS but bun falls back to IPv4
+
+### Status
+
+**NOT YET FIXED.** This appears to be a bun-specific issue triggered by
+the `@google/gemini-cli` package metadata. Possible causes:
+
+1. **Package-specific parsing bug**: Something in gemini-cli's metadata
+   triggers a code path in bun that hangs
+2. **Memory allocation failure**: bun's mimalloc may fail silently for
+   the 263-package dependency tree
+3. **DNS response parsing**: The DNS response may have characteristics
+   that trigger a parsing bug
+
+This issue is separate from the kernel - the kernel correctly handles
+all syscalls, but bun never issues the syscalls to proceed.
+
+---
+
 ## Memory Requirements Summary
 
 | Package Complexity | Minimum RAM | Notes                           |
