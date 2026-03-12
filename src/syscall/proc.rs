@@ -119,6 +119,13 @@ pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {
 
 pub(super) fn sys_exit(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
+            let secs = elapsed_us / 1_000_000;
+            let frac = (elapsed_us % 1_000_000) / 10_000;
+            crate::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n", 
+                akuma_exec::threading::current_thread_id(), proc.pid, proc.name, code, secs, frac);
+        }
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
@@ -128,6 +135,13 @@ pub(super) fn sys_exit(code: i32) -> u64 {
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
+            let secs = elapsed_us / 1_000_000;
+            let frac = (elapsed_us % 1_000_000) / 10_000;
+            crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n", 
+                proc.pid, proc.name, code, secs, frac);
+        }
         let l0_phys = proc.address_space.l0_phys();
         proc.exited = true;
         proc.exit_code = code;
@@ -142,13 +156,18 @@ pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child
     const CLONE_THREAD: u64 = 0x10000;
     const CLONE_VFORK: u64 = 0x4000;
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(128, "[syscall] clone(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::tprint!(128, "[clone] flags=0x{:x} stack=0x{:x}\n", flags, stack);
     }
 
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
         match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid) {
-            Ok(tid) => return tid as u64,
+            Ok(tid) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(64, "[clone] new thread TID={}\n", tid);
+                }
+                return tid as u64;
+            }
             Err(e) => {
                 crate::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
                 return EAGAIN;

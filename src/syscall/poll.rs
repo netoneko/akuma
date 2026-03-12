@@ -121,7 +121,11 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
         akuma_exec::process::FileDescriptor::Socket(idx) => {
             if socket::is_udp_socket(idx) {
                 if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                    if requested & EPOLLIN != 0 && akuma_net::smoltcp_net::udp_can_recv(handle) {
+                    let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
+                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                        crate::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
+                    }
+                    if requested & EPOLLIN != 0 && can_recv {
                         ready |= EPOLLIN;
                     }
                     if requested & EPOLLOUT != 0 && akuma_net::smoltcp_net::udp_can_send(handle) {
@@ -206,7 +210,15 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
     };
     let start_time = crate::timer::uptime_us();
 
+    // Log entry for debugging bun resolution hangs
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        crate::tprint!(128, "[epoll] pwait enter: pid={} epfd={} timeout={}ms\n", pid, epfd, timeout);
+    }
+
+    let mut iterations = 0u64;
     loop {
+        iterations += 1;
         akuma_net::smoltcp_net::poll();
 
         let interest_snapshot: Vec<(u32, u32, u64)> = {
@@ -237,6 +249,11 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         }
 
         if ready_count > 0 {
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                let elapsed = crate::timer::uptime_us() - start_time;
+                crate::tprint!(128, "[epoll] pwait ready: {} events after {}us ({}iter)\n", 
+                    ready_count, elapsed, iterations);
+            }
             return ready_count as u64;
         }
 
@@ -247,8 +264,20 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         if timeout > 0 {
             let elapsed = crate::timer::uptime_us() - start_time;
             if elapsed >= timeout_us {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations > 100 {
+                    crate::tprint!(128, "[epoll] pwait timeout: {}us elapsed, {} iterations\n", 
+                        elapsed, iterations);
+                }
                 return 0;
             }
+        }
+
+        // Periodic log for long waits (every 10 seconds)
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations % 100000 == 0 {
+            let elapsed = crate::timer::uptime_us() - start_time;
+            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed, {} fds\n", 
+                pid, epfd, elapsed, interest_snapshot.len());
         }
 
         if akuma_exec::process::is_current_interrupted() {
@@ -369,6 +398,12 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     } else {
         0
     };
+
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        crate::tprint!(128, "[ppoll] enter: pid={} nfds={} timeout_us={}\n", pid, nfds, 
+            if infinite { u64::MAX } else { timeout_us });
+    }
 
     let start_time = crate::timer::uptime_us();
 

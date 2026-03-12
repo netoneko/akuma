@@ -52,7 +52,13 @@ pub(super) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             efd.counter = efd.counter.saturating_add(val);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::tprint!(96, "[eventfd] write id={} val={} counter={}\n", id, val, efd.counter);
+            }
             if let Some(tid) = efd.reader_thread.take() {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(64, "[eventfd] waking reader thread {}\n", tid);
+                }
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
             Ok(())

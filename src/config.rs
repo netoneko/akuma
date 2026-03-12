@@ -205,6 +205,10 @@ pub const PROCESS_SYSCALL_STATS: bool = true;
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
+/// Verbose network/epoll debugging for bun resolution issues.
+/// Logs epoll_pwait enter/exit, UDP recv/send, and DNS traffic.
+pub const SYSCALL_DEBUG_NET_ENABLED: bool = false;
+
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;
 

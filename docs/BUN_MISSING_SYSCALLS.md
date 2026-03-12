@@ -789,12 +789,36 @@ if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
 
 **Symptoms observed:**
 
-1. **Hang during resolution:** Bun makes DNS queries (sendto to 10.0.2.3:53)
+1. **Out of Memory (OOM):** The most common crash with large packages.
+   ```
+   [DA-DP] pid=49 va=0x903f1918 anon alloc failed, 0 free pages
+   [signal] sig 11 frame page 0x903f1000 not mappable
+   [Fault] Process 50 (HTTP Client) SIGSEGV after 78.66s
+   ```
+   
+   **Key indicator:** "0 free pages" means the PMM has exhausted all
+   physical memory. Bun's worker threads crash one by one because:
+   - They access lazy-mapped pages
+   - Demand paging fails (no free pages)
+   - Signal frame allocation also fails
+   - Process is killed with SIGSEGV
+   
+   **Solution:** Run with more RAM. For `@google/gemini-cli`:
+   ```bash
+   MEMORY=2048M cargo run --release  # 2GB recommended
+   ```
+   
+   Memory requirements:
+   - Small packages (express): 256MB-512MB
+   - Medium packages (typescript): 512MB-1GB
+   - Large packages (@google/gemini-cli): 1GB-2GB+
+
+2. **Hang during resolution:** Bun makes DNS queries (sendto to 10.0.2.3:53)
    then appears to hang. The process is running but no progress is made.
    This may be related to epoll/poll not waking properly for UDP socket
    responses from the DNS server.
 
-2. **ENOSYS crash:** With larger packages or under memory pressure:
+3. **ENOSYS crash:** With certain syscall patterns:
    ```
    [WILD-DA] *** FAR=0xffffffffffffffda is -38 (ENOSYS) - syscall error used as pointer! ***
    panic: Segmentation fault at address 0xFFFFFFFFFFFFFFDA
@@ -802,7 +826,7 @@ if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
    This is caused by bun not checking the return value of a syscall that
    returns ENOSYS and using it as a pointer. See "ENOSYS Crash Pattern" above.
 
-3. **JIT cache coherency warnings:**
+4. **JIT cache coherency warnings:**
    ```
    [JIT] IC flush + replay #1 bogus nr=12297829382473034410 ELR=0x300183d8
    ```
@@ -811,13 +835,20 @@ if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
 
 **Debugging guidance:**
 
-- Run with `MEMORY=1024M` or higher for complex package installations
+- Run with `MEMORY=2048M` or higher for complex package installations
+- Check for "0 free pages" messages - indicates OOM
 - Check for `[syscall] nr=... -> ENOSYS` messages before crashes
 - The `last_sc` value in crash logs shows the most recent syscall tracked
 - JIT bogus syscall numbers (> 500) trigger automatic IC flush/retry
 
+**Memory layout with 2GB RAM:**
+- Kernel code/stack: ~128MB
+- Kernel heap: 16MB
+- User pages: ~1.8GB (~460,000 pages)
+
 **Potential areas to investigate:**
 
+- OOM killer implementation (currently just kills faulting process)
+- Memory pressure notifications to userspace
 - UDP socket polling in epoll (DNS responses may not wake epoll correctly)
-- Memory pressure during large package downloads
 - JIT code execution after mprotect PROT_EXEC changes

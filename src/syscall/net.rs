@@ -200,6 +200,11 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
             if !validate_user_ptr(dest_addr, addr_len) { return EFAULT; }
             let a = unsafe { core::ptr::read(dest_addr as *const SockAddrIn) }.to_addr();
             crate::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
+            // Extra debug for DNS traffic
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED && a.port == 53 {
+                crate::tprint!(128, "[DNS] query sent: fd={} len={} to {}.{}.{}.{}:53\n", 
+                    fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3]);
+            }
             a
         } else {
             match socket::udp_default_peer(idx) {
@@ -208,8 +213,18 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
             }
         };
         match socket::socket_send_udp(idx, buf, dest) {
-            Ok(n) => n as u64,
-            Err(e) => (-e as i64) as u64,
+            Ok(n) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
+                    crate::tprint!(64, "[DNS] query sent OK: {} bytes\n", n);
+                }
+                n as u64
+            }
+            Err(e) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
+                    crate::tprint!(64, "[DNS] query send error: {}\n", e);
+                }
+                (-e as i64) as u64
+            }
         }
     } else {
         match socket::socket_send(idx, buf, fd_is_nonblock(fd)) {
@@ -229,8 +244,16 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            crate::tprint!(96, "[UDP] recvfrom: fd={} len={} nonblock={}\n", fd, len, nonblock);
+        }
         match socket::socket_recv_udp(idx, buf, nonblock) {
             Ok((n, from)) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    let ip = from.ip;
+                    crate::tprint!(96, "[UDP] recvfrom OK: {} bytes from {}.{}.{}.{}:{}\n", 
+                        n, ip[0], ip[1], ip[2], ip[3], from.port);
+                }
                 if src_addr != 0 && addr_len_ptr != 0 {
                     if validate_user_ptr(src_addr, core::mem::size_of::<SockAddrIn>())
                         && validate_user_ptr(addr_len_ptr, core::mem::size_of::<u32>())
@@ -242,7 +265,12 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 }
                 n as u64
             }
-            Err(e) => (-e as i64) as u64,
+            Err(e) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
+                    crate::tprint!(64, "[UDP] recvfrom error: {}\n", e);
+                }
+                (-e as i64) as u64
+            }
         }
     } else {
         match socket::socket_recv(idx, buf, nonblock) {
@@ -459,8 +487,16 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            crate::tprint!(96, "[UDP] recvmsg: fd={} buflen={} nonblock={}\n", fd, buf.len(), nonblock);
+        }
         match socket::socket_recv_udp(idx, buf, nonblock) {
             Ok((n, from)) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    let ip = from.ip;
+                    crate::tprint!(96, "[UDP] recvmsg OK: {} bytes from {}.{}.{}.{}:{}\n",
+                        n, ip[0], ip[1], ip[2], ip[3], from.port);
+                }
                 if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32 {
                     if validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
                         let sa = SockAddrIn::from_addr(&from);
@@ -472,7 +508,12 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 msg.msg_flags = 0;
                 n as u64
             }
-            Err(e) => (-e as i64) as u64,
+            Err(e) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
+                    crate::tprint!(64, "[UDP] recvmsg error: {}\n", e);
+                }
+                (-e as i64) as u64
+            }
         }
     } else {
         match socket::socket_recv(idx, buf, nonblock) {

@@ -766,7 +766,7 @@ pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, s
     }).unwrap_or(Err(()))
 }
 
-#[must_use] 
+#[must_use]
 pub fn udp_can_recv(handle: SocketHandle) -> bool {
     with_network(|net| {
         net.sockets.get::<udp::Socket>(handle).can_recv()

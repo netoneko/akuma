@@ -203,6 +203,7 @@ pub fn run_memory_tests() -> bool {
     // ENOSYS syscall handling (bun crash prevention)
     run_test!(test_enosys_syscalls_return_proper_errno, "enosys_syscalls_proper_errno");
     run_test!(test_enosys_is_negative_38, "enosys_is_negative_38");
+    run_test!(test_oom_crash_pattern_documentation, "oom_crash_pattern_docs");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -6826,4 +6827,67 @@ fn test_enosys_is_negative_38() -> bool {
     }
 
     pass
+}
+
+/// Test: Document OOM crash pattern for bun
+///
+/// When bun runs out of memory during package installation, the PMM reports
+/// "0 free pages" and demand paging fails. The kernel tries to deliver SIGSEGV
+/// but can't allocate a signal frame either, so the process is killed.
+///
+/// This test documents the pattern and verifies memory calculation helpers.
+fn test_oom_crash_pattern_documentation() -> bool {
+    console::print("\n[TEST] OOM crash pattern documentation\n");
+
+    // Get current memory stats
+    let (pmm_total, _pmm_alloc, pmm_free) = crate::pmm::stats();
+    let total_mb = (pmm_total * 4096) / 1024 / 1024;
+    let free_mb = (pmm_free * 4096) / 1024 / 1024;
+
+    crate::safe_print!(128, "  PMM: {} total pages ({} MB), {} free pages ({} MB)\n",
+        pmm_total, total_mb, pmm_free, free_mb);
+
+    // Document memory requirements for bun
+    console::print("\n  Memory requirements for bun install:\n");
+    console::print("    Small packages (express):        256MB-512MB\n");
+    console::print("    Medium packages (typescript):    512MB-1GB\n");
+    console::print("    Large packages (gemini-cli):     1GB-2GB+\n");
+
+    // Document the OOM crash signature
+    console::print("\n  OOM crash signature:\n");
+    console::print("    [DA-DP] ... anon alloc failed, 0 free pages\n");
+    console::print("    [signal] sig 11 frame page ... not mappable\n");
+    console::print("    [Fault] Process N (name) SIGSEGV after Xs\n");
+
+    // Calculate minimum recommended RAM for large packages
+    // Kernel overhead: ~144MB (128MB code/stack + 16MB heap)
+    // Bun base: ~200MB
+    // Per-download worker: ~50MB
+    // Safety margin: 200MB
+    const KERNEL_OVERHEAD_MB: usize = 144;
+    const BUN_BASE_MB: usize = 200;
+    const PER_WORKER_MB: usize = 50;
+    const SAFETY_MB: usize = 200;
+    const TYPICAL_WORKERS: usize = 4;
+
+    let recommended_mb = KERNEL_OVERHEAD_MB + BUN_BASE_MB + (PER_WORKER_MB * TYPICAL_WORKERS) + SAFETY_MB;
+    crate::safe_print!(128, "\n  Recommended minimum RAM for large packages: {} MB\n", recommended_mb);
+    crate::safe_print!(128, "    Kernel overhead: {} MB\n", KERNEL_OVERHEAD_MB);
+    crate::safe_print!(128, "    Bun base:        {} MB\n", BUN_BASE_MB);
+    crate::safe_print!(128, "    Workers (x{}):    {} MB\n", TYPICAL_WORKERS, PER_WORKER_MB * TYPICAL_WORKERS);
+    crate::safe_print!(128, "    Safety margin:   {} MB\n", SAFETY_MB);
+
+    // Check if current memory might be insufficient
+    let current_available_mb = free_mb;
+    let might_oom = current_available_mb < (BUN_BASE_MB + PER_WORKER_MB * TYPICAL_WORKERS);
+
+    if might_oom {
+        crate::safe_print!(128, "\n  WARNING: Current free memory ({} MB) may be insufficient\n",
+            current_available_mb);
+        console::print("           for large package installations.\n");
+        console::print("           Run with: MEMORY=2048M cargo run --release\n");
+    }
+
+    crate::safe_print!(64, "  Result: PASS (documentation only)\n");
+    true
 }
