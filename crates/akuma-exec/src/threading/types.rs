@@ -173,6 +173,9 @@ pub struct ThreadSlot {
     pub start_time_us: u64,
     pub timeout_us: u64,
     pub exception_stack_top: u64,
+    /// Address of a fault handler for user memory access (copy_from/to_user).
+    /// If non-zero, an EL1 Data Abort will redirect here instead of killing the process.
+    pub user_copy_fault_handler: u64,
 }
 
 impl ThreadSlot {
@@ -182,6 +185,7 @@ impl ThreadSlot {
             start_time_us: 0,
             timeout_us: 0,
             exception_stack_top: 0,
+            user_copy_fault_handler: 0,
         }
     }
 }

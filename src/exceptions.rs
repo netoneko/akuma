@@ -1042,6 +1042,19 @@ extern "C" fn rust_sync_el1_handler() {
         // Kernel is loaded at RAM_BASE+2MB (0x4020_0000) and extends to ~0x6000_0000.
         let in_kernel_code = elr >= 0x4020_0000 && elr < 0x6000_0000;
         if in_kernel_code {
+            // Check if thread has a registered fault handler for user copy operations
+            let fault_handler = akuma_exec::threading::get_user_copy_fault_handler();
+            if fault_handler != 0 {
+                // Redirect ELR to the recovery handler
+                // This allows copy_from_user/copy_to_user to return EFAULT safely
+                unsafe {
+                    core::arch::asm!("msr elr_el1, {}", in(reg) fault_handler);
+                }
+                // Clear the handler to prevent infinite loops if the recovery code itself faults
+                akuma_exec::threading::set_user_copy_fault_handler(0);
+                return;
+            }
+
             let _ = write!(w, "  EC=0x25 in kernel code — killing current process (EFAULT)\n");
             w.flush();
             if let Some(proc) = akuma_exec::process::current_process() {

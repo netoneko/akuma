@@ -2215,6 +2215,33 @@ pub fn mark_current_terminated() {
     }
 }
 
+/// Get the current thread's user copy fault handler address
+pub fn get_user_copy_fault_handler() -> u64 {
+    let tid = get_current_thread_register();
+    if tid < MAX_THREADS {
+        // Safe to read lock-free? No, it's not atomic.
+        // But in exception handler (which calls this), we are effectively atomic wrt this thread.
+        // However, correct way is lock.
+        with_irqs_disabled(|| {
+            let pool = POOL.lock();
+            pool.slots[tid].user_copy_fault_handler
+        })
+    } else {
+        0
+    }
+}
+
+/// Set the current thread's user copy fault handler address
+pub fn set_user_copy_fault_handler(handler: u64) {
+    let tid = get_current_thread_register();
+    if tid < MAX_THREADS {
+        with_irqs_disabled(|| {
+            let mut pool = POOL.lock();
+            pool.slots[tid].user_copy_fault_handler = handler;
+        })
+    }
+}
+
 /// Get current thread ID from TPIDR_EL0 register
 /// This is more reliable than a global atomic as it's per-CPU
 #[inline]

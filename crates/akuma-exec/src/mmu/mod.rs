@@ -7,6 +7,7 @@
 
 pub mod types;
 pub mod asid;
+pub mod user_access;
 
 pub use types::*;
 

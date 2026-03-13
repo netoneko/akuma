@@ -1,5 +1,6 @@
 use super::*;
 use akuma_net::socket::{self, libc_errno};
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const EROFS: u64 = (-30i64) as u64;
 
@@ -77,7 +78,11 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 None => {
                     let mut temp = alloc::vec![0u8; count];
                     let n = proc.read_stdin(&mut temp);
-                    if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                    if n > 0 { 
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
+                    }
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                         crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
                     }
@@ -99,12 +104,8 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             let to_read = ready.len();
                             kernel_buf[..to_read].copy_from_slice(&ready);
                             drop(ts);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    kernel_buf.as_ptr(),
-                                    buf_ptr as *mut u8,
-                                    to_read,
-                                );
+                            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                                return EFAULT;
                             }
                             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                                 crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes from canon_ready\n", to_read);
@@ -138,12 +139,8 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     let to_read = ready.len();
                                     kernel_buf[..to_read].copy_from_slice(&ready);
                                     drop(ts);
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            kernel_buf.as_ptr(),
-                                            buf_ptr as *mut u8,
-                                            to_read,
-                                        );
+                                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                                        return EFAULT;
                                     }
                                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                                         crate::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
@@ -162,7 +159,9 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         }
                     }
 
-                    unsafe { core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, n); }
+                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
+                        return EFAULT;
+                    }
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                         let mut snippet = [0u8; 32];
                         let sn_len = n.min(32);
@@ -187,12 +186,8 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                 let to_read = ready.len();
                                 kernel_buf[..to_read].copy_from_slice(&ready);
                                 drop(ts);
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(
-                                        kernel_buf.as_ptr(),
-                                        buf_ptr as *mut u8,
-                                        to_read,
-                                    );
+                                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                                    return EFAULT;
                                 }
                                 return to_read as u64;
                             }
@@ -244,7 +239,9 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             match crate::fs::read_at(&f.path, f.position, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
-                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
                         proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -256,12 +253,14 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         akuma_exec::process::FileDescriptor::Socket(idx) => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
+            let limit = 64 * 1024;
+            let to_read = count.min(limit);
+            let mut temp = alloc::vec![0u8; to_read];
             let nonblock = super::net::fd_is_nonblock(fd_num as u32);
             let result = if socket::is_udp_socket(idx) {
-                socket::socket_recv_udp(idx, buf, nonblock).map(|(n, _)| n)
+                socket::socket_recv_udp(idx, &mut temp, nonblock).map(|(n, _)| n)
             } else {
-                socket::socket_recv(idx, buf, nonblock)
+                socket::socket_recv(idx, &mut temp, nonblock)
             };
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 match &result {
@@ -270,7 +269,14 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             match result {
-                Ok(n) => n as u64,
+                Ok(n) => {
+                    if n > 0 {
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
+                    }
+                    n as u64
+                }
                 Err(e) => (-(e as i64)) as u64,
             }
         }
@@ -278,7 +284,11 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
                 let mut temp = alloc::vec![0u8; count];
                 let n = ch.read(&mut temp);
-                if n > 0 { unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); } }
+                if n > 0 { 
+                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        return EFAULT;
+                    }
+                }
                 n as u64
             } else {
                 !0u64
@@ -289,7 +299,9 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             loop {
                 let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
                 if n > 0 {
-                    unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        return EFAULT;
+                    }
                     return n as u64;
                 }
                 if eof {
@@ -309,7 +321,11 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             loop {
                 match super::eventfd::eventfd_read(efd_id) {
                     Ok(val) => {
-                        unsafe { core::ptr::write(buf_ptr as *mut u64, val); }
+                        let mut temp = [0u8; 8];
+                        unsafe { core::ptr::write(temp.as_mut_ptr() as *mut u64, val); }
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
+                            return EFAULT;
+                        }
                         return 8;
                     }
                     Err(_) => {
@@ -324,14 +340,22 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevUrandom => {
-            super::proc::fill_random_bytes(buf_ptr as *mut u8, count);
+            let mut temp = alloc::vec![0u8; count];
+            super::proc::fill_random_bytes(temp.as_mut_ptr(), count);
+            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                return EFAULT;
+            }
             count as u64
         }
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             let result = super::timerfd::timerfd_read(timer_id);
             if result == EAGAIN { return EAGAIN; }
             if count >= 8 && validate_user_ptr(buf_ptr, 8) {
-                unsafe { core::ptr::write(buf_ptr as *mut u64, result); }
+                let mut temp = [0u8; 8];
+                unsafe { core::ptr::write(temp.as_mut_ptr() as *mut u64, result); }
+                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
+                    return EFAULT;
+                }
                 8
             } else { EINVAL }
         }
@@ -354,7 +378,9 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
-                        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n); }
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
@@ -366,7 +392,11 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevUrandom => {
-            super::proc::fill_random_bytes(buf_ptr as *mut u8, count);
+            let mut temp = alloc::vec![0u8; count];
+            super::proc::fill_random_bytes(temp.as_mut_ptr(), count);
+            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                return EFAULT;
+            }
             count as u64
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
@@ -383,8 +413,12 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
-            let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-            match crate::fs::write_at(&f.path, offset as usize, buf) {
+            // Allocate kernel buffer and copy safely
+            let mut buf = alloc::vec![0u8; count];
+            if unsafe { copy_from_user_safe(buf.as_mut_ptr(), buf_ptr as *const u8, count).is_err() } {
+                return EFAULT;
+            }
+            match crate::fs::write_at(&f.path, offset as usize, &buf) {
                 Ok(n) => n as u64,
                 Err(_) => !0u64
             }
@@ -398,87 +432,143 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
-    let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-
-    match fd {
-        akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                let display_len = count.min(64);
-                let mut snippet = [0u8; 64];
-                let n = display_len.min(snippet.len());
-                snippet[..n].copy_from_slice(&buf[..n]);
-                for byte in &mut snippet[..n] {
-                    if *byte < 32 || *byte > 126 { *byte = b'.'; }
+    
+    // Chunk large writes to avoid huge kernel allocations (max 64KB per chunk)
+    // For small writes (common case), 64KB vec allocation is still overhead, 
+    // but safer than stack overflow or raw access.
+    // Optimization: Use stack for small writes?
+    // But variable size stack allocation is not possible in Rust safe code easily.
+    // Just use Vec for now, efficiency comes second to safety here.
+    
+    let chunk_size = count.min(64 * 1024);
+    // Allocate buffer once and reuse if we loop? 
+    // sys_write returns partial write count if needed.
+    // If we just process the first chunk and return, the app loops.
+    // Standard behavior is to write as much as possible.
+    
+    let mut kernel_buf = alloc::vec![0u8; chunk_size];
+    let mut total_written = 0;
+    
+    while total_written < count {
+        let remaining = count - total_written;
+        let this_chunk = remaining.min(chunk_size);
+        
+        let user_ptr = (buf_ptr as usize + total_written) as *const u8;
+        if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), user_ptr, this_chunk).is_err() } {
+            if total_written > 0 { return total_written as u64; }
+            return EFAULT;
+        }
+        
+        let buf_slice = &kernel_buf[..this_chunk];
+        
+        let written = match fd {
+            akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED && total_written == 0 {
+                    let display_len = this_chunk.min(64);
+                    let mut snippet = [0u8; 64];
+                    let n = display_len.min(snippet.len());
+                    snippet[..n].copy_from_slice(&buf_slice[..n]);
+                    for byte in &mut snippet[..n] {
+                        if *byte < 32 || *byte > 126 { *byte = b'.'; }
+                    }
+                    let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
+                    crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
                 }
-                let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-                crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
-            }
 
-            if let Some(ch) = akuma_exec::process::current_channel() {
-                if ch.is_stdin_closed() {
-                    ch.write(buf);
-                } else {
-                    let term_state_opt = akuma_exec::process::current_terminal_state();
-                    if let Some(ts_lock) = term_state_opt {
-                        let translated = ts_lock.lock().translate_output(buf);
-                        ch.write(&translated);
+                if let Some(ch) = akuma_exec::process::current_channel() {
+                    if ch.is_stdin_closed() {
+                        ch.write(buf_slice);
                     } else {
-                        ch.write(buf);
+                        let term_state_opt = akuma_exec::process::current_terminal_state();
+                        if let Some(ts_lock) = term_state_opt {
+                            let translated = ts_lock.lock().translate_output(buf_slice);
+                            ch.write(&translated);
+                        } else {
+                            ch.write(buf_slice);
+                        }
+                    }
+                }
+                
+                if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
+                    proc.write_stdout(buf_slice);
+                }
+                
+                this_chunk as u64
+            }
+            akuma_exec::process::FileDescriptor::File(ref f) => {
+                match crate::fs::write_at(&f.path, f.position, buf_slice) {
+                    Ok(n) => {
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                        n as u64
+                    }
+                    Err(_) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return !0u64; 
                     }
                 }
             }
-            
-            if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
-                proc.write_stdout(buf);
-            }
-            
-            count as u64
-        }
-        akuma_exec::process::FileDescriptor::File(ref f) => {
-            match crate::fs::write_at(&f.path, f.position, buf) {
-                Ok(n) => {
-                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
-                    n as u64
+            akuma_exec::process::FileDescriptor::Socket(idx) => {
+                let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+                let result = if socket::is_udp_socket(idx) {
+                    match socket::udp_default_peer(idx) {
+                        Some(peer) => socket::socket_send_udp(idx, buf_slice, peer),
+                        None => Err(libc_errno::EDESTADDRREQ),
+                    }
+                } else {
+                    socket::socket_send(idx, buf_slice, nonblock)
+                };
+                
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED && total_written == 0 {
+                    match &result {
+                        Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
+                        Err(e) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                    }
                 }
-                Err(_) => !0u64
-            }
-        }
-        akuma_exec::process::FileDescriptor::Socket(idx) => {
-            let nonblock = super::net::fd_is_nonblock(fd_num as u32);
-            let result = if socket::is_udp_socket(idx) {
-                match socket::udp_default_peer(idx) {
-                    Some(peer) => socket::socket_send_udp(idx, buf, peer),
-                    None => Err(libc_errno::EDESTADDRREQ),
-                }
-            } else {
-                socket::socket_send(idx, buf, nonblock)
-            };
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                match &result {
-                    Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
-                    Err(e) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                
+                match result {
+                    Ok(n) => n as u64,
+                    Err(e) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return (-(e as i64)) as u64;
+                    }
                 }
             }
-            match result {
-                Ok(n) => n as u64,
-                Err(e) => (-(e as i64)) as u64,
+            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+                super::pipe::pipe_write(pipe_id, buf_slice) as u64
             }
-        }
-        akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-            super::pipe::pipe_write(pipe_id, buf) as u64
-        }
-        akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
-            if count < 8 { return EINVAL; }
-            let val = unsafe { core::ptr::read(buf_ptr as *const u64) };
-            if val == u64::MAX { return EINVAL; }
-            match super::eventfd::eventfd_write(efd_id, val) {
-                Ok(()) => 8,
-                Err(e) => (-(e as i64)) as u64,
+            akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
+                let val = unsafe { core::ptr::read(buf_slice.as_ptr() as *const u64) };
+                if val == u64::MAX { return EINVAL; }
+                match super::eventfd::eventfd_write(efd_id, val) {
+                    Ok(()) => 8,
+                    Err(e) => (-(e as i64)) as u64,
+                }
             }
+            akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => this_chunk as u64,
+            _ => !0u64
+        };
+        
+        // If write failed or returned error code (large positive u64)
+        if (written as i64) < 0 {
+            if total_written > 0 { return total_written as u64; }
+            return written;
         }
-        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
-        _ => !0u64
+        
+        let written_usize = written as usize;
+        total_written += written_usize;
+        
+        // If partial write, stop (short write)
+        if written_usize < this_chunk {
+            break;
+        }
+        
+        // Special case: some FDs don't support chunking or offsets (like EventFd)
+        // If we wrote something, checking FDs type to break might be complex.
+        // Assuming file-like behavior.
     }
+    
+    total_written as u64
 }
 
 pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
