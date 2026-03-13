@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::mmu::user_access::copy_from_user_safe;
 
 static FUTEX_WAITERS: Spinlock<BTreeMap<usize, Vec<usize>>> = Spinlock::new(BTreeMap::new());
 
@@ -56,7 +57,10 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // Read the futex value atomically
-            let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            let mut current_val: u32 = 0;
+            if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
             if current_val != val {
                 return EAGAIN;
             }
@@ -70,7 +74,10 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             }
 
             let deadline = if timeout_ptr != 0 && validate_user_ptr(timeout_ptr, 16) {
-                let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+                let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+                if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+                    return EFAULT;
+                }
                 let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
                 if cmd == FUTEX_WAIT_BITSET {
                     // FUTEX_WAIT_BITSET uses absolute time if CLOCK_REALTIME flag set
@@ -160,7 +167,10 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let max_requeue = timeout_ptr as u32;
             
             // Check current value matches expected
-            let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            let mut current_val: u32 = 0;
+            if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
             if current_val != val3 {
                 return EAGAIN;
             }

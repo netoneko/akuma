@@ -1,5 +1,6 @@
 use super::*;
 use akuma_net::socket;
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 struct EpollEntry {
     events: u32,
@@ -24,6 +25,7 @@ const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct PollFd {
     fd: i32,
     events: i16,
@@ -80,7 +82,10 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
     match op {
         EPOLL_CTL_ADD => {
             if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
-            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
+            if unsafe { copy_from_user_safe(&mut ev as *mut EpollEvent as *mut u8, event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
+                return EFAULT;
+            }
             if instance.interest_list.contains_key(&fd) {
                 return EEXIST;
             }
@@ -95,7 +100,10 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
         }
         EPOLL_CTL_MOD => {
             if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
-            let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+            let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
+            if unsafe { copy_from_user_safe(&mut ev as *mut EpollEvent as *mut u8, event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
+                return EFAULT;
+            }
             let ev_events = { ev.events };
             let ev_data = { ev.data };
             match instance.interest_list.get_mut(&fd) {
@@ -241,23 +249,22 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         };
 
         let mut ready_count = 0usize;
+        let mut kernel_events = alloc::vec![];
+
         for &(fd, requested_events, data) in &interest_snapshot {
             if ready_count >= maxevents { break; }
 
             let revents = epoll_check_fd_readiness(fd, requested_events);
             if revents != 0 {
-                let out_event = EpollEvent { events: revents, _pad: 0, data };
-                unsafe {
-                    core::ptr::write_unaligned(
-                        (events_ptr + ready_count * EPOLL_EVENT_SIZE) as *mut EpollEvent,
-                        out_event,
-                    );
-                }
+                kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
                 ready_count += 1;
             }
         }
 
         if ready_count > 0 {
+            if unsafe { copy_to_user_safe(events_ptr as *mut u8, kernel_events.as_ptr() as *const u8, ready_count * EPOLL_EVENT_SIZE).is_err() } {
+                return EFAULT;
+            }
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                 let elapsed = crate::timer::uptime_us() - start_time;
                 crate::tprint!(128, "[epoll] pwait ready: {} events after {}us ({}iter)\n", 
@@ -309,17 +316,24 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
 
     if readfds_ptr != 0 {
         if !validate_user_ptr(readfds_ptr, fd_set_bytes) { return EFAULT; }
-        unsafe { core::ptr::copy_nonoverlapping(readfds_ptr as *const u64, orig_read.as_mut_ptr(), nwords); }
+        if unsafe { copy_from_user_safe(orig_read.as_mut_ptr() as *mut u8, readfds_ptr as *const u8, fd_set_bytes).is_err() } {
+            return EFAULT;
+        }
     }
     if writefds_ptr != 0 {
         if !validate_user_ptr(writefds_ptr, fd_set_bytes) { return EFAULT; }
-        unsafe { core::ptr::copy_nonoverlapping(writefds_ptr as *const u64, orig_write.as_mut_ptr(), nwords); }
+        if unsafe { copy_from_user_safe(orig_write.as_mut_ptr() as *mut u8, writefds_ptr as *const u8, fd_set_bytes).is_err() } {
+            return EFAULT;
+        }
     }
 
     let infinite = timeout_ptr == 0;
     let timeout_us = if !infinite {
         if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
-        let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+            return EFAULT;
+        }
         (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
     } else {
         0
@@ -380,14 +394,30 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
         }
 
         if ready_count > 0 {
-            if readfds_ptr != 0 { unsafe { core::ptr::copy_nonoverlapping(out_read.as_ptr(), readfds_ptr as *mut u64, nwords); } }
-            if writefds_ptr != 0 { unsafe { core::ptr::copy_nonoverlapping(out_write.as_ptr(), writefds_ptr as *mut u64, nwords); } }
+            if readfds_ptr != 0 { 
+                if unsafe { copy_to_user_safe(readfds_ptr as *mut u8, out_read.as_ptr() as *const u8, fd_set_bytes).is_err() } {
+                    return EFAULT;
+                }
+            }
+            if writefds_ptr != 0 { 
+                if unsafe { copy_to_user_safe(writefds_ptr as *mut u8, out_write.as_ptr() as *const u8, fd_set_bytes).is_err() } {
+                    return EFAULT;
+                }
+            }
             return ready_count;
         }
 
         if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
-            if readfds_ptr != 0 { unsafe { core::ptr::write_bytes(readfds_ptr as *mut u8, 0, fd_set_bytes); } }
-            if writefds_ptr != 0 { unsafe { core::ptr::write_bytes(writefds_ptr as *mut u8, 0, fd_set_bytes); } }
+            if readfds_ptr != 0 { 
+                if unsafe { copy_to_user_safe(readfds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
+                    return EFAULT;
+                }
+            }
+            if writefds_ptr != 0 { 
+                if unsafe { copy_to_user_safe(writefds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
+                    return EFAULT;
+                }
+            }
             return 0;
         }
 
@@ -397,12 +427,16 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
 
 pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 {
     if nfds == 0 { return 0; }
-    if !validate_user_ptr(fds_ptr, nfds * 8) { return EFAULT; }
+    let fds_size = nfds * core::mem::size_of::<PollFd>();
+    if !validate_user_ptr(fds_ptr, fds_size) { return EFAULT; }
 
     let infinite = timeout_ptr == 0;
     let timeout_us = if !infinite {
         if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
-        let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+            return EFAULT;
+        }
         (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
     } else {
         0
@@ -415,85 +449,90 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     }
 
     let start_time = crate::timer::uptime_us();
+    let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
+    if unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr() as *mut u8, fds_ptr as *const u8, fds_size).is_err() } {
+        return EFAULT;
+    }
 
     loop {
         akuma_net::smoltcp_net::poll();
         let mut ready_count = 0;
-        unsafe {
-            let fds = core::slice::from_raw_parts_mut(fds_ptr as *mut PollFd, nfds);
-            for fd in fds.iter_mut() {
-                fd.revents = 0;
+        
+        for fd in kernel_fds.iter_mut() {
+            fd.revents = 0;
 
-                if fd.fd < 0 { continue; }
+            if fd.fd < 0 { continue; }
 
-                let fd_entry = if fd.fd > 2 {
-                    akuma_exec::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
-                } else {
-                    None
-                };
+            let fd_entry = if fd.fd > 2 {
+                akuma_exec::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
+            } else {
+                None
+            };
 
-                let socket_idx = match &fd_entry {
-                    Some(akuma_exec::process::FileDescriptor::Socket(idx)) => Some(*idx),
-                    _ => None,
-                };
-                let eventfd_id = match &fd_entry {
-                    Some(akuma_exec::process::FileDescriptor::EventFd(id)) => Some(*id),
-                    _ => None,
-                };
+            let socket_idx = match &fd_entry {
+                Some(akuma_exec::process::FileDescriptor::Socket(idx)) => Some(*idx),
+                _ => None,
+            };
+            let eventfd_id = match &fd_entry {
+                Some(akuma_exec::process::FileDescriptor::EventFd(id)) => Some(*id),
+                _ => None,
+            };
 
-                if fd.events & 1 != 0 {
-                    if fd.fd == 0 {
-                        if let Some(ch) = akuma_exec::process::current_channel() {
-                            if ch.has_stdin_data() {
-                                fd.revents |= 1;
-                            }
-                        }
-                    } else if let Some(efd_id) = eventfd_id {
-                        if super::eventfd::eventfd_can_read(efd_id) {
+            if fd.events & 1 != 0 {
+                if fd.fd == 0 {
+                    if let Some(ch) = akuma_exec::process::current_channel() {
+                        if ch.has_stdin_data() {
                             fd.revents |= 1;
                         }
-                    } else if let Some(idx) = socket_idx {
-                        if socket::is_udp_socket(idx) {
-                            if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                                if akuma_net::smoltcp_net::udp_can_recv(handle) {
-                                    fd.revents |= 1;
-                                }
-                            }
-                        } else {
-                            if super::net::socket_can_recv_tcp(idx) {
+                    }
+                } else if let Some(efd_id) = eventfd_id {
+                    if super::eventfd::eventfd_can_read(efd_id) {
+                        fd.revents |= 1;
+                    }
+                } else if let Some(idx) = socket_idx {
+                    if socket::is_udp_socket(idx) {
+                        if let Some(handle) = super::net::socket_get_udp_handle(idx) {
+                            if akuma_net::smoltcp_net::udp_can_recv(handle) {
                                 fd.revents |= 1;
                             }
                         }
-                    } else if fd.fd > 2 {
-                        fd.revents |= 1;
-                    }
-                }
-
-                if fd.events & 4 != 0 {
-                    if eventfd_id.is_some() {
-                        fd.revents |= 4;
-                    } else if let Some(idx) = socket_idx {
-                        if socket::is_udp_socket(idx) {
-                            if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                                if akuma_net::smoltcp_net::udp_can_send(handle) {
-                                    fd.revents |= 4;
-                                }
-                            }
-                        } else if super::net::socket_can_send_tcp(idx) {
-                            fd.revents |= 4;
+                    } else {
+                        if super::net::socket_can_recv_tcp(idx) {
+                            fd.revents |= 1;
                         }
-                    } else if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
+                    }
+                } else if fd.fd > 2 {
+                    fd.revents |= 1;
+                }
+            }
+
+            if fd.events & 4 != 0 {
+                if eventfd_id.is_some() {
+                    fd.revents |= 4;
+                } else if let Some(idx) = socket_idx {
+                    if socket::is_udp_socket(idx) {
+                        if let Some(handle) = super::net::socket_get_udp_handle(idx) {
+                            if akuma_net::smoltcp_net::udp_can_send(handle) {
+                                fd.revents |= 4;
+                            }
+                        }
+                    } else if super::net::socket_can_send_tcp(idx) {
                         fd.revents |= 4;
                     }
+                } else if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
+                    fd.revents |= 4;
                 }
+            }
 
-                if fd.revents != 0 {
-                    ready_count += 1;
-                }
+            if fd.revents != 0 {
+                ready_count += 1;
             }
         }
 
         if ready_count > 0 {
+            if unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr() as *const u8, fds_size).is_err() } {
+                return EFAULT;
+            }
             return ready_count as u64;
         }
 

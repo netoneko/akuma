@@ -1,9 +1,11 @@
 use super::*;
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct KernelSigaction {
     sa_handler: usize,
     sa_flags: u64,
@@ -36,11 +38,16 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
             sa_restorer: old.restorer,
             sa_mask: if sigset_ok { old.mask } else { 0 },
         };
-        unsafe { core::ptr::write_unaligned(oldact_ptr as *mut KernelSigaction, out); }
+        if unsafe { copy_to_user_safe(oldact_ptr as *mut u8, &out as *const KernelSigaction as *const u8, 32).is_err() } {
+            return EFAULT;
+        }
     }
 
     if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
-        let sa = unsafe { core::ptr::read_unaligned(act_ptr as *const KernelSigaction) };
+        let mut sa = KernelSigaction::default();
+        if unsafe { copy_from_user_safe(&mut sa as *mut KernelSigaction as *mut u8, act_ptr as *const u8, 32).is_err() } {
+            return EFAULT;
+        }
         let handler = match sa.sa_handler {
             SIG_DFL => akuma_exec::process::SignalHandler::Default,
             SIG_IGN => akuma_exec::process::SignalHandler::Ignore,
@@ -85,8 +92,8 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
         if !validate_user_ptr(oldset_ptr, 8) {
             return EFAULT;
         }
-        unsafe {
-            core::ptr::write(oldset_ptr as *mut u64, proc.signal_mask);
+        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, &proc.signal_mask as *const u64 as *const u8, 8).is_err() } {
+            return EFAULT;
         }
     }
 
@@ -95,7 +102,10 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
         if !validate_user_ptr(set_ptr, 8) {
             return EFAULT;
         }
-        let new_mask = unsafe { core::ptr::read(set_ptr as *const u64) };
+        let mut new_mask: u64 = 0;
+        if unsafe { copy_from_user_safe(&mut new_mask as *mut u64 as *mut u8, set_ptr as *const u8, 8).is_err() } {
+            return EFAULT;
+        }
 
         // SIGKILL (9) and SIGSTOP (19) cannot be blocked
         let allowed_mask = new_mask & !((1u64 << 8) | (1u64 << 18));
@@ -138,11 +148,16 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         if !validate_user_ptr(old_ss_ptr, STACK_T_SIZE) {
             return EFAULT;
         }
-        unsafe {
-            // Write old stack_t (currently we don't track this, so return disabled)
-            core::ptr::write((old_ss_ptr) as *mut u64, proc.sigaltstack_sp);
-            core::ptr::write((old_ss_ptr + 8) as *mut i32, proc.sigaltstack_flags);
-            core::ptr::write((old_ss_ptr + 16) as *mut u64, proc.sigaltstack_size);
+        #[repr(C)]
+        struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
+        let out = StackT {
+            sp: proc.sigaltstack_sp,
+            flags: proc.sigaltstack_flags,
+            _pad: 0,
+            size: proc.sigaltstack_size,
+        };
+        if unsafe { copy_to_user_safe(old_ss_ptr as *mut u8, &out as *const StackT as *const u8, STACK_T_SIZE).is_err() } {
+            return EFAULT;
         }
     }
 
@@ -151,25 +166,26 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         if !validate_user_ptr(ss_ptr, STACK_T_SIZE) {
             return EFAULT;
         }
-        unsafe {
-            let sp = core::ptr::read(ss_ptr as *const u64);
-            let flags = core::ptr::read((ss_ptr + 8) as *const i32);
-            let size = core::ptr::read((ss_ptr + 16) as *const u64);
+        #[repr(C)]
+        struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
+        let mut ss = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
+        if unsafe { copy_from_user_safe(&mut ss as *mut StackT as *mut u8, ss_ptr as *const u8, STACK_T_SIZE).is_err() } {
+            return EFAULT;
+        }
 
-            // SS_DISABLE disables the alternate stack
-            if flags & SS_DISABLE != 0 {
-                proc.sigaltstack_sp = 0;
-                proc.sigaltstack_flags = SS_DISABLE;
-                proc.sigaltstack_size = 0;
-            } else {
-                // Minimum stack size check (MINSIGSTKSZ = 2048 on most systems)
-                if size < 2048 {
-                    return ENOMEM;
-                }
-                proc.sigaltstack_sp = sp;
-                proc.sigaltstack_flags = flags;
-                proc.sigaltstack_size = size;
+        // SS_DISABLE disables the alternate stack
+        if ss.flags & SS_DISABLE != 0 {
+            proc.sigaltstack_sp = 0;
+            proc.sigaltstack_flags = SS_DISABLE;
+            proc.sigaltstack_size = 0;
+        } else {
+            // Minimum stack size check (MINSIGSTKSZ = 2048 on most systems)
+            if ss.size < 2048 {
+                return ENOMEM;
             }
+            proc.sigaltstack_sp = ss.sp;
+            proc.sigaltstack_flags = ss.flags;
+            proc.sigaltstack_size = ss.size;
         }
     }
 

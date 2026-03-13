@@ -120,10 +120,15 @@ table). If the page is not yet mapped, this write takes an EC=0x25 data abort.
 there are TLB coherency or TTBR0-swap scenarios where the page isn't visible to the
 subsequent write even after mapping.
 
-The principled fix would be a `copy_to_user()` primitive backed by an exception
-fixup table (like Linux's `__ex_table`), so individual instruction faults can be
-directed to a known-good return path. The landing pad is a pragmatic substitute
-until that infrastructure is in place.
+The principled fix is a `copy_to_user()` and `copy_from_user()` primitive set backed by an exception fixup mechanism. 
+
+This was implemented on 2026-03-13:
+1.  **Thread Infrastructure:** Added `user_copy_fault_handler` to `ThreadSlot`.
+2.  **Exception Handling:** `rust_sync_el1_handler` now checks this handler and redirects `ELR_EL1` to a recovery path if a fault occurs during safe user access.
+3.  **Safe Primitives:** Implemented `copy_from_user_safe` and `copy_to_user_safe` in `crates/akuma-exec/src/mmu/user_access.rs` using AArch64 assembly.
+4.  **Syscall Hardening:** Refactored `sys_read`, `sys_write`, `sys_epoll_pwait`, `sys_ppoll`, `sys_pselect6`, and other metadata-related syscalls to use these safe primitives instead of raw pointer dereferences.
+
+This provides robust protection against TLB coherency issues and race conditions (TOCTTOU) when accessing user memory from the kernel.
 
 ---
 

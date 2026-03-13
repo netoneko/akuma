@@ -13,30 +13,30 @@ unsafe extern "C" {
 
 global_asm!(
     r#"
-    .section .text
-    .global __arch_copy_user_memory
-    .global __arch_copy_user_fault
+.text
+.global __arch_copy_user_memory
+.global __arch_copy_user_fault
 
-    // x0 = dst, x1 = src, x2 = len
-    // Returns 0 on success, non-zero (EFAULT) on error
-    __arch_copy_user_memory:
-        // Check for 0 length
-        cbz x2, 2f
-    1:
-        // Byte copy loop
-        ldrb w3, [x1], #1
-        strb w3, [x0], #1
-        subs x2, x2, #1
-        b.ne 1b
-    2:
-        mov x0, #0
-        ret
+// x0 = dst, x1 = src, x2 = len
+// Returns 0 on success, non-zero (EFAULT) on error
+__arch_copy_user_memory:
+    // Check for 0 length
+    cbz x2, 2f
+1:
+    // Byte copy loop
+    ldrb w3, [x1], #1
+    strb w3, [x0], #1
+    subs x2, x2, #1
+    b.ne 1b
+2:
+    mov x0, #0
+    ret
 
-    // Fault handler - jumped to by exception handler
-    // Returns EFAULT (14)
-    __arch_copy_user_fault:
-        mov x0, #14
-        ret
+// Fault handler - jumped to by exception handler
+// Returns EFAULT (14)
+__arch_copy_user_fault:
+    mov x0, #14
+    ret
     "#
 );
 

@@ -51,6 +51,7 @@ pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct IoVec {
     pub(super) iov_base: u64,
     pub(super) iov_len: usize,
@@ -572,10 +573,17 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 }
 
 pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
-    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let iov_size = iov_cnt * core::mem::size_of::<IoVec>();
+    if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
+    
+    let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
+    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr() as *mut u8, iov_ptr as *const u8, iov_size).is_err() } {
+        return EFAULT;
+    }
+    
     let mut total_read: u64 = 0;
     for i in 0..iov_cnt {
-        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        let iov = &kernel_iovs[i];
         if iov.iov_len == 0 { continue; }
         let n = sys_read(fd_num, iov.iov_base, iov.iov_len);
         if (n as i64) < 0 {
@@ -592,10 +600,17 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
 }
 
 pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
-    if !validate_user_ptr(iov_ptr, iov_cnt * core::mem::size_of::<IoVec>()) { return EFAULT; }
+    let iov_size = iov_cnt * core::mem::size_of::<IoVec>();
+    if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
+    
+    let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
+    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr() as *mut u8, iov_ptr as *const u8, iov_size).is_err() } {
+        return EFAULT;
+    }
+    
     let mut total_written: u64 = 0;
     for i in 0..iov_cnt {
-        let iov = unsafe { &*((iov_ptr as *const IoVec).add(i)) };
+        let iov = &kernel_iovs[i];
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
         if (written as i64) < 0 {
             if total_written == 0 { return written; }
@@ -640,7 +655,9 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
         f_flags: 0,
         f_spare: [0; 4],
     };
-    unsafe { core::ptr::copy_nonoverlapping(&st as *const Statfs as *const u8, buf_ptr as *mut u8, core::mem::size_of::<Statfs>()); }
+    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, &st as *const Statfs as *const u8, core::mem::size_of::<Statfs>()).is_err() } {
+        return EFAULT;
+    }
     0
 }
 
@@ -913,47 +930,50 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 }
 
 pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
-    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+    let stat_size = core::mem::size_of::<Stat>();
+    if !validate_user_ptr(stat_ptr, stat_size) { return EFAULT; }
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
-    match proc.get_fd(fd) {
+    
+    let mut stat = Stat::default();
+    let res = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
-                let stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
-                unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
-                return 0;
-            }
-            !0u64
+                0
+            } else { !0u64 }
         }
         Some(akuma_exec::process::FileDescriptor::DevNull) => {
-            let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::DevUrandom) => {
-            let stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::TimerFd(_)) | Some(akuma_exec::process::FileDescriptor::EpollFd(_)) => {
-            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::Stdin) | Some(akuma_exec::process::FileDescriptor::Stdout) | Some(akuma_exec::process::FileDescriptor::Stderr) => {
-            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::PipeRead(_)) | Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
-            let stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
-            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
         _ => !0u64,
+    };
+    
+    if res == 0 {
+        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, &stat as *const Stat as *const u8, stat_size).is_err() } {
+            return EFAULT;
+        }
     }
+    res
 }
 
 pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
@@ -988,72 +1008,79 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         crate::vfs::resolve_path(&base_path, &path)
     };
     
-    if resolved_path == "/dev/null" {
-        let stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
-        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
-        return 0;
-    }
-
-    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
-    let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
-
-    if !follow && crate::vfs::is_symlink(&resolved_path) {
-        let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
-        let stat = Stat {
-            st_dev: 1,
-            st_ino: 1,
-            st_size: target.len() as i64,
-            st_mode: 0o120777,
-            st_nlink: 1,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
-        return 0;
-    }
-
-    let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
-
-    if let Ok(meta) = crate::vfs::metadata(&final_path) {
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-            crate::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
+    let mut stat = Stat::default();
+    let res = (|| {
+        if resolved_path == "/dev/null" {
+            stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            return 0;
         }
-        let stat = Stat { 
-            st_dev: 1,
-            st_ino: meta.inode,
-            st_size: meta.size as i64, 
-            st_mode: meta.mode, 
-            st_nlink: if meta.is_dir { 2 } else { 1 },
-            st_blksize: 4096,
-            st_blocks: ((meta.size as i64) + 511) / 512,
-            st_atime: meta.accessed.unwrap_or(0) as i64,
-            st_mtime: meta.modified.unwrap_or(0) as i64,
-            st_ctime: meta.created.unwrap_or(0) as i64,
-            ..Default::default() 
-        };
-        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
-        return 0;
-    }
 
-    if crate::vfs::is_symlink(&final_path) {
-        let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
-        let stat = Stat {
-            st_dev: 1,
-            st_ino: 1,
-            st_size: target.len() as i64,
-            st_mode: 0o120777,
-            st_nlink: 1,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
-        return 0;
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
+
+        if !follow && crate::vfs::is_symlink(&resolved_path) {
+            let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
+            stat = Stat {
+                st_dev: 1,
+                st_ino: 1,
+                st_size: target.len() as i64,
+                st_mode: 0o120777,
+                st_nlink: 1,
+                st_blksize: 4096,
+                ..Default::default()
+            };
+            return 0;
+        }
+
+        let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
+
+        if let Ok(meta) = crate::vfs::metadata(&final_path) {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
+            }
+            stat = Stat { 
+                st_dev: 1,
+                st_ino: meta.inode,
+                st_size: meta.size as i64, 
+                st_mode: meta.mode, 
+                st_nlink: if meta.is_dir { 2 } else { 1 },
+                st_blksize: 4096,
+                st_blocks: ((meta.size as i64) + 511) / 512,
+                st_atime: meta.accessed.unwrap_or(0) as i64,
+                st_mtime: meta.modified.unwrap_or(0) as i64,
+                st_ctime: meta.created.unwrap_or(0) as i64,
+                ..Default::default() 
+            };
+            return 0;
+        }
+
+        if crate::vfs::is_symlink(&final_path) {
+            let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
+            stat = Stat {
+                st_dev: 1,
+                st_ino: 1,
+                st_size: target.len() as i64,
+                st_mode: 0o120777,
+                st_nlink: 1,
+                st_blksize: 4096,
+                ..Default::default()
+            };
+            return 0;
+        }
+        
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] newfstatat: ENOENT {}\n", final_path);
+        }
+        ENOENT
+    })();
+
+    if res == 0 {
+        let stat_size = core::mem::size_of::<Stat>();
+        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, &stat as *const Stat as *const u8, stat_size).is_err() } {
+            return EFAULT;
+        }
     }
-    
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-        crate::safe_print!(128, "[syscall] newfstatat: ENOENT {}\n", final_path);
-    }
-    ENOENT
+    res
 }
 
 pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
@@ -1193,11 +1220,14 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
         if cwd_bytes.len() + 1 > size {
             return (-libc_errno::ERANGE as i64) as u64;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf_ptr as *mut u8, cwd_bytes.len());
-            *(buf_ptr as *mut u8).add(cwd_bytes.len()) = 0;
+        let mut temp = alloc::vec![0u8; cwd_bytes.len() + 1];
+        temp[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
+        temp[cwd_bytes.len()] = 0;
+        
+        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), temp.len()).is_err() } {
+            return EFAULT;
         }
-        return (cwd_bytes.len() + 1) as u64;
+        return temp.len() as u64;
     }
     ENOENT
 }
@@ -1452,12 +1482,13 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
             if let Ok(entries) = crate::fs::list_dir(&f.path) {
                 if f.position >= entries.len() { return 0; }
+                let mut kernel_buf = alloc::vec![0u8; size];
                 let mut written = 0;
                 for entry in entries.iter().skip(f.position) {
                     let reclen = (19 + entry.name.len() + 1 + 7) & !7;
                     if written + reclen > size { break; }
+                    let p = unsafe { kernel_buf.as_mut_ptr().add(written) };
                     unsafe {
-                        let p = (ptr as *mut u8).add(written);
                         core::ptr::write_unaligned(p as *mut u64, 1);
                         core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
                         core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
@@ -1468,6 +1499,11 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
                     }
                     written += reclen;
                     proc.update_fd(fd, |e| if let akuma_exec::process::FileDescriptor::File(file) = e { file.position += 1; });
+                }
+                if written > 0 {
+                    if unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
+                        return EFAULT;
+                    }
                 }
                 return written as u64;
             }

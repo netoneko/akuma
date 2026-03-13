@@ -50,7 +50,7 @@ impl SocketAddrV4 {
 
 /// Linux `sockaddr_in` structure (for syscall interface)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SockAddrIn {
     pub sin_family: u16,    // AF_INET = 2
     pub sin_port: u16,      // Network byte order (big-endian)

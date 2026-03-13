@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 struct TimerFdState {
     armed_at_us: u64,
@@ -10,20 +11,31 @@ struct TimerFdState {
 static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTreeMap::new());
 static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-fn timespec_to_us(ptr: usize) -> u64 {
-    if ptr == 0 { return 0; }
-    let sec = unsafe { core::ptr::read(ptr as *const u64) };
-    let nsec = unsafe { core::ptr::read((ptr + 8) as *const u64) };
-    sec * 1_000_000 + nsec / 1_000
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LocalTimespec {
+    tv_sec: u64,
+    tv_nsec: u64,
 }
 
-fn us_to_timespec(us: u64, ptr: usize) {
-    let sec = us / 1_000_000;
-    let nsec = (us % 1_000_000) * 1_000;
-    unsafe {
-        core::ptr::write(ptr as *mut u64, sec);
-        core::ptr::write((ptr + 8) as *mut u64, nsec);
+fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
+    if ptr == 0 { return Ok(0); }
+    let mut ts = LocalTimespec::default();
+    if unsafe { copy_from_user_safe(&mut ts as *mut LocalTimespec as *mut u8, ptr as *const u8, 16).is_err() } {
+        return Err(EFAULT);
     }
+    Ok(ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000)
+}
+
+fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
+    let ts = LocalTimespec {
+        tv_sec: us / 1_000_000,
+        tv_nsec: (us % 1_000_000) * 1_000,
+    };
+    if unsafe { copy_to_user_safe(ptr as *mut u8, &ts as *const LocalTimespec as *const u8, 16).is_err() } {
+        return Err(EFAULT);
+    }
+    Ok(())
 }
 
 pub(super) fn timerfd_can_read(timer_id: u32) -> bool {
@@ -66,10 +78,11 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
-            us_to_timespec(state.interval_us, old_value);      // it_interval
-            us_to_timespec(remaining, old_value + 16);         // it_value (remaining time)
+            let _ = us_to_timespec_safe(state.interval_us, old_value);      // it_interval
+            let _ = us_to_timespec_safe(remaining, old_value + 16);         // it_value (remaining time)
         } else {
-            unsafe { core::ptr::write_bytes(old_value as *mut u8, 0, 32); }
+            let zero = [0u8; 32];
+            let _ = unsafe { copy_to_user_safe(old_value as *mut u8, zero.as_ptr(), 32) };
         }
     }
 
@@ -77,8 +90,8 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 
     // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
     // it_interval is at offset 0, it_value (initial) is at offset 16
-    let interval_us = timespec_to_us(new_value);       // it_interval
-    let initial_us = timespec_to_us(new_value + 16);   // it_value (initial expiration)
+    let interval_us = match timespec_to_us_safe(new_value) { Ok(v) => v, Err(e) => return e };       // it_interval
+    let initial_us = match timespec_to_us_safe(new_value + 16) { Ok(v) => v, Err(e) => return e };   // it_value (initial expiration)
 
     const TFD_TIMER_ABSTIME: i32 = 1;
     let now = crate::timer::uptime_us();
@@ -117,10 +130,11 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
             let now = crate::timer::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
-            us_to_timespec(state.interval_us, out);
-            us_to_timespec(remaining, out + 16);
+            let _ = us_to_timespec_safe(state.interval_us, out);
+            let _ = us_to_timespec_safe(remaining, out + 16);
         } else {
-            unsafe { core::ptr::write_bytes(out as *mut u8, 0, 32); }
+            let zero = [0u8; 32];
+            let _ = unsafe { copy_to_user_safe(out as *mut u8, zero.as_ptr(), 32) };
         }
     }
     0
