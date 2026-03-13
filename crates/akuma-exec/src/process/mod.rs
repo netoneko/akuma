@@ -2244,6 +2244,86 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
 }
 
+/// Process exit path used when recovering from an EL1 data abort (EC=0x25).
+///
+/// Identical to `return_to_kernel` except it skips all user-memory reads/writes
+/// (CLONE_CHILD_CLEARTID and robust-futex list cleanup). Those writes use the
+/// same EL1→user-VA path that triggered the original fault; attempting them here
+/// would cause a second EC=0x25, redirecting ELR back to this function and
+/// overflowing the kernel stack.
+///
+/// Skipping CLEARTID and robust-futex cleanup is safe because:
+/// - The process is already marked Zombie before this runs.
+/// - `kill_thread_group` has already terminated all sibling threads, so there
+///   are no live waiters to wake via FUTEX_OWNER_DIED.
+pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
+    let tid = crate::threading::current_thread_id();
+    log::debug!("[RTK-FAULT] code={} tid={}", exit_code, tid);
+
+    let already_terminated = crate::threading::is_thread_terminated(tid);
+
+    let pid = if !already_terminated {
+        if let Some(proc) = current_process() {
+            let pid = proc.pid;
+            cleanup_process_fds(proc);
+            Some(pid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(channel) = remove_channel(tid) {
+        channel.set_exited(exit_code);
+    }
+
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().remove(&tid);
+    });
+
+    // SKIP: CLEARTID write — would re-trigger EC=0x25
+    // SKIP: robust futex list cleanup — would re-trigger EC=0x25
+
+    crate::mmu::UserAddressSpace::deactivate();
+
+    if let Some(pid) = pid {
+        let box_to_kill = find_primary_box(pid);
+        if let Some(bid) = box_to_kill {
+            log::debug!("[Process] Primary PID {} exited, shutting down box {:08x}", pid, bid);
+            if let Err(e) = kill_box(bid) {
+                log::debug!("[Process] Error: Failed to kill box {:08x}: {}", bid, e);
+            }
+        }
+
+        if let Some(proc) = lookup_process(pid) {
+            if !proc.address_space.is_shared() {
+                let l0_phys = proc.address_space.l0_phys();
+                kill_thread_group(pid, l0_phys);
+            }
+        }
+
+        let start_us = lookup_process(pid)
+            .map(|p| p.start_time_us)
+            .unwrap_or(0);
+        let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
+        let secs = elapsed_us / 1_000_000;
+        let frac = (elapsed_us % 1_000_000) / 10_000;
+
+        clear_lazy_regions(pid);
+        let _dropped_process = unregister_process(pid);
+        log::debug!("[Process] PID {} thread {} faulted ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
+    } else {
+        log::debug!("[Process] Thread {} faulted ({})", tid, exit_code);
+    }
+
+    crate::threading::mark_current_terminated();
+
+    loop {
+        crate::threading::yield_now();
+    }
+}
+
 /// Clean up all file descriptors owned by a process
 fn cleanup_process_fds(proc: &Process) {
     // 1. Collect all special FDs that need manual cleanup

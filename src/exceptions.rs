@@ -968,7 +968,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 /// bits, so this function runs at EL1 and can safely call kernel functions.
 #[unsafe(no_mangle)]
 extern "C" fn el1_fault_recovery_pad() {
-    akuma_exec::process::return_to_kernel(-14);
+    akuma_exec::process::return_to_kernel_from_fault(-14);
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)
