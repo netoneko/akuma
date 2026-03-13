@@ -952,6 +952,22 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     0  // No context switch
 }
 
+/// Landing pad for EL1 fault recovery.
+///
+/// After an EC=0x25 data abort from kernel code, ELR is redirected here so
+/// that ERET doesn't return to the middle of the faulting instruction sequence
+/// (which would immediately fault again, causing an infinite loop).
+///
+/// The process is already marked Zombie before we land here.  We just yield
+/// in a loop; the scheduler will stop dispatching this thread once it's cleaned
+/// up by cleanup_terminated().
+#[unsafe(no_mangle)]
+extern "C" fn el1_fault_recovery_pad() {
+    loop {
+        akuma_exec::threading::yield_now();
+    }
+}
+
 /// Synchronous exception handler from EL1 (kernel mode)
 /// Uses static buffers to avoid heap allocation during crash
 #[unsafe(no_mangle)]
@@ -1034,14 +1050,17 @@ extern "C" fn rust_sync_el1_handler() {
                 proc.state = akuma_exec::process::ProcessState::Zombie(-14);
                 akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
             }
-            // CRITICAL: advance ELR past the faulting instruction so that the
-            // ERET in sync_el1_handler does not immediately re-fault and recurse
-            // until the kernel stack overflows.  ARM64 instructions are always
-            // 4 bytes; skipping one instruction is safe here because the process
-            // is already Zombie and the scheduler will switch away on the next
-            // preemption tick.
+            // Redirect ELR to the recovery landing pad so that ERET does NOT
+            // return into the middle of the faulting instruction sequence.
+            // Skipping by +4 would just execute the next instruction which
+            // likely uses the same corrupt register and faults again, causing
+            // an infinite fault loop (observed as repeated EC=0x25 with
+            // FAR=0x1 as the cascade drifts through garbage code).
+            // The landing pad yields in a loop; the scheduler stops dispatching
+            // this thread once cleanup_terminated() recycles the slot.
             unsafe {
-                core::arch::asm!("mrs {0}, elr_el1; add {0}, {0}, #4; msr elr_el1, {0}", out(reg) _);
+                let pad = el1_fault_recovery_pad as *const () as usize as u64;
+                core::arch::asm!("msr elr_el1, {}", in(reg) pad);
             }
             return;
         }

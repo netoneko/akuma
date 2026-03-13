@@ -1,12 +1,12 @@
-# Fix: EL1 Crash During epoll_pwait / Stack Overflow in Bun
+# Fix: EL1 Crash During epoll_pwait / Stack Overflow / DNS Hang in Bun
 
 ## Date
 
 2026-03-13
 
-## Problem
+---
 
-Running `opencode` (Bun-based) triggered two crashes in close succession:
+## Problems (in order of discovery)
 
 ### Crash 1 — EL1 data abort (kernel panic)
 
@@ -33,76 +33,146 @@ The eagerly-allocated stack had no lazy backing region below it, so growth past 
 initial allocation caused an unhandled translation fault. Signal delivery then also
 failed because the signal frame page was equally unmapped.
 
+### Regression 1 — EFAULT on `//package.json` (introduced and reverted)
+
+`bun install @google/gemini-cli` returned:
+
+```
+error: failed to read package.json "//package.json": EFAULT
+```
+
+An attempted fix for Crash 1 added a kernel VA exclusion `[0x4000_0000, 0x6000_0000)`
+to `validate_user_ptr`. Bun's JSC heap mmap starts at `0x50000000`, so path strings
+allocated in the JSC heap were inside the excluded range and incorrectly returned
+EFAULT. The exclusion was reverted.
+
+### Regression 2 — SSH drops / kernel loops on EC=0x25
+
+After adding the EL1 recovery (return after killing the process), the kernel handler
+did `eret` back to `ELR_EL1` — which still pointed at the faulting instruction. The
+fault fired again immediately, re-entering the handler, recursing until the kernel
+stack overflowed and corrupted state including the SSH server.
+
+Fix: the handler redirects `ELR_EL1` to an `el1_fault_recovery_pad()` function before
+returning, so `eret` lands in the recovery pad instead of the faulting instruction.
+
+### Regression 3 — DNS hangs after fork
+
+`bun install` would start, then hang indefinitely on DNS resolution.
+
+**Root cause:** When `bun` forks child processes (e.g. for lifecycle scripts),
+the child inherits the parent's fd table, including `EpollFd(epoll_id)` entries.
+Both parent and child point to the **same `epoll_id`** in the global `EPOLL_TABLE`.
+Our new `sys_close` arm calls `epoll_destroy(epoll_id)` when an epoll fd is closed.
+If the child explicitly calls `close(epoll_fd)` — or if any code path triggers
+`sys_close` on that fd — `epoll_destroy` removes the shared global instance. The
+parent's next `epoll_pwait` call then gets EBADF and the DNS event loop breaks
+silently.
+
+Additionally, `EPOLL_CLOEXEC` was being ignored (`_flags` parameter was unused in
+`sys_epoll_create1`), so epoll fds were never marked as close-on-exec even when
+requested.
+
+### Regression 4 — EL1 fault loop (FAR=0x1)
+
+With the ELR+4 fix, the first fault was skipped, but the next instruction in the
+sequence used the same corrupt register (e.g. x9 still held the bad address) and
+faulted again. Each +4 advance put us deeper into the same broken instruction
+sequence. The cascade was observed as:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403d8b5c, FAR=0x1
+  WARNING: Kernel accessing user-space address!
+  (repeating)
+```
+
+`FAR=0x1` was not the original fault address — it was a cascaded fault after the
+ELR+4 hack drifted into other instructions that happened to use the same poisoned
+register. The process exit code was -137 (killed externally due to the hung state).
+
 ---
 
-## Root Causes
+## Root Causes (summary)
 
-### Bug 1 — EL1 faults killed the kernel, not just the process
+| # | Bug | Root cause |
+|---|-----|-----------|
+| 1 | EL1 panic | `rust_sync_el1_handler` always looped on `wfe`, no recovery |
+| 2 | Stack overflow SIGSEGV | Stack eagerly allocated to fixed size, no lazy growth region |
+| 3 | EFAULT on JSC heap addrs | Kernel VA exclusion in `validate_user_ptr` overlapped JSC mmap |
+| 4 | SSH crash | EL1 recovery returned to faulting instruction → recursion → stack overflow |
+| 5 | DNS hang | `epoll_destroy` in `sys_close` shared-with-child instances; `EPOLL_CLOEXEC` ignored |
+| 6 | Infinite fault loop | ELR+4 moved to next instruction using same bad register → re-faulted |
 
-`rust_sync_el1_handler` in `src/exceptions.rs` always called `wfe` (infinite spin)
-on any synchronous EL1 exception.  A bad user pointer reaching a kernel
-`write_unaligned` or `copy_nonoverlapping` would take an EC=0x25 abort and hang
-the kernel permanently.
+---
 
-### Bug 2 — Epoll instances leaked on close / process exit
+## Why EC=0x25 happens at all
 
-`EPOLL_TABLE` (a global `BTreeMap<u32, EpollInstance>`) was never cleaned up.
-`sys_close` had a catch-all `_ => {}` arm that skipped `EpollFd` entirely. Every
-process that used epoll leaked its `EpollInstance` and all `EpollEntry` nodes until
-the next reboot.
+The syscall code writes directly to user VA pointers at EL1:
 
-### Bug 3 — User stack had no demand-paged growth region
+```rust
+core::ptr::write_unaligned(events_ptr as *mut EpollEvent, out_event)
+```
 
-`load_elf_with_stack` eagerly allocates exactly `compute_user_stack_size(RAM)` bytes
-for the stack (512 KB on 1 GB RAM).  No lazy region was registered to back stack
-growth beyond that limit. The fault handler's `lazy_region_lookup` found nothing for
-addresses below the eager stack bottom and delivered SIGSEGV.
+On AArch64 during a syscall, low VAs are translated through TTBR0 (user page
+table). If the page is not yet mapped, this write takes an EC=0x25 data abort.
+`validate_user_ptr` tries to pre-map the page via `ensure_user_pages_mapped`, but
+there are TLB coherency or TTBR0-swap scenarios where the page isn't visible to the
+subsequent write even after mapping.
 
-### Non-issue — `validate_user_ptr` kernel VA exclusion (reverted)
-
-An earlier attempt to guard against EC=0x25 by excluding `[0x4000_0000, 0x6000_0000)`
-from valid user addresses was reverted. Bun's JSC heap starts at `0x50000000`, so
-the exclusion incorrectly returned EFAULT for legitimate path strings allocated in
-that heap (e.g. `"//package.json"`). Since the kernel VA and user mmap ranges
-overlap on this system, a simple VA-range check cannot distinguish them reliably.
+The principled fix would be a `copy_to_user()` primitive backed by an exception
+fixup table (like Linux's `__ex_table`), so individual instruction faults can be
+directed to a known-good return path. The landing pad is a pragmatic substitute
+until that infrastructure is in place.
 
 ---
 
 ## Fixes
 
-### Fix 1 — EL1 data-abort recovery (`src/exceptions.rs`)
+### Fix 1 — EL1 data-abort recovery with landing pad (`src/exceptions.rs`)
 
-When EC=0x25 fires with ELR in kernel code range `[0x4020_0000, 0x6000_0000)`,
-instead of looping with `wfe`, the handler now:
+Added `el1_fault_recovery_pad()` — a function that just calls `yield_now()` in a
+loop. When EC=0x25 fires with ELR in kernel code range `[0x4020_0000, 0x6000_0000)`:
 
 1. Marks the current process as Zombie (exit code −14 / EFAULT)
 2. Calls `kill_thread_group` to terminate all threads of the process
-3. Returns — the scheduler will not resume the dead process
+3. Sets `ELR_EL1` to `el1_fault_recovery_pad` (not ELR+4)
+4. Returns — `eret` lands in the pad which yields; scheduler cleans up the slot
 
-This means a bad user pointer that leaks past `validate_user_ptr` degrades to a
-process kill, not a kernel panic.
+Redirecting to the pad (rather than +4) prevents the fault cascade where the next
+instruction uses the same poisoned register and faults again.
 
-### Fix 2 — Epoll cleanup on close (`src/syscall/poll.rs`, `src/syscall/fs.rs`)
+### Fix 2 — Epoll cleanup on explicit close (`src/syscall/poll.rs`, `src/syscall/fs.rs`)
 
 Added `pub(super) fn epoll_destroy(epoll_id: u32)` that removes the instance from
-`EPOLL_TABLE`. `sys_close` now matches `EpollFd` and calls `epoll_destroy`.
+`EPOLL_TABLE`. `sys_close` now matches `EpollFd` and calls `epoll_destroy`. The
+`close_cloexec_fds` exec path also calls `epoll_destroy` for cloexec epoll fds.
 
 ### Fix 3 — Lazy demand-paged stack region (`crates/akuma-exec/src/process/mod.rs`)
 
-After the eager stack allocation, all four process-creation paths (`from_elf`,
-`from_elf_path`, `replace_image`, `replace_image_from_path`) now register a 32 MB
-lazy anonymous region covering `[stack_top − 32 MB, stack_top)`.
+All four process-creation paths (`from_elf`, `from_elf_path`, `replace_image`,
+`replace_image_from_path`) now register a 32 MB lazy anonymous region covering
+`[stack_top − 32 MB, stack_top)`.
 
 ```
 const LAZY_STACK_MAX: usize = 32 * 1024 * 1024;
-let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
-push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, RW_NO_EXEC);
+push_lazy_region(pid, stack_top.saturating_sub(LAZY_STACK_MAX), LAZY_STACK_MAX, RW_NO_EXEC);
 ```
 
-Pages within the eager stack are already mapped; the lazy region covers growth
-beyond them at no physical-memory cost until actually faulted. This also fixes
-signal delivery to a process that has grown its stack (the signal frame page is now
-within the lazy region and can be demand-paged).
+Physical pages are only allocated on fault. This also fixes signal delivery to a
+process whose stack has grown past the initial eager pages.
+
+### Fix 4 — Don't inherit EpollFd across fork (`crates/akuma-exec/src/process/mod.rs`)
+
+Both fork paths now strip `EpollFd` entries from the child's fd table. Children
+exec immediately and don't need the parent's epoll state; inheriting it causes
+`epoll_destroy` to nuke the parent's shared global instance when the child closes
+that fd.
+
+### Fix 5 — Honor `EPOLL_CLOEXEC` (`src/syscall/poll.rs`)
+
+`sys_epoll_create1` previously ignored the `flags` parameter. It now calls
+`proc.set_cloexec(fd)` when `EPOLL_CLOEXEC` is set.
 
 ---
 
@@ -110,22 +180,32 @@ within the lazy region and can be demand-paged).
 
 | File | Change |
 |------|--------|
-| `src/exceptions.rs` | EL1 abort recovery — kill process on EC=0x25 in kernel code |
-| `src/syscall/poll.rs` | Added `epoll_destroy()` |
-| `src/syscall/fs.rs` | `sys_close` — added `EpollFd` arm calling `epoll_destroy` |
-| `crates/akuma-exec/src/process/mod.rs` | 32 MB lazy stack region in all exec paths |
+| `src/exceptions.rs` | EL1 abort recovery with landing pad; `el1_fault_recovery_pad()` |
+| `src/syscall/poll.rs` | `epoll_destroy()`; honor `EPOLL_CLOEXEC` in `epoll_create1` |
+| `src/syscall/fs.rs` | `sys_close` — `EpollFd` arm calls `epoll_destroy` |
+| `src/syscall/proc.rs` | `execve` cloexec path — `EpollFd` arm calls `epoll_destroy` |
+| `crates/akuma-exec/src/process/mod.rs` | 32 MB lazy stack region; strip `EpollFd` on fork |
 
 ---
 
 ## Why the validate_user_ptr Kernel-VA Check Was Removed
 
-The original EC=0x25 crash plan proposed excluding `[KERNEL_VA_BASE, KERNEL_VA_END)`
-from user pointers. This was added and then reverted because:
+A proposed fix excluded `[0x4000_0000, 0x6000_0000)` from `validate_user_ptr`.
+This was wrong because:
 
-- Kernel code is loaded at physical/virtual `0x40200000` and the kernel heap extends
-  upward from there. With 1 GB RAM the heap ceiling is around `0x50200000`.
-- Bun/JSC requests a 1 GB anonymous mmap starting at `0x50000000` (the "gigacage").
-- The ranges `[0x50000000, 0x50200000)` overlap — any fixed VA exclusion that covers
-  the kernel heap also rejects legitimate user addresses.
-- The EL1 recovery (Fix 1) is the correct architectural answer: if a write to a user
-  VA faults at EL1, the kernel recovers without a panic.
+- Kernel code loads at physical `0x40200000`. With 1 GB RAM the kernel heap can
+  extend to `~0x50200000`.
+- Bun/JSC maps a 1 GB "gigacage" starting at `0x50000000`.
+- The range `[0x50000000, 0x50200000)` is in both the kernel heap and the JSC mmap.
+  No fixed VA exclusion can cover the kernel heap without also rejecting valid user
+  addresses.
+- The EL1 landing-pad recovery is the correct defence: if a write to a user VA faults
+  at EL1, the kernel kills only the offending process and continues.
+
+## Known Limitation
+
+`epoll_destroy` is not reference-counted. If two processes share an epoll id (e.g.
+via `dup` across a fork without our EpollFd-stripping fix), closing either fd
+destroys the shared instance. The current mitigation is to strip EpollFd from forked
+children. A proper fix would use a per-instance refcount incremented on fork/dup and
+decremented on close.
