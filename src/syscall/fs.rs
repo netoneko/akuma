@@ -753,6 +753,9 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     super::eventfd::eventfd_close(efd_id);
                 }
+                akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => {
+                    super::poll::epoll_destroy(epoll_id);
+                }
                 _ => {}
             }
             proc.clear_nonblock(fd);

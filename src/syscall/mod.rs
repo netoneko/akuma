@@ -330,6 +330,11 @@ fn user_va_limit() -> u64 {
     }
 }
 
+// Kernel VA range: RAM base (0x4000_0000) through code + heap.
+// Use a conservative upper bound of 0x6000_0000 to cover the kernel image and heap.
+const KERNEL_VA_BASE: u64 = 0x4000_0000;
+const KERNEL_VA_END: u64 = 0x6000_0000;
+
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
     if ptr < 0x1000 { return false; }
@@ -337,6 +342,8 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
+    // Reject any pointer that overlaps the kernel VA range
+    if ptr < KERNEL_VA_END && end > KERNEL_VA_BASE { return false; }
     if end > user_va_limit() { return false; }
 
     if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len) {

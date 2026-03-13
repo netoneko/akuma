@@ -1326,6 +1326,11 @@ fn syscall_name(nr: usize) -> &'static str {
 }
 
 
+/// Maximum virtual address range registered for demand-paged stack growth.
+/// Physical pages are only allocated on fault, so this costs nothing unless used.
+/// 32 MB is enough for even the heaviest runtimes (Bun/JSC uses ~600KB–2MB).
+const LAZY_STACK_MAX: usize = 32 * 1024 * 1024;
+
 fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
     const MIN_HEAP: usize = 16 * 1024 * 1024;
     const RESERVE_PAGES: usize = 2048; // 8MB
@@ -1362,6 +1367,12 @@ impl Process {
 
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
+
+        // Register demand-paged regions for heap and stack growth.
+        let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
+        push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
 
         // Initialize FD table with stdin/stdout/stderr pre-allocated
         let mut fd_map = alloc::collections::BTreeMap::new();
@@ -1478,6 +1489,9 @@ impl Process {
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
         push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+        // Register a demand-paged region for stack growth below the eager stack pages.
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
 
         Ok(Self {
             pid,
@@ -1549,7 +1563,9 @@ impl Process {
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
-        
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        push_lazy_region(self.pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
+
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
                 self.pid, entry_point, brk, stack_bottom, stack_top, sp);
@@ -1622,6 +1638,8 @@ impl Process {
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
         push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        push_lazy_region(self.pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
 
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",

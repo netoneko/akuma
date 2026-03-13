@@ -1014,7 +1014,32 @@ extern "C" fn rust_sync_el1_handler() {
         safe_print!(128, "  WARNING: Kernel accessing user-space address!\n");
         safe_print!(128, "  This suggests stale TTBR0 or dereferencing user pointer from kernel.\n");
     }
-    
+
+    // Recovery: if this is a data abort (EC=0x25) caused by writing/reading a bad
+    // address while executing kernel (syscall) code, kill only the offending process
+    // instead of halting the kernel.  This guards against validate_user_ptr letting a
+    // kernel address slip through.
+    if ec == 0x25 {
+        // Kernel is loaded at RAM_BASE+2MB (0x4020_0000) and extends to ~0x6000_0000.
+        let in_kernel_code = elr >= 0x4020_0000 && elr < 0x6000_0000;
+        if in_kernel_code {
+            let _ = write!(w, "  EC=0x25 in kernel code — killing current process (EFAULT)\n");
+            w.flush();
+            if let Some(proc) = akuma_exec::process::current_process() {
+                let _ = write!(w, "  Killing PID {} ({})\n", proc.pid, proc.name);
+                w.flush();
+                let l0_phys = proc.address_space.l0_phys();
+                proc.exited = true;
+                proc.exit_code = -14; // EFAULT
+                proc.state = akuma_exec::process::ProcessState::Zombie(-14);
+                akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
+            }
+            // Return — the EL1 ERET will fall back to the scheduler which will
+            // pick a different thread since this one is now Zombie.
+            return;
+        }
+    }
+
     // Check for page table corruption on translation table walk faults
     let dfsc = iss & 0x3F;
     if dfsc == 0x21 || dfsc == 0x22 || dfsc == 0x23 {

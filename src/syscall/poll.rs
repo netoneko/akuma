@@ -40,6 +40,10 @@ struct EpollEvent {
     data: u64,
 }
 
+pub(super) fn epoll_destroy(epoll_id: u32) {
+    EPOLL_TABLE.lock().remove(&epoll_id);
+}
+
 pub(super) fn sys_epoll_create1(_flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
