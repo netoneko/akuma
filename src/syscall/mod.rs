@@ -687,7 +687,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, args[1] as usize),
         nr::EPOLL_CREATE1 => poll::sys_epoll_create1(args[0] as u32),
         nr::EPOLL_CTL => poll::sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
-        nr::EPOLL_PWAIT => poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32),
+        nr::EPOLL_PWAIT => {
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
+                crate::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
+            }
+            poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32)
+        }
         nr::TIMERFD_CREATE => timerfd::sys_timerfd_create(args[0] as i32, args[1] as i32),
         nr::TIMERFD_SETTIME => timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
         nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
