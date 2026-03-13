@@ -2419,7 +2419,15 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
         fd_table: {
-            let cloned = parent.fd_table.lock().clone();
+            // Strip EpollFd entries: epoll instances are not reference-counted,
+            // so if the child inherits an EpollFd and later calls close() on it,
+            // epoll_destroy() would nuke the parent's shared global instance.
+            // Children exec immediately and don't need the parent's epoll state.
+            let cloned: alloc::collections::BTreeMap<u32, FileDescriptor> = parent
+                .fd_table.lock().iter()
+                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect();
             for entry in cloned.values() {
                 match entry {
                     FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
@@ -2648,7 +2656,11 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         mmap_regions: Vec::new(),
         lazy_regions: Vec::new(), // managed via LAZY_REGION_TABLE
         fd_table: {
-            let cloned = parent.fd_table.lock().clone();
+            let cloned: alloc::collections::BTreeMap<u32, FileDescriptor> = parent
+                .fd_table.lock().iter()
+                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect();
             for entry in cloned.values() {
                 match entry {
                     FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),

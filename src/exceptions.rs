@@ -1034,8 +1034,15 @@ extern "C" fn rust_sync_el1_handler() {
                 proc.state = akuma_exec::process::ProcessState::Zombie(-14);
                 akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
             }
-            // Return — the EL1 ERET will fall back to the scheduler which will
-            // pick a different thread since this one is now Zombie.
+            // CRITICAL: advance ELR past the faulting instruction so that the
+            // ERET in sync_el1_handler does not immediately re-fault and recurse
+            // until the kernel stack overflows.  ARM64 instructions are always
+            // 4 bytes; skipping one instruction is safe here because the process
+            // is already Zombie and the scheduler will switch away on the next
+            // preemption tick.
+            unsafe {
+                core::arch::asm!("mrs {0}, elr_el1; add {0}, {0}, #4; msr elr_el1, {0}", out(reg) _);
+            }
             return;
         }
     }

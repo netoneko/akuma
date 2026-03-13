@@ -44,14 +44,19 @@ pub(super) fn epoll_destroy(epoll_id: u32) {
     EPOLL_TABLE.lock().remove(&epoll_id);
 }
 
-pub(super) fn sys_epoll_create1(_flags: u32) -> u64 {
+const EPOLL_CLOEXEC: u32 = 0o2000000;
+
+pub(super) fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
             interest_list: BTreeMap::new(),
         });
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
-        crate::tprint!(96, "[epoll] create1() id={} fd={}\n", epoll_id, fd);
+        if flags & EPOLL_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        }
+        crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & EPOLL_CLOEXEC != 0);
         fd as u64
     } else {
         EBADF
