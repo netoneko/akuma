@@ -583,7 +583,10 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
         if !BYPASS_VALIDATION.load(Ordering::Acquire) {
             if !validate_user_ptr(ptr + i * 8, 8) { break; }
         }
-        let str_ptr = unsafe { *((ptr + i * 8) as *const u64) };
+        let mut str_ptr: u64 = 0;
+        if unsafe { copy_from_user_safe(&mut str_ptr as *mut u64 as *mut u8, (ptr + i * 8) as *const u8, 8).is_err() } {
+            break;
+        }
         if str_ptr == 0 { break; }
         
         match copy_from_user_str(str_ptr, 1024) {
@@ -700,7 +703,12 @@ pub(super) fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 
     if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
         if ch.has_exited() {
-            if status_ptr != 0 { unsafe { *(status_ptr as *mut u32) = encode_wait_status(ch.exit_code()); } }
+            if status_ptr != 0 { 
+                let status = encode_wait_status(ch.exit_code());
+                if unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4).is_err() } {
+                    return EFAULT;
+                }
+            }
             return pid as u64;
         }
     }

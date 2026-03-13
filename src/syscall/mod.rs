@@ -30,6 +30,10 @@ pub use sync::futex_wake;
 pub use mem::membarrier_cmd;
 pub(crate) use fs::sys_close_range;
 
+pub(crate) fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
+    poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
+}
+
 pub static CURRENT_SYSCALL_NR: AtomicU64 = AtomicU64::new(9999);
 pub fn current_syscall_nr() -> u64 { CURRENT_SYSCALL_NR.load(Ordering::Relaxed) }
 

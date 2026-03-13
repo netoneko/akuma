@@ -2376,26 +2376,48 @@ fn cleanup_process_fds(proc: &Process) {
 /// * `Ok(())` if the process was successfully killed
 /// * `Err(message)` if the process was not found or could not be killed
 pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
+    // Kill direct children first so parent-kill semantics cascade and avoid
+    // leaving orphaned workers running after the parent exits.
+    let child_pids: Vec<Pid> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter_map(|(&child_pid, p)| {
+                if p.parent_pid == pid {
+                    Some(child_pid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+    for child_pid in child_pids {
+        if child_pid != pid {
+            let _ = kill_process(child_pid);
+        }
+    }
+
     // Look up the process
     let proc = lookup_process(pid).ok_or("Process not found")?;
-    
-    // Get thread_id before cleanup (needed for channel removal and thread termination)
-    let thread_id = proc.thread_id.ok_or("Process has no thread_id (not yet started?)")?;
-    
+
+    // Get thread_id before cleanup (needed for channel removal and thread termination).
+    // Some synthetic test processes don't have a started thread yet; still allow
+    // kill/unregister for those entries.
+    let thread_id = proc.thread_id;
+
     // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
     // to detect the interrupt and properly abort their sockets before we clean up.
-    // The interrupt check in syscalls will cause them to return EINTR and clean up
-    // their own resources (e.g., abort TcpSocket in block_on_accept).
-    if let Some(channel) = get_channel(thread_id) {
-        channel.set_interrupted();
+    if let Some(tid) = thread_id {
+        if let Some(channel) = get_channel(tid) {
+            channel.set_interrupted();
+        }
+
+        // Yield a few times to give the blocked thread a chance to detect the interrupt.
+        for _ in 0..5 {
+            crate::threading::yield_now();
+        }
     }
-    
-    // Yield a few times to give the blocked thread a chance to detect the interrupt
-    // and abort its sockets. This is important for listening sockets in accept().
-    for _ in 0..5 {
-        crate::threading::yield_now();
-    }
-    
+
     // Clean up all open FDs for this process
     // Note: This cleans up sockets in the fd_table, but sockets created inside
     // syscalls (like the TcpSocket in accept()) are handled by the interrupt mechanism.
@@ -2428,14 +2450,16 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // _dropped_process goes out of scope here, triggering the drop
     
     // Remove and notify the process channel
-    if let Some(channel) = remove_channel(thread_id) {
-        channel.set_exited(137);
+    if let Some(tid) = thread_id {
+        if let Some(channel) = remove_channel(tid) {
+            channel.set_exited(137);
+        }
+
+        // Mark the thread as terminated so scheduler stops scheduling it
+        crate::threading::mark_thread_terminated(tid);
     }
     
-    // Mark the thread as terminated so scheduler stops scheduling it
-    crate::threading::mark_thread_terminated(thread_id);
-    
-    log::debug!("[kill] Killed PID {} (thread {})", pid, thread_id);
+    log::debug!("[kill] Killed PID {} (thread {:?})", pid, thread_id);
     
     Ok(())
 }
@@ -2738,7 +2762,6 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         fd_table: {
             let cloned: alloc::collections::BTreeMap<u32, FileDescriptor> = parent
                 .fd_table.lock().iter()
-                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
             for entry in cloned.values() {

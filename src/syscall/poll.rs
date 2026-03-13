@@ -23,6 +23,17 @@ const EPOLLRDHUP: u32 = 0x2000;
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
+const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
+
+pub(crate) fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
+    if timeout > 0 {
+        start_time + timeout_us
+    } else if timeout == 0 {
+        0
+    } else {
+        now + BLOCKING_POLL_INTERVAL_US
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -300,13 +311,7 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             return EINTR;
         }
 
-        let deadline = if timeout > 0 {
-            start_time + timeout_us
-        } else if timeout == 0 {
-            0 // Should have returned above if not ready
-        } else {
-            u64::MAX
-        };
+        let deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
 
         if deadline == 0 { return 0; }
 
@@ -431,7 +436,11 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             return 0;
         }
 
-        let deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        let deadline = if infinite {
+            crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US
+        } else {
+            start_time + timeout_us
+        };
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }
@@ -551,7 +560,11 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             return 0;
         }
 
-        let deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        let deadline = if infinite {
+            crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US
+        } else {
+            start_time + timeout_us
+        };
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }

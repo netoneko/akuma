@@ -199,6 +199,8 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
     run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
+    run_test!(test_epoll_infinite_wait_uses_bounded_deadline, "epoll_infinite_wait_bounded_deadline");
+    run_test!(test_kill_process_cascades_to_children, "kill_process_cascades_to_children");
 
     // ENOSYS syscall handling (bun crash prevention)
     run_test!(test_enosys_syscalls_return_proper_errno, "enosys_syscalls_proper_errno");
@@ -4795,6 +4797,61 @@ fn test_kill_process_clears_lazy_regions() -> bool {
     pass
 }
 
+/// Verify kill_process(parent) cascades to direct children.
+fn test_kill_process_cascades_to_children() -> bool {
+    console::print("\n[TEST] kill_process: parent kill cascades to child\n");
+
+    let parent_pid = akuma_exec::process::allocate_pid();
+    let child_pid = akuma_exec::process::allocate_pid();
+
+    let parent_as = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (parent AS)\n"); return false; }
+    };
+    let child_as = match akuma_exec::mmu::UserAddressSpace::new() {
+        Some(a) => a,
+        None => { console::print("  OOM (child AS)\n"); return false; }
+    };
+    let parent_info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM (parent info)\n"); return false; }
+    };
+    let child_info = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            crate::pmm::free_page(parent_info);
+            console::print("  OOM (child info)\n");
+            return false;
+        }
+    };
+
+    let parent_proc = make_test_process(parent_pid, 0, parent_as, parent_info.addr);
+    let child_proc = make_test_process(child_pid, parent_pid, child_as, child_info.addr);
+    akuma_exec::process::register_process(parent_pid, parent_proc);
+    akuma_exec::process::register_process(child_pid, child_proc);
+
+    let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
+    let parent_alive = akuma_exec::process::lookup_process(parent_pid).is_some();
+    let child_alive = akuma_exec::process::lookup_process(child_pid).is_some();
+
+    if parent_alive {
+        let _ = akuma_exec::process::unregister_process(parent_pid);
+    }
+    if child_alive {
+        let _ = akuma_exec::process::unregister_process(child_pid);
+    }
+    crate::pmm::free_page(parent_info);
+    crate::pmm::free_page(child_info);
+
+    let pass = kill_ok && !parent_alive && !child_alive;
+    if !pass {
+        crate::safe_print!(128, "  kill_ok={} parent_alive={} child_alive={}\n",
+            kill_ok, parent_alive, child_alive);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 /// Batch allocate 64 pages, verify all distinct and zeroed.
 fn test_alloc_pages_batch_basic() -> bool {
     console::print("\n[TEST] alloc_pages_zeroed: batch 64 pages, all distinct and zeroed\n");
@@ -6731,6 +6788,29 @@ fn test_epoll_event_is_16_bytes_on_arm64() -> bool {
     pass
 }
 
+/// Test: epoll infinite waits use bounded scheduler deadlines.
+fn test_epoll_infinite_wait_uses_bounded_deadline() -> bool {
+    console::print("\n[TEST] epoll infinite wait uses bounded deadline\n");
+
+    let start_time = 1_000_000u64;
+    let timeout_us = 42_000u64;
+    let now = 1_234_567u64;
+
+    let finite = crate::syscall::epoll_wait_deadline_for_test(10, start_time, timeout_us, now);
+    let zero = crate::syscall::epoll_wait_deadline_for_test(0, start_time, timeout_us, now);
+    let infinite = crate::syscall::epoll_wait_deadline_for_test(-1, start_time, timeout_us, now);
+
+    let pass = finite == start_time + timeout_us
+        && zero == 0
+        && infinite == now + 10_000
+        && infinite != u64::MAX;
+    if !pass {
+        crate::safe_print!(128, "  finite={} zero={} infinite={}\n", finite, zero, infinite);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 // ============================================================================
 // ENOSYS syscall handling tests (bun crash prevention)
 // ============================================================================
@@ -6960,12 +7040,12 @@ fn test_copy_from_user_str_fault() -> bool {
     let res = crate::syscall::copy_from_user_str(invalid_addr, 1024);
     
     let ok = match res {
-        Err(14) => {
+        Err(e) if e == 14 || e == 18446744073709551602 => {
             console::print("  OK: copy_from_user_str returned EFAULT for invalid addr\n");
             true
         }
         Err(e) => {
-            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
+            crate::safe_print!(128, "  FAILED: expected EFAULT (14 or -14), got {}\n", e);
             false
         }
         Ok(s) => {

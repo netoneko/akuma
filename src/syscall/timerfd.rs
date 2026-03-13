@@ -72,17 +72,22 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 
     let mut table = TIMERFD_TABLE.lock();
 
-    if old_value != 0 && validate_user_ptr(old_value as u64, 32) {
+    if old_value != 0 {
+        if !validate_user_ptr(old_value as u64, 32) {
+            return EFAULT;
+        }
         if let Some(state) = table.get(&timer_id) {
             let now = crate::timer::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
-            let _ = us_to_timespec_safe(state.interval_us, old_value);      // it_interval
-            let _ = us_to_timespec_safe(remaining, old_value + 16);         // it_value (remaining time)
+            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return EFAULT; }      // it_interval
+            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return EFAULT; }         // it_value (remaining time)
         } else {
             let zero = [0u8; 32];
-            let _ = unsafe { copy_to_user_safe(old_value as *mut u8, zero.as_ptr(), 32) };
+            if unsafe { copy_to_user_safe(old_value as *mut u8, zero.as_ptr(), 32).is_err() } {
+                return EFAULT;
+            }
         }
     }
 
@@ -124,17 +129,22 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
         _ => return EBADF,
     };
     let out = out_ptr as usize;
-    if out != 0 && validate_user_ptr(out_ptr, 32) {
+    if out != 0 {
+        if !validate_user_ptr(out_ptr, 32) {
+            return EFAULT;
+        }
         let table = TIMERFD_TABLE.lock();
         if let Some(state) = table.get(&timer_id) {
             let now = crate::timer::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
-            let _ = us_to_timespec_safe(state.interval_us, out);
-            let _ = us_to_timespec_safe(remaining, out + 16);
+            if us_to_timespec_safe(state.interval_us, out).is_err() { return EFAULT; }
+            if us_to_timespec_safe(remaining, out + 16).is_err() { return EFAULT; }
         } else {
             let zero = [0u8; 32];
-            let _ = unsafe { copy_to_user_safe(out as *mut u8, zero.as_ptr(), 32) };
+            if unsafe { copy_to_user_safe(out as *mut u8, zero.as_ptr(), 32).is_err() } {
+                return EFAULT;
+            }
         }
     }
     0

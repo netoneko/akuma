@@ -1463,7 +1463,9 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         };
         let bytes = exe.as_bytes();
         let copy_len = bytes.len().min(bufsize);
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, bytes.as_ptr(), copy_len).is_err() } {
+            return EFAULT;
+        }
         return copy_len as u64;
     }
 
@@ -1471,7 +1473,9 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, copy_len); }
+        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, bytes.as_ptr(), copy_len).is_err() } {
+            return EFAULT;
+        }
         return copy_len as u64;
     }
 
