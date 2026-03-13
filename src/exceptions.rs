@@ -958,14 +958,17 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 /// that ERET doesn't return to the middle of the faulting instruction sequence
 /// (which would immediately fault again, causing an infinite loop).
 ///
-/// The process is already marked Zombie before we land here.  We just yield
-/// in a loop; the scheduler will stop dispatching this thread once it's cleaned
-/// up by cleanup_terminated().
+/// The process is already marked Zombie before we land here. We call
+/// `return_to_kernel` to properly close all file descriptors (sockets, pipes,
+/// etc.) and free the process's address space.  Without this, each EL1-fault
+/// crash leaks all socket slots in the 128-slot socket table, causing later
+/// `bun install` runs to fail to allocate UDP sockets for DNS.
+///
+/// Safety: ERET from an EL1 exception restores SPSR_EL1 which had EL1 mode
+/// bits, so this function runs at EL1 and can safely call kernel functions.
 #[unsafe(no_mangle)]
 extern "C" fn el1_fault_recovery_pad() {
-    loop {
-        akuma_exec::threading::yield_now();
-    }
+    akuma_exec::process::return_to_kernel(-14);
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)

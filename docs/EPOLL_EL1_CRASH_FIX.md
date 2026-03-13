@@ -176,18 +176,6 @@ that fd.
 
 ---
 
-## Files Changed
-
-| File | Change |
-|------|--------|
-| `src/exceptions.rs` | EL1 abort recovery with landing pad; `el1_fault_recovery_pad()` |
-| `src/syscall/poll.rs` | `epoll_destroy()`; honor `EPOLL_CLOEXEC` in `epoll_create1` |
-| `src/syscall/fs.rs` | `sys_close` — `EpollFd` arm calls `epoll_destroy` |
-| `src/syscall/proc.rs` | `execve` cloexec path — `EpollFd` arm calls `epoll_destroy` |
-| `crates/akuma-exec/src/process/mod.rs` | 32 MB lazy stack region; strip `EpollFd` on fork |
-
----
-
 ## Why the validate_user_ptr Kernel-VA Check Was Removed
 
 A proposed fix excluded `[0x4000_0000, 0x6000_0000)` from `validate_user_ptr`.
@@ -201,6 +189,55 @@ This was wrong because:
   addresses.
 - The EL1 landing-pad recovery is the correct defence: if a write to a user VA faults
   at EL1, the kernel kills only the offending process and continues.
+
+### Regression 5 — Socket table exhaustion / second `bun install` hangs on DNS
+
+After the EL1 recovery fix, `bun install` of small packages (express) worked, but
+`bun install @google/gemini-cli` (200+ packages) crashed with:
+
+```
+[WILD-DA] pid=44 FAR=0xfffffffffffffffa ELR=0x2d1d870 last_sc=113
+[signal] sig 11 frame page 0x203ffdf000 not mappable
+```
+
+A second `bun install express` would then hang indefinitely on DNS resolution, but
+only if `node_modules` was still present.
+
+**Root cause:** `el1_fault_recovery_pad` looped calling `yield_now()` forever. The
+process was marked Zombie but:
+1. Its socket fds were never cleaned up (`cleanup_process_fds` was not called for
+   the faulting process itself — only for sibling threads via `kill_thread_group`)
+2. The thread slot occupied the scheduler run-queue permanently
+
+Each crash leaked all of the process's open sockets (TCP connections to npm registry,
+UDP sockets for DNS). With MAX_SOCKETS=128, after a few crashes the socket table
+was full. The next `bun install` could not allocate a UDP socket for DNS, causing the
+resolver to hang waiting for a response from a socket that was never created.
+
+The "remove node_modules fixes it" observation: removing `node_modules` changes which
+packages Bun tries to install, resulting in fewer syscalls between the crash point and
+DNS resolution — by chance the socket table happens to not be exhausted yet.
+
+**Fix:** `el1_fault_recovery_pad` now calls `return_to_kernel(-14)` instead of
+yielding forever. Since ERET from an EL1 exception restores SPSR_EL1 (which contains
+EL1 mode bits), the function runs at EL1 and can safely call kernel code.
+`return_to_kernel` calls `cleanup_process_fds`, removes the channel, deactivates the
+address space, and unregisters the process — exactly the same cleanup path as a
+normal process exit.
+
+---
+
+## Files Changed (updated)
+
+| File | Change |
+|------|--------|
+| `src/exceptions.rs` | EL1 abort recovery with landing pad; `el1_fault_recovery_pad()` now calls `return_to_kernel(-14)` |
+| `src/syscall/poll.rs` | `epoll_destroy()`; honor `EPOLL_CLOEXEC` in `epoll_create1` |
+| `src/syscall/fs.rs` | `sys_close` — `EpollFd` arm calls `epoll_destroy` |
+| `src/syscall/proc.rs` | `execve` cloexec path — `EpollFd` arm calls `epoll_destroy` |
+| `crates/akuma-exec/src/process/mod.rs` | 32 MB lazy stack region; strip `EpollFd` on fork |
+
+---
 
 ## Known Limitation
 
