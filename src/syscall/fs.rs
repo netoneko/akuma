@@ -885,7 +885,7 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
     };
 
     let fds: Vec<u32> = crate::irq::with_irqs_disabled(|| {
-        proc.fd_table.lock().range(first..=last).map(|(&fd, _)| fd).collect()
+        proc.fds.table.lock().range(first..=last).map(|(&fd, _)| fd).collect()
     });
 
     for fd in fds {

@@ -97,16 +97,19 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
             if unsafe { copy_from_user_safe(&mut ev as *mut EpollEvent as *mut u8, event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
-            if instance.interest_list.contains_key(&fd) {
-                return EEXIST;
-            }
             let ev_events = { ev.events };
             let ev_data = { ev.data };
-            instance.interest_list.insert(fd, EpollEntry {
-                events: ev_events,
-                data: ev_data,
-            });
-            crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            if let Some(entry) = instance.interest_list.get_mut(&fd) {
+                entry.events = ev_events;
+                entry.data = ev_data;
+                crate::tprint!(96, "[epoll] ctl ADD->MOD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            } else {
+                instance.interest_list.insert(fd, EpollEntry {
+                    events: ev_events,
+                    data: ev_data,
+                });
+                crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
+            }
             0
         }
         EPOLL_CTL_MOD => {

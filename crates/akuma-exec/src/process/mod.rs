@@ -7,8 +7,10 @@ pub mod types;
 pub use types::*;
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
@@ -235,7 +237,6 @@ pub fn unregister_thread_pid(tid: usize) {
 // ============================================================================
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32};
 
@@ -1059,6 +1060,64 @@ pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
 
 
 
+/// Shared file descriptor table for CLONE_FILES semantics.
+///
+/// When threads are created with CLONE_VM (pthreads), they share this table
+/// via Arc — matching Linux CLONE_FILES behavior. Fork creates a deep copy.
+pub struct SharedFdTable {
+    pub table: Spinlock<BTreeMap<u32, FileDescriptor>>,
+    pub cloexec: Spinlock<BTreeSet<u32>>,
+    pub nonblock: Spinlock<BTreeSet<u32>>,
+    pub next_fd: AtomicU32,
+}
+
+impl SharedFdTable {
+    pub fn new() -> Self {
+        Self {
+            table: Spinlock::new(BTreeMap::new()),
+            cloexec: Spinlock::new(BTreeSet::new()),
+            nonblock: Spinlock::new(BTreeSet::new()),
+            next_fd: AtomicU32::new(3),
+        }
+    }
+
+    pub fn with_stdio() -> Self {
+        let mut fd_map = BTreeMap::new();
+        fd_map.insert(0, FileDescriptor::Stdin);
+        fd_map.insert(1, FileDescriptor::Stdout);
+        fd_map.insert(2, FileDescriptor::Stderr);
+        Self {
+            table: Spinlock::new(fd_map),
+            cloexec: Spinlock::new(BTreeSet::new()),
+            nonblock: Spinlock::new(BTreeSet::new()),
+            next_fd: AtomicU32::new(3),
+        }
+    }
+
+    /// Deep copy for fork (separate fd table, with pipe ref bumps).
+    /// Strips EpollFd entries since epoll instances are not reference-counted.
+    #[must_use]
+    pub fn clone_deep_for_fork(&self) -> Self {
+        let cloned: BTreeMap<u32, FileDescriptor> = self.table.lock().iter()
+            .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        for entry in cloned.values() {
+            match entry {
+                FileDescriptor::PipeWrite(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, true),
+                FileDescriptor::PipeRead(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, false),
+                _ => {}
+            }
+        }
+        Self {
+            table: Spinlock::new(cloned),
+            cloexec: Spinlock::new(self.cloexec.lock().clone()),
+            nonblock: Spinlock::new(self.nonblock.lock().clone()),
+            next_fd: AtomicU32::new(self.next_fd.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 /// A user process
 pub struct Process {
     /// Process ID
@@ -1126,15 +1185,8 @@ pub struct Process {
     pub lazy_regions: Vec<LazyRegion>,
 
     // ========== File Descriptor Table ==========
-    /// Per-process file descriptor table
-    /// Maps FD numbers to FileDescriptor entries (sockets, files, etc.)
-    pub fd_table: Spinlock<alloc::collections::BTreeMap<u32, FileDescriptor>>,
-    /// FDs marked close-on-exec (closed during execve)
-    pub cloexec_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
-    /// FDs marked non-blocking (O_NONBLOCK)
-    pub nonblock_fds: Spinlock<alloc::collections::BTreeSet<u32>>,
-    /// Next available file descriptor number
-    pub next_fd: AtomicU32,
+    /// Shared file descriptor table (shared across CLONE_VM threads via Arc).
+    pub fds: Arc<SharedFdTable>,
 
     // ========== Thread tracking ==========
     /// Thread ID running this process (set after spawn, used for kill)
@@ -1374,12 +1426,6 @@ impl Process {
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
         push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
 
-        // Initialize FD table with stdin/stdout/stderr pre-allocated
-        let mut fd_map = alloc::collections::BTreeMap::new();
-        fd_map.insert(0, FileDescriptor::Stdin);
-        fd_map.insert(1, FileDescriptor::Stdout);
-        fd_map.insert(2, FileDescriptor::Stderr);
-
         Ok(Self {
             pid,
             pgid: pid,
@@ -1393,26 +1439,16 @@ impl Process {
             entry_point,
             memory,
             process_info_phys: process_info_frame.addr,
-            // Command line arguments - initialized empty
             args: Vec::new(),
-            // Current working directory - defaults to root
             cwd: String::from("/"),
-            // Per-process I/O - Spinlock-protected for thread safety
             stdin: Spinlock::new(StdioBuffer::new()),
             stdout: Spinlock::new(StdioBuffer::new()),
             exited: false,
             exit_code: 0,
-            // Dynamic page tables - for mmap-allocated page tables
             dynamic_page_tables: Vec::new(),
-            // Mmap regions - for tracking VA->frames mapping (used by munmap)
             mmap_regions: Vec::new(),
             lazy_regions: Vec::new(),
-            // File descriptor table - stdin/stdout/stderr pre-allocated
-            fd_table: Spinlock::new(fd_map),
-            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-            nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-            next_fd: AtomicU32::new(3), // Start after stdin/stdout/stderr
-            // Thread ID - set when spawned
+            fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
             // Spawner PID - set when spawned by another process
             spawner_pid: None,
@@ -1482,14 +1518,8 @@ impl Process {
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
 
-        let mut fd_map = alloc::collections::BTreeMap::new();
-        fd_map.insert(0, FileDescriptor::Stdin);
-        fd_map.insert(1, FileDescriptor::Stdout);
-        fd_map.insert(2, FileDescriptor::Stderr);
-
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
         push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
-        // Register a demand-paged region for stack growth below the eager stack pages.
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
         push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
 
@@ -1515,10 +1545,7 @@ impl Process {
             dynamic_page_tables: Vec::new(),
             mmap_regions: Vec::new(),
             lazy_regions: Vec::new(),
-            fd_table: Spinlock::new(fd_map),
-            cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-            nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-            next_fd: AtomicU32::new(3),
+            fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
             spawner_pid: None,
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
@@ -1792,33 +1819,31 @@ impl Process {
     /// the FD number is allocated and inserted while holding the lock.
     pub fn alloc_fd(&self, entry: FileDescriptor) -> u32 {
         with_irqs_disabled(|| {
-            let mut table = self.fd_table.lock();
-            let fd = self.next_fd.fetch_add(1, Ordering::SeqCst);
+            let mut table = self.fds.table.lock();
+            let fd = self.fds.next_fd.fetch_add(1, Ordering::SeqCst);
             table.insert(fd, entry);
             fd
         })
     }
 
     /// Get a file descriptor entry (cloned)
-    ///
-    /// Returns a clone of the entry to avoid holding the lock.
     pub fn get_fd(&self, fd: u32) -> Option<FileDescriptor> {
         with_irqs_disabled(|| {
-            self.fd_table.lock().get(&fd).cloned()
+            self.fds.table.lock().get(&fd).cloned()
         })
     }
 
     /// Remove and return a file descriptor entry
     pub fn remove_fd(&self, fd: u32) -> Option<FileDescriptor> {
         with_irqs_disabled(|| {
-            self.fd_table.lock().remove(&fd)
+            self.fds.table.lock().remove(&fd)
         })
     }
 
     /// Set a file descriptor entry at a specific FD number, replacing any existing entry
     pub fn set_fd(&self, fd: u32, entry: FileDescriptor) {
         with_irqs_disabled(|| {
-            self.fd_table.lock().insert(fd, entry);
+            self.fds.table.lock().insert(fd, entry);
         });
     }
 
@@ -1828,7 +1853,7 @@ impl Process {
         F: FnOnce(&mut FileDescriptor),
     {
         with_irqs_disabled(|| {
-            let mut table = self.fd_table.lock();
+            let mut table = self.fds.table.lock();
             if let Some(entry) = table.get_mut(&fd) {
                 f(entry);
                 true
@@ -1840,54 +1865,59 @@ impl Process {
 
     pub fn set_cloexec(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.cloexec_fds.lock().insert(fd);
+            self.fds.cloexec.lock().insert(fd);
         });
     }
 
     pub fn clear_cloexec(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.cloexec_fds.lock().remove(&fd);
+            self.fds.cloexec.lock().remove(&fd);
         });
     }
 
     pub fn is_cloexec(&self, fd: u32) -> bool {
         with_irqs_disabled(|| {
-            self.cloexec_fds.lock().contains(&fd)
+            self.fds.cloexec.lock().contains(&fd)
         })
     }
 
     pub fn set_nonblock(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.nonblock_fds.lock().insert(fd);
+            self.fds.nonblock.lock().insert(fd);
         });
     }
 
     pub fn clear_nonblock(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.nonblock_fds.lock().remove(&fd);
+            self.fds.nonblock.lock().remove(&fd);
         });
     }
 
     pub fn is_nonblock(&self, fd: u32) -> bool {
         with_irqs_disabled(|| {
-            self.nonblock_fds.lock().contains(&fd)
+            self.fds.nonblock.lock().contains(&fd)
         })
     }
 
     /// Close all FDs marked close-on-exec, returning them for cleanup.
     pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
         with_irqs_disabled(|| {
-            let cloexec: Vec<u32> = self.cloexec_fds.lock().iter().copied().collect();
+            let cloexec: Vec<u32> = self.fds.cloexec.lock().iter().copied().collect();
             let mut closed = Vec::new();
-            let mut table = self.fd_table.lock();
+            let mut table = self.fds.table.lock();
             for fd in &cloexec {
                 if let Some(entry) = table.remove(fd) {
                     closed.push((*fd, entry));
                 }
             }
-            self.cloexec_fds.lock().clear();
+            self.fds.cloexec.lock().clear();
             closed
         })
+    }
+
+    /// Get a reference to the shared fd table (for direct access in sys_close_range, etc.)
+    pub fn fd_table(&self) -> &Arc<SharedFdTable> {
+        &self.fds
     }
 }
 
@@ -2324,15 +2354,20 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     }
 }
 
-/// Clean up all file descriptors owned by a process
+/// Clean up all file descriptors owned by a process.
+///
+/// With shared fd tables (CLONE_FILES), only the last thread referencing the
+/// table performs actual cleanup. Other threads just drop their Arc reference.
 fn cleanup_process_fds(proc: &Process) {
-    // 1. Collect all special FDs that need manual cleanup
+    if Arc::strong_count(&proc.fds) > 1 {
+        return;
+    }
+
     let fds: alloc::vec::Vec<FileDescriptor> = {
-        let table = proc.fd_table.lock();
+        let table = proc.fds.table.lock();
         table.values().cloned().collect()
     };
     
-    // 2. Perform manual cleanup for special FDs
     for fd in fds {
         match fd {
             FileDescriptor::Socket(idx) => {
@@ -2354,10 +2389,7 @@ fn cleanup_process_fds(proc: &Process) {
         }
     }
     
-    // 3. Clear the FD table. 
-    // This will drop KernelFile and other descriptors, 
-    // which in turn will call their respective cleanup logic (like VFS close).
-    let mut table = proc.fd_table.lock();
+    let mut table = proc.fds.table.lock();
     table.clear();
 }
 
@@ -2522,28 +2554,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
-        fd_table: {
-            // Strip EpollFd entries: epoll instances are not reference-counted,
-            // so if the child inherits an EpollFd and later calls close() on it,
-            // epoll_destroy() would nuke the parent's shared global instance.
-            // Children exec immediately and don't need the parent's epoll state.
-            let cloned: alloc::collections::BTreeMap<u32, FileDescriptor> = parent
-                .fd_table.lock().iter()
-                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect();
-            for entry in cloned.values() {
-                match entry {
-                    FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
-                    FileDescriptor::PipeRead(id) => (runtime().pipe_clone_ref)(*id, false),
-                    _ => {}
-                }
-            }
-            Spinlock::new(cloned)
-        },
-        cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
-        nonblock_fds: Spinlock::new(parent.nonblock_fds.lock().clone()),
-        next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
+        fds: Arc::new(parent.fds.clone_deep_for_fork()),
         thread_id: None,
         spawner_pid: parent.spawner_pid,
         terminal_state: parent.terminal_state.clone(),
@@ -2759,23 +2770,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
         lazy_regions: Vec::new(), // managed via LAZY_REGION_TABLE
-        fd_table: {
-            let cloned: alloc::collections::BTreeMap<u32, FileDescriptor> = parent
-                .fd_table.lock().iter()
-                .map(|(&k, v)| (k, v.clone()))
-                .collect();
-            for entry in cloned.values() {
-                match entry {
-                    FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
-                    FileDescriptor::PipeRead(id) => (runtime().pipe_clone_ref)(*id, false),
-                    _ => {}
-                }
-            }
-            Spinlock::new(cloned)
-        },
-        cloexec_fds: Spinlock::new(parent.cloexec_fds.lock().clone()),
-        nonblock_fds: Spinlock::new(parent.nonblock_fds.lock().clone()),
-        next_fd: AtomicU32::new(parent.next_fd.load(Ordering::Relaxed)),
+        fds: parent.fds.clone(), // Arc::clone — shared fd table (CLONE_FILES)
         thread_id: None,
         spawner_pid: parent.spawner_pid,
         terminal_state: parent.terminal_state.clone(),

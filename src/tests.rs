@@ -3564,10 +3564,7 @@ fn make_test_process(
         exited: false, exit_code: 0,
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
-        fd_table: Spinlock::new(alloc::collections::BTreeMap::new()),
-        cloexec_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-        nonblock_fds: Spinlock::new(alloc::collections::BTreeSet::new()),
-        next_fd: core::sync::atomic::AtomicU32::new(3),
+        fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         thread_id: None, spawner_pid: None,
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_terminal::TerminalState::default(),
