@@ -155,8 +155,12 @@ Each process gets its own TTBR0 page tables. These include:
   pages at L2[80] (0x0a00_0000). GIC, UART, and fw_cfg are NOT mapped here —
   the kernel accesses them via a temporary TTBR0 swap to boot page tables
   (see `docs/DEVICE_MMIO_VA_CONFLICT.md`).
-- **L1[1] → L2 table**: Kernel RAM at 0x40000000-0x7FFFFFFF,
-  plus user mmap region at 0x50000000-0x7FFFFFFF.
+- **L1[1] → L2 table**: Kernel RAM identity-mapped as 512 × 2MB blocks
+  (0x40000000-0x7FFFFFFF). This covers the full 1GB of RAM so that
+  `phys_to_virt()` works for any PMM-allocated page during syscalls. The
+  mmap VA allocator skips this range (`KERNEL_VA_END = 0x80000000`).
+  If a user `MAP_FIXED` lands in this range, the affected 2MB block is
+  shattered into 4KB L3 page entries preserving the identity mapping.
 
 ## Configuration Files
 

@@ -211,6 +211,11 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_safe_user_access_fault, "safe_user_access_fault");
     run_test!(test_copy_from_user_str_fault, "copy_from_user_str_fault");
 
+    // Kernel identity-mapping regression tests (opencode crash fix)
+    run_test!(test_kernel_identity_map_covers_full_ram, "kernel_identity_map_full_ram");
+    run_test!(test_mmap_allocator_skips_full_kernel_range, "mmap_allocator_skips_kernel_range");
+    run_test!(test_block_shatter_preserves_identity, "block_shatter_preserves_identity");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -7056,4 +7061,140 @@ fn test_copy_from_user_str_fault() -> bool {
     
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+/// Verify that user page tables identity-map the full 1GB RAM range
+/// (0x40000000-0x7FFFFFFF) so that phys_to_virt works for any PMM-allocated
+/// page regardless of which TTBR0 is active.  Before the fix, only 256MB
+/// (0x40000000-0x4FFFFFFF) was mapped, causing EL1 data aborts when the PMM
+/// returned physical pages at 0x50000000+.
+fn test_kernel_identity_map_covers_full_ram() -> bool {
+    console::print("\n[TEST] kernel identity map covers full 1GB RAM\n");
+    let mut pass = true;
+
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    let check_addrs: &[usize] = &[
+        0x4000_0000, // first 2MB block (always mapped)
+        0x4800_0000, // 128MB offset
+        0x4FFE_0000, // last block of the old 256MB range
+        0x5000_0000, // first block BEYOND old 256MB limit (the crash point)
+        0x5000_4000, // exact FAR from the opencode crash
+        0x6000_0000, // 512MB offset
+        0x7FFE_0000, // last 2MB block of 1GB
+    ];
+
+    for &va in check_addrs {
+        let mapped = unsafe {
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+            let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+            if l0e & 1 == 0 { false }
+            else {
+                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+                let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+                if l1e & 1 == 0 { false }
+                else if l1e & 2 == 0 { true } // L1 block
+                else {
+                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+                    let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+                    l2e & 1 != 0 // valid L2 block or table entry
+                }
+            }
+        };
+        if !mapped {
+            crate::safe_print!(96, "  FAIL: VA {:#x} not mapped in user page tables\n", va);
+            pass = false;
+        }
+    }
+
+    if pass {
+        console::print("  OK: all 1GB RAM addresses mapped in user page tables\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the mmap VA allocator skips the full kernel identity range
+/// (0x40000000-0x7FFFFFFF) to avoid conflicts with block-mapped RAM.
+fn test_mmap_allocator_skips_full_kernel_range() -> bool {
+    console::print("\n[TEST] mmap allocator skips full kernel VA range\n");
+    let mut pass = true;
+
+    let mut mem = akuma_exec::process::types::ProcessMemory::new(
+        0x3000_0000, // code_end: just below kernel range
+        0x1_0000_0000, // stack_bottom
+        0x1_0020_0000, // stack_top
+        0x3000_0000,   // mmap_floor
+    );
+
+    for _ in 0..20 {
+        if let Some(addr) = mem.alloc_mmap(0x100_0000) { // 16MB chunks
+            if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+                crate::safe_print!(96, "  FAIL: alloc_mmap returned {:#x} inside kernel range\n", addr);
+                pass = false;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if pass {
+        console::print("  OK: mmap never returned addresses in 0x40000000-0x7FFFFFFF\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that shattering a 2MB block descriptor into L3 page entries
+/// preserves the identity mapping for all 512 pages within the block.
+fn test_block_shatter_preserves_identity() -> bool {
+    console::print("\n[TEST] block shatter preserves identity mapping\n");
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            console::print("  SKIP: out of memory\n");
+            return true;
+        }
+    };
+
+    // Construct a fake 2MB block entry for PA 0x50000000 with typical kernel flags
+    let block_pa: u64 = 0x5000_0000;
+    let block_flags: u64 = akuma_exec::mmu::flags::VALID
+        | akuma_exec::mmu::flags::BLOCK
+        | akuma_exec::mmu::flags::AF
+        | akuma_exec::mmu::flags::UXN
+        | akuma_exec::mmu::flags::SH_INNER
+        | akuma_exec::mmu::attr_index(akuma_exec::mmu::MAIR_NORMAL_WB);
+    let block_entry = block_pa | block_flags;
+
+    unsafe { akuma_exec::mmu::shatter_block_to_pages(frame.addr, block_entry); }
+
+    let mut pass = true;
+    let l3_ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+
+    for i in [0usize, 1, 255, 511] {
+        let entry = unsafe { l3_ptr.add(i).read_volatile() };
+        let expected_pa = block_pa + (i as u64) * 0x1000;
+        let got_pa = entry & 0x0000_FFFF_FFFF_F000;
+        if got_pa != expected_pa {
+            crate::safe_print!(128, "  FAIL: L3[{}] PA={:#x}, expected {:#x}\n", i, got_pa, expected_pa);
+            pass = false;
+        }
+        if entry & 0x3 != 0x3 {
+            crate::safe_print!(96, "  FAIL: L3[{}] type bits={:#x}, expected 0x3 (page)\n", i, entry & 0x3);
+            pass = false;
+        }
+    }
+
+    crate::pmm::free_page(frame);
+
+    if pass {
+        console::print("  OK: shattered block has correct identity-mapped L3 entries\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
 }

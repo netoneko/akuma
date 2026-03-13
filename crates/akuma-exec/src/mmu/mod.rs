@@ -233,9 +233,9 @@ impl UserAddressSpace {
             }
         }
 
-        // L1[1]: kernel RAM. Use an L2 table with 2MB blocks for only the
-        // actual 256MB of RAM (128 blocks) instead of a 1GB L1 block.
-        // This leaves VA 0x50000000-0x7FFFFFFF available for user mmap.
+        // L1[1]: kernel RAM. Use an L2 table with 2MB blocks covering the
+        // full 1GB (512 blocks) instead of a 1GB L1 block, so that
+        // user MAP_FIXED in this range can shatter individual blocks.
         let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
         (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable);
         self.page_table_frames.push(l2_ram_frame);
@@ -248,12 +248,15 @@ impl UserAddressSpace {
             let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
                 | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
 
-            // 256MB = 128 × 2MB blocks: VA 0x40000000-0x4FFFFFFF → PA 0x40000000-0x4FFFFFFF
-            for i in 0..128u64 {
+            // 1GB = 512 × 2MB blocks: VA 0x40000000-0x7FFFFFFF → PA 0x40000000-0x7FFFFFFF
+            // The full RAM range must be identity-mapped so that phys_to_virt()
+            // works for any PMM-allocated page regardless of which TTBR0 is active.
+            // If user MAP_FIXED lands in this range, get_or_create_table_atomic
+            // shatters the affected 2MB block into 4KB L3 page entries.
+            for i in 0..512u64 {
                 let pa = 0x4000_0000 + i * 0x20_0000;
                 core::ptr::write_volatile(l2_ram_ptr.add(i as usize), pa | kernel_ram_flags);
             }
-            // L2[128..511] left zeroed — VA 0x50000000-0x7FFFFFFF available for user pages
         }
         Ok(())
     }
@@ -297,6 +300,7 @@ impl UserAddressSpace {
                     let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
                     (rt.track_frame)(frame, FrameSource::UserPageTable);
                     self.page_table_frames.push(frame);
+                    shatter_block_to_pages(frame.addr, entry);
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     table_ptr.add(idx).write_volatile(new_entry);
                     Ok(frame)
@@ -522,6 +526,20 @@ impl Drop for UserAddressSpace {
 }
 
 
+/// Populate an L3 page table from a 2MB block descriptor, preserving the
+/// block's identity mapping as 512 individual 4KB page entries.
+pub unsafe fn shatter_block_to_pages(l3_frame_addr: usize, block_entry: u64) {
+    let l3_ptr = phys_to_virt(l3_frame_addr) as *mut u64;
+    let block_pa = block_entry & 0x0000_FFFF_FFE0_0000; // 2MB-aligned PA
+    let attrs = block_entry & 0xFFF0_0000_0000_0FFC; // upper[63:52] + lower[11:2]
+    for i in 0..512u64 {
+        let page_pa = block_pa + (i << 12);
+        unsafe {
+            l3_ptr.add(i as usize).write_volatile(page_pa | attrs | flags::VALID | flags::TABLE);
+        }
+    }
+}
+
 /// Map a user page at `va` to physical address `pa`.
 ///
 /// Returns `(table_frames, installed)`:
@@ -591,8 +609,11 @@ unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize,
 
         if entry & flags::VALID != 0 {
             if entry & flags::TABLE == 0 {
-                // BLOCK descriptor — replace with a table so we can map individual pages
+                // BLOCK descriptor — shatter into L3 page entries preserving the mapping
                 if let Some(frame) = (runtime().alloc_page_zeroed)() {
+                    shatter_block_to_pages(frame.addr, entry);
+                    #[cfg(target_os = "none")]
+                    core::arch::asm!("dsb ishst");
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => return (frame.addr, Some(frame)),

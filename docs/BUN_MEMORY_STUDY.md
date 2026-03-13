@@ -368,11 +368,15 @@ brk (~0x05C6_E000)   +---------------------------+
                      |           |               |
                      |           v               |
                      |   (free VA space)         |
+0x4000_0000          + - - - - - - - - - - - - - +
+                     | Kernel RAM (identity      |  512 × 2MB blocks
+                     | mapped, EL1 only)         |  mmap allocator skips
+0x8000_0000          + - - - - - - - - - - - - - +
 mmap_start           +---------------------------+
                      | mmap region (grows up)    |  128GB reserved
                      |                           |
 stack_bottom         +---------------------------+
-                     | User stack (2MB)          |
+                     | User stack (auto-sized)   |
 stack_top (256GB)    +---------------------------+
 ```
 
@@ -451,12 +455,13 @@ Even at 2GB, bun can crash during resolution with a kernel data abort:
   Process PID=45 'HTTP Client'
 ```
 
-This is a separate issue where kernel code accesses a lazy mmap page
-that hasn't been demand-paged yet. See issue #9 below.
+This was caused by the kernel identity mapping gap. FAR=0x50005000 is
+a physical page address outside the 256MB identity-mapped range in user
+page tables. Fixed by issue #14.
 
 ---
 
-## 9. Kernel Data Abort on Lazy mmap Pages (ONGOING)
+## 9. Kernel Data Abort on Lazy mmap Pages
 
 ### Symptom
 
@@ -478,21 +483,6 @@ Key details:
 - **ELR=0x403d22c8**: In kernel space (above 0x40000000)
 - **ISS=0x47**: Translation fault at level 3 (page not mapped)
 
-### Root Cause
-
-The kernel is attempting to access a userspace lazy mmap page directly
-without first ensuring it's mapped. This happens when:
-
-1. Bun allocates a large lazy mmap region (e.g., 1GB at 0x50000000)
-2. A syscall handler or kernel function dereferences a userspace pointer
-   within this region
-3. The page at FAR hasn't been demand-paged yet (no physical backing)
-4. The kernel MMU faults because the page table entry is empty
-
-The instruction `0xf800852b` is `str x11, [x9], #8` -- a memcpy-like
-store operation. The kernel is likely copying data to/from userspace
-without validating that the destination pages exist.
-
 ### Misleading Diagnostic
 
 The crash message includes:
@@ -505,27 +495,23 @@ This is misleading for `CLONE_VM` threads. Worker threads created with
 while `ProcessMemory` still reports the *process's* high stack region
 (0x203fe00000). The comparison is invalid for threads.
 
-### Root Cause Analysis
+### Root Cause
 
-After investigation, the crash mechanism is:
+Initially suspected as a TOCTTOU race on user pages, this was actually
+caused by the **kernel identity mapping gap** (see issue #14 below).
+FAR=0x50005000 is NOT a user lazy mmap page — it's a physical address
+in the kernel's RAM range that the kernel tried to access via
+`phys_to_virt()` (identity mapping: VA == PA). User page tables only
+identity-mapped 256MB (0x40000000-0x4FFFFFFF), so physical addresses
+at 0x50000000+ had no mapping in TTBR0 during syscalls.
 
-1. **Syscall entry**: Thread A validates a user buffer via `validate_user_ptr()`
-2. **Demand paging**: `ensure_user_pages_mapped()` maps any lazy pages
-3. **Race condition**: Thread B calls `munmap()` on the region
-4. **Fault**: Thread A's memset/memcpy faults on the now-unmapped page
-5. **Kernel panic**: EL1 data abort handler halts (no recovery path)
+The instruction `0xf800852b` (`str x11, [x9], #8`) was the kernel
+writing to a newly-allocated physical page frame during demand paging
+or `alloc_page_zeroed()`, not accessing user memory.
 
-The `validate_user_ptr` function already calls `ensure_user_pages_mapped`,
-but there's a TOCTTOU (time-of-check-to-time-of-use) race when another
-thread unmaps the region between validation and use.
+### Fix (2026-03-13)
 
-### Status
-
-**NOT YET FIXED.** Potential fixes:
-1. Handle EL1 data aborts on user addresses by demand-paging from kernel mode
-2. Pin pages during syscall operations (complex, requires reference counting)
-3. Add per-region locks to prevent concurrent munmap during syscall
-4. Catch EL1 faults and return EFAULT instead of panicking (requires stack unwind)
+Resolved by issue #14 (Kernel Identity Mapping Gap). See below.
 
 ---
 
@@ -780,6 +766,128 @@ Implemented a comprehensive "Safe User Access" mechanism:
 
 ---
 
+## 14. Kernel Identity Mapping Gap (opencode crash)
+
+### Symptom
+
+`opencode` (a Bun-based application) crashes during startup:
+
+```
+[mmap] pid=53 len=0x81000 prot=0x3 flags=0x4022 = 0x2004f6000 (lazy, 45 regions)
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403dd844, FAR=0x50004000, SPSR=0x80002345
+  Thread=8, TTBR0=0x350000454cb000, TTBR1=0x40430000
+  Instruction at ELR: 0xf800852b
+  Likely: Rn(base)=x9, Rt(dest)=x11
+  EC=0x25 in kernel code — killing current process (EFAULT)
+  Killing PID 53 (/usr/bin/opencode)
+```
+
+The Bun runtime reports `error: EEXIST: file already exists, epoll_ctl`
+followed by `[exit code: -14]`. `bun install express` works fine because
+it allocates fewer pages (the PMM doesn't cross the 256MB threshold).
+
+### Root Cause
+
+**The kernel identity-mapped only 256MB of RAM in user page tables,
+but the PMM allocates physical pages from the entire 1GB of RAM.**
+
+The boot page tables use a 1GB L1 block to identity-map all of RAM
+(0x40000000-0x7FFFFFFF). User page tables, however, used 2MB L2 block
+entries for only 128 blocks (256MB: 0x40000000-0x4FFFFFFF), leaving
+L2[128..511] (0x50000000-0x7FFFFFFF) zeroed:
+
+```
+add_kernel_mappings() — BEFORE FIX:
+  L2[0..127]:   2MB blocks → PA 0x40000000-0x4FFFFFFF ✅ (256MB)
+  L2[128..511]: zeroed → VA 0x50000000-0x7FFFFFFF    ❌ (unmapped!)
+```
+
+When system memory usage exceeded ~256MB of physical pages, the PMM
+returned pages at physical addresses ≥ 0x50000000. The kernel wrote
+to these pages via `phys_to_virt(paddr) = paddr as *mut u8` (identity
+mapping), but user TTBR0 had no mapping at those VAs, causing an EL1
+data abort.
+
+The crash typically happened during:
+- `alloc_page_zeroed()` zeroing a newly-allocated page frame
+- Demand paging file reads into a page frame
+- Page table manipulation when table frames were above 0x50000000
+
+### Why It Didn't Manifest Earlier
+
+The first 256MB of physical RAM (0x40000000-0x4FFFFFFF) includes the
+kernel image (~3MB), boot page tables, kernel heap (16MB), and early
+allocations. Small binaries like express only need ~30 packages and
+never push PMM allocations past the 256MB boundary. Large binaries
+like opencode (Bun, 93MB binary with 45+ lazy mmap regions) consume
+enough memory to trigger allocations above 0x50000000.
+
+### Fix (2026-03-13)
+
+Three changes:
+
+1. **Extended kernel RAM mapping to 1GB.**
+   `add_kernel_mappings()` now creates 512 L2 block entries
+   (0x40000000-0x7FFFFFFF), matching the boot page tables' 1GB coverage.
+   All PMM-allocated pages are now accessible via identity mapping
+   regardless of which TTBR0 is active.
+
+   ```
+   add_kernel_mappings() — AFTER FIX:
+     L2[0..511]: 2MB blocks → PA 0x40000000-0x7FFFFFFF ✅ (1GB)
+   ```
+
+2. **Updated mmap VA allocator to skip the full kernel range.**
+   `KERNEL_VA_END` in `ProcessMemory` changed from 0x50000000 to
+   0x80000000. The mmap allocator already skipped 0x40000000-0x4FFFFFFF;
+   now it skips the full 1GB identity-mapped range. Normal mmap
+   allocations are placed well above 0x80000000 (e.g., 0xbca52000)
+   so this has no practical impact.
+
+3. **Fixed block shattering to preserve identity mapping.**
+   When `map_user_page` encounters a 2MB block descriptor (e.g., from
+   a user `MAP_FIXED` at 0x50000000 for Bun's JSC Gigacage), the block
+   must be "shattered" into 512 L3 page entries. Previously,
+   `get_or_create_table_atomic` replaced the block with a zeroed L3
+   table, destroying the identity mapping for the entire 2MB range. Now,
+   `shatter_block_to_pages()` populates the L3 table with page entries
+   that reproduce the block's identity mapping. Only the specific 4KB
+   page targeted by the user mmap is overwritten.
+
+### Diagnostic Improvement
+
+The EL1 fault handler now prints a hint when FAR falls in the kernel
+identity-mapped range (0x40000000-0x7FFFFFFF), making this class of
+bug easier to identify in the future.
+
+### Kernel Tests
+
+- `test_kernel_identity_map_covers_full_ram` — walks user page tables
+  to verify VA 0x40000000, 0x50000000, 0x50004000 (the crash address),
+  0x60000000, 0x7FFE0000 are all mapped
+- `test_mmap_allocator_skips_full_kernel_range` — verifies `alloc_mmap`
+  never returns addresses in 0x40000000-0x7FFFFFFF
+- `test_block_shatter_preserves_identity` — verifies shattered 2MB
+  block produces correct 4KB L3 page entries
+
+### Known Limitation
+
+When a user `MAP_FIXED` overlaps the kernel RAM range (e.g., Bun's JSC
+Gigacage at 0x50000000), block shattering preserves the identity mapping
+for 511 of the 512 pages in the 2MB block. The one page overwritten by
+the user mapping is no longer identity-accessible via user TTBR0. If
+the PMM later allocates a physical page at that exact address, the
+kernel's `phys_to_virt()` write would go to the user's page instead.
+
+This is extremely unlikely in practice (the PMM would need to allocate
+a page at the exact same PA as a user-mapped VA) and could be fully
+resolved by routing `phys_to_virt()` through TTBR1 (the kernel
+high-half page tables, which always have the boot identity mapping).
+This is tracked as a future improvement.
+
+---
+
 ## Related Documentation
 
 - `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix
@@ -787,3 +895,4 @@ Implemented a comprehensive "Safe User Access" mechanism:
 - `docs/BUN_MISSING_SYSCALLS.md` -- Syscalls added for bun
 - `docs/MEMORY_LAYOUT.md` -- Physical and virtual memory layout
 - `docs/USERSPACE_MEMORY_MODEL.md` -- User address space layout
+- `docs/IDENTITY_MAPPING_DEPENDENCIES.md` -- Kernel identity mapping catalog

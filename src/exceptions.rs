@@ -1055,6 +1055,14 @@ extern "C" fn rust_sync_el1_handler() {
                 return;
             }
 
+            if far >= 0x4000_0000 && far < 0x8000_0000 {
+                let _ = write!(w, "  HINT: FAR={:#x} is in kernel identity-mapped RAM range.\n", far);
+                w.flush();
+                let _ = write!(w, "  Likely cause: phys_to_virt() write to a physical page whose VA\n");
+                w.flush();
+                let _ = write!(w, "  is not mapped in the current user page tables (TTBR0).\n");
+                w.flush();
+            }
             let _ = write!(w, "  EC=0x25 in kernel code — killing current process (EFAULT)\n");
             w.flush();
             if let Some(proc) = akuma_exec::process::current_process() {

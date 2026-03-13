@@ -76,7 +76,7 @@ The kernel is responsible for:
            │ Code (.text)            │  ← ELF loaded here
            │ Data (.data, .bss)      │
            ├─────────────────────────┤
-           │ Heap (brk-based)        │  ← Grows upward (64MB lazy region)
+           │ Heap (brk-based)        │  ← Grows upward (dynamic lazy region)
            │         ↓               │
 0x0A000000 ├─────────────────────────┤
            │ VirtIO device pages     │  ← Kernel device MMIO (L3 entries)
@@ -90,8 +90,12 @@ The kernel is responsible for:
            │ Stack                   │  ← Grows downward
 0x3FFFF000 └─────────────────────────┘
 0x40000000 ┌─────────────────────────┐
-           │ (kernel memory - not    │  ← User cannot access
-           │  accessible from EL0)   │
+           │ Kernel RAM (identity    │  ← 1GB of 2MB block entries
+           │ mapped, 0x40000000-     │     Accessible to kernel only (EL1)
+           │ 0x7FFFFFFF)             │     mmap allocator skips this range
+0x80000000 ├─────────────────────────┤
+           │ (device mappings via    │  ← L0[1]: GIC, UART, fw_cfg, VirtIO
+           │  shared L1/L2/L3)      │     at VA 0x80_0000_0000+
            └─────────────────────────┘
 ```
 
@@ -102,23 +106,33 @@ Large binaries push brk into the 0x05-0x09 range. GIC (0x0800_0000), UART
 to avoid collision with the heap. The kernel accesses them via a temporary
 TTBR0 swap to boot page tables. See `docs/DEVICE_MMIO_VA_CONFLICT.md`.
 
+The mmap allocator skips the full kernel identity range (0x40000000-0x7FFFFFFF)
+and places allocations above 0x80000000. Kernel RAM is identity-mapped in user
+page tables via 2MB L2 block entries to ensure `phys_to_virt()` works for any
+PMM-allocated page during syscalls.
+
 ```
 0x00200000 ├─────────────────────────┤
            │ Bun code + data         │  93MB
 0x05C6E000 ├─────────────────────────┤
-           │ Heap (brk-based)        │  64MB lazy region
+           │ Heap (brk-based)        │  dynamic lazy region
            │         ↓               │
-0x09C6E000 ├─────────────────────────┤  heap end
 0x0A000000 ├─────────────────────────┤
            │ VirtIO device pages     │
            ├─────────────────────────┤
 0x30000000 ├─────────────────────────┤
            │ Dynamic linker          │  ld-musl-aarch64.so.1
-0x30100000 ├─────────────────────────┤
-           │ mmap region             │  → 0xFFD00000
-0xFFE00000 ├─────────────────────────┤
-           │ Stack (2MB)             │
-0xFFFFFFFF └─────────────────────────┘
+           ├─────────────────────────┤
+0x40000000 ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+           │ Kernel RAM (identity    │  512 × 2MB blocks, EL1 only
+           │ mapped, not user-       │  mmap allocator skips this range
+           │ accessible from EL0)    │
+0x80000000 ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+           │ mmap region             │  allocations start here
+           │         ↓               │
+           ├─────────────────────────┤
+           │ Stack (auto-sized)      │
+stack_top  └─────────────────────────┘
 ```
 
 ## Cache Coherency

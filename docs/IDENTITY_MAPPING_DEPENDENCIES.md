@@ -14,6 +14,30 @@ The kernel uses identity mapping set up at boot time:
 
 This allows the kernel to use physical addresses directly as pointers via translation functions.
 
+### Boot vs User Page Tables
+
+Boot page tables use 1GB L1 blocks to identity-map all of RAM. User
+page tables reproduce this using 512 × 2MB L2 block entries (covering
+the full 1GB at 0x40000000-0x7FFFFFFF). This is critical because
+`phys_to_virt()` returns low-half addresses that go through TTBR0 (user
+page tables during syscalls). If any physical page allocated by the PMM
+falls outside the identity-mapped range in TTBR0, kernel writes to it
+will fault.
+
+**Historical bug (fixed 2026-03-13):** User page tables previously only
+mapped 256MB (L2[0..127], 0x40000000-0x4FFFFFFF), leaving 768MB
+unmapped. When the PMM allocated pages above 0x50000000, kernel writes
+via `phys_to_virt()` caused EL1 data aborts. See
+`docs/BUN_MEMORY_STUDY.md` issue #14.
+
+### Block Shattering
+
+When `map_user_page` encounters a 2MB block descriptor during page
+table walks (e.g., for a user MAP_FIXED in the kernel RAM range),
+`shatter_block_to_pages()` replaces it with an L3 table populated with
+512 identity-mapped 4KB page entries. This preserves kernel access to
+the physical RAM while allowing user page-level mappings to coexist.
+
 ## Translation Functions
 
 The kernel provides explicit translation functions in `src/mmu.rs`:
@@ -158,13 +182,39 @@ The kernel accesses GIC (0x0800_0000), UART (0x0900_0000), and fw_cfg
 (93MB, brk at 0x05C6_E000) have heap regions that overlap with these device
 addresses. See `docs/DEVICE_MMIO_VA_CONFLICT.md` for the full analysis.
 
+## Known Limitation: MAP_FIXED in Kernel RAM Range
+
+When a user does `MAP_FIXED` at a VA in 0x40000000-0x7FFFFFFF (e.g.,
+Bun's JSC Gigacage at 0x50000000), block shattering preserves identity
+mapping for 511 of 512 pages in the affected 2MB block. The one
+overwritten page is no longer identity-accessible via user TTBR0. If
+the PMM allocates a physical page at that same address, the kernel's
+`phys_to_virt()` write would incorrectly target the user's page.
+
+This is extremely unlikely but could be fully resolved by routing
+`phys_to_virt()` through TTBR1.
+
 ## Future Changes
 
 If the kernel is ever moved to a non-identity-mapped configuration:
 
-1. Update `phys_to_virt()` to add the kernel virtual offset
-2. Update `virt_to_phys()` to subtract the kernel virtual offset (or walk page tables)
+1. Update `phys_to_virt()` to add the kernel virtual offset (or use TTBR1 high-half)
+2. Update `virt_to_phys()` to subtract the kernel virtual offset (or mask bits)
 3. All existing code should work without changes
+
+The cleanest long-term solution is to route `phys_to_virt()` through
+TTBR1 (the kernel high-half page tables), which always have the boot
+identity mapping and never conflict with user VA space:
+
+```rust
+pub fn phys_to_virt(paddr: usize) -> *mut u8 {
+    (paddr | 0xFFFF_0000_0000_0000) as *mut u8
+}
+```
+
+This would make kernel heap, stacks, and page table access go through
+TTBR1 (which maps all RAM via 1GB blocks), eliminating any dependency
+on user TTBR0 for physical memory access.
 
 ---
 
