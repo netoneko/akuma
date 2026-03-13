@@ -94,6 +94,13 @@ already in the interest list, the kernel silently updates it (MOD semantics)
 instead of returning `EEXIST`.  This handles same-thread re-registration
 patterns used by Bun's event loop initialization.
 
+Edge-triggered mode (`EPOLLET`, bit 31) is now supported.  Each `EpollEntry`
+tracks `last_ready` — the readiness state last reported to userspace.  For
+EPOLLET fds, `epoll_pwait` only reports newly set bits (`current & !last`).
+This prevents busy-polling when a socket stays writable (EPOLLOUT) and the
+application uses edge-triggered semantics, as Bun's HTTP Client thread does.
+`epoll_ctl` ADD/MOD resets `last_ready` to re-arm the trigger.
+
 ### Pipes
 
 Pipe reference counts track the number of distinct fd table entries referencing
@@ -160,7 +167,7 @@ the `fd > 2` ENOTTY guard for terminal-specific ioctls.
   field replacement, method redirects, clone_thread/fork_process/cleanup updates,
   `stdin_bytes_available()` on ProcessChannel
 - `src/syscall/fs.rs` — `sys_close_range` updated to use `proc.fds.table`
-- `src/syscall/poll.rs` — `EPOLL_CTL_ADD` made idempotent
+- `src/syscall/poll.rs` — `EPOLL_CTL_ADD` made idempotent, EPOLLET edge-triggered support
 - `src/syscall/term.rs` — FIONBIO/FIONREAD/FIOCLEX/FIONCLEX on any fd
 - `src/syscall/pipe.rs` — `pipe_bytes_available()` helper
 - `src/syscall/net.rs` — `socket_recv_queue_size()` helper

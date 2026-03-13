@@ -1177,6 +1177,151 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
     }
 }
 
+pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let resolved = if path.starts_with('/') {
+        path
+    } else if let Some(proc) = akuma_exec::process::current_process() {
+        crate::vfs::resolve_path(&proc.cwd, &path)
+    } else {
+        return EBADF;
+    };
+    match crate::vfs::truncate(&resolved, length as u64) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
+}
+
+pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> u64 {
+    const STATX_SIZE: usize = 256;
+    if !validate_user_ptr(buf_ptr, STATX_SIZE) { return EFAULT; }
+
+    let path = match copy_from_user_str(path_ptr, 512) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let resolved_path = if path.is_empty() {
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return ENOENT;
+        }
+    } else if path.starts_with('/') {
+        String::from(&path)
+    } else {
+        let base_path = if dirfd == -100 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                proc.cwd.clone()
+            } else {
+                return EBADF;
+            }
+        } else if dirfd >= 0 {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    f.path.clone()
+                } else {
+                    return EBADF;
+                }
+            } else {
+                return EBADF;
+            }
+        } else {
+            return EINVAL;
+        };
+        crate::vfs::resolve_path(&base_path, &path)
+    };
+
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+
+    let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor) =
+        if resolved_path == "/dev/null" {
+            (0o20666u16, 1u64, 0u64, 1u32, 0i64, 0i64, 0i64, 1u32, 3u32)
+        } else if !follow && crate::vfs::is_symlink(&resolved_path) {
+            let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
+            (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
+        } else {
+            let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
+            if let Ok(meta) = crate::vfs::metadata(&final_path) {
+                (meta.mode as u16, meta.inode, meta.size,
+                 if meta.is_dir { 2 } else { 1 },
+                 meta.accessed.unwrap_or(0) as i64,
+                 meta.modified.unwrap_or(0) as i64,
+                 meta.created.unwrap_or(0) as i64,
+                 0, 0)
+            } else if crate::vfs::is_symlink(&final_path) {
+                let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
+                (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
+            } else {
+                return ENOENT;
+            }
+        };
+
+    let blksize: u32 = 4096;
+    let blocks: u64 = (size + 511) / 512;
+
+    // STATX_BASIC_STATS covers type/mode/nlink/uid/gid/ino/size/blocks/times
+    const STATX_BASIC_STATS: u32 = 0x07ff;
+
+    let mut buf = [0u8; STATX_SIZE];
+    unsafe {
+        let p = buf.as_mut_ptr();
+        // stx_mask (u32 @ 0)
+        core::ptr::write(p.add(0) as *mut u32, STATX_BASIC_STATS);
+        // stx_blksize (u32 @ 4)
+        core::ptr::write(p.add(4) as *mut u32, blksize);
+        // stx_attributes (u64 @ 8) — none
+        // stx_nlink (u32 @ 16)
+        core::ptr::write(p.add(16) as *mut u32, nlink);
+        // stx_uid (u32 @ 20)
+        // stx_gid (u32 @ 24)
+        // stx_mode (u16 @ 28)
+        core::ptr::write(p.add(28) as *mut u16, mode);
+        // stx_ino (u64 @ 32)
+        core::ptr::write(p.add(32) as *mut u64, ino);
+        // stx_size (u64 @ 40)
+        core::ptr::write(p.add(40) as *mut u64, size);
+        // stx_blocks (u64 @ 48)
+        core::ptr::write(p.add(48) as *mut u64, blocks);
+        // stx_attributes_mask (u64 @ 56) — none
+        // stx_atime (statx_timestamp @ 64): tv_sec(i64) + tv_nsec(u32) + __reserved(i32) = 16 bytes
+        core::ptr::write(p.add(64) as *mut i64, atime);
+        // stx_btime (@ 80)
+        // stx_ctime (@ 96)
+        core::ptr::write(p.add(96) as *mut i64, ctime);
+        // stx_mtime (@ 112)
+        core::ptr::write(p.add(112) as *mut i64, mtime);
+        // stx_rdev_major (u32 @ 128)
+        core::ptr::write(p.add(128) as *mut u32, rdev_major);
+        // stx_rdev_minor (u32 @ 132)
+        core::ptr::write(p.add(132) as *mut u32, rdev_minor);
+        // stx_dev_major (u32 @ 136)
+        core::ptr::write(p.add(136) as *mut u32, 0);
+        // stx_dev_minor (u32 @ 140)
+        core::ptr::write(p.add(140) as *mut u32, 1);
+        // stx_mnt_id (u64 @ 144)
+        core::ptr::write(p.add(144) as *mut u64, 1);
+    }
+
+    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, buf.as_ptr(), STATX_SIZE).is_err() } {
+        return EFAULT;
+    }
+    0
+}
+
 pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,

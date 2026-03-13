@@ -860,6 +860,14 @@ fn run_async_main() -> ! {
             );
         }
 
+        static LAST_PSTATS_US: AtomicU64 = AtomicU64::new(0);
+        const PSTATS_INTERVAL_US: u64 = 30_000_000; // 30 seconds
+        let last_ps = LAST_PSTATS_US.load(Ordering::Relaxed);
+        if now_us.saturating_sub(last_ps) >= PSTATS_INTERVAL_US {
+            LAST_PSTATS_US.store(now_us, Ordering::Relaxed);
+            akuma_exec::process::dump_running_process_stats();
+        }
+
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
         // Poll network stack in a loop until no more progress.
         // Each poll() may only process one RX packet (single VirtIO buffer),

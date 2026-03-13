@@ -940,6 +940,106 @@ consuming them.
 
 ---
 
+## Bug: Missing statx (nr=291) and truncate (nr=45)
+
+### Symptom
+
+ENOSYS diagnostics revealed two unimplemented syscalls during `opencode` startup:
+
+```
+[ENOSYS] nr=291 pid=46 args=[0xffffffffffffff9c, 0x80031808, 0x0]
+[ENOSYS] nr=45 pid=46 args=[0xed018518, 0x0, 0x30]
+```
+
+Syscall 291 is `statx` (modern replacement for `fstatat`), called with
+`AT_FDCWD` and a path pointer.  Syscall 45 is `truncate` (truncate file by
+path).  Bun uses `statx` for all file-stat operations and `truncate` for
+file management.
+
+### Fix
+
+**statx:** Implemented by wrapping the existing `vfs::metadata()` and
+`vfs::is_symlink()` infrastructure.  The 256-byte `struct statx` is populated
+with `stx_mask`, `stx_blksize`, `stx_nlink`, `stx_mode`, `stx_ino`,
+`stx_size`, `stx_blocks`, timestamps, device IDs, and mount ID.  Supports
+`AT_FDCWD`, directory fd-relative paths, `AT_EMPTY_PATH`, and
+`AT_SYMLINK_NOFOLLOW`.
+
+**truncate:** Resolves the path (absolute or CWD-relative) and delegates to
+the existing `vfs::truncate()`.  Complements the already-implemented
+`ftruncate` (nr=46).
+
+---
+
+## Bug: EPOLLET (Edge-Triggered Epoll) Not Implemented
+
+### Symptom
+
+`opencode`'s HTTP Client thread consumed 38.8% CPU while all other threads
+sat at 0%.  The `top` output showed:
+
+```
+ 14   52  host      READY     38.8%     83661  HTTP Client
+```
+
+Despite spending most time in `epoll_pwait`, the thread never blocked — it
+was in a tight busy loop with millions of iterations.
+
+### Root Cause
+
+The kernel had no concept of `EPOLLET` (edge-triggered mode, bit 31 of the
+events field).  When userspace registered an fd with `EPOLLET | EPOLLOUT`,
+the kernel stored the raw events value but:
+
+1. Passed the raw value (including the `EPOLLET` flag bit) to
+   `epoll_check_fd_readiness()`, which only checks `EPOLLIN`/`EPOLLOUT`/etc.
+2. Since a connected TCP socket with send buffer space always reports
+   `EPOLLOUT` ready, level-triggered mode returned it on every call.
+3. `epoll_pwait` returned immediately each iteration instead of blocking.
+
+The result was a tight poll loop: wake → check → EPOLLOUT ready → return →
+userspace calls epoll_pwait again → repeat.
+
+### Fix
+
+1. Added `EPOLLET` constant (`1 << 31`) and `EPOLL_EVENT_MASK` to strip
+   flag bits from event bits.
+2. Each `EpollEntry` now tracks `last_ready` — the readiness state last
+   reported to userspace.
+3. For EPOLLET fds, `sys_epoll_pwait` only reports **newly set** bits
+   (`current_ready & !last_ready`).  Once `EPOLLOUT` is reported and the
+   socket stays writable, it won't fire again until it goes not-writable
+   then becomes writable again.
+4. `epoll_ctl` ADD and MOD reset `last_ready` to 0, so re-registration
+   re-arms the edge trigger.
+
+### Impact
+
+HTTP Client drops from 38.8% CPU to near 0% when idle, properly sleeping
+in `schedule_blocking` between actual state changes.
+
+---
+
+## Periodic PSTATS for Running Processes
+
+### Problem
+
+PSTATS (per-process syscall statistics) only printed when a process exited.
+Long-running processes like `opencode` — which may run for minutes before
+crashing — provided no visibility into what syscalls they were calling or
+where time was being spent.
+
+### Fix
+
+The heartbeat loop in `src/main.rs` now calls
+`dump_running_process_stats()` every 30 seconds.  This iterates all
+non-exited processes that have been running for at least 10 seconds and
+prints their current PSTATS.  The output is identical to the exit-time
+dump, showing syscall counts, time in kernel, page faults, and top syscalls
+by time.
+
+---
+
 ## Related Documentation
 
 - `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix

@@ -5,6 +5,7 @@ use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 struct EpollEntry {
     events: u32,
     data: u64,
+    last_ready: u32,
 }
 
 struct EpollInstance {
@@ -19,6 +20,8 @@ const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
 const EPOLLRDHUP: u32 = 0x2000;
+const EPOLLET: u32 = 1 << 31;
+const EPOLL_EVENT_MASK: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -102,11 +105,13 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
             if let Some(entry) = instance.interest_list.get_mut(&fd) {
                 entry.events = ev_events;
                 entry.data = ev_data;
+                entry.last_ready = 0;
                 crate::tprint!(96, "[epoll] ctl ADD->MOD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
             } else {
                 instance.interest_list.insert(fd, EpollEntry {
                     events: ev_events,
                     data: ev_data,
+                    last_ready: 0,
                 });
                 crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
             }
@@ -124,6 +129,7 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
                 Some(entry) => {
                     entry.events = ev_events;
                     entry.data = ev_data;
+                    entry.last_ready = 0;
                     0
                 }
                 None => ENOENT,
@@ -252,11 +258,11 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         iterations += 1;
         akuma_net::smoltcp_net::poll();
 
-        let interest_snapshot: Vec<(u32, u32, u64)> = {
+        let interest_snapshot: Vec<(u32, u32, u64, u32)> = {
             let table = EPOLL_TABLE.lock();
             match table.get(&epoll_id) {
                 Some(inst) => inst.interest_list.iter()
-                    .map(|(&fd, entry)| (fd, entry.events, entry.data))
+                    .map(|(&fd, entry)| (fd, entry.events, entry.data, entry.last_ready))
                     .collect(),
                 None => return EBADF,
             }
@@ -264,14 +270,38 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
 
         let mut ready_count = 0usize;
         let mut kernel_events = alloc::vec![];
+        let mut readiness_updates: Vec<(u32, u32)> = alloc::vec![];
 
-        for &(fd, requested_events, data) in &interest_snapshot {
+        for &(fd, raw_events, data, last_ready) in &interest_snapshot {
             if ready_count >= maxevents { break; }
 
-            let revents = epoll_check_fd_readiness(fd, requested_events);
-            if revents != 0 {
-                kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
-                ready_count += 1;
+            let is_et = raw_events & EPOLLET != 0;
+            let requested = raw_events & EPOLL_EVENT_MASK;
+            let revents = epoll_check_fd_readiness(fd, requested);
+
+            if is_et {
+                let new_bits = revents & !last_ready;
+                readiness_updates.push((fd, revents));
+                if new_bits != 0 {
+                    kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
+                    ready_count += 1;
+                }
+            } else {
+                if revents != 0 {
+                    kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
+                    ready_count += 1;
+                }
+            }
+        }
+
+        if !readiness_updates.is_empty() {
+            let mut table = EPOLL_TABLE.lock();
+            if let Some(inst) = table.get_mut(&epoll_id) {
+                for (fd, cur_ready) in readiness_updates {
+                    if let Some(entry) = inst.interest_list.get_mut(&fd) {
+                        entry.last_ready = cur_ready;
+                    }
+                }
             }
         }
 

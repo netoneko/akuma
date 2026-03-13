@@ -1379,11 +1379,33 @@ fn syscall_name(nr: usize) -> &'static str {
         35 => "unlinkat",
         85 => "timerfd_create", 86 => "timerfd_settime",
         19 => "eventfd2",
+        34 => "mkdirat", 45 => "truncate",
+        291 => "statx",
         435 => "clone3", 439 => "faccessat2",
         _ => "",
     }
 }
 
+
+/// Dump syscall stats for all running processes (called periodically from heartbeat).
+pub fn dump_running_process_stats() {
+    if !process_syscall_stats_enabled() { return; }
+    let pids: Vec<(Pid, alloc::string::String, u64)> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, p)| !p.exited && p.start_time_us > 0)
+            .map(|(&pid, p)| (pid, p.name.clone(), p.start_time_us))
+            .collect()
+    });
+    let now = (runtime().uptime_us)();
+    for (pid, name, start_us) in pids {
+        let elapsed = now.saturating_sub(start_us);
+        if elapsed < 10_000_000 { continue; } // skip processes running < 10s
+        if let Some(proc) = lookup_process(pid) {
+            proc.syscall_stats.dump(pid, &name, elapsed);
+        }
+    }
+}
 
 /// Maximum virtual address range registered for demand-paged stack growth.
 /// Physical pages are only allocated on fault, so this costs nothing unless used.
