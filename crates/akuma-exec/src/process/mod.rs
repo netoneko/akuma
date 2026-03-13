@@ -417,6 +417,13 @@ impl ProcessChannel {
         })
     }
 
+    /// Return the number of bytes available in the stdin buffer
+    pub fn stdin_bytes_available(&self) -> usize {
+        with_irqs_disabled(|| {
+            self.stdin_buffer.lock().len()
+        })
+    }
+
     /// Clear all pending data from the stdin buffer
     pub fn flush_stdin(&self) {
         with_irqs_disabled(|| {

@@ -122,6 +122,12 @@ pub(super) fn pipe_can_read(id: u32) -> bool {
     })
 }
 
+pub(super) fn pipe_bytes_available(id: u32) -> usize {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(0, |p| p.buffer.len())
+    })
+}
+
 pub(super) fn pipe_can_write(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(false, |p| p.read_count > 0)

@@ -11,15 +11,74 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TIOCGWINSZ: u32 = 0x5413;
     const TIOCGPGRP: u32 = 0x540f;
     const TIOCSPGRP: u32 = 0x5410;
+    const FIONBIO: u32 = 0x5421;
+    const FIONREAD: u32 = 0x541B;
+    const FIOCLEX: u32 = 0x5451;
+    const FIONCLEX: u32 = 0x5450;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
-    let _proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
-    
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+
+    match cmd {
+        FIONBIO => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let mut val: i32 = 0;
+            if unsafe { copy_from_user_safe(&mut val as *mut i32 as *mut u8, arg as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
+            if val != 0 { proc.set_nonblock(fd); } else { proc.clear_nonblock(fd); }
+            return 0;
+        }
+        FIONREAD => {
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let fd_entry = proc.get_fd(fd);
+            let count: i32 = match fd_entry {
+                Some(akuma_exec::process::FileDescriptor::PipeRead(pipe_id)) => {
+                    super::pipe::pipe_bytes_available(pipe_id) as i32
+                }
+                Some(akuma_exec::process::FileDescriptor::Socket(idx)) => {
+                    super::net::socket_recv_queue_size(idx) as i32
+                }
+                Some(akuma_exec::process::FileDescriptor::EventFd(efd_id)) => {
+                    if super::eventfd::eventfd_can_read(efd_id) { 8 } else { 0 }
+                }
+                Some(akuma_exec::process::FileDescriptor::TimerFd(timer_id)) => {
+                    if super::timerfd::timerfd_can_read(timer_id) { 8 } else { 0 }
+                }
+                Some(akuma_exec::process::FileDescriptor::Stdin) => {
+                    akuma_exec::process::current_channel()
+                        .map_or(0, |ch| ch.stdin_bytes_available() as i32)
+                }
+                Some(akuma_exec::process::FileDescriptor::File(ref f)) => {
+                    crate::fs::file_size(&f.path)
+                        .map(|sz| (sz as usize).saturating_sub(f.position) as i32)
+                        .unwrap_or(0)
+                }
+                Some(akuma_exec::process::FileDescriptor::ChildStdout(_)) => 0,
+                Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => 0,
+                _ => 0,
+            };
+            if unsafe { copy_to_user_safe(arg as *mut u8, &count as *const i32 as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
+            return 0;
+        }
+        FIOCLEX => {
+            proc.set_cloexec(fd);
+            return 0;
+        }
+        FIONCLEX => {
+            proc.clear_cloexec(fd);
+            return 0;
+        }
+        _ => {}
+    }
+
     if fd > 2 {
-        return (-(25i64)) as u64; // ENOTTY
+        return (-(25i64)) as u64; // ENOTTY for terminal ioctls on non-TTY fds
     }
 
     let result = match cmd {

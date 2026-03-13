@@ -623,6 +623,24 @@ pub(super) fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net
     }).flatten()
 }
 
+pub(super) fn socket_recv_queue_size(idx: usize) -> usize {
+    socket::with_socket(idx, |sock| {
+        match &sock.inner {
+            socket::SocketType::Stream(h) => {
+                akuma_net::smoltcp_net::with_network(|net| {
+                    net.sockets.get::<smoltcp::socket::tcp::Socket>(*h).recv_queue()
+                }).unwrap_or(0)
+            }
+            socket::SocketType::Datagram { handle, .. } => {
+                akuma_net::smoltcp_net::with_network(|net| {
+                    net.sockets.get::<smoltcp::socket::udp::Socket>(*handle).recv_queue()
+                }).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }).unwrap_or(0)
+}
+
 pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         match &sock.inner {
