@@ -662,6 +662,10 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
         akuma_exec::process::lazy_region_lookup_for_pid(pid, page_va)
     {
         // Only demand-page anonymous regions here; file-backed pages handled by the fault path
+        // PROT_NONE regions must NOT be demand-paged — access should SIGSEGV.
+        if akuma_exec::mmu::user_flags::is_none(flags) {
+            return false;
+        }
         if matches!(source, akuma_exec::process::LazySource::Zero) {
             let map_flags = if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW };
             if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
@@ -1463,17 +1467,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
-                    let page_va = far_usize & !(0xFFF);
-                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                        let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-                        return unsafe { (*frame).x0 };
+                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                    if !akuma_exec::mmu::user_flags::is_none(region_flags) {
+                        let page_va = far_usize & !(0xFFF);
+                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                            let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                            return unsafe { (*frame).x0 };
+                        }
                     }
                 }
             }
 
             if is_translation_fault {
                 if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                    if akuma_exec::mmu::user_flags::is_none(flags) {
+                        // PROT_NONE: don't demand-page, fall through to SIGSEGV
+                    } else {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
@@ -1661,6 +1670,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 pid, far_usize, free);
                         }
                     }
+                    } // end else (not PROT_NONE)
                 } else {
                     // Fallback: check eager mmap regions — the PTE may have been lost.
                     // Use lookup_process(pid) where pid = address-space owner (from
@@ -1777,17 +1787,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
-                    let page_va = far_usize & !(0xFFF);
-                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-                        let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
-                        return unsafe { (*frame).x0 };
+                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                    if !akuma_exec::mmu::user_flags::is_none(region_flags) {
+                        let page_va = far_usize & !(0xFFF);
+                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                            let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
+                            return unsafe { (*frame).x0 };
+                        }
                     }
                 }
             }
 
             if is_translation_fault {
                 if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                    if akuma_exec::mmu::user_flags::is_none(flags) {
+                        // PROT_NONE: don't demand-page, fall through to SIGSEGV
+                    } else {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
@@ -1933,6 +1948,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 pid, far_usize, free);
                         }
                     }
+                    } // end else (not PROT_NONE)
                 } else {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);

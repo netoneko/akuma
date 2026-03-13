@@ -58,6 +58,8 @@ impl PageTable {
 
 pub mod user_flags {
     use super::flags;
+    /// PROT_NONE: EL1-only access, EL0 gets no read/write/exec.
+    pub const NONE: u64 = flags::AP_RO_EL1 | flags::UXN | flags::PXN;
     pub const RO: u64 = flags::AP_RO_ALL;
     pub const RW: u64 = flags::AP_RW_ALL;
     pub const EXEC: u64 = flags::AP_RO_ALL;
@@ -65,11 +67,16 @@ pub mod user_flags {
     pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
 
     pub fn from_prot(prot: u32) -> u64 {
+        if prot == 0 { return NONE; }
         match (prot & 0x2 != 0, prot & 0x4 != 0) {
             (true, _)      => RW_NO_EXEC,
             (false, true)  => RX,
             (false, false) => RO,
         }
+    }
+
+    pub fn is_none(flags: u64) -> bool {
+        flags == NONE
     }
 }
 
@@ -95,11 +102,15 @@ mod tests {
 
     #[test]
     fn user_flags_from_prot() {
-        // prot 0 = read-only
-        assert_eq!(user_flags::from_prot(0), user_flags::RO);
-        // prot 2 = write
+        // prot 0 = PROT_NONE (no EL0 access)
+        assert_eq!(user_flags::from_prot(0), user_flags::NONE);
+        assert!(user_flags::is_none(user_flags::from_prot(0)));
+        // prot 1 = PROT_READ
+        assert_eq!(user_flags::from_prot(1), user_flags::RO);
+        assert!(!user_flags::is_none(user_flags::from_prot(1)));
+        // prot 2 = PROT_WRITE
         assert_eq!(user_flags::from_prot(2), user_flags::RW_NO_EXEC);
-        // prot 4 = exec
+        // prot 4 = PROT_EXEC
         assert_eq!(user_flags::from_prot(4), user_flags::RX);
     }
 
