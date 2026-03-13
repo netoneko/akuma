@@ -6498,18 +6498,17 @@ fn test_lazy_region_lookup_pid_consistency() -> bool {
 
 /// Test: User stack size is automatically computed from RAM
 ///
-/// With auto-scaling: stack_size = RAM / 2048, clamped to [128KB, 8MB]
-/// This test verifies the compute_user_stack_size function works correctly.
+/// With auto-scaling: stack_size = RAM / 2048, clamped to [2MB, 8MB]
+/// The 2MB minimum is required for bun/JSC which uses ~600KB during init.
 fn test_user_stack_size_is_2mb() -> bool {
     console::print("\n[TEST] User stack size auto-scaling\n");
 
-    // Test the scaling function
-    let test_cases: [(usize, usize); 6] = [
-        (256 * 1024 * 1024, 128 * 1024),      // 256 MB → 128 KB (minimum)
-        (512 * 1024 * 1024, 256 * 1024),      // 512 MB → 256 KB
-        (1024 * 1024 * 1024, 512 * 1024),     // 1 GB → 512 KB
-        (2048 * 1024 * 1024, 1024 * 1024),    // 2 GB → 1 MB
-        (4096 * 1024 * 1024, 2 * 1024 * 1024),// 4 GB → 2 MB
+    // Test the scaling function - all cases below 4GB should get 2MB minimum
+    let test_cases: [(usize, usize); 5] = [
+        (256 * 1024 * 1024, 2 * 1024 * 1024),  // 256 MB → 2 MB (minimum for bun)
+        (1024 * 1024 * 1024, 2 * 1024 * 1024), // 1 GB → 2 MB (minimum)
+        (4096 * 1024 * 1024, 2 * 1024 * 1024), // 4 GB → 2 MB
+        (8192 * 1024 * 1024, 4 * 1024 * 1024), // 8 GB → 4 MB
         (16384 * 1024 * 1024, 8 * 1024 * 1024),// 16 GB → 8 MB (maximum)
     ];
 
@@ -6527,9 +6526,9 @@ fn test_user_stack_size_is_2mb() -> bool {
     let actual_stack = akuma_exec::runtime::config().user_stack_size;
     crate::safe_print!(128, "  Runtime user_stack_size = {} KB\n", actual_stack / 1024);
     
-    // Should be at least 128KB
-    if actual_stack < 128 * 1024 {
-        crate::safe_print!(64, "  FAIL: Stack too small\n");
+    // Should be at least 2MB for bun compatibility
+    if actual_stack < 2 * 1024 * 1024 {
+        crate::safe_print!(64, "  FAIL: Stack too small for bun\n");
         pass = false;
     }
 

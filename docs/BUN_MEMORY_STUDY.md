@@ -579,13 +579,14 @@ Scaling table:
 
 | RAM    | Stack Size |
 |--------|------------|
-| 256 MB | 128 KB     |
-| 512 MB | 256 KB     |
-| 1 GB   | 512 KB     |
-| 2 GB   | 1 MB       |
+| 256 MB | 2 MB       |
+| 1 GB   | 2 MB       |
 | 4 GB   | 2 MB       |
 | 8 GB   | 4 MB       |
 | 16 GB+ | 8 MB (max) |
+
+The 2MB minimum is required because bun's JSC initialization uses ~600KB
+of stack. Smaller stacks cause immediate SIGSEGV during bun startup.
 
 The kernel logs the computed stack size at boot:
 
@@ -620,75 +621,55 @@ without fragmentation.
 
 ---
 
-## 12. gemini-cli Resolution Freeze (ONGOING)
+## 12. gemini-cli Resolution Crash (Resolved - Same as Issue #9)
 
 ### Symptom
 
-`bun install @google/gemini-cli` freezes during the "Resolving" phase, even
-with sufficient RAM (2GB) and stack (1MB). The process times out after ~11
-seconds without making progress. Meanwhile, `bun install express` works
-correctly under identical conditions.
-
-### Observed Behavior
-
-**express (works):**
-```
-[syscall] sendto(fd=14, len=36, dest=10.0.2.3:53)  <- DNS query
-[syscall] socket(type=TCP) = fd 15                  <- TCP created
-[syscall] connect(fd=15, ip=104.16.2.34:443)       <- HTTPS to registry
-🔍 Resolving [1/131]
-📦 Installing [15/65]
-installed express@5.2.1 [15.99s]
-```
-
-**gemini-cli (freezes):**
-```
-[syscall] sendto(fd=14, len=36, dest=10.0.2.3:53)  <- DNS query sent
-<no TCP connections>
-<no resolution progress>
-[exception] Process 49 (/bin/bun) exited (code 0) [10.99s]  <- worker timeout
-```
-
-### Key Differences
-
-1. **DNS query is sent** for both packages
-2. **No TCP connections** are created for gemini-cli after DNS
-3. **Worker thread exits** after ~11 seconds (bun's internal timeout)
-4. **No SIGSEGV or crash** - bun silently fails to proceed
+`bun install @google/gemini-cli` appeared to freeze during the "Resolving"
+phase. Investigation revealed this was actually caused by **Issue #9** (EL1
+data abort on lazy mmap pages) manifesting during the complex resolution.
 
 ### Investigation
 
-The DNS query is sent to 10.0.2.3:53 (QEMU's user-mode networking DNS).
-No `recvmsg` or `recvfrom` syscall appears in logs after the DNS query,
-suggesting bun either:
-- Doesn't receive the DNS response
-- Receives it but fails to parse it
-- Has an internal error before attempting TCP connections
+Initial symptoms suggested a freeze:
+- DNS query sent but no TCP connections
+- SSH session times out
+- No visible error from bun
 
-Kernel logs show no errors - bun simply doesn't call the network syscalls
-needed to establish HTTP connections.
+However, enabling verbose logging (`SYSCALL_DEBUG_NET_ENABLED=true`) revealed
+that resolution **was progressing**:
 
-### Ruling Out
+```
+🔍 wsl-utils [153/284]
+[DNS] query sent OK: 36 bytes
+[UDP] recvmsg OK: 228 bytes from 10.0.2.3:53
+```
 
-- **Stack size**: Tested with 1MB (2GB RAM) and 2MB (4GB RAM) - same behavior
-- **UDP buffer size**: Increased to 1500 bytes - same behavior  
-- **DNS truncation**: DNS response for npm registry is typically ~200 bytes
-- **IPv6**: IPv6 socket creation fails with ENOSYS but bun falls back to IPv4
+The "freeze" was actually the kernel crashing silently before SSH could
+report the output:
 
-### Status
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403d3970, FAR=0x50004000
+  Process PID=52 'Bun Pool 3'
+```
 
-**NOT YET FIXED.** This appears to be a bun-specific issue triggered by
-the `@google/gemini-cli` package metadata. Possible causes:
+### Root Cause
 
-1. **Package-specific parsing bug**: Something in gemini-cli's metadata
-   triggers a code path in bun that hangs
-2. **Memory allocation failure**: bun's mimalloc may fail silently for
-   the 263-package dependency tree
-3. **DNS response parsing**: The DNS response may have characteristics
-   that trigger a parsing bug
+The crash is the same EL1 data abort issue (#9). During gemini-cli resolution
+(284 packages with complex dependencies), bun's worker threads access many
+lazy mmap pages. The high concurrency increases the chance of hitting the
+TOCTTOU race where the kernel accesses a lazy page that hasn't been
+demand-paged yet.
 
-This issue is separate from the kernel - the kernel correctly handles
-all syscalls, but bun never issues the syscalls to proceed.
+With `express` (65 packages, simpler dependencies), the resolution completes
+before the race condition triggers. With `gemini-cli`, the crash happens
+reliably around 140-180 packages into resolution.
+
+### Resolution
+
+This is **not a separate issue** - it's Issue #9. Once the EL1 data abort
+handling is fixed, gemini-cli resolution should work.
 
 ---
 

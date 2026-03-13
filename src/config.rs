@@ -339,26 +339,27 @@ pub const SSH_BUILT_INS_FIRST: bool = false;
 /// Compute user process stack size based on available RAM.
 ///
 /// Returns `USER_STACK_SIZE_OVERRIDE` if non-zero, otherwise scales:
-///   - 256 MB RAM → 128 KB (minimum)
-///   - 512 MB RAM → 256 KB
-///   - 1 GB RAM   → 512 KB  
-///   - 2 GB RAM   → 1 MB
-///   - 4 GB+ RAM  → 2 MB (maximum)
+///   - 256 MB - 2 GB RAM → 2 MB (minimum required for bun/JSC)
+///   - 4 GB RAM   → 2 MB
+///   - 8 GB RAM   → 4 MB
+///   - 16 GB+ RAM → 8 MB (maximum)
 ///
-/// The formula is: stack_size = RAM / 2048, clamped to [128KB, 2MB]
+/// The formula is: stack_size = RAM / 2048, clamped to [2MB, 8MB]
+/// The 2MB minimum is required because bun's JSC initialization uses ~600KB
+/// of stack, and complex package resolution can use even more.
 pub const fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
     if USER_STACK_SIZE_OVERRIDE != 0 {
         return USER_STACK_SIZE_OVERRIDE;
     }
     
-    const MIN_STACK: usize = 128 * 1024;  // 128 KB minimum
+    // 2 MB minimum - required for bun/JSC which uses ~600KB during init
+    const MIN_STACK: usize = 2 * 1024 * 1024;
     const MAX_STACK: usize = 8 * 1024 * 1024;  // 8 MB maximum
     
     // RAM / 2048 gives us nice scaling:
-    // 256 MB / 2048 = 128 KB
-    // 512 MB / 2048 = 256 KB
-    // 1 GB / 2048 = 512 KB
-    // 2 GB / 2048 = 1 MB
+    // 256 MB / 2048 = 128 KB → clamped to 2 MB
+    // 1 GB / 2048 = 512 KB → clamped to 2 MB
+    // 2 GB / 2048 = 1 MB → clamped to 2 MB
     // 4 GB / 2048 = 2 MB
     // 8 GB / 2048 = 4 MB
     // 16 GB / 2048 = 8 MB
