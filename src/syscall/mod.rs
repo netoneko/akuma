@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
+mod aio;
 mod container;
 mod eventfd;
 mod fb;
@@ -714,7 +715,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         // Linux AIO syscalls (io_setup=0, io_destroy=1, io_submit=2, io_cancel=3, io_getevents=4)
-        0 | 1 | 2 | 3 | 4 => ENOSYS,
+        0 => aio::sys_io_setup(args[0], args[1]),
+        1 => aio::sys_io_destroy(args[0]),
+        2 | 3 | 4 => ENOSYS,
         // Extended attributes syscalls (5-16) - return ENOTSUP (not supported on this fs)
         5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr

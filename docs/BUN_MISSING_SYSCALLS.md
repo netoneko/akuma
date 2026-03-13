@@ -360,9 +360,11 @@ not available, bun should fall back to epoll. Newer versions of bun
 
 ### Linux AIO syscalls (NR 0-4)
 
-`io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents` all
-return `ENOSYS`. These are legacy async I/O syscalls; modern applications
-use io_uring or epoll instead.
+`io_setup` (NR 0) and `io_destroy` (NR 1) are **implemented** with a
+kernel-side context table (`src/syscall/aio.rs`). `io_setup` allocates an
+AIO context and writes its ID to the user pointer; `io_destroy` removes it.
+`io_submit` (2), `io_cancel` (3), and `io_getevents` (4) still return
+`ENOSYS` — no actual I/O submission is supported yet.
 
 ### `inotify_init1` / `inotify_add_watch` / `inotify_rm_watch` (NR 26, 27, 28)
 
@@ -392,9 +394,11 @@ is `ENOSYS`. The kernel now logs this pattern explicitly to aid debugging.
 3. The ELR value shows where in bun's code the crash occurred
 
 **Common culprits:**
-- `io_setup` (syscall 0) - Linux AIO probe
 - `io_uring_setup` (syscall 425) - io_uring probe
 - `pidfd_open` (syscall 434) - process fd creation
+
+Note: `io_setup` (syscall 0) is now implemented and no longer returns ENOSYS,
+so it is no longer a crash risk from this pattern.
 
 The kernel includes tests for this pattern in `src/tests.rs`:
 - `test_enosys_syscalls_return_proper_errno` - verifies all ENOSYS syscalls

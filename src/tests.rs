@@ -205,6 +205,7 @@ pub fn run_memory_tests() -> bool {
     // ENOSYS syscall handling (bun crash prevention)
     run_test!(test_enosys_syscalls_return_proper_errno, "enosys_syscalls_proper_errno");
     run_test!(test_enosys_is_negative_38, "enosys_is_negative_38");
+    run_test!(test_io_setup_and_destroy, "io_setup_and_destroy");
     run_test!(test_oom_crash_pattern_documentation, "oom_crash_pattern_docs");
 
     // Safe user access fault redirection tests
@@ -6851,15 +6852,7 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
     crate::safe_print!(128, "  io_uring_register(427) = {:#x} (expect {:#x})\n",
         io_uring_register_result, ENOSYS);
 
-    // Test Linux AIO syscalls (NR 0-4)
-    // These are legacy async I/O syscalls; bun might probe these too
-    let io_setup_result = crate::syscall::handle_syscall(0, &[0, 0, 0, 0, 0, 0]);
-    let io_destroy_result = crate::syscall::handle_syscall(1, &[0, 0, 0, 0, 0, 0]);
-
-    crate::safe_print!(128, "  io_setup(0) = {:#x} (expect {:#x})\n",
-        io_setup_result, ENOSYS);
-    crate::safe_print!(128, "  io_destroy(1) = {:#x} (expect {:#x})\n",
-        io_destroy_result, ENOSYS);
+    // io_setup (NR 0) and io_destroy (NR 1) are now implemented; not tested here
 
     // Test pidfd_open (NR 434)
     // Bun calls this after clone3 for process monitoring; falls back to wait4
@@ -6886,14 +6879,6 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
     }
     if io_uring_register_result != ENOSYS {
         console::print("  FAIL: io_uring_register did not return ENOSYS\n");
-        pass = false;
-    }
-    if io_setup_result != ENOSYS {
-        console::print("  FAIL: io_setup did not return ENOSYS\n");
-        pass = false;
-    }
-    if io_destroy_result != ENOSYS {
-        console::print("  FAIL: io_destroy did not return ENOSYS\n");
         pass = false;
     }
     if pidfd_open_result != ENOSYS {
@@ -6944,6 +6929,41 @@ fn test_enosys_is_negative_38() -> bool {
     }
 
     pass
+}
+
+/// Test: io_setup and io_destroy lifecycle
+fn test_io_setup_and_destroy() -> bool {
+    console::print("\n[TEST] io_setup and io_destroy\n");
+
+    const EINVAL: u64 = (-22i64) as u64;
+    const EFAULT: u64 = (-14i64) as u64;
+
+    // nr_events=0 must return EINVAL
+    let r = crate::syscall::handle_syscall(0, &[0, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_setup(nr=0, null) = {:#x} (expect EINVAL={:#x})\n", r, EINVAL);
+    if r != EINVAL {
+        console::print("  FAIL: io_setup(0) did not return EINVAL\n");
+        return false;
+    }
+
+    // null ctx_idp with nr_events>0 must return EFAULT (BYPASS_VALIDATION=false, ptr 0 is invalid)
+    let r = crate::syscall::handle_syscall(0, &[8, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_setup(nr=8, null) = {:#x} (expect EFAULT={:#x})\n", r, EFAULT);
+    if r != EFAULT {
+        console::print("  FAIL: io_setup(nr=8, null) did not return EFAULT\n");
+        return false;
+    }
+
+    // io_destroy with unknown context must return EINVAL
+    let r = crate::syscall::handle_syscall(1, &[0xdeadbeef, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_destroy(0xdeadbeef) = {:#x} (expect EINVAL={:#x})\n", r, EINVAL);
+    if r != EINVAL {
+        console::print("  FAIL: io_destroy(bad_ctx) did not return EINVAL\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
 }
 
 /// Test: Document OOM crash pattern for bun
