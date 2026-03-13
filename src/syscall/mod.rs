@@ -17,7 +17,7 @@ mod fb;
 mod fs;
 mod mem;
 mod net;
-mod pipe;
+pub(crate) mod pipe;
 mod poll;
 mod proc;
 mod signal;
@@ -643,7 +643,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::TIMES => time::sys_times(args[0] as usize),
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => 0,
-        nr::PROCESS_VM_READV => ENOSYS,
+        nr::PROCESS_VM_READV => {
+            crate::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
+                akuma_exec::process::read_current_pid().unwrap_or(0));
+            ENOSYS
+        }
         nr::SCHED_SETAFFINITY => 0,
         118 => { 0 }
         119 => {
@@ -671,7 +675,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
-        nr::PIDFD_OPEN => ENOSYS,
+        nr::PIDFD_OPEN => {
+            crate::tprint!(96, "[ENOSYS] nr=434 (pidfd_open) pid={}\n",
+                akuma_exec::process::read_current_pid().unwrap_or(0));
+            ENOSYS
+        }
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
@@ -696,7 +704,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::TIMERFD_CREATE => timerfd::sys_timerfd_create(args[0] as i32, args[1] as i32),
         nr::TIMERFD_SETTIME => timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
         nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
-        nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => ENOSYS,
+        nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
+            crate::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
+                akuma_exec::process::read_current_pid().unwrap_or(0));
+            ENOSYS
+        }
         // Linux AIO syscalls (io_setup=0, io_destroy=1, io_submit=2, io_cancel=3, io_getevents=4)
         0 | 1 | 2 | 3 | 4 => ENOSYS,
         // Extended attributes syscalls (5-16) - return ENOTSUP (not supported on this fs)
@@ -706,13 +718,18 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             const ENOTSUP: u64 = (!95i64) as u64; // Operation not supported
             ENOTSUP
         }
-        nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => ENOSYS,
+        nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
+            crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
+                akuma_exec::process::read_current_pid().unwrap_or(0));
+            ENOSYS
+        }
         nr::MOUNT => container::sys_mount(args[0], args[1], args[2], args[3] as u64, args[4]),
         nr::UMOUNT2 => container::sys_umount2(args[0], args[1] as i32),
         nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize),
         _ => {
-            crate::safe_print!(128, "[syscall] Unknown syscall: {} (args: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}])\n",
-                syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
+            crate::safe_print!(128, "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
+                syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),
+                args[0], args[1], args[2]);
             ENOSYS
         }
     };

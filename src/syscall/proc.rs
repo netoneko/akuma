@@ -509,16 +509,23 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
 pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
     if !validate_user_ptr(info_ptr as u64, 112) { return EFAULT; }
     let mut info = [0u8; 112];
+    let total_pages = crate::pmm::total_count() as u64;
     let free_pages = crate::pmm::free_count() as u64;
+    let uptime_secs = crate::timer::uptime_us() / 1_000_000;
+    // struct sysinfo layout (AArch64, 8-byte unsigned long):
+    //   0: uptime (8), 8: loads[3] (24), 32: totalram (8), 40: freeram (8),
+    //   48: sharedram (8), 56: bufferram (8), 64: totalswap (8), 72: freeswap (8),
+    //   80: procs (2), 82: pad (2), 84: [align 4], 88: totalhigh (8),
+    //   96: freehigh (8), 104: mem_unit (4), 108: _f[0], pad to 112
     unsafe {
         let ptr = info.as_mut_ptr() as *mut u64;
-        core::ptr::write(ptr.add(0), 3600);
-        core::ptr::write(ptr.add(4), 256 * 1024 * 1024);
-        core::ptr::write(ptr.add(5), free_pages * 4096);
+        core::ptr::write(ptr.add(0), uptime_secs);          // offset 0
+        core::ptr::write(ptr.add(4), total_pages * 4096);   // offset 32: totalram
+        core::ptr::write(ptr.add(5), free_pages * 4096);    // offset 40: freeram
         let procs_ptr = info.as_mut_ptr().add(80) as *mut u16;
-        core::ptr::write(procs_ptr, 1);
-        let memunit_ptr = info.as_mut_ptr().add(100) as *mut u32;
-        core::ptr::write(memunit_ptr, 1);
+        core::ptr::write(procs_ptr, 1);                     // offset 80: procs
+        let memunit_ptr = info.as_mut_ptr().add(104) as *mut u32;
+        core::ptr::write(memunit_ptr, 1);                   // offset 104: mem_unit
     }
     if unsafe { copy_to_user_safe(info_ptr as *mut u8, info.as_ptr(), 112).is_err() } {
         return EFAULT;

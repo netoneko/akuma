@@ -122,10 +122,46 @@ thread exit.
 | `opencode` EEXIST crash | Epoll ADD on fd already registered by same/other thread | Idempotent ADD + shared table |
 | `process.stdout.columns` undefined | WriteStream constructor fails due to EEXIST, leaving stdout undefined | Idempotent ADD |
 
+## ioctl FIONBIO / FIONREAD Support
+
+The shared fd table also required proper `ioctl` support for non-terminal
+file descriptors.  Previously, all ioctls on fd > 2 returned `ENOTTY`,
+which caused Bun to crash when setting sockets to non-blocking mode.
+
+### FIONBIO (0x5421) — Set/clear non-blocking
+
+Reads a 4-byte int from the user pointer.  If non-zero, marks the fd
+non-blocking in the process fd table (`proc.set_nonblock(fd)`); if zero,
+clears it.  All read/write syscall paths already check `fd_is_nonblock()`
+from the process-level set, so no additional propagation is needed.
+
+### FIONREAD (0x541B) — Bytes available for read
+
+Returns the actual byte count based on fd type:
+
+| FD type   | Source                          |
+|-----------|---------------------------------|
+| PipeRead  | `pipe_bytes_available(id)` — pipe buffer length |
+| Socket    | `smoltcp recv_queue()` — TCP/UDP receive buffer |
+| EventFd   | 8 if counter > 0, else 0        |
+| TimerFd   | 8 if timer expired, else 0      |
+| Stdin     | `channel.stdin_bytes_available()` |
+| File      | `file_size - position`          |
+| Other     | 0                               |
+
+### FIOCLEX / FIONCLEX (0x5451 / 0x5450)
+
+Set or clear the close-on-exec flag for any fd.  These are handled before
+the `fd > 2` ENOTTY guard for terminal-specific ioctls.
+
 ## Files Changed
 
 - `crates/akuma-exec/src/process/mod.rs` — `SharedFdTable` struct, Process
-  field replacement, method redirects, clone_thread/fork_process/cleanup updates
+  field replacement, method redirects, clone_thread/fork_process/cleanup updates,
+  `stdin_bytes_available()` on ProcessChannel
 - `src/syscall/fs.rs` — `sys_close_range` updated to use `proc.fds.table`
 - `src/syscall/poll.rs` — `EPOLL_CTL_ADD` made idempotent
-- `src/tests.rs` — Test process uses `SharedFdTable::new()`
+- `src/syscall/term.rs` — FIONBIO/FIONREAD/FIOCLEX/FIONCLEX on any fd
+- `src/syscall/pipe.rs` — `pipe_bytes_available()` helper
+- `src/syscall/net.rs` — `socket_recv_queue_size()` helper
+- `src/tests.rs` — Test process uses `SharedFdTable::new()`, pipe/fd table tests

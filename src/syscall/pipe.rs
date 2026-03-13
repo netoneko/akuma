@@ -11,7 +11,7 @@ struct KernelPipe {
 static PIPES: Spinlock<BTreeMap<u32, KernelPipe>> = Spinlock::new(BTreeMap::new());
 static NEXT_PIPE_ID: AtomicU32 = AtomicU32::new(1);
 
-pub(super) fn pipe_create() -> u32 {
+pub(crate) fn pipe_create() -> u32 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().insert(id, KernelPipe {
@@ -37,7 +37,7 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
     });
 }
 
-pub(super) fn pipe_write(id: u32, data: &[u8]) -> usize {
+pub(crate) fn pipe_write(id: u32, data: &[u8]) -> usize {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
@@ -52,7 +52,7 @@ pub(super) fn pipe_write(id: u32, data: &[u8]) -> usize {
     })
 }
 
-pub(super) fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
+pub(crate) fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
@@ -122,7 +122,7 @@ pub(super) fn pipe_can_read(id: u32) -> bool {
     })
 }
 
-pub(super) fn pipe_bytes_available(id: u32) -> usize {
+pub(crate) fn pipe_bytes_available(id: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.buffer.len())
     })

@@ -43,7 +43,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         match proc.memory.alloc_mmap(pages * 4096) {
             Some(a) => a,
             None => {
-                crate::tprint!(160, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+                crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
                     proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
                 return !0u64;
             }

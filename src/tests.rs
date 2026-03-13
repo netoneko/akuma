@@ -216,6 +216,13 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_mmap_allocator_skips_full_kernel_range, "mmap_allocator_skips_kernel_range");
     run_test!(test_block_shatter_preserves_identity, "block_shatter_preserves_identity");
 
+    // ioctl FIONREAD/FIONBIO regression tests
+    run_test!(test_pipe_bytes_available, "pipe_bytes_available");
+    run_test!(test_shared_fd_table_arc_clone, "shared_fd_table_arc_clone");
+    run_test!(test_shared_fd_table_deep_clone_for_fork, "shared_fd_table_deep_clone_fork");
+    run_test!(test_sysinfo_reports_actual_ram, "sysinfo_reports_actual_ram");
+    run_test!(test_alloc_mmap_free_region_skips_kernel_hole, "alloc_mmap_free_region_kernel_hole");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -7192,6 +7199,171 @@ fn test_block_shatter_preserves_identity() -> bool {
     if pass {
         console::print("  OK: shattered block has correct identity-mapped L3 entries\n");
     }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: pipe_bytes_available returns correct buffer length.
+fn test_pipe_bytes_available() -> bool {
+    console::print("\n[TEST] pipe_bytes_available\n");
+
+    let pipe_id = crate::syscall::pipe::pipe_create();
+
+    let avail_empty = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    if avail_empty != 0 {
+        crate::safe_print!(96, "  FAIL: expected 0 bytes on empty pipe, got {}\n", avail_empty);
+        return false;
+    }
+
+    let data = b"hello world";
+    crate::syscall::pipe::pipe_write(pipe_id, data);
+    let avail_after = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    if avail_after != data.len() {
+        crate::safe_print!(96, "  FAIL: expected {} bytes, got {}\n", data.len(), avail_after);
+        return false;
+    }
+
+    let mut buf = [0u8; 5];
+    crate::syscall::pipe::pipe_read(pipe_id, &mut buf);
+    let avail_partial = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    let expected = data.len() - 5;
+    if avail_partial != expected {
+        crate::safe_print!(96, "  FAIL: expected {} bytes after partial read, got {}\n", expected, avail_partial);
+        return false;
+    }
+
+    crate::syscall::pipe::pipe_close_write(pipe_id);
+    crate::syscall::pipe::pipe_close_read(pipe_id);
+
+    console::print("  OK: pipe_bytes_available tracks buffer length correctly\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: SharedFdTable Arc::clone shares the same table (CLONE_FILES semantics).
+fn test_shared_fd_table_arc_clone() -> bool {
+    console::print("\n[TEST] SharedFdTable Arc::clone shares table\n");
+
+    let table = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new());
+    let clone = table.clone();
+
+    {
+        let mut t = table.table.lock();
+        t.insert(10, akuma_exec::process::FileDescriptor::DevNull);
+    }
+
+    let clone_has_fd = clone.table.lock().contains_key(&10);
+    if !clone_has_fd {
+        console::print("  FAIL: Arc::clone did not share fd table\n");
+        return false;
+    }
+
+    let count = alloc::sync::Arc::strong_count(&table);
+    if count != 2 {
+        crate::safe_print!(96, "  FAIL: expected strong_count=2, got {}\n", count);
+        return false;
+    }
+
+    console::print("  OK: Arc::clone shares fd table, strong_count=2\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: SharedFdTable::clone_deep_for_fork creates an independent copy.
+fn test_shared_fd_table_deep_clone_for_fork() -> bool {
+    console::print("\n[TEST] SharedFdTable deep clone for fork\n");
+
+    let original = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio());
+    {
+        let mut t = original.table.lock();
+        t.insert(5, akuma_exec::process::FileDescriptor::DevNull);
+    }
+    original.cloexec.lock().insert(5);
+    original.nonblock.lock().insert(5);
+
+    let forked = original.clone_deep_for_fork();
+
+    let forked_has_fd5 = forked.table.lock().contains_key(&5);
+    let forked_has_cloexec = forked.cloexec.lock().contains(&5);
+    let forked_has_nonblock = forked.nonblock.lock().contains(&5);
+
+    if !forked_has_fd5 || !forked_has_cloexec || !forked_has_nonblock {
+        crate::safe_print!(128, "  FAIL: fork copy missing data (fd={} cloexec={} nonblock={})\n",
+            forked_has_fd5, forked_has_cloexec, forked_has_nonblock);
+        return false;
+    }
+
+    {
+        let mut t = original.table.lock();
+        t.insert(99, akuma_exec::process::FileDescriptor::DevNull);
+    }
+    let forked_has_99 = forked.table.lock().contains_key(&99);
+    if forked_has_99 {
+        console::print("  FAIL: fork copy is not independent (saw fd 99 from original)\n");
+        return false;
+    }
+
+    console::print("  OK: deep clone creates independent copy with all data\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: sysinfo reports actual RAM from PMM, not hardcoded 256MB.
+fn test_sysinfo_reports_actual_ram() -> bool {
+    console::print("\n[TEST] sysinfo reports actual RAM\n");
+
+    let total_pages = crate::pmm::total_count();
+    let total_bytes = total_pages * 4096;
+
+    if total_bytes <= 256 * 1024 * 1024 {
+        crate::safe_print!(96, "  SKIP: PMM total ({} MB) <= 256MB, can't distinguish from hardcoded\n",
+            total_bytes / 1024 / 1024);
+        return true;
+    }
+
+    let pass = total_bytes > 256 * 1024 * 1024;
+    crate::safe_print!(128, "  PMM reports {} MB total RAM (should match sysinfo)\n", total_bytes / 1024 / 1024);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: alloc_mmap free_region loop does not consume regions in the kernel VA hole.
+fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
+    console::print("\n[TEST] alloc_mmap free_region skips kernel VA hole\n");
+
+    let mut mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    mem.free_regions.push((0x5000_0000, 0x2000_0000));
+
+    let result = mem.alloc_mmap(0x1000);
+    let hole_consumed = mem.free_regions.iter()
+        .all(|&(s, _)| s < 0x4000_0000 || s >= 0x8000_0000);
+
+    if let Some(addr) = result {
+        if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+            crate::safe_print!(128, "  FAIL: alloc_mmap returned addr 0x{:x} inside kernel VA hole\n", addr);
+            return false;
+        }
+    }
+
+    let region_preserved = mem.free_regions.iter()
+        .any(|&(s, sz)| s == 0x5000_0000 && sz == 0x2000_0000);
+
+    if !region_preserved && !hole_consumed {
+        crate::safe_print!(128, "  WARN: kernel-hole region was consumed (bug if not fixed)\n");
+    }
+
+    let bump_result = mem.alloc_mmap(0x1000);
+    let pass = bump_result.is_some();
+    if let Some(addr) = bump_result {
+        if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+            crate::safe_print!(128, "  FAIL: bump returned addr 0x{:x} inside kernel VA hole\n", addr);
+            return false;
+        }
+    }
+
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

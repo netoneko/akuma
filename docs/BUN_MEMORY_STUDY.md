@@ -888,6 +888,58 @@ This is tracked as a future improvement.
 
 ---
 
+## Bug: sysinfo Hardcoded 256MB Total RAM
+
+### Symptom
+
+`opencode` (Bun-based) crashed with:
+```
+failed to asynchronously prepare wasm: RangeError: Out of memory
+```
+despite 590MB of free physical memory.
+
+### Root Cause
+
+`sys_sysinfo()` hardcoded `totalram` to `256 * 1024 * 1024` (256MB) instead
+of reading the actual PMM total.  Bun/JavaScriptCore uses `sysinfo()` to
+determine the system's physical memory and calculates internal memory budgets
+as a fraction of totalram.  With only 256MB reported, JSC's WebAssembly
+memory allocator refused allocations that would have been fine with the real
+1GB of RAM.
+
+### Fix
+
+Changed `sys_sysinfo()` to:
+- Report `totalram = pmm::total_count() * 4096` (actual RAM from PMM)
+- Report `freeram = pmm::free_count() * 4096` (actual free memory)
+- Report `uptime` from `timer::uptime_us()` instead of hardcoded 3600
+- Fixed `mem_unit` offset: was written at byte 100, correct offset is 104
+  on AArch64 (due to alignment padding after the `procs`/`pad` u16 fields
+  before the 8-byte `totalhigh`/`freehigh` fields).  With `mem_unit = 0`
+  at the correct offset, programs multiplying by `mem_unit` would see zero
+  total RAM.
+
+### ENOSYS Diagnostics
+
+Added `[ENOSYS]` log messages for all syscalls returning ENOSYS, including
+inotify, io_uring, pidfd_open, process_vm_readv, and unknown syscalls.
+The `[mmap] REJECT` message was also upgraded from `tprint!` to
+`safe_print!` so it's always visible.
+
+### Bug: alloc_mmap Free Region Kernel VA Hole
+
+The free-region recycler in `ProcessMemory::alloc_mmap` had a logic bug:
+when a free region fell inside the kernel VA hole (`0x4000_0000–0x8000_0000`),
+the code would *remove* the region from the list, push back a remainder,
+then `continue` without returning an address.  This leaked the VA space
+for that region permanently.
+
+Fixed by checking the kernel VA hole *before* removing the region from
+the free list — the `continue` now skips over hole regions without
+consuming them.
+
+---
+
 ## Related Documentation
 
 - `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix
@@ -896,3 +948,4 @@ This is tracked as a future improvement.
 - `docs/MEMORY_LAYOUT.md` -- Physical and virtual memory layout
 - `docs/USERSPACE_MEMORY_MODEL.md` -- User address space layout
 - `docs/IDENTITY_MAPPING_DEPENDENCIES.md` -- Kernel identity mapping catalog
+- `docs/SHARED_FD_TABLES.md` -- Shared fd tables and ioctl support

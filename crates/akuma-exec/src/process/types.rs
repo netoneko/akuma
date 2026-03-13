@@ -314,12 +314,12 @@ impl ProcessMemory {
         for i in 0..self.free_regions.len() {
             let (start, f_size) = self.free_regions[i];
             if f_size >= size {
+                if start >= Self::KERNEL_VA_START && start < Self::KERNEL_VA_END {
+                    continue;
+                }
                 self.free_regions.remove(i);
                 if f_size > size {
                     self.free_regions.push((start + size, f_size - size));
-                }
-                if start >= Self::KERNEL_VA_START && start < Self::KERNEL_VA_END {
-                    continue;
                 }
                 return Some(start);
             }
