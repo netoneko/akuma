@@ -849,15 +849,62 @@ pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page
 
 /// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
 /// Called by sys_mprotect so demand paging uses the correct permissions.
+///
+/// Regions that are only partially covered by the mprotect range are split:
+/// the covered sub-range gets the new flags while the uncovered tails keep
+/// their original flags.  Without splitting, a mprotect on a small guard page
+/// at the start of a huge region would incorrectly mark the entire region as
+/// PROT_NONE, causing spurious SIGSEGVs on all later accesses.
 pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
     let range_end = range_start + range_size;
     with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
-            for r in regions.iter_mut() {
-                let r_end = r.start_va + r.size;
-                if r.start_va < range_end && r_end > range_start {
-                    r.flags = new_flags;
+            let mut i = 0;
+            while i < regions.len() {
+                let r_start = regions[i].start_va;
+                let r_end = r_start + regions[i].size;
+                if r_start >= range_end || r_end <= range_start {
+                    i += 1;
+                    continue;
+                }
+                let clip_start = r_start.max(range_start);
+                let clip_end = r_end.min(range_end);
+                if clip_start == r_start && clip_end == r_end {
+                    // Fully contained: update in place.
+                    regions[i].flags = new_flags;
+                    i += 1;
+                } else {
+                    // Partially overlapping: split into up to 3 pieces.
+                    let old_flags = regions[i].flags;
+                    let old_source = regions[i].source.clone();
+                    regions.remove(i);
+                    // "before" tail keeps old flags.
+                    if clip_start > r_start {
+                        regions.push(LazyRegion {
+                            start_va: r_start,
+                            size: clip_start - r_start,
+                            flags: old_flags,
+                            source: old_source.clone(),
+                        });
+                    }
+                    // Overlapping slice gets new flags.
+                    regions.push(LazyRegion {
+                        start_va: clip_start,
+                        size: clip_end - clip_start,
+                        flags: new_flags,
+                        source: old_source.clone(),
+                    });
+                    // "after" tail keeps old flags.
+                    if clip_end < r_end {
+                        regions.push(LazyRegion {
+                            start_va: clip_end,
+                            size: r_end - clip_end,
+                            flags: old_flags,
+                            source: old_source,
+                        });
+                    }
+                    // i unchanged: former index i now holds the next original region.
                 }
             }
         }

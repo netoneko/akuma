@@ -1040,6 +1040,82 @@ by time.
 
 ---
 
+## JSC Gigacage SIGSEGV (mprotect lazy-region splitting bug)
+
+### Symptom
+
+opencode (bun 1.3.10) crashes ~32 seconds into a session with exit code -5
+(SIGTRAP from bun's own panic handler):
+
+```
+panic(main thread): Segmentation fault at address 0x2EC85E400
+```
+
+Kernel log shows two identical large mmaps followed by a SIGSEGV:
+
+```
+[T61.01] [mmap] pid=54 len=0x100800000 prot=0x3 flags=0x4022 = 0x2ec85e000 (lazy, 68 regions)
+[T61.34] [mmap] pid=54 len=0x100800000 prot=0x3 flags=0x4032 = 0x2ec85e000 (lazy, 68 regions)
+[T61.43] [signal] Delivering sig 11 to handler 0x46a8840 (restorer=0x30051c50)
+```
+
+The crash address `0x2EC85E400` is at offset +0x400 (1 KB) inside the
+4 GB+8 MB JIT region mapped at `0x2ec85e000`.  The page should be a
+demand-pageable PROT\_READ|PROT\_WRITE anonymous region, so no SIGSEGV
+should be produced.
+
+Stack trace (bun crash reporter) shows the fault inside JSC's
+`AssemblerBuffer` while writing JIT code for `boundFunctionCallGenerator` —
+confirming the JIT code buffer at `0x2EC85E400` is the crash site.
+
+### Root Cause
+
+`update_lazy_region_flags()` in
+`crates/akuma-exec/src/process/mod.rs` was called by `sys_mprotect`.
+When `mprotect` is applied to a **sub-range** of a lazy region, the
+function updated the **entire** overlapping region's flags to the new
+value:
+
+```rust
+// BEFORE (buggy):
+for r in regions.iter_mut() {
+    let r_end = r.start_va + r.size;
+    if r.start_va < range_end && r_end > range_start {
+        r.flags = new_flags;   // ← clobbers the whole 4 GB+8 MB region!
+    }
+}
+```
+
+JSC's JIT setup calls `mprotect` on a small sub-range at the start of the
+4 GB+8 MB cage (e.g., a guard page or metadata header) with `PROT_NONE`.
+This caused the entire lazy region's flags to become PROT\_NONE.  On the
+next access to any page inside the region (including offset +0x400), the
+demand-pager found `is_none(flags) == true` and fell through to SIGSEGV
+instead of allocating a physical page.
+
+### Fix
+
+`update_lazy_region_flags` now **splits** lazy regions when the mprotect
+range covers only part of one, preserving the original flags for the
+untouched tails:
+
+```
+Before:  [------------ RW 4 GB+8 MB ------------]
+mprotect: ^^^^ PROT_NONE (4 KB guard)
+
+After fix:
+  [PROT_NONE 4 KB] [RW 4 GB+8 MB minus 4 KB]
+```
+
+The splitting logic mirrors `munmap_lazy_region_overlapping`: remove the
+original region, push a "before" tail with old flags, push the covered
+slice with new flags, push an "after" tail with old flags.
+
+**File changed:** `crates/akuma-exec/src/process/mod.rs` —
+`update_lazy_region_flags`.
+
+---
+
 ## Related Documentation
 
 - `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix
