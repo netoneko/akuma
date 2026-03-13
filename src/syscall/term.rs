@@ -1,6 +1,7 @@
 use super::*;
 use akuma_net::socket::libc_errno;
 use akuma_terminal::mode_flags;
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCGETS: u32 = 0x5401;
@@ -29,15 +30,16 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return (-(12i64)) as u64,
             };
             let ts = term_state_lock.lock();
+            let mut kernel_buf = [0u32; 9]; // 4 flags + 5 u32 for 20 bytes CC
+            kernel_buf[0] = ts.iflag;
+            kernel_buf[1] = ts.oflag;
+            kernel_buf[2] = ts.cflag;
+            kernel_buf[3] = ts.lflag;
             unsafe {
-                let ptr = arg as *mut u32;
-                *ptr.add(0) = ts.iflag;
-                *ptr.add(1) = ts.oflag;
-                *ptr.add(2) = ts.cflag;
-                *ptr.add(3) = ts.lflag;
-                
-                let cc_ptr = ptr.add(4) as *mut u8;
-                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), cc_ptr, 20);
+                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), kernel_buf[4..].as_mut_ptr() as *mut u8, 20);
+            }
+            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_buf.as_ptr() as *const u8, 36).is_err() } {
+                return EFAULT;
             }
             0
         }
@@ -47,21 +49,23 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(state) => state,
                 None => return (-(12i64)) as u64,
             };
+            let mut kernel_buf = [0u32; 9];
+            if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr() as *mut u8, arg as *const u8, 36).is_err() } {
+                return EFAULT;
+            }
             let mut ts = term_state_lock.lock();
+            ts.iflag = kernel_buf[0];
+            ts.oflag = kernel_buf[1];
+            ts.cflag = kernel_buf[2];
+            ts.lflag = kernel_buf[3];
+            
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
+                    ts.iflag, ts.oflag, ts.cflag, ts.lflag);
+            }
+            
             unsafe {
-                let ptr = arg as *const u32;
-                ts.iflag = *ptr.add(0);
-                ts.oflag = *ptr.add(1);
-                ts.cflag = *ptr.add(2);
-                ts.lflag = *ptr.add(3);
-                
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
-                        ts.iflag, ts.oflag, ts.cflag, ts.lflag);
-                }
-                
-                let cc_ptr = ptr.add(4) as *const u8;
-                core::ptr::copy_nonoverlapping(cc_ptr, ts.cc.as_mut_ptr(), 20);
+                core::ptr::copy_nonoverlapping(kernel_buf[4..].as_ptr() as *const u8, ts.cc.as_mut_ptr(), 20);
             }
 
             if let Some(ch) = akuma_exec::process::current_channel() {
@@ -79,12 +83,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return (-(12i64)) as u64,
             };
             let ts = term_state_lock.lock();
-            unsafe {
-                let ptr = arg as *mut u16;
-                *ptr.add(0) = ts.term_height;
-                *ptr.add(1) = ts.term_width;
-                *ptr.add(2) = 0;
-                *ptr.add(3) = 0;
+            let kernel_winsz = [ts.term_height, ts.term_width, 0, 0];
+            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_winsz.as_ptr() as *const u8, 8).is_err() } {
+                return EFAULT;
             }
             0
         }
@@ -95,12 +96,12 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return (-(12i64)) as u64,
             };
             let ts = term_state_lock.lock();
-            unsafe {
-                let pgid = ts.foreground_pgid;
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
-                }
-                *(arg as *mut u32) = pgid;
+            let pgid = ts.foreground_pgid;
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
+            }
+            if unsafe { copy_to_user_safe(arg as *mut u8, &pgid as *const u32 as *const u8, 4).is_err() } {
+                return EFAULT;
             }
             0
         }
@@ -110,14 +111,15 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(state) => state,
                 None => return (-(12i64)) as u64,
             };
-            let mut ts = term_state_lock.lock();
-            unsafe {
-                let pgid = *(arg as *const u32);
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
-                }
-                ts.foreground_pgid = pgid;
+            let mut pgid: u32 = 0;
+            if unsafe { copy_from_user_safe(&mut pgid as *mut u32 as *mut u8, arg as *const u8, 4).is_err() } {
+                return EFAULT;
             }
+            let mut ts = term_state_lock.lock();
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
+            }
+            ts.foreground_pgid = pgid;
             0
         }
         _ => (-(25i64)) as u64,
@@ -178,9 +180,9 @@ pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     };
 
     let term_state = term_state_lock.lock();
-
-    unsafe {
-        *(attr_ptr as *mut u64) = term_state.mode_flags;
+    let val = term_state.mode_flags;
+    if unsafe { copy_to_user_safe(attr_ptr as *mut u8, &val as *const u64 as *const u8, 8).is_err() } {
+        return EFAULT;
     }
 
     0
@@ -284,8 +286,8 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
     }
 
     if bytes_read > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf_ptr as *mut u8, bytes_read);
+        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), bytes_read).is_err() } {
+            return EFAULT;
         }
         bytes_read as u64
     } else {
@@ -294,7 +296,8 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
 }
 
 pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
-    if !validate_user_ptr(ptr, max * core::mem::size_of::<ThreadCpuStat>()) { return EFAULT; }
+    let stat_size = core::mem::size_of::<ThreadCpuStat>();
+    if !validate_user_ptr(ptr, max * stat_size) { return EFAULT; }
     let count = max.min(crate::config::MAX_THREADS);
     for i in 0..count {
         let mut stat = ThreadCpuStat {
@@ -322,7 +325,9 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             for b in &mut stat.name { *b = 0; }
         }
 
-        unsafe { core::ptr::write_volatile((ptr as *mut ThreadCpuStat).add(i), stat); }
+        if unsafe { copy_to_user_safe((ptr as usize + i * stat_size) as *mut u8, &stat as *const ThreadCpuStat as *const u8, stat_size).is_err() } {
+            return EFAULT;
+        }
     }
     count as u64
 }

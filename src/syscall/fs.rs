@@ -342,11 +342,14 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
-            super::proc::fill_random_bytes(temp.as_mut_ptr(), count);
-            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
-                return EFAULT;
+            if crate::rng::fill_bytes(&mut temp).is_ok() {
+                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                    return EFAULT;
+                }
+                count as u64
+            } else {
+                !0u64
             }
-            count as u64
         }
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             let result = super::timerfd::timerfd_read(timer_id);
@@ -394,11 +397,14 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
-            super::proc::fill_random_bytes(temp.as_mut_ptr(), count);
-            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
-                return EFAULT;
+            if crate::rng::fill_bytes(&mut temp).is_ok() {
+                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                    return EFAULT;
+                }
+                count as u64
+            } else {
+                !0u64
             }
-            count as u64
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,

@@ -205,6 +205,10 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_enosys_is_negative_38, "enosys_is_negative_38");
     run_test!(test_oom_crash_pattern_documentation, "oom_crash_pattern_docs");
 
+    // Safe user access fault redirection tests
+    run_test!(test_safe_user_access_fault, "safe_user_access_fault");
+    run_test!(test_copy_from_user_str_fault, "copy_from_user_str_fault");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -6914,4 +6918,62 @@ fn test_oom_crash_pattern_documentation() -> bool {
 
     crate::safe_print!(64, "  Result: PASS (documentation only)\n");
     true
+}
+
+/// Test safe user memory access and EC=0x25 fault redirection.
+/// Verifies that accessing an unmapped address via safe primitives 
+/// returns EFAULT (14) instead of killing the process.
+fn test_safe_user_access_fault() -> bool {
+    console::print("\n[TEST] Safe user access fault redirection\n");
+    
+    // Address that is definitely not mapped
+    let invalid_addr = 0xdead0000usize as *mut u8;
+    let kernel_buf = [0u8; 16];
+    
+    // This should NOT crash/kill kernel, but return Err(14) (EFAULT)
+    let res = unsafe { akuma_exec::mmu::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
+    
+    let ok = match res {
+        Err(14) => {
+            console::print("  OK: copy to invalid address returned EFAULT\n");
+            true
+        }
+        Err(e) => {
+            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
+            false
+        }
+        Ok(_) => {
+            console::print("  FAILED: expected EFAULT, but copy succeeded?!\n");
+            false
+        }
+    };
+    
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test safe copy_from_user_str handling of unmapped memory.
+fn test_copy_from_user_str_fault() -> bool {
+    console::print("\n[TEST] copy_from_user_str fault handling\n");
+    
+    let invalid_addr = 0xdead0000u64;
+    let res = crate::syscall::copy_from_user_str(invalid_addr, 1024);
+    
+    let ok = match res {
+        Err(14) => {
+            console::print("  OK: copy_from_user_str returned EFAULT for invalid addr\n");
+            true
+        }
+        Err(e) => {
+            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
+            false
+        }
+        Ok(s) => {
+            crate::safe_print!(128, "  FAILED: expected EFAULT, got success: \"{}\"\n", s);
+            false
+        }
+    };
+    
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
 }

@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::mmu::user_access::copy_to_user_safe;
 
 struct KernelPipe {
     buffer: Vec<u8>,
@@ -140,8 +141,9 @@ pub(super) fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
         proc.set_cloexec(fd_w);
     }
 
-    unsafe {
-        *(fds_ptr as *mut [i32; 2]) = [fd_r as i32, fd_w as i32];
+    let fds = [fd_r as i32, fd_w as i32];
+    if unsafe { copy_to_user_safe(fds_ptr as *mut u8, fds.as_ptr() as *const u8, 8).is_err() } {
+        return EFAULT;
     }
     0
 }

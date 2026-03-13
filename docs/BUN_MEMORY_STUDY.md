@@ -715,8 +715,74 @@ page for a heap/stack expansion.
 
 ---
 
+## 13. Safe User Memory Access (Principled Fix)
+
+### Symptom
+
+Bun's JIT and allocator (mimalloc) frequently trigger Data Aborts from EL1
+(`EC=0x25`) during syscalls. This happens when the kernel attempts to
+dereference a userspace pointer that:
+1.  Is valid in software (`validate_user_ptr` passes) but not yet in hardware
+    (TLB/coherency lag).
+2.  Is part of a lazy mmap region that hasn't been demand-paged yet.
+3.  Is concurrently unmapped by another thread (race condition).
+
+**Manifestation: Kernel-level process kill.** The previous exception handler
+treated EL1 faults on user addresses as fatal kernel errors and killed the
+process to preserve integrity.
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x403d7f30, FAR=0x50004000
+  EC=0x25 in kernel code — killing current process (EFAULT)
+```
+
+### Root Cause
+
+The kernel relied on "check-then-use" (TOCTTOU) validation. If the check passed
+but the use failed (due to the reasons above), the kernel had no recovery path
+other than killing the process. Standard Linux behavior requires returning
+`EFAULT` from the syscall instead.
+
+### Fix (2026-03-13)
+
+Implemented a comprehensive "Safe User Access" mechanism:
+
+1.  **Thread-Local Recovery:** Added `user_copy_fault_handler` to `ThreadSlot`.
+    This stores a recovery address during sensitive copy operations.
+2.  **Fault Redirection:** Updated `rust_sync_el1_handler` (`src/exceptions.rs`)
+    to check this handler. If set, it redirects `ELR_EL1` to the recovery path
+    instead of killing the process.
+3.  **Assembly Primitives:** Implemented `copy_from_user_safe` and
+    `copy_to_user_safe` in `crates/akuma-exec/src/mmu/user_access.rs` using
+    AArch64 assembly. These functions wrap a byte-copy loop with the
+    registration/clearing of the fault handler.
+4.  **Comprehensive Hardening:** Refactored over 100 instances of raw pointer
+    dereferences across the entire syscall layer to use safe primitives:
+    -   **Networking:** `sys_sendto`, `sys_recvfrom`, `sys_sendmsg`, `sys_recvmsg` now
+        use intermediate kernel buffers.
+    -   **Filesystem:** `sys_read`, `sys_write`, `sys_getdents64`, `sys_getcwd` now
+        perform chunked safe copies.
+    -   **Synchronization:** `sys_futex` safely reads user-space atomic values.
+    -   **Metadata:** `sys_fstat`, `sys_newfstatat`, `sys_uname`, `sys_sysinfo` use safe copies.
+5.  **Poll Efficiency:** Improved `epoll_pwait`, `ppoll`, and `pselect6` to use
+    `schedule_blocking` instead of busy-yielding, allowing threads to sleep
+    until network events or timeouts occur.
+
+### Impact
+
+- **Stability:** `opencode` and `bun install` no longer trigger kernel-level
+  process kills for valid (but unmapped) memory access. The kernel correctly
+  returns `EFAULT` (or demand-pages via the safe access path) and remains stable.
+- **Performance:** Efficient polling reduces CPU usage during "Resolving" phases.
+- **Correctness:** Resolved the `bun install` hang by ensuring DNS responses
+  and socket events correctly wake the event loop.
+
+---
+
 ## Related Documentation
 
+- `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix
 - `docs/DEVICE_MMIO_VA_CONFLICT.md` -- Device MMIO remapping details
 - `docs/BUN_MISSING_SYSCALLS.md` -- Syscalls added for bun
 - `docs/MEMORY_LAYOUT.md` -- Physical and virtual memory layout

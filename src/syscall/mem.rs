@@ -177,7 +177,18 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
 
         let copy_len = old_size.min(new_size);
         if validate_user_ptr(old_addr as u64, copy_len) {
-            unsafe { core::ptr::copy_nonoverlapping(old_addr as *const u8, new_addr as *mut u8, copy_len); }
+            let mut kernel_buf = alloc::vec![0u8; copy_len.min(1024 * 1024)];
+            let mut total_copied = 0;
+            while total_copied < copy_len {
+                let chunk = (copy_len - total_copied).min(kernel_buf.len());
+                if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), (old_addr + total_copied) as *const u8, chunk).is_err() } {
+                    break; 
+                }
+                if unsafe { copy_to_user_safe((new_addr + total_copied) as *mut u8, kernel_buf.as_ptr(), chunk).is_err() } {
+                    break;
+                }
+                total_copied += chunk;
+            }
         }
 
         proc.mmap_regions.push((new_addr, new_frames));

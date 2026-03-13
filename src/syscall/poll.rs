@@ -300,7 +300,17 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             return EINTR;
         }
 
-        akuma_exec::threading::yield_now();
+        let deadline = if timeout > 0 {
+            start_time + timeout_us
+        } else if timeout == 0 {
+            0 // Should have returned above if not ready
+        } else {
+            u64::MAX
+        };
+
+        if deadline == 0 { return 0; }
+
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
@@ -421,7 +431,8 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             return 0;
         }
 
-        akuma_exec::threading::yield_now();
+        let deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
@@ -540,6 +551,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             return 0;
         }
 
-        akuma_exec::threading::yield_now();
+        let deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }

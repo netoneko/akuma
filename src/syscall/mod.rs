@@ -9,6 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 mod container;
 mod eventfd;
@@ -417,33 +418,38 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
     true
 }
 
-fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
+/// Safely read a single byte from user memory.
+pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
+    let mut b: u8 = 0;
+    if unsafe { copy_from_user_safe(&mut b as *mut u8, ptr as *const u8, 1).is_err() } {
+        return Err(EFAULT);
+    }
+    Ok(b)
+}
+
+pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     let limit = user_va_limit();
     if !BYPASS_VALIDATION.load(Ordering::Acquire) {
         if ptr < 0x1000 || ptr >= limit { return Err(EFAULT); }
-        if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, 1) { return Err(EFAULT); }
     }
+    let mut bytes = Vec::new();
     let mut len = 0;
     while len < max_len {
         let addr = ptr + len as u64;
-        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            if addr >= limit { return Err(EFAULT); }
-            if addr % 4096 == 0 {
-                if !akuma_exec::mmu::is_current_user_range_mapped(addr as usize, 1) { return Err(EFAULT); }
-            }
+        if !BYPASS_VALIDATION.load(Ordering::Acquire) && addr >= limit {
+            return Err(EFAULT);
         }
-        let c = unsafe { *(addr as *const u8) };
+        
+        let c = copy_from_user_byte(addr)?;
         if c == 0 { break; }
+        bytes.push(c);
         len += 1;
     }
     if len == max_len {
-        let first_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, 16) };
-        crate::safe_print!(128, "[syscall] copy_from_user_str: not null terminated within {} bytes at {:#x}. First 16 bytes: {:?}\n", max_len, ptr, first_bytes);
         return Err(EINVAL);
     }
     
-    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    match core::str::from_utf8(slice) {
+    match core::str::from_utf8(&bytes) {
         Ok(s) => Ok(String::from(s)),
         Err(_) => {
             crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
@@ -639,7 +645,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         119 => {
             let param_ptr = args[1] as usize;
             if param_ptr != 0 && validate_user_ptr(param_ptr as u64, 4) {
-                unsafe { core::ptr::write(param_ptr as *mut i32, 0); }
+                let zero: i32 = 0;
+                let _ = unsafe { copy_to_user_safe(param_ptr as *mut u8, &zero as *const i32 as *const u8, 4) };
             }
             0
         }
@@ -651,10 +658,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;
             if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
-                unsafe {
-                    core::ptr::write_bytes(mask_ptr as *mut u8, 0, cpusetsize);
-                    core::ptr::write(mask_ptr as *mut u64, 1);
+                let mut kernel_mask = alloc::vec![0u8; cpusetsize];
+                if cpusetsize >= 8 {
+                    unsafe { core::ptr::write(kernel_mask.as_mut_ptr() as *mut u64, 1); }
                 }
+                let _ = unsafe { copy_to_user_safe(mask_ptr as *mut u8, kernel_mask.as_ptr(), cpusetsize) };
             }
             0
         }
@@ -666,7 +674,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CAPGET => {
             let data_ptr = args[1] as usize;
             if data_ptr != 0 && validate_user_ptr(args[1], 24) {
-                unsafe { core::ptr::write_bytes(data_ptr as *mut u8, 0, 24); }
+                let zero = [0u8; 24];
+                let _ = unsafe { copy_to_user_safe(data_ptr as *mut u8, zero.as_ptr(), 24) };
             }
             0
         }

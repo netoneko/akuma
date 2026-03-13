@@ -1,10 +1,22 @@
 use super::*;
+use akuma_exec::mmu::user_access::copy_from_user_safe;
 
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
-    let name = unsafe { core::str::from_utf8(core::slice::from_raw_parts(name_ptr as *const u8, name_len)).unwrap_or("unknown") };
-    let root = unsafe { core::str::from_utf8(core::slice::from_raw_parts(root_ptr as *const u8, root_len)).unwrap_or("/") };
+    
+    let mut name_buf = alloc::vec![0u8; name_len];
+    let mut root_buf = alloc::vec![0u8; root_len];
+    
+    if unsafe { copy_from_user_safe(name_buf.as_mut_ptr(), name_ptr as *const u8, name_len).is_err() } {
+        return EFAULT;
+    }
+    if unsafe { copy_from_user_safe(root_buf.as_mut_ptr(), root_ptr as *const u8, root_len).is_err() } {
+        return EFAULT;
+    }
+    
+    let name = core::str::from_utf8(&name_buf).unwrap_or("unknown");
+    let root = core::str::from_utf8(&root_buf).unwrap_or("/");
     let creator_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
 
     akuma_exec::process::register_box(akuma_exec::process::BoxInfo {
@@ -102,14 +114,18 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     if !validate_user_ptr(target_ptr, target_len) { return EFAULT; }
     if !validate_user_ptr(fstype_ptr, fstype_len) { return EFAULT; }
 
-    let target = unsafe {
-        core::str::from_utf8(core::slice::from_raw_parts(target_ptr as *const u8, target_len))
-            .unwrap_or("")
-    };
-    let fstype = unsafe {
-        core::str::from_utf8(core::slice::from_raw_parts(fstype_ptr as *const u8, fstype_len))
-            .unwrap_or("")
-    };
+    let mut target_buf = alloc::vec![0u8; target_len];
+    let mut fstype_buf = alloc::vec![0u8; fstype_len];
+    
+    if unsafe { copy_from_user_safe(target_buf.as_mut_ptr(), target_ptr as *const u8, target_len).is_err() } {
+        return EFAULT;
+    }
+    if unsafe { copy_from_user_safe(fstype_buf.as_mut_ptr(), fstype_ptr as *const u8, fstype_len).is_err() } {
+        return EFAULT;
+    }
+
+    let target = core::str::from_utf8(&target_buf).unwrap_or("");
+    let fstype = core::str::from_utf8(&fstype_buf).unwrap_or("");
 
     let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
         "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
