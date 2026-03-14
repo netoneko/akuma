@@ -18,4 +18,4 @@
 	url = https://github.com/ggerganov/llama.cpp.git
 [submodule "userspace/crush/crush"]
 	path = userspace/crush/crush
-	url = https://github.com/charmbracelet/crush.git
+	url = git@github.com:netoneko/crush.git

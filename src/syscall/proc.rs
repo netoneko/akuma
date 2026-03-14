@@ -244,6 +244,9 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::tprint!(128, "[syscall] execve(path_ptr=0x{:x}, argv_ptr=0x{:x}, envp_ptr=0x{:x})\n", path_ptr, argv_ptr, envp_ptr);
+    }
     let path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => {

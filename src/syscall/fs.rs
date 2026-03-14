@@ -745,6 +745,10 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         Err(e) => return e,
     };
 
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::tprint!(128, "[syscall] openat(dirfd={}, path={:?}, flags=0x{:x}, mode=0x{:x})\n", dirfd, raw_path, flags, mode);
+    }
+
     let path = if raw_path.starts_with('/') {
         crate::vfs::canonicalize_path(&raw_path)
     } else {

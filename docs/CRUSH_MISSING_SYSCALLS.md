@@ -8,7 +8,7 @@ This document tracks the syscalls and kernel features that were found to be miss
 **Status:** Partially Implemented.
 **Details:** 
 - The kernel's `sys_fcntl` implements `F_GETFD`, `F_SETFD`, `F_GETFL`, and `F_SETFL`.
-- It **does not** implement locking commands: `F_SETLK`, `F_SETLKW`, `F_GETLK`.
+- It **does not** implement locking commands: `F_SETLK` (5), `F_SETLKW` (6), `F_GETLK` (7).
 - SQLite's default VFS (and the `modernc.org/sqlite` pure Go driver) relies on these for database concurrency.
 **Workaround:** Use `nolock=1` in the SQLite DSN to bypass these checks.
 
@@ -21,17 +21,30 @@ This document tracks the syscalls and kernel features that were found to be miss
 - Akuma currently treats all mmaps as private or does not correctly implement the shared visibility required by WAL.
 **Workaround:** Use `PRAGMA journal_mode = DELETE` to avoid the need for shared memory.
 
-## 3. Directory Management (`mkdirat` / `MkdirAll`)
+## 3. Path Resolution and CWD (`getcwd`, `chdir`, `openat`)
 
-**Symptoms:** `SQLITE_CANTOPEN (14)` when creating the `.crush` directory.
-**Status:** Incomplete / Buggy.
+**Symptoms:** `SQLITE_CANTOPEN (14)` when opening `crush.db`.
+**Status:** Inconsistent relative path handling.
 **Details:**
-- `MkdirAll` (recursive directory creation) in Go depends on reliable `mkdir` and `stat` behavior.
-- Issues were observed where relative paths or recursive creation failed due to VFS path resolution edge cases.
-- Specifically, the `.` and `..` resolution in some VFS contexts might be inconsistent.
-**Workaround:** Ensure absolute paths are used for database and data directory initialization.
+- Go's `os.Getwd()` and `filepath.Abs()` depend on accurate `getcwd` syscall behavior.
+- `libakuma`'s `getcwd` implementation returns the length *including* the null terminator, which is standard for Linux/Akuma but must be handled carefully by callers.
+- VFS mount points and relative paths in URI-style SQLite connections (e.g., `file:.crush/crush.db`) can fail if the working directory or parent directories aren't perfectly resolved.
+**Workaround:** 
+- Use `filepath.Abs()` to convert all database paths to absolute before passing to `sql.Open`.
+- Explicitly call `os.MkdirAll` on the parent directory.
+- Manually `os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0644)` before `sql.Open` to ensure the file exists if the VFS/SQLite driver fails to create it via URI.
 
-## 4. File Synchronization (`fsync`)
+## 4. Subprocess Execution (`execve`, `clone3`, `wait4`)
+
+**Symptoms:** `execve: path copy failed with -14` (EFAULT) and SIGSEGV at `FAR=0xfff2`.
+**Status:** Partially broken for certain Go runtime paths.
+**Details:**
+- Go's `os/exec` (e.g., calling `git rev-parse`) uses `clone3` or `fork/exec`.
+- In some cases, `execve` receives invalid pointers or attempts to access memory outside the mapped range, triggering `EFAULT`.
+- This often happens when the Go runtime tries to resolve the executable path or environment variables in a way that Akuma's memory model doesn't expect.
+**Workaround:** Avoid calling external binaries (like `git`) inside the Go app if possible, or ensure the environment is stripped of complex variables.
+
+## 5. File Synchronization (`fsync`)
 
 **Status:** No-op.
 **Details:**
@@ -39,7 +52,7 @@ This document tracks the syscalls and kernel features that were found to be miss
 - While this doesn't "break" the app, it makes it vulnerable to database corruption on power loss.
 **Workaround:** Set `PRAGMA synchronous = OFF` to acknowledge this reality and gain a small performance boost.
 
-## 5. Large Stack Requirements
+## 6. Large Stack Requirements
 
 **Symptoms:** `exit code 137` (OOM/Stack Overflow).
 **Status:** Configurable.
@@ -53,7 +66,7 @@ This document tracks the syscalls and kernel features that were found to be miss
 To run `crush` on Akuma, the following DSN and Pragmas are mandatory:
 
 ```go
-dsn := "file:/path/to/crush.db?nolock=1"
+dsn := "file:/absolute/path/to/crush.db?nolock=1"
 // PRAGMA journal_mode = DELETE
 // PRAGMA synchronous = OFF
 ```
