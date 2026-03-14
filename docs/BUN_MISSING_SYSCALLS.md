@@ -366,6 +366,46 @@ AIO context and writes its ID to the user pointer; `io_destroy` removes it.
 `io_submit` (2), `io_cancel` (3), and `io_getevents` (4) still return
 `ENOSYS` — no actual I/O submission is supported yet.
 
+**Bug 1 (2026-03-14):** The initial `io_setup` implementation returned
+`EEXIST` when `*ctx_idp` was non-zero, per the Linux man page requirement that
+callers zero the pointer before calling `io_setup`. Bun does not guarantee this
+— it passes whatever is in uninitialized/reused memory. This caused EEXIST
+(-17 = `0xFFFFFFFFFFFFFFEF`) to be used as a pointer, crashing immediately with
+a WILD-DA diagnostic:
+
+```
+[WILD-DA] *** FAR=0xffffffffffffffef is -17 (EEXIST) - syscall error used as pointer! ***
+[T44.06] [WILD-DA] pid=53 FAR=0xffffffffffffffef ELR=0xcc8e5f3c last_sc=0
+```
+
+**Fix:** `sys_io_setup` now only returns `EEXIST` when the existing value in
+`*ctx_idp` is a **live entry** in the `AIO_CONTEXTS` table. Garbage/uninitialized
+values are silently overwritten.
+
+**Bug 2 (2026-03-14):** The AIO context was stored as a small sequential integer
+(1, 2, 3…) written to `*ctx_idp`. Linux's `aio_context_t` is actually the
+**virtual address** of a kernel-mapped ring buffer (`struct aio_ring`). Bun
+immediately dereferences the returned ctx as a pointer; writing `ctx=1` caused
+a null dereference crash:
+
+```
+[io_setup] nr_events=4009873536 ctx=1
+[DP] no lazy region for FAR=0x0 pid=63 (pid has 56 lazy regions)
+[WILD-DA] pid=63 FAR=0x0 ELR=0xcc8f7750 last_sc=0
+```
+
+**Fix:** `sys_io_setup` now allocates a real page from the PMM, maps it into the
+process's user address space (RW, no-exec), and writes a valid `struct aio_ring`
+header into it:
+- `magic = 0xa10a10a1` — tells glibc's io_getevents to use the ring directly
+- `head = tail = 0` — ring is empty (no pending events)
+- `nr = min(nr_events, 126)` — capped to fit in one 4 KB page
+
+The ring's virtual address is written to `*ctx_idp` as the context value, matching
+Linux behavior. Since `io_submit` still returns `ENOSYS`, no events are ever
+enqueued; glibc's ring-polling path reads `head == tail` and returns 0 immediately
+without making any syscall.
+
 ### `inotify_init1` / `inotify_add_watch` / `inotify_rm_watch` (NR 26, 27, 28)
 
 Return `ENOSYS`. File watching is not implemented. Bun uses inotify for
@@ -750,6 +790,48 @@ timer activity visible), then exited with code 0.
 `Result` and return `(-e as i64) as u64` for errors, properly encoding EAGAIN as
 -11 so libuv breaks its accept loop normally.
 ```
+
+#### Bug 5: EPOLLHUP not emitted for fully-closed TCP sockets, causing epoll spin (FIXED 2026-03-14)
+
+**Symptom:** The HTTP Client thread consumed 70.4% CPU in the READY state during an
+opencode session. It was calling `epoll_pwait` in a tight loop — never sleeping in
+`schedule_blocking`. The PSTATS showed no accumulated `epoll_pwait` time despite
+millions of iterations, because each call returned immediately without blocking.
+
+**Root cause:** `socket_can_recv_tcp()` in `src/syscall/net.rs` contained the condition:
+```rust
+s.can_recv() || !s.is_active() || !s.may_recv()
+```
+The `!s.is_active()` branch fires for a fully-closed smoltcp TCP socket (state=Closed).
+This made `epoll_check_fd_readiness` unconditionally report `EPOLLIN` for dead sockets,
+so `epoll_pwait` never blocked. The correct Linux behavior for a fully-closed socket is
+`EPOLLHUP`, not `EPOLLIN`.
+
+**Fix:**
+
+1. Changed `socket_can_recv_tcp()` condition to exclude dead sockets:
+```rust
+s.can_recv() || (s.is_active() && !s.may_recv())
+```
+
+2. Added `socket_is_dead_tcp()` helper that returns `true` when `!s.is_active()`.
+
+3. In `epoll_check_fd_readiness()` (`src/syscall/poll.rs`), dead TCP sockets now emit
+`EPOLLHUP` instead of `EPOLLIN`:
+```rust
+if super::net::socket_is_dead_tcp(idx) {
+    ready |= EPOLLHUP;
+} else {
+    if requested & EPOLLIN != 0 && super::net::socket_can_recv_tcp(idx) { ready |= EPOLLIN; }
+    if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) { ready |= EPOLLOUT; }
+    if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) { ready |= EPOLLRDHUP; }
+}
+```
+
+**Impact:** HTTP Client thread drops from 70.4% CPU to near 0% when idle, blocking
+correctly in `schedule_blocking` between actual state changes.
+
+---
 
 #### Bug 4: EPOLLIN not reported after remote peer closes connection (FIXED 2026-03-11)
 

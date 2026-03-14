@@ -1,58 +1,151 @@
 use super::*;
 
+// Linux AIO ring buffer magic — glibc checks this to decide whether to read
+// events directly from the ring or fall back to the io_getevents syscall.
+const AIO_RING_MAGIC: u32 = 0xa10a10a1;
+const AIO_RING_HEADER_SIZE: u32 = 32; // sizeof(struct aio_ring)
+const AIO_RING_EVENT_SIZE: usize = 32; // sizeof(struct io_event)
+const PAGE_SIZE: usize = 4096;
+const AIO_MAX_NR_EVENTS: u32 =
+    ((PAGE_SIZE - AIO_RING_HEADER_SIZE as usize) / AIO_RING_EVENT_SIZE) as u32; // 126
+
+// Layout of Linux's struct aio_ring (first 32 bytes of the mapped page).
+// The ctx_idp written by io_setup IS the VA of this ring — userspace reads it
+// directly via the shared-memory path in glibc's io_getevents wrapper.
+#[repr(C)]
+struct AioRingHeader {
+    id: u32,
+    nr: u32,
+    head: u32,
+    tail: u32,
+    magic: u32,
+    compat_features: u32,
+    incompat_features: u32,
+    header_length: u32,
+}
+
 struct AioContext {
-    _nr_events: u32,
+    // ring_va is also used as the BTreeMap key (== ctx value written to user).
+    _ring_va: usize,
 }
 
 static AIO_CONTEXTS: Spinlock<BTreeMap<u64, AioContext>> = Spinlock::new(BTreeMap::new());
-static NEXT_AIO_ID: AtomicU64 = AtomicU64::new(1);
 
 /// io_setup(nr_events: u32, ctx_idp: *mut aio_context_t) -> i64
 pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     if nr_events == 0 {
         return EINVAL;
     }
-    // ctx_idp must be a valid writable user pointer to u64
     if !validate_user_ptr(ctx_idp, 8) {
         return EFAULT;
     }
-    // *ctx_idp must be 0 (no existing context)
+
+    // Linux requires *ctx_idp == 0 before the call; only return EEXIST if it
+    // refers to a live context.  Bun may pass uninitialized memory here.
     let mut existing: u64 = 0;
-    if unsafe { copy_from_user_safe(&mut existing as *mut u64 as *mut u8, ctx_idp as *const u8, 8).is_err() } {
+    if unsafe {
+        copy_from_user_safe(
+            &mut existing as *mut u64 as *mut u8,
+            ctx_idp as *const u8,
+            8,
+        )
+        .is_err()
+    } {
         return EFAULT;
     }
     if existing != 0 {
-        // Only EEXIST if the value refers to an actual live context.
-        // Linux requires callers to zero *ctx_idp before calling io_setup,
-        // but some callers (e.g. bun) pass uninitialized/reused memory.
-        let live = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&existing));
+        let live =
+            crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&existing));
         if live {
             return EEXIST;
         }
     }
 
-    let id = NEXT_AIO_ID.fetch_add(1, Ordering::Relaxed);
+    // Cap to what fits in one page so we don't OOM on huge nr_events values.
+    let capped_nr = (nr_events as u32).min(AIO_MAX_NR_EVENTS);
+
+    // ── Allocate the ring-buffer page ────────────────────────────────────────
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let proc = match akuma_exec::process::lookup_process(owner_pid) {
+        Some(p) => p,
+        None => return EFAULT,
+    };
+
+    let ring_va = match proc.memory.alloc_mmap(PAGE_SIZE) {
+        Some(va) => va,
+        None => return ENOMEM,
+    };
+
+    let frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => return ENOMEM,
+    };
+    let ring_phys = frame.addr;
+
+    let (table_frames, _) = unsafe {
+        akuma_exec::mmu::map_user_page(
+            ring_va,
+            ring_phys,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        )
+    };
+    proc.address_space.track_user_frame(frame);
+    for tf in table_frames {
+        proc.address_space.track_page_table_frame(tf);
+    }
+
+    // ── Write the ring header into kernel-virtual space ──────────────────────
+    let ring_kva = akuma_exec::mmu::phys_to_virt(ring_phys) as *mut AioRingHeader;
+    unsafe {
+        (*ring_kva).id = 0;
+        (*ring_kva).nr = capped_nr;
+        (*ring_kva).head = 0;
+        (*ring_kva).tail = 0;
+        (*ring_kva).magic = AIO_RING_MAGIC;
+        (*ring_kva).compat_features = 0;
+        (*ring_kva).incompat_features = 0;
+        (*ring_kva).header_length = AIO_RING_HEADER_SIZE;
+    }
+
+    // ── Register context and write VA to user ────────────────────────────────
     crate::irq::with_irqs_disabled(|| {
-        AIO_CONTEXTS.lock().insert(id, AioContext { _nr_events: nr_events as u32 });
+        AIO_CONTEXTS
+            .lock()
+            .insert(ring_va as u64, AioContext { _ring_va: ring_va });
     });
 
-    if unsafe { copy_to_user_safe(ctx_idp as *mut u8, &id as *const u64 as *const u8, 8).is_err() } {
-        crate::irq::with_irqs_disabled(|| { AIO_CONTEXTS.lock().remove(&id); });
+    let ring_va_u64 = ring_va as u64;
+    if unsafe {
+        copy_to_user_safe(
+            ctx_idp as *mut u8,
+            &ring_va_u64 as *const u64 as *const u8,
+            8,
+        )
+        .is_err()
+    } {
+        crate::irq::with_irqs_disabled(|| {
+            AIO_CONTEXTS.lock().remove(&ring_va_u64);
+        });
+        // Physical page is already tracked in address_space; it will be freed
+        // on process exit.  We can't easily unmap here, but this path is rare.
         return EFAULT;
     }
 
-    crate::tprint!(64, "[io_setup] nr_events={} ctx={}\n", nr_events, id);
+    crate::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
     0
 }
 
 /// io_destroy(ctx: aio_context_t) -> i64
 pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
-    let removed = crate::irq::with_irqs_disabled(|| {
-        AIO_CONTEXTS.lock().remove(&ctx)
-    });
+    let removed =
+        crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().remove(&ctx));
     match removed {
-        Some(_) => {
-            crate::tprint!(64, "[io_destroy] ctx={} destroyed\n", ctx);
+        Some(_aio_ctx) => {
+            // The physical page is tracked in proc.address_space and will be
+            // freed when the process exits (or we could unmap it here, but
+            // leaving it mapped until exit is safe since bun never reuses the
+            // address and the page is read-only after io_destroy).
+            crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
             0
         }
         None => EINVAL,

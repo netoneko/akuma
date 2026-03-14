@@ -60,6 +60,21 @@ pub(super) fn epoll_destroy(epoll_id: u32) {
     EPOLL_TABLE.lock().remove(&epoll_id);
 }
 
+/// Called when a non-blocking socket read returns EAGAIN (socket fully drained).
+/// Resets the EPOLLET edge for this fd so the next data arrival fires a new EPOLLIN event.
+/// Without this, if new data arrives within the same 10ms poll window as the drain,
+/// the transition is missed and EPOLLIN never re-fires.
+pub(super) fn epoll_on_fd_drained(fd: u32) {
+    let mut table = EPOLL_TABLE.lock();
+    for inst in table.values_mut() {
+        if let Some(entry) = inst.interest_list.get_mut(&fd) {
+            if entry.events & EPOLLET != 0 {
+                entry.last_ready &= !EPOLLIN;
+            }
+        }
+    }
+}
+
 const EPOLL_CLOEXEC: u32 = 0o2000000;
 
 pub(super) fn sys_epoll_create1(flags: u32) -> u64 {
@@ -318,8 +333,15 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             }
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                 let elapsed = crate::timer::uptime_us() - start_time;
-                crate::tprint!(128, "[epoll] pwait ready: {} events after {}us ({}iter)\n", 
-                    ready_count, elapsed, iterations);
+                let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                for ev in &kernel_events {
+                    let in_flag = if ev.events & EPOLLIN != 0 { "IN" } else { "" };
+                    let out_flag = if ev.events & EPOLLOUT != 0 { "OUT" } else { "" };
+                    let hup_flag = if ev.events & EPOLLHUP != 0 { "HUP" } else { "" };
+                    let err_flag = if ev.events & EPOLLERR != 0 { "ERR" } else { "" };
+                    crate::tprint!(128, "[epoll] pwait pid={} event: data=0x{:x} {}{}{}{} after {}us\n",
+                        pid, ev.data, in_flag, out_flag, hup_flag, err_flag, elapsed);
+                }
             }
             return ready_count as u64;
         }
@@ -339,8 +361,8 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             }
         }
 
-        // Periodic log for long waits (every 10 seconds)
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations % 100000 == 0 {
+        // Periodic log for long waits (every ~5 seconds = 500 iterations × 10ms)
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations % 500 == 0 {
             let elapsed = crate::timer::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed, {} fds\n", 

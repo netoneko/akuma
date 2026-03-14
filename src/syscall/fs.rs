@@ -263,10 +263,13 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             } else {
                 socket::socket_recv(idx, &mut temp, nonblock)
             };
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                 match &result {
-                    Ok(n) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = {}\n", fd_num, count, n),
-                    Err(e) => crate::safe_print!(128, "[syscall] read(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                    Ok(n) => crate::tprint!(128, "[sock] read fd={} req={} got={}\n", fd_num, count, n),
+                    Err(e) if *e == akuma_net::socket::libc_errno::EAGAIN => {
+                        crate::tprint!(64, "[sock] read fd={} EAGAIN (drained)\n", fd_num);
+                    }
+                    Err(e) => crate::tprint!(128, "[sock] read fd={} err={}\n", fd_num, *e as i64),
                 }
             }
             match result {
@@ -278,7 +281,13 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     n as u64
                 }
-                Err(e) => (-(e as i64)) as u64,
+                Err(e) => {
+                    if e == akuma_net::socket::libc_errno::EAGAIN {
+                        // Socket was drained — reset EPOLLET edge so next data arrival fires EPOLLIN.
+                        super::poll::epoll_on_fd_drained(fd_num as u32);
+                    }
+                    (-(e as i64)) as u64
+                }
             }
         }
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -470,6 +479,9 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         
         let written = match fd {
             akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
+                if total_written == 0 {
+                    crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", proc.pid, fd_num, count);
+                }
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED && total_written == 0 {
                     let display_len = this_chunk.min(64);
                     let mut snippet = [0u8; 64];

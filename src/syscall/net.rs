@@ -311,12 +311,23 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     } else {
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(96, "[TCP] recvfrom fd={} got={}\n", fd, n);
+                }
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
                     return EFAULT;
                 }
                 n as u64
             }
-            Err(e) => (-e as i64) as u64,
+            Err(e) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(64, "[TCP] recvfrom fd={} err={}\n", fd, e);
+                }
+                if e == libc_errno::EAGAIN {
+                    super::poll::epoll_on_fd_drained(fd);
+                }
+                (-e as i64) as u64
+            }
         }
     }
 }
@@ -591,6 +602,9 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     } else {
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(96, "[TCP] recvmsg fd={} got={}\n", fd, n);
+                }
                 if unsafe { copy_to_user_safe(iov.iov_base as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
                     return EFAULT;
                 }
@@ -599,7 +613,16 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
                 n as u64
             }
-            Err(e) => (-e as i64) as u64,
+            Err(e) => {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(64, "[TCP] recvmsg fd={} err={}\n", fd, e);
+                }
+                if e == libc_errno::EAGAIN {
+                    // Socket drained — reset EPOLLET edge so next data arrival re-fires EPOLLIN.
+                    super::poll::epoll_on_fd_drained(fd);
+                }
+                (-e as i64) as u64
+            }
         }
     }
 }

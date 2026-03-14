@@ -1116,6 +1116,77 @@ slice with new flags, push an "after" tail with old flags.
 
 ---
 
+## opencode: No Visible Output Despite Running 46 Seconds (UNDER INVESTIGATION)
+
+### Symptom
+
+`/usr/bin/opencode` runs for ~46 seconds and exits with code 1 without printing
+anything to the terminal:
+
+```
+[exception] Process 63 (/usr/bin/opencode) exited (code 1) [46.55s]
+[PSTATS] PID 63 (/usr/bin/opencode) 46.55s: 99738 syscalls (2142/s) ...
+  futex=726(168261ms) epoll_pwait=45(31956ms) sched_yield=3116(26534ms)
+  nr101=95(10735ms) ppoll=1(2506ms) read=1559(1806ms) write=24(251ms)
+```
+
+### Investigation
+
+**Unknown syscalls:** The kernel logs `[ENOSYS] nr=... pid=...` for every unknown
+syscall via `safe_print!`. The absence of such messages confirms that no unknown
+syscalls are being called. The 99 738 syscalls all hit known, implemented paths.
+
+**Write path:** `write(1, ...)` and `write(2, ...)` (stdout/stderr) go through
+`current_channel()` → channel write → SSH session or kernel shell output. This
+path is functional. The 24 total write calls are most likely HTTP request bodies
+sent to sockets, not stdout writes.
+
+**Terminal detection:** `isatty(1)` calls `ioctl(1, TCGETS, ...)` which returns 0
+(success) for fd ≤ 2. So opencode correctly identifies stdout as a TTY.
+`TIOCGWINSZ` returns the default 80×24 terminal size. Neither would cause silent
+output suppression.
+
+**CLONE_VM threads:** Worker threads inherit `proc.channel` from the parent at
+clone time (line 2855 of `crates/akuma-exec/src/process/mod.rs`), so stdout
+writes from any thread go to the correct channel.
+
+### Root Cause (FOUND)
+
+opencode uses the `GEMINI_API_KEY` (not `ANTHROPIC_API_KEY`). Without an API
+key set, bun spends 46 seconds waiting for a connection that is rejected at the
+application layer, then exits with code 1. With the key set, opencode connects
+immediately — but then hit a new crash (see below).
+
+### Follow-up Crash: io_setup Ring Buffer Not Mapped
+
+With the API key set, opencode crashed almost immediately:
+
+```
+[io_setup] nr_events=4009873536 ctx=1
+[DP] no lazy region for FAR=0x0 pid=63 (pid has 56 lazy regions)
+[WILD-DA] pid=63 FAR=0x0 ELR=0xcc8f7750 last_sc=0
+```
+
+`last_sc=0` confirms io_setup (NR 0) was the last syscall. The crash is a null
+dereference at FAR=0x0 immediately after io_setup returned.
+
+**Root cause:** Linux's `aio_context_t` is the **virtual address** of a
+kernel-mapped ring buffer (`struct aio_ring`), not a small integer ID. The
+first implementation wrote a sequential integer (ctx=1) to `*ctx_idp`. Bun
+dereferences this value as a pointer — address 1 → null-page → SIGSEGV.
+
+**Fix (2026-03-14):** `sys_io_setup` now:
+1. Allocates a page from the PMM (`alloc_page_zeroed`)
+2. Maps it into the process's user VA space (RW, no-exec)
+3. Writes a valid `struct aio_ring` header with `magic=0xa10a10a1`, `head=tail=0`
+4. Writes the page's **virtual address** to `*ctx_idp`
+
+glibc's `io_getevents` wrapper checks the magic, reads `head==tail`, and
+returns 0 (no events) without making a syscall. Since `io_submit` returns
+`ENOSYS`, no events ever arrive — bun falls back to its epoll path.
+
+---
+
 ## Related Documentation
 
 - `docs/EPOLL_EL1_CRASH_FIX.md` -- Detailed design of the principled fix
