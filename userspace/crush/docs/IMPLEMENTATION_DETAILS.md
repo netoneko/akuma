@@ -36,7 +36,27 @@ go build -ldflags="-s -w -linkmode external -extldflags '-static'" \
 - **`-linkmode external`**: Forces the use of an external linker (the `CC` specified) instead of Go's internal linker.
 - **`-extldflags '-static'`**: Passes the `-static` flag to the external linker, ensuring all libraries (including `musl`) are linked statically.
 
+## SQLite Compatibility Fixes for Akuma
+
+Running `modernc.org/sqlite` on Akuma OS requires several adjustments due to current kernel and VFS limitations.
+
+### 1. Disabling WAL Mode
+**Issue:** Write-Ahead Logging (WAL) requires shared memory (`mmap` with `MAP_SHARED`) and complex POSIX file locking (`F_SETLK` with `F_WRLCK`), which are not yet fully implemented or supported in the Akuma VFS.
+**Fix:** Set `PRAGMA journal_mode = DELETE` in `internal/db/connect.go`. This uses a traditional rollback journal which is more compatible with simple file systems.
+
+### 2. Bypassing File Locking
+**Issue:** SQLite's default locking protocol relies on `fcntl` commands (`F_SETLK`, etc.) that may return `ENOSYS` or `EINVAL` on Akuma, causing `SQLITE_PROTOCOL (15)` errors.
+**Fix:** Append `nolock=1` to the SQLite connection string (DSN) in `internal/db/connect_modernc.go`. This instructs the driver to bypass host-level file locking. Note that this is only safe if only one process accesses the database at a time.
+
+### 3. Memory Management (Stack Size)
+**Issue:** The `modernc.org/sqlite` driver (being a C-to-Go transpilation) can be stack-heavy. Standard Akuma user stacks (e.g., 1MB) may lead to stack overflows or OOM-like crashes (`exit code 137`).
+**Fix:** The kernel `USER_STACK_SIZE_OVERRIDE` was increased to 8MB in `src/config.rs` to provide sufficient headroom for the SQLite engine and Go runtime.
+
+### 4. Cache Size Tuning
+**Fix:** Reduced `PRAGMA cache_size = -2000` (~2MB) to keep the memory footprint manageable within the userspace environment.
+
 ## Verification
+...
 
 After building, verify the binary type using the `file` command:
 

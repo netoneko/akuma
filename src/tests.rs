@@ -6574,23 +6574,35 @@ fn test_lazy_region_lookup_pid_consistency() -> bool {
 fn test_user_stack_size_is_2mb() -> bool {
     console::print("\n[TEST] User stack size auto-scaling\n");
 
-    // Test the scaling function
-    let test_cases: [(usize, usize); 6] = [
-        (256 * 1024 * 1024, 128 * 1024),      // 256 MB → 128 KB (minimum)
-        (512 * 1024 * 1024, 256 * 1024),      // 512 MB → 256 KB
-        (1024 * 1024 * 1024, 512 * 1024),     // 1 GB → 512 KB
-        (2048 * 1024 * 1024, 1024 * 1024),    // 2 GB → 1 MB
-        (4096 * 1024 * 1024, 2 * 1024 * 1024),// 4 GB → 2 MB
-        (16384 * 1024 * 1024, 8 * 1024 * 1024),// 16 GB → 8 MB (maximum)
-    ];
-
     let mut pass = true;
-    for (ram, expected_stack) in test_cases {
-        let actual = crate::config::compute_user_stack_size(ram);
-        if actual != expected_stack {
-            crate::safe_print!(128, "  FAIL: RAM {}MB → {}KB (expected {}KB)\n",
-                ram / 1024 / 1024, actual / 1024, expected_stack / 1024);
-            pass = false;
+    
+    // If override is active, skip scaling tests and verify the override instead
+    if crate::config::USER_STACK_SIZE_OVERRIDE != 0 {
+        crate::safe_print!(128, "  Override is active: {} KB\n", crate::config::USER_STACK_SIZE_OVERRIDE / 1024);
+        let actual = crate::config::compute_user_stack_size(4096 * 1024 * 1024);
+        if actual != crate::config::USER_STACK_SIZE_OVERRIDE {
+             crate::safe_print!(128, "  FAIL: Expected override {}KB, got {}KB\n", 
+                crate::config::USER_STACK_SIZE_OVERRIDE / 1024, actual / 1024);
+             pass = false;
+        }
+    } else {
+        // Test the scaling function
+        let test_cases: [(usize, usize); 6] = [
+            (256 * 1024 * 1024, 128 * 1024),      // 256 MB → 128 KB (minimum)
+            (512 * 1024 * 1024, 256 * 1024),      // 512 MB → 256 KB
+            (1024 * 1024 * 1024, 512 * 1024),     // 1 GB → 512 KB
+            (2048 * 1024 * 1024, 1024 * 1024),    // 2 GB → 1 MB
+            (4096 * 1024 * 1024, 2 * 1024 * 1024),// 4 GB → 2 MB
+            (16384 * 1024 * 1024, 8 * 1024 * 1024),// 16 GB → 8 MB (maximum)
+        ];
+
+        for (ram, expected_stack) in test_cases {
+            let actual = crate::config::compute_user_stack_size(ram);
+            if actual != expected_stack {
+                crate::safe_print!(128, "  FAIL: RAM {}MB → {}KB (expected {}KB)\n",
+                    ram / 1024 / 1024, actual / 1024, expected_stack / 1024);
+                pass = false;
+            }
         }
     }
     

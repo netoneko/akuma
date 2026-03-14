@@ -47,7 +47,7 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// Set to a non-zero value to override automatic scaling.
 /// Bun's JSC initialization uses ~600KB of stack, and complex dependency
 /// resolution (like @google/gemini-cli with 263 packages) may need more.
-pub const USER_STACK_SIZE_OVERRIDE: usize = 0;
+pub const USER_STACK_SIZE_OVERRIDE: usize = 8 * 1024 * 1024;
 
 /// Maximum kernel threads
 ///

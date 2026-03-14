@@ -1435,7 +1435,11 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             0
         }
-        _ => 0,
+        _ => {
+            crate::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
+                proc.pid, fd, cmd, arg);
+            EINVAL
+        },
     }
 }
 
