@@ -28,7 +28,8 @@ members = [
     "sbase",
     "xbps",
     "apk-tools",
-    "llama.cpp"
+    "llama.cpp",
+    "crush"
 ]
 
 [profile.dev]

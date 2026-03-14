@@ -30,7 +30,9 @@ MEMBERS=(
     "xbps"
     "apk-tools"
     "llama-cpp"
-)
+    "crush"
+    )
+
 
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
@@ -103,6 +105,7 @@ BINARIES=(
     "tar"
     "sshd"
     "llama-cli"
+    "crush"
 )
 
 for bin in "${BINARIES[@]}"; do
