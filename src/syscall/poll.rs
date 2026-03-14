@@ -504,11 +504,8 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             return 0;
         }
 
-        let deadline = if infinite {
-            crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US
-        } else {
-            start_time + timeout_us
-        };
+        let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }
@@ -628,11 +625,8 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             return 0;
         }
 
-        let deadline = if infinite {
-            crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US
-        } else {
-            start_time + timeout_us
-        };
+        let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }

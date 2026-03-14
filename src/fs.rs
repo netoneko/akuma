@@ -120,7 +120,20 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    vfs::read_file(path)
+    match vfs::read_file(path) {
+        Ok(data) => {
+            if path.contains("git") {
+                crate::safe_print!(128, "[FS] read_file(\"{}\") -> {} bytes\n", path, data.len());
+            }
+            Ok(data)
+        },
+        Err(e) => {
+             if path.contains("git") {
+                crate::safe_print!(128, "[FS] read_file(\"{}\") -> Error: {}\n", path, e);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Read file contents as a string

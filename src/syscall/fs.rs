@@ -479,10 +479,10 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         
         let written = match fd {
             akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
-                if total_written == 0 {
-                    crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", proc.pid, fd_num, count);
-                }
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED && total_written == 0 {
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    if total_written == 0 {
+                      crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", proc.pid, fd_num, count);
+                    } else {
                     let display_len = this_chunk.min(64);
                     let mut snippet = [0u8; 64];
                     let n = display_len.min(snippet.len());
@@ -492,6 +492,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
                     crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
+                    }
                 }
 
                 if let Some(ch) = akuma_exec::process::current_channel() {
