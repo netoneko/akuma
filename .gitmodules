@@ -16,3 +16,6 @@
 [submodule "userspace/llama.cpp/llama.cpp"]
 	path = userspace/llama.cpp/llama.cpp
 	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "userspace/crush/crush"]
+	path = userspace/crush/crush
+	url = https://github.com/charmbracelet/crush.git
