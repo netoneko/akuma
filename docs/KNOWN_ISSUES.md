@@ -196,3 +196,71 @@ No active boxes found.
 This may indicate a discrepancy in how `read_at` or `read_dir` handles virtual
 ProcFS files, or a synchronization issue between the global `BOX_REGISTRY`
 and the VFS view.
+
+---
+
+## 6. bun HTTPS fetch hangs — epoll_pwait sleeps forever on large positive timeout
+
+**Status:** Fixed (2026-03-14) in `src/syscall/poll.rs`
+**Component:** `src/syscall/poll.rs` — `sys_epoll_pwait`
+
+### Symptom
+
+Running a bun script that performs an HTTPS `fetch()` hangs indefinitely after
+the TLS handshake completes.  The HTTP request is never sent and the process
+loops on 4-second timerfd callbacks forever.
+
+### Root cause
+
+bun's internal network/resolver thread calls
+`epoll_pwait(epfd=12, ..., timeout=1827387391ms)` — roughly a 21-day timeout.
+
+`epoll_wait_deadline()` for positive timeouts returned `start_time + timeout_us`
+(the absolute deadline for the whole wait, not the per-iteration sleep).
+`schedule_blocking(deadline)` was then called with that huge deadline.
+
+`schedule_blocking` parks the kernel thread until the deadline is reached.
+The only early-exit path was an explicit `wake()` call, which only happens when
+a thread directly `read()`s a blocking eventfd — not when an eventfd's epoll
+registration fires.  So the thread slept until the 21-day deadline expired.
+
+Meanwhile bun's main event loop (epfd=19, timeout=-1) correctly polled every
+10 ms because the infinite-wait case always used `now + 10ms` as the deadline.
+This asymmetry meant only the `-1` case worked.
+
+### Diagnostic trace
+
+After TLS handshake completion (two-level signaling in bun):
+
+1. TLS worker writes `eventfd fd=14 (id=1)` → signals the network thread.
+2. Network thread is in `epoll_pwait(epfd=12, timeout=1827387391ms)` watching
+   `fd=14`.  Due to the bug it is sleeping until the year 2047 and never polls.
+3. DNS had correctly used `fd=21 (id=2)` to signal the main loop (epfd=19),
+   which polled every 10 ms — those events fired fine.
+4. The main loop (epfd=19) only sees 4-second timerfd ticks; the HTTP request
+   is never sent.
+
+### Fix
+
+In `sys_epoll_pwait`, cap the per-iteration `schedule_blocking` deadline to
+`now + BLOCKING_POLL_INTERVAL_US (10ms)` regardless of the total timeout:
+
+```rust
+let abs_deadline = epoll_wait_deadline(timeout, start_time, timeout_us, now);
+let deadline = abs_deadline.min(now + BLOCKING_POLL_INTERVAL_US);
+schedule_blocking(deadline);
+```
+
+The absolute deadline is still checked at the top of every loop iteration to
+correctly return 0 when the caller's timeout expires.
+
+### Related bugs found during investigation
+
+- **EPOLLET drain reset** (`epoll_on_fd_drained`): After a successful TCP
+  `recvfrom`/`recvmsg`, the EPOLLET edge was not reset, so new data arriving
+  before the socket drained to EAGAIN would not re-fire EPOLLIN.  Fixed by
+  calling `epoll_on_fd_drained(fd)` after every successful read.
+- **eventfd id vs fd confusion**: bun uses two eventfds for a two-level
+  notification scheme (DNS/completion → main loop via `fd=21 id=2`;
+  TLS/work-done → network thread via `fd=14 id=1`).  The level-triggered
+  EPOLLIN for the network thread's eventfd was masked by the sleep bug above.

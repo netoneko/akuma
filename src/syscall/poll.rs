@@ -204,7 +204,8 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
             }
         }
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
-            if requested & EPOLLIN != 0 && super::eventfd::eventfd_can_read(efd_id) {
+            let can_read = super::eventfd::eventfd_can_read(efd_id);
+            if requested & EPOLLIN != 0 && can_read {
                 ready |= EPOLLIN;
             }
             if requested & EPOLLOUT != 0 {
@@ -373,9 +374,14 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             return EINTR;
         }
 
-        let deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
-
-        if deadline == 0 { return 0; }
+        // Always cap the per-iteration sleep to BLOCKING_POLL_INTERVAL_US (10ms).
+        // For positive timeouts, epoll_wait_deadline returns start_time + timeout_us
+        // which can be hours/days away — schedule_blocking would then sleep the entire
+        // duration since there is no eventfd wake() for epoll waiters.  We check
+        // expiry above so it is safe to poll every 10ms regardless of timeout.
+        let abs_deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
+        if abs_deadline == 0 { return 0; }
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
 
         akuma_exec::threading::schedule_blocking(deadline);
     }

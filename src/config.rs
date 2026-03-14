@@ -214,7 +214,7 @@ pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait enter/exit, UDP recv/send, and DNS traffic.
-pub const SYSCALL_DEBUG_NET_ENABLED: bool = false;
+pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;
 
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;

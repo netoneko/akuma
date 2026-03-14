@@ -537,10 +537,10 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     socket::socket_send(idx, buf_slice, nonblock)
                 };
                 
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED && total_written == 0 {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED && total_written == 0 {
                     match &result {
-                        Ok(n) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = {}\n", fd_num, count, n),
-                        Err(e) => crate::safe_print!(128, "[syscall] write(socket fd={}, req={}) = err {}\n", fd_num, count, *e as i64),
+                        Ok(n) => crate::tprint!(96, "[TCP] write fd={} len={} sent={}\n", fd_num, count, n),
+                        Err(e) => crate::tprint!(96, "[TCP] write fd={} len={} err={}\n", fd_num, count, *e as i64),
                     }
                 }
                 
@@ -559,6 +559,9 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
                 let val = unsafe { core::ptr::read(buf_slice.as_ptr() as *const u64) };
                 if val == u64::MAX { return EINVAL; }
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(96, "[eventfd] write via fd={} id={} val={}\n", fd_num, efd_id, val);
+                }
                 match super::eventfd::eventfd_write(efd_id, val) {
                     Ok(()) => 8,
                     Err(e) => (-(e as i64)) as u64,

@@ -317,6 +317,10 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
                     return EFAULT;
                 }
+                // Reset the EPOLLET edge so the next data arrival fires EPOLLIN.
+                // BoringSSL/bun reads one TLS record at a time without draining to EAGAIN,
+                // so we can't rely on EAGAIN to reset the edge.
+                super::poll::epoll_on_fd_drained(fd);
                 n as u64
             }
             Err(e) => {
@@ -532,7 +536,14 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             Err(e) => (-e as i64) as u64,
         }
     } else {
-        match socket::socket_send(idx, &kernel_buf, fd_is_nonblock(fd)) {
+        let result = socket::socket_send(idx, &kernel_buf, fd_is_nonblock(fd));
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            match &result {
+                Ok(n) => crate::tprint!(96, "[TCP] sendmsg fd={} len={} sent={}\n", fd, kernel_buf.len(), n),
+                Err(e) => crate::tprint!(64, "[TCP] sendmsg fd={} err={}\n", fd, e),
+            }
+        }
+        match result {
             Ok(n) => n as u64,
             Err(e) => (-e as i64) as u64,
         }
@@ -611,6 +622,9 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 msg.msg_controllen = 0;
                 msg.msg_flags = 0;
                 let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
+                // Reset EPOLLET edge — BoringSSL reads one TLS record at a time without
+                // draining to EAGAIN, so we reset after every successful read.
+                super::poll::epoll_on_fd_drained(fd);
                 n as u64
             }
             Err(e) => {
@@ -618,7 +632,6 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                     crate::tprint!(64, "[TCP] recvmsg fd={} err={}\n", fd, e);
                 }
                 if e == libc_errno::EAGAIN {
-                    // Socket drained — reset EPOLLET edge so next data arrival re-fires EPOLLIN.
                     super::poll::epoll_on_fd_drained(fd);
                 }
                 (-e as i64) as u64

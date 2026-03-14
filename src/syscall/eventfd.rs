@@ -104,6 +104,6 @@ pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
     if flags & EFD_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }
-    crate::tprint!(64, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {}\n", initval, flags, fd);
+    crate::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
     fd as u64
 }
