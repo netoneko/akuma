@@ -264,3 +264,46 @@ correctly return 0 when the caller's timeout expires.
   notification scheme (DNS/completion → main loop via `fd=21 id=2`;
   TLS/work-done → network thread via `fd=14 id=1`).  The level-triggered
   EPOLLIN for the network thread's eventfd was masked by the sleep bug above.
+
+---
+
+## 7. apk (and other ppoll/select users) hang — `sys_ppoll`/`sys_select` sleep for full timeout
+
+**Status:** Fixed (2026-03-15) in `src/syscall/poll.rs`
+**Component:** `src/syscall/poll.rs` — `sys_ppoll`, `sys_select`
+
+### Symptom
+
+`apk add <pkg>` hangs after DNS resolves and the TCP connection to the mirror
+is initiated.  The kernel log shows the TCP `connect` returning `EINPROGRESS`
+followed by `ppoll` entering with `timeout_us=60000000` — after which nothing
+happens for 60 seconds, then the connection times out.
+
+### Root cause
+
+The same scheduling bug as issue 6, but in `sys_ppoll` and `sys_select`.
+
+For non-infinite timeouts both functions computed the `schedule_blocking`
+deadline as `start_time + timeout_us` — the absolute expiry of the *entire*
+wait, not the per-iteration sleep.  On a 60-second timeout the thread would
+block for 60 seconds before calling `smoltcp_net::poll()` again.  The TCP
+connection (in `EINPROGRESS`) therefore never got polled and could not advance
+to `Established`, so the fd was never seen as writable and ppoll returned 0
+after the full timeout.
+
+The fix for `epoll_pwait` (issue 6, commit `4da73f6`) correctly capped the
+per-iteration sleep but was not applied to `sys_ppoll` or `sys_select`.
+
+### Fix
+
+Cap the per-iteration deadline to `now + BLOCKING_POLL_INTERVAL_US (10ms)` in
+both `sys_ppoll` and `sys_select`, mirroring the `epoll_pwait` fix:
+
+```rust
+let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
+let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
+schedule_blocking(deadline);
+```
+
+The expiry check at the top of each loop iteration (`elapsed >= timeout_us`)
+still correctly returns 0 when the caller's timeout is reached.
