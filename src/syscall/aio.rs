@@ -22,7 +22,13 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         return EFAULT;
     }
     if existing != 0 {
-        return EEXIST;
+        // Only EEXIST if the value refers to an actual live context.
+        // Linux requires callers to zero *ctx_idp before calling io_setup,
+        // but some callers (e.g. bun) pass uninitialized/reused memory.
+        let live = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&existing));
+        if live {
+            return EEXIST;
+        }
     }
 
     let id = NEXT_AIO_ID.fetch_add(1, Ordering::Relaxed);

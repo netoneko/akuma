@@ -647,7 +647,17 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
             socket::SocketType::Stream(h) => {
                 akuma_net::smoltcp_net::with_network(|net| {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
-                    s.can_recv() || !s.is_active() || !s.may_recv()
+                    // Report readable when:
+                    //   - data is buffered (can_recv), OR
+                    //   - remote sent FIN and socket is still active (!may_recv && is_active):
+                    //     this causes recv() to return 0 (EOF) so the app can clean up.
+                    //
+                    // Do NOT use !is_active() here: a Closed smoltcp socket (e.g. after TCP
+                    // timeout or RST) would permanently signal EPOLLIN even with no data,
+                    // causing the caller to spin recv() → EAGAIN → epoll → EPOLLIN → ...
+                    // Instead, a fully-dead socket is reported via EPOLLHUP in
+                    // epoll_check_fd_readiness.
+                    s.can_recv() || (s.is_active() && !s.may_recv())
                 }).unwrap_or(false)
             }
             socket::SocketType::Listener { handles, .. } => {
@@ -670,6 +680,20 @@ pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
             akuma_net::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                 s.can_send()
+            }).unwrap_or(false)
+        } else {
+            false
+        }
+    }).unwrap_or(false)
+}
+
+/// Returns true when the smoltcp socket is completely dead (Closed state).
+/// Used to report EPOLLHUP so callers detect connection loss without spinning.
+pub(super) fn socket_is_dead_tcp(idx: usize) -> bool {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Stream(h) = &sock.inner {
+            akuma_net::smoltcp_net::with_network(|net| {
+                !net.sockets.get::<smoltcp::socket::tcp::Socket>(*h).is_active()
             }).unwrap_or(false)
         } else {
             false

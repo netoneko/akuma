@@ -170,14 +170,21 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                     }
                 }
             } else {
-                if requested & EPOLLIN != 0 && super::net::socket_can_recv_tcp(idx) {
-                    ready |= EPOLLIN;
-                }
-                if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) {
-                    ready |= EPOLLOUT;
-                }
-                if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
-                    ready |= EPOLLRDHUP;
+                // EPOLLHUP: unconditionally set when the socket is fully dead (not
+                // connected and not connecting).  This lets the caller detect a
+                // timed-out or reset connection without spinning on EPOLLIN.
+                if super::net::socket_is_dead_tcp(idx) {
+                    ready |= EPOLLHUP;
+                } else {
+                    if requested & EPOLLIN != 0 && super::net::socket_can_recv_tcp(idx) {
+                        ready |= EPOLLIN;
+                    }
+                    if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) {
+                        ready |= EPOLLOUT;
+                    }
+                    if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
+                        ready |= EPOLLRDHUP;
+                    }
                 }
             }
         }
