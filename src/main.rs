@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(never_type)]
+#![feature(alloc_error_handler)]
 
 extern crate alloc;
 
@@ -274,15 +275,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: fixed 16MB - kernel data structures (page tables, PCBs, VFS, networking)
-    //   Thread stacks are now PMM-backed, so the heap only holds metadata.
-    //   16MB needed for bun's 40+ concurrent TCP sockets (128KB buffers each = 5MB+).
+    // - Heap: 1/4 of RAM (min 64MB) - kernel data structures
+    //   Sized dynamically so that memory-hungry workloads (go build, bun, etc.)
+    //   don't exhaust kernel metadata allocations.
     // - User pages: remaining - for user processes
-    const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
-
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = KERNEL_HEAP_SIZE;
+    let heap_size = core::cmp::max(ram_size / 4, 64 * 1024 * 1024);
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 

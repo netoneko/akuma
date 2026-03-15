@@ -641,6 +641,7 @@ mod esr {
 
 // Signal frame layout constants (Linux AArch64 compatible)
 const SA_SIGINFO: u64 = 4;
+const SA_ONSTACK: u64 = 0x08000000;
 // siginfo_t: 128 bytes
 // ucontext_t header (uc_flags..uc_sigmask + __unused): 168 bytes
 // sigcontext (fault_address + regs[31] + sp + pc + pstate): 280 bytes
@@ -724,7 +725,37 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
     let frame_ref = unsafe { &*frame };
     let user_sp = frame_ref.sp_el0 as usize;
 
-    let new_sp = (user_sp - SIGFRAME_SIZE) & !0xF;
+    // Detect re-entrant signal: if sp is already on the sigaltstack, we are
+    // inside a signal handler that itself faulted.  Re-delivering would cause
+    // an infinite loop (the handler keeps faulting on the same address).
+    // Terminate instead, which matches Linux's default behaviour when a fatal
+    // signal fires with SA_NODEFER not set (the signal is masked during handler
+    // execution so a second delivery goes to the default action = termination).
+    if proc.sigaltstack_sp != 0 {
+        let alt_lo = proc.sigaltstack_sp as usize;
+        let alt_hi = alt_lo + proc.sigaltstack_size as usize;
+        if user_sp >= alt_lo && user_sp < alt_hi {
+            crate::tprint!(128,
+                "[signal] sig {} re-entrant fault at {:#x} (sp={:#x} on sigaltstack [{:#x},{:#x})) — killing process\n",
+                signal, fault_addr, user_sp, alt_lo, alt_hi);
+            return false; // caller will kill the process
+        }
+    }
+
+    // If SA_ONSTACK is set and a sigaltstack is configured, deliver on the
+    // alternate signal stack rather than the current goroutine/thread stack.
+    // Go (and other runtimes) require this to detect which stack a signal
+    // arrived on; without it, Go panics with "handler not on signal stack".
+    let stack_top = if (action.flags & SA_ONSTACK) != 0
+        && proc.sigaltstack_sp != 0
+        && proc.sigaltstack_size >= SIGFRAME_SIZE as u64
+    {
+        (proc.sigaltstack_sp + proc.sigaltstack_size) as usize
+    } else {
+        user_sp
+    };
+
+    let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
 
     // Ensure stack pages are mapped (signal frame may span 2 pages).
     // Demand-page lazy anonymous stack pages if not yet mapped.

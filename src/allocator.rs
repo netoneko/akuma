@@ -178,6 +178,25 @@ fn registry_remove(addr: usize) -> bool {
 #[global_allocator]
 static ALLOCATOR: HybridAllocator = HybridAllocator;
 
+/// OOM handler: kill the current userspace process instead of panicking the kernel.
+/// If there is no current process (pure kernel context), fall through to panic.
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    let heap_total = HEAP_SIZE.load(Ordering::Relaxed);
+    let heap_used = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    crate::safe_print!(256,
+        "\n[OOM] allocation of {} bytes failed (heap {}MB / {}MB used) — killing process\n",
+        layout.size(),
+        heap_used / 1024 / 1024,
+        heap_total / 1024 / 1024,
+    );
+    // Kill the current process if there is one; otherwise panic the kernel.
+    if akuma_exec::process::current_process().is_some() {
+        akuma_exec::process::return_to_kernel(-12); // ENOMEM
+    }
+    panic!("kernel OOM: allocation of {} bytes failed", layout.size());
+}
+
 static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
 // Memory tracking
