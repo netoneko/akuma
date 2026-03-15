@@ -293,6 +293,10 @@ pub mod nr {
     pub const RENAMEAT2: u64 = 276;
     pub const STATX: u64 = 291;
     pub const TRUNCATE: u64 = 45;
+    pub const MSGGET: u64 = 186;
+    pub const MSGCTL: u64 = 187;
+    pub const MSGRCV: u64 = 188;
+    pub const MSGSND: u64 = 189;
 }
 
 /// Thread CPU statistics for top command
@@ -677,6 +681,14 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // best we can do is return EINTR so callers know to retry the operation.  Returning
         // ENOSYS causes Go's runtime to crash because it doesn't check for ENOSYS here.
         128 => EINTR,
+        // SysV message queue stubs: we don't implement message queues, but returning ENOSYS
+        // causes Go's runtime to crash (it takes a fallback path that dereferences the error
+        // code as a pointer). EINVAL / ENOSYS are handled differently — EINVAL is a normal
+        // "invalid arg" error that callers properly check.
+        nr::MSGGET => EINVAL,
+        nr::MSGCTL => EINVAL,
+        nr::MSGRCV => EINVAL,
+        nr::MSGSND => EINVAL,
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;

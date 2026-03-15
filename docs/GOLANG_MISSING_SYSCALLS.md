@@ -601,7 +601,47 @@ nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32)
 
 ---
 
-## 12. Known remaining gaps (not yet fixed)
+## 12. `msgctl` / `msgget` / `msgrcv` / `msgsnd` (syscalls 186-189) — `go build` crashes after epoll
+
+**Status:** Fixed (2026-03-15) in `src/syscall/mod.rs`
+**Component:** `src/syscall/mod.rs` — dispatch stubs
+
+### Symptom
+
+`go build` crashes with a wild data abort at `FAR=0xffffffffffffffda` (which is −38 =
+`ENOSYS`), indicating a syscall error code was used as a memory address:
+
+```
+[ENOSYS] nr=187 pid=48 args=[0xc42cc000, 0xc42a8460, 0x50]
+[WILD-DA] *** FAR=0xffffffffffffffda is -38 (ENOSYS) - syscall error used as pointer! ***
+[WILD-DA] pid=48 FAR=0xffffffffffffffda ELR=0x1009296c last_sc=187
+```
+
+### Root cause
+
+Syscalls 186–189 (SysV message queue operations: `msgget`, `msgctl`, `msgrcv`, `msgsnd`)
+fell through to the default `ENOSYS` handler.  Go's runtime calls `msgctl` during its
+build process and has a code path (same pattern as `restart_syscall` / syscall 128) where
+an `ENOSYS` return value is used as a pointer without first checking errno, crashing at the
+address of the error code.
+
+### Fix
+
+Added `nr::MSGGET/MSGCTL/MSGRCV/MSGSND` constants (186–189) and stub dispatch arms that
+return `EINVAL` instead of `ENOSYS`.  `EINVAL` is treated by Go as a normal "invalid
+argument" error that is properly checked and returned to the caller, so Go's code never
+reaches the pointer-dereference path.
+
+```rust
+nr::MSGGET => EINVAL,
+nr::MSGCTL => EINVAL,
+nr::MSGRCV => EINVAL,
+nr::MSGSND => EINVAL,
+```
+
+---
+
+## 13. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
