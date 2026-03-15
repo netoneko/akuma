@@ -15,6 +15,7 @@ mod aio;
 mod container;
 mod pidfd;
 mod eventfd;
+mod msgqueue;
 mod fb;
 mod fs;
 mod mem;
@@ -681,14 +682,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // best we can do is return EINTR so callers know to retry the operation.  Returning
         // ENOSYS causes Go's runtime to crash because it doesn't check for ENOSYS here.
         128 => EINTR,
-        // SysV message queue stubs: we don't implement message queues, but returning ENOSYS
-        // causes Go's runtime to crash (it takes a fallback path that dereferences the error
-        // code as a pointer). EINVAL / ENOSYS are handled differently — EINVAL is a normal
-        // "invalid arg" error that callers properly check.
-        nr::MSGGET => EINVAL,
-        nr::MSGCTL => EINVAL,
-        nr::MSGRCV => EINVAL,
-        nr::MSGSND => EINVAL,
+        nr::MSGGET => msgqueue::sys_msgget(args[0] as i32, args[1] as i32),
+        nr::MSGCTL => msgqueue::sys_msgctl(args[0] as u32, args[1] as i32, args[2]),
+        nr::MSGRCV => msgqueue::sys_msgrcv(args[0] as u32, args[1], args[2] as usize, args[3] as i64, args[4] as i32),
+        nr::MSGSND => msgqueue::sys_msgsnd(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;
