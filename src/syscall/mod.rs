@@ -667,6 +667,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             akuma_exec::threading::yield_now();
             0
         }
+        // restart_syscall (ARM64 = 128): kernel-internal mechanism to restart interrupted
+        // syscalls after signal delivery. We don't implement SA_RESTART semantics, so the
+        // best we can do is return EINTR so callers know to retry the operation.  Returning
+        // ENOSYS causes Go's runtime to crash because it doesn't check for ENOSYS here.
+        128 => EINTR,
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;

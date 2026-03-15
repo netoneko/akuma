@@ -186,7 +186,110 @@ there is nothing else to do.
 
 ---
 
-## 4. Known remaining gaps (not yet fixed)
+## 4. EPOLLET edge not reset after `read()` on TCP sockets — model response hang
+
+**Status:** Fixed (2026-03-15) in `src/syscall/fs.rs`
+**Component:** `src/syscall/fs.rs` — `sys_read` socket path
+
+### Symptom
+
+Go programs making streaming HTTP/TLS connections (e.g. crush waiting for a
+model API response) stall indefinitely mid-stream. The kernel log shows
+`epoll_pwait` being called repeatedly with `timeout=0ms` (returning 0 events)
+even though data is buffered in the TCP socket.
+
+### Root cause
+
+The EPOLLET (edge-triggered) logic in `sys_epoll_pwait` only fires an `EPOLLIN`
+event when `revents & !last_ready` has new bits. It records `last_ready =
+revents` on every poll iteration. After the first event fires, `last_ready =
+EPOLLIN`.
+
+`recvfrom` and `recvmsg` already called `epoll_on_fd_drained()` after every
+successful read to clear the EPOLLIN bit in `last_ready`. This was added earlier
+to handle BoringSSL/bun which reads one TLS record at a time without draining to
+EAGAIN.
+
+Go uses `read()` (not `recvfrom`/`recvmsg`) for TCP sockets, and reads one
+chunk, then goes back to epoll before draining. The `sys_read` socket path only
+called `epoll_on_fd_drained()` on EAGAIN. So after the first read:
+
+1. epoll fires EPOLLIN → `last_ready = EPOLLIN`
+2. Go reads one chunk via `read()` — more data remains, no EAGAIN
+3. Go's netpoller polls epoll again (timeout=0)
+4. `revents = EPOLLIN`, `last_ready = EPOLLIN`, `new_bits = 0` → **no event**
+5. Go thinks socket idle, stops reading → **hang**
+
+### Fix
+
+Call `epoll_on_fd_drained()` after every successful TCP `read()` in `sys_read`,
+matching what `recvfrom`/`recvmsg` already do:
+
+```rust
+Ok(n) => {
+    // ...copy to user...
+    // Reset EPOLLET edge after every successful TCP read. Go does not
+    // drain to EAGAIN before going back to epoll.
+    if !socket::is_udp_socket(idx) {
+        super::poll::epoll_on_fd_drained(fd_num as u32);
+    }
+    n as u64
+}
+```
+
+UDP is excluded because UDP sockets do not have a byte-stream; each `read()`
+returns one complete datagram and draining semantics differ.
+
+---
+
+## 5. `restart_syscall` (nr=128) returns ENOSYS — Go runtime crash after signal
+
+**Status:** Fixed (2026-03-15) in `src/syscall/mod.rs`
+**Component:** `src/syscall/mod.rs` — syscall dispatch
+
+### Symptom
+
+After EPOLLET was fixed (section 4), Go programs that reach a code path where
+signal delivery races with a blocking syscall crash with a data abort at a
+near-zero address (e.g. `FAR=0x59`):
+
+```
+[ENOSYS] nr=128 pid=52 args=[0xa45fbf80, 0x27, 0x0]
+[WILD-DA] pid=52 FAR=0x59 ELR=0x432e60 last_sc=128
+  x0=0xffffffffffffffda ...
+```
+
+`x0=0xffffffffffffffda` = -38 = ENOSYS. The Go runtime at `ELR=0x432e60` does
+not check for ENOSYS from `restart_syscall` and dereferences the return value
+(or a struct reached via it) as a pointer.
+
+### Root cause
+
+On ARM64, syscall number 128 is `restart_syscall` — a kernel-internal mechanism
+for restarting syscalls that were interrupted by a signal when the action has
+`SA_RESTART` set. When the kernel delivers a signal mid-syscall and the
+sigaction has `SA_RESTART`, it rewrites the interrupted context so that after
+`rt_sigreturn` the process re-executes the original syscall via `restart_syscall`
+(x8=128).
+
+Akuma did not have SA_RESTART syscall-restart semantics, so `restart_syscall`
+fell through to the default `ENOSYS` handler. Go's runtime does not check for
+`ENOSYS` in this path and crashes.
+
+### Fix
+
+Add an explicit case for 128 (`restart_syscall`) that returns `EINTR` instead
+of `ENOSYS`. Since Akuma does not track per-process restartable syscall state,
+`EINTR` is the correct fallback — the caller retries the original operation:
+
+```rust
+// restart_syscall = 128 on ARM64
+128 => EINTR,
+```
+
+---
+
+## 6. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
@@ -198,3 +301,4 @@ The following are likely to surface as Go workloads grow more complex:
 | `clone(CLONE_SIGHAND)` | Shared signal tables across threads not implemented |
 | `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval (see issue #6 in `KNOWN_ISSUES.md`) |
 | Unmapped runtime data above g0 stack | Go places `m` struct adjacent to `g0.stack.hi`; if that region is not covered by a lazy mmap region the handler loop fix masks the crash but the underlying missing mapping is unresolved |
+| SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting; programs relying on transparent syscall restart after signal may need to retry manually |

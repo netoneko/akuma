@@ -5,12 +5,16 @@ This document tracks the syscalls and kernel features that were found to be miss
 ## 1. POSIX File Locking (`fcntl`)
 
 **Symptoms:** `SQLITE_PROTOCOL (15)` error.
-**Status:** Partially Implemented.
-**Details:** 
-- The kernel's `sys_fcntl` implements `F_GETFD`, `F_SETFD`, `F_GETFL`, and `F_SETFL`.
-- It **does not** implement locking commands: `F_SETLK` (5), `F_SETLKW` (6), `F_GETLK` (7).
-- SQLite's default VFS (and the `modernc.org/sqlite` pure Go driver) relies on these for database concurrency.
-**Workaround:** Use `nolock=1` in the SQLite DSN to bypass these checks.
+**Status:** Stub-implemented (2026-03-15) in `src/syscall/fs.rs`.
+**Details:**
+- The kernel's `sys_fcntl` now implements `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL`,
+  `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETLK`, `F_SETLK`, and `F_SETLKW`.
+- `F_GETLK`/`F_SETLK`/`F_SETLKW` are no-ops (return 0). Akuma has no per-file lock
+  state, so advisory locks are silently accepted. This is sufficient for SQLite's
+  single-process use case; multi-process locking correctness is not guaranteed.
+- `F_DUPFD` / `F_DUPFD_CLOEXEC` duplicate the fd (like `dup()`) with optional
+  `O_CLOEXEC` marking; needed by Bun's `WriteStream` fast path.
+**Workaround:** `nolock=1` in the SQLite DSN is still recommended for robustness.
 
 ## 2. Shared Memory Mappings (`mmap`)
 

@@ -279,6 +279,14 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             return EFAULT;
                         }
                     }
+                    // Reset EPOLLET edge after every successful TCP read. Go (and other callers
+                    // using read() rather than recvfrom/recvmsg) do not always drain to EAGAIN
+                    // before going back to epoll. Without this reset the EPOLLET "last_ready"
+                    // stays set to EPOLLIN so the next poll sees new_bits=0 and fires no event,
+                    // leaving the socket unread even though more data is buffered.
+                    if !socket::is_udp_socket(idx) {
+                        super::poll::epoll_on_fd_drained(fd_num as u32);
+                    }
                     n as u64
                 }
                 Err(e) => {
@@ -1403,10 +1411,16 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
+    const F_DUPFD: u32 = 0;
     const F_GETFD: u32 = 1;
     const F_SETFD: u32 = 2;
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
+    // Advisory record locking — no-op stubs (we have no lock state)
+    const F_SETLK: u32 = 6;
+    const F_SETLKW: u32 = 7;
+    const F_GETLK: u32 = 5;
+    const F_DUPFD_CLOEXEC: u32 = 1030;
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
@@ -1417,6 +1431,14 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 
     match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
+            let new_fd = proc.alloc_fd(entry);
+            if cmd == F_DUPFD_CLOEXEC {
+                proc.set_cloexec(new_fd);
+            }
+            new_fd as u64
+        }
         F_GETFD => {
             if proc.is_cloexec(fd) { FD_CLOEXEC } else { 0 }
         }
@@ -1439,6 +1461,8 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             0
         }
+        // Advisory locks: no-op (we have no file locking state)
+        F_GETLK | F_SETLK | F_SETLKW => 0,
         _ => {
             crate::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
                 proc.pid, fd, cmd, arg);

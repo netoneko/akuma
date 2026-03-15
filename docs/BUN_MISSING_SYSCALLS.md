@@ -938,3 +938,40 @@ if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
 - Memory pressure notifications to userspace
 - UDP socket polling in epoll (DNS responses may not wake epoll correctly)
 - JIT code execution after mprotect PROT_EXEC changes
+
+---
+
+## opencode / Bun WriteStream crash (2026-03-15)
+
+**Fixed:** `src/syscall/fs.rs` (`sys_fcntl`), `src/syscall/mod.rs` (`restart_syscall`)
+
+### Symptom
+
+opencode (Bun-based) crashes at startup with:
+
+```
+error: EINVAL: invalid argument, fcntl
+  at WriteStream (internal:fs/streams:244:58)
+TypeError: undefined is not an object (evaluating 'process.stdout.columns')
+```
+
+### Root causes
+
+**A — `F_DUPFD_CLOEXEC` unimplemented.** Bun's `WriteStream` fast path
+(`Bun.file(fd).writer()`) calls `fcntl(fd, F_DUPFD_CLOEXEC, 0)` (cmd=1030) to
+duplicate the file descriptor with `O_CLOEXEC`. The kernel's `sys_fcntl` did
+not handle this command and returned `EINVAL`. The constructor threw, leaving
+`process.stdout` undefined, which cascaded into the `columns` TypeError.
+
+**Fix:** Added `F_DUPFD` (0) and `F_DUPFD_CLOEXEC` (1030) to `sys_fcntl`. Both
+call `proc.alloc_fd(entry)` to clone the fd; `F_DUPFD_CLOEXEC` additionally
+marks the new fd with `set_cloexec`.
+
+**B — Advisory locking commands missing.** `F_GETLK` (5), `F_SETLK` (6),
+`F_SETLKW` (7) also returned `EINVAL`. Added as no-op stubs returning 0.
+
+**C — `restart_syscall` (ARM64 nr=128) returns ENOSYS.** After the EPOLLET fix
+(see `GOLANG_MISSING_SYSCALLS.md` §4), Go programs make more progress and can
+hit a signal-interrupted-syscall path that sets up `restart_syscall`. The kernel
+returned ENOSYS; Go did not check it and crashed with `FAR=0x59`. Fixed to
+return `EINTR` so callers retry the original operation.
