@@ -90,6 +90,7 @@ pub struct AuxEntry {
 #[derive(Debug)]
 pub enum ElfError {
     InvalidFormat(&'static str),
+    InvalidMagic([u8; 4]),
     WrongArchitecture,
     NotExecutable,
     DynamicallyLinked,
@@ -102,6 +103,7 @@ impl core::fmt::Display for ElfError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ElfError::InvalidFormat(msg) => write!(f, "Invalid ELF format: {}", msg),
+            ElfError::InvalidMagic(magic) => write!(f, "Invalid ELF magic: {:02x} {:02x} {:02x} {:02x}", magic[0], magic[1], magic[2], magic[3]),
             ElfError::WrongArchitecture => write!(f, "Not an AArch64 binary"),
             ElfError::NotExecutable => write!(f, "Not an executable"),
             ElfError::DynamicallyLinked => write!(f, "Dynamically linked binary requires interpreter"),

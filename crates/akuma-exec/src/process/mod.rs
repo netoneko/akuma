@@ -1644,14 +1644,13 @@ impl Process {
     }
 
     /// Replace current process image with a new ELF binary (execve core)
-    pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), &'static str> {
+    pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
         let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)
-            .map_err(|_| "Failed to load ELF")?;
-            
+            .map_err(|e| format!("Failed to load ELF: {}", e))?;
+
         mmu::UserAddressSpace::deactivate();
-        
         self.address_space = address_space;
         self.entry_point = entry_point;
         self.brk = brk;
@@ -1705,11 +1704,11 @@ impl Process {
     }
 
     /// Replace current process image using on-demand loading from a file path.
-    pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), &'static str> {
+    pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
         let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)
-            .map_err(|_| "Failed to load ELF")?;
+            .map_err(|e| format!("Failed to load ELF: {}", e))?;
 
         mmu::UserAddressSpace::deactivate();
 

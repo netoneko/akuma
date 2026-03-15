@@ -448,20 +448,18 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
-    
-    // Chunk large writes to avoid huge kernel allocations (max 64KB per chunk)
-    // For small writes (common case), 64KB vec allocation is still overhead, 
-    // but safer than stack overflow or raw access.
-    // Optimization: Use stack for small writes?
-    // But variable size stack allocation is not possible in Rust safe code easily.
-    // Just use Vec for now, efficiency comes second to safety here.
-    
+
+    // For File descriptors, capture the initial position now (before the loop).
+    // The `fd` variable is a clone — proc.update_fd() updates the real fd table but
+    // `fd` itself never reflects those updates. Track write_pos independently so
+    // multi-chunk writes advance the offset correctly instead of overwriting offset 0.
+    let mut write_pos = if let akuma_exec::process::FileDescriptor::File(ref f) = fd {
+        f.position
+    } else {
+        0
+    };
+
     let chunk_size = count.min(64 * 1024);
-    // Allocate buffer once and reuse if we loop? 
-    // sys_write returns partial write count if needed.
-    // If we just process the first chunk and return, the app loops.
-    // Standard behavior is to write as much as possible.
-    
     let mut kernel_buf = alloc::vec![0u8; chunk_size];
     let mut total_written = 0;
     
@@ -516,14 +514,15 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 this_chunk as u64
             }
             akuma_exec::process::FileDescriptor::File(ref f) => {
-                match crate::fs::write_at(&f.path, f.position, buf_slice) {
+                match crate::fs::write_at(&f.path, write_pos, buf_slice) {
                     Ok(n) => {
+                        write_pos += n;
                         proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                         n as u64
                     }
                     Err(_) => {
                         if total_written > 0 { return total_written as u64; }
-                        return !0u64; 
+                        return !0u64;
                     }
                 }
             }

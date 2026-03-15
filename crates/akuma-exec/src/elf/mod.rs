@@ -33,8 +33,16 @@ pub struct LoadedElf {
 /// linker (used for container rootfs where the interpreter lives under a prefix).
 pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
     // Parse ELF header
-    let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
-        .map_err(|_| ElfError::InvalidFormat("Parse failed"))?;
+    let elf = match ElfBytes::<LittleEndian>::minimal_parse(elf_data) {
+        Ok(e) => e,
+        Err(_) => {
+            let mut magic = [0u8; 4];
+            if elf_data.len() >= 4 {
+                magic.copy_from_slice(&elf_data[0..4]);
+            }
+            return Err(ElfError::InvalidMagic(magic));
+        }
+    };
 
     // Verify architecture
     if elf.ehdr.e_machine != EM_AARCH64 {
