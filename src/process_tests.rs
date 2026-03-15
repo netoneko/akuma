@@ -31,6 +31,15 @@ pub fn run_all_tests() {
     // Test waitid WNOHANG with no children returns ECHILD
     test_waitid_stub();
 
+    // Test POSIX exec signal-reset invariant (signal_actions + sigaltstack cleared on exec)
+    test_signal_reset_on_exec();
+
+    // Test that SIG_IGN is preserved across exec (POSIX)
+    test_signal_ignore_preserved_on_exec();
+
+    // Test tgkill (syscall 131) is wired — does not return ENOSYS
+    test_tgkill_not_enosys();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -325,6 +334,115 @@ fn test_procfs_stdio() {
     crate::safe_print!(64, "[Test] procfs stdio test complete\n");
 }
 
+/// POSIX requires that on exec, custom signal handlers are reset to SIG_DFL and
+/// the alternate signal stack is disabled.  This test verifies the invariant
+/// directly on the Process struct without executing the process.
+fn test_signal_reset_on_exec() {
+    use akuma_exec::process::{SignalAction, SignalHandler};
+    use alloc::string::String;
+
+    const ELF_PATH: &str = "/bin/elftest";
+    let elf_data = match fs::read_file(ELF_PATH) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::safe_print!(96, "[Test] signal_reset_on_exec SKIPPED ({} not found)\n", ELF_PATH);
+            return;
+        }
+    };
+
+    let mut proc = match process::Process::from_elf(
+        "elftest", &[String::from("elftest")], &[], &elf_data, None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::safe_print!(64, "[Test] signal_reset_on_exec: from_elf failed: {:?}\n", e);
+            return;
+        }
+    };
+
+    // Inject a custom signal handler (SIGSEGV = index 10) and a fake sigaltstack.
+    proc.signal_actions[10] = SignalAction {
+        handler: SignalHandler::UserFn(0xdeadbeef),
+        flags: 0x0800_0000, // SA_ONSTACK
+        mask: 0,
+        restorer: 0,
+    };
+    proc.sigaltstack_sp    = 0xc400_4000;
+    proc.sigaltstack_size  = 0x8000;
+    proc.sigaltstack_flags = 0; // SS_ONSTACK active
+
+    // Replace the image — same binary, new address space.
+    if let Err(e) = proc.replace_image(&elf_data, &[String::from("elftest")], &[]) {
+        crate::safe_print!(64, "[Test] signal_reset_on_exec: replace_image failed: {}\n", e);
+        return;
+    }
+
+    // The custom handler must be gone.
+    let handler_reset = matches!(proc.signal_actions[10].handler, SignalHandler::Default);
+    // The alternate signal stack must be disabled (SS_DISABLE = 2).
+    let altstack_disabled = proc.sigaltstack_sp == 0
+        && proc.sigaltstack_size == 0
+        && proc.sigaltstack_flags == 2;
+
+    if handler_reset && altstack_disabled {
+        console::print("[Test] signal_reset_on_exec PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] signal_reset_on_exec FAILED: handler_reset={} altstack_disabled={} (sp=0x{:x} flags={})\n",
+            handler_reset, altstack_disabled,
+            proc.sigaltstack_sp, proc.sigaltstack_flags,
+        );
+    }
+}
+
+/// POSIX: SIG_IGN (ignore) dispositions survive exec; only custom handlers are reset.
+fn test_signal_ignore_preserved_on_exec() {
+    use akuma_exec::process::{SignalAction, SignalHandler};
+    use alloc::string::String;
+
+    const ELF_PATH: &str = "/bin/elftest";
+    let elf_data = match fs::read_file(ELF_PATH) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::safe_print!(96, "[Test] signal_ignore_preserved SKIPPED ({} not found)\n", ELF_PATH);
+            return;
+        }
+    };
+
+    let mut proc = match process::Process::from_elf(
+        "elftest", &[String::from("elftest")], &[], &elf_data, None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::safe_print!(64, "[Test] signal_ignore_preserved: from_elf failed: {:?}\n", e);
+            return;
+        }
+    };
+
+    // SIGPIPE (index 12) is commonly set to SIG_IGN by Go and shells.
+    proc.signal_actions[12] = SignalAction {
+        handler: SignalHandler::Ignore,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+
+    if let Err(e) = proc.replace_image(&elf_data, &[String::from("elftest")], &[]) {
+        crate::safe_print!(64, "[Test] signal_ignore_preserved: replace_image failed: {}\n", e);
+        return;
+    }
+
+    if matches!(proc.signal_actions[12].handler, SignalHandler::Ignore) {
+        console::print("[Test] signal_ignore_preserved PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] signal_ignore_preserved FAILED: SIG_IGN was not preserved after exec\n",
+        );
+    }
+}
+
 /// Minimal waitid coverage check: confirms sys_waitid (syscall 95) is wired up.
 /// Full ABI testing requires a userspace binary that calls waitid() directly.
 fn test_waitid_stub() {
@@ -342,5 +460,21 @@ fn test_waitid_stub() {
         }
     } else {
         console::print("[Test] waitid stub SKIPPED (no current pid)\n");
+    }
+}
+
+/// Verify tgkill (syscall 131) is dispatched and does not return ENOSYS.
+///
+/// Calls tgkill(0, 0, 0) — null signal, which is a no-op on Linux used to
+/// check if a thread exists.  Any wired implementation returns 0; ENOSYS
+/// returns 0xffffffffffffffda (-38).
+fn test_tgkill_not_enosys() {
+    const ENOSYS: u64 = (-38i64) as u64;
+    // nr=131 (TGKILL), args: tgid=0, tid=0, sig=0
+    let result = crate::syscall::handle_syscall(131, &[0, 0, 0, 0, 0, 0]);
+    if result != ENOSYS {
+        console::print("[Test] tgkill not-ENOSYS PASSED\n");
+    } else {
+        console::print("[Test] tgkill not-ENOSYS FAILED: returned ENOSYS\n");
     }
 }
