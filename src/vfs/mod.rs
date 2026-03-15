@@ -149,42 +149,52 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    // Check spawn namespace override (set during container ELF loading)
+    // Check spawn namespace override (set during container ELF loading).
+    // Use resolve_arc so the lock is dropped before any I/O.
     {
         let tid = akuma_exec::threading::current_thread_id();
-        let overrides = SPAWN_NS_OVERRIDE.lock();
-        if let Some(ns) = overrides.get(&tid) {
-            let cwd = akuma_exec::process::current_process()
-                .map_or_else(|| String::from("/"), |p| p.cwd.clone());
-            let absolute = resolve_path(&cwd, path);
-            let ns_mount = ns.mount.lock();
-            if let Some((fs, rel)) = ns_mount.resolve(&absolute) {
-                return f(fs, rel);
+        let maybe_arc = {
+            let overrides = SPAWN_NS_OVERRIDE.lock();
+            if let Some(ns) = overrides.get(&tid) {
+                let cwd = akuma_exec::process::current_process()
+                    .map_or_else(|| String::from("/"), |p| p.cwd.clone());
+                let absolute = resolve_path(&cwd, path);
+                let ns_mount = ns.mount.lock();
+                ns_mount.resolve_arc(&absolute)
+            } else {
+                None
             }
+        };
+        if let Some((fs, rel)) = maybe_arc {
+            return f(fs.as_ref(), &rel);
         }
     }
 
     if let Some(proc) = akuma_exec::process::current_process() {
         let absolute = resolve_path(&proc.cwd, path);
 
-        {
-            let ns_mount = proc.namespace.mount.lock();
-            if let Some((fs, rel)) = ns_mount.resolve(&absolute) {
-                return f(fs, rel);
-            }
+        // Try process namespace first (lock released before I/O).
+        let ns_arc = proc.namespace.mount.lock().resolve_arc(&absolute);
+        if let Some((fs, rel)) = ns_arc {
+            return f(fs.as_ref(), &rel);
         }
 
-        let table = MOUNT_TABLE.lock();
-        let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-        let (fs, relative_path) = table.resolve(&absolute).ok_or(FsError::NotFound)?;
-        f(fs, relative_path)
+        // Fall back to global mount table (lock released before I/O).
+        let global_arc = {
+            let table = MOUNT_TABLE.lock();
+            let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+            table.resolve_arc(&absolute).ok_or(FsError::NotFound)?
+        };
+        f(global_arc.0.as_ref(), &global_arc.1)
     } else {
         let normalized = normalize_path_owned(path);
 
-        let table = MOUNT_TABLE.lock();
-        let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-        let (fs, relative_path) = table.resolve(&normalized).ok_or(FsError::NotFound)?;
-        f(fs, relative_path)
+        let global_arc = {
+            let table = MOUNT_TABLE.lock();
+            let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+            table.resolve_arc(&normalized).ok_or(FsError::NotFound)?
+        };
+        f(global_arc.0.as_ref(), &global_arc.1)
     }
 }
 
@@ -307,27 +317,31 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     let old_abs = resolve_absolute(old_path);
     let new_abs = resolve_absolute(new_path);
 
-    // Try process namespace first
+    // Try process namespace first (lock released before I/O).
     if let Some(proc) = akuma_exec::process::current_process() {
-        let ns_mount = proc.namespace.mount.lock();
-        if let (Some((old_fs, old_rel)), Some((_, new_rel))) =
-            (ns_mount.resolve(&old_abs), ns_mount.resolve(&new_abs))
-        {
-            return old_fs.rename(old_rel, new_rel);
+        let ns_arcs = {
+            let ns_mount = proc.namespace.mount.lock();
+            match (ns_mount.resolve_arc(&old_abs), ns_mount.resolve_arc(&new_abs)) {
+                (Some(o), Some(n)) => Some((o.0, o.1, n.1)),
+                _ => None,
+            }
+        };
+        if let Some((old_fs, old_rel, new_rel)) = ns_arcs {
+            return old_fs.rename(&old_rel, &new_rel);
         }
     }
 
-    let table = MOUNT_TABLE.lock();
-    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-
-    let (old_fs, old_rel) = table.resolve(&old_abs).ok_or(FsError::NotFound)?;
-    let (new_fs, new_rel) = table.resolve(&new_abs).ok_or(FsError::NotFound)?;
-
-    if old_fs.name() != new_fs.name() {
-        return Err(FsError::NotSupported);
-    }
-
-    old_fs.rename(old_rel, new_rel)
+    let (old_arc, old_rel, new_rel) = {
+        let table = MOUNT_TABLE.lock();
+        let table = table.as_ref().ok_or(FsError::NotInitialized)?;
+        let (old_fs, old_r) = table.resolve_arc(&old_abs).ok_or(FsError::NotFound)?;
+        let (new_fs, new_r) = table.resolve_arc(&new_abs).ok_or(FsError::NotFound)?;
+        if old_fs.name() != new_fs.name() {
+            return Err(FsError::NotSupported);
+        }
+        (old_fs, old_r, new_r)
+    };
+    old_arc.rename(&old_rel, &new_rel)
 }
 
 /// Get filesystem statistics for a path

@@ -57,7 +57,7 @@ impl MountTable {
     }
 
     /// Resolve an **absolute** path to `(filesystem, relative_path)`.
-    #[must_use] 
+    #[must_use]
     pub fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a dyn Filesystem, &'a str)> {
         let normalized = normalize_path(path);
 
@@ -75,6 +75,32 @@ impl MountTable {
                 }
                 if rest.starts_with('/') {
                     return Some((mount.fs.as_ref(), rest));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Like `resolve` but returns owned types so the lock can be released before I/O.
+    #[must_use]
+    pub fn resolve_arc(&self, path: &str) -> Option<(Arc<dyn Filesystem>, String)> {
+        let normalized = normalize_path(path);
+
+        for mount in &self.mounts {
+            if mount.path == "/" {
+                return Some((mount.fs.clone(), normalized.into()));
+            }
+            if normalized == mount.path {
+                return Some((mount.fs.clone(), String::from("/")));
+            }
+            if normalized.starts_with(&mount.path) {
+                let rest = &normalized[mount.path.len()..];
+                if rest.is_empty() {
+                    return Some((mount.fs.clone(), String::from("/")));
+                }
+                if rest.starts_with('/') {
+                    return Some((mount.fs.clone(), rest.into()));
                 }
             }
         }

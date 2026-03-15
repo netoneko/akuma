@@ -148,6 +148,7 @@ pub enum FileDescriptor {
     DevUrandom,
     TimerFd(u32),
     EpollFd(u32),
+    PidFd(u32),
 }
 
 /// Kernel file handle for open files

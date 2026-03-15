@@ -289,7 +289,212 @@ of `ENOSYS`. Since Akuma does not track per-process restartable syscall state,
 
 ---
 
-## 6. Known remaining gaps (not yet fixed)
+## 6. `waitid` (syscall 95) — `go build` crashes waiting for child processes
+
+**Status:** Fixed (2026-03-15) in `src/syscall/proc.rs` + `src/syscall/mod.rs`
+**Component:** `src/syscall/proc.rs` — `sys_waitid`
+
+### Symptom
+
+`go build` crashes with a nil dereference shortly after spawning subprocesses
+(`compile`, `link`, etc.):
+
+```
+[ENOSYS] nr=95 pid=92 args=[0x1, 0x60, 0xc431cbb8]  ← waitid(P_PID, 96, siginfo_ptr)
+[WILD-DA] pid=96 FAR=0x90 ELR=0x100a65b8             ← nil deref in Go after ENOSYS
+[signal] sig 11 re-entrant fault at 0x48             ← kills process
+```
+
+### Root cause
+
+Syscall 95 (`waitid`) fell through to the default `ENOSYS` handler. Go's
+`os/exec` calls `waitid(P_PID, child_pid, &siginfo, WEXITED)` to reap
+spawned subprocesses. When `ENOSYS` is returned, Go reads uninitialized data
+from the `siginfo_t` buffer and dereferences a null pointer.
+
+### Fix
+
+Added `sys_waitid` in `src/syscall/proc.rs` as a thin wrapper over the
+existing child-channel infrastructure already used by `sys_wait4`. Instead of
+writing a 4-byte encoded wait status, it fills a 128-byte `siginfo_t` struct
+with `SIGCHLD` fields (`si_signo`, `si_code`, `si_pid`, `si_status`).
+
+Added `nr::WAITID = 95` constant and dispatcher entry in
+`src/syscall/mod.rs`.
+
+---
+
+## 7. `pidfd_open` (syscall 434) + `waitid(P_PIDFD)` — Go busy-polls with nanosleep, child crash
+
+**Status:** Fixed (2026-03-15) in `src/syscall/pidfd.rs` + `src/syscall/proc.rs` + `src/syscall/poll.rs`
+**Component:** new `src/syscall/pidfd.rs`; epoll readiness in `poll.rs`; `sys_waitid` in `proc.rs`
+
+### Symptom
+
+After the `waitid` fix (#6), `go build` still spins: PSTATS shows `nr101=287(6422ms)` —
+287 calls to `nanosleep` consuming ~6.4 s of a 12.8 s run. A child process (the compiled
+binary) crashes with `FAR=0x90` then `FAR=0x48` (nil deref pattern identical to #6).
+
+```
+[ENOSYS] nr=434 (pidfd_open) pid=46
+...
+[WILD-DA] pid=50 FAR=0x90 ELR=0x100a65b8 last_sc=101   ← nanosleep, not waitid
+```
+
+### Root cause
+
+Go 1.22+ uses `pidfd_open` to obtain a file descriptor for each child process. The fd is
+added to Go's netpoller epoll so that child exit triggers an epoll event (EPOLLIN) rather
+than requiring a polling loop with `nanosleep`. When `pidfd_open` returns `ENOSYS`, Go
+falls back to a polling loop: sleep 1 ms, check child status, repeat. This produces the
+`nr101` tsunami and makes the overall build much slower. The child crash at `last_sc=101`
+is the child's own nanosleep returning after the parent has given up and exited.
+
+### Fix
+
+**New module `src/syscall/pidfd.rs`:**
+
+A global `PIDFD_TABLE` maps pidfd IDs to their target PID. Readiness is determined by
+checking the existing `ProcessChannel` for the target PID (same infrastructure as
+`sys_wait4` / `sys_waitid`).
+
+```rust
+pub(super) fn pidfd_can_read(id: u32) -> bool {
+    let pid = match pidfd_get_pid(id) { Some(p) => p, None => return true };
+    akuma_exec::process::get_child_channel(pid)
+        .map_or(true, |ch| ch.has_exited())
+}
+```
+
+**Epoll integration (`src/syscall/poll.rs`):**
+
+```rust
+FileDescriptor::PidFd(pidfd_id) => {
+    if requested & EPOLLIN != 0 && super::pidfd::pidfd_can_read(pidfd_id) {
+        ready |= EPOLLIN;
+    }
+}
+```
+
+**`waitid(P_PIDFD=3, fd, ...)` (`src/syscall/proc.rs`):**
+
+When `idtype == P_PIDFD`, the `id` argument is a fd number. The fd is resolved to a
+`PidFd(pidfd_id)`, then to the underlying PID via `pidfd_get_pid`, and finally waited
+on with the same child-channel loop used by `P_PID`.
+
+**Supporting changes:**
+- `FileDescriptor::PidFd(u32)` added to the enum in `crates/akuma-exec/src/process/types.rs`
+- `sys_close` / `sys_close_range` call `pidfd_close` to release table entries
+- `src/vfs/proc.rs` /proc/pid/fd symlink shows `anon_inode:[pidfd:N]`
+
+---
+
+## 8. `CLONE_PIDFD` not handled — Go netpoller uses garbage fd, crashes at FAR=0x90
+
+**Status:** Fixed (2026-03-15) in `src/syscall/proc.rs`
+**Component:** `src/syscall/proc.rs` — `sys_clone3` / `sys_clone_pidfd`
+
+### Symptom
+
+After implementing `pidfd_open` (fix #7), `go build` still crashes with
+`last_sc=22` (EPOLL_PWAIT) and `FAR=0x90`. All x-registers are zero at
+the fault site `ELR=0x100a65b8`. The nanosleep counter `nr101` remains
+high, indicating Go is still spinning even after the pidfd implementation.
+
+### Root cause
+
+Go 1.22+ uses `clone3(CLONE_PIDFD|CLONE_VFORK|CLONE_VM|SIGCHLD)` to
+obtain the child's pidfd **atomically** in the same syscall that creates
+the child. The `clone_args.pidfd` field is a pointer to where the kernel
+should write the pidfd fd number after fork.
+
+Our `sys_clone3` forwarded all clone_args fields to `sys_clone` but
+silently ignored `CLONE_PIDFD` — it never wrote the fd number to
+`cl_args.pidfd`. Go read an uninitialised value (often 0) from that
+pointer and used it as a pidfd fd number. fd 0 (stdin) was then added to
+epoll with `data = ptr_to_pollDesc`. When stdin returned EPOLLIN, Go
+called `netpollunblock(pollDesc_ptr)`. Since `pollDesc_ptr` was actually
+the stdin fd's data value — which could be 0 or some other invalid
+pointer — accessing `pollDesc->rg` at offset `0x90` faulted at FAR=0x90.
+
+### Fix
+
+`sys_clone3` now passes `cl_args.pidfd` (the pointer) to a new internal
+function `sys_clone_pidfd`. After `fork_process` succeeds, if
+`CLONE_PIDFD` is set and the pointer is non-zero, the function calls
+`sys_pidfd_open` for the new child and writes the resulting fd number
+(4 bytes, i32) back to the pointer:
+
+```rust
+const CLONE_PIDFD: u64 = 0x1000;
+
+if flags & CLONE_PIDFD != 0 && pidfd_out_ptr != 0 {
+    if validate_user_ptr(pidfd_out_ptr, 4) {
+        let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0);
+        if (pidfd_fd as i64) >= 0 {
+            let fd_i32 = pidfd_fd as i32;
+            let _ = unsafe { copy_to_user_safe(pidfd_out_ptr as *mut u8,
+                                               &fd_i32 as *const i32 as *const u8, 4) };
+        }
+    }
+}
+```
+
+`sys_clone` (the old two-argument clone syscall) still delegates to
+`sys_clone_pidfd` with `pidfd_out_ptr = 0`, so it is unaffected.
+
+---
+
+## 9. `MOUNT_TABLE` spinlock held during disk I/O — intermittent hang in parallel tests
+
+**Status:** Fixed (2026-03-15) in `src/vfs/mod.rs`, `crates/akuma-vfs/src/mount.rs`, `crates/akuma-isolation/src/mount.rs`
+**Component:** `src/vfs/mod.rs` — `with_fs`
+
+### Symptom
+
+The kernel intermittently hangs after printing `[TEST] Parallel process
+execution` / `Spawning process 1...` and never returns. The hang is
+nondeterministic (some runs pass, others hang forever).
+
+### Root cause
+
+`with_fs` (the VFS dispatch function) acquired `MOUNT_TABLE` (a plain
+spinlock) and held it for the entire duration of the filesystem callback —
+including the ext2 disk read inside `read_file`. On a single-core QEMU:
+
+1. Thread A holds `MOUNT_TABLE` while reading a large ELF binary from
+   ext2 (e.g. `/bin/hello`).
+2. The 10 ms timer IRQ fires and the scheduler switches to thread B.
+3. Thread B calls any VFS function (e.g. another `read_file`) and spins
+   on `MOUNT_TABLE`.
+4. Thread A never gets rescheduled while thread B is spinning → kernel
+   deadlocks.
+
+### Fix
+
+Add `resolve_arc` to `MountTable` (akuma-vfs) and `MountNamespace`
+(akuma-isolation) that returns `(Arc<dyn Filesystem>, String)` — owned
+types — so the lock can be released before calling the filesystem
+callback.
+
+`with_fs` now releases the `MOUNT_TABLE` / namespace mount lock
+**before** calling the I/O closure:
+
+```rust
+let global_arc = {
+    let table = MOUNT_TABLE.lock();           // brief lock
+    let table = table.as_ref()?;
+    table.resolve_arc(&absolute).ok_or(FsError::NotFound)?
+};                                            // lock released here
+f(global_arc.0.as_ref(), &global_arc.1)     // I/O without any lock
+```
+
+`rename` received the same treatment since it also held the lock across
+two path resolutions and the rename I/O call.
+
+---
+
+## 11. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 

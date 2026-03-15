@@ -153,9 +153,16 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
 }
 
 pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
+    sys_clone_pidfd(flags, stack, parent_tid, tls, child_tid, 0)
+}
+
+/// Internal clone implementation that optionally writes a pidfd to `pidfd_out_ptr`.
+/// `pidfd_out_ptr = 0` means no pidfd requested (used by sys_clone).
+pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64, pidfd_out_ptr: u64) -> u64 {
     const CLONE_VM: u64 = 0x100;
     const CLONE_THREAD: u64 = 0x10000;
     const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_PIDFD: u64 = 0x1000;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
         crate::tprint!(128, "[clone] flags=0x{:x} stack=0x{:x}\n", flags, stack);
@@ -190,6 +197,25 @@ pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child
 
         match akuma_exec::process::fork_process(child_pid, stack) {
             Ok(new_pid) => {
+                // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
+                // back to the caller. Go 1.22+ uses this to get the pidfd in a single syscall.
+                if flags & CLONE_PIDFD != 0 && pidfd_out_ptr != 0 {
+                    if validate_user_ptr(pidfd_out_ptr, 4) {
+                        let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0 /* no flags */);
+                        if (pidfd_fd as i64) >= 0 {
+                            // Write the fd number as i32 to the pidfd pointer
+                            let fd_i32 = pidfd_fd as i32;
+                            let _ = unsafe {
+                                copy_to_user_safe(
+                                    pidfd_out_ptr as *mut u8,
+                                    &fd_i32 as *const i32 as *const u8,
+                                    4,
+                                )
+                            };
+                            crate::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
+                        }
+                    }
+                }
                 return new_pid as u64;
             },
             Err(e) => {
@@ -240,7 +266,9 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
         crate::tprint!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
-    sys_clone(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid)
+    // Pass the pidfd pointer through so CLONE_PIDFD can write the fd number back
+    // to the caller's clone_args.pidfd field.
+    sys_clone_pidfd(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid, cl_args.pidfd)
 }
 
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
@@ -328,6 +356,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
             }
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
             akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
+            akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
             _ => {}
         }
     }
@@ -482,6 +511,129 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
     }
     (-libc_errno::ECHILD as i64) as u64
+}
+
+pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 {
+    const SIGINFO_SIZE: usize = 128;
+    const P_ALL: u32 = 0;
+    const P_PID: u32 = 1;
+    const P_PIDFD: u32 = 3;
+    const WNOHANG: i32 = 1;
+    const WNOWAIT: i32 = 0x0100_0000;
+    const SIGCHLD: u32 = 17;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] waitid(idtype={}, id={}, options=0x{:x})\n", idtype, id, options);
+    }
+
+    // Zero siginfo buffer before any early return so Go sees clean data.
+    if infop != 0 {
+        if !validate_user_ptr(infop, SIGINFO_SIZE) {
+            return EFAULT;
+        }
+        let zero = [0u8; SIGINFO_SIZE];
+        let _ = unsafe { copy_to_user_safe(infop as *mut u8, zero.as_ptr(), SIGINFO_SIZE) };
+    }
+
+    let wnohang = (options & WNOHANG) != 0;
+
+    let current_pid = match akuma_exec::process::read_current_pid() {
+        Some(p) => p,
+        None => return (-libc_errno::ECHILD as i64) as u64,
+    };
+
+    let result: Option<(u32, i32)> = match idtype {
+        P_PID => {
+            if let Some(ch) = akuma_exec::process::get_child_channel(id) {
+                loop {
+                    if ch.has_exited() {
+                        break Some((id, ch.exit_code()));
+                    }
+                    if wnohang { break None; }
+                    akuma_exec::threading::yield_now();
+                }
+            } else {
+                return (-libc_errno::ECHILD as i64) as u64;
+            }
+        }
+        P_ALL => {
+            if !akuma_exec::process::has_children(current_pid) {
+                return (-libc_errno::ECHILD as i64) as u64;
+            }
+            loop {
+                if let Some((cpid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+                    break Some((cpid, ch.exit_code()));
+                }
+                if wnohang { break None; }
+                akuma_exec::threading::yield_now();
+            }
+        }
+        P_PIDFD => {
+            // `id` is the fd number of a pidfd; resolve it to a target PID.
+            let target_pid = if let Some(proc) = akuma_exec::process::current_process() {
+                match proc.get_fd(id) {
+                    Some(akuma_exec::process::FileDescriptor::PidFd(pidfd_id)) => {
+                        match super::pidfd::pidfd_get_pid(pidfd_id) {
+                            Some(p) => p,
+                            None => return (-libc_errno::ECHILD as i64) as u64,
+                        }
+                    }
+                    _ => return EBADF,
+                }
+            } else {
+                return (-libc_errno::ECHILD as i64) as u64;
+            };
+            if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
+                loop {
+                    if ch.has_exited() {
+                        break Some((target_pid, ch.exit_code()));
+                    }
+                    if wnohang { break None; }
+                    akuma_exec::threading::yield_now();
+                }
+            } else {
+                return (-libc_errno::ECHILD as i64) as u64;
+            }
+        }
+        _ => return (-libc_errno::EINVAL as i64) as u64,
+    };
+
+    if let Some((child_pid, code)) = result {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[syscall] waitid: PID {} exited with code {}\n", child_pid, code);
+        }
+        if infop != 0 {
+            // siginfo_t layout for SIGCHLD (AArch64 Linux):
+            //   0: si_signo (u32), 4: si_errno (u32), 8: si_code (i32)
+            //  12: si_pid   (u32), 16: si_uid  (u32), 20: si_status (i32)
+            #[repr(C)]
+            struct SigChld {
+                si_signo:  u32,
+                si_errno:  u32,
+                si_code:   i32,
+                si_pid:    u32,
+                si_uid:    u32,
+                si_status: i32,
+            }
+            let (si_code, si_status) = if code < 0 { (CLD_KILLED, -code) } else { (CLD_EXITED, code) };
+            let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code,
+                                 si_pid: child_pid, si_uid: 0, si_status };
+            let _ = unsafe {
+                copy_to_user_safe(infop as *mut u8,
+                                  &info as *const SigChld as *const u8,
+                                  core::mem::size_of::<SigChld>())
+            };
+        }
+        if (options & WNOWAIT) == 0 {
+            akuma_exec::process::remove_child_channel(child_pid);
+        }
+        0
+    } else {
+        // WNOHANG with no exited child: return 0, si_pid stays 0
+        0
+    }
 }
 
 pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {

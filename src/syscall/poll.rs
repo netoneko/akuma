@@ -227,6 +227,12 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                 ready |= EPOLLIN;
             }
         }
+        akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
+            // A pidfd becomes readable (EPOLLIN) when the tracked process has exited.
+            if requested & EPOLLIN != 0 && super::pidfd::pidfd_can_read(pidfd_id) {
+                ready |= EPOLLIN;
+            }
+        }
         akuma_exec::process::FileDescriptor::Stdin => {
             if requested & EPOLLIN != 0 {
                 if let Some(ch) = akuma_exec::process::current_channel() {

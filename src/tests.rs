@@ -6866,11 +6866,11 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
 
     // io_setup (NR 0) and io_destroy (NR 1) are now implemented; not tested here
 
-    // Test pidfd_open (NR 434)
-    // Bun calls this after clone3 for process monitoring; falls back to wait4
+    // Test pidfd_open (NR 434) — now implemented; returns ESRCH for non-child pid=1
     let pidfd_open_result = crate::syscall::handle_syscall(434, &[1, 0, 0, 0, 0, 0]);
-    crate::safe_print!(128, "  pidfd_open(434) = {:#x} (expect {:#x})\n",
-        pidfd_open_result, ENOSYS);
+    let esrch: u64 = (-3i64) as u64;
+    crate::safe_print!(128, "  pidfd_open(434) = {:#x} (expect {:#x} ESRCH)\n",
+        pidfd_open_result, esrch);
 
     // Test inotify syscalls (NR 26, 27, 28)
     // Bun uses these for file watching
@@ -6893,8 +6893,9 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
         console::print("  FAIL: io_uring_register did not return ENOSYS\n");
         pass = false;
     }
-    if pidfd_open_result != ENOSYS {
-        console::print("  FAIL: pidfd_open did not return ENOSYS\n");
+    if pidfd_open_result != esrch {
+        crate::safe_print!(64, "  FAIL: pidfd_open returned {:#x}, expected ESRCH ({:#x})\n",
+            pidfd_open_result, esrch);
         pass = false;
     }
     if inotify_init1_result != ENOSYS {

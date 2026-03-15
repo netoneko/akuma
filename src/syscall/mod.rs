@@ -13,6 +13,7 @@ use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 mod aio;
 mod container;
+mod pidfd;
 mod eventfd;
 mod fb;
 mod fs;
@@ -199,6 +200,7 @@ pub mod nr {
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
     pub const WAIT4: u64 = 260;
+    pub const WAITID: u64 = 95;
     pub const RESOLVE_HOST: u64 = 300;
     pub const SPAWN: u64 = 301;
     pub const KILL: u64 = 302;
@@ -307,6 +309,7 @@ pub struct ThreadCpuStat {
 
 const EINTR: u64 = (-4i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
+const ESRCH: u64 = (-3i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const EBADF: u64 = (-9i64) as u64;
@@ -600,6 +603,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0] as u32, args[1]),
         nr::FACCESSAT2 => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
+        nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
         nr::FB_INIT => fb::sys_fb_init(args[0] as u32, args[1] as u32),
         nr::FB_DRAW => fb::sys_fb_draw(args[0], args[1] as usize),
@@ -685,11 +689,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
-        nr::PIDFD_OPEN => {
-            crate::tprint!(96, "[ENOSYS] nr=434 (pidfd_open) pid={}\n",
-                akuma_exec::process::read_current_pid().unwrap_or(0));
-            ENOSYS
-        }
+        nr::PIDFD_OPEN => pidfd::sys_pidfd_open(args[0] as u32, args[1] as u32),
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }

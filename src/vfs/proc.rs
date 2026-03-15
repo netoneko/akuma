@@ -542,6 +542,7 @@ impl Filesystem for ProcFilesystem {
                     FileDescriptor::Stdout => String::from("/dev/stdout"),
                     FileDescriptor::Stderr => String::from("/dev/stderr"),
                     FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{}]", child_pid),
+                    FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{}]", id),
                 };
                 return Ok(target);
             }
