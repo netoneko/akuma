@@ -1,6 +1,23 @@
 use super::*;
 use akuma_net::socket::libc_errno;
 
+// Maps child PID → parent thread ID for processes created with CLONE_VFORK.
+// The parent blocks after fork until the child calls execve (success) or exits.
+// Without this, both parent and child run the Go runtime concurrently in the
+// same address space, causing memory corruption.
+static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>> = Spinlock::new(BTreeMap::new());
+
+/// Wake the vfork parent (if any) of the given child PID.
+/// Called from do_execve (on successful image replacement) and sys_exit_group/sys_exit.
+fn vfork_complete(child_pid: u32) {
+    let parent_tid = crate::irq::with_irqs_disabled(|| {
+        VFORK_WAITERS.lock().remove(&child_pid)
+    });
+    if let Some(tid) = parent_tid {
+        akuma_exec::threading::get_waker_for_thread(tid).wake();
+    }
+}
+
 fn encode_wait_status(code: i32) -> u32 {
     if code < 0 {
         let sig = (-code) as u32 & 0x7F;
@@ -124,12 +141,14 @@ pub(super) fn sys_exit(code: i32) -> u64 {
             let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
-            crate::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n", 
+            crate::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.name, code, secs, frac);
         }
+        let pid = proc.pid;
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        vfork_complete(pid);
     }
     code as u64
 }
@@ -140,14 +159,16 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
-            crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n", 
+            crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
                 proc.pid, proc.name, code, secs, frac);
         }
+        let pid = proc.pid;
         let l0_phys = proc.address_space.l0_phys();
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
-        akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
+        akuma_exec::process::kill_thread_group(pid, l0_phys);
+        vfork_complete(pid);
     }
     code as u64
 }
@@ -215,6 +236,17 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                             crate::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
                         }
                     }
+                }
+                // CLONE_VFORK: block parent until child calls execve or exits.
+                // Without this, both parent and child run the Go runtime concurrently
+                // in the same address space, corrupting each other's state.
+                if flags & CLONE_VFORK != 0 {
+                    let parent_tid = akuma_exec::threading::current_thread_id();
+                    crate::irq::with_irqs_disabled(|| {
+                        VFORK_WAITERS.lock().insert(new_pid, parent_tid);
+                    });
+                    crate::tprint!(96, "[clone] CLONE_VFORK: blocking parent tid={} until child pid={} execs/exits\n", parent_tid, new_pid);
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
                 return new_pid as u64;
             },
@@ -384,6 +416,11 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
     }
+
+    // Wake any CLONE_VFORK parent that was blocked waiting for this exec.
+    // Must happen before enter_user_mode (which never returns).
+    let pid = proc.pid;
+    vfork_complete(pid);
 
     proc.address_space.activate();
 

@@ -664,7 +664,64 @@ without it `E2BIG` is returned and the message stays in the queue.
 
 ---
 
-## 13. Known remaining gaps (not yet fixed)
+## 13. `CLONE_VFORK` does not block parent — two goroutine runtimes corrupt shared address space
+
+**Status:** Fixed (2026-03-16) in `src/syscall/proc.rs`
+**Component:** `sys_clone_pidfd`, `do_execve`, `sys_exit`, `sys_exit_group`
+
+### Symptom
+
+After the `tgkill` fix (#11), `go build` still crashes. The log shows pid=52 (a child
+spawned via `clone(CLONE_VFORK|CLONE_VM|SIGCHLD)`) dying with `FAR=0x90` and
+`FAR=0x48` — the same Go netpoller nil-dereference pattern as issues #7/#8 — even
+though `pidfd_open` and `CLONE_PIDFD` are already working. The epoll log shows pid=48
+(the parent) continuing to run after the clone instead of blocking.
+
+### Root cause
+
+`sys_clone_pidfd` handled `CLONE_VFORK` by forking the child and immediately returning
+the child PID to the parent — no blocking. This violates vfork semantics: the parent
+and child both ran the Go goroutine scheduler concurrently in the same address space
+(`CLONE_VM`), trampling each other's heap, stack, and runtime state. The crashes at
+`FAR=0x90` / `FAR=0x48` are consequences of this concurrent corruption, not missing
+syscalls.
+
+### Fix
+
+Added a `static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>>` (child PID → parent
+thread ID) and a `vfork_complete(child_pid)` helper in `src/syscall/proc.rs`.
+
+**After fork with `CLONE_VFORK`** — register the parent thread ID in `VFORK_WAITERS`
+then block it with `schedule_blocking(u64::MAX)`:
+
+```rust
+if flags & CLONE_VFORK != 0 {
+    let parent_tid = akuma_exec::threading::current_thread_id();
+    VFORK_WAITERS.lock().insert(new_pid, parent_tid);
+    akuma_exec::threading::schedule_blocking(u64::MAX);
+}
+```
+
+**`do_execve` (after successful `replace_image`)** — wake the parent before entering
+the new user image (which never returns):
+
+```rust
+let pid = proc.pid;
+vfork_complete(pid);   // unblock vfork parent
+proc.address_space.activate();
+unsafe { enter_user_mode(&proc.context); }
+```
+
+**`sys_exit` / `sys_exit_group`** — wake the parent if the child exits before exec
+(e.g. exec fails):
+
+```rust
+vfork_complete(pid);
+```
+
+---
+
+## 14. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 

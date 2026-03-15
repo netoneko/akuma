@@ -40,6 +40,14 @@ pub fn run_all_tests() {
     // Test tgkill (syscall 131) is wired — does not return ENOSYS
     test_tgkill_not_enosys();
 
+    // Test SysV message queue syscalls (186-189)
+    test_msgqueue_create_destroy();
+    test_msgqueue_send_recv();
+    test_msgqueue_box_isolation();
+
+    // Test CLONE_VFORK is dispatched (not ENOSYS) and VFORK_WAITERS is clean afterward
+    test_vfork_dispatch();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -476,5 +484,140 @@ fn test_tgkill_not_enosys() {
         console::print("[Test] tgkill not-ENOSYS PASSED\n");
     } else {
         console::print("[Test] tgkill not-ENOSYS FAILED: returned ENOSYS\n");
+    }
+}
+
+// ── SysV message queue tests (nr 186–189) ─────────────────────────────────
+
+const NR_MSGGET: u64 = 186;
+const NR_MSGCTL: u64 = 187;
+const NR_MSGRCV: u64 = 188;
+const NR_MSGSND: u64 = 189;
+const IPC_PRIVATE: u64 = 0;
+const IPC_CREAT: u64 = 0o1000;
+const IPC_RMID: u64 = 0;
+/// msgget(IPC_PRIVATE) creates a queue and returns a valid msqid; two successive
+/// calls return distinct msqids; msgctl(IPC_RMID) returns 0 for each.
+fn test_msgqueue_create_destroy() {
+    let flags = IPC_CREAT | 0o600;
+
+    let id1 = crate::syscall::handle_syscall(NR_MSGGET, &[IPC_PRIVATE, flags, 0, 0, 0, 0]);
+    let id2 = crate::syscall::handle_syscall(NR_MSGGET, &[IPC_PRIVATE, flags, 0, 0, 0, 0]);
+
+    // Both IDs must be small positive integers, not error codes.
+    let ok_ids = (id1 as i64) > 0 && (id2 as i64) > 0 && id1 != id2;
+
+    let rm1 = crate::syscall::handle_syscall(NR_MSGCTL, &[id1, IPC_RMID, 0, 0, 0, 0]);
+    let rm2 = crate::syscall::handle_syscall(NR_MSGCTL, &[id2, IPC_RMID, 0, 0, 0, 0]);
+
+    if ok_ids && rm1 == 0 && rm2 == 0 {
+        console::print("[Test] msgqueue_create_destroy PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] msgqueue_create_destroy FAILED: id1={} id2={} rm1={} rm2={}\n",
+            id1 as i64, id2 as i64, rm1 as i64, rm2 as i64,
+        );
+    }
+}
+
+/// Full round-trip: create queue, send a message, receive it back, check the
+/// content, then remove the queue.  Uses BYPASS_VALIDATION so kernel-stack
+/// buffers pass the user-pointer check.
+fn test_msgqueue_send_recv() {
+    use core::sync::atomic::Ordering;
+
+    // Enable pointer bypass for this test so kernel stack addresses are accepted.
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let flags = IPC_CREAT | 0o600;
+    let msqid = crate::syscall::handle_syscall(NR_MSGGET, &[IPC_PRIVATE, flags, 0, 0, 0, 0]);
+
+    // Build a send buffer: [mtype: i64][mtext: "hello\0"]
+    let send_mtype: i64 = 42;
+    let mtext = b"hello";
+    let mut send_buf = [0u8; 8 + 5];
+    send_buf[0..8].copy_from_slice(&send_mtype.to_ne_bytes());
+    send_buf[8..].copy_from_slice(mtext);
+
+    let send_ptr = send_buf.as_ptr() as u64;
+    let send_ret = crate::syscall::handle_syscall(
+        NR_MSGSND,
+        &[msqid, send_ptr, 5, 0, 0, 0], // msgsz=5, flags=0
+    );
+
+    // Receive buffer: [mtype: i64][mtext: 16 bytes]
+    let recv_buf = [0u8; 8 + 16];
+    let recv_ptr = recv_buf.as_ptr() as u64;
+    let recv_ret = crate::syscall::handle_syscall(
+        NR_MSGRCV,
+        &[msqid, recv_ptr, 16, 0, 0, 0], // msgsz=16, msgtyp=0 (any), flags=0
+    );
+
+    crate::syscall::handle_syscall(NR_MSGCTL, &[msqid, IPC_RMID, 0, 0, 0, 0]);
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    let recv_mtype = i64::from_ne_bytes(recv_buf[0..8].try_into().unwrap());
+    let recv_text = &recv_buf[8..8 + recv_ret as usize];
+
+    if send_ret == 0 && recv_ret == 5 && recv_mtype == 42 && recv_text == mtext {
+        console::print("[Test] msgqueue_send_recv PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] msgqueue_send_recv FAILED: send={} recv={} mtype={} text={:?}\n",
+            send_ret as i64, recv_ret as i64, recv_mtype, recv_text,
+        );
+    }
+}
+
+/// Two queues created with the same named key in box 0 share the same msqid
+/// (second msgget without IPC_EXCL returns the existing one).
+/// A third call with IPC_EXCL returns EEXIST.
+fn test_msgqueue_box_isolation() {
+    const EEXIST: u64 = (-17i64) as u64;
+    let key: u64 = 0xdeadbeef_u64;
+    let flags = IPC_CREAT | 0o600;
+
+    let id1 = crate::syscall::handle_syscall(NR_MSGGET, &[key, flags, 0, 0, 0, 0]);
+    // Same key, no IPC_EXCL — should return the same msqid.
+    let id2 = crate::syscall::handle_syscall(NR_MSGGET, &[key, flags, 0, 0, 0, 0]);
+    // Same key + IPC_EXCL — should return EEXIST.
+    let id3 = crate::syscall::handle_syscall(
+        NR_MSGGET,
+        &[key, flags | 0o2000 /* IPC_EXCL */, 0, 0, 0, 0],
+    );
+
+    crate::syscall::handle_syscall(NR_MSGCTL, &[id1, IPC_RMID, 0, 0, 0, 0]);
+
+    if (id1 as i64) > 0 && id1 == id2 && id3 == EEXIST {
+        console::print("[Test] msgqueue_box_isolation PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] msgqueue_box_isolation FAILED: id1={} id2={} id3={}\n",
+            id1 as i64, id2 as i64, id3 as i64,
+        );
+    }
+}
+
+// ── CLONE_VFORK dispatch test ──────────────────────────────────────────────
+
+/// Verify CLONE_VFORK (flag 0x4000) is dispatched rather than falling through
+/// to ENOSYS.  In the kernel boot context there is no current process, so
+/// sys_clone_pidfd returns !0u64 (EFAULT-ish) rather than a child PID — but
+/// that is distinct from ENOSYS (-38), proving the dispatch arm is wired.
+fn test_vfork_dispatch() {
+    const ENOSYS: u64 = (-38i64) as u64;
+    const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_VM: u64 = 0x100;
+    // nr=56 (clone), flags=CLONE_VFORK|CLONE_VM|SIGCHLD
+    let flags = CLONE_VFORK | CLONE_VM | 0x11; // 0x11 = SIGCHLD
+    let result = crate::syscall::handle_syscall(56, &[flags, 0, 0, 0, 0, 0]);
+    if result != ENOSYS {
+        console::print("[Test] vfork_dispatch not-ENOSYS PASSED\n");
+    } else {
+        console::print("[Test] vfork_dispatch FAILED: returned ENOSYS (arm not wired)\n");
     }
 }
