@@ -28,31 +28,46 @@ struct MsgQueue {
     messages: VecDeque<KernelMsg>,
 }
 
-static MSGQUEUE_TABLE: Spinlock<BTreeMap<u32, MsgQueue>> = Spinlock::new(BTreeMap::new());
+// Keyed by (box_id, msqid). SysV message queues use integer keys visible to any
+// process, so they must be scoped per box — otherwise a process in one container
+// could open a queue belonging to another container by guessing the key.
+// msqids are still allocated from a global atomic so they are unique across all
+// boxes; the box_id in the tuple provides the isolation boundary.
+static MSGQUEUE_TABLE: Spinlock<BTreeMap<(u64, u32), MsgQueue>> = Spinlock::new(BTreeMap::new());
+// Global counter — msqids only need to be unique within a box (the table key is
+// (box_id, msqid)), but a single atomic is simpler and the 32-bit space is large
+// enough that cross-box "waste" is not a concern in practice.
 static NEXT_MSQID: AtomicU32 = AtomicU32::new(1);
 
+fn current_box_id() -> u64 {
+    akuma_exec::process::current_process().map_or(0, |p| p.box_id)
+}
+
 pub(super) fn sys_msgget(key: i32, flags: i32) -> u64 {
+    let box_id = current_box_id();
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if key == IPC_PRIVATE {
             let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
             let mode = (flags & 0o777) as u32;
-            table.insert(msqid, MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new() });
-            crate::tprint!(96, "[msgget] IPC_PRIVATE -> msqid={}\n", msqid);
+            table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new() });
+            crate::tprint!(96, "[msgget] box={} IPC_PRIVATE -> msqid={}\n", box_id, msqid);
             msqid as u64
         } else {
-            let found = table.iter().find(|(_, q)| q.key == key).map(|(id, _)| *id);
+            let found = table.iter()
+                .find(|((bid, _), q)| *bid == box_id && q.key == key)
+                .map(|((_, msqid), _)| *msqid);
             if let Some(msqid) = found {
                 if flags & IPC_EXCL != 0 {
                     return EEXIST;
                 }
-                crate::tprint!(96, "[msgget] key={} found msqid={}\n", key, msqid);
+                crate::tprint!(96, "[msgget] box={} key={} found msqid={}\n", box_id, key, msqid);
                 msqid as u64
             } else if flags & IPC_CREAT != 0 {
                 let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
                 let mode = (flags & 0o777) as u32;
-                table.insert(msqid, MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new() });
-                crate::tprint!(96, "[msgget] IPC_CREAT key={} -> msqid={}\n", key, msqid);
+                table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new() });
+                crate::tprint!(96, "[msgget] box={} IPC_CREAT key={} -> msqid={}\n", box_id, key, msqid);
                 msqid as u64
             } else {
                 ENOENT
@@ -62,12 +77,13 @@ pub(super) fn sys_msgget(key: i32, flags: i32) -> u64 {
 }
 
 pub(super) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
+    let box_id = current_box_id();
     match cmd {
         IPC_RMID => {
             crate::irq::with_irqs_disabled(|| {
-                MSGQUEUE_TABLE.lock().remove(&msqid);
+                MSGQUEUE_TABLE.lock().remove(&(box_id, msqid));
             });
-            crate::tprint!(96, "[msgctl] IPC_RMID msqid={}\n", msqid);
+            crate::tprint!(96, "[msgctl] box={} IPC_RMID msqid={}\n", box_id, msqid);
             0
         }
         IPC_STAT => {
@@ -76,7 +92,7 @@ pub(super) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             }
             let (key, mode, cbytes, qnum) = crate::irq::with_irqs_disabled(|| {
                 let table = MSGQUEUE_TABLE.lock();
-                if let Some(q) = table.get(&msqid) {
+                if let Some(q) = table.get(&(box_id, msqid)) {
                     (q.key, q.mode, q.cbytes, q.messages.len())
                 } else {
                     (0i32, 0u32, 0usize, 0usize)
@@ -111,7 +127,7 @@ pub(super) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             let mode = u16::from_ne_bytes([ds[20], ds[21]]) as u32;
             crate::irq::with_irqs_disabled(|| {
                 let mut table = MSGQUEUE_TABLE.lock();
-                if let Some(q) = table.get_mut(&msqid) {
+                if let Some(q) = table.get_mut(&(box_id, msqid)) {
                     q.mode = mode;
                     0u64
                 } else {
@@ -124,6 +140,7 @@ pub(super) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
 }
 
 pub(super) fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
+    let box_id = current_box_id();
     if msgsz > MSGMAX {
         return EINVAL;
     }
@@ -145,7 +162,7 @@ pub(super) fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64
     loop {
         let result = crate::irq::with_irqs_disabled(|| {
             let mut table = MSGQUEUE_TABLE.lock();
-            let q = match table.get_mut(&msqid) {
+            let q = match table.get_mut(&(box_id, msqid)) {
                 Some(q) => q,
                 None => return Some(EINVAL),
             };
@@ -167,13 +184,14 @@ pub(super) fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64
 }
 
 pub(super) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) -> u64 {
+    let box_id = current_box_id();
     if !validate_user_ptr(msgp, 8 + msgsz) {
         return EFAULT;
     }
     loop {
         let result = crate::irq::with_irqs_disabled(|| {
             let mut table = MSGQUEUE_TABLE.lock();
-            let q = match table.get_mut(&msqid) {
+            let q = match table.get_mut(&(box_id, msqid)) {
                 Some(q) => q,
                 None => return Some(EINVAL),
             };
@@ -242,4 +260,13 @@ pub(super) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags
             None => akuma_exec::threading::yield_now(),
         }
     }
+}
+
+/// Called from sys_kill_box to remove all queues belonging to a box.
+#[allow(dead_code)]
+pub(super) fn cleanup_box_queues(box_id: u64) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = MSGQUEUE_TABLE.lock();
+        table.retain(|(bid, _), _| *bid != box_id);
+    });
 }

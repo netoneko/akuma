@@ -603,8 +603,8 @@ nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32)
 
 ## 12. `msgctl` / `msgget` / `msgrcv` / `msgsnd` (syscalls 186-189) — `go build` crashes after epoll
 
-**Status:** Fixed (2026-03-15) in `src/syscall/mod.rs`
-**Component:** `src/syscall/mod.rs` — dispatch stubs
+**Status:** Fully implemented (2026-03-16) in `src/syscall/msgqueue.rs`
+**Component:** new `src/syscall/msgqueue.rs`; dispatch in `src/syscall/mod.rs`
 
 ### Symptom
 
@@ -625,19 +625,42 @@ build process and has a code path (same pattern as `restart_syscall` / syscall 1
 an `ENOSYS` return value is used as a pointer without first checking errno, crashing at the
 address of the error code.
 
-### Fix
+### Fix (phase 1 — 2026-03-15)
 
-Added `nr::MSGGET/MSGCTL/MSGRCV/MSGSND` constants (186–189) and stub dispatch arms that
-return `EINVAL` instead of `ENOSYS`.  `EINVAL` is treated by Go as a normal "invalid
-argument" error that is properly checked and returned to the caller, so Go's code never
-reaches the pointer-dereference path.
+Added `nr::MSGGET/MSGCTL/MSGRCV/MSGSND` constants (186–189) and stub dispatch arms
+returning `EINVAL` as a safe stop-gap to prevent the crash.
 
-```rust
-nr::MSGGET => EINVAL,
-nr::MSGCTL => EINVAL,
-nr::MSGRCV => EINVAL,
-nr::MSGSND => EINVAL,
-```
+### Fix (phase 2 — 2026-03-16)
+
+Replaced the stubs with a full SysV message queue implementation in the new module
+`src/syscall/msgqueue.rs`.
+
+**Design:** SysV message queues are opened by integer key via `msgget`, not by file
+descriptor inheritance, so a process in one container could reach another container's
+queue by guessing the key. Queues are therefore scoped per box: the backing store is
+`static MSGQUEUE_TABLE: Spinlock<BTreeMap<(u64, u32), MsgQueue>>` keyed by
+`(box_id, msqid)`. msqids are still allocated from a global atomic (so they are unique
+across all boxes), but all lookups in `msgctl`/`msgsnd`/`msgrcv` are keyed by the
+caller's `box_id`, preventing cross-container access. `box_id` is read from the kernel
+`Process` struct — it cannot be spoofed from userspace as it is never writable from EL0.
+
+**`sys_msgget(key, flags)`** — creates or opens a queue.  `IPC_PRIVATE` always creates a
+new private queue.  A named key searches the global table; `IPC_CREAT`/`IPC_EXCL` behave
+per POSIX.
+
+**`sys_msgctl(msqid, cmd, buf)`** — supports `IPC_RMID` (remove), `IPC_STAT` (read a
+112-byte `msqid_ds` to userspace), and `IPC_SET` (update mode bits from userspace).
+
+**`sys_msgsnd(msqid, msgp, msgsz, flags)`** — reads `mtype` (i64) + `mtext` from
+userspace and enqueues a `KernelMsg`.  Blocks (yields) if the queue is full; returns
+`EAGAIN` if `IPC_NOWAIT` is set.  Enforces `MSGMAX` (8192) per-message and `MSGMNB`
+(16384) total-bytes-queued limits.
+
+**`sys_msgrcv(msqid, msgp, msgsz, msgtyp, flags)`** — dequeues a matching message and
+copies it to userspace.  Supports all three `msgtyp` modes: 0 = any, >0 = exact type
+match, <0 = lowest type ≤ |msgtyp|.  Blocks (yields) if no match and `IPC_NOWAIT` is
+not set; returns `ENOMSG` otherwise.  `MSG_NOERROR` truncates oversized messages;
+without it `E2BIG` is returned and the message stays in the queue.
 
 ---
 
