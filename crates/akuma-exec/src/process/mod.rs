@@ -1699,7 +1699,18 @@ impl Process {
 
         // Reset I/O state (but keep FDs and Channel!)
         self.reset_io();
-        
+
+        // POSIX: on exec, custom signal handlers are reset to SIG_DFL; SIG_IGN is preserved.
+        // Also disable the alternate signal stack — it pointed into the old address space.
+        for action in &mut self.signal_actions {
+            if matches!(action.handler, SignalHandler::UserFn(_)) {
+                *action = SignalAction::default();
+            }
+        }
+        self.sigaltstack_sp = 0;
+        self.sigaltstack_size = 0;
+        self.sigaltstack_flags = 2; // SS_DISABLE
+
         Ok(())
     }
 
@@ -1771,6 +1782,17 @@ impl Process {
         }
 
         self.reset_io();
+
+        // POSIX: on exec, custom signal handlers are reset to SIG_DFL; SIG_IGN is preserved.
+        // Also disable the alternate signal stack — it pointed into the old address space.
+        for action in &mut self.signal_actions {
+            if matches!(action.handler, SignalHandler::UserFn(_)) {
+                *action = SignalAction::default();
+            }
+        }
+        self.sigaltstack_sp = 0;
+        self.sigaltstack_size = 0;
+        self.sigaltstack_flags = 2; // SS_DISABLE
 
         Ok(())
     }

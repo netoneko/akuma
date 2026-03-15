@@ -494,14 +494,120 @@ two path resolutions and the rename I/O call.
 
 ---
 
-## 11. Known remaining gaps (not yet fixed)
+## 10. Signal state not reset on `execve` — child crash at FAR=0x90 with stale sigaltstack
+
+**Status:** Fixed (2026-03-15) in `crates/akuma-exec/src/process/mod.rs`
+**Component:** `replace_image` / `replace_image_from_path`
+
+### Symptom
+
+After the `CLONE_PIDFD` fix (#8), `go build` still crashes in the child
+compiler subprocess (`pid=50`, a freshly exec'd `/usr/lib/go/bin/go`) with:
+
+```
+[WILD-DA] pid=50 FAR=0x90 ELR=0x100a65b8 last_sc=101
+[signal] Delivering sig 11 to handler 0x10093180 sp=0xc400bc70 on sigaltstack [0xc4004000,0xc400c000)
+[signal] sig 11 re-entrant fault at 0x48
+```
+
+`last_sc=101` is `nanosleep` — not a wait syscall. `ELR=0x100a65b8` is the
+same Go netpoller function seen in earlier crashes. The signal is delivered on
+the sigaltstack `[0xc4004000, 0xc400c000)` even though pid=50 has only just
+started and should have a clean signal state.
+
+### Root cause
+
+`replace_image` and `replace_image_from_path` did not reset signal state after
+replacing the process image. The new child process (`pid=50`) inherited:
+
+- `signal_actions`: parent pid=46's goroutine signal handlers (e.g. SIGSEGV →
+  `0x10093180`) pointing into the **parent's** binary. After exec, pid=50 maps
+  its own binary at the same addresses, so the handler address coincidentally
+  looks valid — but the handler runs with the parent's signal setup, not the
+  child's freshly initialised one.
+- `sigaltstack_sp = 0xc4004000`, `sigaltstack_size = 0x8000`: the parent's
+  goroutine-local gsignal stack. This address may or may not exist in the new
+  address space.
+
+Per POSIX, on `execve`:
+- Signals with a custom handler (`SA_SIGACTION` / function pointer) must be
+  reset to `SIG_DFL`.
+- `SIG_IGN` dispositions are preserved.
+- The alternate signal stack is cleared (`SS_DISABLE`).
+
+Because this was not done, the child's first fault delivered a signal using the
+parent's stale sigaltstack, landing `sp` at `0xc400bc70` inside the inherited
+`[0xc4004000, 0xc400c000)` window. The handler then faulted at `FAR=0x90`
+(netpoller nil deref) and the re-entrant check killed the process with a
+secondary fault at `FAR=0x48`.
+
+### Fix
+
+In both `replace_image` and `replace_image_from_path`, after `reset_io()`:
+
+```rust
+// POSIX: on exec, custom signal handlers are reset to SIG_DFL; SIG_IGN is preserved.
+// Also disable the alternate signal stack — it pointed into the old address space.
+for action in &mut self.signal_actions {
+    if matches!(action.handler, SignalHandler::UserFn(_)) {
+        *action = SignalAction::default();
+    }
+}
+self.sigaltstack_sp = 0;
+self.sigaltstack_size = 0;
+self.sigaltstack_flags = 2; // SS_DISABLE
+```
+
+---
+
+## 11. `tgkill` (syscall 131) returns ENOSYS — spurious ENOSYS log noise
+
+**Status:** Fixed (2026-03-15) in `src/syscall/signal.rs` + `src/syscall/mod.rs`
+**Component:** `src/syscall/signal.rs` — `sys_tgkill`
+
+### Symptom
+
+The kernel log contains entries such as:
+
+```
+[ENOSYS] nr=131 pid=46 args=[0x2e, 0x2e, 0x0]
+```
+
+Go uses `tgkill(tgid, tid, sig)` to send signals to specific threads within a
+thread group. With `ENOSYS`, signal delivery to specific threads fails silently.
+
+### Root cause
+
+`tkill` (syscall 130) was implemented as `sys_tkill(tid, sig)` but `tgkill`
+(syscall 131) had no constant or dispatch entry, so it fell through to `ENOSYS`.
+
+### Fix
+
+Added `sys_tgkill(_tgid, tid, sig)` in `src/syscall/signal.rs` that forwards
+to `sys_tkill`. The `tgid` argument is accepted but not validated (Akuma does
+not track thread groups separately from PIDs):
+
+```rust
+pub(super) fn sys_tgkill(_tgid: u32, tid: u32, sig: u32) -> u64 {
+    sys_tkill(tid, sig)
+}
+```
+
+Added `nr::TGKILL = 131` constant and dispatch entry:
+
+```rust
+nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),
+```
+
+---
+
+## 12. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
 | Syscall / feature | Notes |
 |---|---|
 | `rt_sigtimedwait` | Used by Go's signal forwarding; currently unimplemented |
-| `tgkill` | Go uses this to send signals to specific threads; `tkill` is implemented but does not actually invoke userspace handlers |
 | Signal mask during handler | Full `sa_mask` blocking during handler execution not implemented; re-entrant detection (fix #2) covers the common crash case |
 | `clone(CLONE_SIGHAND)` | Shared signal tables across threads not implemented |
 | `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval (see issue #6 in `KNOWN_ISSUES.md`) |

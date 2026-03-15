@@ -226,3 +226,9 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
         }
     }
 }
+
+/// tgkill(tgid, tid, sig) — like tkill but checks the thread group id.
+/// We don't track thread groups separately so we just forward to tkill.
+pub(super) fn sys_tgkill(_tgid: u32, tid: u32, sig: u32) -> u64 {
+    sys_tkill(tid, sig)
+}

@@ -267,6 +267,7 @@ pub mod nr {
     pub const SCHED_SETAFFINITY: u64 = 122;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const TKILL: u64 = 130;
+    pub const TGKILL: u64 = 131;
     pub const PIDFD_OPEN: u64 = 434;
     pub const CLOSE_RANGE: u64 = 436;
     pub const SYSINFO: u64 = 179;
@@ -689,6 +690,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             0
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
+        nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIDFD_OPEN => pidfd::sys_pidfd_open(args[0] as u32, args[1] as u32),
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
