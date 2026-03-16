@@ -772,8 +772,8 @@ failure the pre-inserted entry is removed in the error path.
 
 ## 14. `go build -x -n .` deadlocks — goroutine scheduler never starts
 
-**Status:** Under investigation (2026-03-16)
-**Component:** unknown — likely `src/syscall/sync.rs` (futex) or `src/syscall/poll.rs` (epoll + eventfd)
+**Status:** Fixed (2026-03-16) in `src/syscall/sync.rs`
+**Component:** `src/syscall/sync.rs` — `sys_futex` FUTEX_WAIT path
 
 ### Symptom
 
