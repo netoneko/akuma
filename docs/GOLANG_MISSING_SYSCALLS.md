@@ -870,22 +870,47 @@ could cause early returns).
 
 This is lower priority — the durations look correct for a blocking wait.
 
-### Next debugging steps
+### Fix
 
-1. **Add per-process current-syscall field** to `Process` struct, written on
-   syscall entry and cleared on return. Expose in `ps` and `/proc/<pid>/status`.
-   This will confirm threads 49–51 are in `futex` and show the exact futex
-   address being waited on.
+Root cause confirmed as **H2** (futex missed-wakeup race).
 
-2. **Check `poll.rs` eventfd handling** — add `FileDescriptor::EventFd` to the
-   epoll readiness match arm if missing (same pattern as `PidFd` fix in #7).
+In `src/syscall/sync.rs`, the `FUTEX_WAIT` path read the futex value **outside**
+the `FUTEX_WAITERS` lock:
 
-3. **Add eventfd write logging** — log when `sys_eventfd_write` is called and
-   whether any epoll fd is watching that eventfd. If writes happen but epoll
-   never returns `EPOLLIN`, H1 is confirmed.
+```rust
+// BEFORE (racy):
+let mut current_val: u32 = 0;
+copy_from_user_safe(&mut current_val, uaddr, 4); // outside lock
+if current_val != val { return EAGAIN; }
+let mut waiters = FUTEX_WAITERS.lock();
+waiters.entry(uaddr).or_default().push(tid);   // inserted after value read
+```
 
-4. **Audit `sys_futex` for CLONE_VM** — verify the futex physical-address key
-   is derived from the address-space owner's page table, not the calling thread's.
+Race window: if `futex_wake` fires between the value read and the TID push, it
+finds an empty queue (returns 0), sets no sticky flag, and the waiter calls
+`schedule_blocking(u64::MAX)` — parking forever because the waker already ran.
+
+Fix: move the value read **inside** the lock so the check and push are atomic
+with respect to concurrent `futex_do_wake` calls:
+
+```rust
+// AFTER (race-free):
+let mut waiters = FUTEX_WAITERS.lock();
+let mut current_val: u32 = 0;
+copy_from_user_safe(&mut current_val, uaddr, 4); // inside lock
+if current_val != val { return EAGAIN; }
+waiters.entry(uaddr).or_default().push(tid);     // atomic with wake
+```
+
+A concurrent wake now either:
+- Runs **before** we lock → it already changed the futex word → we see the
+  new value → return EAGAIN immediately (no park).
+- Runs **after** we push → it finds our TID, calls `get_waker_for_thread(tid).wake()`
+  → sticky flag set → `schedule_blocking` returns immediately.
+
+Covered by `src/sync_tests.rs`: `test_futex_wake_before_wait` (race scenario)
+and `test_futex_basic_wake` / `test_futex_wake_all` / `test_futex_requeue`
+(multi-threaded wake paths).
 
 ---
 

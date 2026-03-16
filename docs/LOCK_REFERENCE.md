@@ -16,9 +16,12 @@ Quick reference card for Akuma's synchronization primitives.
 └─────────────────────────────────────────────────────────────┘
 
 Special:
-  • POOL         → scheduler context OR with_irqs_disabled()
-  • IRQ_HANDLERS → copy-out pattern (release before calling)
-  • FS_MUTEX     → async mutex (can hold across await)
+  • POOL           → scheduler context OR with_irqs_disabled()
+  • IRQ_HANDLERS   → copy-out pattern (release before calling)
+  • FS_MUTEX       → async mutex (can hold across await)
+  • FUTEX_WAITERS  → spinning_top (no IRQ disable); may call POOL via
+                     copy_from_user_safe → set_user_copy_fault_handler;
+                     value read must happen INSIDE this lock (missed-wake fix)
 ```
 
 ## Quick Rules
@@ -44,6 +47,9 @@ Special:
 | `IRQ_WORK_QUEUE` | `executor.rs:146` | `Spinlock<Vec<IrqWork>>` |
 | `FS_MUTEX` | `async_fs.rs:23` | `Mutex<CriticalSectionRawMutex, ()>` |
 | `HOST_KEY` | `ssh.rs:75` | `Spinlock<Option<SigningKey>>` |
+| `FUTEX_WAITERS` | `syscall/sync.rs:4` | `Spinlock<BTreeMap<usize, Vec<usize>>>` |
+| `VFORK_WAITERS` | `syscall/proc.rs:4` | `Spinlock<BTreeMap<u32, usize>>` |
+| `SYSCALL_LOG` | `syscall/log.rs:19` | `Spinlock<BTreeMap<u32, ProcessSyscallLog>>` |
 
 ## Common Patterns
 
