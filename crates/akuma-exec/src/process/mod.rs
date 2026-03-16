@@ -1084,6 +1084,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
                 name: proc.name.clone(),
                 state,
                 last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
+                args: proc.args.clone(),
             });
         }
 

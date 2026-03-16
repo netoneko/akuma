@@ -463,7 +463,7 @@ impl Command for PsCommand {
         Box::pin(async move {
             use akuma_exec::process;
 
-            let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  NAME\r\n").await;
+            let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  CMDLINE\r\n").await;
 
             let procs = process::list_processes();
 
@@ -473,9 +473,20 @@ impl Command for PsCommand {
                 for p in procs {
                     let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
                     let sc = if p.last_syscall > 0 { format!("{:>3}", p.last_syscall) } else { String::from("  -") };
+                    let cmdline = if p.args.is_empty() {
+                        p.name.clone()
+                    } else {
+                        format!("{} {}", p.name, p.args.join(" "))
+                    };
+                    // Truncate to 80 chars to keep output readable
+                    let cmdline = if cmdline.len() > 80 {
+                        format!("{}…", &cmdline[..79])
+                    } else {
+                        cmdline
+                    };
                     let line = format!(
                         "{:>5}  {:>4}  {:<8}  {:<8}  {:>7}  {}\r\n",
-                        p.pid, p.ppid, box_str, p.state, sc, p.name
+                        p.pid, p.ppid, box_str, p.state, sc, cmdline
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }

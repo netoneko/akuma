@@ -361,6 +361,7 @@ pub struct ProcessInfo2 {
     pub name: String,
     pub state: &'static str,
     pub last_syscall: u64,
+    pub args: Vec<String>,
 }
 
 #[cfg(test)]
