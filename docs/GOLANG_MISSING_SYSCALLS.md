@@ -1056,7 +1056,53 @@ all paths is safe.
 
 ---
 
-## 18. Known remaining gaps (not yet fixed)
+## 18. `compile -V=full` produces empty output — argv rejected by user_va_limit
+
+**Status:** Fixed (2026-03-16) in `src/syscall/mod.rs`
+**Component:** `user_va_limit()` — too-low upper bound for user VA validation
+
+### Symptom
+
+```
+go: parsing buildID from go tool compile -V=full: unexpected output:
+```
+
+`go build` failed immediately after the first VFORK child (the `-V=full` build
+ID check) returned exit code 0 with empty stdout. The subsequent actual
+compilation (1.70 s) succeeded (code 0) but go still exited with code 1.
+
+### Root cause
+
+`sys_execve` reads argv with `validate_user_ptr`, which calls `user_va_limit()`.
+That function returned `proc.memory.stack_top` ≈ 0xa4508000 (the ELF fixed
+stack top).
+
+Go on AArch64 allocates goroutine stacks and M-structs from high virtual
+arenas. On this binary the arenas sit at 0x203e000000 ≈ 130 GB, well above
+both `stack_top` and the 4 GB limit. Every user pointer in that range fails
+the `end > user_va_limit()` check.
+
+For `sys_execve`: Go's `forkAndExecInChild1` places its argv array on the
+current goroutine stack (heap memory at 0xc???_???? – 0x203?_????). With the
+wrong upper bound the argv reading loop breaks immediately, `args` comes out
+empty, and compile starts with `argc=0`, sees no `-V=full`, prints nothing,
+exits 0 → "unexpected output:".
+
+For other syscalls (e.g. `sigaltstack` called during runtime init): the
+goroutine stack pointer passed as `ss_ptr` is at 0x203???_???? > limit →
+EFAULT → Go runtime crashes dereferencing a null goroutine pointer.
+
+### Fix
+
+Return `0x0000_FFFF_FFFF_FFFFu64` (48-bit / standard Linux user VA limit)
+from `user_va_limit()` instead of `stack_top`. The kernel's own addresses are
+in the TTBR1 range (bit 63 = 1), so excluding those is the only necessary
+cap. The real safety for arbitrary pointers is `is_current_user_range_mapped`
+(the page-table walk immediately after) and the EL1 data-abort recovery path.
+
+---
+
+## 19. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 

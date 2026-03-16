@@ -341,11 +341,17 @@ struct Timespec {
 }
 
 fn user_va_limit() -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
-        proc.memory.stack_top as u64
-    } else {
-        0x4000_0000
-    }
+    // Allow the full user (TTBR0) address range.
+    //
+    // Go on AArch64 allocates goroutine stacks and M-structs from high arenas
+    // (e.g. 0x203e000000 ≈ 130 GB) via mmap, so any fixed small cap (4 GB,
+    // stack_top, …) rejects valid user pointers.
+    //
+    // The kernel's own addresses live in the TTBR1 range (top half of 64-bit
+    // space, bit 63 = 1), so excluding those is the only necessary upper bound.
+    // The real safety for arbitrary pointers is is_current_user_range_mapped
+    // (the page-table walk below) plus the EL1 data-abort recovery path.
+    0x0000_FFFF_FFFF_FFFFu64 // 48-bit user VA limit (standard Linux)
 }
 
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
