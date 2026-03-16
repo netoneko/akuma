@@ -47,6 +47,10 @@ pub(crate) fn pipe_write(id: u32, data: &[u8]) -> usize {
             }
             data.len()
         } else {
+            // Pipe not found — always log this as it indicates a use-after-close bug.
+            // Go's compile -V=full writes to stdout (fd=1 = PipeWrite) and if the pipe
+            // ID is missing here, sys_write returns 0 and Go sees empty output.
+            crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
             0
         }
     })

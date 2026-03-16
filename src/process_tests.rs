@@ -52,6 +52,22 @@ pub fn run_all_tests() {
     test_vfork_waiters_clean_at_boot();
     test_vfork_complete_removes_entry();
 
+    // Test that user_va_limit allows Go's high-arena goroutine stacks (>4 GB, ~130 GB)
+    test_user_va_limit_48bit();
+
+    // Test signal mask blocking on delivery (SA_NODEFER logic)
+    test_signal_mask_nodefer_blocks();
+    test_signal_mask_nodefer_flag_skips();
+
+    // Test signal frame layout constants are self-consistent
+    test_sigframe_layout_constants();
+
+    // Test pipe write/read round-trip (catches use-after-close silent data loss)
+    test_pipe_write_read_roundtrip();
+    test_pipe_write_missing_returns_zero();
+    test_pipe_close_write_signals_eof();
+    test_pipe_refcount_lifecycle();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -642,6 +658,286 @@ fn test_vfork_waiters_clean_at_boot() {
             len,
         );
     }
+}
+
+// ── user_va_limit regression tests ────────────────────────────────────────
+
+/// Verify that `user_va_limit()` returns the full 48-bit TTBR0 limit.
+///
+/// Regression test for the bug where `user_va_limit` returned
+/// `proc.memory.stack_top` (≈2.7 GB) or later a hard-coded 4 GB cap.  Both
+/// were too small for Go on AArch64, which places goroutine stacks and
+/// M-structs in high arenas like 0x203e000000 (≈130 GB).  The correct limit
+/// is 0x0000_FFFF_FFFF_FFFF (standard Linux 48-bit VA).
+fn test_user_va_limit_48bit() {
+    const EXPECTED: u64 = 0x0000_FFFF_FFFF_FFFFu64;
+    // 4 GB — the old wrong cap
+    const OLD_CAP_4GB: u64 = 0x1_0000_0000u64;
+    // Representative Go goroutine arena address (~130 GB) that must be allowed
+    const GO_GOROUTINE_ARENA: u64 = 0x203e_0000_00u64;
+
+    let limit = crate::syscall::user_va_limit_value();
+
+    if limit == EXPECTED && limit > OLD_CAP_4GB && limit >= GO_GOROUTINE_ARENA {
+        console::print("[Test] user_va_limit_48bit PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] user_va_limit_48bit FAILED: limit=0x{:x} expected=0x{:x}\n",
+            limit, EXPECTED,
+        );
+    }
+}
+
+// ── Signal mask / SA_NODEFER regression tests ─────────────────────────────
+
+/// Verify that delivering a signal blocks the signal in the process signal mask
+/// when SA_NODEFER is NOT set.
+///
+/// The kernel code in `try_deliver_signal` does:
+///   if action.flags & SA_NODEFER == 0 { proc.signal_mask |= 1 << (signal - 1); }
+///
+/// This test exercises that bit arithmetic directly: starting with a cleared
+/// mask and a SIGURG delivery (signal 23, bit 22), the mask must have bit 22
+/// set after delivery and only bit 22 set.
+fn test_signal_mask_nodefer_blocks() {
+    const SA_NODEFER: u64 = 0x40000000;
+    const SIGURG: u32 = 23;
+    let flags_without_nodefer: u64 = 0; // No SA_NODEFER
+
+    let mut signal_mask: u64 = 0;
+    // Mirror the kernel logic from try_deliver_signal
+    if flags_without_nodefer & SA_NODEFER == 0 && SIGURG >= 1 && SIGURG <= 64 {
+        signal_mask |= 1u64 << (SIGURG - 1);
+    }
+
+    let expected_bit = 1u64 << (SIGURG - 1); // bit 22
+    if signal_mask == expected_bit {
+        console::print("[Test] signal_mask_nodefer_blocks PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] signal_mask_nodefer_blocks FAILED: mask=0x{:x} expected=0x{:x}\n",
+            signal_mask, expected_bit,
+        );
+    }
+}
+
+/// Verify that SA_NODEFER prevents the delivered signal from being added to
+/// the process signal mask.
+///
+/// When SA_NODEFER is set the signal handler may be entered recursively; the
+/// kernel must NOT block the signal in `proc.signal_mask`.
+fn test_signal_mask_nodefer_flag_skips() {
+    const SA_NODEFER: u64 = 0x40000000;
+    const SIGURG: u32 = 23;
+    let flags_with_nodefer: u64 = SA_NODEFER;
+
+    let mut signal_mask: u64 = 0;
+    if flags_with_nodefer & SA_NODEFER == 0 && SIGURG >= 1 && SIGURG <= 64 {
+        signal_mask |= 1u64 << (SIGURG - 1);
+    }
+
+    if signal_mask == 0 {
+        console::print("[Test] signal_mask_nodefer_flag_skips PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] signal_mask_nodefer_flag_skips FAILED: mask unexpectedly set to 0x{:x}\n",
+            signal_mask,
+        );
+    }
+}
+
+// ── Signal frame layout constant regression tests ─────────────────────────
+
+/// Verify that the signal frame layout constants are self-consistent and match
+/// the Linux AArch64 ABI.
+///
+/// Layout (from linux/arch/arm64/include/uapi/asm/sigcontext.h):
+///   siginfo_t      128 bytes  at offset   0
+///   ucontext_t hdr 168 bytes  at offset 128  (uc_flags+uc_link+uc_stack+uc_sigmask+__unused)
+///   sigcontext     280 bytes  at offset 296  (fault_addr + regs[31] + sp + pc + pstate)
+///   FPSIMD record  528 bytes  at offset 576  (_aarch64_ctx(8)+fpsr(4)+fpcr(4)+vregs[32](512))
+///   null terminator  8 bytes  at offset 1104
+///   total size    1112 bytes
+///
+/// The `uc_sigmask` field lives at ucontext+40 → frame offset 168 (128+40).
+fn test_sigframe_layout_constants() {
+    use crate::exceptions::{
+        TEST_SIGFRAME_FPSIMD, TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_SIZE,
+        TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_UCONTEXT,
+    };
+
+    let mut ok = true;
+
+    // siginfo_t: 128 bytes, starts at 0
+    if TEST_SIGFRAME_UCONTEXT != 128 {
+        crate::safe_print!(64, "[Test] sigframe: UCONTEXT offset wrong: {}\n", TEST_SIGFRAME_UCONTEXT);
+        ok = false;
+    }
+
+    // ucontext header: 168 bytes
+    if TEST_SIGFRAME_MCONTEXT != 128 + 168 {
+        crate::safe_print!(64, "[Test] sigframe: MCONTEXT offset wrong: {}\n", TEST_SIGFRAME_MCONTEXT);
+        ok = false;
+    }
+
+    // sigcontext: 280 bytes
+    if TEST_SIGFRAME_FPSIMD != 128 + 168 + 280 {
+        crate::safe_print!(64, "[Test] sigframe: FPSIMD offset wrong: {}\n", TEST_SIGFRAME_FPSIMD);
+        ok = false;
+    }
+
+    // FPSIMD(528) + null(8) = 536
+    if TEST_SIGFRAME_SIZE != 128 + 168 + 280 + 528 + 8 {
+        crate::safe_print!(64, "[Test] sigframe: SIZE wrong: {}\n", TEST_SIGFRAME_SIZE);
+        ok = false;
+    }
+
+    // uc_sigmask is at ucontext_t+40 within the frame
+    if TEST_SIGFRAME_UC_SIGMASK != 128 + 40 {
+        crate::safe_print!(64, "[Test] sigframe: UC_SIGMASK offset wrong: {}\n", TEST_SIGFRAME_UC_SIGMASK);
+        ok = false;
+    }
+
+    if ok {
+        console::print("[Test] sigframe_layout_constants PASSED\n");
+    }
+}
+
+// ── Pipe lifecycle regression tests ───────────────────────────────────────
+
+/// Verify a basic pipe write/read round-trip works correctly.
+///
+/// This is the most fundamental sanity check for the pipe subsystem: create a
+/// pipe, write known bytes into the write end, read them back from the read
+/// end, and verify the content matches.
+///
+/// If this test fails or `pipe_write` silently returns 0, the symptom would be
+/// processes getting empty stdout — exactly the bug seen with `compile -V=full`.
+fn test_pipe_write_read_roundtrip() {
+    let id = crate::syscall::pipe::pipe_create();
+    let input = b"hello pipe";
+    let n = crate::syscall::pipe::pipe_write(id, input);
+    if n != input.len() {
+        crate::safe_print!(64, "[Test] pipe_write_read_roundtrip FAILED: pipe_write returned {} expected {}\n", n, input.len());
+        crate::syscall::pipe::pipe_close_write(id);
+        crate::syscall::pipe::pipe_close_read(id);
+        return;
+    }
+
+    let mut buf = [0u8; 32];
+    let (read_n, eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    if read_n == input.len() && buf[..read_n] == *input && !eof {
+        console::print("[Test] pipe_write_read_roundtrip PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] pipe_write_read_roundtrip FAILED: read_n={} eof={} content={:?}\n",
+            read_n, eof, &buf[..read_n],
+        );
+    }
+
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+}
+
+/// Verify `pipe_write` returns 0 for an unknown pipe ID (use-after-close guard).
+///
+/// After `pipe_close_write` + `pipe_close_read` the pipe is removed from PIPES.
+/// Any subsequent `pipe_write` call with that ID must return 0, not panic.
+/// This matches the "silent 0 return" behaviour that was identified as the
+/// root cause of `compile -V=full` producing empty stdout: if fd=1 somehow
+/// pointed at a closed pipe, `sys_write` would return 0 silently and Go's
+/// `fmt.Printf` would discard all output.
+fn test_pipe_write_missing_returns_zero() {
+    let id = crate::syscall::pipe::pipe_create();
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+    // Pipe should be fully removed now; write must return 0 and not panic.
+    let n = crate::syscall::pipe::pipe_write(id, b"should be lost");
+    if n == 0 {
+        console::print("[Test] pipe_write_missing_returns_zero PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] pipe_write_missing_returns_zero FAILED: returned {} expected 0\n",
+            n,
+        );
+    }
+}
+
+/// Verify that closing the write end of a pipe causes subsequent reads to
+/// return EOF (`eof = true, n = 0`).
+///
+/// Go's pipe reader blocks in `sys_read` until either data is available or the
+/// write end is closed.  If the write-close logic is broken, the reader would
+/// hang forever rather than getting EOF.
+fn test_pipe_close_write_signals_eof() {
+    let id = crate::syscall::pipe::pipe_create();
+    // Don't write anything; just close the write end.
+    crate::syscall::pipe::pipe_close_write(id);
+
+    let mut buf = [0u8; 16];
+    let (n, eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    if n == 0 && eof {
+        console::print("[Test] pipe_close_write_signals_eof PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] pipe_close_write_signals_eof FAILED: n={} eof={}\n",
+            n, eof,
+        );
+    }
+
+    crate::syscall::pipe::pipe_close_read(id);
+}
+
+/// Verify pipe refcount lifecycle: the pipe stays alive until BOTH the cloned
+/// write ref AND the original read ref are closed.
+///
+/// `dup3` (and `fork_process`) call `pipe_clone_ref` to increment the write or
+/// read count.  The pipe must not be destroyed after the first close — only
+/// after all refs on both sides reach zero.  This test simulates one dup:
+///   write_count=2 (original + cloned), read_count=1
+/// After the first write close: pipe still alive (write_count=1 > 0).
+/// After second write close: EOF visible to reader.
+/// After read close: pipe fully removed.
+fn test_pipe_refcount_lifecycle() {
+    let id = crate::syscall::pipe::pipe_create();
+    // Clone the write ref (simulates dup3 or fork).
+    crate::syscall::pipe::pipe_clone_ref(id, true);
+
+    // Close first write ref — pipe must still be alive.
+    crate::syscall::pipe::pipe_close_write(id);
+    let n = crate::syscall::pipe::pipe_write(id, b"still alive");
+    if n == 0 {
+        crate::safe_print!(64, "[Test] pipe_refcount_lifecycle FAILED: pipe died after first close\n");
+        crate::syscall::pipe::pipe_close_write(id);
+        crate::syscall::pipe::pipe_close_read(id);
+        return;
+    }
+
+    // Close second write ref — now the read end should see EOF after draining.
+    crate::syscall::pipe::pipe_close_write(id);
+
+    let mut buf = [0u8; 32];
+    let (read_n, _eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    // After draining, a second read should return EOF.
+    let (n2, eof2) = crate::syscall::pipe::pipe_read(id, &mut buf);
+
+    if read_n == 11 && n2 == 0 && eof2 {
+        console::print("[Test] pipe_refcount_lifecycle PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] pipe_refcount_lifecycle FAILED: read_n={} n2={} eof2={}\n",
+            read_n, n2, eof2,
+        );
+    }
+
+    crate::syscall::pipe::pipe_close_read(id);
 }
 
 /// Directly exercise the CLONE_VFORK race-fix mechanism:

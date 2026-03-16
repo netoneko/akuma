@@ -340,6 +340,11 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+/// Exposed for kernel tests only.
+pub(crate) fn user_va_limit_value() -> u64 {
+    user_va_limit()
+}
+
 fn user_va_limit() -> u64 {
     // Allow the full user (TTBR0) address range.
     //
