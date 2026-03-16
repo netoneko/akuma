@@ -914,16 +914,157 @@ and `test_futex_basic_wake` / `test_futex_wake_all` / `test_futex_requeue`
 
 ---
 
-## 15. Known remaining gaps (not yet fixed)
+## 15. Signal frame: complete `ucontext_t`, FPSIMD state, and `rt_sigreturn` mask restore
+
+**Status:** Fixed (2026-03-16) in `src/exceptions.rs`
+**Component:** `src/exceptions.rs` — `try_deliver_signal`, `do_rt_sigreturn`
+
+### Symptom
+
+Go binaries using SIGURG (goroutine preemption) or SIGSEGV handlers crashed
+re-entrantly with `FAR=0x48` (nil goroutine pointer dereference inside the
+signal handler) after the first signal was delivered. Log:
+
+```
+[signal] Delivering sig 23 to handler 0x10093180 (restorer=0x2000)
+[WILD-DA] pid=48 FAR=0x48 ELR=0x100956f4
+```
+
+### Root cause
+
+The signal frame written by `try_deliver_signal` left `uc_stack` and
+`uc_sigmask` zeroed. Go's `sigtramp` reads `uc_stack.ss_flags` to determine
+whether the signal arrived on the altstack; with `ss_flags=0` (SS_ONSTACK not
+set), Go searched for its goroutine via `m.gsignal` but `g.m` was nil because
+the goroutine struct page hadn't been copied to the child address space (see
+fix #16). Additionally, FP/NEON registers were not saved/restored across signal
+delivery, so signal handlers that use floating-point corrupted the goroutine's
+FP state.
+
+### Fix
+
+Six changes in `src/exceptions.rs`:
+
+1. **`uc_stack`/`uc_sigmask`** — populate at `new_sp + SIGFRAME_UCONTEXT`:
+   - `uc_stack.ss_sp/flags/size` from `proc.sigaltstack_*` when on altstack
+   - `uc_sigmask` from `proc.signal_mask`
+
+2. **SA_NODEFER** — block the delivered signal during handler execution
+   (`proc.signal_mask |= 1u64 << (signal-1)`) unless `SA_NODEFER` (0x40000000)
+   is set.
+
+3. **`rt_sigreturn` mask restore** — read `uc_sigmask` from the signal frame
+   and restore to `proc.signal_mask` (clearing SIGKILL/SIGSTOP bits).
+
+4. **FPSIMD extension record** — save all 32 V-registers + fpsr/fpcr from the
+   kernel stack NEON save area into `__reserved` at `SIGFRAME_FPSIMD` (offset
+   576); restore on `rt_sigreturn`. `SIGFRAME_SIZE` extended from 592 to 1112.
+
+5. **`si_code` fix** — use `SI_TKILL=-6` for software-sent signals (tkill,
+   SIGURG) instead of hardcoded `SEGV_MAPERR=1`.
+
+6. **Extended register dump** — WILD-DA/WILD-IA handlers now print x8–x28
+   (including x28 = Go's goroutine pointer) for crash diagnosis.
+
+---
+
+## 16. VFORK child gets zeroed goroutine struct — crash at FAR=0x90
+
+**Status:** Fixed (2026-03-16) in `crates/akuma-exec/src/process/mod.rs`
+**Component:** `fork_process` — lazy region page copy
+
+### Symptom
+
+VFORK children (Go's `rawVforkSyscall` spawning compile/link tools) crashed
+immediately with `FAR=0x90`, which is a null goroutine pointer dereference:
+`ldr x0, [x28, #0x30]` (load g.m) → x0=0 → `ldr x?, [x0, #0x90]` → SIGSEGV.
+
+### Root cause
+
+`fork_process` copied the stack, code+heap, dynamic linker, and tracked
+`mmap_regions`, then called `clone_lazy_regions` which copies only lazy-region
+**metadata**. Go's goroutine struct lives in a demand-paged heap arena (e.g.
+`0xc40021c0`) that is registered as a lazy region but not in `mmap_regions`.
+When the VFORK child accessed this page, demand-paging gave it a zeroed frame
+instead of the parent's goroutine data, so `g.m` read as nil.
+
+### Fix
+
+After copying `mmap_regions` and before `clone_lazy_regions`, iterate the
+parent's lazy region list and copy any physically-mapped pages (up to 4096
+pages = 16 MB cap to bound fork latency for large heaps):
+
+```rust
+const MAX_FORK_LAZY_PAGES: usize = 4096;
+for (va, size) in lazy_ranges {
+    for i in 0..pages {
+        if lazy_pages_copied >= MAX_FORK_LAZY_PAGES { break 'lazy_copy; }
+        if let Some(src_phys) = translate_user_va(parent_l0, page_va) {
+            if let Ok(frame) = new_proc.address_space.alloc_and_map(...) {
+                memcpy(src, phys_to_virt(frame.addr), PAGE_SIZE);
+            }
+        }
+    }
+}
+```
+
+`translate_user_va` returns `None` for unmapped (not yet demand-paged) pages,
+so sparse lazy regions iterate quickly without copying.
+
+---
+
+## 17. VFORK parent hangs forever when child crashes
+
+**Status:** Fixed (2026-03-16) in `src/syscall/proc.rs`, `src/exceptions.rs`
+**Component:** fault exit paths — `vfork_complete` not called on fault
+
+### Symptom
+
+After a VFORK child crashed due to a fault (SIGSEGV, SIGILL, etc.), the parent
+thread blocked forever in `schedule_blocking(u64::MAX)`. The kernel log showed
+the last VFORK clone but no further output:
+
+```
+[T28.59] [clone] flags=0x4111 stack=0x0
+[T28.62] [epoll] pwait enter: pid=48 epfd=5 timeout=0ms
+[HUNG]
+```
+
+### Root cause
+
+`vfork_complete(child_pid)` was only called from `sys_exit`, `sys_exit_group`,
+and `do_execve`. When a VFORK child died via a hardware fault (data abort,
+instruction abort, BRK, EL1 fault recovery), none of those paths were taken,
+so `VFORK_WAITERS` still held the parent TID and `schedule_blocking` never
+returned.
+
+### Fix
+
+Made `vfork_complete` `pub(crate)` and added calls at every fault-induced exit
+path in `src/exceptions.rs`:
+
+- `el1_fault_recovery_pad` path (EC=0x25 EL1 data abort)
+- Data abort EL0 (`EC_DATA_ABORT_LOWER`) — before `return_to_kernel(-11)`
+- Instruction abort EL0 (`EC_INST_ABORT_LOWER`) — before `return_to_kernel(-11)`
+- `rt_sigreturn` failure — before `return_to_kernel(-11)`
+- BRK / SIGTRAP — before `return_to_kernel(-5)`
+- Unknown EC — before `return_to_kernel(-1)`
+
+Each call is `if let Some(pid) = read_current_pid() { vfork_complete(pid); }`.
+`vfork_complete` is a no-op if the PID has no VFORK waiter, so adding it to
+all paths is safe.
+
+---
+
+## 18. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
 | Syscall / feature | Notes |
 |---|---|
 | `rt_sigtimedwait` | Used by Go's signal forwarding; currently unimplemented |
-| Signal mask during handler | Full `sa_mask` blocking during handler execution not implemented; re-entrant detection (fix #2) covers the common crash case |
 | `clone(CLONE_SIGHAND)` | Shared signal tables across threads not implemented |
-| `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval. Current deadlock (#14) may be caused by missing eventfd readiness in epoll |
-| Unmapped runtime data above g0 stack | Go places `m` struct adjacent to `g0.stack.hi`; if that region is not covered by a lazy mmap region the handler loop fix masks the crash but the underlying missing mapping is unresolved |
-| SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting; programs relying on transparent syscall restart after signal may need to retry manually |
+| `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval |
+| SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting |
 | Per-process current-syscall visibility | `ps` shows `SYSCALL=-` for all processes; threads blocked in long-running syscalls (futex, epoll) are invisible in diagnostics |
+| CLONE_VM sharing | VFORK+CLONE_VM creates a full copy of the address space instead of sharing page tables; this makes fork slow for large heap processes. True CLONE_VM would eliminate the copy |

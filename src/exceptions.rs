@@ -1238,10 +1238,13 @@ extern "C" fn rust_sync_el1_handler() {
                 let _ = write!(w, "  Killing PID {} ({})\n", proc.pid, proc.name);
                 w.flush();
                 let l0_phys = proc.address_space.l0_phys();
+                let pid = proc.pid;
                 proc.exited = true;
                 proc.exit_code = -14; // EFAULT
                 proc.state = akuma_exec::process::ProcessState::Zombie(-14);
-                akuma_exec::process::kill_thread_group(proc.pid, l0_phys);
+                akuma_exec::process::kill_thread_group(pid, l0_phys);
+                // Wake any CLONE_VFORK parent waiting for this child to exec/exit.
+                crate::syscall::proc::vfork_complete(pid);
             }
             // Redirect ELR to the recovery landing pad so that ERET does NOT
             // return into the middle of the faulting instruction sequence.
@@ -1552,6 +1555,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             if syscall_num == 139 {
                 if let Some(saved_x0) = do_rt_sigreturn(frame) {
                     return saved_x0;
+                }
+                if let Some(pid) = akuma_exec::process::read_current_pid() {
+                    crate::syscall::proc::vfork_complete(pid);
                 }
                 akuma_exec::process::return_to_kernel(-11);
             }
@@ -1975,6 +1981,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
+                crate::syscall::proc::vfork_complete(proc.pid);
             }
             akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
@@ -2188,6 +2195,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
+                crate::syscall::proc::vfork_complete(proc.pid);
             }
             akuma_exec::process::return_to_kernel(-11) // never returns
         }
@@ -2243,6 +2251,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
         }
         esr::EC_BRK_AARCH64 => {
             // BRK instruction — intentional trap/abort from user code
+            if let Some(pid) = akuma_exec::process::read_current_pid() {
+                crate::syscall::proc::vfork_complete(pid);
+            }
             akuma_exec::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
@@ -2260,17 +2271,20 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mov {}, sp", out(reg) sp);
             }
             let tid = akuma_exec::threading::current_thread_id();
-            
+
             crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n", ec, iss);
             crate::safe_print!(128, "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", tid, elr, far, spsr);
             crate::safe_print!(64, "  TTBR0={:#x}, SP={:#x}\n", ttbr0, sp);
-            
+
             // Check if this looks like a kernel TTBR0 (boot page tables)
             // Boot TTBR0 is typically around 0x43xxxxxx
             if ttbr0 & 0xFFFF_0000_0000_0000 == 0 && ttbr0 < 0x4400_0000 && ttbr0 > 0x4300_0000 {
                 safe_print!(128, "  WARNING: TTBR0 looks like boot page tables, not user process!\n");
             }
-            
+
+            if let Some(pid) = akuma_exec::process::read_current_pid() {
+                crate::syscall::proc::vfork_complete(pid);
+            }
             akuma_exec::process::return_to_kernel(-1) // never returns
         }
     }

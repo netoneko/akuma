@@ -2789,15 +2789,37 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // Go heap arena) must be explicitly copied so the child doesn't get
     // zeroed pages and dereference a nil goroutine pointer.
     // copy_range_phys skips unmapped pages, so sparse regions are cheap.
+    // We cap total pages to avoid excessive copy time for large heaps.
     {
+        const MAX_FORK_LAZY_PAGES: usize = 4096; // 16 MB cap
         let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
             let table = LAZY_REGION_TABLE.lock();
             table.get(&parent_pid)
                 .map(|regions| regions.iter().map(|r| (r.start_va, r.size)).collect())
                 .unwrap_or_default()
         });
-        for (va, size) in lazy_ranges {
-            let _ = copy_range_phys(parent_l0, va, size, &mut new_proc.address_space);
+        let mut lazy_pages_copied = 0usize;
+        'lazy_copy: for (va, size) in lazy_ranges {
+            let pages = (size + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+            for i in 0..pages {
+                if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
+                    break 'lazy_copy;
+                }
+                let page_va = va + i * mmu::PAGE_SIZE;
+                if let Some(src_phys) = mmu::translate_user_va(parent_l0, page_va) {
+                    if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
+                        unsafe {
+                            let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
+                            let dst = mmu::phys_to_virt(frame.addr);
+                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                        }
+                        lazy_pages_copied += 1;
+                    }
+                }
+            }
+        }
+        if config().syscall_debug_info_enabled && lazy_pages_copied > 0 {
+            log::debug!("[fork] copied {} lazy pages from pid={}", lazy_pages_copied, parent_pid);
         }
     }
     

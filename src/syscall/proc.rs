@@ -8,8 +8,9 @@ use akuma_net::socket::libc_errno;
 static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>> = Spinlock::new(BTreeMap::new());
 
 /// Wake the vfork parent (if any) of the given child PID.
-/// Called from do_execve (on successful image replacement) and sys_exit_group/sys_exit.
-fn vfork_complete(child_pid: u32) {
+/// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
+/// and fault exit paths in exceptions.rs.
+pub(crate) fn vfork_complete(child_pid: u32) {
     let parent_tid = crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().remove(&child_pid)
     });
