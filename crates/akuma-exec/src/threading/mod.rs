@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
@@ -99,6 +99,14 @@ static TOTAL_CPU_TIMES: [AtomicU64; MAX_THREADS] = {
 /// Atomic "sticky wake" flags - set when wake() is called, cleared when thread resumes
 static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread pending signal number (0 = none).
+/// Set by sys_tkill/sys_tgkill when a UserFn signal handler is registered.
+/// Cleared and delivered at the next syscall return for that thread.
+static PENDING_SIGNAL: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
     [INIT; MAX_THREADS]
 };
 
@@ -2247,6 +2255,27 @@ pub fn set_user_copy_fault_handler(handler: u64) {
 #[inline]
 pub fn current_thread_id() -> usize {
     get_current_thread_register()
+}
+
+/// Pend a signal on the given thread slot.
+/// The signal will be delivered at the next syscall return for that thread.
+/// Overwrites any previously pending signal (only one pending signal supported).
+pub fn pend_signal_for_thread(tid: usize, sig: u32) {
+    if tid < MAX_THREADS {
+        PENDING_SIGNAL[tid].store(sig, Ordering::Release);
+    }
+}
+
+/// Take the pending signal for the current thread, if any.
+/// Returns Some(sig) and clears the pending signal, or None.
+pub fn take_pending_signal() -> Option<u32> {
+    let tid = get_current_thread_register();
+    if tid < MAX_THREADS {
+        let sig = PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel);
+        if sig != 0 { Some(sig) } else { None }
+    } else {
+        None
+    }
 }
 
 /// Get max thread count

@@ -700,6 +700,54 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
     false
 }
 
+/// Fixed VA where the rt_sigreturn trampoline is mapped in every user process.
+/// Go on arm64 does not set SA_RESTORER and relies on the kernel/vDSO to provide
+/// the return stub.  We map this page lazily on first signal delivery.
+const SIGRETURN_TRAMPOLINE_ADDR: usize = 0x2000;
+
+/// Ensure the rt_sigreturn trampoline page is mapped at SIGRETURN_TRAMPOLINE_ADDR
+/// in the current process.  Returns Some(SIGRETURN_TRAMPOLINE_ADDR) on success.
+///
+/// AArch64 trampoline:
+///   movz x8, #139   ; SYS_rt_sigreturn
+///   svc  #0
+fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
+    // movz x8, #139 = 0xD2801168 (LE: 68 11 80 D2)
+    // svc  #0       = 0xD4000001 (LE: 01 00 00 D4)
+    const TRAMPOLINE: [u8; 8] = [0x68, 0x11, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4];
+
+    if akuma_exec::mmu::is_current_user_page_mapped(SIGRETURN_TRAMPOLINE_ADDR) {
+        return Some(SIGRETURN_TRAMPOLINE_ADDR);
+    }
+
+    let frame = crate::pmm::alloc_page_zeroed()?;
+    unsafe {
+        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
+        core::ptr::copy_nonoverlapping(TRAMPOLINE.as_ptr(), ptr, TRAMPOLINE.len());
+    }
+
+    let (table_frames, installed) = unsafe {
+        akuma_exec::mmu::map_user_page(SIGRETURN_TRAMPOLINE_ADDR, frame.addr, akuma_exec::mmu::user_flags::RX)
+    };
+
+    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+        if installed {
+            owner.address_space.track_user_frame(frame);
+        } else {
+            crate::pmm::free_page(frame);
+        }
+        for tf in table_frames {
+            owner.address_space.track_page_table_frame(tf);
+        }
+    } else {
+        crate::pmm::free_page(frame);
+        for tf in table_frames { crate::pmm::free_page(tf); }
+        return None;
+    }
+
+    Some(SIGRETURN_TRAMPOLINE_ADDR)
+}
+
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
@@ -721,7 +769,19 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         _ => return false,
     };
 
-    let restorer = action.restorer;
+    // When the process didn't register a restorer (Go on arm64 relies on the
+    // vDSO instead of SA_RESTORER), lazily map our kernel-provided trampoline.
+    let restorer = if action.restorer != 0 {
+        action.restorer
+    } else {
+        match ensure_sigreturn_trampoline(pid) {
+            Some(addr) => addr,
+            None => {
+                crate::tprint!(64, "[signal] failed to map sigreturn trampoline for pid={}\n", pid);
+                return false;
+            }
+        }
+    };
     let frame_ref = unsafe { &*frame };
     let user_sp = frame_ref.sp_el0 as usize;
 
@@ -1479,6 +1539,21 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             akuma_exec::threading::clear_current_trap_frame();
+
+            // Deliver any pending signal (e.g. SIGURG for Go goroutine preemption).
+            // sys_tkill pends the signal; we deliver it here so the target thread
+            // sees it at the next syscall boundary (async delivery via pending queue).
+            if let Some(sig) = akuma_exec::threading::take_pending_signal() {
+                // Store the syscall return value in x0 of the trap frame so that
+                // sigreturn restores it correctly (the signal handler's x0 = sig,
+                // and after sigreturn the caller sees x0 = syscall result).
+                unsafe { (*frame).x0 = ret; }
+                if try_deliver_signal(frame, sig, 0) {
+                    return sig as u64; // x0 = signal number for the handler
+                }
+                // Delivery failed (no handler / bad stack); just return normally.
+            }
+
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
@@ -1778,6 +1853,24 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         pid, far_usize, frame_ref.elr_el1, last_sc,
                         frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3,
                         frame_ref.x4, frame_ref.x5, frame_ref.x6, frame_ref.x7);
+
+                    // Auto-dump syscall log for post-crash diagnosis.
+                    // Note: CLONE_VM threads share the address space owner's process info
+                    // page, so read_current_pid() returns the owner PID for all siblings —
+                    // the syscall log is stored under that owner PID, not the thread's own PID.
+                    match crate::syscall::log::get_formatted(pid) {
+                        Some(log_bytes) => {
+                            crate::safe_print!(64, "[WILD-DA] syscall log (pid={}):\n", pid);
+                            if let Ok(s) = core::str::from_utf8(&log_bytes) {
+                                for line in s.lines() {
+                                    crate::safe_print!(128, "  {}\n", line);
+                                }
+                            }
+                        }
+                        None => {
+                            crate::safe_print!(128, "[WILD-DA] no syscall log for pid={} (CLONE_VM thread? check owner PID)\n", pid);
+                        }
+                    }
                 }
             }
 

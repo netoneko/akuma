@@ -222,6 +222,11 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
             if sig == 6 {
                 super::proc::sys_exit_group(-(sig as i32));
             }
+            // Pend the signal on the target thread so it is delivered at the
+            // next syscall return for that thread.  This implements async signal
+            // delivery: the target goroutine sees the signal (e.g. SIGURG for
+            // preemption) the next time it returns from a syscall.
+            akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
             0
         }
     }
