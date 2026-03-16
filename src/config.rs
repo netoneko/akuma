@@ -209,6 +209,18 @@ pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 
+/// Enable per-process syscall ring-buffer log in procfs (/proc/<pid>/syscalls).
+pub const PROC_SYSCALL_LOG_ENABLED: bool = true;
+
+/// Number of most-recent syscall entries to retain per process.
+pub const PROC_SYSCALL_LOG_MAX_ENTRIES: usize = 500;
+
+/// How long (ms) to keep a dead process's log after it exits.
+pub const PROC_SYSCALL_LOG_RETAIN_MS: u64 = 10_000; // 10 s
+
+/// Expose SysV IPC message queue state at /proc/sysvipc/msg.
+pub const PROC_SYSVIPC_ENABLED: bool = true;
+
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 

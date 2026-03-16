@@ -262,6 +262,30 @@ pub(super) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags
     }
 }
 
+pub(crate) struct MsgQueueSnapshot {
+    pub box_id: u64,
+    pub key: i32,
+    pub msqid: u32,
+    pub mode: u32,
+    pub cbytes: usize,
+    pub qnum: usize,
+}
+
+pub(crate) fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
+    crate::irq::with_irqs_disabled(|| {
+        MSGQUEUE_TABLE.lock().iter()
+            .map(|((box_id, msqid), q)| MsgQueueSnapshot {
+                box_id: *box_id,
+                key: q.key,
+                msqid: *msqid,
+                mode: q.mode,
+                cbytes: q.cbytes,
+                qnum: q.messages.len(),
+            })
+            .collect()
+    })
+}
+
 /// Called from sys_kill_box to remove all queues belonging to a box.
 #[allow(dead_code)]
 pub(super) fn cleanup_box_queues(box_id: u64) {

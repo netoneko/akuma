@@ -15,7 +15,8 @@ mod aio;
 mod container;
 mod pidfd;
 mod eventfd;
-mod msgqueue;
+pub(crate) mod log;
+pub(crate) mod msgqueue;
 mod fb;
 mod fs;
 mod mem;
@@ -524,7 +525,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     }
 
-    let t0 = if track_time { crate::timer::uptime_us() } else { 0 };
+    let need_timing = track_time || crate::config::PROC_SYSCALL_LOG_ENABLED;
+    let t0 = if need_timing { crate::timer::uptime_us() } else { 0 };
 
     let result = match syscall_num {
         nr::EXIT => proc::sys_exit(args[0] as i32),
@@ -757,11 +759,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     };
 
-    if track_time {
+    if need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
-            proc.syscall_stats.add_time_us(syscall_num, elapsed);
+        if track_time {
+            if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+                proc.syscall_stats.add_time_us(syscall_num, elapsed);
+            }
+        }
+        if crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0 {
+            log::record(owner_pid, syscall_num, t0, elapsed, result);
         }
     }
 

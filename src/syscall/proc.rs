@@ -174,6 +174,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+            crate::syscall::log::mark_exited(pid);
+        }
         vfork_complete(pid);
     }
     code as u64
@@ -193,6 +196,9 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+            crate::syscall::log::mark_exited(pid);
+        }
         akuma_exec::process::kill_thread_group(pid, l0_phys);
         vfork_complete(pid);
     }

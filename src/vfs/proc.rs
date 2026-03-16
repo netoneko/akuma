@@ -126,6 +126,34 @@ impl Filesystem for ProcFilesystem {
                 size: 0,
             });
 
+            // Add recently-exited PIDs that still have retained syscall logs
+            if crate::config::PROC_SYSCALL_LOG_ENABLED {
+                let logged_pids = crate::syscall::log::list_pids_with_logs();
+                let live_pids: alloc::collections::BTreeSet<u32> = entries.iter()
+                    .filter_map(|e| e.name.parse::<u32>().ok())
+                    .collect();
+                for pid in logged_pids {
+                    if !live_pids.contains(&pid) {
+                        entries.push(DirEntry {
+                            name: format!("{}", pid),
+                            is_dir: true,
+                            is_symlink: false,
+                            size: 0,
+                        });
+                    }
+                }
+            }
+
+            // sysvipc directory
+            if crate::config::PROC_SYSVIPC_ENABLED {
+                entries.push(DirEntry {
+                    name: String::from("sysvipc"),
+                    is_dir: true,
+                    is_symlink: false,
+                    size: 0,
+                });
+            }
+
             return Ok(entries);
         }
 
@@ -139,17 +167,35 @@ impl Filesystem for ProcFilesystem {
                 ]);
             }
 
-            // /<pid> - list "fd" directory
+            if parts[0] == "sysvipc" && crate::config::PROC_SYSVIPC_ENABLED {
+                return Ok(alloc::vec![
+                    DirEntry { name: String::from("msg"), is_dir: false, is_symlink: false, size: 0 },
+                ]);
+            }
+
+            // /<pid> - list "fd" directory and optionally "syscalls"
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            if !Self::process_exists(pid) {
+            // Process may have exited but still have a retained log
+            let pid_has_log = crate::config::PROC_SYSCALL_LOG_ENABLED
+                && crate::syscall::log::get_formatted(pid).is_some();
+            if !Self::process_exists(pid) && !pid_has_log {
                 return Err(FsError::NotFound);
             }
-            return Ok(alloc::vec![DirEntry {
+            let mut pid_entries = alloc::vec![DirEntry {
                 name: String::from("fd"),
                 is_dir: true,
                 is_symlink: false,
                 size: 0,
-            }]);
+            }];
+            if crate::config::PROC_SYSCALL_LOG_ENABLED {
+                pid_entries.push(DirEntry {
+                    name: String::from("syscalls"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
+            }
+            return Ok(pid_entries);
         }
 
         if parts.len() == 2 && parts[1] == "fd" {
@@ -184,9 +230,9 @@ impl Filesystem for ProcFilesystem {
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         let path = path.trim_start_matches('/');
-        
-        // Handle virtual files first (boxes, net/tcp, etc.)
-        if path == "boxes" || path.starts_with("net/") {
+
+        // Handle virtual files first (boxes, net/tcp, sysvipc/msg, <pid>/syscalls, etc.)
+        if path == "boxes" || path.starts_with("net/") || path == "sysvipc/msg" {
             let data = self.read_file(path)?;
             if offset >= data.len() {
                 return Ok(0);
@@ -194,6 +240,23 @@ impl Filesystem for ProcFilesystem {
             let n = buf.len().min(data.len() - offset);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
             return Ok(n);
+        }
+
+        // Handle <pid>/syscalls
+        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "syscalls" {
+                if let Ok(pid) = parts[0].parse::<Pid>() {
+                    let data = crate::syscall::log::get_formatted(pid)
+                        .ok_or(FsError::NotFound)?;
+                    if offset >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(data.len() - offset);
+                    buf[..n].copy_from_slice(&data[offset..offset + n]);
+                    return Ok(n);
+                }
+            }
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
@@ -269,6 +332,43 @@ impl Filesystem for ProcFilesystem {
 
         if path == "net/udp" {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
+        }
+
+        if path == "sysvipc/msg" && crate::config::PROC_SYSVIPC_ENABLED {
+            let queues = crate::syscall::msgqueue::list_msg_queues();
+            let mut out = String::from(
+                "       key      msqid perms      cbytes       qnum lspid lrpid   stime   rtime   ctime\n"
+            );
+            for q in queues {
+                // Box isolation: box N only sees its own queues
+                if current_box_id != 0 && q.box_id != current_box_id {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "{:10} {:10} {:5o} {:10} {:10}     0     0       0       0       0\n",
+                    q.key, q.msqid, q.mode, q.cbytes, q.qnum
+                ));
+            }
+            return Ok(out.into_bytes());
+        }
+
+        // Handle <pid>/syscalls
+        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "syscalls" {
+                if let Ok(pid) = parts[0].parse::<Pid>() {
+                    // Box isolation check: only allow if same box or host
+                    if current_box_id != 0 {
+                        if let Some(proc) = process::lookup_process(pid) {
+                            if proc.box_id != current_box_id {
+                                return Err(FsError::NotFound);
+                            }
+                        }
+                    }
+                    return crate::syscall::log::get_formatted(pid)
+                        .ok_or(FsError::NotFound);
+                }
+            }
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
@@ -379,6 +479,10 @@ impl Filesystem for ProcFilesystem {
             return true;
         }
 
+        if crate::config::PROC_SYSVIPC_ENABLED && (path == "sysvipc" || path == "sysvipc/msg") {
+            return true;
+        }
+
         // Try to parse as fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
             return Self::process_exists(pid) && fd_num <= 1;
@@ -388,10 +492,17 @@ impl Filesystem for ProcFilesystem {
         if let Ok(pid) = Self::parse_pid_path(path) {
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() == 1 {
-                return Self::process_exists(pid);
+                if Self::process_exists(pid) { return true; }
+                if crate::config::PROC_SYSCALL_LOG_ENABLED {
+                    return crate::syscall::log::get_formatted(pid).is_some();
+                }
+                return false;
             }
             if parts.len() == 2 && parts[1] == "fd" {
                 return Self::process_exists(pid);
+            }
+            if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
+                return crate::syscall::log::get_formatted(pid).is_some();
             }
         }
 
@@ -462,6 +573,30 @@ impl Filesystem for ProcFilesystem {
             });
         }
 
+        if crate::config::PROC_SYSVIPC_ENABLED && path == "sysvipc" {
+            return Ok(Metadata {
+                is_dir: true,
+                size: 0,
+                inode,
+                mode: 0o40555,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        if crate::config::PROC_SYSVIPC_ENABLED && path == "sysvipc/msg" {
+            return Ok(Metadata {
+                is_dir: false,
+                size: 0,
+                inode,
+                mode: 0o100444,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
         // Try fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
             let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
@@ -483,7 +618,26 @@ impl Filesystem for ProcFilesystem {
 
         // Try pid or pid/fd path
         if let Ok(pid) = Self::parse_pid_path(path) {
-            if !Self::process_exists(pid) {
+            let parts: Vec<&str> = path.split('/').collect();
+            // <pid>/syscalls
+            if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
+                if crate::syscall::log::get_formatted(pid).is_some() {
+                    return Ok(Metadata {
+                        is_dir: false,
+                        size: 0,
+                        inode,
+                        mode: 0o100444,
+                        created: None,
+                        modified: None,
+                        accessed: None,
+                    });
+                }
+                return Err(FsError::NotFound);
+            }
+            let pid_exists = Self::process_exists(pid)
+                || (crate::config::PROC_SYSCALL_LOG_ENABLED
+                    && crate::syscall::log::get_formatted(pid).is_some());
+            if !pid_exists {
                 return Err(FsError::NotFound);
             }
             return Ok(Metadata {
