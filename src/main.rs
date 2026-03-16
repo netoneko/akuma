@@ -33,6 +33,7 @@ mod ramfb;
 mod rng;
 mod shell;
 mod shell_tests;
+mod sync_tests;
 mod ssh;
 mod syscall;
 mod tests;
@@ -596,6 +597,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                                     console::print("WARNING: Threading tests failed but continuing...\n");
                                 }
                             }
+
+                            // Run futex sync tests
+                            sync_tests::run_all_tests();
 
                             // Run process execution tests
                             process_tests::run_all_tests();

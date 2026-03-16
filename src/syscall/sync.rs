@@ -56,19 +56,21 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // Read the futex value atomically
-            let mut current_val: u32 = 0;
-            if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
-                return EFAULT;
-            }
-            if current_val != val {
-                return EAGAIN;
-            }
-
             let tid = akuma_exec::threading::current_thread_id();
 
             {
                 let mut waiters = FUTEX_WAITERS.lock();
+                // Read value INSIDE the lock — atomic with respect to futex_do_wake.
+                // A concurrent wake either runs before we lock (and changes the futex
+                // value, so we see the new value and return EAGAIN) or after we insert
+                // our TID (so it finds us and calls wake, setting the sticky flag).
+                let mut current_val: u32 = 0;
+                if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                    return EFAULT;
+                }
+                if current_val != val {
+                    return EAGAIN;
+                }
                 let queue = waiters.entry(uaddr).or_insert_with(Vec::new);
                 queue.push(tid);
             }
