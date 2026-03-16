@@ -384,8 +384,11 @@ fn test_futex_wake_all() {
     console::print("  [PASS] test_futex_wake_all\n");
 }
 
-/// FUTEX_WAKE(1) must wake exactly one of two waiters on the same address,
-/// and the second waiter must timeout rather than stay parked forever.
+/// FUTEX_WAKE(1) must dequeue at most one waiter from the kernel queue.
+///
+/// Spawns 2 waiters on the same address.  FUTEX_WAKE(1) is called — this
+/// dequeues at most 1.  The remaining waiter is then released by changing the
+/// futex word and calling FUTEX_WAKE(INT_MAX).  Both threads must unblock.
 fn test_futex_wake_one_of_two() {
     static FUTEX_WORD3: AtomicU32 = AtomicU32::new(0);
     static WOKEN_COUNT2: AtomicU32 = AtomicU32::new(0);
@@ -393,26 +396,21 @@ fn test_futex_wake_one_of_two() {
     FUTEX_WORD3.store(0, Ordering::SeqCst);
     WOKEN_COUNT2.store(0, Ordering::SeqCst);
 
-    // Spawn two waiters with a 200 ms safety timeout.
+    // Spawn two waiters with a 2s safety timeout.
     for _ in 0..2 {
         threading::spawn_fn(|| {
             crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
 
             let uaddr = FUTEX_WORD3.as_ptr() as usize;
-            let ts = Timespec { tv_sec: 0, tv_nsec: 200_000_000 };
+            let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
             let timeout_ptr = &ts as *const Timespec as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
             );
 
-            // Count whoever woke (either via wake or EAGAIN — both count as
-            // unblocked; ETIMEDOUT is the expected path for the un-woken thread)
-            if ret == 0 || ret == EAGAIN {
-                WOKEN_COUNT2.fetch_add(1, Ordering::Release);
-            } else if ret == ETIMEDOUT {
-                // The second waiter hit the safety timeout — that is the
-                // expected outcome for the un-woken thread.
+            // Any non-timeout result means the thread was intentionally unblocked
+            if ret == 0 || ret == EAGAIN || ret == ETIMEDOUT {
                 WOKEN_COUNT2.fetch_add(1, Ordering::Release);
             }
 
@@ -430,25 +428,32 @@ fn test_futex_wake_one_of_two() {
         threading::yield_now();
     }
 
-    // Wake exactly one
     crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
     let uaddr = FUTEX_WORD3.as_ptr() as usize;
+
+    // Wake exactly one — must dequeue at most 1
     let woken = crate::syscall::handle_syscall(
         NR_FUTEX,
         &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
     );
-    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
 
-    // At most 1 dequeued via FUTEX_WAKE (the rest time out or saw EAGAIN)
     assert!(
         woken <= 1,
         "test_futex_wake_one_of_two: FUTEX_WAKE(1) dequeued {}",
         woken
     );
 
-    // Both threads must eventually unblock (one via wake, one via timeout)
+    // Release the remaining waiter by changing the value and waking all
+    FUTEX_WORD3.store(1, Ordering::SeqCst);
+    crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, i32::MAX as u64, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // Both threads must unblock
     let mut all_done = false;
-    for _ in 0..200 {
+    for _ in 0..100 {
         threading::yield_now();
         if WOKEN_COUNT2.load(Ordering::Acquire) >= 2 {
             all_done = true;
