@@ -770,7 +770,126 @@ failure the pre-inserted entry is removed in the error path.
 
 ---
 
-## 14. Known remaining gaps (not yet fixed)
+## 14. `go build -x -n .` deadlocks — goroutine scheduler never starts
+
+**Status:** Under investigation (2026-03-16)
+**Component:** unknown — likely `src/syscall/sync.rs` (futex) or `src/syscall/poll.rs` (epoll + eventfd)
+
+### Symptom
+
+`go build -x -n .` in `/playground` starts four OS threads (PIDs 48–51) and
+then freezes indefinitely without producing any output or reading any source
+files. The process can run for 30+ minutes without making progress:
+
+```
+PID  PPID  BOX  STATE      SYSCALL  CMDLINE
+ 48     0  0         running         -  /usr/lib/go/bin/go build -x -n .
+ 49    48  0         running         -  /usr/lib/go/bin/go build -x -n .
+ 50    48  0         running         -  /usr/lib/go/bin/go build -x -n .
+ 51    48  0         running         -  /usr/lib/go/bin/go build -x -n .
+```
+
+`/proc/sysvipc/msg` shows no active message queues (header only) — the message
+queue implementation from fix #12 is not implicated.
+
+### Evidence from `/proc/<pid>/syscalls`
+
+PID 48's ring buffer (500 entries, ~2 s of history at the time of capture) contains
+**only three syscall numbers**, repeating without interruption from the very first
+logged entry through the most recent:
+
+```
+NR 113  clock_gettime        (1–9 µs)
+NR  22  epoll_pwait          (96–60 000 µs, result always 0 = timeout)
+NR 101  nanosleep            (~12 ms)
+```
+
+`NR 113 → 22 → 101 → 113 → 22 → 101 → …`
+
+This is Go's network poller thread: `clock_gettime` to compute the deadline,
+`epoll_pwait` to wait for I/O events (times out every time — **result is always 0**),
+then `nanosleep` to yield before polling again.
+
+**Not a single file I/O syscall** (`openat`, `read`, `write`, `fstat`) appears in
+the log. The build never read a single source file.
+
+PIDs 49, 50, 51 have **no log entries at all**. Since they are CLONE_VM threads
+they log under PID 48's entry (all share the same process info page and thus the
+same `read_current_pid()` value). The absence of any record means each of those
+threads entered a single blocking syscall at startup and has never returned from
+it in 30+ minutes. The most likely candidate is `futex(FUTEX_WAIT)` — Go parks
+idle OS threads this way.
+
+### Diagnosis
+
+The Go runtime successfully spawned OS threads but its **goroutine scheduler
+deadlocked before running any goroutines**:
+
+- Thread 48 (Go network poller): running, but `epoll_pwait` returns 0 on every
+  call — no events are ever delivered.
+- Threads 49–51 (Go worker OS threads): parked in `futex(FUTEX_WAIT)` from the
+  moment they were created; never woken.
+- No goroutine has been scheduled on any thread. No build work has started.
+
+### Hypotheses (priority order)
+
+**H1 — epoll never fires for Go's internal scheduler eventfd.**
+
+Go's runtime creates an `eventfd` at startup and registers it with the epoll fd
+(`EPOLL_CTL_ADD, EPOLLIN`). When a goroutine becomes runnable, the scheduler
+writes to the eventfd to wake the poller, which in turn wakes a parked OS thread.
+If our epoll implementation does not track `eventfd` readiness correctly (e.g.
+`EventFd` is not handled in the epoll readiness check in `poll.rs`), the eventfd
+write is never reflected as `EPOLLIN`, so the poller never wakes, and the parked
+threads stay parked.
+
+Check: `src/syscall/poll.rs` — does the `epoll_pwait` readiness loop handle
+`FileDescriptor::EventFd(_)`? Compare with how `PidFd` readiness was added in
+fix #7.
+
+**H2 — `futex(FUTEX_WAKE)` does not correctly wake CLONE_VM sibling threads.**
+
+The goroutine scheduler uses `futex(FUTEX_WAKE)` to unpark a sleeping OS thread.
+If `sys_futex` in `src/syscall/sync.rs` looks up the futex address in the wrong
+address space (e.g. using the calling thread's page table instead of the shared
+CLONE_VM address space), the wake may silently do nothing.
+
+Check: does `sys_futex` resolve the futex VA relative to the address-space owner,
+or relative to the current thread? For CLONE_VM threads the physical page backing
+the futex word is the same for all threads — but if the kernel translates the VA
+through different page tables it may get different physical addresses for the same
+VA and the waiter/waker never agree on a key.
+
+**H3 — `epoll_pwait` with a signal mask (`sigmask` argument) returns immediately.**
+
+Go passes a non-null `sigmask` to `epoll_pwait`. Our implementation may ignore
+the mask (acceptable) but it must not return 0 events prematurely. If the handler
+returns 0 when it should block, the poller spins at maximum speed (the ~60 ms
+`epoll_pwait` durations visible in the log show it IS blocking, but something
+could cause early returns).
+
+This is lower priority — the durations look correct for a blocking wait.
+
+### Next debugging steps
+
+1. **Add per-process current-syscall field** to `Process` struct, written on
+   syscall entry and cleared on return. Expose in `ps` and `/proc/<pid>/status`.
+   This will confirm threads 49–51 are in `futex` and show the exact futex
+   address being waited on.
+
+2. **Check `poll.rs` eventfd handling** — add `FileDescriptor::EventFd` to the
+   epoll readiness match arm if missing (same pattern as `PidFd` fix in #7).
+
+3. **Add eventfd write logging** — log when `sys_eventfd_write` is called and
+   whether any epoll fd is watching that eventfd. If writes happen but epoll
+   never returns `EPOLLIN`, H1 is confirmed.
+
+4. **Audit `sys_futex` for CLONE_VM** — verify the futex physical-address key
+   is derived from the address-space owner's page table, not the calling thread's.
+
+---
+
+## 15. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
@@ -779,6 +898,7 @@ The following are likely to surface as Go workloads grow more complex:
 | `rt_sigtimedwait` | Used by Go's signal forwarding; currently unimplemented |
 | Signal mask during handler | Full `sa_mask` blocking during handler execution not implemented; re-entrant detection (fix #2) covers the common crash case |
 | `clone(CLONE_SIGHAND)` | Shared signal tables across threads not implemented |
-| `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval (see issue #6 in `KNOWN_ISSUES.md`) |
+| `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval. Current deadlock (#14) may be caused by missing eventfd readiness in epoll |
 | Unmapped runtime data above g0 stack | Go places `m` struct adjacent to `g0.stack.hi`; if that region is not covered by a lazy mmap region the handler loop fix masks the crash but the underlying missing mapping is unresolved |
 | SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting; programs relying on transparent syscall restart after signal may need to retry manually |
+| Per-process current-syscall visibility | `ps` shows `SYSCALL=-` for all processes; threads blocked in long-running syscalls (futex, epoll) are invisible in diagnostics |
