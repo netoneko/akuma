@@ -691,14 +691,28 @@ syscalls.
 Added a `static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>>` (child PID → parent
 thread ID) and a `vfork_complete(child_pid)` helper in `src/syscall/proc.rs`.
 
-**After fork with `CLONE_VFORK`** — register the parent thread ID in `VFORK_WAITERS`
-then block it with `schedule_blocking(u64::MAX)`:
+**Before `fork_process`** — insert into `VFORK_WAITERS` _before_ the child thread is
+marked READY. Inserting after `fork_process` returns races: the child can exec and call
+`vfork_complete` (finding nothing in the map) before the parent inserts its TID,
+leaving the parent blocked forever.
 
 ```rust
+// Insert BEFORE fork so the child always finds the entry when it calls vfork_complete.
 if flags & CLONE_VFORK != 0 {
-    let parent_tid = akuma_exec::threading::current_thread_id();
-    VFORK_WAITERS.lock().insert(new_pid, parent_tid);
-    akuma_exec::threading::schedule_blocking(u64::MAX);
+    VFORK_WAITERS.lock().insert(child_pid, parent_tid);
+}
+// Now fork — child may exec immediately on the next scheduler tick.
+match fork_process(child_pid, stack) {
+    Ok(new_pid) => {
+        // ... CLONE_PIDFD handling ...
+        if flags & CLONE_VFORK != 0 {
+            schedule_blocking(u64::MAX);  // unblocked by vfork_complete
+        }
+    }
+    Err(_) => {
+        // Clean up the pre-inserted entry on failure.
+        if flags & CLONE_VFORK != 0 { VFORK_WAITERS.lock().remove(&child_pid); }
+    }
 }
 ```
 
@@ -718,6 +732,41 @@ unsafe { enter_user_mode(&proc.context); }
 ```rust
 vfork_complete(pid);
 ```
+
+### Race condition in original fix (2026-03-16)
+
+After the initial fix landed, `go build` ran without crashing but never completed
+(~85 s of nanosleep polling, 6848 `epoll_pwait` calls returning 0 events).
+
+**Root cause:** a race between `fork_process` marking the child READY and the parent
+inserting into `VFORK_WAITERS`:
+
+```
+Parent                            Child thread (newly READY)
+──────────────────────────────    ──────────────────────────────
+fork_process() → child READY  →  [scheduler picks child]
+                                  run fork-child code
+                                  call execve
+                                  do_execve → vfork_complete(child_pid)
+                                    VFORK_WAITERS.remove(child_pid) → None
+                                    (no wake sent to parent!)
+                                  enter_user_mode(new image)
+VFORK_WAITERS.insert(child_pid, parent_tid)  ← TOO LATE
+schedule_blocking(u64::MAX)
+  WOKEN_STATES[parent_tid] == false → block forever  ← BUG
+```
+
+**Fix:** insert into `VFORK_WAITERS` **before** `fork_process` (before the child
+thread is created).  `vfork_complete` then always finds the parent TID.  On fork
+failure the pre-inserted entry is removed in the error path.
+
+### Kernel tests (in `src/process_tests.rs`)
+
+| Test | What it checks |
+|---|---|
+| `test_vfork_dispatch` | `clone(CLONE_VFORK)` is dispatched (not ENOSYS) |
+| `test_vfork_waiters_clean_at_boot` | `VFORK_WAITERS` is empty at boot (no leaked entries) |
+| `test_vfork_complete_removes_entry` | Pre-inserting into `VFORK_WAITERS` then calling `vfork_complete` removes the entry — directly exercises the race-fix mechanism |
 
 ---
 

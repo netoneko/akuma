@@ -22,7 +22,7 @@ mod mem;
 mod net;
 pub(crate) mod pipe;
 mod poll;
-mod proc;
+pub(crate) mod proc;
 mod signal;
 mod sync;
 mod term;

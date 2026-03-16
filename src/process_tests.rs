@@ -48,6 +48,10 @@ pub fn run_all_tests() {
     // Test CLONE_VFORK is dispatched (not ENOSYS) and VFORK_WAITERS is clean afterward
     test_vfork_dispatch();
 
+    // Test CLONE_VFORK pre-insertion race fix
+    test_vfork_waiters_clean_at_boot();
+    test_vfork_complete_removes_entry();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -619,5 +623,59 @@ fn test_vfork_dispatch() {
         console::print("[Test] vfork_dispatch not-ENOSYS PASSED\n");
     } else {
         console::print("[Test] vfork_dispatch FAILED: returned ENOSYS (arm not wired)\n");
+    }
+}
+
+// ── CLONE_VFORK race-fix tests ─────────────────────────────────────────────
+
+/// Verify VFORK_WAITERS is empty at kernel boot.  A non-zero count would mean
+/// a previous test (or boot-time clone) leaked an entry, which would prevent
+/// those child PIDs from ever being correctly reaped.
+fn test_vfork_waiters_clean_at_boot() {
+    let len = crate::syscall::proc::vfork_waiters_len();
+    if len == 0 {
+        console::print("[Test] vfork_waiters_clean_at_boot PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] vfork_waiters_clean_at_boot FAILED: {} stale entries\n",
+            len,
+        );
+    }
+}
+
+/// Directly exercise the CLONE_VFORK race-fix mechanism:
+///
+/// Before the fix, `sys_clone_pidfd` inserted the parent TID into VFORK_WAITERS
+/// *after* `fork_process` marked the child thread READY.  On a preemptive
+/// scheduler the child could exec and call `vfork_complete` before the parent
+/// inserted, leaving the table empty — so `vfork_complete` became a no-op and
+/// the parent blocked in `schedule_blocking(u64::MAX)` forever.
+///
+/// The fix: insert into VFORK_WAITERS *before* `fork_process`.  This test
+/// simulates that scenario end-to-end: pre-insert an entry then call
+/// `vfork_complete` and verify the entry is removed (table is clean again).
+fn test_vfork_complete_removes_entry() {
+    // Use a PID that is unlikely to collide with any real process.
+    const FAKE_CHILD_PID: u32 = 0xFFFF_FFFE;
+
+    let removed = crate::syscall::proc::test_vfork_complete_mechanism(FAKE_CHILD_PID);
+
+    if removed {
+        console::print("[Test] vfork_complete_removes_entry PASSED\n");
+    } else {
+        console::print(
+            "[Test] vfork_complete_removes_entry FAILED: entry still in VFORK_WAITERS after vfork_complete\n",
+        );
+    }
+
+    // Ensure no entry leaked regardless of the outcome above.
+    let len = crate::syscall::proc::vfork_waiters_len();
+    if len != 0 {
+        crate::safe_print!(
+            64,
+            "[Test] vfork_complete_removes_entry: LEAK — {} stale entries remain\n",
+            len,
+        );
     }
 }

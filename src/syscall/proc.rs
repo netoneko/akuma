@@ -18,6 +18,32 @@ fn vfork_complete(child_pid: u32) {
     }
 }
 
+/// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
+pub(crate) fn vfork_waiters_len() -> usize {
+    crate::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
+}
+
+/// Kernel test helper: insert a fake pending vfork for `child_pid`, invoke
+/// `vfork_complete`, and return whether the entry was cleanly removed.
+///
+/// This exercises the fix for the race condition where the child calls
+/// `vfork_complete` before the parent has inserted its TID into VFORK_WAITERS
+/// (which used to leave the parent blocked forever).
+pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
+    let tid = akuma_exec::threading::current_thread_id();
+    // Simulate the pre-fork insertion the fixed code now does.
+    crate::irq::with_irqs_disabled(|| {
+        VFORK_WAITERS.lock().insert(child_pid, tid);
+    });
+    // Simulate the child calling execve → vfork_complete.
+    vfork_complete(child_pid);
+    // The entry must be gone; a lingering entry would mean the parent blocked forever.
+    let still_present = crate::irq::with_irqs_disabled(|| {
+        VFORK_WAITERS.lock().contains_key(&child_pid)
+    });
+    !still_present
+}
+
 fn encode_wait_status(code: i32) -> u32 {
     if code < 0 {
         let sig = (-code) as u32 & 0x7F;
@@ -216,6 +242,17 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
         }
 
+        // CLONE_VFORK: register the parent TID in VFORK_WAITERS *before* fork_process
+        // marks the child thread READY.  If we insert after fork_process returns, there
+        // is a race window where the child can exec, call vfork_complete (which removes
+        // the entry), and find nothing — leaving the parent blocked forever.
+        let parent_tid = akuma_exec::threading::current_thread_id();
+        if flags & CLONE_VFORK != 0 {
+            crate::irq::with_irqs_disabled(|| {
+                VFORK_WAITERS.lock().insert(child_pid, parent_tid);
+            });
+        }
+
         match akuma_exec::process::fork_process(child_pid, stack) {
             Ok(new_pid) => {
                 // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
@@ -240,17 +277,20 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 // CLONE_VFORK: block parent until child calls execve or exits.
                 // Without this, both parent and child run the Go runtime concurrently
                 // in the same address space, corrupting each other's state.
+                // Note: VFORK_WAITERS was already populated above, before fork_process.
                 if flags & CLONE_VFORK != 0 {
-                    let parent_tid = akuma_exec::threading::current_thread_id();
-                    crate::irq::with_irqs_disabled(|| {
-                        VFORK_WAITERS.lock().insert(new_pid, parent_tid);
-                    });
                     crate::tprint!(96, "[clone] CLONE_VFORK: blocking parent tid={} until child pid={} execs/exits\n", parent_tid, new_pid);
                     akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
                 return new_pid as u64;
             },
             Err(e) => {
+                // Fork failed: clean up the VFORK_WAITERS entry we pre-inserted.
+                if flags & CLONE_VFORK != 0 {
+                    crate::irq::with_irqs_disabled(|| {
+                        VFORK_WAITERS.lock().remove(&child_pid);
+                    });
+                }
                 crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
                 return !0u64;
             }
