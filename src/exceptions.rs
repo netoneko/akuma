@@ -642,14 +642,18 @@ mod esr {
 // Signal frame layout constants (Linux AArch64 compatible)
 const SA_SIGINFO: u64 = 4;
 const SA_ONSTACK: u64 = 0x08000000;
+const SA_NODEFER: u64 = 0x40000000;
 // siginfo_t: 128 bytes
 // ucontext_t header (uc_flags..uc_sigmask + __unused): 168 bytes
 // sigcontext (fault_address + regs[31] + sp + pc + pstate): 280 bytes
-// __reserved (null terminator for aarch64_ctx): 16 bytes
-const SIGFRAME_SIZE: usize = 128 + 168 + 280 + 16; // 592 bytes
+// FPSIMD extension record: _aarch64_ctx(8) + fpsr(4) + fpcr(4) + vregs[32](512) = 528 bytes
+// Null terminator _aarch64_ctx{0,0}: 8 bytes
+const SIGFRAME_SIZE: usize = 128 + 168 + 280 + 528 + 8; // 1112 bytes
 const SIGFRAME_SIGINFO: usize = 0;
 const SIGFRAME_UCONTEXT: usize = 128;
-const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168;
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168; // 296
+const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 576
+const FPSIMD_MAGIC: u32 = 0x46508001;
 
 /// Ensure a userspace page is mapped. If it's in a lazy anonymous region and
 /// not yet mapped, allocates and maps a zeroed page. Returns true if the page
@@ -837,8 +841,21 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         // siginfo_t
         let si = base.add(SIGFRAME_SIGINFO);
         core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
-        core::ptr::write(si.add(8) as *mut i32, 1);               // si_code = SEGV_MAPERR
+        // SI_TKILL (-6) for software-sent signals; SEGV_MAPERR (1) for fault signals
+        let si_code: i32 = if fault_addr == 0 { -6i32 } else { 1i32 };
+        core::ptr::write(si.add(8) as *mut i32, si_code);         // si_code
         core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
+
+        // ucontext_t header: populate uc_stack and uc_sigmask
+        // Layout: uc_flags(+0,8) uc_link(+8,8) uc_stack(+16,24) uc_sigmask(+40,8) __unused[120]
+        let uc = base.add(SIGFRAME_UCONTEXT);
+        let on_altstack = (action.flags & SA_ONSTACK) != 0 && proc.sigaltstack_sp != 0;
+        if on_altstack {
+            core::ptr::write(uc.add(16) as *mut u64, proc.sigaltstack_sp);  // ss_sp
+            core::ptr::write(uc.add(24) as *mut i32, 1i32);                 // ss_flags = SS_ONSTACK
+            core::ptr::write(uc.add(32) as *mut u64, proc.sigaltstack_size); // ss_size
+        }
+        core::ptr::write(uc.add(40) as *mut u64, proc.signal_mask);         // uc_sigmask
 
         // mcontext_t (sigcontext): fault_address, regs[31], sp, pc, pstate
         let mc = base.add(SIGFRAME_MCONTEXT);
@@ -879,6 +896,29 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         core::ptr::write(mc.add(264) as *mut u64, frame_ref.elr_el1);  // pc
         core::ptr::write(mc.add(272) as *mut u64, frame_ref.spsr_el1); // pstate
 
+        // FPSIMD extension record at SIGFRAME_FPSIMD.
+        // sync_el0_handler saves Q0-Q31 at frame+304 (16 bytes each), fpcr at frame+816,
+        // fpsr at frame+824.  The kernel never uses FP so those values are the user's.
+        let kernel_neon = (frame as *const u8).add(304);
+        let fp = base.add(SIGFRAME_FPSIMD);
+        core::ptr::write(fp as *mut u32, FPSIMD_MAGIC);       // _aarch64_ctx.magic
+        core::ptr::write(fp.add(4) as *mut u32, 528u32);      // _aarch64_ctx.size
+        // fpsr at +8, fpcr at +12 (stored as 64-bit on kernel stack, lower 32 bits used)
+        let fpsr_val = core::ptr::read((frame as *const u8).add(824) as *const u32);
+        let fpcr_val = core::ptr::read((frame as *const u8).add(816) as *const u32);
+        core::ptr::write(fp.add(8) as *mut u32, fpsr_val);
+        core::ptr::write(fp.add(12) as *mut u32, fpcr_val);
+        // vregs[0..31]: 16 bytes each
+        let vregs_dst = fp.add(16);
+        for i in 0..32usize {
+            let src = kernel_neon.add(i * 16) as *const u128;
+            let dst = vregs_dst.add(i * 16) as *mut u128;
+            core::ptr::write(dst, core::ptr::read(src));
+        }
+        // Null terminator _aarch64_ctx{0,0}
+        let null_term = fp.add(528);
+        core::ptr::write(null_term as *mut u64, 0u64);
+
         // Redirect execution to the signal handler
         (*frame).elr_el1 = handler_addr as u64;
         (*frame).sp_el0 = new_sp as u64;
@@ -887,6 +927,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         if action.flags & SA_SIGINFO != 0 {
             (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
             (*frame).x2 = (new_sp + SIGFRAME_UCONTEXT) as u64;
+        }
+    }
+
+    // Block the delivered signal during handler execution unless SA_NODEFER is set.
+    // This prevents recursive delivery of the same signal.
+    if action.flags & SA_NODEFER == 0 && signal >= 1 && signal <= 64 {
+        if signal != 9 && signal != 19 { // SIGKILL/SIGSTOP cannot be masked
+            proc.signal_mask |= 1u64 << (signal - 1);
         }
     }
 
@@ -949,6 +997,32 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         (*frame).sp_el0 = core::ptr::read(mc.add(256) as *const u64);
         (*frame).elr_el1 = core::ptr::read(mc.add(264) as *const u64);
         (*frame).spsr_el1 = core::ptr::read(mc.add(272) as *const u64);
+
+        // Restore signal mask from uc_sigmask (ucontext+40)
+        let uc_sigmask_ptr = (sigframe_sp + SIGFRAME_UCONTEXT + 40) as *const u64;
+        let saved_mask = core::ptr::read(uc_sigmask_ptr);
+        if let Some(proc) = akuma_exec::process::current_process() {
+            // Never block SIGKILL (bit 8) or SIGSTOP (bit 18)
+            proc.signal_mask = saved_mask & !((1u64 << 8) | (1u64 << 18));
+        }
+
+        // Restore FPSIMD state from signal frame into kernel stack NEON save area.
+        // sync_el0_handler will restore NEON from frame+304 after rust_sync_el0_handler returns.
+        let fp = (sigframe_sp + SIGFRAME_FPSIMD) as *const u8;
+        let magic = core::ptr::read(fp as *const u32);
+        if magic == FPSIMD_MAGIC {
+            let fpsr_val = core::ptr::read(fp.add(8) as *const u32) as u64;
+            let fpcr_val = core::ptr::read(fp.add(12) as *const u32) as u64;
+            core::ptr::write((frame as *mut u8).add(824) as *mut u64, fpsr_val);
+            core::ptr::write((frame as *mut u8).add(816) as *mut u64, fpcr_val);
+            let vregs_src = fp.add(16);
+            let kernel_neon = (frame as *mut u8).add(304);
+            for i in 0..32usize {
+                let src = vregs_src.add(i * 16) as *const u128;
+                let dst = kernel_neon.add(i * 16) as *mut u128;
+                core::ptr::write(dst, core::ptr::read(src));
+            }
+        }
 
         let saved_x0 = (*frame).x0;
         Some(saved_x0)
@@ -1853,6 +1927,12 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         pid, far_usize, frame_ref.elr_el1, last_sc,
                         frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3,
                         frame_ref.x4, frame_ref.x5, frame_ref.x6, frame_ref.x7);
+                    crate::tprint!(128, "  x8={:#x} x9={:#x} x10={:#x} x11={:#x}\n",
+                        frame_ref.x8, frame_ref.x9, frame_ref.x10, frame_ref.x11);
+                    crate::tprint!(128, "  x12={:#x} x13={:#x} x14={:#x} x15={:#x}\n",
+                        frame_ref.x12, frame_ref.x13, frame_ref.x14, frame_ref.x15);
+                    crate::tprint!(128, "  x16={:#x} x17={:#x} x18={:#x} x28={:#x}\n",
+                        frame_ref.x16, frame_ref.x17, frame_ref.x18, frame_ref.x28);
 
                     // Auto-dump syscall log for post-crash diagnosis.
                     // Note: CLONE_VM threads share the address space owner's process info
@@ -2081,6 +2161,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let frame_ref = unsafe { &*frame };
                     crate::tprint!(256, "[WILD-IA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
                         pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
+                    crate::tprint!(128, "  x8={:#x} x9={:#x} x16={:#x} x17={:#x} x28={:#x}\n",
+                        frame_ref.x8, frame_ref.x9, frame_ref.x16, frame_ref.x17, frame_ref.x28);
                 }
             }
 

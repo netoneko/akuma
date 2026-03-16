@@ -2782,6 +2782,24 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.mmap_regions = child_mmap_regions;
     new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap = parent.memory.next_mmap;
+
+    // Copy physically-mapped pages from parent's lazy regions.
+    // clone_lazy_regions() (called later) copies only metadata; any pages
+    // already demand-paged in the parent (e.g. Go goroutine structs in the
+    // Go heap arena) must be explicitly copied so the child doesn't get
+    // zeroed pages and dereference a nil goroutine pointer.
+    // copy_range_phys skips unmapped pages, so sparse regions are cheap.
+    {
+        let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+            let table = LAZY_REGION_TABLE.lock();
+            table.get(&parent_pid)
+                .map(|regions| regions.iter().map(|r| (r.start_va, r.size)).collect())
+                .unwrap_or_default()
+        });
+        for (va, size) in lazy_ranges {
+            let _ = copy_range_phys(parent_l0, va, size, &mut new_proc.address_space);
+        }
+    }
     
     // 5. Write ProcessInfo to child's process info page
     unsafe {
