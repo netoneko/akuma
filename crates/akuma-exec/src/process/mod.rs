@@ -1945,6 +1945,15 @@ impl Process {
         });
     }
 
+    /// Atomically replace a file descriptor, returning the old entry if one existed.
+    /// Use this instead of get_fd + set_fd when you need to close the old entry,
+    /// to avoid a TOCTOU race on shared fd tables (CLONE_FILES).
+    pub fn swap_fd(&self, fd: u32, entry: FileDescriptor) -> Option<FileDescriptor> {
+        with_irqs_disabled(|| {
+            self.fds.table.lock().insert(fd, entry)
+        })
+    }
+
     /// Update a file descriptor entry (for file position updates, etc.)
     pub fn update_fd<F>(&self, fd: u32, f: F) -> bool
     where

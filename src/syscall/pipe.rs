@@ -21,6 +21,7 @@ pub(crate) fn pipe_create() -> u32 {
             reader_thread: None,
         });
     });
+    crate::safe_print!(64, "[pipe] create id={}\n", id);
     id
 }
 
@@ -30,8 +31,10 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
         if let Some(pipe) = pipes.get_mut(&id) {
             if is_write {
                 pipe.write_count += 1;
+                crate::safe_print!(64, "[pipe] clone_ref id={} write_count={}\n", id, pipe.write_count);
             } else {
                 pipe.read_count += 1;
+                crate::safe_print!(64, "[pipe] clone_ref id={} read_count={}\n", id, pipe.read_count);
             }
         }
     });
@@ -81,15 +84,15 @@ pub fn pipe_close_write(id: u32) {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[pipe] close_write pipe={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
-            }
+            // Always log close_write so we can trace use-after-close bugs.
+            crate::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             if pipe.write_count == 0 {
                 if let Some(tid) = pipe.reader_thread.take() {
                     akuma_exec::threading::get_waker_for_thread(tid).wake();
                 }
             }
             if pipe.write_count == 0 && pipe.read_count == 0 {
+                crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
         }
@@ -101,10 +104,10 @@ pub fn pipe_close_read(id: u32) {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.read_count = pipe.read_count.saturating_sub(1);
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[pipe] close_read pipe={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
-            }
+            // Always log close_read so we can trace use-after-close bugs.
+            crate::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             if pipe.write_count == 0 && pipe.read_count == 0 {
+                crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
         }

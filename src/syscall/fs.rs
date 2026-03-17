@@ -728,26 +728,36 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
         crate::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}, flags=0x{:x}) PID {}\n", oldfd, newfd, flags, pid);
     }
 
-    if let Some(old_entry) = proc.get_fd(newfd) {
-        match old_entry {
-            akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_close_write(id),
-            akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_close_read(id),
-            _ => {}
-        }
-    }
-
+    // Increment refcount for the new entry BEFORE atomically swapping it in.
+    // This must happen before swap_fd so the pipe isn't prematurely destroyed
+    // if another thread closes oldfd between these two steps.
     match &entry {
         akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
         akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
         _ => {}
     }
 
-    proc.set_fd(newfd, entry);
+    // Atomically replace newfd and retrieve the old entry in one operation.
+    // This prevents a TOCTOU race on shared fd tables (CLONE_FILES goroutines).
+    let old_entry = proc.swap_fd(newfd, entry);
 
     if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
         proc.set_cloexec(newfd);
     } else {
         proc.clear_cloexec(newfd);
+    }
+
+    // Close the old entry AFTER inserting the new one.
+    if let Some(old) = old_entry {
+        match old {
+            akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_close_write(id),
+            akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_close_read(id),
+            akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+            akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                super::eventfd::eventfd_close(efd_id);
+            }
+            _ => {}
+        }
     }
 
     newfd as u64
@@ -1442,6 +1452,12 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
+            // Bump pipe refcount before inserting the duplicate entry.
+            match &entry {
+                akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
+                akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+                _ => {}
+            }
             let new_fd = proc.alloc_fd(entry);
             if cmd == F_DUPFD_CLOEXEC {
                 proc.set_cloexec(new_fd);

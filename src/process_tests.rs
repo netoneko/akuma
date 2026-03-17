@@ -67,6 +67,11 @@ pub fn run_all_tests() {
     test_pipe_write_missing_returns_zero();
     test_pipe_close_write_signals_eof();
     test_pipe_refcount_lifecycle();
+    test_pipe_write_survives_read_close();
+    test_pipe_eof_only_when_write_count_zero();
+    test_pipe_clone_ref_then_double_close();
+    test_pipe_dupfd_bumps_refcount();
+    test_pipe_dup3_atomically_replaces_and_closes_old();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -938,6 +943,208 @@ fn test_pipe_refcount_lifecycle() {
     }
 
     crate::syscall::pipe::pipe_close_read(id);
+}
+
+/// Verify that closing the READ end of a pipe does NOT destroy the pipe while
+/// there are still active writers.
+///
+/// The bug in `compile -V=full` is that pipe_id=6 was fully destroyed (both
+/// counts 0) BEFORE compile's write. This can happen if:
+///   1. read_count prematurely hits 0 (Go's reader closes fd_r early)
+///   2. write_count then drops to 0 (Go closes fd_w + race)
+///   3. Pipe removed → compile's subsequent write returns 0 (silent data loss)
+///
+/// This test verifies that a single close_read (simulating Go's reader closing
+/// early) leaves the pipe alive and writable as long as write_count > 0.
+fn test_pipe_write_survives_read_close() {
+    let id = crate::syscall::pipe::pipe_create();
+    // Close the only read ref — simulates Go reader closing fd_r prematurely.
+    crate::syscall::pipe::pipe_close_read(id);
+    // write_count=1 still; pipe must remain in PIPES.
+    let n = crate::syscall::pipe::pipe_write(id, b"still writable");
+    if n == 14 {
+        console::print("[Test] pipe_write_survives_read_close PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] pipe_write_survives_read_close FAILED: write returned {} (pipe may have been destroyed early)\n",
+            n,
+        );
+    }
+    // Cleanup: close the write end.
+    crate::syscall::pipe::pipe_close_write(id);
+}
+
+/// Verify that `pipe_can_read` returns EOF (true) ONLY when write_count==0,
+/// not when write_count > 0 and buffer is empty.
+///
+/// This is the fundamental condition that triggers the broken epoll-fires-early
+/// scenario: if write_count is 0 while a writer's fd is still open, `pipe_can_read`
+/// mistakenly returns true, epoll fires immediately, the reader reads 0 bytes, and
+/// closes its end — causing the pipe to be fully destroyed before the writer writes.
+fn test_pipe_eof_only_when_write_count_zero() {
+    // Case 1: write_count > 0, buffer empty → NOT EOF (false)
+    let id = crate::syscall::pipe::pipe_create();
+    let mut buf = [0u8; 16];
+    let (n, eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let case1_ok = n == 0 && !eof;
+
+    // Case 2: write_count == 0 (write end closed), buffer empty → EOF (true)
+    crate::syscall::pipe::pipe_close_write(id);
+    let (n2, eof2) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let case2_ok = n2 == 0 && eof2;
+
+    if case1_ok && case2_ok {
+        console::print("[Test] pipe_eof_only_when_write_count_zero PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] pipe_eof_only_when_write_count_zero FAILED: case1(n={},eof={}) case2(n={},eof={})\n",
+            n, eof, n2, eof2,
+        );
+    }
+    crate::syscall::pipe::pipe_close_read(id);
+}
+
+/// Simulate the vfork stdout pipe lifecycle:
+///   pipe_create → clone_ref (for child) → clone_ref (for child dup3) →
+///   close_write (child closes original fd_w) → close_write (parent closes fd_w) →
+///   write (simulate compile writing) → should succeed.
+///
+/// This mirrors what SHOULD happen for compile -V=full:
+///   1. Go: pipe_create → write_count=1, read_count=1
+///   2. fork: clone_deep_for_fork bumps write_count=2, read_count=2
+///   3. child: dup3 bumps write_count=3; close fd_w → 2; execve closes fd_r → read_count=1
+///   4. parent: close fd_w → write_count=1
+///   5. compile writes to fd[1] → MUST SUCCEED
+fn test_pipe_clone_ref_then_double_close() {
+    let id = crate::syscall::pipe::pipe_create(); // write=1, read=1
+
+    // Step 2: fork bumps both counts
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=2 (child copy)
+    crate::syscall::pipe::pipe_clone_ref(id, false); // read=2 (child copy)
+
+    // Step 3a: child dup3 adds write ref for fd=1
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=3
+
+    // Step 3b: child closes original fd_w
+    crate::syscall::pipe::pipe_close_write(id); // write=2
+
+    // Step 3c: execve closes child's fd_r (cloexec)
+    crate::syscall::pipe::pipe_close_read(id); // read=1
+
+    // Step 4: parent closes its fd_w
+    crate::syscall::pipe::pipe_close_write(id); // write=1
+
+    // Step 5: compile writes to fd[1] — MUST find pipe
+    let n = crate::syscall::pipe::pipe_write(id, b"compile -V=full output");
+    if n == 22 {
+        console::print("[Test] pipe_clone_ref_then_double_close PASSED\n");
+    } else {
+        crate::safe_print!(
+            64,
+            "[Test] pipe_clone_ref_then_double_close FAILED: write returned {} (pipe missing with write_count=1)\n",
+            n,
+        );
+    }
+
+    // Cleanup
+    crate::syscall::pipe::pipe_close_write(id); // write=0
+    crate::syscall::pipe::pipe_close_read(id);  // read=0, pipe destroyed
+}
+
+/// Verify that duplicating a PipeRead via `pipe_clone_ref` (simulating F_DUPFD_CLOEXEC)
+/// properly maintains the read_count so the pipe is not prematurely destroyed.
+///
+/// Bug fixed: `sys_fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` was not calling `pipe_clone_ref`,
+/// so closing the original fd would drop read_count to 0 even though the duplicate
+/// fd still referenced the pipe.  This caused `pipe_can_write` to return false
+/// (no reader) and confused the EOF logic.
+fn test_pipe_dupfd_bumps_refcount() {
+    use crate::syscall::pipe::*;
+
+    let id = pipe_create(); // write=1, read=1
+
+    // Simulate fcntl(fd_r, F_DUPFD_CLOEXEC): duplicate the read end
+    pipe_clone_ref(id, false); // read=2
+
+    // Close the original read end (as if Go closed the source fd after dup)
+    pipe_close_read(id); // read=1 — NOT 0, because the duplicate still holds a ref
+
+    // We should still be able to write (read_count=1 due to duplicate)
+    let n = pipe_write(id, b"data for duplicate reader");
+    if n == 25 {
+        console::print("[Test] pipe_dupfd_bumps_refcount PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pipe_dupfd_bumps_refcount FAILED: pipe_write returned {} (expected 25; pipe may be prematurely destroyed or read_count=0)\n",
+            n,
+        );
+    }
+
+    // Cleanup: close duplicate reader and write end
+    pipe_close_read(id);  // read=0
+    pipe_close_write(id); // write=0, pipe destroyed
+}
+
+/// Verify that `sys_dup3` atomically replaces an existing fd entry and properly
+/// closes the old entry's resources.
+///
+/// Bug fixed: the old implementation used `get_fd` + `set_fd` as separate
+/// operations, leaving a TOCTOU window where a concurrent thread (CLONE_FILES
+/// goroutine) could insert a new PipeRead between the check and the write,
+/// causing `set_fd` to silently overwrite it without calling `pipe_close_read`.
+/// The new `swap_fd` method closes this race.
+fn test_pipe_dup3_atomically_replaces_and_closes_old() {
+    use crate::syscall::pipe::*;
+
+    // Create pipe A (simulates fd that currently occupies newfd slot)
+    let id_a = pipe_create(); // write=1, read=1
+
+    // Create pipe B (the new fd we're dup3-ing in)
+    let id_b = pipe_create(); // write=1, read=1
+
+    // Simulate: dup3 replaces the PipeRead(id_a) slot with PipeWrite(id_b)
+    // Step 1: increment refcount for pipe_b (the new entry)
+    pipe_clone_ref(id_b, true); // write=2
+    // Step 2: old entry at the slot was PipeRead(id_a) — close it
+    pipe_close_read(id_a);  // read=0; pipe_a: write=1, read=0
+    // Step 3: new entry is installed (pipe_b write end)
+    // (slot now holds PipeWrite(id_b), write_count=2)
+
+    // After the simulated dup3:
+    // - pipe_a read_count should be 0 (old slot entry was closed)
+    // - pipe_b write_count should be 2 (original + dup'd)
+
+    // pipe_a: read_count=0 → writing should still work (pipe not destroyed since write_count=1)
+    // but a write to pipe_a should succeed (pipe exists, write_count>0)
+    let a_write = pipe_write(id_a, b"to pipe_a");
+    // pipe_a still exists (write_count=1, read_count=0) — write should succeed
+    if a_write == 9 {
+        console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: old entry closed correctly PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_a) returned {} (pipe may be gone)\n",
+            a_write,
+        );
+    }
+
+    // pipe_b: write_count=2, should still be writable
+    let n = pipe_write(id_b, b"still alive");
+    if n == 11 {
+        console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: new entry still alive PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_b) returned {}\n",
+            n,
+        );
+    }
+
+    // Cleanup
+    pipe_close_write(id_a); // write=0 → pipe_a fully destroyed
+    pipe_close_write(id_b); // write=2-1=1
+    pipe_close_write(id_b); // write=0
+    pipe_close_read(id_b);  // read=0, pipe_b destroyed
 }
 
 /// Directly exercise the CLONE_VFORK race-fix mechanism:

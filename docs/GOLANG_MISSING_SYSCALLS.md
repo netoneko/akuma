@@ -1102,7 +1102,135 @@ cap. The real safety for arbitrary pointers is `is_current_user_range_mapped`
 
 ---
 
-## 19. Known remaining gaps (not yet fixed)
+## 19. `compile -V=full` produces empty stdout — `go build` fails with "unexpected output:"
+
+**Status:** Fixed (2026-03-17) — two refcount bugs found and patched
+**Component:** `src/syscall/pipe.rs`, `src/syscall/fs.rs`
+
+### Symptom
+
+`go build` exits with:
+
+```
+go: parsing buildID from go tool compile -V=full: unexpected output:
+[exit code: 1]
+```
+
+The compile tool runs for ~1.6 s, returns exit code 0, but Go sees empty stdout.
+
+### Root cause: two pipe refcount bugs
+
+#### Bug 1 — `sys_fcntl(F_DUPFD / F_DUPFD_CLOEXEC)` did not call `pipe_clone_ref`
+
+When Go's runtime duplicates a pipe fd via `fcntl(fd_r, F_DUPFD_CLOEXEC, ...)`, the kernel copies the `PipeRead(id)` entry to a new fd slot but the pipe's `read_count` was NOT incremented.  Closing the original fd_r then decremented `read_count` to 0, even though the duplicate fd still referenced the pipe.  This made `pipe_can_write` return false (no readers), and could cause downstream logic to see a premature EOF on the write end.
+
+**Fix:** `sys_fcntl` F_DUPFD / F_DUPFD_CLOEXEC now calls `pipe_clone_ref` before `alloc_fd`, mirroring `sys_dup` and `sys_dup3`.
+
+#### Bug 2 — `sys_dup3` had a TOCTOU race on shared fd tables (CLONE_FILES)
+
+The old implementation was:
+
+```rust
+// NOT atomic together:
+let old_entry = proc.get_fd(newfd);   // 1. read under lock, then release
+pipe_close(old_entry);                 // 2. close outside lock
+pipe_clone_ref(new_entry);             // 3. bump refcount outside lock
+proc.set_fd(newfd, new_entry);         // 4. write under lock
+```
+
+Between steps 1 and 4, a concurrent goroutine (Go uses `CLONE_FILES`/`CLONE_VM` — all goroutines share the same fd table Arc) could have `pipe2()`'d a new `PipeRead` into the `newfd` slot.  `set_fd` would then silently overwrite it via `BTreeMap::insert` **without** calling `pipe_close_read`, leaking the refcount downward: `read_count` stays at 1 but there is no longer any fd entry holding it. When Go later closes other fds that drive `read_count` to 0, the pipe is destroyed prematurely.
+
+**Fix:** A new `swap_fd` method atomically replaces the fd table entry and returns the displaced old entry in a single `BTreeMap::insert` call under the spinlock.  `sys_dup3` now:
+1. Calls `pipe_clone_ref` for the new entry (before swapping in, so the source fd cannot be freed underneath us)
+2. Calls `swap_fd` (atomic get-and-replace under lock)
+3. Calls `pipe_close` for the returned old entry (after the lock is released)
+
+This closes the race window entirely.
+
+### Pipe lifecycle (expected — after both fixes)
+
+| Event | write_count | read_count |
+|---|---|---|
+| `pipe_create` | 1 | 1 |
+| `fcntl(fd_r, F_DUPFD_CLOEXEC)` → `pipe_clone_ref` | 1 | 2 |
+| `close(fd_r)` | 1 | 1 |
+| `fork` → `clone_deep_for_fork` (bumps both) | 2 | 2 |
+| child: `dup3(fd_w, 1, O_CLOEXEC)` → `pipe_clone_ref` | 3 | 2 |
+| execve cloexec closes child fd_r duplicate | 3 | 1 |
+| parent wakes from vfork, closes fd_w | 2 | 1 |
+| **compile writes to fd=1** | 2 | 1 → succeeds |
+| compile exits → fd=1 closed | 1 | 1 |
+| parent reads pipe → closes fd_r_dup | 1 | 0 |
+| parent closes fd_w | 0 | 0 → pipe destroyed |
+
+### Kernel tests added
+
+- `test_pipe_dupfd_bumps_refcount` — verifies F_DUPFD_CLOEXEC refcount semantics: writing to the pipe after closing the original fd (but not the duplicate) must succeed.
+- `test_pipe_dup3_atomically_replaces_and_closes_old` — verifies the dup3 replacement path properly closes the displaced old entry and keeps the new entry alive.
+
+---
+
+---
+
+## 20. Stale `PENDING_SIGNAL` on thread slot reuse — EL1 data abort in innocent process
+
+**Status:** Fixed (2026-03-17) in `crates/akuma-exec/src/threading/mod.rs`
+**Component:** `PENDING_SIGNAL` array, thread slot cleanup path
+
+### Symptom
+
+The `parallel_processes` threading test (which spawns multiple `/bin/hello` processes)
+crashed with an EL1 data abort:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x7
+  ELR=0x403c29c0, FAR=0x0, SPSR=0x60000345
+  Thread=8, ...
+  Instruction at ELR: 0xa94007c0
+  Likely: Rn(base)=x30, Rt(dest)=x0   ← LDP X0,X1,[X30] with X30=0 (null)
+  EC=0x25 in kernel code — killing current process (EFAULT)
+  Killing PID 20 (/bin/hello)
+```
+
+Process `/bin/hello` (PID 20) exited with code −14 (EFAULT).
+
+### Root cause
+
+`PENDING_SIGNAL[tid]` is an `AtomicU32` array (one slot per thread) used to defer
+signal delivery from `sys_tkill` to the next syscall return of the target thread.
+
+When a Go goroutine (e.g. running `go build`) received `SIGURG` (goroutine
+preemption), `sys_tkill` stored the signal number in `PENDING_SIGNAL[tid]`.
+If that goroutine's thread slot was later recycled (TERMINATED → INITIALIZING → FREE)
+**without clearing `PENDING_SIGNAL[tid]`**, the next process that ran on the same
+thread slot would see the stale signal at its first syscall boundary.
+
+`take_pending_signal()` would return `SIGURG` (23). `try_deliver_signal` would be
+called for `/bin/hello`, which has no registered signal handler. However, the
+`ensure_sigreturn_trampoline` path triggered, reaching kernel code with X30 = 0 in
+an unexpected code path, causing a null-pointer dereference → EL1 data abort → EFAULT.
+
+### Fix
+
+In the slot-recycling cleanup loop in `cleanup_terminated_threads()`, after zeroing the
+thread context and clearing slot metadata, add:
+
+```rust
+// Clear any pending signal from the previous occupant of this slot.
+PENDING_SIGNAL[i].store(0, Ordering::Release);
+```
+
+This prevents stale signals from crossing process boundaries when thread slots are reused.
+
+### Lesson
+
+Any per-thread kernel state that was set by one process must be explicitly cleared
+during thread slot recycling, before the slot is made available (set to FREE) again.
+The `PENDING_SIGNAL` array must be treated with the same discipline as `THREAD_CONTEXTS`.
+
+---
+
+## 21. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
@@ -1114,3 +1242,4 @@ The following are likely to surface as Go workloads grow more complex:
 | SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting |
 | Per-process current-syscall visibility | `ps` shows `SYSCALL=-` for all processes; threads blocked in long-running syscalls (futex, epoll) are invisible in diagnostics |
 | CLONE_VM sharing | VFORK+CLONE_VM creates a full copy of the address space instead of sharing page tables; this makes fork slow for large heap processes. True CLONE_VM would eliminate the copy |
+| `compile -V=full` stdout pipe | Fixed in §19 — `F_DUPFD_CLOEXEC` refcount and `dup3` TOCTOU race both patched |

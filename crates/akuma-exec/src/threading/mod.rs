@@ -427,6 +427,13 @@ fn cleanup_terminated_internal(force: bool) -> usize {
                 pool.slots[i].start_time_us = 0;
                 pool.slots[i].timeout_us = 0;
             }
+
+            // Clear any pending signal from the previous occupant of this slot.
+            // Without this, a stale SIGURG (or any signal) pended by a Go goroutine
+            // would be delivered to the next process that runs on this thread slot,
+            // triggering signal delivery code in an unexpected context (e.g. /bin/hello
+            // which never registered a signal handler), causing an EL1 data abort.
+            PENDING_SIGNAL[i].store(0, Ordering::Release);
             
             // Re-initialize canary for reuse
             if config().enable_stack_canaries {
