@@ -1337,7 +1337,70 @@ Existing tests in `src/process_tests.rs` were updated to match the new
 
 ---
 
-## 22. Known remaining gaps (not yet fixed)
+## 23. Process unregistration race in `exit_group` — `ENOSYS` or crash in siblings
+
+**Status:** Fixed (2026-03-19) in `crates/akuma-exec/src/process/mod.rs` and `crates/akuma-exec/src/threading/mod.rs`
+**Component:** `kill_thread_group`, `on_thread_cleanup`
+
+### Symptom
+
+Go binaries crash or return `ENOSYS` for syscalls like `rt_sigaction` during process exit. The kernel log might show `[ENOSYS] nr=13` (rt_sigaction) or `[ENOSYS] nr=220` (clone) for a process that is supposed to be exiting.
+
+### Root cause
+
+`kill_thread_group` (used by `exit_group`) was immediately unregistering sibling processes and removing them from `THREAD_PID_MAP`. If a sibling thread was still running and attempted a syscall (e.g., Go's signal handler setup during exit), `current_process()` would return `None`, leading to `ENOSYS` or a crash.
+
+### Fix
+
+Implemented a deferred cleanup mechanism:
+1. `kill_thread_group` now marks siblings as `Zombie` and wakes them, but does **not** unregister them.
+2. Added a `CLEANUP_CALLBACK` in the threading module, invoked when a thread slot is recycled.
+3. The process module registers `on_thread_cleanup` as this callback. It removes the thread from `THREAD_PID_MAP` and only unregisters the `Process` (dropping its `Box` and memory) when the **last** thread of that PID has exited.
+
+---
+
+## 24. `go build` hangs — `pipe_write` missing epoll notifications
+
+**Status:** Fixed (2026-03-19) in `src/syscall/pipe.rs` and `src/syscall/poll.rs`
+**Component:** `pipe_write`, `epoll_check_fd_readiness`
+
+### Symptom
+
+`go build` hangs indefinitely while waiting for `compile` or `link` subprocesses. `ps` shows processes in `Blocked` or `Running` state but no progress is made.
+
+### Root cause
+
+`pipe_write` only woke up threads explicitly stored in `reader_thread` (used for blocking `read` syscalls). It did not notify threads waiting via `epoll` or `poll`. Go's netpoller (which handles pipe I/O) uses `epoll_pwait` and was never woken up when data arrived in the pipe.
+
+### Fix
+
+1. Added a `pollers` set (`BTreeSet<usize>`) to `KernelPipe` to track threads interested in the pipe.
+2. Updated `epoll_check_fd_readiness` for `PipeRead` to register the current thread via `pipe_add_poller`.
+3. Updated `pipe_write` and `pipe_close_write` to wake all threads in the `pollers` set.
+
+---
+
+## 25. Missing `SIGPIPE` delivery — crash in Go on broken pipe
+
+**Status:** Fixed (2026-03-19) in `src/syscall/pipe.rs` and `src/syscall/signal.rs`
+**Component:** `pipe_write`, `send_sigpipe`
+
+### Symptom
+
+Go binaries crash with unexpected errors or WILD-DA when a pipe they are writing to is closed by the reader.
+
+### Root cause
+
+Linux requires that writing to a pipe with no readers delivers `SIGPIPE` to the calling thread. Akuma was returning `-EPIPE` but not sending the signal. Go expects the signal to be delivered to trigger its internal handler.
+
+### Fix
+
+1. Added `send_sigpipe()` helper in `src/syscall/signal.rs` to send signal 13 to the current thread.
+2. Updated `pipe_write` to call `send_sigpipe()` when `read_count == 0`.
+
+---
+
+## 26. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 

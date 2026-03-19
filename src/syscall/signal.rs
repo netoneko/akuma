@@ -237,3 +237,10 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 pub(super) fn sys_tgkill(_tgid: u32, tid: u32, sig: u32) -> u64 {
     sys_tkill(tid, sig)
 }
+
+/// Helper for other syscalls (like pipe write) to send SIGPIPE
+pub(crate) fn send_sigpipe() {
+    let tid = akuma_exec::threading::current_thread_id() as u32;
+    // SIGPIPE is signal 13
+    sys_tkill(tid, 13);
+}

@@ -69,6 +69,16 @@ macro_rules! safe_print {
 // Lock-Free Thread State Management
 // ============================================================================
 
+/// Cleanup callback (e.g. for process unregistration)
+/// Stored as usize (function pointer cast) to allow atomic access
+static CLEANUP_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Set a callback to be invoked when a thread is cleaned up (recycled).
+/// The callback receives the thread ID (index) of the cleaned up thread.
+pub fn set_cleanup_callback(cb: fn(usize)) {
+    CLEANUP_CALLBACK.store(cb as usize, Ordering::SeqCst);
+}
+
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
 static THREAD_STATES: [AtomicU8; MAX_THREADS] = {
@@ -446,6 +456,13 @@ fn cleanup_terminated_internal(force: bool) -> usize {
                 if stack_base != 0 {
                     init_stack_canary(stack_base);
                 }
+            }
+
+            // Invoke cleanup callback (if any)
+            let cb_addr = CLEANUP_CALLBACK.load(Ordering::Relaxed);
+            if cb_addr != 0 {
+                let cb: fn(usize) = unsafe { core::mem::transmute(cb_addr) };
+                cb(i);
             }
             
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot

@@ -1,12 +1,15 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_to_user_safe;
 use akuma_net::socket::libc_errno;
+use alloc::collections::BTreeSet;
 
 struct KernelPipe {
     buffer: Vec<u8>,
     write_count: u32,
     read_count: u32,
     reader_thread: Option<usize>,
+    /// Threads waiting on this pipe via epoll/poll
+    pollers: BTreeSet<usize>,
 }
 
 static PIPES: Spinlock<BTreeMap<u32, KernelPipe>> = Spinlock::new(BTreeMap::new());
@@ -20,6 +23,7 @@ pub(crate) fn pipe_create() -> u32 {
             write_count: 1,
             read_count: 1,
             reader_thread: None,
+            pollers: BTreeSet::new(),
         });
     });
     crate::safe_print!(64, "[pipe] create id={}\n", id);
@@ -41,6 +45,17 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
     });
 }
 
+/// Register the current thread as interested in polling this pipe.
+/// Called by epoll/poll check logic.
+pub(crate) fn pipe_add_poller(id: u32, tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pipes = PIPES.lock();
+        if let Some(pipe) = pipes.get_mut(&id) {
+            pipe.pollers.insert(tid);
+        }
+    });
+}
+
 /// Write data to a pipe. Returns Ok(n) on success or Err(EPIPE) if the pipe
 /// has been destroyed (no readers left or pipe removed). On Linux, writing to
 /// a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
@@ -49,12 +64,25 @@ pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if pipe.read_count == 0 {
+                // Send SIGPIPE to current process (Linux behaviour)
+                super::signal::send_sigpipe();
                 return Err(libc_errno::EPIPE as i32);
             }
             pipe.buffer.extend_from_slice(data);
+            
+            // Wake blocking reader
             if let Some(tid) = pipe.reader_thread.take() {
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
+
+            // Wake async pollers (epoll/poll)
+            // We drain the set because the pollers will re-register if they
+            // wake up and see no events (or spurious wake), or simply loop.
+            // This prevents the set from growing indefinitely.
+            while let Some(tid) = pipe.pollers.pop_first() {
+                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            }
+
             Ok(data.len())
         } else {
             crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
@@ -90,11 +118,17 @@ pub fn pipe_close_write(id: u32) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
             // Always log close_write so we can trace use-after-close bugs.
             crate::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            
+            // Notify waiters (EOF is an event)
             if pipe.write_count == 0 {
                 if let Some(tid) = pipe.reader_thread.take() {
                     akuma_exec::threading::get_waker_for_thread(tid).wake();
                 }
+                while let Some(tid) = pipe.pollers.pop_first() {
+                    akuma_exec::threading::get_waker_for_thread(tid).wake();
+                }
             }
+
             if pipe.write_count == 0 && pipe.read_count == 0 {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);

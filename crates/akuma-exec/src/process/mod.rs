@@ -32,6 +32,43 @@ fn process_syscall_stats_enabled() -> bool {
     PROCESS_SYSCALL_STATS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Initialize the process subsystem
+pub fn init() {
+    init_box_registry(); // Init Box 0
+    crate::threading::set_cleanup_callback(on_thread_cleanup);
+}
+
+/// Callback invoked by the threading subsystem when a thread slot is recycled.
+/// Used to clean up stale THREAD_PID_MAP entries and zombie processes.
+fn on_thread_cleanup(tid: usize) {
+    // 1. Remove this thread from the PID map
+    let pid_opt = with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().remove(&tid)
+    });
+
+    if let Some(pid) = pid_opt {
+        // 2. Check if this was the last thread for the process
+        let remaining_threads = with_irqs_disabled(|| {
+            let map = THREAD_PID_MAP.lock();
+            // Count threads belonging to this PID. Note: this linear scan is
+            // acceptable because thread count is bounded (MAX_THREADS=256 or similar).
+            map.values().filter(|&&p| p == pid).count()
+        });
+
+        if remaining_threads == 0 {
+            // 3. Unregister the process (this drops the Box and frees memory)
+            // The process is now truly gone from the system.
+            if let Some(_proc) = unregister_process(pid) {
+                if config().syscall_debug_info_enabled {
+                    // Use print directly to avoid allocation in callback context
+                    // (though cleanup callback runs in a safe context)
+                    // log::debug!("[Process] PID {} fully unregistered", pid);
+                }
+            }
+        }
+    }
+}
+
 // Box registry re-exports (implementation in box_registry.rs)
 pub use crate::box_registry::{
     BoxInfo, register_box, unregister_box, list_boxes,
@@ -2183,18 +2220,24 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
         clear_lazy_regions(*sib_pid);
 
         if let Some(tid) = sib_tid {
-            with_irqs_disabled(|| {
-                THREAD_PID_MAP.lock().remove(tid);
-            });
+            // DO NOT remove from THREAD_PID_MAP yet - wait for cleanup_callback
             if let Some(channel) = remove_channel(*tid) {
                 channel.set_exited(137);
             }
         }
 
-        let _dropped = unregister_process(*sib_pid);
+        // DO NOT unregister process yet - wait for cleanup_callback
+        // Just mark as exited/zombie so wait4 can see it
+        if let Some(proc) = lookup_process(*sib_pid) {
+             proc.exited = true;
+             proc.exit_code = 137;
+             proc.state = ProcessState::Zombie(137);
+        }
 
         if let Some(tid) = sib_tid {
             crate::threading::mark_thread_terminated(*tid);
+            // Wake the thread so it exits naturally
+            crate::threading::get_waker_for_thread(*tid).wake();
         }
     }
 

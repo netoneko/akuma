@@ -213,8 +213,12 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
             }
         }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
-            if requested & EPOLLIN != 0 && super::pipe::pipe_can_read(pipe_id) {
-                ready |= EPOLLIN;
+            if requested & EPOLLIN != 0 {
+                // Register for wakeup notifications
+                super::pipe::pipe_add_poller(pipe_id, akuma_exec::threading::current_thread_id());
+                if super::pipe::pipe_can_read(pipe_id) {
+                    ready |= EPOLLIN;
+                }
             }
         }
         akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
