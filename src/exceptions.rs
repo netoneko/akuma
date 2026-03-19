@@ -1631,7 +1631,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Deliver any pending signal (e.g. SIGURG for Go goroutine preemption).
             // sys_tkill pends the signal; we deliver it here so the target thread
             // sees it at the next syscall boundary (async delivery via pending queue).
-            if let Some(sig) = akuma_exec::threading::take_pending_signal() {
+            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
+                p.signal_mask
+            } else {
+                0
+            };
+
+            if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                 // Store the syscall return value in x0 of the trap frame so that
                 // sigreturn restores it correctly (the signal handler's x0 = sig,
                 // and after sigreturn the caller sees x0 = syscall result).

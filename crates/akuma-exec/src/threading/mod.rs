@@ -2290,16 +2290,25 @@ pub fn pend_signal_for_thread(tid: usize, sig: u32) {
     }
 }
 
-/// Take the pending signal for the current thread, if any.
-/// Returns Some(sig) and clears the pending signal, or None.
-pub fn take_pending_signal() -> Option<u32> {
+/// Take the pending signal for the current thread, if any, provided it is not
+/// masked by the given signal mask.  Returns Some(sig) and clears the pending
+/// signal, or None.
+pub fn take_pending_signal(mask: u64) -> Option<u32> {
     let tid = get_current_thread_register();
     if tid < MAX_THREADS {
-        let sig = PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel);
-        if sig != 0 { Some(sig) } else { None }
-    } else {
-        None
+        let sig = PENDING_SIGNAL[tid].load(Ordering::Acquire);
+        if sig != 0 {
+            // Signals 9 (SIGKILL) and 19 (SIGSTOP) cannot be masked.
+            if sig == 9 || sig == 19 {
+                return Some(PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel));
+            }
+            let bit = 1u64 << (sig - 1);
+            if (mask & bit) == 0 {
+                return Some(PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel));
+            }
+        }
     }
+    None
 }
 
 /// Get max thread count

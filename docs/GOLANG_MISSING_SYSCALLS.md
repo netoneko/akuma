@@ -1400,7 +1400,28 @@ Linux requires that writing to a pipe with no readers delivers `SIGPIPE` to the 
 
 ---
 
-## 26. Known remaining gaps (not yet fixed)
+## 27. Signal delivery ignores signal mask — re-entrant crash in Go
+
+**Status:** Fixed (2026-03-19) in `src/exceptions.rs` and `crates/akuma-exec/src/threading/mod.rs`
+**Component:** `take_pending_signal`, `rust_sync_el0_handler`
+
+### Symptom
+
+Go binaries crash with `signal: broken pipe` or exit code -13 during high-frequency signal delivery (e.g., `SIGURG` preemption or `SIGPIPE`). Kernel logs show re-entrant delivery of the same signal to the same handler before the first one has finished.
+
+### Root cause
+
+`take_pending_signal()` blindly returned any pending signal regardless of whether it was blocked by the process's `signal_mask`. In Go, when a `SIGPIPE` handler is running, signal 13 is automatically blocked. If the handler itself triggered another `SIGPIPE`, the kernel would immediately re-deliver it, causing a re-entrant fault and process termination.
+
+### Fix
+
+1.  Updated `akuma_exec::threading::take_pending_signal(mask)` to accept a 64-bit mask and skip signals that are set in the mask (except for `SIGKILL` and `SIGSTOP`).
+2.  Updated `rust_sync_el0_handler` in `src/exceptions.rs` to look up the current process's `signal_mask` and pass it to `take_pending_signal()`.
+3.  Added regression test `test_signal_masking` in `src/process_tests.rs`.
+
+---
+
+## 28. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
