@@ -1421,7 +1421,27 @@ Go binaries crash with `signal: broken pipe` or exit code -13 during high-freque
 
 ---
 
-## 28. Known remaining gaps (not yet fixed)
+## 29. `tkill` uses incorrect signal table — termination of Go binaries on `SIGPIPE`
+
+**Status:** Fixed (2026-03-19) in `src/syscall/signal.rs`
+**Component:** `sys_tkill`, `sys_tgkill`
+
+### Symptom
+
+Go binaries would occasionally exit with code -13 (SIGPIPE) even when a handler was registered and correctly masked. This was particularly visible when one process sent a signal to another (e.g., `go` sending `SIGURG` to `compile`).
+
+### Root cause
+
+`sys_tkill` was using the signal table of the *calling* process (e.g., `go`) to decide the action for the *target* thread (e.g., in `compile`). If the caller didn't have a handler for that signal but the target did, the kernel might incorrectly trigger the default fatal action (termination). Additionally, fatal-by-default signals were triggering an immediate `exit_group` even if they were blocked in the target's `signal_mask`.
+
+### Fix
+
+1.  Updated `sys_tkill` to correctly identify the target process via `find_pid_by_thread(tid)` and use that process's `signal_actions` and `signal_mask`.
+2.  Ensured that fatal-by-default signals (like `SIGPIPE`) only trigger `exit_group` if they are **not** blocked in the target's mask. If blocked, they are pended for later delivery.
+
+---
+
+## 30. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 

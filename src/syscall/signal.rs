@@ -198,34 +198,41 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
     crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
 
+    // Get the target process (the one that owns the thread tid)
+    let (target_handler, target_mask) = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
+        if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+            let idx = (sig - 1) as usize;
+            (proc.signal_actions[idx].handler, proc.signal_mask)
+        } else {
+            (akuma_exec::process::SignalHandler::Default, 0)
+        }
+    } else {
+        (akuma_exec::process::SignalHandler::Default, 0)
+    };
+
+    // SIGKILL (9) is always fatal and cannot be blocked/handled
     if sig == 9 {
         super::proc::sys_exit_group(-(sig as i32));
         return 0;
     }
 
-    let handler = akuma_exec::process::current_process()
-        .map(|p| {
-            let idx = (sig - 1) as usize;
-            p.signal_actions[idx].handler
-        })
-        .unwrap_or(akuma_exec::process::SignalHandler::Default);
-
-    match handler {
+    match target_handler {
         akuma_exec::process::SignalHandler::Ignore => 0,
         akuma_exec::process::SignalHandler::Default => {
-            if signal_is_fatal_default(sig) {
+            let bit = 1u64 << (sig - 1);
+            let blocked = (target_mask & bit) != 0;
+            
+            if signal_is_fatal_default(sig) && !blocked {
                 super::proc::sys_exit_group(-(sig as i32));
+            } else if signal_is_fatal_default(sig) && blocked {
+                // If fatal but blocked, we still pend it so it fires when unmasked
+                akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
             }
             0
         }
         akuma_exec::process::SignalHandler::UserFn(_) => {
-            if sig == 6 {
-                super::proc::sys_exit_group(-(sig as i32));
-            }
             // Pend the signal on the target thread so it is delivered at the
-            // next syscall return for that thread.  This implements async signal
-            // delivery: the target goroutine sees the signal (e.g. SIGURG for
-            // preemption) the next time it returns from a syscall.
+            // next syscall return for that thread.
             akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
             0
         }

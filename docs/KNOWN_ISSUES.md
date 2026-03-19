@@ -307,3 +307,77 @@ schedule_blocking(deadline);
 
 The expiry check at the top of each loop iteration (`elapsed >= timeout_us`)
 still correctly returns 0 when the caller's timeout is reached.
+
+---
+
+## 8. `exit_group` sibling unregistration race — `ENOSYS` or crash on exit
+
+**Status:** Fixed (2026-03-19) in `crates/akuma-exec/src/process/mod.rs`
+**Component:** `kill_thread_group`, `on_thread_cleanup`
+
+### Symptom
+
+Processes with multiple threads (like Go binaries) would occasionally crash or
+return `ENOSYS` for valid syscalls (e.g., `rt_sigaction`) during process exit.
+
+### Root cause
+
+`kill_thread_group` immediately removed processes from the process table. If a
+sibling thread was still executing a syscall, `current_process()` would return
+`None`, causing the syscall to fail or the kernel to fault.
+
+### Fix
+
+Implemented deferred process unregistration. `kill_thread_group` now marks
+processes as zombies but leaves them in the table. A new `CLEANUP_CALLBACK` in
+the threading system notifies the process module when a thread slot is truly
+recycled, at which point the process is removed only if no threads remain.
+
+---
+
+## 9. `go build` hangs on pipe I/O — missing epoll notifications
+
+**Status:** Fixed (2026-03-19) in `src/syscall/pipe.rs`
+**Component:** `pipe_write`, `epoll_check_fd_readiness`
+
+### Symptom
+
+`go build` would hang indefinitely waiting for compiler subprocesses. `ps`
+showed processes in `Blocked` state but they never resumed.
+
+### Root cause
+
+`pipe_write` only woke threads blocked in `read()` syscalls. It did not notify
+threads waiting via `epoll` or `poll`. Go's netpoller uses `epoll_pwait` and was
+never woken when data arrived.
+
+### Fix
+
+Added a `pollers` set to `KernelPipe` and updated `pipe_write` to wake all
+threads in that set. `epoll_check_fd_readiness` now registers the current
+thread as a poller for the pipe.
+
+---
+
+## 10. Re-entrant signal delivery — `SIGPIPE` crash in Go
+
+**Status:** Fixed (2026-03-19) in `src/exceptions.rs` and `crates/akuma-exec/src/threading/mod.rs`
+**Component:** `take_pending_signal`, `rust_sync_el0_handler`
+
+### Symptom
+
+Go binaries would crash with `signal: broken pipe` or exit code -13. Logs showed
+re-entrant delivery of signals to handlers that should have had them masked.
+
+### Root cause
+
+`take_pending_signal()` did not respect the process's signal mask. If a handler
+was running (and thus masking its own signal), the kernel would still "take"
+and deliver a second instance of that signal, causing a re-entrant fault.
+
+### Fix
+
+Updated `take_pending_signal` to accept a signal mask and skip blocked signals.
+`rust_sync_el0_handler` now correctly passes the current mask before delivering
+signals.
+

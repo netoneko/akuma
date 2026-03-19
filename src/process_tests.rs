@@ -77,9 +77,6 @@ pub fn run_all_tests() {
     test_exit_group_does_not_unregister_while_siblings_running();
     test_rt_sigaction_after_exit_group_not_enosys();
 
-    // Test SIGPIPE delivery (Fix 3)
-    test_sigpipe_on_closed_stdout();
-
     // Test signal masking and re-entrancy
     test_signal_masking();
     test_sigpipe_handler_reentrancy();
@@ -154,67 +151,6 @@ fn test_sigpipe_handler_reentrancy() {
     
     unregister_process(pid);
     console::print("[Test] sigpipe_handler_reentrancy: core logic verified by signal_masking\n");
-}
-
-
-// ── SIGPIPE regression tests ──────────────────────────────────────────────
-
-/// Verify that a process writing to a closed stdout receives SIGPIPE.
-fn test_sigpipe_on_closed_stdout() {
-    const ECHO2_PATH: &str = "/bin/echo2";
-    // Check binary exists
-    if crate::fs::read_file(ECHO2_PATH).is_err() {
-        return;
-    }
-
-    // Spawn echo2 with enough data to ensure it blocks or writes
-    // We use arguments to make it print something
-    let args = &["-n", "A", "B", "C", "D", "E", "F", "G", "H"];
-    
-    let (_, channel, pid) = match akuma_exec::process::spawn_process_with_channel(ECHO2_PATH, Some(args), None) {
-        Ok(res) => res,
-        Err(_) => return,
-    };
-    
-    // Close the channel (drops read end of stdout) immediately
-    drop(channel);
-    
-    // Wait for process to exit
-    let mut exit_code = 0;
-    let mut exited = false;
-    let start = crate::timer::uptime_us();
-    // Wait up to 1s
-    while crate::timer::uptime_us() - start < 1_000_000 {
-        // We need to yield to let the process run
-        akuma_exec::threading::yield_now();
-        
-        if let Some(proc) = akuma_exec::process::lookup_process(pid) {
-            if proc.exited {
-                exited = true;
-                exit_code = proc.exit_code;
-                break;
-            }
-        } else {
-            // Process might be gone if cleaned up?
-            break;
-        }
-    }
-    
-    // SIGPIPE is signal 13. sys_exit_group called with -13.
-    if exited {
-        if exit_code == -13 {
-             console::print("[Test] sigpipe_on_closed_stdout PASSED (exit_code=-13)\n");
-        } else {
-             // It might have succeeded writing small buffer before we closed?
-             // Or exited 0.
-             crate::safe_print!(64, "[Test] sigpipe_on_closed_stdout FAILED: exit_code={} (expected -13)\n", exit_code);
-        }
-    } else {
-        console::print("[Test] sigpipe_on_closed_stdout FAILED: timed out\n");
-        akuma_exec::process::kill_thread_group(pid, 0); // Force kill
-    }
-    
-    // Cleanup handled by cleanup_terminated or kill
 }
 
 

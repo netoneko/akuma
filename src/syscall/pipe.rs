@@ -133,6 +133,8 @@ pub fn pipe_close_write(id: u32) {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
+        } else {
+            crate::safe_print!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
     });
 }
@@ -148,6 +150,8 @@ pub fn pipe_close_read(id: u32) {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
+        } else {
+            crate::safe_print!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
     });
 }
