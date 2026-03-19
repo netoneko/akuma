@@ -360,6 +360,7 @@ pub struct ProcessInfo2 {
     pub box_id: u64,
     pub name: String,
     pub state: &'static str,
+    pub current_syscall: u64,
     pub last_syscall: u64,
     pub args: Vec<String>,
 }

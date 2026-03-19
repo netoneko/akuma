@@ -24,7 +24,7 @@ mod net;
 pub(crate) mod pipe;
 mod poll;
 pub(crate) mod proc;
-mod signal;
+pub mod signal;
 mod sync;
 mod term;
 mod time;
@@ -262,6 +262,7 @@ pub mod nr {
     pub const PWRITE64: u64 = 68;
     pub const SETITIMER: u64 = 103;
     pub const MEMBARRIER: u64 = 283;
+    pub const RT_SIGTIMEDWAIT: u64 = 137;
     pub const PRCTL: u64 = 167;
     pub const GETRUSAGE: u64 = 165;
     pub const MSYNC: u64 = 227;
@@ -489,6 +490,12 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
+    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+        proc.last_syscall.store(syscall_num, Ordering::Relaxed);
+        proc.current_syscall.store(syscall_num, Ordering::Relaxed);
+    }
+
     if akuma_exec::process::is_current_interrupted() {
         if let Some(proc) = akuma_exec::process::current_process() {
             proc.exited = true;
@@ -613,6 +620,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EXIT_GROUP => proc::sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
         nr::RT_SIGSUSPEND => 0,
+        nr::RT_SIGTIMEDWAIT => signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
         nr::GETCWD => fs::sys_getcwd(args[0], args[1] as usize),
@@ -770,6 +778,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     };
 
+    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+        proc.current_syscall.store(!0u64, Ordering::Relaxed);
+    }
+
     if need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -783,5 +795,6 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     }
 
+    CURRENT_SYSCALL_NR.store(!0u64, Ordering::Relaxed);
     result
 }

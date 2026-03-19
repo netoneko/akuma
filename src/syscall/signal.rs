@@ -26,7 +26,8 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
     let idx = (sig - 1) as usize;
 
     if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
-        let old = &proc.signal_actions[idx];
+        let actions = proc.signal_actions.actions.lock();
+        let old = &actions[idx];
         let handler_val = match old.handler {
             akuma_exec::process::SignalHandler::Default => SIG_DFL,
             akuma_exec::process::SignalHandler::Ignore => SIG_IGN,
@@ -53,7 +54,8 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
             SIG_IGN => akuma_exec::process::SignalHandler::Ignore,
             addr => akuma_exec::process::SignalHandler::UserFn(addr),
         };
-        proc.signal_actions[idx] = akuma_exec::process::SignalAction {
+        let mut actions = proc.signal_actions.actions.lock();
+        actions[idx] = akuma_exec::process::SignalAction {
             handler,
             flags: sa.sa_flags,
             mask: if sigset_ok { sa.sa_mask } else { 0 },
@@ -192,6 +194,85 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     0
 }
 
+/// rt_sigtimedwait - synchronously wait for queued signals
+/// set: signals to wait for
+/// info: pointer to siginfo_t structure (ignored for now)
+/// timeout: pointer to timespec structure
+/// sigsetsize: size of signal set (must be 8)
+pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigsetsize: usize) -> u64 {
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+
+    let _proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return ENOSYS,
+    };
+
+    if !validate_user_ptr(set_ptr, 8) {
+        return EFAULT;
+    }
+
+    let mut wait_mask: u64 = 0;
+    if unsafe { copy_from_user_safe(&mut wait_mask as *mut u64 as *mut u8, set_ptr as *const u8, 8).is_err() } {
+        return EFAULT;
+    }
+
+    let mut timeout_us = u64::MAX;
+    if timeout_ptr != 0 {
+        if !validate_user_ptr(timeout_ptr, 16) {
+            return EFAULT;
+        }
+        #[repr(C)]
+        struct Timespec { tv_sec: i64, tv_nsec: i64 }
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+            return EFAULT;
+        }
+        timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
+    }
+
+    let start_time = crate::timer::uptime_us();
+
+    loop {
+        // Check for pending signals.  We pass ~wait_mask to take_pending_signal
+        // because take_pending_signal takes a mask of BLOCKED signals, but
+        // rt_sigtimedwait waits for the signals in wait_mask (so anything NOT
+        // in wait_mask is effectively "blocked" for this wait).
+        if let Some(sig) = akuma_exec::threading::take_pending_signal(!wait_mask) {
+            // Fill siginfo if requested (minimal implementation)
+            if info_ptr != 0 && validate_user_ptr(info_ptr, 128) {
+                #[repr(C)]
+                struct Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] }
+                let info = Siginfo { si_signo: sig as i32, si_errno: 0, si_code: 0, _pad: [0; 29] };
+                let _ = unsafe { copy_to_user_safe(info_ptr as *mut u8, &info as *const Siginfo as *const u8, 128) };
+            }
+            return sig as u64;
+        }
+
+        let now = crate::timer::uptime_us();
+        let elapsed = now.saturating_sub(start_time);
+        if timeout_ptr != 0 && elapsed >= timeout_us {
+            return EAGAIN; // Timeout
+        }
+
+        if akuma_exec::process::is_current_interrupted() {
+            return EINTR;
+        }
+
+        // Sleep until next tick or timeout
+        let deadline = if timeout_ptr != 0 {
+            start_time + timeout_us
+        } else {
+            u64::MAX
+        };
+        
+        // Cap sleep to 10ms to keep system responsive
+        let sleep_deadline = deadline.min(now + 10_000);
+        akuma_exec::threading::schedule_blocking(sleep_deadline);
+    }
+}
+
 pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
@@ -202,7 +283,8 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     let (target_handler, target_mask) = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
         if let Some(proc) = akuma_exec::process::lookup_process(pid) {
             let idx = (sig - 1) as usize;
-            (proc.signal_actions[idx].handler, proc.signal_mask)
+            let actions = proc.signal_actions.actions.lock();
+            (actions[idx].handler, proc.signal_mask)
         } else {
             (akuma_exec::process::SignalHandler::Default, 0)
         }

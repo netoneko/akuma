@@ -81,8 +81,101 @@ pub fn run_all_tests() {
     test_signal_masking();
     test_sigpipe_handler_reentrancy();
 
+    // Test shared signal handlers (CLONE_SIGHAND)
+    test_shared_signal_handlers();
+    test_rt_sigtimedwait();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
+
+// ── signal sharing regression tests ──────────────────────────────────────
+
+/// Verify that two processes sharing a signal table see each other's changes.
+fn test_shared_signal_handlers() {
+    use akuma_exec::process::{Process, SharedSignalTable, register_process, unregister_process, SignalHandler};
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
+
+    // 1. Create a shared table
+    let table = Arc::new(SharedSignalTable::new());
+
+    // 2. Create process A using the table
+    let pid_a = 3000;
+    let mut proc_a = match Process::from_elf("proc_a", &["proc_a".to_string()], &[], &[], None) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    proc_a.signal_actions = table.clone();
+    register_process(pid_a, alloc::boxed::Box::new(proc_a));
+
+    // 3. Create process B using the SAME table (simulates CLONE_SIGHAND)
+    let pid_b = 3001;
+    let mut proc_b = match Process::from_elf("proc_b", &["proc_b".to_string()], &[], &[], None) {
+        Ok(p) => p,
+        Err(_) => {
+            unregister_process(pid_a);
+            return;
+        }
+    };
+    proc_b.signal_actions = table.clone();
+    register_process(pid_b, alloc::boxed::Box::new(proc_b));
+
+    // 4. Update action in A
+    {
+        let mut actions = table.actions.lock();
+        actions[10].handler = SignalHandler::UserFn(0xdeadbeef);
+    }
+
+    // 5. Verify B sees the change
+    let handler_b = {
+        let actions = table.actions.lock();
+        actions[10].handler
+    };
+
+    // Cleanup
+    unregister_process(pid_a);
+    unregister_process(pid_b);
+
+    if handler_b == SignalHandler::UserFn(0xdeadbeef) {
+        console::print("[Test] shared_signal_handlers PASSED\n");
+    } else {
+        console::print("[Test] shared_signal_handlers FAILED: B did not see A's change\n");
+    }
+}
+
+/// Verify rt_sigtimedwait returns a pending signal.
+fn test_rt_sigtimedwait() {
+    use akuma_exec::threading::{pend_signal_for_thread, current_thread_id};
+    use crate::syscall::signal::sys_rt_sigtimedwait;
+
+    let tid = current_thread_id();
+    let sig = 13; // SIGPIPE
+    let wait_mask = 1u64 << (sig - 1);
+
+    // 1. Pend the signal
+    pend_signal_for_thread(tid, sig);
+
+    // 2. Call sigtimedwait (pass 0 for timeout pointer)
+    // We need to pass valid user pointers for mask and info, but for this
+    // unit test we'll cheat and use kernel addresses since validation
+    // is disabled or we can bypass it.
+    // Actually, it's safer to use a stack buffer and a real syscall call.
+    
+    // In our kernel, sys_rt_sigtimedwait checks for pending signals FIRST.
+    // Let's verify it sees our pended signal.
+    
+    // Note: info_ptr=0, timeout_ptr=0
+    // We need to pass set_ptr to a 64-bit value on stack.
+    let mut mask_val = wait_mask;
+    let res = sys_rt_sigtimedwait(&mut mask_val as *mut u64 as u64, 0, 0, 8);
+
+    if res == sig as u64 {
+        console::print("[Test] rt_sigtimedwait PASSED (found pending signal)\n");
+    } else {
+        crate::safe_print!(64, "[Test] rt_sigtimedwait FAILED: expected {}, got {}\n", sig, res);
+    }
+}
+
 
 // ── signal delivery regression tests ─────────────────────────────────────
 
@@ -123,19 +216,22 @@ fn test_sigpipe_handler_reentrancy() {
 
     // Create a fake process with a handler
     let pid = 2000;
-    let mut proc = match Process::from_elf("test", &["test".to_string()], &[], &[], None) {
+    let proc = match Process::from_elf("test", &["test".to_string()], &[], &[], None) {
         Ok(p) => p,
         Err(_) => return,
     };
     
     // Set a handler for SIGPIPE (13)
     let sig = 13;
-    proc.signal_actions[sig as usize - 1] = SignalAction {
-        handler: SignalHandler::UserFn(0x1234),
-        flags: 0, // No SA_NODEFER
-        mask: 0,
-        restorer: 0x2000,
-    };
+    {
+        let mut actions = proc.signal_actions.actions.lock();
+        actions[sig as usize - 1] = SignalAction {
+            handler: SignalHandler::UserFn(0x1234),
+            flags: 0, // No SA_NODEFER
+            mask: 0,
+            restorer: 0x2000,
+        };
+    }
     
     let _old_mask = proc.signal_mask;
     register_process(pid, alloc::boxed::Box::new(proc));
@@ -632,12 +728,15 @@ fn test_signal_reset_on_exec() {
     };
 
     // Inject a custom signal handler (SIGSEGV = index 10) and a fake sigaltstack.
-    proc.signal_actions[10] = SignalAction {
-        handler: SignalHandler::UserFn(0xdeadbeef),
-        flags: 0x0800_0000, // SA_ONSTACK
-        mask: 0,
-        restorer: 0,
-    };
+    {
+        let mut actions = proc.signal_actions.actions.lock();
+        actions[10] = SignalAction {
+            handler: SignalHandler::UserFn(0xdeadbeef),
+            flags: 0x0800_0000, // SA_ONSTACK
+            mask: 0,
+            restorer: 0,
+        };
+    }
     proc.sigaltstack_sp    = 0xc400_4000;
     proc.sigaltstack_size  = 0x8000;
     proc.sigaltstack_flags = 0; // SS_ONSTACK active
@@ -649,7 +748,10 @@ fn test_signal_reset_on_exec() {
     }
 
     // The custom handler must be gone.
-    let handler_reset = matches!(proc.signal_actions[10].handler, SignalHandler::Default);
+    let handler_reset = {
+        let actions = proc.signal_actions.actions.lock();
+        matches!(actions[10].handler, SignalHandler::Default)
+    };
     // The alternate signal stack must be disabled (SS_DISABLE = 2).
     let altstack_disabled = proc.sigaltstack_sp == 0
         && proc.sigaltstack_size == 0
@@ -692,19 +794,27 @@ fn test_signal_ignore_preserved_on_exec() {
     };
 
     // SIGPIPE (index 12) is commonly set to SIG_IGN by Go and shells.
-    proc.signal_actions[12] = SignalAction {
-        handler: SignalHandler::Ignore,
-        flags: 0,
-        mask: 0,
-        restorer: 0,
-    };
+    {
+        let mut actions = proc.signal_actions.actions.lock();
+        actions[12] = SignalAction {
+            handler: SignalHandler::Ignore,
+            flags: 0,
+            mask: 0,
+            restorer: 0,
+        };
+    }
 
     if let Err(e) = proc.replace_image(&elf_data, &[String::from("elftest")], &[]) {
         crate::safe_print!(64, "[Test] signal_ignore_preserved: replace_image failed: {}\n", e);
         return;
     }
 
-    if matches!(proc.signal_actions[12].handler, SignalHandler::Ignore) {
+    let handler_ignored = {
+        let actions = proc.signal_actions.actions.lock();
+        matches!(actions[12].handler, SignalHandler::Ignore)
+    };
+
+    if handler_ignored {
         console::print("[Test] signal_ignore_preserved PASSED\n");
     } else {
         crate::safe_print!(

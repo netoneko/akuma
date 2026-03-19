@@ -1120,6 +1120,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
                 box_id: proc.box_id,
                 name: proc.name.clone(),
                 state,
+                current_syscall: proc.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
                 last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
                 args: proc.args.clone(),
             });
@@ -1210,6 +1211,22 @@ impl SharedFdTable {
     }
 }
 
+/// Shared signal action table for CLONE_SIGHAND semantics.
+///
+/// When threads are created with CLONE_THREAD (pthreads), they share this table
+/// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
+pub struct SharedSignalTable {
+    pub actions: Spinlock<[SignalAction; MAX_SIGNALS]>,
+}
+
+impl SharedSignalTable {
+    pub fn new() -> Self {
+        Self {
+            actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
+        }
+    }
+}
+
 /// A user process
 pub struct Process {
     /// Process ID
@@ -1243,7 +1260,7 @@ pub struct Process {
     // ========== Command line arguments ==========
     /// Command line arguments (stored as strings, serialized to ProcessInfo on execute)
     pub args: Vec<String>,
-    
+
     // ========== Current working directory ==========
     /// Current working directory (inherited from parent or set explicitly)
     pub cwd: String,
@@ -1309,8 +1326,8 @@ pub struct Process {
     /// Robust futex list entry size (from set_robust_list len argument)
     pub robust_list_len: usize,
 
-    /// Per-process signal action table (sigaction storage)
-    pub signal_actions: [SignalAction; MAX_SIGNALS],
+    /// Shared signal action table (sigaction storage)
+    pub signal_actions: Arc<SharedSignalTable>,
 
     /// Blocked signal mask (bits 0-63 for signals 1-64)
     /// Bit N is set if signal N+1 is blocked
@@ -1326,9 +1343,11 @@ pub struct Process {
     /// Monotonic timestamp (us) when the process was created
     pub start_time_us: u64,
 
+    /// Current syscall number (for debugging)
+    pub current_syscall: AtomicU64,
+
     /// Last syscall number (for debugging stuck processes)
     pub last_syscall: core::sync::atomic::AtomicU64,
-
     /// Per-process syscall stats (emitted on exit when enabled)
     pub syscall_stats: ProcessSyscallStats,
 }
@@ -1576,12 +1595,13 @@ impl Process {
             clear_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,
-            signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
             start_time_us: (runtime().uptime_us)(),
+            current_syscall: core::sync::atomic::AtomicU64::new(!0),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
             syscall_stats: ProcessSyscallStats::new(),
 })
@@ -1670,12 +1690,13 @@ impl Process {
             clear_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,
-            signal_actions: [SignalAction::default(); MAX_SIGNALS],
+            signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
             start_time_us: (runtime().uptime_us)(),
+            current_syscall: core::sync::atomic::AtomicU64::new(!0),
             last_syscall: core::sync::atomic::AtomicU64::new(0),
             syscall_stats: ProcessSyscallStats::new(),
 })
@@ -1740,9 +1761,12 @@ impl Process {
 
         // POSIX: on exec, custom signal handlers are reset to SIG_DFL; SIG_IGN is preserved.
         // Also disable the alternate signal stack — it pointed into the old address space.
-        for action in &mut self.signal_actions {
-            if matches!(action.handler, SignalHandler::UserFn(_)) {
-                *action = SignalAction::default();
+        {
+            let mut actions = self.signal_actions.actions.lock();
+            for action in actions.iter_mut() {
+                if matches!(action.handler, SignalHandler::UserFn(_)) {
+                    *action = SignalAction::default();
+                }
             }
         }
         self.sigaltstack_sp = 0;
@@ -1823,9 +1847,12 @@ impl Process {
 
         // POSIX: on exec, custom signal handlers are reset to SIG_DFL; SIG_IGN is preserved.
         // Also disable the alternate signal stack — it pointed into the old address space.
-        for action in &mut self.signal_actions {
-            if matches!(action.handler, SignalHandler::UserFn(_)) {
-                *action = SignalAction::default();
+        {
+            let mut actions = self.signal_actions.actions.lock();
+            for action in actions.iter_mut() {
+                if matches!(action.handler, SignalHandler::UserFn(_)) {
+                    *action = SignalAction::default();
+                }
             }
         }
         self.sigaltstack_sp = 0;
@@ -2715,12 +2742,13 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         clear_child_tid: 0,
         robust_list_head: 0,
         robust_list_len: 0,
-        signal_actions: parent.signal_actions,
+        signal_actions: Arc::new(SharedSignalTable::new()), // Fork creates fresh table
         signal_mask: parent.signal_mask,
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
         start_time_us: (runtime().uptime_us)(),
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: ProcessSyscallStats::new(),
     }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
@@ -2971,12 +2999,13 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         clear_child_tid: child_tid_ptr,
         robust_list_head: 0,
         robust_list_len: 0,
-        signal_actions: parent.signal_actions,
+        signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
         signal_mask: parent.signal_mask,
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
         start_time_us: (runtime().uptime_us)(),
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: ProcessSyscallStats::new(),
     }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;

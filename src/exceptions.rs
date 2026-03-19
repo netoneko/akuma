@@ -775,11 +775,30 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         return false;
     }
 
-    let action = proc.signal_actions[idx];
+    let action = {
+        let actions = proc.signal_actions.actions.lock();
+        actions[idx]
+    };
+
     let handler_addr = match action.handler {
         akuma_exec::process::SignalHandler::UserFn(addr) => addr,
         _ => return false,
     };
+
+    // SA_RESTART (ARM64 nr=0x10000000)
+    // If the signal was delivered during a syscall, and SA_RESTART is set,
+    // we want the syscall to be re-executed after the handler returns.
+    // In Linux, this is often done via ERESTARTSYS. Here we do it manually
+    // by backing up ELR to the SVC instruction.
+    const SA_RESTART: u64 = 0x10000000;
+    if action.flags & SA_RESTART != 0 {
+        // Only if we were in a syscall (EC_SVC_LOWER)
+        let esr: u64;
+        unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr); }
+        if (esr >> 26) == 0x15 { // EC_SVC_LOWER
+            unsafe { (*frame).elr_el1 -= 4; } // Back to SVC instruction
+        }
+    }
 
     // When the process didn't register a restorer (Go on arm64 relies on the
     // vDSO instead of SA_RESTORER), lazily map our kernel-provided trampoline.

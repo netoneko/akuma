@@ -472,7 +472,14 @@ impl Command for PsCommand {
             } else {
                 for p in procs {
                     let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
-                    let sc = if p.last_syscall > 0 { format!("{:>3}", p.last_syscall) } else { String::from("  -") };
+                    let sc_num = p.current_syscall;
+                    let sc = if sc_num != !0u64 {
+                        format!("*{}", sc_num)
+                    } else if p.last_syscall > 0 {
+                        format!("{:>3}", p.last_syscall)
+                    } else {
+                        String::from("  -")
+                    };
                     let cmdline = if p.args.is_empty() {
                         p.name.clone()
                     } else {

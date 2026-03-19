@@ -1441,16 +1441,56 @@ Go binaries would occasionally exit with code -13 (SIGPIPE) even when a handler 
 
 ---
 
-## 30. Known remaining gaps (not yet fixed)
+## 30. `rt_sigtimedwait` (137) unimplemented — Go signal forwarding hang
 
-The following are likely to surface as Go workloads grow more complex:
+**Status:** Fixed (2026-03-19) in `src/syscall/signal.rs`
+**Component:** `sys_rt_sigtimedwait`
+
+### Symptom
+
+Go binaries using signal-heavy synchronization (or musl-based binaries) would return `ENOSYS` or hang during signal-wait loops.
+
+### Fix
+
+Implemented `sys_rt_sigtimedwait`. It checks for pending signals and blocks the thread with a timeout if none are available. It correctly populates `siginfo_t` if requested.
+
+---
+
+## 31. Signal handlers not shared across threads — `CLONE_SIGHAND` violation
+
+**Status:** Fixed (2026-03-19) in `crates/akuma-exec/src/process/mod.rs`
+**Component:** `SharedSignalTable`, `Process`
+
+### Symptom
+
+If one thread set a signal handler via `sigaction`, other threads in the same process would not see it, continuing to use the default disposition. This is non-compliant with Linux/POSIX thread semantics.
+
+### Fix
+
+Refactored `Process.signal_actions` into an `Arc<SharedSignalTable>`. `clone_thread` now performs an `Arc::clone`, ensuring all threads in a group share exactly one signal table protected by a `Spinlock`.
+
+---
+
+## 32. `SA_RESTART` ignored — spurious `EINTR` in binaries
+
+**Status:** Fixed (2026-03-19) in `src/exceptions.rs`
+**Component:** `try_deliver_signal`
+
+### Symptom
+
+Syscalls like `read` or `nanosleep` would return `EINTR` even when the signal handler was registered with `SA_RESTART`. This caused unnecessary retry loops or failures in binaries that expect the kernel to handle the restart.
+
+### Fix
+
+Implemented automatic restart logic. If `SA_RESTART` is set for a signal delivered during a syscall, the kernel now decrements the saved `ELR` by 4 bytes, causing the processor to re-execute the `SVC` instruction upon returning from the signal handler.
+
+---
+
+## 33. Known remaining gaps (not yet fixed)
 
 | Syscall / feature | Notes |
 |---|---|
-| `rt_sigtimedwait` | Used by Go's signal forwarding; currently unimplemented |
-| `clone(CLONE_SIGHAND)` | Shared signal tables across threads not implemented |
 | `epoll` + goroutine scheduler | Go's netpoller uses `epoll_pwait`; this is implemented and capped at 10 ms polling interval |
-| SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting |
-| Per-process current-syscall visibility | `ps` shows `SYSCALL=-` for all processes; threads blocked in long-running syscalls (futex, epoll) are invisible in diagnostics |
+| Per-process current-syscall visibility | `ps` now shows `SYSCALL=*NR` for active syscalls; background threads in long-running syscalls are now visible |
 | CLONE_VM sharing | VFORK+CLONE_VM creates a full copy of the address space instead of sharing page tables; this makes fork slow for large heap processes. True CLONE_VM would eliminate the copy |
 | `compile -V=full` stdout pipe | Fixed in §19 (refcount bugs) and §21 (`pipe_write` EPIPE). Both patches are required for reliable `go build` |

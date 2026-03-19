@@ -3586,10 +3586,11 @@ fn make_test_process(
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         channel: None, delegate_pid: None, clear_child_tid: 0,
         robust_list_head: 0, robust_list_len: 0,
-        signal_actions: [akuma_exec::process::SignalAction::default(); akuma_exec::process::MAX_SIGNALS],
+        signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
         signal_mask: 0,
         sigaltstack_sp: 0, sigaltstack_flags: 2, sigaltstack_size: 0,
         start_time_us: 0,
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
     })
