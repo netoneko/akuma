@@ -1,5 +1,6 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_to_user_safe;
+use akuma_net::socket::libc_errno;
 
 struct KernelPipe {
     buffer: Vec<u8>,
@@ -40,21 +41,24 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
     });
 }
 
-pub(crate) fn pipe_write(id: u32, data: &[u8]) -> usize {
+/// Write data to a pipe. Returns Ok(n) on success or Err(EPIPE) if the pipe
+/// has been destroyed (no readers left or pipe removed). On Linux, writing to
+/// a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
+pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
+            if pipe.read_count == 0 {
+                return Err(libc_errno::EPIPE as i32);
+            }
             pipe.buffer.extend_from_slice(data);
             if let Some(tid) = pipe.reader_thread.take() {
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
-            data.len()
+            Ok(data.len())
         } else {
-            // Pipe not found — always log this as it indicates a use-after-close bug.
-            // Go's compile -V=full writes to stdout (fd=1 = PipeWrite) and if the pipe
-            // ID is missing here, sys_write returns 0 and Go sees empty output.
             crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
-            0
+            Err(libc_errno::EPIPE as i32)
         }
     })
 }

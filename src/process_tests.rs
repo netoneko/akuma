@@ -64,10 +64,10 @@ pub fn run_all_tests() {
 
     // Test pipe write/read round-trip (catches use-after-close silent data loss)
     test_pipe_write_read_roundtrip();
-    test_pipe_write_missing_returns_zero();
+    test_pipe_write_missing_returns_epipe();
     test_pipe_close_write_signals_eof();
     test_pipe_refcount_lifecycle();
-    test_pipe_write_survives_read_close();
+    test_pipe_write_returns_epipe_after_read_close();
     test_pipe_eof_only_when_write_count_zero();
     test_pipe_clone_ref_then_double_close();
     test_pipe_dupfd_bumps_refcount();
@@ -824,7 +824,15 @@ fn test_sigframe_layout_constants() {
 fn test_pipe_write_read_roundtrip() {
     let id = crate::syscall::pipe::pipe_create();
     let input = b"hello pipe";
-    let n = crate::syscall::pipe::pipe_write(id, input);
+    let n = match crate::syscall::pipe::pipe_write(id, input) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::safe_print!(64, "[Test] pipe_write_read_roundtrip FAILED: pipe_write returned Err({})\n", e);
+            crate::syscall::pipe::pipe_close_write(id);
+            crate::syscall::pipe::pipe_close_read(id);
+            return;
+        }
+    };
     if n != input.len() {
         crate::safe_print!(64, "[Test] pipe_write_read_roundtrip FAILED: pipe_write returned {} expected {}\n", n, input.len());
         crate::syscall::pipe::pipe_close_write(id);
@@ -848,27 +856,24 @@ fn test_pipe_write_read_roundtrip() {
     crate::syscall::pipe::pipe_close_read(id);
 }
 
-/// Verify `pipe_write` returns 0 for an unknown pipe ID (use-after-close guard).
+/// Verify `pipe_write` returns Err(EPIPE) for a destroyed pipe.
 ///
 /// After `pipe_close_write` + `pipe_close_read` the pipe is removed from PIPES.
-/// Any subsequent `pipe_write` call with that ID must return 0, not panic.
-/// This matches the "silent 0 return" behaviour that was identified as the
-/// root cause of `compile -V=full` producing empty stdout: if fd=1 somehow
-/// pointed at a closed pipe, `sys_write` would return 0 silently and Go's
-/// `fmt.Printf` would discard all output.
-fn test_pipe_write_missing_returns_zero() {
+/// Any subsequent `pipe_write` call with that ID must return Err(EPIPE), not
+/// silently succeed with 0. The old silent-0 behaviour was the root cause of
+/// `compile -V=full` producing empty stdout.
+fn test_pipe_write_missing_returns_epipe() {
     let id = crate::syscall::pipe::pipe_create();
     crate::syscall::pipe::pipe_close_write(id);
     crate::syscall::pipe::pipe_close_read(id);
-    // Pipe should be fully removed now; write must return 0 and not panic.
-    let n = crate::syscall::pipe::pipe_write(id, b"should be lost");
-    if n == 0 {
-        console::print("[Test] pipe_write_missing_returns_zero PASSED\n");
+    let result = crate::syscall::pipe::pipe_write(id, b"should be lost");
+    if result.is_err() {
+        console::print("[Test] pipe_write_missing_returns_epipe PASSED\n");
     } else {
         crate::safe_print!(
             64,
-            "[Test] pipe_write_missing_returns_zero FAILED: returned {} expected 0\n",
-            n,
+            "[Test] pipe_write_missing_returns_epipe FAILED: returned Ok({}) expected Err(EPIPE)\n",
+            result.unwrap(),
         );
     }
 }
@@ -916,8 +921,8 @@ fn test_pipe_refcount_lifecycle() {
 
     // Close first write ref — pipe must still be alive.
     crate::syscall::pipe::pipe_close_write(id);
-    let n = crate::syscall::pipe::pipe_write(id, b"still alive");
-    if n == 0 {
+    let result = crate::syscall::pipe::pipe_write(id, b"still alive");
+    if result.is_err() {
         crate::safe_print!(64, "[Test] pipe_refcount_lifecycle FAILED: pipe died after first close\n");
         crate::syscall::pipe::pipe_close_write(id);
         crate::syscall::pipe::pipe_close_read(id);
@@ -956,22 +961,23 @@ fn test_pipe_refcount_lifecycle() {
 ///
 /// This test verifies that a single close_read (simulating Go's reader closing
 /// early) leaves the pipe alive and writable as long as write_count > 0.
-fn test_pipe_write_survives_read_close() {
+/// When read end is closed, writing should return EPIPE (Linux behavior).
+/// The pipe struct must stay alive (not removed from PIPES) until write_count
+/// also reaches 0, but writes correctly fail with EPIPE.
+fn test_pipe_write_returns_epipe_after_read_close() {
     let id = crate::syscall::pipe::pipe_create();
-    // Close the only read ref — simulates Go reader closing fd_r prematurely.
     crate::syscall::pipe::pipe_close_read(id);
-    // write_count=1 still; pipe must remain in PIPES.
-    let n = crate::syscall::pipe::pipe_write(id, b"still writable");
-    if n == 14 {
-        console::print("[Test] pipe_write_survives_read_close PASSED\n");
+    // write_count=1, read_count=0: pipe is still in PIPES but broken.
+    let result = crate::syscall::pipe::pipe_write(id, b"should fail");
+    if result.is_err() {
+        console::print("[Test] pipe_write_returns_epipe_after_read_close PASSED\n");
     } else {
         crate::safe_print!(
             64,
-            "[Test] pipe_write_survives_read_close FAILED: write returned {} (pipe may have been destroyed early)\n",
-            n,
+            "[Test] pipe_write_returns_epipe_after_read_close FAILED: returned Ok({}) expected Err(EPIPE)\n",
+            result.unwrap(),
         );
     }
-    // Cleanup: close the write end.
     crate::syscall::pipe::pipe_close_write(id);
 }
 
@@ -1036,16 +1042,19 @@ fn test_pipe_clone_ref_then_double_close() {
     // Step 4: parent closes its fd_w
     crate::syscall::pipe::pipe_close_write(id); // write=1
 
-    // Step 5: compile writes to fd[1] — MUST find pipe
-    let n = crate::syscall::pipe::pipe_write(id, b"compile -V=full output");
-    if n == 22 {
-        console::print("[Test] pipe_clone_ref_then_double_close PASSED\n");
-    } else {
-        crate::safe_print!(
+    // Step 5: compile writes to fd[1] — MUST find pipe and succeed
+    match crate::syscall::pipe::pipe_write(id, b"compile -V=full output") {
+        Ok(22) => console::print("[Test] pipe_clone_ref_then_double_close PASSED\n"),
+        Ok(n) => crate::safe_print!(
             64,
-            "[Test] pipe_clone_ref_then_double_close FAILED: write returned {} (pipe missing with write_count=1)\n",
+            "[Test] pipe_clone_ref_then_double_close FAILED: write returned Ok({}) expected Ok(22)\n",
             n,
-        );
+        ),
+        Err(e) => crate::safe_print!(
+            64,
+            "[Test] pipe_clone_ref_then_double_close FAILED: write returned Err({}) — pipe missing with write_count=1\n",
+            e,
+        ),
     }
 
     // Cleanup
@@ -1072,14 +1081,12 @@ fn test_pipe_dupfd_bumps_refcount() {
     pipe_close_read(id); // read=1 — NOT 0, because the duplicate still holds a ref
 
     // We should still be able to write (read_count=1 due to duplicate)
-    let n = pipe_write(id, b"data for duplicate reader");
-    if n == 25 {
-        console::print("[Test] pipe_dupfd_bumps_refcount PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] pipe_dupfd_bumps_refcount FAILED: pipe_write returned {} (expected 25; pipe may be prematurely destroyed or read_count=0)\n",
-            n,
-        );
+    match pipe_write(id, b"data for duplicate reader") {
+        Ok(25) => console::print("[Test] pipe_dupfd_bumps_refcount PASSED\n"),
+        other => crate::safe_print!(128,
+            "[Test] pipe_dupfd_bumps_refcount FAILED: pipe_write returned {:?} (expected Ok(25))\n",
+            other,
+        ),
     }
 
     // Cleanup: close duplicate reader and write end
@@ -1116,28 +1123,24 @@ fn test_pipe_dup3_atomically_replaces_and_closes_old() {
     // - pipe_a read_count should be 0 (old slot entry was closed)
     // - pipe_b write_count should be 2 (original + dup'd)
 
-    // pipe_a: read_count=0 → writing should still work (pipe not destroyed since write_count=1)
-    // but a write to pipe_a should succeed (pipe exists, write_count>0)
+    // pipe_a: read_count=0 → write should return EPIPE (no readers, Linux behavior)
     let a_write = pipe_write(id_a, b"to pipe_a");
-    // pipe_a still exists (write_count=1, read_count=0) — write should succeed
-    if a_write == 9 {
+    if a_write.is_err() {
         console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: old entry closed correctly PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_a) returned {} (pipe may be gone)\n",
-            a_write,
+            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_a) returned Ok({}) expected Err(EPIPE)\n",
+            a_write.unwrap(),
         );
     }
 
-    // pipe_b: write_count=2, should still be writable
-    let n = pipe_write(id_b, b"still alive");
-    if n == 11 {
-        console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: new entry still alive PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_b) returned {}\n",
-            n,
-        );
+    // pipe_b: write_count=2, read_count=1, should still be writable
+    match pipe_write(id_b, b"still alive") {
+        Ok(11) => console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: new entry still alive PASSED\n"),
+        other => crate::safe_print!(128,
+            "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_b) returned {:?}\n",
+            other,
+        ),
     }
 
     // Cleanup

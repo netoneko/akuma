@@ -224,6 +224,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_sysinfo_reports_actual_ram, "sysinfo_reports_actual_ram");
     run_test!(test_alloc_mmap_free_region_skips_kernel_hole, "alloc_mmap_free_region_kernel_hole");
 
+    // Pipe write EPIPE regression tests (go build compile -V=full fix)
+    run_test!(test_pipe_write_to_destroyed_pipe_returns_epipe, "pipe_write_destroyed_returns_epipe");
+    run_test!(test_pipe_write_no_readers_returns_epipe, "pipe_write_no_readers_returns_epipe");
+    run_test!(test_pipe_write_with_readers_succeeds, "pipe_write_with_readers_succeeds");
+    run_test!(test_pipe_cloexec_cleanup_preserves_live_writer, "pipe_cloexec_preserves_writer");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -7249,7 +7255,7 @@ fn test_pipe_bytes_available() -> bool {
     }
 
     let data = b"hello world";
-    crate::syscall::pipe::pipe_write(pipe_id, data);
+    let _ = crate::syscall::pipe::pipe_write(pipe_id, data);
     let avail_after = crate::syscall::pipe::pipe_bytes_available(pipe_id);
     if avail_after != data.len() {
         crate::safe_print!(96, "  FAIL: expected {} bytes, got {}\n", data.len(), avail_after);
@@ -7397,6 +7403,121 @@ fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
         }
     }
 
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe that has been fully destroyed (both ends closed)
+/// returns Err(EPIPE) instead of silently returning Ok(0).
+/// This is the exact regression that caused `go tool compile -V=full` to produce
+/// empty output: pipe_write returned 0, sys_write passed that through as a
+/// successful short write, and the parent Go process saw empty stdout.
+fn test_pipe_write_to_destroyed_pipe_returns_epipe() -> bool {
+    console::print("\n[TEST] pipe_write to destroyed pipe returns EPIPE\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+
+    let result = crate::syscall::pipe::pipe_write(id, b"should fail with EPIPE");
+    let pass = matches!(result, Err(32)); // EPIPE = 32
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Err(32/EPIPE)\n", result);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe where read_count=0 (all readers closed) returns
+/// Err(EPIPE), matching Linux SIGPIPE/EPIPE semantics.
+fn test_pipe_write_no_readers_returns_epipe() -> bool {
+    console::print("\n[TEST] pipe_write with no readers returns EPIPE\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    crate::syscall::pipe::pipe_close_read(id);
+
+    let result = crate::syscall::pipe::pipe_write(id, b"no reader");
+    let pass = matches!(result, Err(32));
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Err(32/EPIPE)\n", result);
+    }
+
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe with active readers succeeds normally.
+fn test_pipe_write_with_readers_succeeds() -> bool {
+    console::print("\n[TEST] pipe_write with readers succeeds\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    let data = b"go tool compile -V=full";
+    let result = crate::syscall::pipe::pipe_write(id, data);
+    let pass = matches!(result, Ok(n) if n == data.len());
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Ok({})\n", result, data.len());
+    }
+
+    let mut buf = [0u8; 64];
+    let (n, eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let data_pass = n == data.len() && &buf[..n] == data && !eof;
+    if !data_pass {
+        crate::safe_print!(96, "  FAIL: read back n={} eof={}\n", n, eof);
+    }
+
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+    let final_pass = pass && data_pass;
+    crate::safe_print!(64, "  Result: {}\n", if final_pass { "PASS" } else { "FAIL" });
+    final_pass
+}
+
+/// Test: simulates the compile -V=full scenario where cloexec cleanup during
+/// execve closes inherited pipe fds but the child's dup'd stdout (fd=1) must
+/// survive. Verifies that pipe_clone_ref correctly keeps the writer alive
+/// through cloexec close of the original fd.
+fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
+    console::print("\n[TEST] cloexec cleanup preserves live pipe writer\n");
+
+    let id = crate::syscall::pipe::pipe_create(); // write=1, read=1
+
+    // Simulate fork: deep-copy bumps both refcounts
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=2
+    crate::syscall::pipe::pipe_clone_ref(id, false); // read=2
+
+    // Child: dup write end to fd=1 (clone_ref again)
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=3
+
+    // Child: close original write fd
+    crate::syscall::pipe::pipe_close_write(id); // write=2
+
+    // Child: execve cloexec closes inherited read fd
+    crate::syscall::pipe::pipe_close_read(id); // read=1
+
+    // Parent: closes its write fd (only needed read end)
+    crate::syscall::pipe::pipe_close_write(id); // write=1
+
+    // Child writes to fd=1 (the dup'd write end) — must succeed
+    let result = crate::syscall::pipe::pipe_write(id, b"compile -V=full\n");
+    let write_ok = matches!(result, Ok(16));
+    if !write_ok {
+        crate::safe_print!(96, "  FAIL: child write returned {:?}, expected Ok(16)\n", result);
+    }
+
+    // Parent reads from its read end — must get the data
+    let mut buf = [0u8; 64];
+    let (n, _eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let read_ok = n == 16;
+    if !read_ok {
+        crate::safe_print!(96, "  FAIL: parent read returned {} bytes, expected 16\n", n);
+    }
+
+    // Cleanup
+    crate::syscall::pipe::pipe_close_write(id); // write=0
+    crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
+
+    let pass = write_ok && read_ok;
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

@@ -561,13 +561,14 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-                let n = super::pipe::pipe_write(pipe_id, buf_slice);
-                if n == 0 && !buf_slice.is_empty() {
-                    // pipe_write returned 0 for a non-empty write — pipe not found.
-                    // Log always (not just when debug enabled) since this causes silent data loss.
-                    crate::safe_print!(128, "[syscall] write WARN: PipeWrite fd={} pipe_id={} lost {} bytes (pipe gone)\n", fd_num, pipe_id, buf_slice.len());
+                match super::pipe::pipe_write(pipe_id, buf_slice) {
+                    Ok(n) => n as u64,
+                    Err(e) => {
+                        crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
+                        if total_written > 0 { return total_written as u64; }
+                        return (-(e as i64)) as u64;
+                    }
                 }
-                n as u64
             }
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes

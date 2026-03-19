@@ -1230,7 +1230,114 @@ The `PENDING_SIGNAL` array must be treated with the same discipline as `THREAD_C
 
 ---
 
-## 21. Known remaining gaps (not yet fixed)
+## 21. `pipe_write` silently returns 0 on destroyed pipe — `compile -V=full` empty output regression
+
+**Status:** Fixed (2026-03-17) in `src/syscall/pipe.rs`, `src/syscall/fs.rs`
+**Component:** `pipe_write` return type, `sys_write` PipeWrite error handling
+
+### Symptom
+
+```
+go: parsing buildID from go tool compile -V=full: unexpected output:
+[exit code: 1]
+```
+
+The kernel log shows:
+
+```
+[pipe] write WARN: pipe id=12 not found (len=25)
+[syscall] write WARN: PipeWrite fd=1 pipe_id=12 lost 25 bytes (pipe gone)
+[exit_group] pid=52 name=compile code=0 after 1.85s
+```
+
+The compile child ran successfully (exit code 0), but its final stdout write
+(the build ID output, 25 bytes) was silently discarded. The parent Go process
+read the pipe and got empty output.
+
+### Root cause
+
+`pipe_write` returned `0usize` when the pipe was not found in the global
+`PIPES` table (already destroyed). `sys_write` treated this as a successful
+short write — zero bytes written, no error. On Linux, writing to a broken
+pipe (no readers) delivers `SIGPIPE` and the `write()` syscall returns
+`-EPIPE` (errno 32).
+
+The pipe destruction itself may have resulted from the refcount races fixed
+in §19, or from legitimate lifecycle ordering (all readers closed before the
+writer's final flush). Regardless of the root cause of the pipe's absence,
+the kernel must not silently discard data — it must report an error so the
+caller can observe the failure.
+
+### Debugging with `/proc/<pid>/syscalls`
+
+The fix was diagnosed using the per-process syscall ring buffer at
+`/proc/<pid>/syscalls`. This facility logs the last N syscalls per process
+with their number, arguments, return value, and duration. To use it:
+
+```
+cat /proc/<pid>/syscalls
+```
+
+For the `compile -V=full` probe, the key evidence was:
+- Pipe write syscalls (nr=64) returning 0 instead of the expected byte count
+- The `[pipe] write WARN` kernel message correlating with the zero-return write
+- `exit_group` (nr=94) immediately after, with code 0
+
+### Fix
+
+**`pipe_write` return type change** (`src/syscall/pipe.rs`):
+
+Changed from `fn pipe_write(id, data) -> usize` to
+`fn pipe_write(id, data) -> Result<usize, i32>`.
+
+- If the pipe exists and has readers (`read_count > 0`): returns `Ok(n)`.
+- If the pipe exists but has no readers (`read_count == 0`): returns
+  `Err(EPIPE)` — matches Linux behavior where writing to a pipe with no
+  readers produces `SIGPIPE`/`EPIPE`.
+- If the pipe is not found (already destroyed): returns `Err(EPIPE)`.
+
+**`sys_write` EPIPE propagation** (`src/syscall/fs.rs`):
+
+The `PipeWrite` arm now matches on the `Result`:
+
+```rust
+match super::pipe::pipe_write(pipe_id, buf_slice) {
+    Ok(n) => n as u64,
+    Err(e) => {
+        if total_written > 0 { return total_written as u64; }
+        return (-(e as i64)) as u64;  // -EPIPE
+    }
+}
+```
+
+If some data was already written in a multi-chunk write, the partial count
+is returned (matching Linux short-write semantics). Otherwise `-EPIPE` is
+returned directly.
+
+### Kernel tests added
+
+Four new tests in `src/tests.rs`:
+
+| Test | What it verifies |
+|---|---|
+| `test_pipe_write_to_destroyed_pipe_returns_epipe` | Writing to a fully destroyed pipe returns `Err(32)` (EPIPE), not `Ok(0)` |
+| `test_pipe_write_no_readers_returns_epipe` | Writing to a pipe with `read_count=0` returns `Err(EPIPE)` |
+| `test_pipe_write_with_readers_succeeds` | Writing to a pipe with active readers returns `Ok(n)` and data round-trips correctly |
+| `test_pipe_cloexec_cleanup_preserves_live_writer` | Simulates the full fork→dup→cloexec→write→read lifecycle; verifies the dup'd writer survives cloexec cleanup |
+
+Existing tests in `src/process_tests.rs` were updated to match the new
+`Result` return type:
+
+| Test | Change |
+|---|---|
+| `test_pipe_write_missing_returns_zero` | Renamed to `test_pipe_write_missing_returns_epipe`; now asserts `Err(EPIPE)` instead of `0` |
+| `test_pipe_write_survives_read_close` | Renamed to `test_pipe_write_returns_epipe_after_read_close`; now asserts `Err(EPIPE)` when `read_count=0` |
+| `test_pipe_dup3_atomically_replaces_and_closes_old` | Updated to expect `Err(EPIPE)` for pipe_a write (read_count=0) |
+| Other pipe tests | Updated to unwrap `Result` from `pipe_write` |
+
+---
+
+## 22. Known remaining gaps (not yet fixed)
 
 The following are likely to surface as Go workloads grow more complex:
 
@@ -1242,4 +1349,4 @@ The following are likely to surface as Go workloads grow more complex:
 | SA_RESTART semantics | `restart_syscall` (128) returns EINTR instead of actually restarting |
 | Per-process current-syscall visibility | `ps` shows `SYSCALL=-` for all processes; threads blocked in long-running syscalls (futex, epoll) are invisible in diagnostics |
 | CLONE_VM sharing | VFORK+CLONE_VM creates a full copy of the address space instead of sharing page tables; this makes fork slow for large heap processes. True CLONE_VM would eliminate the copy |
-| `compile -V=full` stdout pipe | Fixed in §19 — `F_DUPFD_CLOEXEC` refcount and `dup3` TOCTOU race both patched |
+| `compile -V=full` stdout pipe | Fixed in §19 (refcount bugs) and §21 (`pipe_write` EPIPE). Both patches are required for reliable `go build` |
