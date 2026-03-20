@@ -1486,7 +1486,69 @@ Implemented automatic restart logic. If `SA_RESTART` is set for a signal deliver
 
 ---
 
-## 33. Known remaining gaps (not yet fixed)
+## 34. `rt_sigtimedwait` (137) unimplemented — Go signal forwarding hang
+
+**Status:** Fixed (2026-03-19) in `src/syscall/signal.rs`
+**Component:** `sys_rt_sigtimedwait`
+
+### Symptom
+
+Go binaries using signal-heavy synchronization (or musl-based binaries) would return `ENOSYS` or hang during signal-wait loops.
+
+### Fix
+
+Implemented `sys_rt_sigtimedwait`. It checks for pending signals and blocks the thread with a timeout if none are available. It correctly populates `siginfo_t` if requested.
+
+---
+
+## 35. Signal handlers not shared across threads — `CLONE_SIGHAND` violation
+
+**Status:** Fixed (2026-03-19) in `crates/akuma-exec/src/process/mod.rs`
+**Component:** `SharedSignalTable`, `Process`
+
+### Symptom
+
+If one thread set a signal handler via `sigaction`, other threads in the same process would not see it, continuing to use the default disposition. This is non-compliant with Linux/POSIX thread semantics.
+
+### Fix
+
+Refactored `Process.signal_actions` into an `Arc<SharedSignalTable>`. `clone_thread` now performs an `Arc::clone`, ensuring all threads in a group share exactly one signal table protected by a `Spinlock`.
+
+---
+
+## 36. `SA_RESTART` ignored — spurious `EINTR` in binaries
+
+**Status:** Fixed (2026-03-19) in `src/exceptions.rs`
+**Component:** `try_deliver_signal`
+
+### Symptom
+
+Syscalls like `read` or `nanosleep` would return `EINTR` even when the signal handler was registered with `SA_RESTART`. This caused unnecessary retry loops or failures in binaries that expect the kernel to handle the restart.
+
+### Fix
+
+Implemented automatic restart logic. If `SA_RESTART` is set for a signal delivered during a syscall, the kernel now decrements the saved `ELR_EL1` by 4 bytes, causing the processor to re-execute the `SVC` instruction upon returning from the signal handler.
+
+---
+
+## 37. Per-process current-syscall visibility — poor debugging
+
+**Status:** Fixed (2026-03-19) in `src/syscall/mod.rs` and `src/shell/commands/builtin.rs`
+**Component:** `Process`, `ps`
+
+### Symptom
+
+`ps` would show `SYSCALL=-` for all processes, making it difficult to debug stuck threads.
+
+### Fix
+
+1.  Added `current_syscall` field to `Process`.
+2.  Updated `handle_syscall` to set `current_syscall` at entry and reset it on exit.
+3.  Updated `ps` to display the active syscall (marked with `*`) for threads currently in the kernel.
+
+---
+
+## 38. Known remaining gaps (not yet fixed)
 
 | Syscall / feature | Notes |
 |---|---|
