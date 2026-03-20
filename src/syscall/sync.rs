@@ -48,7 +48,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
     // Validate uaddr - must be 4-byte aligned and in user space
     if uaddr == 0 || uaddr & 3 != 0 {
-        crate::tprint!(128, "[futex] EINVAL: uaddr={:#x} op={} (null or unaligned)\n", uaddr, op);
+        let elr: u64;
+        unsafe { core::arch::asm!("mrs {}, elr_el1", out(reg) elr); }
+        crate::tprint!(192,
+            "[futex] EINVAL: uaddr={:#x} op={} elr={:#x} (null or unaligned)\n",
+            uaddr, op, elr);
         return EINVAL;
     }
     if !validate_user_ptr(uaddr as u64, 4) {

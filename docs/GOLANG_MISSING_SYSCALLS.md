@@ -1616,3 +1616,57 @@ The `PC=0x20000000` SIGSEGV that followed was a secondary crash: another gorouti
 **Fix (`src/exceptions.rs` `try_deliver_signal`):** Added an early-return guard: if `(action.flags & SA_ONSTACK) != 0` and `alt_sp == 0`, the signal is re-pended via `pend_signal_for_thread(thread_slot, signal)` and `try_deliver_signal` returns `false`. The signal will be retried at the next syscall boundary. By that point `mstart` will have called `sigaltstack`, so `alt_sp` will be non-zero and delivery will succeed on the correct gsignal stack.
 
 Diagnostic logging was also added at signal delivery time (printing `slot`, `alt_sp`, `alt_size`, `elr_el1`, `new_sp`) and in `do_rt_sigreturn` (printing the restored `sp`, `pc`, `pstate`) to make future regressions easier to diagnose.
+
+## 46. Pending signal not delivered after `rt_sigreturn` — second SIGURG corrupts futex x0 (FIXED 2026-03-20)
+
+**Symptom:** After all previous fixes, `go build` still intermittently produced:
+
+```
+[futex] EINVAL: uaddr=0x1 op=129 (null or unaligned)
+futexwakeup addr=0xc4047158 returned -22
+SIGSEGV fault=0x1006
+```
+
+`uaddr=0x1` is the `mutex_locked` sentinel (1 = locked), not a real address. The `SIGSEGV` at `0x1006` is Go's deliberate crash (`throw`) triggered by an unexpected futex failure.
+
+**Root cause:** Linux delivers pending signals on **every** return to user mode, including after `rt_sigreturn`. Akuma only checked for pending signals at the end of the normal `handle_syscall` path. `rt_sigreturn` (NR 139) returned *early* — before that check — so any signal that arrived while the previous signal handler was executing was silently skipped until the next syscall.
+
+The exact crash sequence:
+
+1. `futexwakeup(addr=0xc4047158)` → `sys_futex(WAKE)` returns `1` (woke one waiter). The kernel sets `frame.x0 = 1`.
+2. A pending SIGURG is found at syscall-return time. The kernel saves `frame.x0 = 1` in `mcontext.regs[0]` of the signal frame and redirects ELR to the SIGURG handler.
+3. Go's `doSigPreempt` calls `pushCall`, which:
+   - decrements `mcontext.sp` by 8 (pushes the original LR onto the goroutine stack),
+   - sets `mcontext.regs[30]` to `pc_after_svc` (so `asyncPreempt`'s `RET` lands after the SVC),
+   - sets `mcontext.pc` to `asyncPreempt`.
+4. `rt_sigreturn` SVC: `do_rt_sigreturn` restores the modified frame. `frame.x0` is restored to `1` (the saved futex return value).
+5. **Before this fix:** `return saved_x0` exited immediately — the pending-signal check was never reached. A second SIGURG that arrived during step 3 was left in the queue.
+6. `asyncPreempt` runs with the goroutine stack shifted by -8 (from `pushCall`). The second SIGURG is deferred to the *next* syscall.
+7. At the next syscall, the goroutine's stack is in the shifted state. A `FUTEX_WAKE` call is made with `x0` still holding the shifted/stale value `1` instead of the correct address. The kernel rejects it with EINVAL.
+
+**Fix (`src/exceptions.rs`):** Immediately after `do_rt_sigreturn` succeeds, the kernel now runs the same pending-signal check that exists at the end of the normal syscall return path:
+
+```rust
+if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
+    unsafe { (*frame).x0 = saved_x0; }
+    if try_deliver_signal(frame, sig, 0) {
+        return sig as u64;
+    }
+}
+return saved_x0;
+```
+
+`do_rt_sigreturn` has already restored the full register set in `*frame` (correct SP/PC), so `try_deliver_signal` sees the right context. `frame.x0` is set to `saved_x0` before delivery so that the nested signal frame correctly saves the original syscall return value, and `rt_sigreturn` from the nested handler restores it.
+
+**Fix (`src/syscall/sync.rs`):** The `[futex] EINVAL` log now reads `elr_el1` and prints it alongside `uaddr` and `op`, making it straightforward to identify the faulting SVC site in future crashes:
+
+```
+[futex] EINVAL: uaddr=0x1 op=129 elr=0x... (null or unaligned)
+```
+
+**New tests (`src/sync_tests.rs`):**
+- `test_futex_einval_uaddr_one` — `FUTEX_WAKE` with `uaddr=1` (the exact Go `mutex_locked` value) returns EINVAL.
+- `test_futex_wake_valid_addr_no_waiters` — `FUTEX_WAKE` with a valid aligned address and no waiters returns 0, not EINVAL (regression guard).
+- `test_pending_signal_drained_by_take` — `take_pending_signal` consumes a pended SIGURG exactly once; a second call returns `None`. This is the critical invariant the `rt_sigreturn` delivery fix relies on.
+
+**See also:** `docs/SIGNAL_DELIVERY.md` for a detailed explanation of the Go preemption / `rt_sigreturn` interaction.

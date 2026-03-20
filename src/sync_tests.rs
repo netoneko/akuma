@@ -919,6 +919,96 @@ fn test_per_thread_sigaltstack() {
     console::print("  [PASS] test_per_thread_sigaltstack\n");
 }
 
+/// uaddr=1 (mutex_locked, also misaligned) must return EINVAL.
+///
+/// This is the exact value that was crashing Go's futexwakeup: x0 was
+/// corrupted to 1 (MUTEX_LOCKED sentinel) between the goroutine setting
+/// x0=addr and the SVC instruction firing.  We verify the kernel rejects it
+/// cleanly with EINVAL rather than dereferencing it.
+fn test_futex_einval_uaddr_one() {
+    set_bypass(true);
+
+    let ret = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[1u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+
+    set_bypass(false);
+
+    assert!(
+        ret == EINVAL,
+        "test_futex_einval_uaddr_one: expected EINVAL ({:#x}) got {:#x}",
+        EINVAL,
+        ret
+    );
+    console::print("  [PASS] test_futex_einval_uaddr_one\n");
+}
+
+/// FUTEX_WAKE with a valid aligned address but no waiters must return 0.
+///
+/// Guards against regression where valid addresses mistakenly get EINVAL.
+fn test_futex_wake_valid_addr_no_waiters() {
+    set_bypass(true);
+
+    let mut val: u32 = 0;
+    let uaddr = &mut val as *mut u32 as usize;
+    assert!(uaddr & 3 == 0, "uaddr not 4-byte aligned in test");
+
+    let ret = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+
+    set_bypass(false);
+
+    assert!(
+        ret == 0,
+        "test_futex_wake_valid_addr_no_waiters: expected 0 (no waiters) got {:#x}",
+        ret
+    );
+    console::print("  [PASS] test_futex_wake_valid_addr_no_waiters\n");
+}
+
+/// Verify take_pending_signal drains the queue correctly.
+///
+/// This tests the critical invariant that the rt_sigreturn pending-signal
+/// delivery fix relies on: a pended signal is consumed exactly once by
+/// take_pending_signal.  A second call must return None (queue drained).
+fn test_pending_signal_drained_by_take() {
+    let slot = akuma_exec::threading::current_thread_id();
+    const NO_MASK: u64 = 0; // no signals blocked
+
+    // Start clean.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    // No signal pending → take returns None.
+    assert!(
+        akuma_exec::threading::take_pending_signal(NO_MASK).is_none(),
+        "test_pending_signal_drained_by_take: expected None before pend"
+    );
+
+    // Pend SIGURG (23) — the signal Go uses for goroutine preemption.
+    akuma_exec::threading::pend_signal_for_thread(slot, 23);
+
+    // First take: must return the signal.
+    let first = akuma_exec::threading::take_pending_signal(NO_MASK);
+    assert!(
+        first == Some(23),
+        "test_pending_signal_drained_by_take: expected Some(23), got {:?}",
+        first
+    );
+
+    // Second take: queue must be empty.
+    let second = akuma_exec::threading::take_pending_signal(NO_MASK);
+    assert!(
+        second.is_none(),
+        "test_pending_signal_drained_by_take: expected None after drain, got {:?}",
+        second
+    );
+
+    console::print("  [PASS] test_pending_signal_drained_by_take\n");
+}
+
 /// Verify peek_pending_signal returns the signal without consuming it.
 fn test_peek_pending_signal() {
     let slot = akuma_exec::threading::current_thread_id();
@@ -954,6 +1044,8 @@ pub fn run_all_tests() {
     test_futex_eagain();
     test_futex_null_addr();
     test_futex_unaligned_addr();
+    test_futex_einval_uaddr_one();
+    test_futex_wake_valid_addr_no_waiters();
     test_futex_timeout();
     test_futex_wake_before_wait();
     test_futex_wake_zero();
@@ -962,6 +1054,7 @@ pub fn run_all_tests() {
     test_futex_wait_bitset_absolute_past();
     test_per_thread_sigaltstack();
     test_peek_pending_signal();
+    test_pending_signal_drained_by_take();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();
     test_rt_sigreturn_restores_registers();

@@ -1614,6 +1614,26 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // rt_sigreturn (NR 139): restore saved context from signal frame
             if syscall_num == 139 {
                 if let Some(saved_x0) = do_rt_sigreturn(frame) {
+                    // Linux delivers pending signals on every return to user mode,
+                    // including after rt_sigreturn. Without this check, a SIGURG
+                    // arriving between a syscall return and rt_sigreturn can corrupt
+                    // the next syscall's x0 (e.g. futex sees uaddr=1 instead of
+                    // the real address). do_rt_sigreturn has already restored the
+                    // full register set in *frame, so delivery here sees the correct
+                    // SP/PC. We must set frame.x0 = saved_x0 before delivering so
+                    // that sigreturn from the nested handler restores the right value.
+                    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                    let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
+                        p.signal_mask
+                    } else {
+                        0
+                    };
+                    if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
+                        unsafe { (*frame).x0 = saved_x0; }
+                        if try_deliver_signal(frame, sig, 0) {
+                            return sig as u64;
+                        }
+                    }
                     return saved_x0;
                 }
                 if let Some(pid) = akuma_exec::process::read_current_pid() {
