@@ -1670,3 +1670,57 @@ return saved_x0;
 - `test_pending_signal_drained_by_take` — `take_pending_signal` consumes a pended SIGURG exactly once; a second call returns `None`. This is the critical invariant the `rt_sigreturn` delivery fix relies on.
 
 **See also:** `docs/SIGNAL_DELIVERY.md` for a detailed explanation of the Go preemption / `rt_sigreturn` interaction.
+
+## 47. Additional signal-pending test coverage for §46 crash paths (2026-03-20)
+
+**Status:** Tests only — no kernel code change.
+
+**Context:** The §46 fix handles the case where a SIGURG is pending when
+`rt_sigreturn` is called. Several related invariants were untested, making it
+hard to confirm whether the fix is complete or a related code path is still
+wrong. Six new tests were added to `src/sync_tests.rs`.
+
+**Tests added:**
+
+- `test_take_pending_signal_sigurg_masked` — Verifies that when SIGURG (23,
+  bit 22) is pending but the mask has bit 22 set, `take_pending_signal` returns
+  `None` and the signal stays in `PENDING_SIGNAL`. With mask=0 the same call
+  returns `Some(23)`. This is the mask state while `asyncPreempt` runs (SIGURG
+  blocked by `proc.signal_mask` after first delivery, then unblocked by the
+  `uc_sigmask` restore in `rt_sigreturn`).
+
+- `test_take_pending_signal_sigkill_ignores_mask` — Verifies SIGKILL (9) and
+  SIGSTOP (19) are returned by `take_pending_signal` regardless of mask,
+  including `u64::MAX`. Guards against the unmaskable-signal logic being
+  accidentally removed.
+
+- `test_pending_signal_overwrite` — Pends SIGUSR1 (10) then immediately pends
+  SIGURG (23). The second pend overwrites the first (single-slot limitation).
+  `take_pending_signal(0)` must return `Some(23)`, not `Some(10)`. Documents
+  the known limitation: if two signals arrive rapidly, only the last survives.
+
+- `test_signal_mask_bit_numbering` — Asserts the exact bit position of
+  SIGHUP/SIGKILL/SIGSTOP/SIGURG (signals 1/9/19/23 → bits 0/8/18/22).
+  Prevents off-by-one errors in mask logic from going unnoticed.
+
+- `test_futex_wake_sigurg_pending_x0_not_reused` — Regression test for the
+  exact crash sequence: spawns one waiter, calls `FUTEX_WAKE(1)`, records the
+  return value (0 or 1), pends SIGURG on the waker thread, verifies
+  `peek_pending_signal` returns 23, and verifies `take_pending_signal(0)`
+  returns `Some(23)` and drains the queue. Confirms the pending-signal
+  machinery is consistent with the state just before the §46 crash.
+
+- `test_futex_wake_returns_exact_count_three_waiters` — Spawns 3 waiters,
+  calls `FUTEX_WAKE(max=1)`, and asserts the return value is ≤ 1. Documents
+  that this return value equals Go's `mutex_locked` sentinel (1), which is
+  why passing it directly as `uaddr` in a subsequent `FUTEX_WAKE` produces
+  EINVAL.
+
+**Signal mask bit-numbering (reference):**
+
+| Signal | N | Bit | Mask value |
+|--------|---|-----|------------|
+| SIGHUP | 1 | 0 | `0x0000_0001` |
+| SIGKILL | 9 | 8 | `0x0000_0100` |
+| SIGSTOP | 19 | 18 | `0x0004_0000` |
+| SIGURG | 23 | 22 | `0x0040_0000` |

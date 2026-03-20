@@ -68,6 +68,45 @@ logic as the normal syscall return path (`src/exceptions.rs`).  Key points:
   handler calls `rt_sigreturn`, the original syscall return value is
   correctly restored.
 
+### Remaining risk: signal masking during asyncPreempt
+
+After the fix, a second SIGURG that arrives **while asyncPreempt is running**
+is blocked by `proc.signal_mask` (set in `try_deliver_signal` at delivery
+time).  `rt_sigreturn` restores `uc_sigmask` from the saved frame — which does
+**not** include SIGURG in the blocked set — so after sigreturn SIGURG is
+unblocked again.  The pending-signal check added by the fix then sees that
+second SIGURG and re-delivers it.
+
+Whether Go handles this re-entrant delivery safely depends on
+`gp.asyncSafePoint` state.  On Linux x86 this is fine because Go's SIGURG
+handler checks `asyncSafePoint` before calling `pushCall`.  On AArch64 the
+same guard applies.  No crash has been observed from this path, but it remains
+a theoretical concern if a goroutine is not at an async-safe point when the
+second SIGURG fires.
+
+### Signal mask bit-numbering convention
+
+Signal N uses bit `1u64 << (N-1)` in the 64-bit `uc_sigmask`:
+
+| Signal | Number | Mask bit | Hex value |
+|--------|--------|----------|-----------|
+| SIGHUP | 1 | 0 | `0x0000_0001` |
+| SIGKILL | 9 | 8 | `0x0000_0100` |
+| SIGSTOP | 19 | 18 | `0x0004_0000` |
+| SIGURG | 23 | 22 | `0x0040_0000` |
+
+SIGKILL (9) and SIGSTOP (19) bypass the mask check entirely in
+`take_pending_signal` — they are delivered regardless of `proc.signal_mask`.
+
+### Single pending-signal slot limitation
+
+`PENDING_SIGNAL[tid]` is a single `AtomicU32`.  A second `pend_signal_for_thread`
+call overwrites the first.  If two signals arrive between two consecutive
+`take_pending_signal` calls, only the later one survives.  This is acceptable
+for SIGURG (Go tolerates dropped async-preemption attempts) but would be
+wrong for SIGTERM + SIGKILL sequencing.  The limitation is documented in
+`test_pending_signal_overwrite` in `src/sync_tests.rs`.
+
 ### Diagnosis aid
 
 The `[futex] EINVAL` log message now includes the caller's ELR (return
@@ -87,6 +126,25 @@ whether a corrupted uaddr originated from a goroutine preemption race:
 | `[futex] EINVAL: uaddr=0x1` | x0 was corrupted to the `mutex_locked` sentinel |
 | `futexwakeup addr=... returned -22` | Go's runtime detected the unexpected EINVAL |
 | `SIGSEGV fault=0x1006` | Go's deliberate crash (`throw`) triggered by futex failure |
+| r11/r12 contain ASCII of "futexwakeup addr=" | crash happened during Go's `throw` string build |
+| goroutine 0 sp outside stack bounds | register corruption occurred before the crash |
+
+---
+
+## Test coverage (src/sync_tests.rs)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_pending_signal_drained_by_take` | signal consumed exactly once |
+| `test_peek_pending_signal` | peek is non-destructive |
+| `test_futex_wait_eintr_signal_preserved` | signal survives FUTEX_WAIT EINTR |
+| `test_take_pending_signal_sigurg_masked` | SIGURG is not taken when bit 22 of mask is set |
+| `test_take_pending_signal_sigkill_ignores_mask` | SIGKILL/SIGSTOP bypass the mask |
+| `test_pending_signal_overwrite` | second pend overwrites first (single-slot limit) |
+| `test_signal_mask_bit_numbering` | bit positions for key signals |
+| `test_futex_wake_sigurg_pending_x0_not_reused` | SIGURG pending after FUTEX_WAKE(1) returns 1 |
+| `test_futex_wake_returns_exact_count_three_waiters` | FUTEX_WAKE(1) returns ≤1, not 3 |
+| `test_futex_einval_uaddr_one` | uaddr=1 returns EINVAL cleanly |
 
 ---
 
@@ -95,5 +153,7 @@ whether a corrupted uaddr originated from a goroutine preemption race:
 - `src/exceptions.rs` — `do_rt_sigreturn`, `try_deliver_signal`, and the
   pending-signal delivery check after `rt_sigreturn`.
 - `src/syscall/sync.rs` — `sys_futex`, including the EINVAL log with ELR.
+- `crates/akuma-exec/src/threading/mod.rs` — `take_pending_signal`,
+  `peek_pending_signal`, `pend_signal_for_thread` (lines ~2312–2368).
 - `src/sync_tests.rs` — unit tests for the futex EINVAL paths and the
   pending-signal drain invariant.
