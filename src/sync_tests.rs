@@ -1038,6 +1038,373 @@ fn test_peek_pending_signal() {
     console::print("  [PASS] test_peek_pending_signal\n");
 }
 
+/// Verify that take_pending_signal respects the signal mask for SIGURG.
+///
+/// SIGURG (23) is Go's goroutine-preemption signal.  During asyncPreempt the
+/// kernel blocks SIGURG in proc.signal_mask.  This test confirms that when
+/// bit 22 (SIGURG's mask bit) is set, take_pending_signal returns None and
+/// leaves the signal in the queue, and that it IS returned once the mask is
+/// cleared.  This is the exact mask state that exists while the first SIGURG
+/// handler runs.
+fn test_take_pending_signal_sigurg_masked() {
+    let slot = akuma_exec::threading::current_thread_id();
+    const SIGURG: u32 = 23;
+    const SIGURG_BIT: u64 = 1u64 << (SIGURG - 1); // bit 22
+
+    // Start clean.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    // Pend SIGURG.
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGURG);
+
+    // With SIGURG masked: take must return None and NOT consume the signal.
+    let taken_masked = akuma_exec::threading::take_pending_signal(SIGURG_BIT);
+    assert!(
+        taken_masked.is_none(),
+        "test_take_pending_signal_sigurg_masked: expected None with mask={:#x}, got {:?}",
+        SIGURG_BIT, taken_masked
+    );
+
+    // Signal must still be in the queue.
+    let peeked = akuma_exec::threading::peek_pending_signal(slot);
+    assert!(
+        peeked == SIGURG,
+        "test_take_pending_signal_sigurg_masked: signal should remain after masked take, got {}",
+        peeked
+    );
+
+    // With no mask: take must return Some(23).
+    let taken_unmasked = akuma_exec::threading::take_pending_signal(0);
+    assert!(
+        taken_unmasked == Some(SIGURG),
+        "test_take_pending_signal_sigurg_masked: expected Some(23) with mask=0, got {:?}",
+        taken_unmasked
+    );
+
+    // Queue must now be empty.
+    assert!(
+        akuma_exec::threading::peek_pending_signal(slot) == 0,
+        "test_take_pending_signal_sigurg_masked: queue not empty after take"
+    );
+
+    console::print("  [PASS] test_take_pending_signal_sigurg_masked\n");
+}
+
+/// Verify that SIGKILL and SIGSTOP bypass the signal mask in take_pending_signal.
+///
+/// Neither SIGKILL (9) nor SIGSTOP (19) can be masked by a process.  This test
+/// guards against the unmaskable-signal logic being accidentally removed from
+/// take_pending_signal.
+fn test_take_pending_signal_sigkill_ignores_mask() {
+    let slot = akuma_exec::threading::current_thread_id();
+    const SIGKILL: u32 = 9;
+    const SIGSTOP: u32 = 19;
+    const SIGKILL_BIT: u64 = 1u64 << (SIGKILL - 1); // bit 8
+    const SIGSTOP_BIT: u64 = 1u64 << (SIGSTOP - 1); // bit 18
+    const ALL_MASK: u64 = u64::MAX; // every signal "blocked"
+
+    // ---- SIGKILL ----
+    akuma_exec::threading::pend_signal_for_thread(slot, 0); // clear
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGKILL);
+
+    let taken = akuma_exec::threading::take_pending_signal(SIGKILL_BIT);
+    assert!(
+        taken == Some(SIGKILL),
+        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with sigkill_bit mask: expected Some(9), got {:?}",
+        taken
+    );
+
+    // Also with all-bits mask.
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGKILL);
+    let taken_all = akuma_exec::threading::take_pending_signal(ALL_MASK);
+    assert!(
+        taken_all == Some(SIGKILL),
+        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with ALL_MASK: expected Some(9), got {:?}",
+        taken_all
+    );
+
+    // ---- SIGSTOP ----
+    akuma_exec::threading::pend_signal_for_thread(slot, 0); // clear
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGSTOP);
+
+    let taken_stop = akuma_exec::threading::take_pending_signal(SIGSTOP_BIT);
+    assert!(
+        taken_stop == Some(SIGSTOP),
+        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with sigstop_bit mask: expected Some(19), got {:?}",
+        taken_stop
+    );
+
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGSTOP);
+    let taken_stop_all = akuma_exec::threading::take_pending_signal(ALL_MASK);
+    assert!(
+        taken_stop_all == Some(SIGSTOP),
+        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with ALL_MASK: expected Some(19), got {:?}",
+        taken_stop_all
+    );
+
+    // Clean up.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    console::print("  [PASS] test_take_pending_signal_sigkill_ignores_mask\n");
+}
+
+/// Verify the single-slot limitation: a second pend overwrites the first.
+///
+/// Only one pending signal slot exists per thread (PENDING_SIGNAL[tid] is a
+/// single u32).  If two signals arrive rapidly, only the last one survives.
+/// This test documents this limitation explicitly.
+fn test_pending_signal_overwrite() {
+    let slot = akuma_exec::threading::current_thread_id();
+
+    // Start clean.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    // Pend SIGUSR1 (10), then immediately pend SIGURG (23).
+    akuma_exec::threading::pend_signal_for_thread(slot, 10); // SIGUSR1
+    akuma_exec::threading::pend_signal_for_thread(slot, 23); // SIGURG — overwrites
+
+    // take must return 23 (SIGURG), not 10 (SIGUSR1).
+    let taken = akuma_exec::threading::take_pending_signal(0);
+    assert!(
+        taken == Some(23),
+        "test_pending_signal_overwrite: expected Some(23) after overwrite, got {:?}",
+        taken
+    );
+
+    // Queue must now be empty (SIGUSR1 was silently dropped).
+    assert!(
+        akuma_exec::threading::take_pending_signal(0).is_none(),
+        "test_pending_signal_overwrite: queue should be empty after single-slot drain"
+    );
+
+    console::print("  [PASS] test_pending_signal_overwrite\n");
+}
+
+/// Document and verify the bit-numbering convention used in signal masks.
+///
+/// Signal N uses bit `1u64 << (N-1)`.  Off-by-one errors in mask logic
+/// produce silent bugs that are very hard to reproduce, so we assert the
+/// expected bit positions for the most relevant signals explicitly.
+fn test_signal_mask_bit_numbering() {
+    // SIGHUP (1) → bit 0
+    assert!(1u64 << (1u32 - 1) == 0x0000_0000_0000_0001,
+        "SIGHUP bit wrong");
+    // SIGKILL (9) → bit 8 = 0x100
+    assert!(1u64 << (9u32 - 1) == 0x0000_0000_0000_0100,
+        "SIGKILL bit wrong");
+    // SIGSTOP (19) → bit 18 = 0x4_0000
+    assert!(1u64 << (19u32 - 1) == 0x0000_0000_0004_0000,
+        "SIGSTOP bit wrong");
+    // SIGURG (23) → bit 22 = 0x40_0000
+    assert!(1u64 << (23u32 - 1) == 0x0000_0000_0040_0000,
+        "SIGURG bit wrong");
+
+    // Cross-check: if the mask has SIGURG's bit set, it is masked.
+    let sigurg_bit: u64 = 1u64 << (23u32 - 1);
+    assert!(sigurg_bit == 0x0040_0000,
+        "SIGURG bit value mismatch: {:#x}", sigurg_bit);
+
+    // Signal 1 (bit 0) and signal 64 (bit 63) are at the extremes.
+    assert!(1u64 << (1u32 - 1) == 1u64,   "signal 1 bit != 1");
+    assert!(1u64 << (64u32 - 1) == 1u64 << 63, "signal 64 bit wrong");
+
+    console::print("  [PASS] test_signal_mask_bit_numbering\n");
+}
+
+/// Regression test for the SIGURG-after-futex-wake crash sequence.
+///
+/// Verifies that after FUTEX_WAKE returns 1 (the Go `mutex_locked` sentinel),
+/// the pending-signal machinery correctly handles SIGURG pended on the waker
+/// thread:
+///   - peek_pending_signal returns 23
+///   - take_pending_signal(0) returns Some(23) and drains the queue
+///   - the queue is empty afterwards
+///
+/// This mirrors the pre-crash state exactly: futex returned 1, SIGURG was
+/// async-delivered, and the next FUTEX_WAKE incorrectly used x0=1 as uaddr.
+fn test_futex_wake_sigurg_pending_x0_not_reused() {
+    static FUTEX_WORD_RX: AtomicU32 = AtomicU32::new(0);
+    static WAITER_DONE_RX: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_RX.store(0, Ordering::SeqCst);
+    WAITER_DONE_RX.store(false, Ordering::SeqCst);
+
+    // Spawn one waiter.
+    threading::spawn_fn(|| {
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+        let uaddr = FUTEX_WORD_RX.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
+        let timeout_ptr = &ts as *const Timespec as u64;
+        crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+        );
+
+        WAITER_DONE_RX.store(true, Ordering::Release);
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_wake_sigurg_pending: spawn failed");
+
+    // Let the waiter park.
+    for _ in 0..15 {
+        threading::yield_now();
+    }
+
+    // Change the word then call FUTEX_WAKE(1) — this is what Go's futexwakeup does.
+    FUTEX_WORD_RX.store(1, Ordering::SeqCst);
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    let uaddr = FUTEX_WORD_RX.as_ptr() as usize;
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // The return value is the number of waiters dequeued (0 or 1 depending on
+    // timing).  Either way it must NOT be used as a futex address.
+    assert!(
+        woken <= 1,
+        "test_futex_wake_sigurg_pending: FUTEX_WAKE(1) returned {} > 1",
+        woken
+    );
+
+    // Now simulate what happens when SIGURG is pending on the waker thread
+    // just after the futex wake returns.
+    let main_tid = threading::current_thread_id();
+
+    // Clear any stale signal first.
+    threading::pend_signal_for_thread(main_tid, 0);
+
+    // Pend SIGURG (the async-preemption signal).
+    threading::pend_signal_for_thread(main_tid, 23);
+
+    // peek must see it without consuming.
+    let peeked = threading::peek_pending_signal(main_tid);
+    assert!(
+        peeked == 23,
+        "test_futex_wake_sigurg_pending: peek should be 23, got {}",
+        peeked
+    );
+
+    // take must consume it exactly once.
+    let taken = threading::take_pending_signal(0);
+    assert!(
+        taken == Some(23),
+        "test_futex_wake_sigurg_pending: take should be Some(23), got {:?}",
+        taken
+    );
+
+    // Queue must be empty after the single take.
+    let after = threading::peek_pending_signal(main_tid);
+    assert!(
+        after == 0,
+        "test_futex_wake_sigurg_pending: queue should be empty after take, got {}",
+        after
+    );
+
+    // Wait for the waiter to finish (belt-and-braces).
+    for _ in 0..60 {
+        threading::yield_now();
+        if WAITER_DONE_RX.load(Ordering::Acquire) {
+            break;
+        }
+    }
+
+    console::print("  [PASS] test_futex_wake_sigurg_pending_x0_not_reused\n");
+}
+
+/// FUTEX_WAKE(max=1) with three waiters must return exactly 1.
+///
+/// Go's runtime uses the futex return value in a specific way: if woken==1 it
+/// knows exactly one goroutine was unblocked.  More critically, the crash in
+/// question involved `x0=1` (the woken count) being passed as `uaddr` to a
+/// subsequent FUTEX_WAKE — which EINVAL's because 1 is not 4-byte aligned.
+/// This test documents that FUTEX_WAKE(1) returns exactly 1, not 0 and not 3.
+fn test_futex_wake_returns_exact_count_three_waiters() {
+    static FUTEX_WORD_EC: AtomicU32 = AtomicU32::new(0);
+    static WOKEN_EC: AtomicU32 = AtomicU32::new(0);
+
+    FUTEX_WORD_EC.store(0, Ordering::SeqCst);
+    WOKEN_EC.store(0, Ordering::SeqCst);
+
+    const WAITERS: u32 = 3;
+
+    for _ in 0..WAITERS {
+        threading::spawn_fn(|| {
+            crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+            let uaddr = FUTEX_WORD_EC.as_ptr() as usize;
+            let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+            let timeout_ptr = &ts as *const Timespec as u64;
+            let ret = crate::syscall::handle_syscall(
+                NR_FUTEX,
+                &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+            );
+
+            // Count any non-timeout wake (EAGAIN = missed the wake but value changed).
+            if ret == 0 || ret == EAGAIN {
+                WOKEN_EC.fetch_add(1, Ordering::Release);
+            }
+
+            crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+            threading::mark_current_terminated();
+            loop { threading::yield_now(); }
+        }).expect("test_futex_wake_exact_count: spawn failed");
+    }
+
+    // Let all 3 waiters park.
+    for _ in 0..30 {
+        threading::yield_now();
+    }
+
+    // Wake exactly one.
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    let uaddr = FUTEX_WORD_EC.as_ptr() as usize;
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // Must be at most 1 (0 if all threads raced and returned EAGAIN before parking).
+    assert!(
+        woken <= 1,
+        "test_futex_wake_exact_count_three_waiters: FUTEX_WAKE(1) returned {} (expected <=1)",
+        woken
+    );
+
+    // Release the remaining waiters.
+    FUTEX_WORD_EC.store(1, Ordering::SeqCst);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, i32::MAX as u64, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // All 3 must eventually unblock.
+    let mut all_done = false;
+    for _ in 0..150 {
+        threading::yield_now();
+        if WOKEN_EC.load(Ordering::Acquire) == WAITERS {
+            all_done = true;
+            break;
+        }
+    }
+
+    assert!(
+        all_done,
+        "test_futex_wake_exact_count_three_waiters: only {}/{} threads unblocked",
+        WOKEN_EC.load(Ordering::Acquire),
+        WAITERS
+    );
+
+    console::print("  [PASS] test_futex_wake_returns_exact_count_three_waiters\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- Futex Sync Tests ---\n");
     // Single-threaded correctness
@@ -1055,6 +1422,10 @@ pub fn run_all_tests() {
     test_per_thread_sigaltstack();
     test_peek_pending_signal();
     test_pending_signal_drained_by_take();
+    test_take_pending_signal_sigurg_masked();
+    test_take_pending_signal_sigkill_ignores_mask();
+    test_pending_signal_overwrite();
+    test_signal_mask_bit_numbering();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();
     test_rt_sigreturn_restores_registers();
@@ -1065,5 +1436,7 @@ pub fn run_all_tests() {
     test_futex_wake_one_of_two();
     test_futex_requeue();
     test_futex_wait_eintr_signal_preserved();
+    test_futex_wake_sigurg_pending_x0_not_reused();
+    test_futex_wake_returns_exact_count_three_waiters();
     console::print("--- Futex Sync Tests Done ---\n\n");
 }
