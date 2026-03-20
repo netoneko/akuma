@@ -827,6 +827,24 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
     let thread_slot = akuma_exec::threading::current_thread_id();
     let (alt_sp, alt_size, _alt_flags) = akuma_exec::threading::get_sigaltstack(thread_slot);
 
+    crate::tprint!(256,
+        "[signal] deliver sig={} slot={} handler={:#x} elr={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
+        signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
+
+    // If the handler requires SA_ONSTACK but no sigaltstack is configured for
+    // this thread yet (e.g. SIGURG arrives before Go M calls sigaltstack during
+    // mstart), delivering on the goroutine stack would corrupt goroutine data
+    // (asyncPreempt2 may grow the goroutine stack into goroutine variables).
+    // Re-pend the signal so it is retried at the next syscall boundary, by
+    // which time mstart will have called sigaltstack.
+    if (action.flags & SA_ONSTACK) != 0 && alt_sp == 0 {
+        crate::tprint!(128,
+            "[signal] sig {} needs sigaltstack but slot {} has none — re-pending\n",
+            signal, thread_slot);
+        akuma_exec::threading::pend_signal_for_thread(thread_slot, signal);
+        return false;
+    }
+
     if alt_sp != 0 {
         let alt_lo = alt_sp as usize;
         let alt_hi = alt_lo + alt_size as usize;
@@ -852,6 +870,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
     };
 
     let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
+
+    crate::tprint!(256,
+        "[signal] frame: stack_top={:#x} new_sp={:#x} on_altstack={}\n",
+        stack_top, new_sp, stack_top != user_sp);
 
     // Ensure stack pages are mapped (signal frame may span 2 pages).
     // Demand-page lazy anonymous stack pages if not yet mapped.
@@ -880,12 +902,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
 
         // ucontext_t header: populate uc_stack and uc_sigmask
         // Layout: uc_flags(+0,8) uc_link(+8,8) uc_stack(+16,24) uc_sigmask(+40,8) __unused[120]
+        // Use per-thread sigaltstack values (alt_sp/alt_size computed above) so that
+        // CLONE_VM threads each report their own gsignal stack in uc_stack.
         let uc = base.add(SIGFRAME_UCONTEXT);
-        let on_altstack = (action.flags & SA_ONSTACK) != 0 && proc.sigaltstack_sp != 0;
+        let on_altstack = (action.flags & SA_ONSTACK) != 0 && alt_sp != 0;
         if on_altstack {
-            core::ptr::write(uc.add(16) as *mut u64, proc.sigaltstack_sp);  // ss_sp
-            core::ptr::write(uc.add(24) as *mut i32, 1i32);                 // ss_flags = SS_ONSTACK
-            core::ptr::write(uc.add(32) as *mut u64, proc.sigaltstack_size); // ss_size
+            core::ptr::write(uc.add(16) as *mut u64, alt_sp);   // ss_sp
+            core::ptr::write(uc.add(24) as *mut i32, 1i32);     // ss_flags = SS_ONSTACK
+            core::ptr::write(uc.add(32) as *mut u64, alt_size); // ss_size
         }
         core::ptr::write(uc.add(40) as *mut u64, proc.signal_mask);         // uc_sigmask
 
@@ -1029,6 +1053,10 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         (*frame).sp_el0 = core::ptr::read(mc.add(256) as *const u64);
         (*frame).elr_el1 = core::ptr::read(mc.add(264) as *const u64);
         (*frame).spsr_el1 = core::ptr::read(mc.add(272) as *const u64);
+
+        crate::tprint!(256,
+            "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
+            (*frame).sp_el0, (*frame).elr_el1, (*frame).spsr_el1, sigframe_sp);
 
         // Restore signal mask from uc_sigmask (ucontext+40)
         let uc_sigmask_ptr = (sigframe_sp + SIGFRAME_UCONTEXT + 40) as *const u64;

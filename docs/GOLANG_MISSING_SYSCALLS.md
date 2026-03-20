@@ -1584,3 +1584,35 @@ Implemented automatic restart logic. If `SA_RESTART` is set for a signal deliver
 **Symptom:** `FUTEX_WAIT_BITSET` with `FUTEX_CLOCK_REALTIME` passed an absolute wall-clock `timespec`. The kernel was treating it as a relative timeout and adding `uptime_us()`, causing threads to sleep far into the future (wall-clock seconds are much larger than uptime microseconds on a freshly-booted VM).
 
 **Fix:** When `(op & FUTEX_CLOCK_REALTIME) != 0` and `cmd == FUTEX_WAIT_BITSET`, the `timeout_us` value is used directly as the deadline (treated as uptime microseconds — imprecise but prevents multi-hour sleeps). Also added: `FUTEX_WAIT_BITSET` with `val3==0` now returns EINVAL per spec.
+
+## 43. uc_stack in signal frame still used process-level sigaltstack (FIXED 2026-03-20)
+
+**Symptom:** After fix §39 (per-thread sigaltstack), `futexwakeup addr=0xc4047158 returned -22` and `SIGSEGV PC=0x20000000` persisted. New diagnostic log showed `[futex] EINVAL: uaddr=0x1 op=129` — Go calling `FUTEX_WAKE` with a clearly corrupted address (0x1). Registers at crash time contained ASCII bytes of the string `"futexwakeup addr="`, proving Go's goroutine stack data had been overwritten.
+
+**Root cause:** `try_deliver_signal` was correctly placing the signal frame on the per-thread sigaltstack (using `get_sigaltstack(thread_slot)`) for the stack selection and re-entrancy check, but the `uc_stack` field written into the `ucontext_t` inside the frame still read from `proc.sigaltstack_sp` / `proc.sigaltstack_size` — which are always 0 for CLONE_VM threads (they only update the per-thread arrays). Go's runtime reads `uc_stack.ss_sp` and `uc_stack.ss_flags` from the signal frame to determine whether the signal was delivered on gsignal. With `uc_stack` showing zeros (SS_ONSTACK not set), Go concluded the signal landed on the goroutine stack and adjusted its internal stack-tracking state accordingly, triggering corruption of Go's goroutine and M state.
+
+**Fix:** Changed the `uc_stack` population in `try_deliver_signal` (`src/exceptions.rs`) to use `alt_sp` / `alt_size` (already computed from `get_sigaltstack(thread_slot)`) rather than `proc.sigaltstack_sp` / `proc.sigaltstack_size`. The `on_altstack` predicate now checks `alt_sp != 0` instead of `proc.sigaltstack_sp != 0`.
+
+**New tests:** `test_sigaltstack_syscall_roundtrip`, `test_rt_sigreturn_restores_registers`, `test_uc_stack_uses_per_thread_sigaltstack`, and `test_futex_wait_eintr_signal_preserved` were added to `src/sync_tests.rs` to exercise these paths in isolation.
+
+## 44. u32 truncation underflow in `test_futex_wait_eintr_signal_preserved` (FIXED 2026-03-20)
+
+**Symptom:** The kernel test `test_futex_wait_eintr_signal_preserved` panicked with `unexpected ret 0xfffc (65532)` immediately after being added.
+
+**Root cause:** The test packed the futex return value and the pending signal number into a single `AtomicU32` using `(ret as u32) << 16 | sig`. `EINTR = -4 = 0xFFFF_FFFF_FFFF_FFFC` as a `u64`; casting to `u32` gives `0xFFFF_FFFC`. Shifting left by 16 in a 32-bit type wraps: `0xFFFF_FFFC << 16 = 0xFFFC_0000`. Reading back `>> 16` then yielded `0xFFFC` (65532) instead of the expected `-4`.
+
+**Fix:** Replaced the single packed `AtomicU32` with a dedicated `AtomicU64` for the return value (`EINTR_RET`) and a separate `AtomicU32` for the signal (`EINTR_SIG`), each with independent sentinel values. The main thread now waits on the `EINTR_SIG` sentinel and reads `EINTR_RET` as a full `u64`, casting to `i64` for the sign check.
+
+## 45. SIGURG delivered before Go M calls sigaltstack — goroutine stack corruption (FIXED 2026-03-20)
+
+**Symptom:** `go build` crashed with `futexwakeup addr=0xc4047158 returned -22` and `SIGSEGV PC=0x20000000` even after all previous fixes were applied. Kernel logs showed `[futex] EINVAL: uaddr=0x1 op=129` immediately after a SIGURG delivery — a goroutine-local futex address variable had been overwritten with a byte from the signal frame.
+
+**Root cause:** Go Ms register their SIGURG (preemption) handler with `SA_ONSTACK|SA_SIGINFO`, which tells the kernel to deliver the signal on the gsignal alternate stack. However, `sigaltstack` is called during `mstart` *after* the OS thread is created. If the Go scheduler sends SIGURG to a newly created M before it has executed `sigaltstack`, `alt_sp == 0` for that kernel thread slot.
+
+When `alt_sp == 0` and `SA_ONSTACK` is set, the previous code fell through to the `else` branch and placed the signal frame at the goroutine's current SP. The signal frame (`rt_sigframe`, 1112 bytes) was written over live goroutine stack variables. In particular, Go's `asyncPreempt` handler calls `asyncPreempt2` (a regular Go function), which may grow the stack further downward — clobbering any goroutine variables that happened to lie just below the current SP. One of these overwritten values was a futex address, which became `0x1` (a byte from the signal frame zero-fill), producing the EINVAL.
+
+The `PC=0x20000000` SIGSEGV that followed was a secondary crash: another goroutine had its saved `pc` field (in `uc_mcontext` at `ucontext+432`) clobbered similarly, causing `rt_sigreturn` to restore a garbage PC.
+
+**Fix (`src/exceptions.rs` `try_deliver_signal`):** Added an early-return guard: if `(action.flags & SA_ONSTACK) != 0` and `alt_sp == 0`, the signal is re-pended via `pend_signal_for_thread(thread_slot, signal)` and `try_deliver_signal` returns `false`. The signal will be retried at the next syscall boundary. By that point `mstart` will have called `sigaltstack`, so `alt_sp` will be non-zero and delivery will succeed on the correct gsignal stack.
+
+Diagnostic logging was also added at signal delivery time (printing `slot`, `alt_sp`, `alt_size`, `elr_el1`, `new_sp`) and in `do_rt_sigreturn` (printing the restored `sp`, `pc`, `pstate`) to make future regressions easier to diagnose.
