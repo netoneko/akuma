@@ -822,9 +822,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
     // Terminate instead, which matches Linux's default behaviour when a fatal
     // signal fires with SA_NODEFER not set (the signal is masked during handler
     // execution so a second delivery goes to the default action = termination).
-    if proc.sigaltstack_sp != 0 {
-        let alt_lo = proc.sigaltstack_sp as usize;
-        let alt_hi = alt_lo + proc.sigaltstack_size as usize;
+    // Use per-thread sigaltstack (indexed by kernel thread slot) so that
+    // CLONE_VM threads each maintain their own independent gsignal stack.
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    let (alt_sp, alt_size, _alt_flags) = akuma_exec::threading::get_sigaltstack(thread_slot);
+
+    if alt_sp != 0 {
+        let alt_lo = alt_sp as usize;
+        let alt_hi = alt_lo + alt_size as usize;
         if user_sp >= alt_lo && user_sp < alt_hi {
             crate::tprint!(128,
                 "[signal] sig {} re-entrant fault at {:#x} (sp={:#x} on sigaltstack [{:#x},{:#x})) — killing process\n",
@@ -838,10 +843,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
     // Go (and other runtimes) require this to detect which stack a signal
     // arrived on; without it, Go panics with "handler not on signal stack".
     let stack_top = if (action.flags & SA_ONSTACK) != 0
-        && proc.sigaltstack_sp != 0
-        && proc.sigaltstack_size >= SIGFRAME_SIZE as u64
+        && alt_sp != 0
+        && alt_size >= SIGFRAME_SIZE as u64
     {
-        (proc.sigaltstack_sp + proc.sigaltstack_size) as usize
+        (alt_sp + alt_size) as usize
     } else {
         user_sp
     };

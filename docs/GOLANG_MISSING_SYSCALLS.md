@@ -1556,3 +1556,31 @@ Implemented automatic restart logic. If `SA_RESTART` is set for a signal deliver
 | Per-process current-syscall visibility | `ps` now shows `SYSCALL=*NR` for active syscalls; background threads in long-running syscalls are now visible |
 | CLONE_VM sharing | VFORK+CLONE_VM creates a full copy of the address space instead of sharing page tables; this makes fork slow for large heap processes. True CLONE_VM would eliminate the copy |
 | `compile -V=full` stdout pipe | Fixed in §19 (refcount bugs) and §21 (`pipe_write` EPIPE). Both patches are required for reliable `go build` |
+
+## 39. Per-thread sigaltstack (FIXED 2026-03-20)
+
+**Symptom:** `go build` crashed with `futexwakeup addr=0xc4047158 returned -22` followed by `SIGSEGV PC=0x20000000`. The garbage PC (0x20000000 is not a valid Go text address) indicated the `rt_sigreturn` was restoring from a corrupted signal frame.
+
+**Root cause:** `sigaltstack_sp/size/flags` were stored in the `Process` struct, keyed by PID. All `CLONE_VM` threads in a Go process share the same `Process` struct (via the address-space owner PID). Each Go M (OS thread) calls `sigaltstack` to configure its own gsignal stack, but all writes collided in the same `proc.sigaltstack_sp`. Signal delivery on thread A used thread B's (overwritten) sigaltstack address, placing the signal frame in the wrong memory → frame corruption → garbage PC on `rt_sigreturn` → Go's `futexwakeup` received -22 (EINVAL) from the garbage address.
+
+**Fix:** Added per-kernel-thread-slot arrays `THREAD_SIGALTSTACK_{SP,SIZE,FLAGS}` in `crates/akuma-exec/src/threading/mod.rs`. `sys_sigaltstack` now reads/writes `threading::get/set_sigaltstack(current_thread_id())`. `try_deliver_signal` in `src/exceptions.rs` reads from the same per-thread array. Each thread slot is reset to SS_DISABLE when the slot is freed.
+
+## 40. pend_signal_for_thread did not wake sleeping thread (FIXED 2026-03-20)
+
+**Symptom:** SIGURG pended on a Go M that was blocked in `FUTEX_WAIT` was silently lost. The thread only woke on timeout or an explicit `FUTEX_WAKE`, so the Go preemption mechanism didn't work reliably.
+
+**Root cause:** `pend_signal_for_thread` stored the signal number in `PENDING_SIGNAL[tid]` but never called `get_waker_for_thread(tid).wake()`, so a thread parked in `schedule_blocking` inside `sys_futex` would not be rescheduled.
+
+**Fix:** Added `get_waker_for_thread(tid).wake()` call at the end of `pend_signal_for_thread`.
+
+## 41. FUTEX_WAIT returned 0 not EINTR when woken by signal (FIXED 2026-03-20)
+
+**Symptom:** When a signal woke a thread from `FUTEX_WAIT`, the syscall returned 0 (success) instead of -EINTR. Go ignores the futex return value in its `futexsleep` wrapper so this wasn't directly crashing, but it violates the Linux spec.
+
+**Fix:** After `schedule_blocking` returns in the `FUTEX_WAIT` path, `peek_pending_signal(tid)` is checked; if non-zero the syscall returns EINTR before checking the timeout.
+
+## 42. FUTEX_WAIT_BITSET + CLOCK_REALTIME absolute timeout mishandled (FIXED 2026-03-20)
+
+**Symptom:** `FUTEX_WAIT_BITSET` with `FUTEX_CLOCK_REALTIME` passed an absolute wall-clock `timespec`. The kernel was treating it as a relative timeout and adding `uptime_us()`, causing threads to sleep far into the future (wall-clock seconds are much larger than uptime microseconds on a freshly-booted VM).
+
+**Fix:** When `(op & FUTEX_CLOCK_REALTIME) != 0` and `cmd == FUTEX_WAIT_BITSET`, the `timeout_us` value is used directly as the deadline (treated as uptime microseconds — imprecise but prevents multi-hour sleeps). Also added: `FUTEX_WAIT_BITSET` with `val3==0` now returns EINVAL per spec.

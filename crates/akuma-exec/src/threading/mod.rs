@@ -120,6 +120,26 @@ static PENDING_SIGNAL: [AtomicU32; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread alternate signal stack base address (0 = not set).
+/// Indexed by kernel thread slot so each CLONE_VM thread has its own sigaltstack.
+static THREAD_SIGALTSTACK_SP: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread alternate signal stack size.
+static THREAD_SIGALTSTACK_SIZE: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread alternate signal stack flags (SS_DISABLE=2 means disabled).
+/// Stored as u32 but semantically i32 (cast on read/write).
+static THREAD_SIGALTSTACK_FLAGS: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(2); // SS_DISABLE
+    [INIT; MAX_THREADS]
+};
+
 /// Current running thread - stored in TPIDRRO_EL0 register
 /// Using a CPU register avoids race conditions with global atomics.
 /// TPIDRRO_EL0 is accessible from EL1 and provides per-CPU thread tracking.
@@ -444,7 +464,11 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // triggering signal delivery code in an unexpected context (e.g. /bin/hello
             // which never registered a signal handler), causing an EL1 data abort.
             PENDING_SIGNAL[i].store(0, Ordering::Release);
-            
+            // Reset per-thread sigaltstack so the next occupant starts clean.
+            THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
+            THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
+            THREAD_SIGALTSTACK_FLAGS[i].store(2, Ordering::Release); // SS_DISABLE
+
             // Re-initialize canary for reuse
             if config().enable_stack_canaries {
                 // Must disable IRQs when acquiring POOL lock to prevent deadlock
@@ -2284,9 +2308,44 @@ pub fn current_thread_id() -> usize {
 /// Pend a signal on the given thread slot.
 /// The signal will be delivered at the next syscall return for that thread.
 /// Overwrites any previously pending signal (only one pending signal supported).
+/// Also wakes the thread if it is sleeping (e.g. in FUTEX_WAIT).
 pub fn pend_signal_for_thread(tid: usize, sig: u32) {
     if tid < MAX_THREADS {
         PENDING_SIGNAL[tid].store(sig, Ordering::Release);
+        get_waker_for_thread(tid).wake();
+    }
+}
+
+/// Peek at the pending signal for a thread slot without consuming it.
+/// Returns 0 if no signal is pending.
+pub fn peek_pending_signal(slot: usize) -> u32 {
+    if slot < MAX_THREADS {
+        PENDING_SIGNAL[slot].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Get the per-thread alternate signal stack (sp, size, flags).
+/// Returns (0, 0, SS_DISABLE=2) for an unset or out-of-range slot.
+pub fn get_sigaltstack(slot: usize) -> (u64, u64, i32) {
+    if slot < MAX_THREADS {
+        (
+            THREAD_SIGALTSTACK_SP[slot].load(Ordering::Acquire),
+            THREAD_SIGALTSTACK_SIZE[slot].load(Ordering::Acquire),
+            THREAD_SIGALTSTACK_FLAGS[slot].load(Ordering::Acquire) as i32,
+        )
+    } else {
+        (0, 0, 2) // SS_DISABLE
+    }
+}
+
+/// Set the per-thread alternate signal stack.
+pub fn set_sigaltstack(slot: usize, sp: u64, size: u64, flags: i32) {
+    if slot < MAX_THREADS {
+        THREAD_SIGALTSTACK_SP[slot].store(sp, Ordering::Release);
+        THREAD_SIGALTSTACK_SIZE[slot].store(size, Ordering::Release);
+        THREAD_SIGALTSTACK_FLAGS[slot].store(flags as u32, Ordering::Release);
     }
 }
 

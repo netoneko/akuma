@@ -48,15 +48,22 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
     // Validate uaddr - must be 4-byte aligned and in user space
     if uaddr == 0 || uaddr & 3 != 0 {
+        crate::tprint!(128, "[futex] EINVAL: uaddr={:#x} op={} (null or unaligned)\n", uaddr, op);
         return EINVAL;
     }
     if !validate_user_ptr(uaddr as u64, 4) {
+        crate::tprint!(128, "[futex] EFAULT: uaddr={:#x} not mapped\n", uaddr);
         return EFAULT;
     }
 
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let tid = akuma_exec::threading::current_thread_id();
+
+            // FUTEX_WAIT_BITSET with val3==0 is invalid per spec.
+            if cmd == FUTEX_WAIT_BITSET && val3 == 0 {
+                return EINVAL;
+            }
 
             {
                 let mut waiters = FUTEX_WAITERS.lock();
@@ -75,16 +82,24 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 queue.push(tid);
             }
 
+            let is_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
             let deadline = if timeout_ptr != 0 && validate_user_ptr(timeout_ptr, 16) {
                 let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
                 if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+                    // Remove ourselves from the waiter queue before returning.
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    if let Some(queue) = waiters.get_mut(&uaddr) {
+                        queue.retain(|&t| t != tid);
+                        if queue.is_empty() { waiters.remove(&uaddr); }
+                    }
                     return EFAULT;
                 }
                 let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
-                if cmd == FUTEX_WAIT_BITSET {
-                    // FUTEX_WAIT_BITSET uses absolute time if CLOCK_REALTIME flag set
-                    // For now, treat as relative since we use monotonic time
-                    crate::timer::uptime_us() + timeout_us
+                if cmd == FUTEX_WAIT_BITSET && is_realtime {
+                    // FUTEX_WAIT_BITSET + CLOCK_REALTIME: timeout is an absolute wall-clock
+                    // value. We treat it as absolute uptime microseconds (imprecise but safe:
+                    // prevents sleeping far into the future compared to adding uptime).
+                    timeout_us
                 } else {
                     crate::timer::uptime_us() + timeout_us
                 }
@@ -102,6 +117,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         waiters.remove(&uaddr);
                     }
                 }
+            }
+
+            // If we were woken by a pending signal, return EINTR (Linux spec).
+            if akuma_exec::threading::peek_pending_signal(tid) != 0 {
+                return EINTR;
             }
 
             if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {

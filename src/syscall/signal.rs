@@ -140,10 +140,7 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     const STACK_T_SIZE: usize = 24;
     const SS_DISABLE: i32 = 2;
 
-    let proc = match akuma_exec::process::current_process() {
-        Some(p) => p,
-        None => return ENOSYS,
-    };
+    let slot = akuma_exec::threading::current_thread_id();
 
     // Return old stack if requested
     if old_ss_ptr != 0 {
@@ -152,12 +149,8 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         }
         #[repr(C)]
         struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
-        let out = StackT {
-            sp: proc.sigaltstack_sp,
-            flags: proc.sigaltstack_flags,
-            _pad: 0,
-            size: proc.sigaltstack_size,
-        };
+        let (sp, size, flags) = akuma_exec::threading::get_sigaltstack(slot);
+        let out = StackT { sp, flags, _pad: 0, size };
         if unsafe { copy_to_user_safe(old_ss_ptr as *mut u8, &out as *const StackT as *const u8, STACK_T_SIZE).is_err() } {
             return EFAULT;
         }
@@ -177,17 +170,13 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 
         // SS_DISABLE disables the alternate stack
         if ss.flags & SS_DISABLE != 0 {
-            proc.sigaltstack_sp = 0;
-            proc.sigaltstack_flags = SS_DISABLE;
-            proc.sigaltstack_size = 0;
+            akuma_exec::threading::set_sigaltstack(slot, 0, 0, SS_DISABLE);
         } else {
             // Minimum stack size check (MINSIGSTKSZ = 2048 on most systems)
             if ss.size < 2048 {
                 return ENOMEM;
             }
-            proc.sigaltstack_sp = ss.sp;
-            proc.sigaltstack_flags = ss.flags;
-            proc.sigaltstack_size = ss.size;
+            akuma_exec::threading::set_sigaltstack(slot, ss.sp, ss.size, ss.flags);
         }
     }
 

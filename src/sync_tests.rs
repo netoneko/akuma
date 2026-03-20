@@ -548,6 +548,126 @@ fn test_futex_requeue() {
     console::print("  [PASS] test_futex_requeue\n");
 }
 
+/// FUTEX_WAIT_BITSET with val3==0 must return EINVAL.
+fn test_futex_wait_bitset_zero_bitset() {
+    set_bypass(true);
+
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAIT_BITSET_PRIVATE: u64 = FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG;
+
+    let mut val: u32 = 0;
+    let uaddr = &mut val as *mut u32 as usize;
+
+    // val3=0 (bitset) is invalid
+    let ret = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0, 0 /* val3=0 */],
+    );
+
+    set_bypass(false);
+
+    assert!(
+        ret == EINVAL,
+        "test_futex_wait_bitset_zero_bitset: expected EINVAL ({:#x}) got {:#x}",
+        EINVAL,
+        ret
+    );
+    console::print("  [PASS] test_futex_wait_bitset_zero_bitset\n");
+}
+
+/// FUTEX_WAIT_BITSET with CLOCK_REALTIME and an already-past deadline must
+/// return ETIMEDOUT immediately (not block forever).
+fn test_futex_wait_bitset_absolute_past() {
+    set_bypass(true);
+
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_CLOCK_REALTIME: u64 = 256;
+    const FUTEX_WAIT_BITSET_REALTIME: u64 = FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
+    const FUTEX_BITSET_MATCH_ANY: u64 = 0xFFFF_FFFF;
+
+    let mut val: u32 = 0;
+    let uaddr = &mut val as *mut u32 as usize;
+
+    // Absolute deadline of 1 second (wall-clock epoch) — always in the past.
+    let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
+    let timeout_ptr = &ts as *const Timespec as u64;
+
+    let ret = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAIT_BITSET_REALTIME, 0, timeout_ptr, 0, FUTEX_BITSET_MATCH_ANY],
+    );
+
+    set_bypass(false);
+
+    assert!(
+        ret == ETIMEDOUT || ret == EAGAIN,
+        "test_futex_wait_bitset_absolute_past: expected ETIMEDOUT or EAGAIN, got {:#x}",
+        ret
+    );
+    console::print("  [PASS] test_futex_wait_bitset_absolute_past\n");
+}
+
+/// Pend a signal on the current thread slot while it would be in FUTEX_WAIT,
+/// verify the pending signal causes EINTR to be returned.
+/// (Single-threaded: we pend the signal before entering wait with mismatched
+/// value so EAGAIN fires, but we verify peek_pending_signal works correctly.)
+fn test_per_thread_sigaltstack() {
+    // Verify get/set sigaltstack per-thread API works for two different slots.
+    // We test slots 0 and 1 directly (without needing actual threads running there).
+    akuma_exec::threading::set_sigaltstack(0, 0xdead_0000, 0x4000, 0);
+    akuma_exec::threading::set_sigaltstack(1, 0xbeef_0000, 0x8000, 0);
+
+    let (sp0, sz0, fl0) = akuma_exec::threading::get_sigaltstack(0);
+    let (sp1, sz1, fl1) = akuma_exec::threading::get_sigaltstack(1);
+
+    assert!(sp0 == 0xdead_0000, "slot 0 sp mismatch: {:#x}", sp0);
+    assert!(sz0 == 0x4000,      "slot 0 size mismatch: {:#x}", sz0);
+    assert!(fl0 == 0,           "slot 0 flags mismatch: {}", fl0);
+
+    assert!(sp1 == 0xbeef_0000, "slot 1 sp mismatch: {:#x}", sp1);
+    assert!(sz1 == 0x8000,      "slot 1 size mismatch: {:#x}", sz1);
+    assert!(fl1 == 0,           "slot 1 flags mismatch: {}", fl1);
+
+    // Slots must be independent — slot 0 must be unchanged after writing slot 1.
+    let (sp0b, _, _) = akuma_exec::threading::get_sigaltstack(0);
+    assert!(sp0b == 0xdead_0000, "slot 0 contaminated by slot 1 write");
+
+    // Restore to disabled state.
+    akuma_exec::threading::set_sigaltstack(0, 0, 0, 2);
+    akuma_exec::threading::set_sigaltstack(1, 0, 0, 2);
+
+    console::print("  [PASS] test_per_thread_sigaltstack\n");
+}
+
+/// Verify peek_pending_signal returns the signal without consuming it.
+fn test_peek_pending_signal() {
+    let slot = akuma_exec::threading::current_thread_id();
+
+    // No signal pending initially (after any previous test cleanup).
+    akuma_exec::threading::pend_signal_for_thread(slot, 0); // clear
+    assert!(
+        akuma_exec::threading::peek_pending_signal(slot) == 0,
+        "peek_pending_signal: expected 0 after clear"
+    );
+
+    // Pend a signal and peek — must see it without consuming.
+    // Use SIGURG (23) as Go does.
+    akuma_exec::threading::pend_signal_for_thread(slot, 23);
+    let first  = akuma_exec::threading::peek_pending_signal(slot);
+    let second = akuma_exec::threading::peek_pending_signal(slot);
+    assert!(first == 23,  "peek_pending_signal: expected 23, got {}", first);
+    assert!(second == 23, "peek_pending_signal: not idempotent, got {}", second);
+
+    // Clear it.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+    assert!(
+        akuma_exec::threading::peek_pending_signal(slot) == 0,
+        "peek_pending_signal: expected 0 after second clear"
+    );
+
+    console::print("  [PASS] test_peek_pending_signal\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- Futex Sync Tests ---\n");
     // Single-threaded correctness
@@ -558,6 +678,10 @@ pub fn run_all_tests() {
     test_futex_wake_before_wait();
     test_futex_wake_zero();
     test_futex_cmp_requeue_mismatch();
+    test_futex_wait_bitset_zero_bitset();
+    test_futex_wait_bitset_absolute_past();
+    test_per_thread_sigaltstack();
+    test_peek_pending_signal();
     // Multi-threaded
     test_futex_basic_wake();
     test_futex_wake_all();
