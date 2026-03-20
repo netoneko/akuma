@@ -11,9 +11,9 @@ use crate::console;
 
 const NR_FUTEX: u64 = 98;
 const NR_SIGALTSTACK: u64 = 132;
-const NR_PIPE2: u64 = 59;
-const NR_WRITE: u64 = 64;
-const NR_CLOSE: u64 = 57;
+//const NR_PIPE2: u64 = 59;
+//const NR_WRITE: u64 = 64;
+//const NR_CLOSE: u64 = 57;
 //const NR_RT_SIGRETURN: u64 = 139;
 
 const FUTEX_WAIT: u64 = 0;
@@ -29,8 +29,8 @@ const FUTEX_CMP_REQUEUE_PRIVATE: u64 = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 const EAGAIN: u64 = (-11i64) as u64;
 const ETIMEDOUT: u64 = (-110i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
-const EPIPE: u64 = (-32i64) as u64;
-const EBADF: u64 = (-9i64) as u64;
+//const EPIPE: u64 = (-32i64) as u64;
+//const EBADF: u64 = (-9i64) as u64;
 
 /// Helper: enable / disable pointer bypass.
 fn set_bypass(v: bool) {
@@ -1554,51 +1554,31 @@ fn test_futex_sequential_wake_no_einval() {
 /// crashed due to the futex EINVAL, other goroutines writing to a pipe it
 /// was supposed to have created got EPIPE.
 fn test_pipe_epipe_for_nonexistent_pipe_id() {
+    use crate::syscall::pipe::{pipe_create, pipe_close_read, pipe_write, pipe_close_write};
+    use akuma_net::socket::libc_errno;
+
     set_bypass(true);
 
     // 1. Write to a pipe ID that was never created.
     let buf = [0u8; 16];
-    let ret = crate::syscall::handle_syscall(
-        NR_WRITE,
-        &[99999, buf.as_ptr() as u64, 16, 0, 0, 0], // fd=99999
-    );
-    assert!(
-        ret == EBADF,
-        "write to nonexistent pipe fd should be EBADF, got {:#x}",
-        ret
-    );
+    let ret = pipe_write(99999, &buf);
+    assert_eq!(ret, Err(libc_errno::EPIPE as i32), "write to nonexistent pipe id should be EPIPE");
 
     // 2. Create a pipe, close the read end, then write to the write end.
-    let mut fds = [0u32; 2];
-    let ret_pipe = crate::syscall::handle_syscall(
-        NR_PIPE2,
-        &[fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0],
-    );
-    assert!(ret_pipe == 0, "pipe2 creation failed: {:#x}", ret_pipe);
-    let fd_r = fds[0] as u64;
-    let fd_w = fds[1] as u64;
+    let pipe_id = pipe_create();
 
     // Close the reader.
-    let ret_close = crate::syscall::handle_syscall(NR_CLOSE, &[fd_r, 0, 0, 0, 0, 0]);
-    assert!(ret_close == 0, "close failed: {:#x}", ret_close);
+    pipe_close_read(pipe_id);
 
     // Write to the writer — must return EPIPE.
-    let ret_write = crate::syscall::handle_syscall(
-        NR_WRITE,
-        &[fd_w, buf.as_ptr() as u64, 16, 0, 0, 0],
-    );
-    assert!(
-        ret_write == EPIPE,
-        "write to pipe with no reader should be EPIPE, got {:#x}",
-        ret_write
-    );
+    let ret_write = pipe_write(pipe_id, &buf);
+    assert_eq!(ret_write, Err(libc_errno::EPIPE as i32), "write to pipe with no reader should be EPIPE");
 
     // Clean up write end.
-    crate::syscall::handle_syscall(NR_CLOSE, &[fd_w, 0, 0, 0, 0, 0]);
+    pipe_close_write(pipe_id);
 
     set_bypass(false);
-    console::print("  [PASS] test_pipe_epipe_for_nonexistent_pipe_id
-");
+    console::print("  [PASS] test_pipe_epipe_for_nonexistent_pipe_id\n");
 }
 
 
