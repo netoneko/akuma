@@ -36,10 +36,10 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
         if let Some(pipe) = pipes.get_mut(&id) {
             if is_write {
                 pipe.write_count += 1;
-                crate::safe_print!(64, "[pipe] clone_ref id={} write_count={}\n", id, pipe.write_count);
+                crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             } else {
                 pipe.read_count += 1;
-                crate::safe_print!(64, "[pipe] clone_ref id={} read_count={}\n", id, pipe.read_count);
+                crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             }
         }
     });

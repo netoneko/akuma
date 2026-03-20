@@ -31,7 +31,7 @@ pub(super) fn pidfd_can_read(id: u32) -> bool {
         .map_or(true, |ch| ch.has_exited())
 }
 
-pub(super) fn pidfd_close(id: u32) {
+pub fn pidfd_close(id: u32) {
     crate::irq::with_irqs_disabled(|| {
         PIDFD_TABLE.lock().remove(&id);
     });

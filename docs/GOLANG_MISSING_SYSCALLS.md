@@ -1776,3 +1776,29 @@ is not modified.
 - `test_futex_sequential_wake_no_einval` — Regression test: a successful `FUTEX_WAKE` returning 1 followed immediately by another `FUTEX_WAKE` must not produce EINVAL.
 - `test_pipe_epipe_for_nonexistent_pipe_id` — Secondary effect test: the crash log showed EPIPE from other goroutines after the futex goroutine died. This verifies our EPIPE return codes are correct.
 - `test_rt_sigreturn_pending_redelivery` — Directly tests the `take_pending_signal` invariant from the §46 fix.
+- `test_pipe_multi_process_lifecycle` — Regression test: verify that a pipe survives when one process closes its FDs but another still has them open.
+
+## 49. Broken Pipe / Premature Pipe Destruction (2026-03-20)
+
+**Status:** Fixed (2026-03-20) in `crates/akuma-exec/src/process/mod.rs` and `src/syscall/fs.rs`
+**Component:** `crates/akuma-exec` — `SharedFdTable`, `src/syscall/fs.rs` — `sys_read`/`sys_write`
+
+### Symptom
+
+Go build processes would fail with `signal: broken pipe` and the kernel would log `[pipe] write WARN: pipe id=X not found (len=25)`. This indicated that the pipe object was being destroyed while processes still had file descriptors pointing to it. Additionally, some syscalls were returning incorrect error codes (e.g., `EPERM` instead of `EBADF`) when given invalid file descriptors.
+
+### Root cause
+
+The bug was in the file descriptor cleanup logic and error reporting:
+1.  **Premature Cleanup:** When a process exited, `cleanup_process_fds` was explicitly closing all its pipes and other resources. However, with `CLONE_FILES` (shared FD tables), multiple processes share the same `SharedFdTable` via `Arc`. Closing resources when one process in the group exited would break them for all others.
+2.  **Global Refcount Issues:** If multiple processes had independent FD tables pointing to the same pipe (e.g., after a `fork`), the global `KernelPipe` reference counts were being decremented prematurely if the cleanup logic was too aggressive.
+3.  **Incorrect Error Codes:** `sys_read` and `sys_write` were returning `!0u64` (often interpreted as `EPERM` or generic error) instead of `EBADF` when a file descriptor was not found in the process's table.
+
+### Fix
+
+The fix involved three parts:
+1.  **Correct Error Codes:** `sys_read` and `sys_write` were updated to return `EBADF` (-9) when a file descriptor is not found.
+2.  **Resource Lifecycle Management:** `SharedFdTable` now implements the `Drop` trait. Resource cleanup (closing pipes, removing sockets, etc.) is now automatically performed only when the *last* reference to the `SharedFdTable` is dropped. 
+3.  **Simplified Exit Cleanup:** `cleanup_process_fds` was simplified to only clear the internal table mapping if it is the sole owner of the FD table. The actual closing of underlying kernel resources is deferred to the `Drop` implementation.
+
+This ensures that shared resources are kept alive as long as any process in the thread group is still using the table, and that `fork`ed processes correctly maintain their independent references to shared pipes.

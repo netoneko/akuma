@@ -84,6 +84,8 @@ pub struct ExecRuntime {
     pub pipe_close_read: fn(u32),
     pub pipe_clone_ref: fn(u32, bool),
     pub eventfd_close: fn(u32),
+    pub epoll_destroy: fn(u32),
+    pub pidfd_close: fn(u32),
 
     // VFS helpers
     pub resolve_symlinks: fn(&str) -> alloc::string::String,

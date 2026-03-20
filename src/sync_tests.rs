@@ -1573,13 +1573,49 @@ fn test_pipe_epipe_for_nonexistent_pipe_id() {
     // Write to the writer — must return EPIPE.
     let ret_write = pipe_write(pipe_id, &buf);
     assert_eq!(ret_write, Err(libc_errno::EPIPE as i32), "write to pipe with no reader should be EPIPE");
+// Clean up write end.
+pipe_close_write(pipe_id);
 
-    // Clean up write end.
-    pipe_close_write(pipe_id);
-
-    set_bypass(false);
-    console::print("  [PASS] test_pipe_epipe_for_nonexistent_pipe_id\n");
+set_bypass(false);
+console::print("  [PASS] test_pipe_epipe_for_nonexistent_pipe_id\n");
 }
+
+/// Verify that a pipe survives when one process closes its FDs but another
+/// still has them open. This is a common pattern in shell pipes.
+fn test_pipe_multi_process_lifecycle() {
+use crate::syscall::pipe::{pipe_create, pipe_close_read, pipe_write, pipe_close_write, pipe_clone_ref};
+use akuma_net::socket::libc_errno;
+
+set_bypass(true);
+
+// 1. Create a pipe (counts: R=1, W=1)
+let pipe_id = pipe_create();
+
+// 2. Simulate a "child" process inheriting it (counts: R=2, W=2)
+pipe_clone_ref(pipe_id, true); // write end
+pipe_clone_ref(pipe_id, false); // read end
+
+// 3. Parent closes its ends (counts: R=1, W=1)
+pipe_close_read(pipe_id);
+pipe_close_write(pipe_id);
+
+// 4. Pipe must still be valid for the child!
+let buf = [0u8; 4];
+let ret = pipe_write(pipe_id, &buf);
+assert_eq!(ret, Ok(4), "pipe should still be writable after parent closes its FDs");
+
+// 5. Child closes its ends (counts: R=0, W=0 -> DESTROY)
+pipe_close_read(pipe_id);
+pipe_close_write(pipe_id);
+
+// 6. Now it should be gone.
+let ret2 = pipe_write(pipe_id, &buf);
+assert_eq!(ret2, Err(libc_errno::EPIPE as i32), "pipe should be gone after last references are closed");
+
+set_bypass(false);
+console::print("  [PASS] test_pipe_multi_process_lifecycle\n");
+}
+
 
 
 /// Verifies the §46 fix: a pending signal is redelivered after rt_sigreturn.
@@ -1652,6 +1688,7 @@ pub fn run_all_tests() {
     test_sa_restart_not_applied_to_successful_futex_wake();
     test_futex_sequential_wake_no_einval();
     test_pipe_epipe_for_nonexistent_pipe_id();
+    test_pipe_multi_process_lifecycle();
     test_rt_sigreturn_pending_redelivery();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();

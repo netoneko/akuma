@@ -56,7 +56,7 @@ struct EpollEvent {
     data: u64,
 }
 
-pub(super) fn epoll_destroy(epoll_id: u32) {
+pub fn epoll_destroy(epoll_id: u32) {
     EPOLL_TABLE.lock().remove(&epoll_id);
 }
 

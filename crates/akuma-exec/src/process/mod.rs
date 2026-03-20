@@ -1211,6 +1211,42 @@ impl SharedFdTable {
     }
 }
 
+impl Drop for SharedFdTable {
+    fn drop(&mut self) {
+        let fds: alloc::vec::Vec<FileDescriptor> = {
+            let mut table = self.table.lock();
+            table.values().cloned().collect()
+        };
+        
+        for fd in fds {
+            match fd {
+                FileDescriptor::Socket(idx) => {
+                    (runtime().remove_socket)(idx);
+                }
+                FileDescriptor::ChildStdout(child_pid) => {
+                    remove_child_channel(child_pid);
+                }
+                FileDescriptor::PipeWrite(pipe_id) => {
+                    (runtime().pipe_close_write)(pipe_id);
+                }
+                FileDescriptor::PipeRead(pipe_id) => {
+                    (runtime().pipe_close_read)(pipe_id);
+                }
+                FileDescriptor::EventFd(efd_id) => {
+                    (runtime().eventfd_close)(efd_id);
+                }
+                FileDescriptor::EpollFd(epoll_id) => {
+                    (runtime().epoll_destroy)(epoll_id);
+                }
+                FileDescriptor::PidFd(pidfd_id) => {
+                    (runtime().pidfd_close)(pidfd_id);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Shared signal action table for CLONE_SIGHAND semantics.
 ///
 /// When threads are created with CLONE_THREAD (pthreads), they share this table
@@ -2536,38 +2572,10 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 /// With shared fd tables (CLONE_FILES), only the last thread referencing the
 /// table performs actual cleanup. Other threads just drop their Arc reference.
 fn cleanup_process_fds(proc: &Process) {
-    if Arc::strong_count(&proc.fds) > 1 {
-        return;
+    if Arc::strong_count(&proc.fds) == 1 {
+        let mut table = proc.fds.table.lock();
+        table.clear();
     }
-
-    let fds: alloc::vec::Vec<FileDescriptor> = {
-        let table = proc.fds.table.lock();
-        table.values().cloned().collect()
-    };
-    
-    for fd in fds {
-        match fd {
-            FileDescriptor::Socket(idx) => {
-                (runtime().remove_socket)(idx);
-            }
-            FileDescriptor::ChildStdout(child_pid) => {
-                remove_child_channel(child_pid);
-            }
-            FileDescriptor::PipeWrite(pipe_id) => {
-                (runtime().pipe_close_write)(pipe_id);
-            }
-            FileDescriptor::PipeRead(pipe_id) => {
-                (runtime().pipe_close_read)(pipe_id);
-            }
-            FileDescriptor::EventFd(efd_id) => {
-                (runtime().eventfd_close)(efd_id);
-            }
-            _ => {}
-        }
-    }
-    
-    let mut table = proc.fds.table.lock();
-    table.clear();
 }
 
 /// Kill a process by PID
