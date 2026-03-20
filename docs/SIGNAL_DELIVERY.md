@@ -174,6 +174,11 @@ whether a corrupted uaddr originated from a goroutine preemption race:
 | `test_futex_wake_sigurg_pending_x0_not_reused` | SIGURG pending after FUTEX_WAKE(1) returns 1 |
 | `test_futex_wake_returns_exact_count_three_waiters` | FUTEX_WAKE(1) returns ≤1, not 3 |
 | `test_futex_einval_uaddr_one` | uaddr=1 returns EINVAL cleanly |
+| `test_sa_restart_not_applied_to_successful_futex_wake` | SA_RESTART only triggers for EINTR/ERESTARTSYS |
+| `test_futex_sequential_wake_no_einval` | two sequential successful wakes do not fault |
+| `test_pipe_epipe_for_nonexistent_pipe_id` | write to invalid pipe returns EPIPE |
+| `test_pipe_multi_process_lifecycle` | pipe survives across shared FD tables and fork/exec |
+| `test_rt_sigreturn_pending_redelivery` | signal redelivered after rt_sigreturn |
 
 ---
 

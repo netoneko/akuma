@@ -71,14 +71,27 @@ close).
 
 ### Cleanup semantics
 
-`cleanup_process_fds` checks `Arc::strong_count(&proc.fds)`.  If other threads
-still reference the shared table (count > 1), the exiting thread skips fd
-cleanup entirely — the table stays alive for the remaining threads.  Only when
-the last thread exits (count == 1) are sockets closed, pipes decremented, and
-the table cleared.
+`SharedFdTable` now implements the `Drop` trait to handle resource cleanup
+automatically. When the last `Arc` reference to a `SharedFdTable` is dropped
+(which happens when the last thread in a thread group exits or the last
+independent process sharing the table exits), the `drop` method:
 
-This matches Linux behavior: the shared fd table is destroyed when its last
-reference is dropped.
+1.  Iterates through all remaining file descriptors in the table.
+2.  Explicitly closes/removes underlying kernel resources:
+    -   Calls `remove_socket` for `Socket` entries.
+    -   Calls `pipe_close_write` / `pipe_close_read` for pipe entries.
+    -   Calls `eventfd_close`, `epoll_destroy`, and `pidfd_close`.
+    -   Cleans up `ChildStdout` channels.
+
+`cleanup_process_fds` has been simplified: it now only clears the internal
+BTreeMap if the current process is the sole owner of the FD table. The actual
+resource destruction is deferred to the `Drop` implementation.
+
+This ensures that resources are never prematurely destroyed as long as at least
+one process or thread is still using the table, and that cleanup happens exactly
+once.
+
+This behavior is verified by `test_pipe_multi_process_lifecycle` in `src/sync_tests.rs`.
 
 ## Impact on Subsystems
 
