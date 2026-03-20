@@ -1,10 +1,10 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_to_user_safe;
 use akuma_net::socket::libc_errno;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeSet, VecDeque};
 
 struct KernelPipe {
-    buffer: Vec<u8>,
+    buffer: VecDeque<u8>,
     write_count: u32,
     read_count: u32,
     reader_thread: Option<usize>,
@@ -19,7 +19,7 @@ pub(crate) fn pipe_create() -> u32 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().insert(id, KernelPipe {
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             write_count: 1,
             read_count: 1,
             reader_thread: None,
@@ -68,7 +68,7 @@ pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
                 super::signal::send_sigpipe();
                 return Err(libc_errno::EPIPE as i32);
             }
-            pipe.buffer.extend_from_slice(data);
+            pipe.buffer.extend(data);
             
             // Wake blocking reader
             if let Some(tid) = pipe.reader_thread.take() {
@@ -97,8 +97,10 @@ pub(crate) fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
         if let Some(pipe) = pipes.get_mut(&id) {
             let n = buf.len().min(pipe.buffer.len());
             if n > 0 {
-                buf[..n].copy_from_slice(&pipe.buffer[..n]);
-                pipe.buffer.drain(..n);
+                // VecDeque::drain is O(n), not O(buffer_size).
+                for (i, b) in pipe.buffer.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
                 (n, false)
             } else if pipe.write_count == 0 {
                 (0, true)

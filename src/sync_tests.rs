@@ -1616,6 +1616,54 @@ set_bypass(false);
 console::print("  [PASS] test_pipe_multi_process_lifecycle\n");
 }
 
+/// Write 1MB of data to a pipe in chunks to stress flow control and buffer performance.
+fn test_pipe_large_transfer() {
+use crate::syscall::pipe::{pipe_create, pipe_close_read, pipe_write, pipe_close_write, pipe_clone_ref, pipe_read};
+
+set_bypass(true);
+
+let pipe_id = pipe_create();
+// Simulate shared access
+pipe_clone_ref(pipe_id, true);
+pipe_clone_ref(pipe_id, false);
+
+// Writer thread: writes 1MB in 1KB chunks
+threading::spawn_fn(move || {
+    let chunk = [0xAAu8; 1024]; // 1KB chunk
+    for _ in 0..1024 { // 1MB total
+        if pipe_write(pipe_id, &chunk).is_err() {
+            break;
+        }
+        threading::yield_now();
+    }
+    pipe_close_write(pipe_id); // Drop writer ref
+    threading::mark_current_terminated();
+    loop { threading::yield_now(); }
+}).expect("spawn writer failed");
+
+// Main thread is the reader
+let mut buf = [0u8; 4096];
+let mut total_read = 0;
+
+// Close our write end so EOF works
+pipe_close_write(pipe_id);
+
+loop {
+    let (n, eof) = pipe_read(pipe_id, &mut buf);
+    if n > 0 {
+        total_read += n;
+    } else if eof {
+        break;
+    } else {
+        threading::yield_now();
+    }
+}
+
+pipe_close_read(pipe_id);
+
+assert_eq!(total_read, 1024 * 1024, "Pipe transfer size mismatch");
+console::print("  [PASS] test_pipe_large_transfer\n");
+}
 
 
 /// Verifies the §46 fix: a pending signal is redelivered after rt_sigreturn.
@@ -1689,6 +1737,7 @@ pub fn run_all_tests() {
     test_futex_sequential_wake_no_einval();
     test_pipe_epipe_for_nonexistent_pipe_id();
     test_pipe_multi_process_lifecycle();
+    test_pipe_large_transfer();
     test_rt_sigreturn_pending_redelivery();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();
