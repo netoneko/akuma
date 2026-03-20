@@ -65,8 +65,8 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 
 pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
-    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
     
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
@@ -455,8 +455,8 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
 pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
-    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
 
     // For File descriptors, capture the initial position now (before the loop).
     // The `fd` variable is a clone — proc.update_fd() updates the real fd table but

@@ -796,7 +796,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         let esr: u64;
         unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr); }
         if (esr >> 26) == 0x15 { // EC_SVC_LOWER
-            unsafe { (*frame).elr_el1 -= 4; } // Back to SVC instruction
+            // Only restart the syscall if it was actually interrupted.
+            // SA_RESTART must NOT apply to successful syscalls — backing up ELR
+            // for a completed FUTEX_WAKE (ret=1) causes it to re-execute with
+            // x0=1 (the return value), producing EINVAL (uaddr=1 is unaligned).
+            let ret_val = unsafe { (*frame).x0 as i64 };
+            if ret_val == -4 /* EINTR */ || ret_val == -512 /* ERESTARTSYS */ {
+                unsafe { (*frame).elr_el1 -= 4; }
+            }
         }
     }
 

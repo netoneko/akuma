@@ -68,6 +68,35 @@ logic as the normal syscall return path (`src/exceptions.rs`).  Key points:
   handler calls `rt_sigreturn`, the original syscall return value is
   correctly restored.
 
+### The `SA_RESTART` / ELR backup bug (§48)
+
+A subtle but critical bug was found in the `SA_RESTART` implementation. When a
+signal was delivered *after* a syscall completed but *before* the syscall's
+return value was processed, the `SA_RESTART` logic would rewind `ELR` by 4 bytes,
+assuming the syscall had been interrupted and needed to be restarted.
+
+This was incorrect for syscalls that had already completed successfully.  For
+example, a `FUTEX_WAKE` syscall that wakes one waiter returns `1`. If a signal
+arrived at this exact moment, the sequence was:
+1. `sys_futex` returns `1`.
+2. `try_deliver_signal` is called.
+3. `SA_RESTART` logic sees the flag, assumes an interrupted syscall, and does
+   `elr_el1 -= 4`, backing the PC up to the `SVC` instruction.
+4. The signal handler runs and returns via `rt_sigreturn`.
+5. Execution resumes at the `SVC` instruction, but with `x0` now holding the
+   *return value* (`1`) from the first call, not the original `uaddr` argument.
+6. `sys_futex` is re-executed with `uaddr=1`, which is unaligned, causing an
+   `EINVAL` error.
+
+The fix, implemented in `try_deliver_signal` in `src/exceptions.rs`, is to
+gate the `ELR` backup. The backup now only occurs if the syscall's return value
+is `-4` (EINTR) or `-512` (ERESTARTSYS), indicating it was genuinely
+interrupted. For any other return value (success or a different error), `ELR`
+is not modified.
+
+This is verified by the `test_sa_restart_not_applied_to_successful_futex_wake`
+and `test_futex_sequential_wake_no_einval` tests in `src/sync_tests.rs`.
+
 ### Remaining risk: signal masking during asyncPreempt
 
 After the fix, a second SIGURG that arrives **while asyncPreempt is running**

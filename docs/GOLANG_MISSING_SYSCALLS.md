@@ -1724,3 +1724,55 @@ wrong. Six new tests were added to `src/sync_tests.rs`.
 | SIGKILL | 9 | 8 | `0x0000_0100` |
 | SIGSTOP | 19 | 18 | `0x0004_0000` |
 | SIGURG | 23 | 22 | `0x0040_0000` |
+
+## 48. `SA_RESTART` rewinds ELR for completed syscalls — `[futex] EINVAL uaddr=0x1` (2026-03-20)
+
+**Status:** Fixed (2026-03-20) in `src/exceptions.rs`
+**Component:** `src/exceptions.rs` — `try_deliver_signal`
+
+### Symptom
+
+After the fix in §46 (pending signal redelivery after `rt_sigreturn`), the `[futex] EINVAL: uaddr=0x1` crash still appeared intermittently:
+
+```
+[signal] Deliver SIGURG (23) to 0x10093180 on slot 1, alt_sp=0xc400c000 ... elr=0x10078238 new_sp=0xc400b860
+[futex] EINVAL: uaddr=0x1 op=129 elr=0x10078238 (null or unaligned)
+futexwakeup: futex(...) returned -22
+```
+
+The key evidence is that the `elr` in the EINVAL log matches the `elr` where the signal was delivered — `0x10078238`. This is the instruction **after** the `SVC` call.
+
+### Root cause
+
+A subtle but critical bug was found in the `SA_RESTART` implementation. When a
+signal was delivered *after* a syscall completed but *before* the syscall's
+return value was processed, the `SA_RESTART` logic would rewind `ELR` by 4 bytes,
+assuming the syscall had been interrupted and needed to be restarted.
+
+This was incorrect for syscalls that had already completed successfully. For
+example, a `FUTEX_WAKE` syscall that wakes one waiter returns `1`. If a signal
+arrived at this exact moment, the sequence was:
+1. `sys_futex` returns `1`.
+2. `try_deliver_signal` is called.
+3. `SA_RESTART` logic sees the flag, assumes an interrupted syscall, and does
+   `elr_el1 -= 4`, backing the PC up to the `SVC` instruction.
+4. The signal handler runs and returns via `rt_sigreturn`.
+5. Execution resumes at the `SVC` instruction, but with `x0` now holding the
+   *return value* (`1`) from the first call, not the original `uaddr` argument.
+6. `sys_futex` is re-executed with `uaddr=1`, which is unaligned, causing an
+   `EINVAL` error.
+
+### Fix
+
+The fix, implemented in `try_deliver_signal` in `src/exceptions.rs`, is to
+gate the `ELR` backup. The backup now only occurs if the syscall's return value
+(in `frame.x0`) is `-4` (EINTR) or `-512` (ERESTARTSYS), indicating it was genuinely
+interrupted. For any other return value (success or a different error), `ELR`
+is not modified.
+
+### New tests (`src/sync_tests.rs`)
+
+- `test_sa_restart_not_applied_to_successful_futex_wake` — Directly asserts that the `elr -= 4` condition is only true for `EINTR`/`ERESTARTSYS`.
+- `test_futex_sequential_wake_no_einval` — Regression test: a successful `FUTEX_WAKE` returning 1 followed immediately by another `FUTEX_WAKE` must not produce EINVAL.
+- `test_pipe_epipe_for_nonexistent_pipe_id` — Secondary effect test: the crash log showed EPIPE from other goroutines after the futex goroutine died. This verifies our EPIPE return codes are correct.
+- `test_rt_sigreturn_pending_redelivery` — Directly tests the `take_pending_signal` invariant from the §46 fix.

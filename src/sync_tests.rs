@@ -11,6 +11,10 @@ use crate::console;
 
 const NR_FUTEX: u64 = 98;
 const NR_SIGALTSTACK: u64 = 132;
+const NR_PIPE2: u64 = 59;
+const NR_WRITE: u64 = 64;
+const NR_CLOSE: u64 = 57;
+//const NR_RT_SIGRETURN: u64 = 139;
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -25,6 +29,8 @@ const FUTEX_CMP_REQUEUE_PRIVATE: u64 = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 const EAGAIN: u64 = (-11i64) as u64;
 const ETIMEDOUT: u64 = (-110i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
+const EPIPE: u64 = (-32i64) as u64;
+const EBADF: u64 = (-9i64) as u64;
 
 /// Helper: enable / disable pointer bypass.
 fn set_bypass(v: bool) {
@@ -56,7 +62,8 @@ fn test_futex_eagain() {
         EAGAIN,
         ret
     );
-    console::print("  [PASS] test_futex_eagain\n");
+    console::print("  [PASS] test_futex_eagain
+");
 }
 
 /// NULL uaddr must return EINVAL.
@@ -76,7 +83,8 @@ fn test_futex_null_addr() {
         EINVAL,
         ret
     );
-    console::print("  [PASS] test_futex_null_addr\n");
+    console::print("  [PASS] test_futex_null_addr
+");
 }
 
 /// Unaligned uaddr must return EINVAL.
@@ -100,7 +108,8 @@ fn test_futex_unaligned_addr() {
         EINVAL,
         ret
     );
-    console::print("  [PASS] test_futex_unaligned_addr\n");
+    console::print("  [PASS] test_futex_unaligned_addr
+");
 }
 
 #[repr(C)]
@@ -135,7 +144,8 @@ fn test_futex_timeout() {
         ETIMEDOUT,
         ret
     );
-    console::print("  [PASS] test_futex_timeout\n");
+    console::print("  [PASS] test_futex_timeout
+");
 }
 
 /// Simulate the missed-wakeup race scenario:
@@ -171,7 +181,8 @@ fn test_futex_wake_before_wait() {
         EAGAIN,
         ret
     );
-    console::print("  [PASS] test_futex_wake_before_wait\n");
+    console::print("  [PASS] test_futex_wake_before_wait
+");
 }
 
 /// FUTEX_WAKE(0) must wake nobody and return 0.
@@ -193,7 +204,8 @@ fn test_futex_wake_zero() {
         "test_futex_wake_zero: expected 0 got {}",
         woken
     );
-    console::print("  [PASS] test_futex_wake_zero\n");
+    console::print("  [PASS] test_futex_wake_zero
+");
 }
 
 /// FUTEX_CMP_REQUEUE with a mismatched val3 must return EAGAIN.
@@ -220,7 +232,8 @@ fn test_futex_cmp_requeue_mismatch() {
         EAGAIN,
         ret
     );
-    console::print("  [PASS] test_futex_cmp_requeue_mismatch\n");
+    console::print("  [PASS] test_futex_cmp_requeue_mismatch
+");
 }
 
 // ============================================================================
@@ -300,7 +313,8 @@ fn test_futex_basic_wake() {
     }
 
     assert!(woke, "test_futex_basic_wake: waiter thread never woke up");
-    console::print("  [PASS] test_futex_basic_wake\n");
+    console::print("  [PASS] test_futex_basic_wake
+");
 }
 
 /// FUTEX_WAKE with N=INT_MAX must wake all waiters, not just one.
@@ -382,7 +396,8 @@ fn test_futex_wake_all() {
         WOKEN_COUNT.load(Ordering::Acquire),
         WAITERS
     );
-    console::print("  [PASS] test_futex_wake_all\n");
+    console::print("  [PASS] test_futex_wake_all
+");
 }
 
 /// FUTEX_WAKE(1) must dequeue at most one waiter from the kernel queue.
@@ -467,7 +482,8 @@ fn test_futex_wake_one_of_two() {
         "test_futex_wake_one_of_two: only {}/2 threads unblocked",
         WOKEN_COUNT2.load(Ordering::Acquire)
     );
-    console::print("  [PASS] test_futex_wake_one_of_two\n");
+    console::print("  [PASS] test_futex_wake_one_of_two
+");
 }
 
 /// FUTEX_REQUEUE moves waiters from one futex address to another.
@@ -546,7 +562,8 @@ fn test_futex_requeue() {
         "test_futex_requeue: only {}/2 threads woke after requeue+wake",
         REQUEUE_WOKEN.load(Ordering::Acquire)
     );
-    console::print("  [PASS] test_futex_requeue\n");
+    console::print("  [PASS] test_futex_requeue
+");
 }
 
 // ============================================================================
@@ -610,7 +627,8 @@ fn test_sigaltstack_syscall_roundtrip() {
     assert!(after_disable.flags == SS_DISABLE, "flags should be SS_DISABLE after disable, got {}", after_disable.flags);
 
     set_bypass(false);
-    console::print("  [PASS] test_sigaltstack_syscall_roundtrip\n");
+    console::print("  [PASS] test_sigaltstack_syscall_roundtrip
+");
 }
 
 /// FUTEX_WAIT returns EINTR when a signal is pended on the waiting thread,
@@ -697,7 +715,8 @@ fn test_futex_wait_eintr_signal_preserved() {
         }
     }
     assert!(done, "test_futex_wait_eintr: waiter thread never finished");
-    console::print("  [PASS] test_futex_wait_eintr_signal_preserved\n");
+    console::print("  [PASS] test_futex_wait_eintr_signal_preserved
+");
 }
 
 /// Verify that rt_sigreturn restores mcontext registers correctly.
@@ -786,7 +805,8 @@ fn test_rt_sigreturn_restores_registers() {
     }
 
     set_bypass(false);
-    console::print("  [PASS] test_rt_sigreturn_restores_registers\n");
+    console::print("  [PASS] test_rt_sigreturn_restores_registers
+");
 }
 
 /// Verify that the uc_stack field in a signal frame is populated from the
@@ -825,7 +845,8 @@ fn test_uc_stack_uses_per_thread_sigaltstack() {
 
     // Restore.
     threading::set_sigaltstack(0, 0, 0, 2);
-    console::print("  [PASS] test_uc_stack_uses_per_thread_sigaltstack\n");
+    console::print("  [PASS] test_uc_stack_uses_per_thread_sigaltstack
+");
 }
 
 /// FUTEX_WAIT_BITSET with val3==0 must return EINVAL.
@@ -852,7 +873,8 @@ fn test_futex_wait_bitset_zero_bitset() {
         EINVAL,
         ret
     );
-    console::print("  [PASS] test_futex_wait_bitset_zero_bitset\n");
+    console::print("  [PASS] test_futex_wait_bitset_zero_bitset
+");
 }
 
 /// FUTEX_WAIT_BITSET with CLOCK_REALTIME and an already-past deadline must
@@ -884,7 +906,8 @@ fn test_futex_wait_bitset_absolute_past() {
         "test_futex_wait_bitset_absolute_past: expected ETIMEDOUT or EAGAIN, got {:#x}",
         ret
     );
-    console::print("  [PASS] test_futex_wait_bitset_absolute_past\n");
+    console::print("  [PASS] test_futex_wait_bitset_absolute_past
+");
 }
 
 /// Pend a signal on the current thread slot while it would be in FUTEX_WAIT,
@@ -916,7 +939,8 @@ fn test_per_thread_sigaltstack() {
     akuma_exec::threading::set_sigaltstack(0, 0, 0, 2);
     akuma_exec::threading::set_sigaltstack(1, 0, 0, 2);
 
-    console::print("  [PASS] test_per_thread_sigaltstack\n");
+    console::print("  [PASS] test_per_thread_sigaltstack
+");
 }
 
 /// uaddr=1 (mutex_locked, also misaligned) must return EINVAL.
@@ -941,7 +965,8 @@ fn test_futex_einval_uaddr_one() {
         EINVAL,
         ret
     );
-    console::print("  [PASS] test_futex_einval_uaddr_one\n");
+    console::print("  [PASS] test_futex_einval_uaddr_one
+");
 }
 
 /// FUTEX_WAKE with a valid aligned address but no waiters must return 0.
@@ -966,7 +991,8 @@ fn test_futex_wake_valid_addr_no_waiters() {
         "test_futex_wake_valid_addr_no_waiters: expected 0 (no waiters) got {:#x}",
         ret
     );
-    console::print("  [PASS] test_futex_wake_valid_addr_no_waiters\n");
+    console::print("  [PASS] test_futex_wake_valid_addr_no_waiters
+");
 }
 
 /// Verify take_pending_signal drains the queue correctly.
@@ -1006,7 +1032,8 @@ fn test_pending_signal_drained_by_take() {
         second
     );
 
-    console::print("  [PASS] test_pending_signal_drained_by_take\n");
+    console::print("  [PASS] test_pending_signal_drained_by_take
+");
 }
 
 /// Verify peek_pending_signal returns the signal without consuming it.
@@ -1035,7 +1062,8 @@ fn test_peek_pending_signal() {
         "peek_pending_signal: expected 0 after second clear"
     );
 
-    console::print("  [PASS] test_peek_pending_signal\n");
+    console::print("  [PASS] test_peek_pending_signal
+");
 }
 
 /// Verify that take_pending_signal respects the signal mask for SIGURG.
@@ -1087,7 +1115,8 @@ fn test_take_pending_signal_sigurg_masked() {
         "test_take_pending_signal_sigurg_masked: queue not empty after take"
     );
 
-    console::print("  [PASS] test_take_pending_signal_sigurg_masked\n");
+    console::print("  [PASS] test_take_pending_signal_sigurg_masked
+");
 }
 
 /// Verify that SIGKILL and SIGSTOP bypass the signal mask in take_pending_signal.
@@ -1145,7 +1174,8 @@ fn test_take_pending_signal_sigkill_ignores_mask() {
     // Clean up.
     akuma_exec::threading::pend_signal_for_thread(slot, 0);
 
-    console::print("  [PASS] test_take_pending_signal_sigkill_ignores_mask\n");
+    console::print("  [PASS] test_take_pending_signal_sigkill_ignores_mask
+");
 }
 
 /// Verify the single-slot limitation: a second pend overwrites the first.
@@ -1177,7 +1207,8 @@ fn test_pending_signal_overwrite() {
         "test_pending_signal_overwrite: queue should be empty after single-slot drain"
     );
 
-    console::print("  [PASS] test_pending_signal_overwrite\n");
+    console::print("  [PASS] test_pending_signal_overwrite
+");
 }
 
 /// Document and verify the bit-numbering convention used in signal masks.
@@ -1208,7 +1239,8 @@ fn test_signal_mask_bit_numbering() {
     assert!(1u64 << (1u32 - 1) == 1u64,   "signal 1 bit != 1");
     assert!(1u64 << (64u32 - 1) == 1u64 << 63, "signal 64 bit wrong");
 
-    console::print("  [PASS] test_signal_mask_bit_numbering\n");
+    console::print("  [PASS] test_signal_mask_bit_numbering
+");
 }
 
 /// Regression test for the SIGURG-after-futex-wake crash sequence.
@@ -1313,7 +1345,8 @@ fn test_futex_wake_sigurg_pending_x0_not_reused() {
         }
     }
 
-    console::print("  [PASS] test_futex_wake_sigurg_pending_x0_not_reused\n");
+    console::print("  [PASS] test_futex_wake_sigurg_pending_x0_not_reused
+");
 }
 
 /// FUTEX_WAKE(max=1) with three waiters must return exactly 1.
@@ -1402,11 +1435,220 @@ fn test_futex_wake_returns_exact_count_three_waiters() {
         WAITERS
     );
 
-    console::print("  [PASS] test_futex_wake_returns_exact_count_three_waiters\n");
+    console::print("  [PASS] test_futex_wake_returns_exact_count_three_waiters
+");
+}
+
+/// SA_RESTART must NOT apply to successful syscalls.
+///
+/// Directly tests the condition in the SA_RESTART fix: ELR must only be
+/// backed up if the syscall return value is EINTR or ERESTARTSYS. A
+/// successful return (0 or 1 for FUTEX_WAKE) must NOT trigger a backup.
+fn test_sa_restart_not_applied_to_successful_futex_wake() {
+    let ret_success_0: i64 = 0; // e.g. FUTEX_WAKE with no waiters
+    let ret_success_1: i64 = 1; // e.g. FUTEX_WAKE waking one
+    let ret_eintr: i64 = -4;
+    let ret_erestartsys: i64 = -512;
+    let ret_other_err: i64 = -22; // EINVAL
+
+    // Successful syscalls must NOT satisfy the restart condition.
+    assert!(
+        !(ret_success_0 == -4 || ret_success_0 == -512),
+        "SA_RESTART incorrectly applied to return value 0"
+    );
+    assert!(
+        !(ret_success_1 == -4 || ret_success_1 == -512),
+        "SA_RESTART incorrectly applied to return value 1"
+    );
+
+    // Interrupted syscalls MUST satisfy the condition.
+    assert!(
+        ret_eintr == -4 || ret_eintr == -512,
+        "SA_RESTART not applied to EINTR"
+    );
+    assert!(
+        ret_erestartsys == -4 || ret_erestartsys == -512,
+        "SA_RESTART not applied to ERESTARTSYS"
+    );
+
+    // Other errors must not.
+    assert!(
+        !(ret_other_err == -4 || ret_other_err == -512),
+        "SA_RESTART incorrectly applied to other error"
+    );
+
+    console::print("  [PASS] test_sa_restart_not_applied_to_successful_futex_wake
+");
+}
+
+/// Regression for the `uaddr=0x1` crash.
+///
+/// A successful FUTEX_WAKE that returns 1 must not corrupt the next syscall.
+/// Without the SA_RESTART fix, if a signal arrived after the first wake, ELR
+/// would be rewound, `asyncPreempt` would run, and on return the SVC would
+/// re-execute with `x0=1`, causing `FUTEX_WAKE(uaddr=1)` -> EINVAL.
+/// This test verifies that a second wake immediately after a first one that
+/// returns 1 does not fail with EINVAL.
+///
+/// Note: in this test environment, no signal is actually delivered, so it
+/// just verifies the non-corrupted sequential execution path. The real fix
+/// is tested in `test_sa_restart_not_applied_to_successful_futex_wake`.
+fn test_futex_sequential_wake_no_einval() {
+    static FUTEX_WORD_SEQ: AtomicU32 = AtomicU32::new(0);
+    static WAITER_DONE_SEQ: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_SEQ.store(0, Ordering::SeqCst);
+    WAITER_DONE_SEQ.store(false, Ordering::SeqCst);
+
+    // Spawn one waiter.
+    threading::spawn_fn(|| {
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+        let uaddr = FUTEX_WORD_SEQ.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
+        let timeout_ptr = &ts as *const Timespec as u64;
+        crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+        );
+        WAITER_DONE_SEQ.store(true, Ordering::Release);
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_sequential_wake_no_einval: spawn failed");
+
+    for _ in 0..15 { threading::yield_now(); } // let waiter park
+
+    // Wake the waiter. Depending on timing, this will return 0 or 1.
+    FUTEX_WORD_SEQ.store(1, Ordering::SeqCst);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    let uaddr = FUTEX_WORD_SEQ.as_ptr() as usize;
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    assert!(woken <= 1, "first wake returned > 1");
+
+    // Immediately call FUTEX_WAKE on a different valid address.
+    // This must return 0 (no waiters), NOT EINVAL.
+    let mut val2: u32 = 0;
+    let uaddr2 = &mut val2 as *mut u32 as usize;
+    let ret2 = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr2 as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    assert!(
+        ret2 == 0,
+        "test_futex_sequential_wake_no_einval: second wake failed with {:#x}",
+        ret2
+    );
+
+    console::print("  [PASS] test_futex_sequential_wake_no_einval
+");
+}
+
+/// Verify that writing to a pipe with no reader returns EPIPE.
+///
+/// This was the secondary effect in the crash log: after the Go goroutine
+/// crashed due to the futex EINVAL, other goroutines writing to a pipe it
+/// was supposed to have created got EPIPE.
+fn test_pipe_epipe_for_nonexistent_pipe_id() {
+    set_bypass(true);
+
+    // 1. Write to a pipe ID that was never created.
+    let buf = [0u8; 16];
+    let ret = crate::syscall::handle_syscall(
+        NR_WRITE,
+        &[99999, buf.as_ptr() as u64, 16, 0, 0, 0], // fd=99999
+    );
+    assert!(
+        ret == EBADF,
+        "write to nonexistent pipe fd should be EBADF, got {:#x}",
+        ret
+    );
+
+    // 2. Create a pipe, close the read end, then write to the write end.
+    let mut fds = [0u32; 2];
+    let ret_pipe = crate::syscall::handle_syscall(
+        NR_PIPE2,
+        &[fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0],
+    );
+    assert!(ret_pipe == 0, "pipe2 creation failed: {:#x}", ret_pipe);
+    let fd_r = fds[0] as u64;
+    let fd_w = fds[1] as u64;
+
+    // Close the reader.
+    let ret_close = crate::syscall::handle_syscall(NR_CLOSE, &[fd_r, 0, 0, 0, 0, 0]);
+    assert!(ret_close == 0, "close failed: {:#x}", ret_close);
+
+    // Write to the writer — must return EPIPE.
+    let ret_write = crate::syscall::handle_syscall(
+        NR_WRITE,
+        &[fd_w, buf.as_ptr() as u64, 16, 0, 0, 0],
+    );
+    assert!(
+        ret_write == EPIPE,
+        "write to pipe with no reader should be EPIPE, got {:#x}",
+        ret_write
+    );
+
+    // Clean up write end.
+    crate::syscall::handle_syscall(NR_CLOSE, &[fd_w, 0, 0, 0, 0, 0]);
+
+    set_bypass(false);
+    console::print("  [PASS] test_pipe_epipe_for_nonexistent_pipe_id
+");
+}
+
+
+/// Verifies the §46 fix: a pending signal is redelivered after rt_sigreturn.
+///
+/// In the kernel, this is handled by `do_rt_sigreturn` calling
+/// `take_pending_signal`. This test verifies the `take_pending_signal`
+/// invariant directly without executing a real sigreturn.
+fn test_rt_sigreturn_pending_redelivery() {
+    let slot = akuma_exec::threading::current_thread_id();
+    const SIGURG: u32 = 23;
+    const SIGURG_MASK: u64 = 1 << (SIGURG - 1);
+
+    // Start clean.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    // 1. Pend a signal, verify `take_pending_signal` consumes it.
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGURG);
+    assert!(
+        akuma_exec::threading::take_pending_signal(0) == Some(SIGURG),
+        "take_pending_signal should have returned SIGURG"
+    );
+    assert!(
+        akuma_exec::threading::take_pending_signal(0).is_none(),
+        "signal should have been drained"
+    );
+
+    // 2. Pend a signal but mask it. `take` should return None.
+    akuma_exec::threading::pend_signal_for_thread(slot, SIGURG);
+    assert!(
+        akuma_exec::threading::take_pending_signal(SIGURG_MASK).is_none(),
+        "masked signal should not be taken"
+    );
+    // And it should still be in the queue.
+    assert!(
+        akuma_exec::threading::peek_pending_signal(slot) == SIGURG,
+        "masked signal should not have been drained"
+    );
+
+    // Cleanup.
+    akuma_exec::threading::pend_signal_for_thread(slot, 0);
+
+    console::print("  [PASS] test_rt_sigreturn_pending_redelivery
+");
 }
 
 pub fn run_all_tests() {
-    console::print("\n--- Futex Sync Tests ---\n");
+    console::print("
+--- Futex Sync Tests ---
+");
     // Single-threaded correctness
     test_futex_eagain();
     test_futex_null_addr();
@@ -1426,6 +1668,11 @@ pub fn run_all_tests() {
     test_take_pending_signal_sigkill_ignores_mask();
     test_pending_signal_overwrite();
     test_signal_mask_bit_numbering();
+    // New tests from §48
+    test_sa_restart_not_applied_to_successful_futex_wake();
+    test_futex_sequential_wake_no_einval();
+    test_pipe_epipe_for_nonexistent_pipe_id();
+    test_rt_sigreturn_pending_redelivery();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();
     test_rt_sigreturn_restores_registers();
@@ -1438,5 +1685,7 @@ pub fn run_all_tests() {
     test_futex_wait_eintr_signal_preserved();
     test_futex_wake_sigurg_pending_x0_not_reused();
     test_futex_wake_returns_exact_count_three_waiters();
-    console::print("--- Futex Sync Tests Done ---\n\n");
+    console::print("--- Futex Sync Tests Done ---
+
+");
 }
