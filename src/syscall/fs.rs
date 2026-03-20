@@ -329,8 +329,9 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return EINTR;
                 }
                 let tid = akuma_exec::threading::current_thread_id();
-                super::pipe::pipe_set_reader_thread(pipe_id, tid);
-                akuma_exec::threading::schedule_blocking(u64::MAX);
+                if !super::pipe::pipe_check_set_reader(pipe_id, tid) {
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                }
             }
         }
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {

@@ -133,8 +133,8 @@ pub fn pipe_close_write(id: u32) {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
-        } else {
-            crate::safe_print!(64, "[pipe] close_rw WARN: id={} not found\n", id);
+        } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
     });
 }
@@ -150,19 +150,48 @@ pub fn pipe_close_read(id: u32) {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
             }
-        } else {
-            crate::safe_print!(64, "[pipe] close_rw WARN: id={} not found\n", id);
+        } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
     });
 }
 
-pub(super) fn pipe_set_reader_thread(id: u32, tid: usize) {
+/// Atomically check if there is data (or EOF) available on the pipe, and if
+/// not, register `tid` as the blocking reader. Returns `true` if the caller
+/// should NOT block (data available, EOF, or pipe gone), `false` if it should
+/// block (and the tid has been registered so it will be woken on next write).
+///
+/// This eliminates the TOCTOU window in the old two-step:
+///   pipe_read() → (empty, no-eof) → pipe_set_reader_thread() → schedule_blocking()
+/// A concurrent write between the first and second step would fire the wakeup
+/// with no reader registered, causing the blocking thread to sleep forever.
+pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
+            if !pipe.buffer.is_empty() || pipe.write_count == 0 {
+                return true;
+            }
             pipe.reader_thread = Some(tid);
+            false
+        } else {
+            true // pipe gone → treat as EOF, don't block
         }
-    });
+    })
+}
+
+/// Test helper: return the current reader_thread tid registered on `id`.
+pub(crate) fn pipe_reader_thread(id: u32) -> Option<usize> {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).and_then(|p| p.reader_thread)
+    })
+}
+
+/// Test helper: return how many pollers are registered on `id`.
+pub(crate) fn pipe_pollers_count(id: u32) -> usize {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())
+    })
 }
 
 pub(super) fn pipe_can_read(id: u32) -> bool {

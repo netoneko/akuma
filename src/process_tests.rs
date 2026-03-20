@@ -73,6 +73,17 @@ pub fn run_all_tests() {
     test_pipe_dupfd_bumps_refcount();
     test_pipe_dup3_atomically_replaces_and_closes_old();
 
+    // Test atomic pipe_check_set_reader (race fix for blocking read hang)
+    test_pipe_check_set_reader_data_available();
+    test_pipe_check_set_reader_eof();
+    test_pipe_check_set_reader_no_data_registers();
+    test_pipe_check_set_reader_pipe_gone();
+    test_pipe_write_wakes_registered_reader();
+    test_pipe_poller_woken_by_write();
+    test_pipe_close_write_wakes_poller();
+    test_pipe_double_close_no_panic();
+    test_pipe_eof_after_data_flush();
+
     // Test exit_group sibling behavior (Fix 1)
     test_exit_group_does_not_unregister_while_siblings_running();
     test_rt_sigaction_after_exit_group_not_enosys();
@@ -1667,4 +1678,178 @@ fn test_vfork_complete_removes_entry() {
             len,
         );
     }
+}
+
+// ── pipe_check_set_reader tests ───────────────────────────────────────────
+
+/// pipe_check_set_reader returns true (no block) when the buffer has data.
+fn test_pipe_check_set_reader_data_available() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    pipe_write(id, b"x").unwrap();
+    let tid = akuma_exec::threading::current_thread_id();
+    let should_not_block = pipe_check_set_reader(id, tid);
+    // reader_thread must NOT be set (we returned early)
+    let reader_set = pipe_reader_thread(id).is_some();
+    if should_not_block && !reader_set {
+        console::print("[Test] pipe_check_set_reader_data_available PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] pipe_check_set_reader_data_available FAILED: should_not_block={} reader_set={}\n",
+            should_not_block, reader_set,
+        );
+    }
+    pipe_close_write(id);
+    pipe_close_read(id);
+}
+
+/// pipe_check_set_reader returns true when write_count==0 (EOF).
+fn test_pipe_check_set_reader_eof() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    pipe_close_write(id); // write_count=0
+    let tid = akuma_exec::threading::current_thread_id();
+    let should_not_block = pipe_check_set_reader(id, tid);
+    if should_not_block {
+        console::print("[Test] pipe_check_set_reader_eof PASSED\n");
+    } else {
+        console::print("[Test] pipe_check_set_reader_eof FAILED: returned false on EOF pipe\n");
+    }
+    pipe_close_read(id);
+}
+
+/// pipe_check_set_reader returns false and registers tid when buffer is empty
+/// and write_count > 0.
+fn test_pipe_check_set_reader_no_data_registers() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create(); // write_count=1, buffer empty
+    let tid = akuma_exec::threading::current_thread_id();
+    let should_block = !pipe_check_set_reader(id, tid);
+    let registered = pipe_reader_thread(id) == Some(tid);
+    if should_block && registered {
+        console::print("[Test] pipe_check_set_reader_no_data_registers PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] pipe_check_set_reader_no_data_registers FAILED: should_block={} registered={}\n",
+            should_block, registered,
+        );
+    }
+    pipe_close_write(id);
+    pipe_close_read(id);
+}
+
+/// pipe_check_set_reader returns true for a non-existent pipe (treat as EOF).
+fn test_pipe_check_set_reader_pipe_gone() {
+    // Use a large id that is very unlikely to collide with any live pipe.
+    let fake_id: u32 = 0xFFFF_FF00;
+    let tid = akuma_exec::threading::current_thread_id();
+    let should_not_block = crate::syscall::pipe::pipe_check_set_reader(fake_id, tid);
+    if should_not_block {
+        console::print("[Test] pipe_check_set_reader_pipe_gone PASSED\n");
+    } else {
+        console::print("[Test] pipe_check_set_reader_pipe_gone FAILED: returned false for non-existent pipe\n");
+    }
+}
+
+/// After pipe_check_set_reader registers a reader, pipe_write clears it
+/// (reader_thread is None after write).
+fn test_pipe_write_wakes_registered_reader() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+    // Register tid as reader
+    let blocked = !pipe_check_set_reader(id, tid);
+    if !blocked {
+        console::print("[Test] pipe_write_wakes_registered_reader FAILED: check_set_reader should have returned false\n");
+        pipe_close_write(id);
+        pipe_close_read(id);
+        return;
+    }
+    // Write — should clear reader_thread via take()
+    pipe_write(id, b"wake").unwrap();
+    let reader_still_set = pipe_reader_thread(id).is_some();
+    if !reader_still_set {
+        console::print("[Test] pipe_write_wakes_registered_reader PASSED\n");
+    } else {
+        console::print("[Test] pipe_write_wakes_registered_reader FAILED: reader_thread still set after write\n");
+    }
+    pipe_close_write(id);
+    pipe_close_read(id);
+}
+
+/// pipe_add_poller + pipe_write drains the pollers set.
+fn test_pipe_poller_woken_by_write() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+    pipe_add_poller(id, tid);
+    let before = pipe_pollers_count(id);
+    pipe_write(id, b"data").unwrap();
+    let after = pipe_pollers_count(id);
+    if before == 1 && after == 0 {
+        console::print("[Test] pipe_poller_woken_by_write PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] pipe_poller_woken_by_write FAILED: pollers before={} after={}\n",
+            before, after,
+        );
+    }
+    pipe_close_write(id);
+    pipe_close_read(id);
+}
+
+/// pipe_add_poller + pipe_close_write (EOF) drains the pollers set.
+fn test_pipe_close_write_wakes_poller() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+    pipe_add_poller(id, tid);
+    let before = pipe_pollers_count(id);
+    pipe_close_write(id); // write_count → 0, EOF event
+    let after = pipe_pollers_count(id);
+    if before == 1 && after == 0 {
+        console::print("[Test] pipe_close_write_wakes_poller PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] pipe_close_write_wakes_poller FAILED: pollers before={} after={}\n",
+            before, after,
+        );
+    }
+    pipe_close_read(id);
+}
+
+/// Calling pipe_close_write twice (second call after pipe is DESTROY'd) must
+/// not panic — the second call should be silently ignored.
+fn test_pipe_double_close_no_panic() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create(); // write=1, read=1
+    pipe_close_write(id); // write=0; read=1 still open
+    pipe_close_read(id);  // read=0 → DESTROY
+    // Second close_write on a gone pipe — must not panic
+    pipe_close_write(id);
+    console::print("[Test] pipe_double_close_no_panic PASSED\n");
+}
+
+/// Write data, close write end, read all data, then read again → EOF.
+fn test_pipe_eof_after_data_flush() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    pipe_write(id, b"abc").unwrap();
+    pipe_close_write(id); // write_count=0, but data still in buffer
+
+    let mut buf = [0u8; 8];
+    let (n1, eof1) = pipe_read(id, &mut buf);
+    // First read: data available, not yet EOF (buffer drained but must signal data)
+    let (n2, eof2) = pipe_read(id, &mut buf);
+    // Second read: buffer empty + write_count==0 → EOF
+
+    if n1 == 3 && !eof1 && n2 == 0 && eof2 {
+        console::print("[Test] pipe_eof_after_data_flush PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pipe_eof_after_data_flush FAILED: first=({},{}) second=({},{})\n",
+            n1, eof1, n2, eof2,
+        );
+    }
+    pipe_close_read(id);
 }
