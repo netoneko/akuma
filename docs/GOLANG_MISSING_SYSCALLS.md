@@ -222,3 +222,41 @@ Moved futex value reading inside the lock to eliminate the missed-wakeup race.
 ### Fix
 - **Blocking Reads**: Added `reader_thread` to `ProcessChannel`, allowing reads to block until data is written.
 - **`epoll` Readiness**: Updated `epoll_check_fd_readiness` to correctly check for `ChildStdout` data availability.
+
+---
+
+## 52. `find /proc` errors on dead-process `fd` directory (2026-03-21)
+
+**Status:** Fixed (2026-03-21) in `src/vfs/proc.rs`
+
+### Symptom
+
+```
+/usr/bin/find: failed to opendir /proc/49/fd: No such file or directory
+```
+
+A dead process (PID retained in the syscall log) appeared in `ls /proc` but its `fd` subdirectory returned `ENOENT` when `find` tried to open it — an inconsistent directory listing that caused `find` to exit with code 1 and confused Go's build tooling.
+
+### Root cause
+
+`read_dir` for `<pid>/` always added a `"fd"` `DirEntry`, even when the process only existed via its retained syscall log (i.e. `process_exists(pid)` was false). Opening that directory then returned `NotFound` because the `<pid>/fd` handler also gated on `process_exists`.
+
+### Fix
+
+Gate the `"fd"` entry on `Self::process_exists(pid)`. Dead processes show only `"syscalls"` in their directory listing — consistent with what can actually be opened.
+
+---
+
+## 53. epoll EINTR + dup3 invariant — kernel regression tests (2026-03-21)
+
+**Status:** Tests added (2026-03-21) in `src/process_tests.rs`, `src/sync_tests.rs`
+
+### Background
+
+Go crashed with `FAR=0xffffffffffffffea` (-22 = EINVAL used as a pointer) after SIGURG delivery. The crash indicated that either `sys_dup3` was returning EINVAL for a valid call (wrongly treating a non-matching fd pair as same-fd), or that `epoll_pwait` was not returning EINTR when a signal was pending — leaving Go's signal handler unsatisfied.
+
+### Tests added
+
+- **`test_dup3_no_einval_for_valid_args`**: Verifies the three `sys_dup3` invariants — `oldfd==newfd` → EINVAL, valid pair → `newfd`, bad `oldfd` → EBADF. Catches any regression where EINVAL leaks into valid dup paths.
+- **`test_pipe_close_write_wakes_epoll_poller`**: Verifies `pipe_close_write` both drains pollers and sets `pipe_can_read` (EOF) simultaneously — the core of Go's parent-waits-for-compile-stdout workflow.
+- **`test_epoll_eintr_when_signal_pending`**: Verifies `sys_epoll_pwait` returns `-EINTR` immediately when `is_current_interrupted()` is true, without blocking. Essential for Go's goroutine preemption via SIGURG.

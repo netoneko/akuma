@@ -15,11 +15,13 @@ The procfs provides file-based access to process I/O buffers, enabling:
 
 ```
 /proc/
-├── <pid>/
+├── <pid>/                        # live process
 │   ├── fd/
 │   │   ├── 0        # stdin buffer
 │   │   └── 1        # stdout buffer
 │   └── syscalls     # ring-buffer log of recent syscalls (when PROC_SYSCALL_LOG_ENABLED)
+├── <dead-pid>/                   # recently-exited (syscall log retained)
+│   └── syscalls     # fd/ is absent — process has no fd table
 ├── net/
 │   ├── tcp          # active TCP sockets
 │   └── udp          # (placeholder)
@@ -28,7 +30,7 @@ The procfs provides file-based access to process I/O buffers, enabling:
 └── boxes            # container list (host box only)
 ```
 
-Recently-exited PIDs are visible in `ls /proc` for up to `PROC_SYSCALL_LOG_RETAIN_MS` (10 s by default), so their `syscalls` log can still be read after the process dies.
+Recently-exited PIDs are visible in `ls /proc` for up to `PROC_SYSCALL_LOG_RETAIN_MS` (10 s by default), so their `syscalls` log can still be read after the process dies. Dead processes only show `syscalls` in their directory — the `fd/` subdirectory is omitted because the process no longer has an fd table. This keeps the listing consistent: every entry in a PID directory can actually be opened.
 
 ## Permission Model
 
@@ -197,7 +199,8 @@ fs::write_file("/proc/42/fd/0", b"input")?;
 - **Read-only structure**: Cannot create/delete files or directories
 - **No stderr**: Only fd 0 (stdin) and fd 1 (stdout) are exposed
 - **No append semantics**: Writes always use "last write wins" policy
-- **Dynamic content**: Directory listings reflect current process list at query time
+- **Dynamic content**: Directory listings reflect current process state at query time
+- **Dead processes**: Only `syscalls` is shown; `fd/` requires a live process
 - **Syscall log**: `lspid`/`lrpid`/timestamps in `/proc/sysvipc/msg` are always 0 (not tracked)
 
 ## Mount Command
