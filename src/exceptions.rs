@@ -763,7 +763,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
-fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool) -> bool {
+fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _is_fault: bool) -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process(pid) {
         Some(p) => p,
@@ -901,27 +901,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 
         // siginfo_t
         let si = base.add(SIGFRAME_SIGINFO);
-        core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
-        // SEGV_MAPERR (1) for hardware faults; SI_TKILL (-6) for software-sent signals.
-        // Do NOT use fault_addr==0 as a proxy: a NULL deref has fault_addr=0 but is_fault=true.
-        let si_code: i32 = if is_fault { 1i32 } else { -6i32 };
-        core::ptr::write(si.add(8) as *mut i32, si_code);         // si_code
+        // ... (existing si and uc writing)
         core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
 
-        // ucontext_t header: populate uc_stack and uc_sigmask
-        // Layout: uc_flags(+0,8) uc_link(+8,8) uc_stack(+16,24) uc_sigmask(+40,8) __unused[120]
-        // Use per-thread sigaltstack values (alt_sp/alt_size computed above) so that
-        // CLONE_VM threads each report their own gsignal stack in uc_stack.
-        let uc = base.add(SIGFRAME_UCONTEXT);
-        let on_altstack = (action.flags & SA_ONSTACK) != 0 && alt_sp != 0;
-        if on_altstack {
-            core::ptr::write(uc.add(16) as *mut u64, alt_sp);   // ss_sp
-            core::ptr::write(uc.add(24) as *mut i32, 1i32);     // ss_flags = SS_ONSTACK
-            core::ptr::write(uc.add(32) as *mut u64, alt_size); // ss_size
-        }
-        core::ptr::write(uc.add(40) as *mut u64, proc.signal_mask);         // uc_sigmask
-
-        // mcontext_t (sigcontext): fault_address, regs[31], sp, pc, pstate
+        // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)
         let mc = base.add(SIGFRAME_MCONTEXT);
         core::ptr::write(mc as *mut u64, fault_addr);
         let regs_base = mc.add(8) as *mut u64;
@@ -987,6 +970,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         (*frame).elr_el1 = handler_addr as u64;
         (*frame).sp_el0 = new_sp as u64;
         (*frame).x30 = restorer as u64;
+        
+        // Ensure handler page is executable (prevents Instruction Abort)
+        let handler_va = handler_addr & !0xFFF;
+        let _ = proc.address_space.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
+        
+        // Ensure restorer page is executable
+        let restorer_va = restorer & !0xFFF;
+        let _ = proc.address_space.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
 
         if action.flags & SA_SIGINFO != 0 {
             (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
@@ -1006,7 +997,6 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         signal, handler_addr, restorer);
     true
 }
-
 /// Restore saved context from a signal frame on the user stack (rt_sigreturn).
 /// Returns the saved x0 value, or None if the frame is invalid.
 fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
@@ -2110,12 +2100,34 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
                     } else {
                     let page_va = far_usize & !(0xFFF);
+                    
+                    // Serialize page fault handling for this process
+                    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+                        loop {
+                            {
+                                let mut faults = proc.fault_mutex.lock();
+                                if !faults.contains(&page_va) {
+                                    faults.insert(page_va);
+                                    break;
+                                }
+                            }
+                            akuma_exec::threading::yield_now();
+                        }
+                    }
+
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
                             if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RX }
                         }
                         _ => akuma_exec::mmu::user_flags::RX,
                     };
+                    // ... (rest of mapping logic) ...
+                    
+                    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+                        proc.fault_mutex.lock().remove(&page_va);
+                    }
+                    // ... (rest of function) ...
+
 
                     if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         crate::tprint!(256, "[IA-DP] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",

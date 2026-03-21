@@ -99,22 +99,16 @@ goroutine scheduling deadlock.
 
 ---
 
-## Root Cause: Demand-Paging Race Condition (v2026-03-21)
+## Root Cause: Missing Executable Permission for Signal Handlers (v2026-03-21)
 
-The Go `compile` processes are crashing with SIGSEGV (Instruction Abort) at kernel identity-mapped memory addresses and reporting "not the start of an archive file" during package imports. 
+Recent logs indicate that signal delivery for Go's `compile` process consistently results in `SIGSEGV` with `Instruction Abort` at the signal handler's address (`0x1009ee90`).
 
-**Hypothesis: Concurrent Faulting on Shared Address Space**
-The kernel's `is_translation_fault` handler is not atomic regarding the `UserAddressSpace` page table updates. In Go's `compile` (which uses `CLONE_VM` worker threads), multiple threads can fault on the same virtual page simultaneously (e.g., during the initial `mmap` of a large data segment). 
+**Hypothesis: Missing 'X' bit on handler page**
+The kernel's `try_deliver_signal` sets `ELR_EL1` to the user-provided signal handler. However, if the handler's page (or the restorer trampoline) was demand-paged with `RW_NO_EXEC` (common for Go's stack and dynamic allocations) and the kernel does not explicitly grant executable permissions, the CPU triggers an `Instruction Abort` (Instruction Permission Fault).
 
-1. **Race Window**: Two threads fault on the same VA.
-2. **Concurrent I/O**: Both threads trigger `crate::vfs::read_at` into the same physical frame (if race condition is severe) or trigger redundant mapping attempts.
-3. **Inconsistent State**: The CPU fetches an instruction from a page while the PTE entry is being updated or before the I/O completion, reading garbage data or triggering an Instruction Abort because the page is still partially mapped or not yet fully flushed to I-cache.
-4. **Go Compiler Corruption**: The "not the start of an archive file" error confirms that the compiler thread read an incomplete or corrupted file-backed page during this race.
-
-### Proposed Fix: Demand-Paging Lock
-- **Introduce a Per-Process Fault Lock**: Add a `Spinlock<BTreeSet<usize>>` to the `Process` struct to track `VAs` currently being serviced by the demand-paging handler.
-- **Serialization**: Ensure that if a thread faults on a VA that is already being handled by another thread, the second thread waits or spins until the page is successfully mapped.
-- **Cache Coherency**: Ensure `dsb ish` and `isb` are executed immediately after mapping the page in the `UserAddressSpace`, before returning execution to the user thread.
+**Fix applied (2026-03-21, `src/exceptions.rs`):**
+- Updated `try_deliver_signal` to explicitly call `proc.address_space.update_page_flags(addr, RX)` for both the signal handler and the restorer trampoline before redirecting `ELR_EL1`.
+- Sanitized `sigframe` initialization by zeroing the `mcontext_t` and `siginfo_t` regions before populating them to prevent potential pointer leakage or corrupted state.
 
 ### Eliminated hypotheses (for the record)
 

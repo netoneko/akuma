@@ -7,6 +7,7 @@ use crate::console;
 use crate::fs;
 use akuma_exec::process;
 use alloc::string::ToString;
+use alloc::collections::BTreeSet;
 use alloc::format;
 
 /// Run all process tests
@@ -135,6 +136,7 @@ pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::proce
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
         fds: Arc::new(SharedFdTable::new()),
+        fault_mutex: Spinlock::new(BTreeSet::new()),
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
