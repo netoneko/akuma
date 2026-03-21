@@ -834,8 +834,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _
     let thread_slot = akuma_exec::threading::current_thread_id();
     let (alt_sp, alt_size, _alt_flags) = akuma_exec::threading::get_sigaltstack(thread_slot);
 
+    // `fault_pc` is the saved ELR at exception entry — i.e. the user PC where the
+    // fault/interrupt occurred — *not* the handler we will install at handler_addr.
+    // Misreading this as “handler PC” suggests ELR corruption; it is not.
     crate::tprint!(256,
-        "[signal] deliver sig={} slot={} handler={:#x} elr={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
+        "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
         signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
 
     // If the handler requires SA_ONSTACK but no sigaltstack is configured for
@@ -970,12 +973,13 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _
         (*frame).elr_el1 = handler_addr as u64;
         (*frame).sp_el0 = new_sp as u64;
         (*frame).x30 = restorer as u64;
-        
-        // Ensure handler page is executable (prevents Instruction Abort)
+
+        // Demand-paged or RW-only mappings can leave the handler/restorer pages
+        // non-executable; without RX, ERET to the handler faults immediately.
+        // (If fault_pc is in the 0x6000_0000 kernel-RAM VA range, that is a
+        // separate bug: user tried to *execute* identity-mapped RAM — usually UXN.)
         let handler_va = handler_addr & !0xFFF;
         let _ = proc.address_space.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
-        
-        // Ensure restorer page is executable
         let restorer_va = restorer & !0xFFF;
         let _ = proc.address_space.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
 

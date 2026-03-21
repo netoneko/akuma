@@ -101,7 +101,7 @@ goroutine scheduling deadlock.
 
 ## Root Cause: Missing Executable Permission for Signal Handlers (v2026-03-21)
 
-Recent logs indicate that signal delivery for Go's `compile` process consistently results in `SIGSEGV` with `Instruction Abort` at the signal handler's address (`0x1009ee90`).
+Recent logs indicate that signal delivery for Go's `compile` process often shows `SIGSEGV` with `Instruction Abort` while the **registered handler** is at a normal PIE address (e.g. `0x1009ee90`). The **faulting PC** in the log (`fault_pc` / saved ELR) may instead lie in ranges such as `0x6000_0000` — attempted execution in **non-executable** identity-mapped RAM — which is a different failure than “handler page not RX”.
 
 **Hypothesis: Missing 'X' bit on handler page**
 The kernel's `try_deliver_signal` sets `ELR_EL1` to the user-provided signal handler. However, if the handler's page (or the restorer trampoline) was demand-paged with `RW_NO_EXEC` (common for Go's stack and dynamic allocations) and the kernel does not explicitly grant executable permissions, the CPU triggers an `Instruction Abort` (Instruction Permission Fault).
@@ -211,6 +211,54 @@ on `ret_val == EINTR || ret_val == ERESTARTSYS`.
 **Status: already implemented** in `src/exceptions.rs:800–805`. The current
 hang is a completely different bug — goroutines not being scheduled, not a
 futex-EINVAL crash.
+
+---
+
+## Exit code 137 (`compile` / `go build`)
+
+On Linux, **`137 = 128 + 9`** is the usual encoding for a process killed by
+**SIGKILL** (often the **OOM killer** when the parent reports
+`compile: exit status 137`).
+
+**On Akuma**, `exit_code == 137` is set in two places:
+
+1. **`kill_process()`** — explicit SIGKILL-style teardown (`sys_kill`, shell
+   `kill -9`, `kill_box`, cascading kill). See `crates/akuma-exec/src/process/signal.rs`.
+2. **`kill_thread_group()`** — when the **non-shared** (address-space owner)
+   thread exits, **sibling** pthread processes that share the same page table
+   but have **different PIDs** are marked **zombie with 137** so they stop
+   using freed page tables. See `crates/akuma-exec/src/process/mod.rs`
+   (`kill_thread_group`).
+
+Kernel **heap** OOM uses **`return_to_kernel(-12)`** (ENOMEM), not 137
+(`src/allocator.rs`).
+
+**What the logs usually mean here:** the build is not “Linux OOM” by default
+on Akuma. A typical sequence is **fatal `SIGSEGV` (signal 11)** in `compile`
+(e.g. `Instruction abort` / bad **ELR** such as `0x6006…`), then teardown; the
+**137** is the kernel’s **SIGKILL-style** exit code, not `128 + 11` (which would
+be **139** on Linux for uncaught SIGSEGV). The **`[JIT] IC flush + replay`**
+lines point at **stale instruction cache** / generated code vs what the CPU
+executes — related to the executable-mapping and coherency work in
+`try_deliver_signal` / `sync_el0_handler`.
+
+**LLM / review pitfall:** A line like
+`[signal] deliver … handler=0x1009ee90 fault_pc=0x6006c15c …` is easy to misread.
+The second address is **not** the handler: it is the **saved user PC at fault
+time** (before the kernel overwrites `ELR_EL1` with `handler`). Values around
+`0x6000_0000` are **kernel identity RAM** in the user page tables (typically
+**execute-never**); a fault there means user code **branched to non-executable
+memory**, not that the Go handler at `0x1009ee90` lacked `RX`. The kernel
+already applies **`update_page_flags(…, RX)`** for both the handler page and
+the sigreturn restorer page in `try_deliver_signal` after that fix. True
+recursive delivery while already on the sigaltstack is handled separately
+(re-pend / fail delivery — see `try_deliver_signal`).
+
+**Separate issue (not 137):** errors like `could not import internal/cpu (not
+the start of an archive file ("cpu.o …"))` mean the **Go build cache entry is
+corrupted** (object bytes where a `.a` archive is expected). Fix on that host
+with `go clean -cache` or by removing the bad `GOCACHE`/`~/.cache/go-build`
+object.
 
 ---
 
