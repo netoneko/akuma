@@ -260,3 +260,49 @@ Go crashed with `FAR=0xffffffffffffffea` (-22 = EINVAL used as a pointer) after 
 - **`test_dup3_no_einval_for_valid_args`**: Verifies the three `sys_dup3` invariants — `oldfd==newfd` → EINVAL, valid pair → `newfd`, bad `oldfd` → EBADF. Catches any regression where EINVAL leaks into valid dup paths.
 - **`test_pipe_close_write_wakes_epoll_poller`**: Verifies `pipe_close_write` both drains pollers and sets `pipe_can_read` (EOF) simultaneously — the core of Go's parent-waits-for-compile-stdout workflow.
 - **`test_epoll_eintr_when_signal_pending`**: Verifies `sys_epoll_pwait` returns `-EINTR` immediately when `is_current_interrupted()` is true, without blocking. Essential for Go's goroutine preemption via SIGURG.
+
+---
+
+## 54. si_code wrong for NULL dereferences — SIGSEGV treated as software signal (2026-03-21)
+
+**Status:** Fixed (2026-03-21) in `src/exceptions.rs`
+
+### Symptom
+
+Go crashed with `PC=0x20000000, sigcode=-6, addr=0x0`. Go's SIGSEGV handler checks `si_code` to distinguish memory faults (`SEGV_MAPERR=1`) from software-sent signals (`SI_TKILL=-6`). With `si_code=-6` on a NULL deref, Go treated it as a goroutine preemption signal and tried to preempt a goroutine at the bogus fault PC.
+
+### Root Cause
+
+`try_deliver_signal` used `fault_addr == 0` as a proxy for "software signal" to set `si_code`:
+```rust
+let si_code: i32 = if fault_addr == 0 { -6i32 } else { 1i32 };
+```
+NULL dereferences have `FAR=0` but are hardware faults (`is_fault=true`), so they got `si_code=-6` incorrectly.
+
+### Fix
+
+Added `is_fault: bool` parameter to `try_deliver_signal`. Hardware fault call sites pass `true`; software signal call sites pass `false`. The `si_code` is now `if is_fault { 1 } else { -6 }`.
+
+---
+
+## 55. procfs non-stdio fd reads returning ENOENT (2026-03-21)
+
+**Status:** Fixed (2026-03-21) in `src/vfs/proc.rs`, `src/syscall/fs.rs`
+
+### Symptom
+
+`cat /proc/<pid>/fd/<n>` for fd > 1 returned ENOENT. fd 0 and 1 worked.
+
+### Root Cause
+
+`read_symlink` returned virtual paths like `"pipe:[5]"` for non-File fds. `sys_openat` called `resolve_symlinks` which chased this to `crate::fs::exists("pipe:[5]")` → false → ENOENT. fd 0/1 accidentally worked because `get_fd(0/1)` returned `None` (stdin/stdout aren't in the fd table for old processes), so `read_symlink` returned `Err` and `resolve_symlinks` left the path unchanged.
+
+Additionally, `exists`, `metadata`, and `read_at` all short-circuited at `fd_num <= 1`.
+
+### Fix
+
+- `read_symlink` now only returns a resolvable path for `File` fds. Other fd types return `Err` so `resolve_symlinks` leaves the path unchanged.
+- `readlinkat` falls back to `proc_fd_description()` (new pub fn) for non-File fds, which returns the virtual description string (`"pipe:[5]"`, `"socket:[n]"`, etc.).
+- `exists` now checks `proc.get_fd(fd_num).is_some()` for fd > 1.
+- `metadata` returns metadata with size=0 for any valid fd > 1.
+- `read_at` returns the fd description string for fd > 1.

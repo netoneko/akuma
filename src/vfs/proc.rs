@@ -66,11 +66,61 @@ impl ProcFilesystem {
     fn process_exists(pid: Pid) -> bool {
         process::lookup_process(pid).is_some()
     }
+
+    /// Returns a human-readable description string for an fd entry (used by readlinkat).
+    /// These strings are NOT necessarily valid filesystem paths.
+    pub fn fd_description(fd_entry: &akuma_exec::process::FileDescriptor, fd: u32) -> String {
+        use akuma_exec::process::FileDescriptor;
+        match fd_entry {
+            FileDescriptor::File(f) => f.path.clone(),
+            FileDescriptor::Socket(_) => format!("socket:[{}]", fd),
+            FileDescriptor::PipeRead(id) => format!("pipe:[{}]", id),
+            FileDescriptor::PipeWrite(id) => format!("pipe:[{}]", id),
+            FileDescriptor::EpollFd(_) => String::from("anon_inode:[eventpoll]"),
+            FileDescriptor::TimerFd(_) => String::from("anon_inode:[timerfd]"),
+            FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
+            FileDescriptor::DevNull => String::from("/dev/null"),
+            FileDescriptor::DevUrandom => String::from("/dev/urandom"),
+            FileDescriptor::Stdin => String::from("/dev/stdin"),
+            FileDescriptor::Stdout => String::from("/dev/stdout"),
+            FileDescriptor::Stderr => String::from("/dev/stderr"),
+            FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{}]", child_pid),
+            FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{}]", id),
+        }
+    }
 }
 
 impl Default for ProcFilesystem {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns the readlinkat description string for a procfs fd path like "/proc/<pid>/fd/<n>".
+/// Unlike `read_symlink`, this returns descriptions for ALL fd types (pipes, sockets, etc.),
+/// not just File fds. Used by the readlinkat syscall to report virtual fd targets.
+pub fn proc_fd_description(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    // Strip leading "proc/" if present
+    let path = path.strip_prefix("proc/").unwrap_or(path);
+
+    // Handle "self/fd/<n>"
+    let path = if let Some(rest) = path.strip_prefix("self/") {
+        let pid = process::current_process().map(|p| p.pid)?;
+        alloc::format!("{}/{}", pid, rest)
+    } else {
+        alloc::string::String::from(path)
+    };
+
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() == 3 && parts[1] == "fd" {
+        let pid: Pid = parts[0].parse().ok()?;
+        let fd: u32 = parts[2].parse().ok()?;
+        let proc = process::lookup_process(pid)?;
+        let fd_entry = proc.get_fd(fd)?;
+        Some(ProcFilesystem::fd_description(&fd_entry, fd))
+    } else {
+        None
     }
 }
 
@@ -300,7 +350,18 @@ impl Filesystem for ProcFilesystem {
                 buf[..n].copy_from_slice(&stdout.data[offset..offset + n]);
                 Ok(n)
             }
-            _ => Err(FsError::NotFound),
+            _ => {
+                // For other fds (pipes, sockets, etc.) return a description string
+                let fd_entry = proc.get_fd(fd_num).ok_or(FsError::NotFound)?;
+                let desc = Self::fd_description(&fd_entry, fd_num);
+                let bytes = desc.as_bytes();
+                if offset >= bytes.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(bytes.len() - offset);
+                buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+                Ok(n)
+            }
         }
     }
 
@@ -495,7 +556,11 @@ impl Filesystem for ProcFilesystem {
 
         // Try to parse as fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
-            return Self::process_exists(pid) && fd_num <= 1;
+            if !Self::process_exists(pid) { return false; }
+            if fd_num <= 1 { return true; }
+            return process::lookup_process(pid)
+                .map(|p| p.get_fd(fd_num).is_some())
+                .unwrap_or(false);
         }
 
         // Try to parse as pid path
@@ -613,13 +678,16 @@ impl Filesystem for ProcFilesystem {
             let size = match fd_num {
                 0 => proc.stdin.lock().len() as u64,
                 1 => proc.stdout.lock().len() as u64,
-                _ => return Err(FsError::NotFound),
+                _ => {
+                    if proc.get_fd(fd_num).is_none() { return Err(FsError::NotFound); }
+                    0
+                }
             };
             return Ok(Metadata {
                 is_dir: false,
                 size,
                 inode,
-                mode: 0o100644,
+                mode: 0o100444,
                 created: None,
                 modified: None,
                 accessed: None,
@@ -683,7 +751,11 @@ impl Filesystem for ProcFilesystem {
             return self.read_symlink(&new_path);
         }
 
-        // Handle "<pid>/fd/<n>" -> symlink to the file path
+        // Handle "<pid>/fd/<n>" -> symlink to the file path.
+        // Only return a path for File fds (resolvable filesystem paths).
+        // For other fd types (pipes, sockets, etc.) return Err so that resolve_symlinks
+        // does NOT chase the virtual description string (e.g. "pipe:[5]" is not a real path).
+        // readlinkat uses proc_fd_description() to get the description string instead.
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() == 3 && parts[1] == "fd" {
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
@@ -692,23 +764,11 @@ impl Filesystem for ProcFilesystem {
             let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
             if let Some(fd_entry) = proc.get_fd(fd) {
                 use akuma_exec::process::FileDescriptor;
-                let target = match fd_entry {
-                    FileDescriptor::File(f) => f.path.clone(),
-                    FileDescriptor::Socket(_) => format!("socket:[{}]", fd),
-                    FileDescriptor::PipeRead(id) => format!("pipe:[{}]", id),
-                    FileDescriptor::PipeWrite(id) => format!("pipe:[{}]", id),
-                    FileDescriptor::EpollFd(_) => format!("anon_inode:[eventpoll]"),
-                    FileDescriptor::TimerFd(_) => format!("anon_inode:[timerfd]"),
-                    FileDescriptor::EventFd(_) => format!("anon_inode:[eventfd]"),
-                    FileDescriptor::DevNull => String::from("/dev/null"),
-                    FileDescriptor::DevUrandom => String::from("/dev/urandom"),
-                    FileDescriptor::Stdin => String::from("/dev/stdin"),
-                    FileDescriptor::Stdout => String::from("/dev/stdout"),
-                    FileDescriptor::Stderr => String::from("/dev/stderr"),
-                    FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{}]", child_pid),
-                    FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{}]", id),
-                };
-                return Ok(target);
+                if let FileDescriptor::File(f) = fd_entry {
+                    return Ok(f.path.clone());
+                }
+                // Non-file fds: not a resolvable symlink target
+                return Err(FsError::NotFound);
             }
             return Err(FsError::NotFound);
         }

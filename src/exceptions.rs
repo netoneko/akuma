@@ -763,7 +763,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
-fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -> bool {
+fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool) -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process(pid) {
         Some(p) => p,
@@ -902,8 +902,9 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64) -
         // siginfo_t
         let si = base.add(SIGFRAME_SIGINFO);
         core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
-        // SI_TKILL (-6) for software-sent signals; SEGV_MAPERR (1) for fault signals
-        let si_code: i32 = if fault_addr == 0 { -6i32 } else { 1i32 };
+        // SEGV_MAPERR (1) for hardware faults; SI_TKILL (-6) for software-sent signals.
+        // Do NOT use fault_addr==0 as a proxy: a NULL deref has fault_addr=0 but is_fault=true.
+        let si_code: i32 = if is_fault { 1i32 } else { -6i32 };
         core::ptr::write(si.add(8) as *mut i32, si_code);         // si_code
         core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
 
@@ -1637,7 +1638,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     };
                     if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                         unsafe { (*frame).x0 = saved_x0; }
-                        if try_deliver_signal(frame, sig, 0) {
+                        if try_deliver_signal(frame, sig, 0, false) {
                             return sig as u64;
                         }
                     }
@@ -1722,7 +1723,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 // sigreturn restores it correctly (the signal handler's x0 = sig,
                 // and after sigreturn the caller sees x0 = syscall result).
                 unsafe { (*frame).x0 = ret; }
-                if try_deliver_signal(frame, sig, 0) {
+                if try_deliver_signal(frame, sig, 0, false) {
                     return sig as u64; // x0 = signal number for the handler
                 }
                 // Delivery failed (no handler / bad stack); just return normally.
@@ -2055,7 +2056,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             // Try delivering SIGSEGV to a registered userspace handler
-            if try_deliver_signal(frame, 11, far) {
+            if try_deliver_signal(frame, 11, far, true) {
                 return 11; // signal number in x0 for the handler
             }
 
@@ -2268,7 +2269,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             // Try delivering SIGSEGV to a registered userspace handler
-            if try_deliver_signal(frame, 11, far) {
+            if try_deliver_signal(frame, 11, far, true) {
                 return 11;
             }
 

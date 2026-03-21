@@ -1703,7 +1703,12 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         return copy_len as u64;
     }
 
-    if let Some(target) = crate::vfs::read_symlink(&path) {
+    // Try filesystem symlinks first (includes File fds in procfs)
+    let target = crate::vfs::read_symlink(&path)
+        // Fall back to procfs fd description for non-file fds (pipes, sockets, etc.)
+        .or_else(|| crate::vfs::proc::proc_fd_description(&path));
+
+    if let Some(target) = target {
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
