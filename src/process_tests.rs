@@ -98,6 +98,7 @@ pub fn run_all_tests() {
     test_sa_restart_logic();
     test_rt_sigtimedwait_timeout();
     test_current_syscall_visibility();
+    test_child_stdout_blocking_read();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -1852,4 +1853,50 @@ fn test_pipe_eof_after_data_flush() {
         );
     }
     pipe_close_read(id);
+}
+
+/// Verify that reading from ChildStdout correctly blocks until the child writes data.
+fn test_child_stdout_blocking_read() {
+    use akuma_exec::process::spawn_process_with_channel_ext;
+
+    // Spawn a shell process to run a script that sleeps then prints.
+    let args = ["/bin/sh", "-c", "sleep 50; echo hello"];
+    
+    let (_tid, ch, _pid) = spawn_process_with_channel_ext(
+        "/bin/sh",
+        Some(&args),
+        None,
+        None,
+        None,
+        0
+    ).expect("spawn failed");
+
+    let mut buf = [0u8; 128];
+    let mut total_read = 0;
+
+    // Simulate the blocking loop in sys_read
+    loop {
+        let n = ch.read(&mut buf[total_read..]);
+        if n > 0 {
+            total_read += n;
+            // Check if we have received our "hello\n" message
+            let s = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
+            if s.contains("hello\n") { break; }
+        }
+        if ch.has_exited() {
+            break;
+        }
+        // Block until data arrives or process exits
+        akuma_exec::threading::yield_now();
+    }
+    
+    let s = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
+    assert!(s.contains("hello\n"), "Did not find expected output 'hello\\n' in '{}'", s);
+
+    // Wait for exit
+    while !ch.has_exited() {
+        akuma_exec::threading::yield_now();
+    }
+
+    console::print("  [PASS] test_child_stdout_blocking_read\n");
 }

@@ -63,7 +63,7 @@ const fn makedev(major: u64, minor: u64) -> u64 {
     (major << 8) | minor
 }
 
-pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
@@ -301,15 +301,30 @@ pub(super) fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
             if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
                 let mut temp = alloc::vec![0u8; count];
-                let n = ch.read(&mut temp);
-                if n > 0 { 
-                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
-                        return EFAULT;
+                let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+                loop {
+                    let n = ch.read(&mut temp);
+                    if n > 0 {
+                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
+                        return n as u64;
                     }
+                    if ch.has_exited() {
+                        return 0; // EOF
+                    }
+                    if nonblock {
+                        return EAGAIN;
+                    }
+                    if akuma_exec::process::is_current_interrupted() {
+                        return EINTR;
+                    }
+
+                    // Block until data arrives or process exits
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
-                n as u64
             } else {
-                !0u64
+                EBADF
             }
         }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {

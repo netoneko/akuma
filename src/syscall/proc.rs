@@ -809,6 +809,7 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct SpawnOptions {
     pub cwd_ptr: u64,
     pub cwd_len: usize,
@@ -883,7 +884,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     !0u64
 }
 
-pub(super) fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
@@ -944,7 +945,7 @@ pub(super) fn sys_kill(pid: u32, _sig: u32) -> u64 {
     if akuma_exec::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
 }
 
-pub(super) fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
+pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
     if let Some(ch) = akuma_exec::process::get_child_channel(pid) {

@@ -296,6 +296,8 @@ pub struct ProcessChannel {
     raw_mode: AtomicBool,
     /// Stdin closed flag (true if no more data will be written to stdin)
     stdin_closed: AtomicBool,
+    /// Thread ID of a blocking reader waiting for output
+    reader_thread: Spinlock<Option<usize>>,
 }
 
 /// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
@@ -312,6 +314,7 @@ impl ProcessChannel {
             interrupted: AtomicBool::new(false),
             raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
+            reader_thread: Spinlock::new(None),
         }
     }
 
@@ -369,7 +372,12 @@ impl ProcessChannel {
             } else {
                 buf.extend(&kernel_copy);
             }
-        })
+        });
+
+        // Wake any blocking reader waiting for this data
+        if let Some(tid) = self.reader_thread.lock().take() {
+            crate::threading::get_waker_for_thread(tid).wake();
+        }
     }
 
     /// Read available data from the channel (non-blocking)
@@ -388,7 +396,7 @@ impl ProcessChannel {
     /// Read available data from the channel into a buffer
     /// Returns number of bytes read
     pub fn read(&self, buf: &mut [u8]) -> usize {
-        with_irqs_disabled(|| {
+        let n = with_irqs_disabled(|| {
             let mut buffer = self.buffer.lock();
             let to_read = buf.len().min(buffer.len());
             for (i, byte) in buffer.drain(..to_read).enumerate() {
@@ -398,7 +406,13 @@ impl ProcessChannel {
                 log::debug!("[ProcessChannel] Read {} bytes from stdout", to_read);
             }
             to_read
-        })
+        });
+
+        if n == 0 {
+            // Register current thread as reader so it can be woken by next write
+            *self.reader_thread.lock() = Some(crate::threading::current_thread_id());
+        }
+        n
     }
 
     /// Read all remaining data from the channel
