@@ -54,7 +54,7 @@ pub const USER_STACK_SIZE_OVERRIDE: usize = 8 * 1024 * 1024;
 /// Total number of thread slots in the thread pool.
 /// Thread 0 is reserved for the boot/idle thread.
 /// Actual usable threads = MAX_THREADS - 1
-pub const MAX_THREADS: usize = 32;
+pub const MAX_THREADS: usize = 64;
 
 /// Number of kernel threads reserved for system services
 ///

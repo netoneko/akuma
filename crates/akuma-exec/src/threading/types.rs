@@ -8,7 +8,7 @@
 use alloc::string::String;
 
 /// Compile-time constant for static array sizes (must match ExecConfig::max_threads).
-pub const MAX_THREADS: usize = 32;
+pub const MAX_THREADS: usize = 64;
 
 /// Default timeout for cooperative threads in microseconds (100ms)
 pub const COOPERATIVE_TIMEOUT_US: u64 = 100_000;
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn constants_sanity() {
         assert_eq!(CONTEXT_MAGIC, 0xDEAD_BEEF_1234_5678, "CONTEXT_MAGIC must match expected value");
-        assert_eq!(MAX_THREADS, 32, "MAX_THREADS should be 32");
+        assert_eq!(MAX_THREADS, 64, "MAX_THREADS should be 64");
         assert_eq!(IRQ_FRAME_SIZE, 304 + 528, "IRQ_FRAME_SIZE = 304 + 528");
         assert_eq!(IRQ_FRAME_SIZE, 832, "IRQ_FRAME_SIZE should be 832 bytes");
         assert!(EXCEPTION_STACK_SIZE > 0, "EXCEPTION_STACK_SIZE must be positive");
@@ -467,9 +467,9 @@ mod tests {
         );
 
         assert_eq!(summary.system_thread_count, 3, "reserved - 1");
-        assert_eq!(summary.user_thread_count, 28, "MAX_THREADS - reserved");
+        assert_eq!(summary.user_thread_count, 60, "MAX_THREADS - reserved");
         assert_eq!(summary.system_total, 3 * 32 * 1024);
-        assert_eq!(summary.user_total, 28 * 64 * 1024);
+        assert_eq!(summary.user_total, 60 * 64 * 1024);
         assert_eq!(
             summary.total_bytes,
             kernel_stack + summary.system_total + summary.user_total
@@ -493,7 +493,7 @@ mod tests {
     fn calculate_stack_requirements_single_system_thread() {
         let summary = calculate_stack_requirements(2, 32 * 1024, 16 * 1024, 32 * 1024);
         assert_eq!(summary.system_thread_count, 1);
-        assert_eq!(summary.user_thread_count, 30);
+        assert_eq!(summary.user_thread_count, 62);
     }
 
     // --- verify_stack_memory_params ---

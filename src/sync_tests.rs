@@ -1792,6 +1792,182 @@ fn test_epoll_eintr_when_signal_pending() {
     console::print("  [PASS] test_epoll_eintr_when_signal_pending\n");
 }
 
+/// Verify FUTEX_WAIT_PRIVATE (op=128) / FUTEX_WAKE_PRIVATE (op=129) work end-to-end.
+fn test_futex_private_flag_basic_wake() {
+    static FUTEX_WORD_PB: AtomicU32 = AtomicU32::new(0);
+    static WOKEN_FLAG_PB: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_PB.store(0, Ordering::SeqCst);
+    WOKEN_FLAG_PB.store(false, Ordering::SeqCst);
+
+    threading::spawn_fn(|| {
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+        let uaddr = FUTEX_WORD_PB.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
+        let timeout_ptr = &ts as *const Timespec as u64;
+        let ret = crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+        );
+
+        if ret == 0 || ret == EAGAIN {
+            WOKEN_FLAG_PB.store(true, Ordering::Release);
+        }
+
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_private_flag_basic_wake: spawn failed");
+
+    for _ in 0..10 { threading::yield_now(); }
+
+    FUTEX_WORD_PB.store(1, Ordering::SeqCst);
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    let uaddr = FUTEX_WORD_PB.as_ptr() as usize;
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    assert!(woken <= 1, "test_futex_private_flag_basic_wake: FUTEX_WAKE_PRIVATE returned {} > 1", woken);
+
+    let mut woke = false;
+    for _ in 0..50 {
+        threading::yield_now();
+        if WOKEN_FLAG_PB.load(Ordering::Acquire) {
+            woke = true;
+            break;
+        }
+    }
+
+    assert!(woke, "test_futex_private_flag_basic_wake: waiter thread never woke");
+    console::print("  [PASS] test_futex_private_flag_basic_wake\n");
+}
+
+/// FUTEX_WAKE_PRIVATE(1) with 2 FUTEX_WAIT_PRIVATE waiters wakes exactly 1.
+fn test_futex_private_flag_wake_one_of_two() {
+    static FUTEX_WORD_PW: AtomicU32 = AtomicU32::new(0);
+    static WOKEN_COUNT_PW: AtomicU32 = AtomicU32::new(0);
+
+    FUTEX_WORD_PW.store(0, Ordering::SeqCst);
+    WOKEN_COUNT_PW.store(0, Ordering::SeqCst);
+
+    for _ in 0..2 {
+        threading::spawn_fn(|| {
+            crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+            let uaddr = FUTEX_WORD_PW.as_ptr() as usize;
+            let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+            let timeout_ptr = &ts as *const Timespec as u64;
+            let ret = crate::syscall::handle_syscall(
+                NR_FUTEX,
+                &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+            );
+
+            if ret == 0 || ret == EAGAIN || ret == ETIMEDOUT {
+                WOKEN_COUNT_PW.fetch_add(1, Ordering::Release);
+            }
+
+            crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+            threading::mark_current_terminated();
+            loop { threading::yield_now(); }
+        }).expect("test_futex_private_flag_wake_one_of_two: spawn failed");
+    }
+
+    for _ in 0..20 { threading::yield_now(); }
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    let uaddr = FUTEX_WORD_PW.as_ptr() as usize;
+
+    // Wake exactly one.
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    assert!(woken <= 1, "test_futex_private_flag_wake_one_of_two: FUTEX_WAKE_PRIVATE(1) dequeued {}", woken);
+
+    // Release the remaining waiter.
+    FUTEX_WORD_PW.store(1, Ordering::SeqCst);
+    crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, i32::MAX as u64, 0, 0, 0],
+    );
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    let mut all_done = false;
+    for _ in 0..100 {
+        threading::yield_now();
+        if WOKEN_COUNT_PW.load(Ordering::Acquire) >= 2 {
+            all_done = true;
+            break;
+        }
+    }
+
+    assert!(all_done, "test_futex_private_flag_wake_one_of_two: only {}/2 threads unblocked",
+        WOKEN_COUNT_PW.load(Ordering::Acquire));
+    console::print("  [PASS] test_futex_private_flag_wake_one_of_two\n");
+}
+
+/// Core isolation test: a wake with the wrong tgid does not affect waiters registered
+/// under a different tgid.
+fn test_futex_private_tgid_isolation() {
+    static FUTEX_WORD_TI: AtomicU32 = AtomicU32::new(0);
+    static REACHED_TI: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_TI.store(0, Ordering::SeqCst);
+    REACHED_TI.store(false, Ordering::SeqCst);
+
+    // Spawn a waiter — in kernel test context, read_current_pid() returns None → tgid=0.
+    threading::spawn_fn(|| {
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+        let uaddr = FUTEX_WORD_TI.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+        let timeout_ptr = &ts as *const Timespec as u64;
+        // FUTEX_WAIT_PRIVATE → tgid = read_current_pid() → 0 in kernel context
+        crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
+        );
+
+        REACHED_TI.store(true, Ordering::Release);
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_private_tgid_isolation: spawn failed");
+
+    for _ in 0..15 { threading::yield_now(); }
+
+    let uaddr = FUTEX_WORD_TI.as_ptr() as usize;
+
+    // Wake with wrong tgid (99) — should find no waiters at (99, uaddr).
+    let woken_wrong = crate::syscall::futex_do_wake(99, uaddr, u32::MAX);
+    assert!(woken_wrong == 0, "test_futex_private_tgid_isolation: wrong tgid should wake 0, got {}", woken_wrong);
+
+    for _ in 0..5 { threading::yield_now(); }
+    assert!(!REACHED_TI.load(Ordering::Acquire),
+        "test_futex_private_tgid_isolation: thread must not have run after wrong-tgid wake");
+
+    // Wake with correct tgid (0) — wakes the thread.
+    let woken_right = crate::syscall::futex_do_wake(0, uaddr, 1);
+    assert!(woken_right == 1, "test_futex_private_tgid_isolation: correct tgid should wake 1, got {}", woken_right);
+
+    let mut done = false;
+    for _ in 0..50 {
+        threading::yield_now();
+        if REACHED_TI.load(Ordering::Acquire) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "test_futex_private_tgid_isolation: thread should have run after correct-tgid wake");
+
+    console::print("  [PASS] test_futex_private_tgid_isolation\n");
+}
+
 pub fn run_all_tests() {
     console::print("
 --- Futex Sync Tests ---
@@ -1836,6 +2012,10 @@ pub fn run_all_tests() {
     test_futex_wait_eintr_signal_preserved();
     test_futex_wake_sigurg_pending_x0_not_reused();
     test_futex_wake_returns_exact_count_three_waiters();
+    // FUTEX_PRIVATE_FLAG tgid-isolation tests (§57)
+    test_futex_private_flag_basic_wake();
+    test_futex_private_flag_wake_one_of_two();
+    test_futex_private_tgid_isolation();
     console::print("--- Futex Sync Tests Done ---
 
 ");

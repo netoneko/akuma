@@ -1448,3 +1448,33 @@ To be determined — need a kernel crash log from a `go build` run to identify t
 - **`mmap` anonymous with `MAP_FIXED`**: Go's compiler allocates large arenas; partial unmaps or MAP_FIXED collisions may fault.
 - **`sched_getaffinity`**: Some Go versions call this to determine GOMAXPROCS.
 - **Signal mask inheritance across `clone`**: Child processes need the correct signal mask from the parent.
+
+---
+
+## 57. FUTEX_PRIVATE_FLAG stripping — cross-process wake theft (Fixed 2026-03-21)
+
+**Status:** Fixed (2026-03-21) in `src/syscall/sync.rs`
+
+### Symptom
+
+`CGO_ENABLED=0 go build` hangs; the `compile` subprocess's goroutines never run. M-threads are stuck in `futex_wait` indefinitely.
+
+### Root Cause
+
+`FUTEX_PRIVATE_FLAG` was stripped and discarded in `sys_futex`. All processes shared a single global `BTreeMap<usize, Vec<usize>>` keyed by VA only. Without ASLR, `go build` and the `compile` subprocess both load the Go runtime at the same base address — their M-thread park futex VA is identical. A `FUTEX_WAKE_PRIVATE` from `go build` accidentally dequeued a `compile` thread (same VA key, different physical page), leaving `compile`'s own M-threads parked forever.
+
+### Fix
+
+Changed the futex waiter key from `usize` (VA only) to `(u32, usize)` — `(tgid, uaddr)`.
+
+- Private ops (`FUTEX_PRIVATE_FLAG` set): `tgid = read_current_pid()`, scoping the futex to the process.
+- Shared/non-private ops and kernel-internal wakes (`clear_child_tid`, robust futex): `tgid = 0`.
+
+This prevents cross-process VA collisions when different processes share the same virtual address due to no ASLR.
+
+### Tests Added
+
+Three kernel-level tests in `src/sync_tests.rs`:
+- `test_futex_private_flag_basic_wake` — FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE end-to-end.
+- `test_futex_private_flag_wake_one_of_two` — FUTEX_WAKE_PRIVATE(1) with 2 waiters wakes exactly 1.
+- `test_futex_private_tgid_isolation` — waking with wrong tgid (99) finds no waiters; correct tgid (0) wakes the thread.

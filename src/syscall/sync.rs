@@ -22,7 +22,7 @@ fn futex_key_tgid(is_private: bool) -> u32 {
     }
 }
 
-fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
+pub(crate) fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
     let mut waiters = FUTEX_WAITERS.lock();
     let key = (tgid, uaddr);
     let woken = if let Some(queue) = waiters.get_mut(&key) {
