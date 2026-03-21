@@ -1209,13 +1209,15 @@ impl SharedFdTable {
             next_fd: AtomicU32::new(self.next_fd.load(Ordering::Relaxed)),
         }
     }
-}
 
-impl Drop for SharedFdTable {
-    fn drop(&mut self) {
+    /// Explicitly close all underlying kernel resources and clear the table.
+    /// This is used during process exit to ensure immediate cleanup.
+    pub fn close_all(&self) {
         let fds: alloc::vec::Vec<FileDescriptor> = {
             let mut table = self.table.lock();
-            table.values().cloned().collect()
+            let items: alloc::vec::Vec<FileDescriptor> = table.values().cloned().collect();
+            table.clear(); // Ensure we don't close twice
+            items
         };
         
         for fd in fds {
@@ -1244,6 +1246,12 @@ impl Drop for SharedFdTable {
                 _ => {}
             }
         }
+    }
+}
+
+impl Drop for SharedFdTable {
+    fn drop(&mut self) {
+        self.close_all();
     }
 }
 
@@ -2573,8 +2581,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 /// table performs actual cleanup. Other threads just drop their Arc reference.
 fn cleanup_process_fds(proc: &Process) {
     if Arc::strong_count(&proc.fds) == 1 {
-        let mut table = proc.fds.table.lock();
-        table.clear();
+        proc.fds.close_all();
     }
 }
 

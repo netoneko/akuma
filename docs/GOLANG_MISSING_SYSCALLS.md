@@ -659,7 +659,7 @@ userspace and enqueues a `KernelMsg`.  Blocks (yields) if the queue is full; ret
 **`sys_msgrcv(msqid, msgp, msgsz, msgtyp, flags)`** — dequeues a matching message and
 copies it to userspace.  Supports all three `msgtyp` modes: 0 = any, >0 = exact type
 match, <0 = lowest type ≤ |msgtyp|.  Blocks (yields) if no match and `IPC_NOWAIT` is
-not set; returns `ENOMSG` otherwise.  `MSG_NOERROR` truncates oversized messages;
+not set; returns `ENOTMSG` otherwise.  `MSG_NOERROR` truncates oversized messages;
 without it `E2BIG` is returned and the message stays in the queue.
 
 ---
@@ -705,6 +705,13 @@ if flags & CLONE_VFORK != 0 {
 match fork_process(child_pid, stack) {
     Ok(new_pid) => {
         // ... CLONE_PIDFD handling ...
+        if flags & CLONE_PIDFD != 0 {
+            let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0);
+            if (pidfd_fd as i64) >= 0 {
+                let fd_i32 = pidfd_fd as i32;
+                let _ = unsafe { copy_to_user_safe(args[2] as *mut u8, &fd_i32 as *const i32 as *const u8, 4) };
+            }
+        }
         if flags & CLONE_VFORK != 0 {
             schedule_blocking(u64::MAX);  // unblocked by vfork_complete
         }
@@ -1776,7 +1783,8 @@ is not modified.
 - `test_futex_sequential_wake_no_einval` — Regression test: a successful `FUTEX_WAKE` returning 1 followed immediately by another `FUTEX_WAKE` must not produce EINVAL.
 - `test_pipe_epipe_for_nonexistent_pipe_id` — Secondary effect test: the crash log showed EPIPE from other goroutines after the futex goroutine died. This verifies our EPIPE return codes are correct.
 - `test_rt_sigreturn_pending_redelivery` — Directly tests the `take_pending_signal` invariant from the §46 fix.
-- `test_pipe_multi_process_lifecycle` — Regression test: verify that a pipe survives when one process closes its FDs but another still has them open.
+- `test_pipe_multi_process_lifecycle` — Regression test for #49: verify that a pipe survives when one process closes its FDs but another still has them open.
+- `test_pipe_large_transfer` — Stress test for #50: transfers 1MB of data through a pipe to verify `VecDeque` performance and flow control.
 
 ## 49. Broken Pipe / Premature Pipe Destruction (2026-03-20)
 
@@ -1790,15 +1798,36 @@ Go build processes would fail with `signal: broken pipe` and the kernel would lo
 ### Root cause
 
 The bug was in the file descriptor cleanup logic and error reporting:
-1.  **Premature Cleanup:** When a process exited, `cleanup_process_fds` was explicitly closing all its pipes and other resources. However, with `CLONE_FILES` (shared FD tables), multiple processes share the same `SharedFdTable` via `Arc`. Closing resources when one process in the group exited would break them for all others.
-2.  **Global Refcount Issues:** If multiple processes had independent FD tables pointing to the same pipe (e.g., after a `fork`), the global `KernelPipe` reference counts were being decremented prematurely if the cleanup logic was too aggressive.
-3.  **Incorrect Error Codes:** `sys_read` and `sys_write` were returning `!0u64` (often interpreted as `EPERM` or generic error) instead of `EBADF` when a file descriptor was not found in the process's table.
+1.  **Delayed Cleanup (Hangs):** When a process exited, its FDs remained "open" in the kernel's view until the process was reaped (the zombie dropped). For pipes, this meant readers would hang waiting for more data instead of seeing EOF immediately upon the writer's death.
+2.  **Premature Cleanup (Shared Tables):** With `CLONE_FILES`, multiple processes share the same `SharedFdTable`. Closing resources when one process exited would break them for all others in the group.
+3.  **Global Refcount Issues:** If multiple processes had independent FD tables pointing to the same pipe (e.g., after a `fork`), the global `KernelPipe` reference counts were being decremented prematurely if the cleanup logic was too aggressive.
+4.  **Incorrect Error Codes:** `sys_read` and `sys_write` were returning generic errors instead of `EBADF` when a file descriptor was not found.
 
 ### Fix
 
 The fix involved three parts:
-1.  **Correct Error Codes:** `sys_read` and `sys_write` were updated to return `EBADF` (-9) when a file descriptor is not found.
-2.  **Resource Lifecycle Management:** `SharedFdTable` now implements the `Drop` trait. Resource cleanup (closing pipes, removing sockets, etc.) is now automatically performed only when the *last* reference to the `SharedFdTable` is dropped. 
-3.  **Simplified Exit Cleanup:** `cleanup_process_fds` was simplified to only clear the internal table mapping if it is the sole owner of the FD table. The actual closing of underlying kernel resources is deferred to the `Drop` implementation.
+1.  **Correct Error Codes:** `sys_read` and `sys_write` now return `EBADF` (-9).
+2.  **Immediate & Automatic Resource Lifecycle Management:** 
+    - `SharedFdTable` implements `close_all()` which iterates and explicitly closes all underlying kernel resources (pipes, sockets, etc.) and clears the internal table.
+    - `SharedFdTable` implements `Drop`, which calls `close_all()`.
+    - `cleanup_process_fds` calls `close_all()` *immediately* when the last process in a thread group (or an independent process) exits, even while it remains a zombie.
+3.  **Correct Sharing Semantics:** `CLONE_VM` threads share the `Arc<SharedFdTable>`, so resources only close when the *entire group* is gone. `fork()`ed processes get a deep copy with incremented pipe refcounts, so they manage their own lifetime correctly.
 
-This ensures that shared resources are kept alive as long as any process in the thread group is still using the table, and that `fork`ed processes correctly maintain their independent references to shared pipes.
+## 50. Pipe Read Performance (Quadratic Slowdown) (2026-03-20)
+
+**Status:** Fixed (2026-03-20) in `src/syscall/pipe.rs`
+**Component:** `src/syscall/pipe.rs`
+
+### Symptom
+
+Large Go builds would hang or take extremely long (minutes) inside the kernel during `read` syscalls. Logs showed `in_kernel` times exceeding 100 seconds.
+
+### Root cause
+
+The `KernelPipe` implementation used a `Vec<u8>` for its buffer. `pipe_read` performed `pipe.buffer.drain(..n)`, which is an **O(N)** operation because it shifts all remaining elements to the front of the vector. For a process writing megabytes of data, every small read (e.g., 4KB) triggered a massive memory shift, leading to quadratic $O(N^2)$ performance.
+
+### Fix
+
+Replaced `Vec<u8>` with `VecDeque<u8>` in `KernelPipe`. `VecDeque::drain` is efficient (O(1) amortized for front removal), eliminating the memory shifting bottleneck.
+
+This is verified by the `test_pipe_large_transfer` test in `src/sync_tests.rs`, which transfers 1MB of data in 1KB chunks.
