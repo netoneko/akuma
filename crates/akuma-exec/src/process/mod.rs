@@ -415,6 +415,10 @@ impl ProcessChannel {
         n
     }
 
+    pub fn has_stdout_data(&self) -> bool {
+        !self.buffer.lock().is_empty()
+    }
+
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
         with_irqs_disabled(|| {

@@ -212,6 +212,17 @@ fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
                 ready |= EPOLLOUT;
             }
         }
+        akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+            if requested & EPOLLIN != 0 {
+                if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
+                    if ch.has_stdout_data() || ch.has_exited() {
+                        ready |= EPOLLIN;
+                    }
+                } else {
+                    ready |= EPOLLHUP;
+                }
+            }
+        }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             if requested & EPOLLIN != 0 {
                 // Register for wakeup notifications
