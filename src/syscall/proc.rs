@@ -200,6 +200,11 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
+        // Close all fds immediately so pipe write-ends are decremented and
+        // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
+        // woken now. close_all() is idempotent — cleanup_process_fds() later
+        // will find an empty table and skip any double-close.
+        proc.fds.close_all();
         akuma_exec::process::kill_thread_group(pid, l0_phys);
         vfork_complete(pid);
     }

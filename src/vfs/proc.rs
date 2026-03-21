@@ -181,13 +181,18 @@ impl Filesystem for ProcFilesystem {
             if !Self::process_exists(pid) && !pid_has_log {
                 return Err(FsError::NotFound);
             }
-            let mut pid_entries = alloc::vec![DirEntry {
-                name: String::from("fd"),
-                is_dir: true,
-                is_symlink: false,
-                size: 0,
-            }];
-            if crate::config::PROC_SYSCALL_LOG_ENABLED {
+            let mut pid_entries = alloc::vec![];
+            if Self::process_exists(pid) {
+                pid_entries.push(DirEntry {
+                    name: String::from("fd"),
+                    is_dir: true,
+                    is_symlink: false,
+                    size: 0,
+                });
+            }
+            if crate::config::PROC_SYSCALL_LOG_ENABLED
+                && crate::syscall::log::get_formatted(pid).is_some()
+            {
                 pid_entries.push(DirEntry {
                     name: String::from("syscalls"),
                     is_dir: false,
@@ -199,30 +204,35 @@ impl Filesystem for ProcFilesystem {
         }
 
         if parts.len() == 2 && parts[1] == "fd" {
-            // /<pid>/fd - list stdin (0) and stdout (1)
+            // /<pid>/fd - list all open file descriptors
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             if !Self::process_exists(pid) {
                 return Err(FsError::NotFound);
             }
 
             let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
-            // Lock buffers to get sizes (thread-safe)
-            let stdin_len = proc.stdin.lock().len() as u64;
-            let stdout_len = proc.stdout.lock().len() as u64;
-            return Ok(alloc::vec![
-                DirEntry {
-                    name: String::from("0"),
+            let mut entries = alloc::vec![];
+            // Always include std fds (Stdin/Stdout/Stderr are not in the BTreeMap)
+            for fd_num in [0u32, 1, 2] {
+                entries.push(DirEntry {
+                    name: format!("{}", fd_num),
                     is_dir: false,
-                    is_symlink: false,
-                    size: stdin_len,
-                },
-                DirEntry {
-                    name: String::from("1"),
-                    is_dir: false,
-                    is_symlink: false,
-                    size: stdout_len,
-                },
-            ]);
+                    is_symlink: true,
+                    size: 0,
+                });
+            }
+            // Add all allocated fds from the table
+            for &fd_num in proc.fds.table.lock().keys() {
+                if fd_num > 2 {
+                    entries.push(DirEntry {
+                        name: format!("{}", fd_num),
+                        is_dir: false,
+                        is_symlink: true,
+                        size: 0,
+                    });
+                }
+            }
+            return Ok(entries);
         }
 
         Err(FsError::NotFound)

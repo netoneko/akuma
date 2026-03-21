@@ -1709,6 +1709,89 @@ fn test_rt_sigreturn_pending_redelivery() {
 ");
 }
 
+/// Verify that sys_epoll_pwait returns -EINTR immediately when the current
+/// thread's channel interrupt flag is set before the call.
+///
+/// This is essential for Go's goroutine preemption via SIGURG: when a signal
+/// arrives while a goroutine is blocked in epoll_pwait, the syscall must
+/// return -EINTR so Go's runtime can deliver the signal and reschedule.
+fn test_epoll_eintr_when_signal_pending() {
+    use alloc::sync::Arc;
+    use akuma_exec::threading::current_thread_id;
+    use akuma_exec::process::{
+        register_process, unregister_process,
+        register_thread_pid, unregister_thread_pid,
+        ProcessChannel, register_system_thread_channel, remove_channel,
+        interrupt_thread, FileDescriptor,
+    };
+    use crate::syscall::pipe::{pipe_create, pipe_close_write};
+
+    const NR_EPOLL_CREATE1: u64 = 20;
+    const NR_EPOLL_CTL: u64 = 21;
+    const NR_EPOLL_PWAIT: u64 = 22;
+    const EPOLL_CTL_ADD: u64 = 1;
+    const EPOLLIN: u32 = 0x001;
+    const EINTR: u64 = (-4i64) as u64;
+
+    let tid = current_thread_id();
+    let pid = 7010u32;
+
+    // Register test process so current_process() works inside epoll
+    let proc = crate::process_tests::make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    // Register a channel so is_current_interrupted() works for this thread
+    let ch = Arc::new(ProcessChannel::new());
+    register_system_thread_channel(tid, ch);
+
+    // Create a pipe and put the read end in the process fd table
+    let pipe_id = pipe_create();
+    let pipe_fd = akuma_exec::process::current_process()
+        .unwrap()
+        .alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    set_bypass(true);
+
+    // Create an epoll instance (fd allocated by the call)
+    let epoll_fd = crate::syscall::handle_syscall(NR_EPOLL_CREATE1, &[0u64, 0, 0, 0, 0, 0]) as u32;
+
+    // Register the pipe read fd with epoll for EPOLLIN
+    #[repr(C)]
+    struct EpollEvent { events: u32, _pad: u32, data: u64 }
+    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: 0 };
+    crate::syscall::handle_syscall(
+        NR_EPOLL_CTL,
+        &[epoll_fd as u64, EPOLL_CTL_ADD, pipe_fd as u64, &ev as *const EpollEvent as u64, 0, 0],
+    );
+
+    // Pre-set the interrupt flag so epoll_pwait returns EINTR on the first pass
+    interrupt_thread(tid);
+
+    // Call epoll_pwait with timeout=-1 (infinite); must return EINTR immediately
+    let mut events_buf = [0u8; 16]; // room for 1 epoll_event
+    let ret = crate::syscall::handle_syscall(
+        NR_EPOLL_PWAIT,
+        &[epoll_fd as u64, events_buf.as_mut_ptr() as u64, 1u64, (-1i64) as u64, 0, 0],
+    );
+
+    set_bypass(false);
+
+    // Clean up: close the write end (not in any fd table), then drop the
+    // process (its fd table calls close_all → pipe_close_read for pipe_fd).
+    pipe_close_write(pipe_id);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+    remove_channel(tid);
+
+    assert_eq!(
+        ret, EINTR,
+        "test_epoll_eintr: expected EINTR ({:#x}) got {:#x}",
+        EINTR, ret
+    );
+    console::print("  [PASS] test_epoll_eintr_when_signal_pending\n");
+}
+
 pub fn run_all_tests() {
     console::print("
 --- Futex Sync Tests ---
@@ -1739,6 +1822,8 @@ pub fn run_all_tests() {
     test_pipe_multi_process_lifecycle();
     test_pipe_large_transfer();
     test_rt_sigreturn_pending_redelivery();
+    // epoll EINTR test (Go SIGURG preemption regression)
+    test_epoll_eintr_when_signal_pending();
     // Signal-stack tests
     test_sigaltstack_syscall_roundtrip();
     test_rt_sigreturn_restores_registers();

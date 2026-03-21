@@ -52,6 +52,12 @@ pub fn run_all_tests() {
     test_vfork_waiters_clean_at_boot();
     test_vfork_complete_removes_entry();
 
+    // Test dup3 EINVAL/EBADF invariants (Go crash regression)
+    test_dup3_no_einval_for_valid_args();
+
+    // Test that pipe_close_write wakes an epoll poller and signals EOF
+    test_pipe_close_write_wakes_epoll_poller();
+
     // Test that user_va_limit allows Go's high-arena goroutine stacks (>4 GB, ~130 GB)
     test_user_va_limit_48bit();
 
@@ -104,7 +110,7 @@ pub fn run_all_tests() {
 }
 
 /// Helper to create a minimal Process for testing logic without loading a real ELF.
-fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Process> {
+pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Process> {
     use akuma_exec::process::{Process, ProcessMemory, SharedFdTable, SharedSignalTable, ProcessSyscallStats};
     use akuma_exec::mmu::UserAddressSpace;
     use spinning_top::Spinlock;
@@ -1905,4 +1911,117 @@ fn test_child_stdout_blocking_read() {
     }
 
     console::print("  [PASS] test_child_stdout_blocking_read\n");
+}
+
+/// Verify dup3 EINVAL/EBADF invariants.
+///
+/// The only valid EINVAL path in sys_dup3 is `oldfd == newfd`.
+/// All other valid combinations must not return EINVAL.
+fn test_dup3_no_einval_for_valid_args() {
+    use core::sync::atomic::Ordering;
+    use akuma_exec::process::{
+        register_process, unregister_process,
+        register_thread_pid, unregister_thread_pid,
+        FileDescriptor,
+    };
+    use crate::syscall::pipe::*;
+
+    const NR_DUP3: u64 = 24;
+    const O_CLOEXEC: u64 = 0x80000;
+    const EINVAL: u64 = (-22i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 7001u32;
+
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    // Allocate a PipeRead fd in the process (next_fd starts at 3)
+    let pipe_id = pipe_create();
+    let src_fd = akuma_exec::process::current_process()
+        .unwrap()
+        .alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    // dup3(src_fd, src_fd, O_CLOEXEC) → EINVAL (same fd is the only valid EINVAL)
+    let ret_einval = crate::syscall::handle_syscall(
+        NR_DUP3,
+        &[src_fd as u64, src_fd as u64, O_CLOEXEC, 0, 0, 0],
+    );
+
+    // dup3(src_fd, src_fd+1, O_CLOEXEC) → src_fd+1 (success)
+    let ret_ok = crate::syscall::handle_syscall(
+        NR_DUP3,
+        &[src_fd as u64, (src_fd + 1) as u64, O_CLOEXEC, 0, 0, 0],
+    );
+
+    // dup3(999, 1000, 0) → EBADF (invalid oldfd)
+    let ret_ebadf = crate::syscall::handle_syscall(NR_DUP3, &[999u64, 1000u64, 0, 0, 0, 0]);
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // Clean up: write end was never in any fd table, close it manually.
+    // The process drop via unregister_process calls close_all → pipe_close_read for
+    // both src_fd and src_fd+1 (the dup3 clone bumped read_count to 2).
+    pipe_close_write(pipe_id);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    assert_eq!(
+        ret_einval, EINVAL,
+        "test_dup3: oldfd==newfd must return EINVAL, got {:#x}",
+        ret_einval
+    );
+    assert_eq!(
+        ret_ok,
+        (src_fd + 1) as u64,
+        "test_dup3: valid dup3 must return newfd, got {:#x}",
+        ret_ok
+    );
+    assert_eq!(
+        ret_ebadf, EBADF,
+        "test_dup3: invalid oldfd must return EBADF, got {:#x}",
+        ret_ebadf
+    );
+
+    console::print("  [PASS] test_dup3_no_einval_for_valid_args\n");
+}
+
+/// Verify that pipe_close_write both signals EOF (pipe_can_read returns true)
+/// and drains any registered epoll pollers.
+///
+/// This is the core of the Go parent-waits-for-compile-stdout workflow: Go
+/// registers the pipe read-end with epoll, then the Go compiler child closes
+/// its write end on exit — the parent must be woken with an EOF event.
+fn test_pipe_close_write_wakes_epoll_poller() {
+    use crate::syscall::pipe::*;
+
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+
+    // Register as poller (simulating epoll_pwait blocking on this pipe)
+    pipe_add_poller(id, tid);
+    assert_eq!(pipe_pollers_count(id), 1, "poller not registered before close_write");
+
+    // Close write end → write_count=0, EOF event, pollers drained
+    pipe_close_write(id);
+
+    // EOF: pipe_can_read must now return true (write_count == 0)
+    assert!(
+        pipe_can_read(id),
+        "EOF not signalled after write end closed (pipe_can_read returned false)"
+    );
+
+    // Pollers must be drained (woken by the close)
+    assert_eq!(
+        pipe_pollers_count(id),
+        0,
+        "poller not drained after pipe_close_write"
+    );
+
+    pipe_close_read(id);
+    console::print("  [PASS] test_pipe_close_write_wakes_epoll_poller\n");
 }

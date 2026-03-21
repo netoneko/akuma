@@ -196,7 +196,7 @@ pub(crate) fn pipe_pollers_count(id: u32) -> usize {
     })
 }
 
-pub(super) fn pipe_can_read(id: u32) -> bool {
+pub(crate) fn pipe_can_read(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(false, |p| !p.buffer.is_empty() || p.write_count == 0)
     })
