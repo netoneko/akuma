@@ -107,8 +107,8 @@ pub struct Process {
     pub process_info_phys: usize,
     pub args: Vec<String>,
     pub cwd: String,
-    pub stdin: Spinlock<StdioBuffer>,
-    pub stdout: Spinlock<StdioBuffer>,
+    pub stdin: Arc<Spinlock<StdioBuffer>>,
+    pub stdout: Arc<Spinlock<StdioBuffer>>,
     pub exited: bool,
     pub exit_code: i32,
     pub dynamic_page_tables: Vec<PhysFrame>,
@@ -214,8 +214,8 @@ impl Process {
             process_info_phys: process_info_frame.addr,
             args: Vec::new(),
             cwd: String::from("/"),
-            stdin: Spinlock::new(StdioBuffer::new()),
-            stdout: Spinlock::new(StdioBuffer::new()),
+            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
             exited: false,
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
@@ -312,8 +312,8 @@ impl Process {
             process_info_phys: process_info_frame.addr,
             args: Vec::new(),
             cwd: String::from("/"),
-            stdin: Spinlock::new(StdioBuffer::new()),
-            stdout: Spinlock::new(StdioBuffer::new()),
+            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
             exited: false,
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
@@ -953,8 +953,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         process_info_phys: process_info_frame.addr,
         args: parent.args.clone(),
         cwd: parent.cwd.clone(),
-        stdin: Spinlock::new(StdioBuffer::new()),
-        stdout: Spinlock::new(StdioBuffer::new()),
+        stdin: parent.stdin.clone(), // Share!
+        stdout: parent.stdout.clone(), // Share!
         exited: false,
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
@@ -1161,6 +1161,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     )?;
     
     new_proc.thread_id = Some(tid);
+    
+    // Copy sigaltstack from parent thread to child thread
+    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
+    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+
     crate::threading::update_thread_context(tid, &child_ctx);
 
     // 8. Create a ProcessChannel for exit notification only.
@@ -1210,8 +1215,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         process_info_phys: parent.process_info_phys,
         args: parent.args.clone(),
         cwd: parent.cwd.clone(),
-        stdin: Spinlock::new(StdioBuffer::new()),
-        stdout: Spinlock::new(StdioBuffer::new()),
+        stdin: parent.stdin.clone(), // Share!
+        stdout: parent.stdout.clone(), // Share!
         exited: false,
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
@@ -1257,6 +1262,11 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     )?;
 
     new_proc.thread_id = Some(tid);
+    
+    // Copy sigaltstack from parent thread to child thread
+    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
+    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+
     crate::threading::update_thread_context(tid, &child_ctx);
 
     let exit_channel = Arc::new(ProcessChannel::new());

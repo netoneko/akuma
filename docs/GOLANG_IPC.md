@@ -99,40 +99,22 @@ goroutine scheduling deadlock.
 
 ---
 
-## Root Cause: FUTEX_PRIVATE_FLAG Stripping — Cross-Process Wake Theft
+## Root Cause: Demand-Paging Race Condition (v2026-03-21)
 
-The Go M:N scheduler parks idle M-threads (OS threads) via:
-```
-futex(m.waitsema, FUTEX_WAIT_PRIVATE, 0, timeout)   // op=128
-```
-When a goroutine becomes runnable, the scheduler wakes an M with:
-```
-futex(m.waitsema, FUTEX_WAKE_PRIVATE, 1)             // op=129
-```
+The Go `compile` processes are crashing with SIGSEGV (Instruction Abort) at kernel identity-mapped memory addresses and reporting "not the start of an archive file" during package imports. 
 
-**The bug:** Akuma's futex implementation stripped `FUTEX_PRIVATE_FLAG` (bit 7)
-from the op and used a **global** `BTreeMap<usize, Vec<usize>>` keyed by
-virtual address. `FUTEX_PRIVATE` should scope the futex to the current
-process (per-address-space), but stripping the flag made all processes share
-one global table.
+**Hypothesis: Concurrent Faulting on Shared Address Space**
+The kernel's `is_translation_fault` handler is not atomic regarding the `UserAddressSpace` page table updates. In Go's `compile` (which uses `CLONE_VM` worker threads), multiple threads can fault on the same virtual page simultaneously (e.g., during the initial `mmap` of a large data segment). 
 
-**Without ASLR**, `go build` and `compile` load the Go runtime at the **same
-base address**. Their M-thread park addresses (`m.waitsema` in the M struct)
-are **identical VAs** pointing to **different physical pages**. With the old
-global VA key, compile's `futex_wake_private(VA=X, 1)` dequeued a `go build`
-M-thread (which also happened to wait at VA=X) instead of compile's own
-parked M — compile's threads stayed in `futex_wait` forever, and the main
-goroutine never ran.
+1. **Race Window**: Two threads fault on the same VA.
+2. **Concurrent I/O**: Both threads trigger `crate::vfs::read_at` into the same physical frame (if race condition is severe) or trigger redundant mapping attempts.
+3. **Inconsistent State**: The CPU fetches an instruction from a page while the PTE entry is being updated or before the I/O completion, reading garbage data or triggering an Instruction Abort because the page is still partially mapped or not yet fully flushed to I-cache.
+4. **Go Compiler Corruption**: The "not the start of an archive file" error confirms that the compiler thread read an incomplete or corrupted file-backed page during this race.
 
-This also explains why `go version` fails while `go build` is running — the
-two processes steal each other's wakes through the shared futex table.
-
-**Fix applied (2026-03-21, `src/syscall/sync.rs`):**
-- `FUTEX_WAITERS` key changed from `usize` to `(u32, usize)` — `(tgid, uaddr)`
-- Private ops: `tgid = read_current_pid()` (shared across CLONE_VM threads
-  via `PROCESS_INFO_ADDR` — all threads in one thread group read the same PID)
-- Non-private / kernel-internal: `tgid = 0`
-- All ops updated: WAIT, WAIT_BITSET, WAKE, WAKE_BITSET, REQUEUE, CMP_REQUEUE, WAKE_OP
+### Proposed Fix: Demand-Paging Lock
+- **Introduce a Per-Process Fault Lock**: Add a `Spinlock<BTreeSet<usize>>` to the `Process` struct to track `VAs` currently being serviced by the demand-paging handler.
+- **Serialization**: Ensure that if a thread faults on a VA that is already being handled by another thread, the second thread waits or spins until the page is successfully mapped.
+- **Cache Coherency**: Ensure `dsb ish` and `isb` are executed immediately after mapping the page in the `UserAddressSpace`, before returning execution to the user thread.
 
 ### Eliminated hypotheses (for the record)
 

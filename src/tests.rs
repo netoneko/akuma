@@ -11,6 +11,7 @@ use akuma_exec::threading;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
+use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -3573,8 +3574,8 @@ fn make_test_process(
         parent_pid: ppid, brk: 0x1000_0000, initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: info_phys,
         args: Vec::new(), cwd: String::from("/"),
-        stdin: Spinlock::new(akuma_exec::process::StdioBuffer::new()),
-        stdout: Spinlock::new(akuma_exec::process::StdioBuffer::new()),
+        stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
+        stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: false, exit_code: 0,
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
