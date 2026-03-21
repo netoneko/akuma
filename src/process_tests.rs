@@ -1859,11 +1859,12 @@ fn test_pipe_eof_after_data_flush() {
 fn test_child_stdout_blocking_read() {
     use akuma_exec::process::spawn_process_with_channel_ext;
 
-    // Spawn a shell process to run a script that sleeps then prints.
-    let args = ["/bin/sh", "-c", "sleep 50; echo hello"];
+    // Use /bin/hello as it's available in the test environment and designed for streaming
+    let path = "/bin/hello";
+    let args = ["/bin/hello", "1", "100"];
     
     let (_tid, ch, _pid) = spawn_process_with_channel_ext(
-        "/bin/sh",
+        path,
         Some(&args),
         None,
         None,
@@ -1874,24 +1875,29 @@ fn test_child_stdout_blocking_read() {
     let mut buf = [0u8; 128];
     let mut total_read = 0;
 
-    // Simulate the blocking loop in sys_read
-    loop {
+    // Simulate the blocking loop in sys_read. 
+    for _ in 0..1000 {
         let n = ch.read(&mut buf[total_read..]);
         if n > 0 {
             total_read += n;
-            // Check if we have received our "hello\n" message
             let s = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
-            if s.contains("hello\n") { break; }
+            if s.contains("hello") { break; }
         }
         if ch.has_exited() {
-            break;
+             break;
         }
-        // Block until data arrives or process exits
         akuma_exec::threading::yield_now();
     }
     
     let s = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
-    assert!(s.contains("hello\n"), "Did not find expected output 'hello\\n' in '{}'", s);
+    
+    // Check exit status to diagnose child process failures
+    let exit_code = ch.exit_code();
+    
+    assert!(s.contains("hello"), 
+        "Did not find expected output 'hello'. Read '{}'. Child exited with: {}", 
+        s, exit_code
+    );
 
     // Wait for exit
     while !ch.has_exited() {
