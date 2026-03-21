@@ -3,15 +3,24 @@
 //! Manages user processes including creation, execution, and termination.
 
 pub mod types;
+pub mod table;
+pub mod channel;
+pub mod children;
+pub mod signal;
 
 pub use types::*;
+pub use table::*;
+pub use channel::*;
+pub use children::*;
+pub use signal::*;
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
@@ -19,7 +28,6 @@ use crate::elf_loader::{self, ElfError};
 use crate::mmu::{self, UserAddressSpace};
 use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled};
 use akuma_terminal as terminal;
-
 
 static PROCESS_SYSCALL_STATS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -39,1142 +47,98 @@ pub fn init() {
 }
 
 /// Callback invoked by the threading subsystem when a thread slot is recycled.
-/// Used to clean up stale THREAD_PID_MAP entries and zombie processes.
 fn on_thread_cleanup(tid: usize) {
-    // 1. Remove this thread from the PID map
     let pid_opt = with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().remove(&tid)
+        table::THREAD_PID_MAP.lock().remove(&tid)
     });
 
     if let Some(pid) = pid_opt {
-        // 2. Check if this was the last thread for the process
         let remaining_threads = with_irqs_disabled(|| {
-            let map = THREAD_PID_MAP.lock();
-            // Count threads belonging to this PID. Note: this linear scan is
-            // acceptable because thread count is bounded (MAX_THREADS=256 or similar).
+            let map = table::THREAD_PID_MAP.lock();
             map.values().filter(|&&p| p == pid).count()
         });
 
         if remaining_threads == 0 {
-            // 3. Unregister the process (this drops the Box and frees memory)
-            // The process is now truly gone from the system.
-            if let Some(_proc) = unregister_process(pid) {
-                if config().syscall_debug_info_enabled {
-                    // Use print directly to avoid allocation in callback context
-                    // (though cleanup callback runs in a safe context)
-                    // log::debug!("[Process] PID {} fully unregistered", pid);
-                }
+            if let Some(_proc) = table::unregister_process(pid) {
             }
         }
     }
 }
 
-// Box registry re-exports (implementation in box_registry.rs)
+// Box registry re-exports
 pub use crate::box_registry::{
     BoxInfo, register_box, unregister_box, list_boxes,
     find_box_by_name, get_box_name, get_box_info, find_primary_box,
     init_box_registry,
 };
 
-/// Write data to a process's stdin (handling both legacy buffer and ProcessChannel)
+/// Write data to a process's stdin
 pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
-    let proc = lookup_process(pid).ok_or("Process not found")?;
+    let proc = children::lookup_process(pid).ok_or("Process not found")?;
     
-    // If this process has delegated its I/O to another PID (reattach), forward it
     if let Some(target_pid) = proc.delegate_pid {
-        // Use with_irqs_disabled or release lock before recursing if needed, 
-        // but lookup_process handles its own locking.
         return write_to_process_stdin(target_pid, data);
     }
 
-    // 1. Write to the legacy StdioBuffer (for procfs visibility)
     proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
     
-    // 2. If the process has a ProcessChannel, write to it so the process actually 
-    // receives the input in sys_read/sys_poll_input_event.
     if let Some(ref channel) = proc.channel {
         channel.write_stdin(data);
         
-        // 3. Wake up the process if it's waiting for input in sys_poll_input_event
         crate::threading::disable_preemption();
         if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
-            if config().syscall_debug_info_enabled {
-                log::debug!("[Process] Waking PID {}", pid);
-            }
             waker.wake();
-            // Ensure scheduler runs to pick up the newly ready process
-            (runtime().trigger_sgi)(0);
-        } else {
-            // Even if no waker is registered, we should still trigger SGI
-            // to ensure the process gets a chance to poll soon.
-            (runtime().trigger_sgi)(0);
         }
         crate::threading::enable_preemption();
     }
-    
     Ok(())
 }
 
-/// Reattach I/O from a caller process (or kernel) to a target PID
-pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
-    // 1. Validate hierarchy permissions
-    let (caller_box_id, channel) = if let Some(pid) = caller_pid {
-        let caller = lookup_process(pid).ok_or("Caller not found")?;
-        (caller.box_id, caller.channel.clone())
-    } else {
-        // Kernel caller (e.g. built-in SSH shell)
-        // System threads use thread-ID based channel lookup
-        let tid = crate::threading::current_thread_id();
-        let ch = get_channel(tid).ok_or("Kernel thread has no channel")?;
-        (0, Some(ch)) // Kernel is Box 0
-    };
-
-    let target_box_id = {
-        let target = lookup_process(target_pid).ok_or("Target not found")?;
-        target.box_id
-    };
-
-    let mut allowed = false;
-    if caller_box_id == 0 {
-        allowed = true; // Host/Kernel can reattach anything
-    } else if target_box_id == caller_box_id {
-        allowed = true; // Same box
-    } else if let Some(pid) = caller_pid {
-        // Check if caller created the target's box (child box)
-        if let Some(info) = get_box_info(target_box_id) {
-            if info.creator_pid == pid {
-                allowed = true;
-            }
-        }
-    }
-
-    if !allowed {
-        return Err("Permission denied: cannot reattach process outside hierarchy");
-    }
-
-    // 2. Perform the delegation
-    if let Some(pid) = caller_pid {
-        let caller = lookup_process(pid).ok_or("Caller not found")?;
-        caller.delegate_pid = Some(target_pid);
-    } else {
-        // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
-        // but we still want to link the channel to the target.
-    }
-
-    // Target process now uses caller's output channel
-    {
-        let target = lookup_process(target_pid).ok_or("Target not found")?;
-        target.channel = channel;
-    }
-
-    if config().syscall_debug_info_enabled {
-        log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);
-    }
-
-    Ok(())
+/// A user process
+pub struct Process {
+    pub pid: Pid,
+    pub pgid: Pid,
+    pub name: String,
+    pub state: ProcessState,
+    pub address_space: UserAddressSpace,
+    pub context: UserContext,
+    pub parent_pid: Pid,
+    pub brk: usize,
+    pub initial_brk: usize,
+    pub entry_point: usize,
+    pub memory: ProcessMemory,
+    pub process_info_phys: usize,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub stdin: Spinlock<StdioBuffer>,
+    pub stdout: Spinlock<StdioBuffer>,
+    pub exited: bool,
+    pub exit_code: i32,
+    pub dynamic_page_tables: Vec<PhysFrame>,
+    pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
+    pub lazy_regions: Vec<LazyRegion>,
+    pub fds: Arc<SharedFdTable>,
+    pub thread_id: Option<usize>,
+    pub spawner_pid: Option<Pid>,
+    pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
+    pub box_id: u64,
+    pub namespace: Arc<akuma_isolation::Namespace>,
+    pub channel: Option<Arc<ProcessChannel>>,
+    pub delegate_pid: Option<Pid>,
+    pub clear_child_tid: u64,
+    pub robust_list_head: u64,
+    pub robust_list_len: usize,
+    pub signal_actions: Arc<SharedSignalTable>,
+    pub signal_mask: u64,
+    pub sigaltstack_sp: u64,
+    pub sigaltstack_flags: i32,
+    pub sigaltstack_size: u64,
+    pub start_time_us: u64,
+    pub current_syscall: AtomicU64,
+    pub last_syscall: AtomicU64,
+    pub syscall_stats: ProcessSyscallStats,
 }
 
-/// Reattach I/O from the current process to a target PID
-pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
-    let caller_pid = read_current_pid(); // Can be None for kernel threads
-    reattach_process_ext(caller_pid, target_pid)
-}
-
-/// Kill all processes in a box and unregister it
-pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
-    if box_id == 0 {
-        return Err("Cannot kill Box 0 (Host)");
-    }
-
-    // 1. Get list of PIDs in this box
-    let pids: Vec<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        table.iter()
-            .filter(|(_, proc)| proc.box_id == box_id)
-            .map(|(&pid, _)| pid)
-            .collect()
-    });
-
-    // 2. Kill each process
-    for pid in pids {
-        // kill_process handles unregistering and thread termination
-        let _ = kill_process(pid);
-    }
-
-    // 3. Unregister the box from the global registry
-    unregister_box(box_id);
-
-    Ok(())
-}
-
-// ============================================================================
-// Stdio Buffer (thread-safe stdin/stdout with size limits)
-// ============================================================================
-
-/// Next available PID
-static NEXT_PID: AtomicU32 = AtomicU32::new(1);
-
-/// Process table: maps PID to owned Process
-///
-/// Processes are stored here when created and removed when they exit.
-/// Syscall handlers use read_current_pid() + lookup_process() to find
-/// the calling process.
-///
-/// IMPORTANT: The table owns the Process via Box. When unregister_process
-/// is called, the Box<Process> is returned and dropped, which triggers
-/// UserAddressSpace::drop() to free all physical pages. This prevents
-/// memory leaks when processes exit.
-static PROCESS_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Box<Process>>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Maps kernel thread IDs to PIDs for CLONE_THREAD children.
-/// Needed because thread clones share the parent's ProcessInfo page, so
-/// read_current_pid() would return the parent's PID.
-static THREAD_PID_MAP: Spinlock<alloc::collections::BTreeMap<usize, Pid>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-
-/// Global lazy region table, keyed by PID.
-/// Stored separately from Process to avoid aliasing/corruption issues
-/// with &mut Process references from current_process().
-pub static LAZY_REGION_TABLE: Spinlock<alloc::collections::BTreeMap<Pid, Vec<LazyRegion>>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Register a process in the table (takes ownership)
-pub fn register_process(pid: Pid, proc: Box<Process>) {
-    with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().insert(pid, proc);
-    })
-}
-
-/// Unregister a process from the table
-///
-/// Returns the owned Process so it can be dropped, freeing all memory
-/// including the UserAddressSpace and all its physical pages.
-pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
-    with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().remove(&pid)
-    })
-}
-
-pub fn register_thread_pid(tid: usize, pid: Pid) {
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().insert(tid, pid);
-    });
-}
-
-pub fn unregister_thread_pid(tid: usize) {
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().remove(&tid);
-    });
-}
-
-// ============================================================================
-// Process Channel - Inter-thread communication for process I/O
-// ============================================================================
-
-use alloc::collections::VecDeque;
-use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicI32};
-
-/// Channel for streaming process output between threads
-///
-/// Used to pass output from a process running on a user thread
-/// to the async shell that spawned it.
-pub struct ProcessChannel {
-    /// Output buffer (spinlock-protected for thread safety)
-    buffer: Spinlock<VecDeque<u8>>,
-    /// Stdin buffer for interactive input (SSH -> process)
-    stdin_buffer: Spinlock<VecDeque<u8>>,
-    /// Exit code (set when process exits)
-    exit_code: AtomicI32,
-    /// Whether the process has exited
-    exited: AtomicBool,
-    /// Interrupt signal (set by Ctrl+C, checked by process)
-    interrupted: AtomicBool,
-    /// Raw mode flag (true if terminal is in raw mode, false for cooked)
-    raw_mode: AtomicBool,
-    /// Stdin closed flag (true if no more data will be written to stdin)
-    stdin_closed: AtomicBool,
-    /// Thread ID of a blocking reader waiting for output
-    reader_thread: Spinlock<Option<usize>>,
-}
-
-/// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
-const MAX_BUFFER_SIZE: usize = 1024 * 1024;
-
-impl ProcessChannel {
-    /// Create a new empty process channel
-    pub fn new() -> Self {
-        Self {
-            buffer: Spinlock::new(VecDeque::new()),
-            stdin_buffer: Spinlock::new(VecDeque::new()),
-            exit_code: AtomicI32::new(0),
-            exited: AtomicBool::new(false),
-            interrupted: AtomicBool::new(false),
-            raw_mode: AtomicBool::new(false),
-            stdin_closed: AtomicBool::new(false),
-            reader_thread: Spinlock::new(None),
-        }
-    }
-
-    /// Mark stdin as closed (no more data will be arriving)
-    pub fn close_stdin(&self) {
-        self.stdin_closed.store(true, Ordering::Release);
-    }
-
-    /// Check if stdin is closed
-    pub fn is_stdin_closed(&self) -> bool {
-        self.stdin_closed.load(Ordering::Acquire)
-    }
-
-    /// Write data to the channel buffer (stdout from process)
-    pub fn write(&self, data: &[u8]) {
-        if data.is_empty() { return; }
-
-        // Copy data from userspace BEFORE the critical section
-        // to prevent page faults while holding a spinlock.
-        let mut kernel_copy = Vec::with_capacity(data.len());
-        kernel_copy.extend_from_slice(data);
-
-        if config().syscall_debug_info_enabled {
-            let sn_len = kernel_copy.len().min(32);
-            let mut snippet = [0u8; 32];
-            let n = sn_len.min(snippet.len());
-            snippet[..n].copy_from_slice(&kernel_copy[..n]);
-            for byte in &mut snippet[..n] {
-                if *byte < 32 || *byte > 126 { *byte = b'.'; }
-            }
-            let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-            log::debug!("[ProcessChannel] Write {} bytes to stdout \"{}\"", kernel_copy.len(), snippet_str);
-        }
-
-        // CRITICAL: Disable IRQs while holding the lock!
-        with_irqs_disabled(|| {
-            let mut buf = self.buffer.lock();
-            
-            // Check for buffer overflow
-            if buf.len() + kernel_copy.len() > MAX_BUFFER_SIZE {
-                // If the write itself is larger than the buffer, truncate it
-                let data_to_write = if kernel_copy.len() > MAX_BUFFER_SIZE {
-                    &kernel_copy[kernel_copy.len() - MAX_BUFFER_SIZE..]
-                } else {
-                    &kernel_copy
-                };
-                
-                // Remove old data to make room
-                let current_len = buf.len();
-                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
-                if overflow > 0 {
-                    buf.drain(..overflow.min(current_len));
-                }
-                buf.extend(data_to_write);
-            } else {
-                buf.extend(&kernel_copy);
-            }
-        });
-
-        // Wake any blocking reader waiting for this data
-        if let Some(tid) = self.reader_thread.lock().take() {
-            crate::threading::get_waker_for_thread(tid).wake();
-        }
-    }
-
-    /// Read available data from the channel (non-blocking)
-    /// Returns None if no data is available
-    pub fn try_read(&self) -> Option<Vec<u8>> {
-        with_irqs_disabled(|| {
-            let mut buf = self.buffer.lock();
-            if buf.is_empty() {
-                None
-            } else {
-                Some(buf.drain(..).collect())
-            }
-        })
-    }
-
-    /// Read available data from the channel into a buffer
-    /// Returns number of bytes read
-    pub fn read(&self, buf: &mut [u8]) -> usize {
-        let n = with_irqs_disabled(|| {
-            let mut buffer = self.buffer.lock();
-            let to_read = buf.len().min(buffer.len());
-            for (i, byte) in buffer.drain(..to_read).enumerate() {
-                buf[i] = byte;
-            }
-            if to_read > 0 && config().syscall_debug_info_enabled {
-                log::debug!("[ProcessChannel] Read {} bytes from stdout", to_read);
-            }
-            to_read
-        });
-
-        if n == 0 {
-            // Register current thread as reader so it can be woken by next write
-            *self.reader_thread.lock() = Some(crate::threading::current_thread_id());
-        }
-        n
-    }
-
-    pub fn has_stdout_data(&self) -> bool {
-        !self.buffer.lock().is_empty()
-    }
-
-    /// Read all remaining data from the channel
-    pub fn read_all(&self) -> Vec<u8> {
-        with_irqs_disabled(|| {
-            let mut buf = self.buffer.lock();
-            buf.drain(..).collect()
-        })
-    }
-
-    /// Write data to stdin buffer (SSH -> process)
-    pub fn write_stdin(&self, data: &[u8]) {
-        with_irqs_disabled(|| {
-            let mut buf = self.stdin_buffer.lock();
-            
-            // Check for buffer overflow
-            if buf.len() + data.len() > MAX_BUFFER_SIZE {
-                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
-                    &data[data.len() - MAX_BUFFER_SIZE..]
-                } else {
-                    data
-                };
-                
-                let current_len = buf.len();
-                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
-                if overflow > 0 {
-                    buf.drain(..overflow.min(current_len));
-                }
-                buf.extend(data_to_write);
-            } else {
-                buf.extend(data);
-            }
-        })
-    }
-
-    /// Read from stdin buffer (process reads from SSH input)
-    /// Returns number of bytes read into buf
-    pub fn read_stdin(&self, buf: &mut [u8]) -> usize {
-        with_irqs_disabled(|| {
-            let mut stdin = self.stdin_buffer.lock();
-            let to_read = buf.len().min(stdin.len());
-            for (i, byte) in stdin.drain(..to_read).enumerate() {
-                buf[i] = byte;
-            }
-            to_read
-        })
-    }
-
-    /// Check if stdin has data available
-    pub fn has_stdin_data(&self) -> bool {
-        with_irqs_disabled(|| {
-            !self.stdin_buffer.lock().is_empty()
-        })
-    }
-
-    /// Return the number of bytes available in the stdin buffer
-    pub fn stdin_bytes_available(&self) -> usize {
-        with_irqs_disabled(|| {
-            self.stdin_buffer.lock().len()
-        })
-    }
-
-    /// Clear all pending data from the stdin buffer
-    pub fn flush_stdin(&self) {
-        with_irqs_disabled(|| {
-            self.stdin_buffer.lock().clear();
-        })
-    }
-
-    /// Mark the process as exited with the given exit code
-    pub fn set_exited(&self, code: i32) {
-        self.exit_code.store(code, Ordering::Release);
-        self.exited.store(true, Ordering::Release);
-    }
-
-    /// Check if the process has exited
-    pub fn has_exited(&self) -> bool {
-        self.exited.load(Ordering::Acquire)
-    }
-
-    /// Get the exit code (only valid after has_exited() returns true)
-    pub fn exit_code(&self) -> i32 {
-        self.exit_code.load(Ordering::Acquire)
-    }
-
-    /// Set the interrupt flag (called when Ctrl+C is pressed)
-    pub fn set_interrupted(&self) {
-        self.interrupted.store(true, Ordering::Release);
-    }
-
-    /// Check if the process has been interrupted
-    pub fn is_interrupted(&self) -> bool {
-        self.interrupted.load(Ordering::Acquire)
-    }
-
-    /// Clear the interrupt flag
-    pub fn clear_interrupted(&self) {
-        self.interrupted.store(false, Ordering::Release);
-    }
-
-    /// Set the raw mode flag
-    pub fn set_raw_mode(&self, enabled: bool) {
-        self.raw_mode.store(enabled, Ordering::Release);
-    }
-
-    /// Check if raw mode is enabled
-    pub fn is_raw_mode(&self) -> bool {
-        self.raw_mode.load(Ordering::Acquire)
-    }
-}
-
-impl Default for ProcessChannel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Global registry mapping thread IDs to their process channels
-static PROCESS_CHANNELS: Spinlock<alloc::collections::BTreeMap<usize, Arc<ProcessChannel>>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Global registry mapping thread IDs to their shared terminal states
-static TERMINAL_STATES: Spinlock<alloc::collections::BTreeMap<usize, Arc<Spinlock<terminal::TerminalState>>>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Register a process channel for a thread
-pub fn register_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
-    with_irqs_disabled(|| {
-        PROCESS_CHANNELS.lock().insert(thread_id, channel);
-    })
-}
-
-/// Register a terminal state for a thread
-pub fn register_terminal_state(thread_id: usize, state: Arc<Spinlock<terminal::TerminalState>>) {
-    with_irqs_disabled(|| {
-        TERMINAL_STATES.lock().insert(thread_id, state);
-    })
-}
-
-/// Register a process channel for a system thread (one that doesn't have a Process struct)
-pub fn register_system_thread_channel(thread_id: usize, channel: Arc<ProcessChannel>) {
-    with_irqs_disabled(|| {
-        PROCESS_CHANNELS.lock().insert(thread_id, channel);
-    });
-}
-
-/// Get the process channel for a thread (if any)
-pub fn get_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
-        PROCESS_CHANNELS.lock().get(&thread_id).cloned()
-    })
-}
-
-/// Get the terminal state for a thread (if any)
-pub fn get_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-    with_irqs_disabled(|| {
-        TERMINAL_STATES.lock().get(&thread_id).cloned()
-    })
-}
-
-/// Remove and return the process channel for a thread
-pub fn remove_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
-        PROCESS_CHANNELS.lock().remove(&thread_id)
-    })
-}
-
-/// Remove and return the terminal state for a thread
-pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-    with_irqs_disabled(|| {
-        TERMINAL_STATES.lock().remove(&thread_id)
-    })
-}
-
-// ============================================================================
-// Child Process Registry (for userspace process management)
-// ============================================================================
-
-/// Registry mapping child PIDs to (ProcessChannel, parent_pid)
-/// Used by parent processes to read child stdout via ChildStdout FD
-/// and by wait4(-1) to find children of a specific parent.
-static CHILD_CHANNELS: Spinlock<alloc::collections::BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Register a child process channel (called when spawning via syscall)
-pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
-    with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().insert(child_pid, (channel, parent_pid));
-    })
-}
-
-/// Get a child process channel by PID
-pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().get(&child_pid).map(|(ch, _)| ch.clone())
-    })
-}
-
-/// Remove a child process channel (called when child exits or parent closes FD)
-pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
-    })
-}
-
-/// Find any exited child of the given parent. Returns (child_pid, channel).
-pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
-    with_irqs_disabled(|| {
-        let channels = CHILD_CHANNELS.lock();
-        for (&child_pid, (ch, ppid)) in channels.iter() {
-            if *ppid == parent_pid && ch.has_exited() {
-                return Some((child_pid, ch.clone()));
-            }
-        }
-        None
-    })
-}
-
-/// Check if the given parent has any children registered.
-pub fn has_children(parent_pid: Pid) -> bool {
-    with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().values().any(|(_, ppid)| *ppid == parent_pid)
-    })
-}
-
-/// Get channel for the current thread (used by syscall handlers)
-pub fn current_channel() -> Option<Arc<ProcessChannel>> {
-    if let Some(proc) = current_process() {
-        if let Some(ref ch) = proc.channel {
-            return Some(ch.clone());
-        }
-    }
-    
-    // Fallback to thread-ID based lookup for legacy system threads
-    let thread_id = crate::threading::current_thread_id();
-    get_channel(thread_id)
-}
-
-/// Check if the current process has been interrupted (Ctrl+C)
-///
-/// Called by syscall handlers to detect interrupt signal.
-/// Returns true if the process should terminate.
-pub fn is_current_interrupted() -> bool {
-    current_channel()
-        .map(|ch| ch.is_interrupted())
-        .unwrap_or(false)
-}
-
-/// Interrupt a process by thread ID
-///
-/// Used by the SSH shell to send Ctrl+C signal to a running process.
-pub fn interrupt_thread(thread_id: usize) {
-    if let Some(channel) = get_channel(thread_id) {
-        channel.set_interrupted();
-    }
-}
-
-/// Read the current process PID from the process info page
-///
-/// During a syscall, TTBR0 is still set to the user's page tables,
-/// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
-/// This prevents PID spoofing since the page is read-only for userspace.
-///
-/// Returns None if TTBR0 points to boot page tables (no user process context).
-pub fn read_current_pid() -> Option<Pid> {
-    // CRITICAL: Check TTBR0 before reading from user address space!
-    //
-    // PROCESS_INFO_ADDR (0x1000) is only mapped in USER page tables.
-    // With boot TTBR0, address 0x1000 is in the device memory region (0x0-0x40000000)
-    // and reading from it returns garbage, causing FAR=0x5 crashes.
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-    }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
-    
-    // Compare against actual boot TTBR0, not a range check.
-    // User page tables are allocated from the same physical memory pool,
-    // so they can have addresses in the same range as boot tables.
-    let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
-    let ttbr0_addr = ttbr0 & 0x0000_FFFF_FFFF_FFFF; // Mask off ASID bits
-    if ttbr0_addr == boot_ttbr0 {
-        return None; // Boot TTBR0 - no user process context
-    }
-    
-    // Read from the fixed address in the current address space
-    // SAFETY: TTBR0 is user page tables, so PROCESS_INFO_ADDR is mapped
-    let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
-    if pid == 0 { None } else { Some(pid) }
-}
-
-/// Look up a process by PID
-///
-/// Returns a mutable reference to the process if found.
-/// SAFETY: The caller must ensure no other code is mutating the process.
-pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
-    with_irqs_disabled(|| {
-        let mut table = PROCESS_TABLE.lock();
-        table.get_mut(&pid).map(|boxed| {
-            // SAFETY: We return a 'static reference because:
-            // 1. The Process is heap-allocated via Box and won't move
-            // 2. The process remains in the table until unregister_process
-            // 3. Callers must not hold reference across unregister_process
-            unsafe { &mut *(&mut **boxed as *mut Process) }
-        })
-    })
-}
-
-/// Get the current process (for syscall handlers)
-///
-/// For CLONE_THREAD children, uses the thread-to-PID map since they share
-/// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
-pub fn current_process() -> Option<&'static mut Process> {
-    let tid = crate::threading::current_thread_id();
-    let thread_pid = with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().get(&tid).copied()
-    });
-    if let Some(pid) = thread_pid {
-        return lookup_process(pid);
-    }
-    let pid = read_current_pid()?;
-    lookup_process(pid)
-}
-
-/// Get the current process's TerminalState (for syscall handlers)
-///
-/// Returns a mutable reference to the TerminalState if found.
-pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>> {
-    // 1. Try thread-ID based lookup (for system threads or overridden processes)
-    let tid = crate::threading::current_thread_id();
-    if let Some(state) = get_terminal_state(tid) {
-        return Some(state);
-    }
-
-    // 2. Fallback to process table
-    current_process().map(|p| p.terminal_state.clone())
-}
-
-/// Allocate mmap region for current process
-/// Returns the address or 0 on failure
-pub fn alloc_mmap(size: usize) -> usize {
-    // Use address-space owner so CLONE_VM threads share allocation state.
-    let pid = read_current_pid().unwrap_or(0);
-    let proc = match lookup_process(pid) {
-        Some(p) => p,
-        None => {
-            (runtime().print_str)("[mmap] ERROR: No current process\n");
-            return 0;
-        }
-    };
-
-    // Use per-process memory tracking
-    match proc.memory.alloc_mmap(size) {
-        Some(addr) => addr,
-        None => {
-            log::debug!("[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}",
-                proc.pid, size, proc.memory.next_mmap, proc.memory.mmap_limit);
-            0
-        }
-    }
-}
-
-/// Record a new mmap region for the current process
-///
-/// Called by sys_mmap after allocating frames.
-/// The frames Vec should contain all physical frames for this region.
-pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
-    let pid = read_current_pid().unwrap_or(0);
-    if let Some(proc) = lookup_process(pid) {
-        proc.mmap_regions.push((start_va, frames));
-    }
-}
-
-/// Record a lazy mmap region — VA reserved, no physical pages.
-/// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
-pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
-    let pid = read_current_pid().unwrap_or(0);
-    if let Some(proc) = lookup_process(pid) {
-        proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
-    }
-}
-
-/// Check if a virtual address falls within any lazy region of the current process.
-/// Returns `(flags, source, region_start, region_size)` if found.
-/// The source is cloned so the caller can release the table lock before performing I/O.
-pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    let pid = read_current_pid()?;
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            for r in regions {
-                if va >= r.start_va && va < r.start_va + r.size {
-                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
-                }
-            }
-        }
-        None
-    })
-}
-
-/// Like lazy_region_lookup but takes an explicit PID (for tests and non-current-process use).
-pub fn lazy_region_count_for_pid(pid: Pid) -> usize {
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        table.get(&pid).map_or(0, |r| r.len())
-    })
-}
-
-pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            for r in regions {
-                if va >= r.start_va && va < r.start_va + r.size {
-                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
-                }
-            }
-        }
-        None
-    })
-}
-
-/// Stack-local writer for visible kernel output without heap allocation.
-struct LazyDebugWriter<const N: usize> {
-    buf: [u8; N],
-    pos: usize,
-}
-impl<const N: usize> LazyDebugWriter<N> {
-    const fn new() -> Self { Self { buf: [0; N], pos: 0 } }
-    fn flush(&mut self) {
-        if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
-            (runtime().print_str)(s);
-        }
-        self.pos = 0;
-    }
-}
-impl<const N: usize> core::fmt::Write for LazyDebugWriter<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = N - self.pos;
-        let len = core::cmp::min(bytes.len(), remaining);
-        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
-        self.pos += len;
-        Ok(())
-    }
-}
-
-pub fn lazy_region_debug(va: usize) {
-    let pid = read_current_pid().unwrap_or(0);
-    with_irqs_disabled(|| {
-        use core::fmt::Write;
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            let mut w = LazyDebugWriter::<256>::new();
-            let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
-            for (i, r) in regions.iter().enumerate().take(8) {
-                if i > 0 { let _ = w.write_str(","); }
-                let _ = write!(w, "{:#x}+{:#x}", r.start_va, r.size);
-            }
-            let _ = w.write_str("]\n");
-            w.flush();
-        } else {
-            let mut w = LazyDebugWriter::<128>::new();
-            let _ = writeln!(w, "[DP] lazy miss: pid={} va={:#x} no entry in table", pid, va);
-            w.flush();
-        }
-    });
-}
-
-pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64) -> usize {
-    push_lazy_region_with_source(pid, start_va, size, page_flags, LazySource::Zero)
-}
-
-pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
-    let len = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let regions = table.entry(pid).or_insert_with(Vec::new);
-        regions.push(LazyRegion { start_va, size, flags: page_flags, source });
-        regions.len()
-    });
-    len
-}
-
-/// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
-/// Called by sys_mprotect so demand paging uses the correct permissions.
-///
-/// Regions that are only partially covered by the mprotect range are split:
-/// the covered sub-range gets the new flags while the uncovered tails keep
-/// their original flags.  Without splitting, a mprotect on a small guard page
-/// at the start of a huge region would incorrectly mark the entire region as
-/// PROT_NONE, causing spurious SIGSEGVs on all later accesses.
-pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
-    let range_end = range_start + range_size;
-    with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get_mut(&pid) {
-            let mut i = 0;
-            while i < regions.len() {
-                let r_start = regions[i].start_va;
-                let r_end = r_start + regions[i].size;
-                if r_start >= range_end || r_end <= range_start {
-                    i += 1;
-                    continue;
-                }
-                let clip_start = r_start.max(range_start);
-                let clip_end = r_end.min(range_end);
-                if clip_start == r_start && clip_end == r_end {
-                    // Fully contained: update in place.
-                    regions[i].flags = new_flags;
-                    i += 1;
-                } else {
-                    // Partially overlapping: split into up to 3 pieces.
-                    let old_flags = regions[i].flags;
-                    let old_source = regions[i].source.clone();
-                    regions.remove(i);
-                    // "before" tail keeps old flags.
-                    if clip_start > r_start {
-                        regions.push(LazyRegion {
-                            start_va: r_start,
-                            size: clip_start - r_start,
-                            flags: old_flags,
-                            source: old_source.clone(),
-                        });
-                    }
-                    // Overlapping slice gets new flags.
-                    regions.push(LazyRegion {
-                        start_va: clip_start,
-                        size: clip_end - clip_start,
-                        flags: new_flags,
-                        source: old_source.clone(),
-                    });
-                    // "after" tail keeps old flags.
-                    if clip_end < r_end {
-                        regions.push(LazyRegion {
-                            start_va: clip_end,
-                            size: r_end - clip_end,
-                            flags: old_flags,
-                            source: old_source,
-                        });
-                    }
-                    // i unchanged: former index i now holds the next original region.
-                }
-            }
-        }
-    });
-}
-
-pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
-    let result = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get_mut(&pid) {
-            if let Some(idx) = regions.iter().position(|r| r.start_va == start_va) {
-                let removed = regions.remove(idx);
-                return Some((removed, regions.len()));
-            }
-        }
-        None
-    });
-    if let Some((removed, _remaining)) = result {
-        Some(removed)
-    } else {
-        None
-    }
-}
-
-/// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
-/// Returns a Vec of (freed_start, freed_pages) for each affected region.
-pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> alloc::vec::Vec<(usize, usize)> {
-    let unmap_end = unmap_addr + unmap_len;
-    let mut results = alloc::vec::Vec::new();
-
-    loop {
-        if let Some(result) = munmap_lazy_region_overlapping(pid, unmap_addr, unmap_end) {
-            results.push(result);
-        } else {
-            break;
-        }
-    }
-    results
-}
-
-/// Find and modify a single lazy region that overlaps with [range_start, range_end).
-/// Uses overlap check rather than containment check, so it finds regions that
-/// start within the range even if range_start is in a gap between regions.
-fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
-    let result = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let regions = table.get_mut(&pid)?;
-
-        let idx = regions.iter().position(|r| {
-            let reg_end = r.start_va + r.size;
-            r.start_va < range_end && reg_end > range_start
-        })?;
-
-        let reg_start = regions[idx].start_va;
-        let reg_size = regions[idx].size;
-        let reg_end = reg_start + reg_size;
-
-        let clip_start = if range_start > reg_start { range_start } else { reg_start };
-        let clip_end = if range_end < reg_end { range_end } else { reg_end };
-
-        if clip_start == reg_start && clip_end == reg_end {
-            regions.remove(idx);
-            Some(('F', reg_start, reg_size / 4096))
-        } else if clip_start == reg_start {
-            regions[idx].start_va = clip_end;
-            regions[idx].size = reg_end - clip_end;
-            let freed = (clip_end - clip_start) / 4096;
-            Some(('P', clip_start, freed))
-        } else if clip_end == reg_end {
-            regions[idx].size = clip_start - reg_start;
-            let freed = (reg_end - clip_start) / 4096;
-            Some(('S', clip_start, freed))
-        } else {
-            let right = LazyRegion {
-                start_va: clip_end,
-                size: reg_end - clip_end,
-                flags: regions[idx].flags,
-                source: regions[idx].source.clone(),
-            };
-            regions[idx].size = clip_start - reg_start;
-            regions.push(right);
-            let freed = (clip_end - clip_start) / 4096;
-            Some(('M', clip_start, freed))
-        }
-    });
-
-    if let Some((op, freed_start, freed_pages)) = result {
-        log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
-            op as char, pid, freed_start, freed_pages * 4096, freed_pages);
-        Some((freed_start, freed_pages))
-    } else {
-        None
-    }
-}
-
-pub fn clear_lazy_regions(pid: Pid) {
-    let count = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let count = table.get(&pid).map_or(0, |r| r.len());
-        table.remove(&pid);
-        count
-    });
-    if count > 0 {
-        log::debug!("[LR!] clear pid={} ({} regions)", pid, count);
-    }
-}
-
-pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
-    with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&from_pid) {
-            let cloned = regions.clone();
-            let len = cloned.len();
-            table.insert(to_pid, cloned);
-            log::debug!("[LR] clone pid={}->{} ({} regions)", from_pid, to_pid, len);
-        }
-    });
-}
-
-/// Check if a virtual address falls within any lazy region.
-pub fn is_in_lazy_region(va: usize) -> bool {
-    lazy_region_lookup(va).is_some()
-}
-
-/// Remove and return mmap region starting at the given VA
-///
-/// Called by sys_munmap to find frames to free.
-/// Returns None if no region starts at this VA.
-pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
-    let pid = read_current_pid().unwrap_or(0);
-    let proc = lookup_process(pid)?;
-    
-    // Find the region
-    let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;
-    
-    // Remove and return the frames
-    let (va, frames) = proc.mmap_regions.remove(idx);
-    
-    // RECLAIM: Add the freed range to free_regions
-    let size = frames.len() * 4096; // config::PAGE_SIZE
-    proc.memory.free_regions.push((va, size));
-    
-    Some(frames)
-}
-
-/// Get stack bounds for current process
-pub fn get_stack_bounds() -> (usize, usize) {
-    match current_process() {
-        Some(p) => (p.memory.stack_bottom, p.memory.stack_top),
-        None => (0, 0),
-    }
-}
-
-
-/// List all running processes
-///
-/// Returns a vector of process info for display.
-pub fn list_processes() -> Vec<ProcessInfo2> {
-    // Take a quick snapshot while holding lock with IRQs disabled
-    // to prevent deadlock if timer fires while holding PROCESS_TABLE lock.
-    // We collect data into a local Vec while locked, then return it.
-    with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        let mut result = Vec::new();
-
-        for (&pid, proc) in table.iter() {
-            let state = match proc.state {
-                ProcessState::Ready => "ready",
-                ProcessState::Running => "running",
-                ProcessState::Blocked => "blocked",
-                ProcessState::Zombie(_) => "zombie",
-            };
-            result.push(ProcessInfo2 {
-                pid,
-                ppid: proc.parent_pid,
-                box_id: proc.box_id,
-                name: proc.name.clone(),
-                state,
-                current_syscall: proc.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
-                last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
-                args: proc.args.clone(),
-            });
-        }
-
-        result
-    })
-}
-
-/// Find a process PID by thread ID
-///
-/// Returns the PID of the process running on the given thread, if any.
-pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
-    with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        for (&pid, proc) in table.iter() {
-            if proc.thread_id == Some(thread_id) {
-                return Some(pid);
-            }
-        }
-        None
-    })
-}
-
-
-
-// ============================================================================
-// Signal Infrastructure
-// ============================================================================
-
-
-
-/// Shared file descriptor table for CLONE_FILES semantics.
-///
-/// When threads are created with CLONE_VM (pthreads), they share this table
-/// via Arc — matching Linux CLONE_FILES behavior. Fork creates a deep copy.
 pub struct SharedFdTable {
     pub table: Spinlock<BTreeMap<u32, FileDescriptor>>,
     pub cloexec: Spinlock<BTreeSet<u32>>,
@@ -1277,145 +241,34 @@ impl Drop for SharedFdTable {
 ///
 /// When threads are created with CLONE_THREAD (pthreads), they share this table
 /// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
-pub struct SharedSignalTable {
-    pub actions: Spinlock<[SignalAction; MAX_SIGNALS]>,
-}
-
-impl SharedSignalTable {
-    pub fn new() -> Self {
-        Self {
-            actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
-        }
+/// Kill all processes in a box and unregister it
+pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
+    if box_id == 0 {
+        return Err("Cannot kill Box 0 (Host)");
     }
+
+    // 1. Get list of PIDs in this box
+    let pids: Vec<Pid> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.box_id == box_id)
+            .map(|(&pid, _)| pid)
+            .collect()
+    });
+
+    // 2. Kill each process
+    for pid in pids {
+        // kill_process handles unregistering and thread termination
+        let _ = kill_process(pid);
+    }
+
+    // 3. Unregister the box from the global registry
+    unregister_box(box_id);
+
+    Ok(())
 }
 
-/// A user process
-pub struct Process {
-    /// Process ID
-    pub pid: Pid,
-    /// Process group ID
-    pub pgid: Pid,
-    /// Process name (for debugging)
-    pub name: String,
-    /// Process state
-    pub state: ProcessState,
-    /// User address space
-    pub address_space: UserAddressSpace,
-    /// Saved user context
-    pub context: UserContext,
-    /// Parent process ID (0 for init)
-    pub parent_pid: Pid,
-    /// Current program break (heap end)
-    pub brk: usize,
-    /// Initial program break (start of heap, set from ELF loader)
-    pub initial_brk: usize,
-    /// Entry point address (start of execution)
-    pub entry_point: usize,
-    /// Memory regions tracking
-    pub memory: ProcessMemory,
-    /// Physical address of the process info page
-    ///
-    /// This page is mapped read-only at PROCESS_INFO_ADDR for the user.
-    /// The kernel writes to it (via phys_to_virt) before entering userspace.
-    pub process_info_phys: usize,
-
-    // ========== Command line arguments ==========
-    /// Command line arguments (stored as strings, serialized to ProcessInfo on execute)
-    pub args: Vec<String>,
-
-    // ========== Current working directory ==========
-    /// Current working directory (inherited from parent or set explicitly)
-    pub cwd: String,
-
-    // ========== Per-process I/O (Spinlock-protected for thread safety) ==========
-    /// Process stdin buffer with read position
-    /// Protected by Spinlock to prevent races between procfs reads and process reads
-    pub stdin: Spinlock<StdioBuffer>,
-    /// Process stdout buffer
-    /// Protected by Spinlock to prevent races between syscall writes and procfs reads
-    pub stdout: Spinlock<StdioBuffer>,
-    /// Process has exited
-    pub exited: bool,
-    /// Exit code (valid when exited=true)
-    pub exit_code: i32,
-
-    // ========== Dynamic page table tracking ==========
-    /// Page table frames allocated during mmap (for cleanup on exit)
-    /// These are allocated by map_user_page() and need to be freed separately
-    /// from address_space.page_table_frames since they're created dynamically.
-    pub dynamic_page_tables: Vec<PhysFrame>,
-
-    // ========== Mmap region tracking ==========
-    /// Tracks mmap'd regions: (start_va, Vec<PhysFrame>)
-    /// Used by munmap to find and free the correct frames.
-    pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
-    /// Lazy mmap regions. VA is reserved but physical pages are allocated
-    /// on demand via page fault. flags=0 means PROT_NONE (needs mprotect
-    /// before access); non-zero means demand-paged with those permissions
-    /// on first touch.
-    pub lazy_regions: Vec<LazyRegion>,
-
-    // ========== File Descriptor Table ==========
-    /// Shared file descriptor table (shared across CLONE_VM threads via Arc).
-    pub fds: Arc<SharedFdTable>,
-
-    // ========== Thread tracking ==========
-    /// Thread ID running this process (set after spawn, used for kill)
-    pub thread_id: Option<usize>,
-
-    /// Spawner tracking (for procfs permissions)
-    pub spawner_pid: Option<Pid>,
-    // ========== Terminal State ==========
-    pub terminal_state: Arc<Spinlock<terminal::TerminalState>>,
-
-    // ========== Isolation Context ==========
-    /// Box ID (0 = Host, >0 = Isolated Box)
-    pub box_id: u64,
-    /// Per-process namespace (mount + network isolation)
-    pub namespace: Arc<akuma_isolation::Namespace>,
-
-    /// I/O Channel for async/interactive communication
-    pub channel: Option<Arc<ProcessChannel>>,
-
-    /// PID to which this process has delegated its I/O (for reattach)
-    pub delegate_pid: Option<Pid>,
-
-    /// Address to clear and futex-wake on thread exit (CLONE_CHILD_CLEARTID)
-    pub clear_child_tid: u64,
-
-    /// Robust futex list head pointer (set by set_robust_list syscall)
-    pub robust_list_head: u64,
-    /// Robust futex list entry size (from set_robust_list len argument)
-    pub robust_list_len: usize,
-
-    /// Shared signal action table (sigaction storage)
-    pub signal_actions: Arc<SharedSignalTable>,
-
-    /// Blocked signal mask (bits 0-63 for signals 1-64)
-    /// Bit N is set if signal N+1 is blocked
-    pub signal_mask: u64,
-
-    /// Alternate signal stack base address
-    pub sigaltstack_sp: u64,
-    /// Alternate signal stack flags
-    pub sigaltstack_flags: i32,
-    /// Alternate signal stack size
-    pub sigaltstack_size: u64,
-
-    /// Monotonic timestamp (us) when the process was created
-    pub start_time_us: u64,
-
-    /// Current syscall number (for debugging)
-    pub current_syscall: AtomicU64,
-
-    /// Last syscall number (for debugging stuck processes)
-    pub last_syscall: core::sync::atomic::AtomicU64,
-    /// Per-process syscall stats (emitted on exit when enabled)
-    pub syscall_stats: ProcessSyscallStats,
-}
-
-/// Per-process syscall counters, emitted on exit for performance profiling.
-/// Indexed directly by syscall number for zero-overhead tracking.
+// ============================================================================
 pub struct ProcessSyscallStats {
     counts: [AtomicU64; Self::MAX_NR],
     times_us: [AtomicU64; Self::MAX_NR],
@@ -2603,110 +1456,6 @@ fn cleanup_process_fds(proc: &Process) {
     }
 }
 
-/// Kill a process by PID
-///
-/// Terminates the process and cleans up all associated resources:
-/// - Closes all open sockets and file descriptors
-/// - Removes process from process table
-/// - Removes process channel
-/// - Marks the thread as terminated
-///
-/// # Arguments
-/// * `pid` - Process ID to kill
-///
-/// # Returns
-/// * `Ok(())` if the process was successfully killed
-/// * `Err(message)` if the process was not found or could not be killed
-pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
-    // Kill direct children first so parent-kill semantics cascade and avoid
-    // leaving orphaned workers running after the parent exits.
-    let child_pids: Vec<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        table
-            .iter()
-            .filter_map(|(&child_pid, p)| {
-                if p.parent_pid == pid {
-                    Some(child_pid)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    });
-    for child_pid in child_pids {
-        if child_pid != pid {
-            let _ = kill_process(child_pid);
-        }
-    }
-
-    // Look up the process
-    let proc = lookup_process(pid).ok_or("Process not found")?;
-
-    // Get thread_id before cleanup (needed for channel removal and thread termination).
-    // Some synthetic test processes don't have a started thread yet; still allow
-    // kill/unregister for those entries.
-    let thread_id = proc.thread_id;
-
-    // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
-    // to detect the interrupt and properly abort their sockets before we clean up.
-    if let Some(tid) = thread_id {
-        if let Some(channel) = get_channel(tid) {
-            channel.set_interrupted();
-        }
-
-        // Yield a few times to give the blocked thread a chance to detect the interrupt.
-        for _ in 0..5 {
-            crate::threading::yield_now();
-        }
-    }
-
-    // Clean up all open FDs for this process
-    // Note: This cleans up sockets in the fd_table, but sockets created inside
-    // syscalls (like the TcpSocket in accept()) are handled by the interrupt mechanism.
-    cleanup_process_fds(proc);
-    
-    // Mark process as killed (using signal 9 = SIGKILL)
-    proc.exited = true;
-    proc.exit_code = 137; // 128 + SIGKILL(9)
-    proc.state = ProcessState::Zombie(137);
-    
-    // Done using proc - the reference becomes invalid after unregister_process
-    // drops the Box. We don't access proc after this point.
-    // (Using let _ = proc would be redundant since it's just a reference)
-    
-    // Deactivate user TTBR0 for the killed thread
-    // Note: The killed thread will do this itself in return_to_kernel when it
-    // eventually runs, but if it's blocked in a syscall it may not run soon.
-    // For safety, we rely on the thread to deactivate its own TTBR0.
-    
-    // Clear lazy region metadata before dropping the process.
-    // Without this, the LAZY_REGION_TABLE BTreeMap entry leaks.
-    clear_lazy_regions(pid);
-
-    // Unregister from process table and DROP the Box<Process>
-    // This calls Process::drop() -> UserAddressSpace::drop() which frees:
-    // - All user pages (code, data, stack, heap, mmap)
-    // - All page table frames (L0, L1, L2, L3)
-    // - The ASID
-    let _dropped_process = unregister_process(pid);
-    // _dropped_process goes out of scope here, triggering the drop
-    
-    // Remove and notify the process channel
-    if let Some(tid) = thread_id {
-        if let Some(channel) = remove_channel(tid) {
-            channel.set_exited(137);
-        }
-
-        // Mark the thread as terminated so scheduler stops scheduling it
-        crate::threading::mark_thread_terminated(tid);
-    }
-    
-    log::debug!("[kill] Killed PID {} (thread {:?})", pid, thread_id);
-    
-    Ok(())
-}
-
-
 pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
     if let Some(ch) = get_child_channel(pid) {
         if ch.has_exited() {
@@ -3607,3 +2356,69 @@ where
 
     Ok(exit_code)
 }
+
+/// Reattach I/O from a caller process (or kernel) to a target PID
+pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
+    // 1. Validate hierarchy permissions
+    let (caller_box_id, channel) = if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
+        (caller.box_id, caller.channel.clone())
+    } else {
+        // Kernel caller (e.g. built-in SSH shell)
+        // System threads use thread-ID based channel lookup
+        let tid = crate::threading::current_thread_id();
+        let ch = get_channel(tid).ok_or("Kernel thread has no channel")?;
+        (0, Some(ch)) // Kernel is Box 0
+    };
+
+    let target_box_id = {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.box_id
+    };
+
+    let mut allowed = false;
+    if caller_box_id == 0 {
+        allowed = true; // Host/Kernel can reattach anything
+    } else if target_box_id == caller_box_id {
+        allowed = true; // Same box
+    } else if let Some(pid) = caller_pid {
+        // Check if caller created the target's box (child box)
+        if let Some(info) = get_box_info(target_box_id) {
+            if info.creator_pid == pid {
+                allowed = true;
+            }
+        }
+    }
+
+    if !allowed {
+        return Err("Permission denied: cannot reattach process outside hierarchy");
+    }
+
+    // 2. Perform the delegation
+    if let Some(pid) = caller_pid {
+        let caller = lookup_process(pid).ok_or("Caller not found")?;
+        caller.delegate_pid = Some(target_pid);
+    } else {
+        // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
+        // but we still want to link the channel to the target.
+    }
+
+    // Target process now uses caller's output channel
+    {
+        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        target.channel = channel;
+    }
+
+    if config().syscall_debug_info_enabled {
+        log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);
+    }
+
+    Ok(())
+}
+
+/// Reattach I/O from the current process to a target PID
+pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+    let caller_pid = read_current_pid(); // Can be None for kernel threads
+    reattach_process_ext(caller_pid, target_pid)
+}
+

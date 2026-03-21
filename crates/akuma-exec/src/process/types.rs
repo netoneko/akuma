@@ -365,6 +365,7 @@ pub struct ProcessInfo2 {
     pub args: Vec<String>,
 }
 
+// SharedSignalTable moved to signal.rs (as it had internal dependencies)
 #[cfg(test)]
 mod tests {
     use super::*;
