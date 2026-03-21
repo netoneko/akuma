@@ -2,6 +2,13 @@
 
 Tracked gaps and fixes required to run Go binaries on Akuma.
 
+## Milestone Status
+
+| Milestone | Status |
+|-----------|--------|
+| `CGO_ENABLED=0 go build -n` (dry run, no compilation) | **Fixed** (2026-03-21) |
+| `CGO_ENABLED=0 go build` (actual compilation) | **In progress** — crashes during compilation |
+
 ---
 
 ## 1. Signal delivery ignores `SA_ONSTACK` — crash in Go runtime
@@ -306,3 +313,29 @@ Additionally, `exists`, `metadata`, and `read_at` all short-circuited at `fd_num
 - `exists` now checks `proc.get_fd(fd_num).is_some()` for fd > 1.
 - `metadata` returns metadata with size=0 for any valid fd > 1.
 - `read_at` returns the fd description string for fd > 1.
+
+---
+
+## 56. `CGO_ENABLED=0 go build` crashes during compilation (2026-03-21)
+
+**Status:** In progress
+
+### Background
+
+`CGO_ENABLED=0 go build -n` (dry run — resolves dependencies and prints commands without executing them) now works. `CGO_ENABLED=0 go build` (actual compilation — invokes the Go compiler and assembler) still crashes.
+
+The `-n` path exercises: process spawning, pipes, epoll, signal delivery, `/proc` reads, `waitpid`. These are all fixed. The actual build path additionally runs the `compile` and `asm` toolchain binaries inside Go's build graph, which stress different kernel paths.
+
+### Known current failure point
+
+To be determined — need a kernel crash log from a `go build` run to identify the next failing syscall or kernel bug.
+
+### Likely candidates
+
+- **`clone3` / `clone` with new flags**: The Go toolchain spawns many compiler workers; any unhandled clone flag causes EINVAL.
+- **`prlimit64` / `getrlimit`**: Compiler may query resource limits.
+- **`fcntl(F_DUPFD_CLOEXEC)`**: Used during pipe setup for compiler subprocesses.
+- **`/proc/self/fd` enumeration**: Compiler may walk its own fd table to close inherited fds.
+- **`mmap` anonymous with `MAP_FIXED`**: Go's compiler allocates large arenas; partial unmaps or MAP_FIXED collisions may fault.
+- **`sched_getaffinity`**: Some Go versions call this to determine GOMAXPROCS.
+- **Signal mask inheritance across `clone`**: Child processes need the correct signal mask from the parent.
