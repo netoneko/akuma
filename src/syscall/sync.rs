@@ -1,15 +1,35 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_from_user_safe;
 
-static FUTEX_WAITERS: Spinlock<BTreeMap<usize, Vec<usize>>> = Spinlock::new(BTreeMap::new());
+/// Futex waiter table.
+///
+/// Key is `(tgid, uaddr)`:
+/// - For FUTEX_PRIVATE operations, `tgid` is the thread-group leader's PID (from
+///   `PROCESS_INFO_ADDR`), scoping the futex to the process. This prevents cross-process
+///   VA collisions when different processes have the same virtual address (no ASLR).
+/// - For FUTEX_SHARED (non-private) operations, `tgid = 0`.
+/// - For kernel-internal wakes (clear_child_tid, robust futex), `tgid = 0`.
+static FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<usize>>> = Spinlock::new(BTreeMap::new());
 
-fn futex_do_wake(uaddr: usize, max_wake: u32) -> u64 {
+/// Returns the TGID to use as the futex key namespace.
+/// For private futex: returns the current process's PID (shared among CLONE_VM threads via
+/// `PROCESS_INFO_ADDR`). For non-private (shared): returns 0.
+fn futex_key_tgid(is_private: bool) -> u32 {
+    if is_private {
+        akuma_exec::process::read_current_pid().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
     let mut waiters = FUTEX_WAITERS.lock();
-    let woken = if let Some(queue) = waiters.get_mut(&uaddr) {
+    let key = (tgid, uaddr);
+    let woken = if let Some(queue) = waiters.get_mut(&key) {
         let count = (max_wake as usize).min(queue.len());
         let to_wake: Vec<usize> = queue.drain(..count).collect();
         if queue.is_empty() {
-            waiters.remove(&uaddr);
+            waiters.remove(&key);
         }
         drop(waiters);
         for tid in &to_wake {
@@ -22,8 +42,9 @@ fn futex_do_wake(uaddr: usize, max_wake: u32) -> u64 {
     woken
 }
 
+/// Kernel-internal futex wake (clear_child_tid, robust futex). Uses tgid=0 (shared).
 pub fn futex_wake(uaddr: usize, max_wake: i32) {
-    futex_do_wake(uaddr, max_wake as u32);
+    futex_do_wake(0, uaddr, max_wake as u32);
 }
 
 pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr2: usize, val3: u32) -> u64 {
@@ -44,6 +65,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
     const FUTEX_PRIVATE_FLAG: i32 = 128;
     const FUTEX_CLOCK_REALTIME: i32 = 256;
 
+    let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
     // Validate uaddr - must be 4-byte aligned and in user space
@@ -58,6 +80,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let tid = akuma_exec::threading::current_thread_id();
+            let tgid = futex_key_tgid(is_private);
+            let key = (tgid, uaddr);
 
             // FUTEX_WAIT_BITSET with val3==0 is invalid per spec.
             if cmd == FUTEX_WAIT_BITSET && val3 == 0 {
@@ -77,7 +101,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 if current_val != val {
                     return EAGAIN;
                 }
-                let queue = waiters.entry(uaddr).or_insert_with(Vec::new);
+                let queue = waiters.entry(key).or_insert_with(Vec::new);
                 queue.push(tid);
             }
 
@@ -87,9 +111,9 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
                     // Remove ourselves from the waiter queue before returning.
                     let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(queue) = waiters.get_mut(&uaddr) {
+                    if let Some(queue) = waiters.get_mut(&key) {
                         queue.retain(|&t| t != tid);
-                        if queue.is_empty() { waiters.remove(&uaddr); }
+                        if queue.is_empty() { waiters.remove(&key); }
                     }
                     return EFAULT;
                 }
@@ -110,10 +134,10 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
             {
                 let mut waiters = FUTEX_WAITERS.lock();
-                if let Some(queue) = waiters.get_mut(&uaddr) {
+                if let Some(queue) = waiters.get_mut(&key) {
                     queue.retain(|&t| t != tid);
                     if queue.is_empty() {
-                        waiters.remove(&uaddr);
+                        waiters.remove(&key);
                     }
                 }
             }
@@ -130,63 +154,70 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             0
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            futex_do_wake(uaddr, val)
+            let tgid = futex_key_tgid(is_private);
+            futex_do_wake(tgid, uaddr, val)
         }
         FUTEX_REQUEUE => {
             // Wake up to val waiters, requeue rest to uaddr2
             // val2 (passed as timeout_ptr) is max to requeue
             let max_requeue = timeout_ptr as u32;
-            
+            let tgid = futex_key_tgid(is_private);
+            let key1 = (tgid, uaddr);
+            let key2 = (tgid, uaddr2);
+
             if uaddr2 != 0 && !validate_user_ptr(uaddr2 as u64, 4) {
                 return EFAULT;
             }
-            
+
             let mut waiters = FUTEX_WAITERS.lock();
-            
+
             // Extract waiters from uaddr
-            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&uaddr) {
+            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
                 let wake_count = (val as usize).min(queue.len());
                 let mut remaining: Vec<usize> = queue;
                 let to_wake: Vec<usize> = remaining.drain(..wake_count).collect();
-                
+
                 let requeue_count = if uaddr2 != 0 {
                     (max_requeue as usize).min(remaining.len())
                 } else {
                     0
                 };
                 let to_requeue: Vec<usize> = remaining.drain(..requeue_count).collect();
-                
+
                 // Put back any remaining waiters
                 if !remaining.is_empty() {
-                    waiters.insert(uaddr, remaining);
+                    waiters.insert(key1, remaining);
                 }
-                
+
                 (to_wake, to_requeue)
             } else {
                 (Vec::new(), Vec::new())
             };
-            
+
             // Add requeued waiters to uaddr2
             if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(uaddr2).or_insert_with(Vec::new);
+                let queue2 = waiters.entry(key2).or_insert_with(Vec::new);
                 queue2.extend(to_requeue.iter().copied());
             }
-            
+
             let woken = to_wake.len();
             let requeued = to_requeue.len();
-            
+
             drop(waiters);
-            
+
             for tid in &to_wake {
                 akuma_exec::threading::get_waker_for_thread(*tid).wake();
             }
-            
+
             (woken + requeued) as u64
         }
         FUTEX_CMP_REQUEUE => {
             // Like FUTEX_REQUEUE but also checks val3 against uaddr value
             let max_requeue = timeout_ptr as u32;
-            
+            let tgid = futex_key_tgid(is_private);
+            let key1 = (tgid, uaddr);
+            let key2 = (tgid, uaddr2);
+
             // Check current value matches expected
             let mut current_val: u32 = 0;
             if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
@@ -195,54 +226,55 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             if current_val != val3 {
                 return EAGAIN;
             }
-            
+
             if uaddr2 != 0 && !validate_user_ptr(uaddr2 as u64, 4) {
                 return EFAULT;
             }
-            
+
             let mut waiters = FUTEX_WAITERS.lock();
-            
-            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&uaddr) {
+
+            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
                 let wake_count = (val as usize).min(queue.len());
                 let mut remaining: Vec<usize> = queue;
                 let to_wake: Vec<usize> = remaining.drain(..wake_count).collect();
-                
+
                 let requeue_count = if uaddr2 != 0 {
                     (max_requeue as usize).min(remaining.len())
                 } else {
                     0
                 };
                 let to_requeue: Vec<usize> = remaining.drain(..requeue_count).collect();
-                
+
                 if !remaining.is_empty() {
-                    waiters.insert(uaddr, remaining);
+                    waiters.insert(key1, remaining);
                 }
-                
+
                 (to_wake, to_requeue)
             } else {
                 (Vec::new(), Vec::new())
             };
-            
+
             if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(uaddr2).or_insert_with(Vec::new);
+                let queue2 = waiters.entry(key2).or_insert_with(Vec::new);
                 queue2.extend(to_requeue.iter().copied());
             }
-            
+
             let woken = to_wake.len();
             let requeued = to_requeue.len();
-            
+
             drop(waiters);
-            
+
             for tid in &to_wake {
                 akuma_exec::threading::get_waker_for_thread(*tid).wake();
             }
-            
+
             (woken + requeued) as u64
         }
         FUTEX_WAKE_OP => {
             // Complex operation: wake waiters at uaddr, optionally wake at uaddr2
             // based on atomic operation result. For now, just wake at uaddr.
-            futex_do_wake(uaddr, val)
+            let tgid = futex_key_tgid(is_private);
+            futex_do_wake(tgid, uaddr, val)
         }
         FUTEX_LOCK_PI | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI => ENOSYS,
         FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => ENOSYS,

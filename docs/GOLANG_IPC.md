@@ -69,57 +69,83 @@ fd/3+ = ENOENT     (no other fds)
 
 ---
 
-## Root Cause: Goroutine Scheduler Deadlock
+## Key Update: Goroutine Scheduling Is Fine
 
-The Go M:N scheduler parks idle M-threads (OS threads) by calling:
+`go version` (run on a fresh kernel, without `go build` consuming threads) works
+correctly:
+
 ```
-futex(m.waitsema, FUTEX_WAIT, 0, timeout)
+go version go1.25.8 linux/arm64
+[clone] flags=0x50f00  new thread TID=50
+[clone] flags=0x50f00  new thread TID=51
+[clone] flags=0x50f00  new thread TID=52
+[epoll] create1, eventfd2, epoll_ctl...
+[signal] tkill(sig=23) + deliver SIGURG
+[exit_group] code=0 after 0.49s
+PSTATS: futex=13(334ms), clone=3, mmap=89, openat=12, read=7
+```
+
+- Futex used 13 times with 334ms total blocking → **goroutine park/unpark works**
+- Signals delivered correctly
+- 3 CLONE_THREAD M-threads, all working
+
+The previous `go version` timeout during the SSH session was because `go build`
+was occupying thread slots, not a kernel bug.
+
+**This eliminates**: TGID/getpid() confusion, futex implementation bugs,
+goroutine scheduling deadlock.
+
+**The hang is specific to how `go build` coordinates with `compile`.**
+
+---
+
+## Root Cause: FUTEX_PRIVATE_FLAG Stripping — Cross-Process Wake Theft
+
+The Go M:N scheduler parks idle M-threads (OS threads) via:
+```
+futex(m.waitsema, FUTEX_WAIT_PRIVATE, 0, timeout)   // op=128
 ```
 When a goroutine becomes runnable, the scheduler wakes an M with:
 ```
-futex(m.waitsema, FUTEX_WAKE, 1)
+futex(m.waitsema, FUTEX_WAKE_PRIVATE, 1)             // op=129
 ```
 
-**Threads 64–66 are parked in `futex_wait` and the wake never reaches them.**
-The main goroutine is placed on the run queue by the Go runtime initializer,
-but no M-thread is woken to run it. The sysmon goroutine (running on thread
-63) keeps printing its `clock_gettime + nanosleep` heartbeat but cannot
-unblock the scheduler because sysmon's job is just monitoring — it doesn't
-directly run goroutines.
+**The bug:** Akuma's futex implementation stripped `FUTEX_PRIVATE_FLAG` (bit 7)
+from the op and used a **global** `BTreeMap<usize, Vec<usize>>` keyed by
+virtual address. `FUTEX_PRIVATE` should scope the futex to the current
+process (per-address-space), but stripping the flag made all processes share
+one global table.
 
-### Candidate bugs
+**Without ASLR**, `go build` and `compile` load the Go runtime at the **same
+base address**. Their M-thread park addresses (`m.waitsema` in the M struct)
+are **identical VAs** pointing to **different physical pages**. With the old
+global VA key, compile's `futex_wake_private(VA=X, 1)` dequeued a `go build`
+M-thread (which also happened to wait at VA=X) instead of compile's own
+parked M — compile's threads stayed in `futex_wait` forever, and the main
+goroutine never ran.
 
-**A. TGID/PID semantics (most likely)**
+This also explains why `go version` fails while `go build` is running — the
+two processes steal each other's wakes through the shared futex table.
 
-Linux `clone(CLONE_THREAD)` threads share a TGID with their parent:
-- `getpid()`  → returns the TGID (same as parent)
-- `gettid()`  → returns the individual thread's TID
+**Fix applied (2026-03-21, `src/syscall/sync.rs`):**
+- `FUTEX_WAITERS` key changed from `usize` to `(u32, usize)` — `(tgid, uaddr)`
+- Private ops: `tgid = read_current_pid()` (shared across CLONE_VM threads
+  via `PROCESS_INFO_ADDR` — all threads in one thread group read the same PID)
+- Non-private / kernel-internal: `tgid = 0`
+- All ops updated: WAIT, WAIT_BITSET, WAKE, WAKE_BITSET, REQUEUE, CMP_REQUEUE, WAKE_OP
 
-In Akuma, each `clone` creates a new Process entry with its own PID. So for
-thread 64: `getpid()` → 64, but the Go runtime expects `getpid()` → 63 (the
-TGID). The Go runtime uses `getpid()` return values internally (e.g. to scope
-signal delivery, to identify the thread group). If thread 64 calls `getpid()`
-and gets 64 instead of 63, the runtime may fail to locate its own M-struct
-and the goroutine run-queue, causing a silent scheduler failure.
+### Eliminated hypotheses (for the record)
 
-**B. `futex_wake` not finding waiters across CLONE_VM threads**
+**A. TGID/PID semantics** — Not the cause. Akuma already implements correct
+TGID semantics: CLONE_THREAD children share `process_info_phys`, so
+`getpid()` returns the parent's PID (the TGID) for all threads in the group.
 
-Akuma's `FUTEX_WAITERS` is a global `BTreeMap<usize, Vec<usize>>` keyed by
-virtual address, where the value is a list of kernel thread IDs. For CLONE_VM
-threads sharing an address space, the same VA key is used, so wakes from
-thread 63 should find thread 64's TID. This path looks correct in the code
-(`src/syscall/sync.rs`). Less likely to be the root cause, but worth
-verifying with a debug log.
+**B. `futex_wake` not finding waiters across CLONE_VM threads** — Not the
+cause. For CLONE_VM threads in the same process, the same VA key is used and
+wakes reach the right TID. The problem was cross-PROCESS collisions.
 
-**C. `compile` reading from stdin pipe blocks the main goroutine**
-
-The Go build system may use a JSON-over-stdin protocol (`-json` compile mode)
-where `go build` sends work requests to `compile` via the pipe. If `go build`
-is supposed to write to `pipe:[36]` but hasn't yet (because it's waiting for
-`compile` to exit first), this is a classic pipe deadlock. However, since
-**no `read` syscall ever completes** for compile, this isn't blocking the main
-goroutine at the syscall layer — the goroutine may not even be scheduled yet
-to make the read call.
+**C. stdin pipe deadlock** — Not the cause. The goroutines never ran at all
+(no file I/O syscalls), so they couldn't have blocked on stdin read.
 
 ---
 
@@ -172,48 +198,29 @@ and whether GOMAXPROCS is being set to a non-zero value.
 
 ## Course of Action
 
-### Step 1 — Fix `getpid()` for CLONE_THREAD (TGID semantics)
+### Step 1 — FUTEX_PRIVATE fix ✓ DONE (2026-03-21)
 
-Check what `sys_getpid` returns for CLONE_VM/CLONE_THREAD children:
+Fixed `src/syscall/sync.rs`: FUTEX_WAITERS keyed by `(tgid, uaddr)` instead
+of `uaddr`. See "Root Cause" section above.
 
+### Step 2 — Test with go build
+
+Boot the updated kernel and run:
 ```
-src/syscall/mod.rs or src/syscall/proc.rs — sys_getpid
+CGO_ENABLED=0 go build -x -v -o ./hello_go .
 ```
+If goroutines now run but something else fails, check the next hypothesis.
 
-Linux contract:
-- `getpid()` → TGID (the process group leader's PID; same for all threads in a group)
-- `gettid()` → per-thread TID (unique)
+### Step 3 — Raise thread cap if needed
 
-If Akuma returns the thread's own new PID for `getpid()` instead of the
-parent's PID, fix it by returning `parent_pid` for CLONE_THREAD children.
-This is likely the primary scheduler bug.
+If `go build` spawns many parallel `compile` instances and hits the 32-thread
+limit (`MAX_THREADS` in `crates/akuma-exec/src/threading/types.rs`), raise it
+to 64. Each extra slot costs ~32KB (default thread stack) + 300B of state.
+Also update `ExecConfig::max_threads` in `src/main.rs`.
 
-### Step 2 — Add futex_wake debug logging temporarily
+### Step 4 — Document in GOLANG_MISSING_SYSCALLS.md
 
-In `futex_do_wake`, add a print that shows `uaddr`, how many waiters were
-found, and which TIDs were woken. Run `go build` and check whether wakes
-are emitted. If wakes are emitted but threads don't wake up, the issue is
-in `get_waker_for_thread`. If no wakes appear, the address being used for
-wake doesn't match the address registered for wait.
-
-### Step 3 — Run the minimal reproducer
-
-Build and run `test_goroutine.go` on Akuma. If it hangs, add the futex
-logging and trace through the goroutine park/unpark cycle for this simple
-case before tackling `compile`.
-
-### Step 4 — Understand the compile stdin pipe
-
-Run `go build -x -v` on a host Linux system and observe:
-- what flags are passed to `compile`
-- whether `-json` or `-stdin` is used
-- what `go build` writes to the pipe before waiting
-
-Replicate correct pipe handling in Akuma's `clone`/`exec` path if needed.
-
-### Step 5 — Document in GOLANG_MISSING_SYSCALLS.md
-
-Once root cause is confirmed, add entry #57 with the fix details.
+Add entry #57 for FUTEX_PRIVATE fix.
 
 ---
 
@@ -240,10 +247,10 @@ futex-EINVAL crash.
 - futex (basic `FUTEX_WAIT`/`FUTEX_WAKE`, `FUTEX_WAKE_OP`, `CMP_REQUEUE`) — Fixed
 - `procfs` fd reads for non-stdio fds — Fixed (2026-03-21)
 
-## Still Blocked
+## Fix Applied
 
-- `CGO_ENABLED=0 go build` — **hangs at goroutine scheduling stage**
-  - `compile` tool spawns 3 M-threads, all stuck in `futex_wait`
-  - Main goroutine never runs, no file I/O ever issued
-  - Most likely cause: `getpid()` returning thread-local PID instead of TGID,
-    breaking Go's runtime M-struct lookup
+- `CGO_ENABLED=0 go build` — **FUTEX_PRIVATE fix applied (2026-03-21)**
+  - Root cause: global VA-keyed futex table let `go build` steal `compile`'s
+    M-thread wake, goroutines never ran
+  - Fix: `(tgid, uaddr)` key in FUTEX_WAITERS, scoping private futex per process
+  - Testing pending: boot updated kernel and run `go build`
