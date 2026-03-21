@@ -663,6 +663,15 @@ pub(crate) const TEST_SIGFRAME_FPSIMD: usize = SIGFRAME_FPSIMD;
 /// Byte offset of uc_sigmask within the signal frame (ucontext_t + 40).
 pub(crate) const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 
+/// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).
+/// Used when deciding whether an EL0 instruction abort might be “stale translation” vs
+/// a deliberate fault from jumping into kernel RAM.
+#[inline]
+pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
+    let a = far as usize;
+    a >= 0x4000_0000 && a < 0x8000_0000
+}
+
 /// Ensure a userspace page is mapped. If it's in a lazy anonymous region and
 /// not yet mapped, allocates and maps a zeroed page. Returns true if the page
 /// is mapped after this call (either was already mapped, or was just demand-paged).
@@ -982,6 +991,8 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _
         let _ = proc.address_space.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
         let restorer_va = restorer & !0xFFF;
         let _ = proc.address_space.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
+        proc.address_space.invalidate_icache_for_page_va(handler_va);
+        proc.address_space.invalidate_icache_for_page_va(restorer_va);
 
         if action.flags & SA_SIGINFO != 0 {
             (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
@@ -2092,6 +2103,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let page_va = far_usize & !(0xFFF);
                         if let Some(owner) = akuma_exec::process::lookup_process(pid) {
                             let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
+                            owner.address_space.invalidate_icache_for_page_va(page_va);
                             return unsafe { (*frame).x0 };
                         }
                     }

@@ -485,6 +485,66 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
+    /// Used by kernel tests and diagnostics (e.g. verify `UXN` after `update_page_flags`).
+    pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
+        let va = va & !(PAGE_SIZE - 1);
+        let _irq_guard = IrqGuard::new();
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 {
+                return None;
+            }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 {
+                return None;
+            }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 {
+                return None;
+            }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            if l3_entry & flags::VALID == 0 {
+                return None;
+            }
+            Some(l3_entry)
+        }
+    }
+
+    /// Physical address of the 4KiB frame backing `va`, if mapped.
+    pub fn phys_addr_for_page_va(&self, va: usize) -> Option<usize> {
+        let e = self.read_l3_page_entry(va)?;
+        Some((e & 0x0000_FFFF_FFFF_F000) as usize)
+    }
+
+    /// Invalidate the instruction cache for the physical page backing `va`
+    /// (after PTE permission changes or new code bytes). Matches the
+    /// `dc cvau`/`ic ivau` pattern used when demand-paging file-backed text.
+    pub fn invalidate_icache_for_page_va(&self, va: usize) {
+        let Some(pa) = self.phys_addr_for_page_va(va) else {
+            return;
+        };
+        let kva = phys_to_virt(pa) as usize;
+        #[cfg(target_os = "none")]
+        unsafe {
+            for off in (0..PAGE_SIZE).step_by(64) {
+                core::arch::asm!("ic ivau, {}", in(reg) kva + off);
+            }
+            core::arch::asm!("dsb ish");
+            core::arch::asm!("isb");
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = kva;
+    }
+
     /// Check whether a virtual address has a valid page table entry (public).
     pub fn is_mapped(&self, va: usize) -> bool {
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *const u64;

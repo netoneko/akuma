@@ -143,6 +143,30 @@ Go uses **`SA_SIGINFO`**.
 
 ---
 
+## Implementation status (2026-03-22)
+
+**Done**
+
+- **Phase 1:** `UserAddressSpace::invalidate_icache_for_page_va` in
+  `crates/akuma-exec/src/mmu/mod.rs` (`ic ivau` per cache line + `dsb ish` /
+  `isb`). Called from `try_deliver_signal` after promoting handler and restorer
+  pages to `RX`, and from the **EL0 instruction-abort permission** path after
+  `update_page_flags` to `RX` for lazy-mapped regions.
+- **Phase 3:** `read_l3_page_entry`, `phys_addr_for_page_va` on
+  `UserAddressSpace`. Kernel tests in `src/process_tests.rs`:
+  `test_update_page_flags_rw_to_rx_clears_uxn`, `test_icache_invalidate_page_va_smoke`.
+- **Phase 4:** `test_sa_siginfo_frame_offsets_for_x1_x2`.
+- **Phase 2 (policy only):** `far_in_kernel_identity_user_range` in
+  `src/exceptions.rs` + `test_far_kernel_identity_range_policy` (no automatic
+  `ic iallu` replay on EL0 IA yet — too risky without more data).
+
+**Not done (optional)**
+
+- **Phase 2** full stale-TB replay loop for `EC_INST_ABORT_LOWER`.
+- **Phase 5** fault counters.
+
+---
+
 ## Success criteria
 
 - **`CGO_ENABLED=0 go build -o ./hello_go .`** completes on Akuma QEMU for a

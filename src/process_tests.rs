@@ -69,6 +69,12 @@ pub fn run_all_tests() {
     // Test signal frame layout constants are self-consistent
     test_sigframe_layout_constants();
 
+    // MMU: RX promotion + I-cache invalidate (PLAN_SIGSEGV_COMPILE_FIX)
+    test_update_page_flags_rw_to_rx_clears_uxn();
+    test_icache_invalidate_page_va_smoke();
+    test_far_kernel_identity_range_policy();
+    test_sa_siginfo_frame_offsets_for_x1_x2();
+
     // Test pipe write/read round-trip (catches use-after-close silent data loss)
     test_pipe_write_read_roundtrip();
     test_pipe_write_missing_returns_epipe();
@@ -1312,6 +1318,108 @@ fn test_sigframe_layout_constants() {
     if ok {
         console::print("[Test] sigframe_layout_constants PASSED\n");
     }
+}
+
+// ── MMU / signal delivery (PLAN_SIGSEGV_COMPILE_FIX) ──────────────────────
+
+/// `update_page_flags(RX)` must clear `UXN` relative to `RW_NO_EXEC`.
+fn test_update_page_flags_rw_to_rx_clears_uxn() {
+    use akuma_exec::mmu::flags;
+    let mut p = make_test_process(99901);
+    let va = 0x200_0000;
+    if p.address_space.alloc_and_map(va, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::safe_print!(64, "[Test] update_page_flags_rw_rx SKIPPED or FAILED: alloc_and_map\n");
+        return;
+    }
+    let Some(e) = p.address_space.read_l3_page_entry(va) else {
+        crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: no pte\n");
+        return;
+    };
+    if e & flags::UXN == 0 {
+        crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: RW_NO_EXEC should set UXN\n");
+        return;
+    }
+    if p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX).is_err() {
+        crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: update_page_flags\n");
+        return;
+    }
+    let Some(e2) = p.address_space.read_l3_page_entry(va) else {
+        crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: read pte after RX\n");
+        return;
+    };
+    if e2 & flags::UXN != 0 {
+        crate::safe_print!(
+            96,
+            "[Test] update_page_flags_rw_rx FAILED: RX should clear UXN (pte={:#x})\n",
+            e2
+        );
+        return;
+    }
+    let _ = p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    let Some(e3) = p.address_space.read_l3_page_entry(va) else {
+        crate::safe_print!(64, "[Test] update_page_flags_idempotent_rx FAILED: read\n");
+        return;
+    };
+    if e3 & flags::UXN != 0 {
+        crate::safe_print!(64, "[Test] update_page_flags_idempotent_rx FAILED: UXN\n");
+        return;
+    }
+    console::print("[Test] update_page_flags_rw_to_rx_clears_uxn PASSED\n");
+}
+
+/// Smoke: `invalidate_icache_for_page_va` completes for a mapped executable page.
+fn test_icache_invalidate_page_va_smoke() {
+    let mut p = make_test_process(99902);
+    let va = 0x201_0000;
+    if p.address_space.alloc_and_map(va, akuma_exec::mmu::user_flags::RX).is_err() {
+        crate::safe_print!(64, "[Test] icache_invalidate_smoke SKIPPED or FAILED: alloc_and_map\n");
+        return;
+    }
+    p.address_space.invalidate_icache_for_page_va(va);
+    console::print("[Test] icache_invalidate_page_va_smoke PASSED\n");
+}
+
+/// Policy helper for EL0 IA replay: kernel identity RAM faults should not be treated as “stale TB”.
+fn test_far_kernel_identity_range_policy() {
+    use crate::exceptions::far_in_kernel_identity_user_range;
+    let mut ok = true;
+    if !far_in_kernel_identity_user_range(0x6006_c15c) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: 0x6006c15c expected in range\n");
+        ok = false;
+    }
+    if far_in_kernel_identity_user_range(0x1009_ee90) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: PIE should be out of range\n");
+        ok = false;
+    }
+    if far_in_kernel_identity_user_range(0x3fff_ffff) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: below 0x4000_0000\n");
+        ok = false;
+    }
+    if far_in_kernel_identity_user_range(0x8000_0000) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: boundary 0x8000_0000\n");
+        ok = false;
+    }
+    if ok {
+        console::print("[Test] far_kernel_identity_range_policy PASSED\n");
+    }
+}
+
+/// `SA_SIGINFO` passes `&siginfo` and `&ucontext` — x1/x2 offsets from frame base.
+fn test_sa_siginfo_frame_offsets_for_x1_x2() {
+    use crate::exceptions::TEST_SIGFRAME_UCONTEXT;
+    const SIGINFO_OFF: usize = 0;
+    let sp = 0xc400_bba0usize;
+    let x1 = sp + SIGINFO_OFF;
+    let x2 = sp + TEST_SIGFRAME_UCONTEXT;
+    if x1 != sp || x2 != sp + 128 {
+        crate::safe_print!(
+            96,
+            "[Test] sa_siginfo_offsets FAILED: x1={:#x} x2={:#x} sp={:#x}\n",
+            x1, x2, sp
+        );
+        return;
+    }
+    console::print("[Test] sa_siginfo_frame_offsets_for_x1_x2 PASSED\n");
 }
 
 // ── Pipe lifecycle regression tests ───────────────────────────────────────
