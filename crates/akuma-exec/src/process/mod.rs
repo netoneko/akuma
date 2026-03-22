@@ -629,6 +629,9 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
              proc.exited = true;
              proc.exit_code = 137;
              proc.state = ProcessState::Zombie(137);
+             // Clear thread_id so entry_point_trampoline won't match this
+             // zombie when a new process is spawned on the same thread slot.
+             proc.thread_id = None;
         }
 
         if let Some(tid) = sib_tid {
@@ -655,25 +658,22 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let tid = crate::threading::current_thread_id();
     log::debug!("[RTK] code={} tid={} LR={:#x}", exit_code, tid, lr);
     
-    // Check if this thread was already killed externally (by kill_process).
-    // If so, cleanup has already been done - just skip to the yield loop.
-    // This handles the race where kill_process() terminates the thread while
-    // it's still running, and it later reaches this exit path.
+    // Check if this thread was already killed externally (by kill_process or
+    // kill_thread_group).
     let already_terminated = crate::threading::is_thread_terminated(tid);
     
-    // Get process info before cleanup (skip if already killed)
-    let pid = if !already_terminated {
-        if let Some(proc) = current_process() {
-            let pid = proc.pid;
-            
-            // Clean up all open FDs for this process (sockets, child channels)
-            // This must happen before unregistering the process so we can access fd_table
+    // Always try to resolve the PID so we can unregister the process later.
+    // For kill_process: the process is already unregistered, current_process()
+    //   returns None → pid = None → cleanup section is skipped.
+    // For kill_thread_group: the process is still registered (only marked
+    //   zombie), current_process() succeeds → pid = Some → we can unregister
+    //   below, preventing the process from leaking in PROCESS_TABLE.
+    let pid = if let Some(proc) = current_process() {
+        let pid = proc.pid;
+        if !already_terminated {
             cleanup_process_fds(proc);
-            
-            Some(pid)
-        } else {
-            None
         }
+        Some(pid)
     } else {
         None
     };

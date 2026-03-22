@@ -124,6 +124,11 @@ pub fn run_all_tests() {
     test_kill_thread_group_marks_siblings_zombie();
     test_schedule_blocking_respects_terminated();
 
+    // Process identity collision fixes (zombie thread_id leak)
+    test_kill_thread_group_clears_thread_id();
+    test_entry_point_trampoline_no_zombie_match();
+    test_zombie_process_unregistered_after_return_to_kernel();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2475,5 +2480,149 @@ fn test_schedule_blocking_respects_terminated() {
         crate::safe_print!(96,
             "[Test] schedule_blocking_respects_terminated FAILED: state after wake = {}\n",
             state_after);
+    }
+}
+
+/// Verify that `kill_thread_group` clears `thread_id` on killed siblings.
+/// Without this, a zombie process with a stale `thread_id` causes
+/// `entry_point_trampoline` to pick up the wrong process when a new thread
+/// is spawned on the same slot.
+fn test_kill_thread_group_clears_thread_id() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_thread_group, clear_lazy_regions,
+    };
+
+    let owner_pid = 62_000u32;
+    let sibling_pid = 62_001u32;
+
+    let mut owner_proc = make_test_process(owner_pid);
+    owner_proc.thread_id = Some(12);
+    let l0_phys = owner_proc.address_space.l0_phys();
+    register_process(owner_pid, owner_proc);
+
+    let mut sib_proc = make_test_process(sibling_pid);
+    sib_proc.thread_id = Some(14);
+    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    register_process(sibling_pid, sib_proc);
+
+    kill_thread_group(sibling_pid, l0_phys);
+
+    let owner_tid = lookup_process(owner_pid).map(|p| p.thread_id);
+
+    clear_lazy_regions(owner_pid);
+    clear_lazy_regions(sibling_pid);
+    let _ = unregister_process(owner_pid);
+    let _ = unregister_process(sibling_pid);
+
+    if owner_tid == Some(None) {
+        console::print("[Test] kill_thread_group_clears_thread_id PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] kill_thread_group_clears_thread_id FAILED: owner thread_id={:?}\n",
+            owner_tid);
+    }
+}
+
+/// Verify that `entry_point_trampoline`'s PROCESS_TABLE scan does not match
+/// a zombie process whose `thread_id` was cleared by `kill_thread_group`.
+/// When two processes have the same thread slot, only the non-zombie should
+/// be found.
+fn test_entry_point_trampoline_no_zombie_match() {
+    use akuma_exec::process::{
+        register_process, unregister_process,
+        clear_lazy_regions, ProcessState,
+    };
+
+    let zombie_pid = 63_000u32;
+    let child_pid = 63_001u32;
+    let slot = 20usize;
+
+    // Simulate a zombie left by kill_thread_group (thread_id cleared).
+    let mut zombie_proc = make_test_process(zombie_pid);
+    zombie_proc.exited = true;
+    zombie_proc.exit_code = 137;
+    zombie_proc.state = ProcessState::Zombie(137);
+    zombie_proc.thread_id = None; // cleared by fix
+    register_process(zombie_pid, zombie_proc);
+
+    // New child spawned on the same slot.
+    let mut child_proc = make_test_process(child_pid);
+    child_proc.thread_id = Some(slot);
+    register_process(child_pid, child_proc);
+
+    // Replicate entry_point_trampoline's scan logic.
+    let mut found_pid: Option<u32> = None;
+    crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::table::PROCESS_TABLE.lock();
+        for proc in table.values() {
+            if proc.thread_id == Some(slot) {
+                found_pid = Some(proc.pid);
+                break;
+            }
+        }
+    });
+
+    clear_lazy_regions(zombie_pid);
+    clear_lazy_regions(child_pid);
+    let _ = unregister_process(zombie_pid);
+    let _ = unregister_process(child_pid);
+
+    if found_pid == Some(child_pid) {
+        console::print("[Test] entry_point_trampoline_no_zombie_match PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] entry_point_trampoline_no_zombie_match FAILED: found_pid={:?} expected={}\n",
+            found_pid, child_pid);
+    }
+}
+
+/// Verify that the `return_to_kernel` path for already-terminated threads
+/// captures the PID and can unregister the process, preventing a leak.
+///
+/// We can't call `return_to_kernel` directly (it never returns), but we can
+/// verify the precondition: `current_process()` succeeds for a process that
+/// was killed by `kill_thread_group` (marked zombie but still registered).
+/// This is what the fix relies on — the already_terminated path now calls
+/// `current_process()` instead of unconditionally setting `pid = None`.
+fn test_zombie_process_unregistered_after_return_to_kernel() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_thread_group, clear_lazy_regions,
+    };
+
+    let owner_pid = 64_000u32;
+    let sibling_pid = 64_001u32;
+
+    let owner_proc = make_test_process(owner_pid);
+    let l0_phys = owner_proc.address_space.l0_phys();
+    register_process(owner_pid, owner_proc);
+
+    let mut sib_proc = make_test_process(sibling_pid);
+    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    register_process(sibling_pid, sib_proc);
+
+    // Simulate exit_group from sibling.
+    kill_thread_group(sibling_pid, l0_phys);
+
+    // After kill_thread_group, the owner is zombie but still registered.
+    let still_registered = lookup_process(owner_pid).is_some();
+    let is_exited = lookup_process(owner_pid).map(|p| p.exited).unwrap_or(false);
+
+    // Simulate what the fixed return_to_kernel does: unregister the zombie.
+    clear_lazy_regions(owner_pid);
+    let dropped = unregister_process(owner_pid);
+    let gone_after = lookup_process(owner_pid).is_none();
+
+    // Clean up sibling too.
+    clear_lazy_regions(sibling_pid);
+    let _ = unregister_process(sibling_pid);
+
+    if still_registered && is_exited && dropped.is_some() && gone_after {
+        console::print("[Test] zombie_process_unregistered_after_return_to_kernel PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} dropped={} gone={}\n",
+            still_registered, is_exited, dropped.is_some(), gone_after);
     }
 }

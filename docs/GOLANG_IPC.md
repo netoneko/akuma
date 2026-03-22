@@ -411,3 +411,86 @@ scheduler never re-schedules the thread.
 
 Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
 The compile step should no longer crash with exit status 137.
+
+---
+
+## Process identity collision after kill_thread_group (SIGSEGV at 0x6006c15c)
+
+### Symptom
+
+After the lazy-region and schedule_blocking fixes above, the same
+`fault_pc=0x6006c15c` crash still occurs.  The Go `compile` tool exits with
+code 137 approximately 600 ms after a sibling thread calls `exit_group(2)`.
+Thread recycling logs show the original thread slot was freed within ~80 ms,
+yet the SIGSEGV fires much later — on a **new** process that was spawned on
+the same recycled slot.
+
+The build output also shows corrupted Go cache entries:
+
+```
+could not import internal/cpu (not the start of an archive file ...)
+```
+
+This is a downstream effect: the previous compile process was killed mid-write,
+leaving a truncated `.a` file in the Go build cache.
+
+### Root cause
+
+`kill_thread_group` marks the address-space owner as `Zombie(137)` but does
+**not** clear `proc.thread_id`.  The subsequent `return_to_kernel` for the
+already-terminated thread sets `pid = None` (skip path) and never calls
+`unregister_process`, so the zombie process **leaks** in `PROCESS_TABLE` with
+a stale `thread_id = Some(slot)`.
+
+When a new child is spawned on the same slot via `fork_process`, both the
+leaked zombie and the new child have `thread_id = Some(slot)`.
+`entry_point_trampoline` scans `PROCESS_TABLE` (a `BTreeMap`, iterated in
+ascending PID order) and finds the leaked zombie **first** (lower PID).  The
+new child thread calls `zombie.run()`, activating the **stale** address space
+with stale user context.  The Go runtime resumes in a corrupted state and
+branches to `0x6006c15c` (kernel identity RAM, UXN in user tables) — SIGSEGV.
+
+The real child process (higher PID) never runs.  If the parent used
+`CLONE_VFORK`, it blocks forever waiting for `vfork_complete` that never fires.
+
+### Affected code paths
+
+- `kill_thread_group` in `crates/akuma-exec/src/process/mod.rs` — sets
+  `proc.exited`, `proc.state = Zombie(137)` but leaves `proc.thread_id` intact.
+- `return_to_kernel` — the `already_terminated = true` branch unconditionally
+  sets `pid = None`, skipping `unregister_process`.  Designed for `kill_process`
+  (which unregisters before terminating), but `kill_thread_group` does not.
+- `entry_point_trampoline` — linear scan of `PROCESS_TABLE.values_mut()` for
+  `proc.thread_id == Some(tid)`.  BTreeMap order means lower (stale) PIDs win.
+
+### Fix (2026-03-22)
+
+**Fix 1 (`crates/akuma-exec/src/process/mod.rs` — `kill_thread_group`):**
+Added `proc.thread_id = None` when marking each sibling as `Zombie(137)`.
+This prevents `entry_point_trampoline` from matching the zombie when scanning
+`PROCESS_TABLE` by `thread_id`.
+
+**Fix 2 (`crates/akuma-exec/src/process/mod.rs` — `return_to_kernel`):**
+Removed the `already_terminated` shortcut that unconditionally set `pid = None`.
+Now `current_process()` is always called.  For `kill_process` (which
+unregisters before terminating) it returns `None` naturally — no behaviour
+change.  For `kill_thread_group` (zombie still registered) it returns the PID
+so the process is properly unregistered, fixing the memory/identity leak.
+
+### Kernel tests (in `src/process_tests.rs`)
+
+- `test_kill_thread_group_clears_thread_id` — registers owner + sibling with
+  shared `l0_phys`, calls `kill_thread_group`, asserts that the owner's
+  `thread_id` is `None` afterward.
+- `test_entry_point_trampoline_no_zombie_match` — registers a zombie (cleared
+  `thread_id`) and a live child on the same slot.  Replicates the
+  `entry_point_trampoline` scan and asserts only the child is found.
+- `test_zombie_process_unregistered_after_return_to_kernel` — verifies a
+  zombie left by `kill_thread_group` is still registered and can be
+  unregistered (the precondition the `return_to_kernel` fix relies on).
+
+### Verification
+
+Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
+The compile step should no longer crash with exit status 137, and the
+`CLONE_VFORK` parent should not hang.
