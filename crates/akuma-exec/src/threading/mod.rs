@@ -2165,7 +2165,13 @@ pub fn schedule_blocking(wake_time_us: u64) {
         // Double check sticky wake flag in loop
         if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
             WAKE_TIMES[tid].store(0, Ordering::SeqCst);
-            THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            // Don't overwrite TERMINATED — kill_thread_group may have marked
+            // this thread terminated while we were waiting. Resuming as
+            // RUNNING would let the thread return to user mode with freed
+            // resources (lazy regions cleared, fds closed).
+            if THREAD_STATES[tid].load(Ordering::SeqCst) != thread_state::TERMINATED {
+                THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            }
             break;
         }
 

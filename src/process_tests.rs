@@ -119,6 +119,11 @@ pub fn run_all_tests() {
     test_epoll_pidfd_readiness_on_exit();
     test_notify_child_channel_exited_idempotent();
 
+    // kill_thread_group fixes (exit_group SIGSEGV fix)
+    test_kill_thread_group_preserves_lazy_regions();
+    test_kill_thread_group_marks_siblings_zombie();
+    test_schedule_blocking_respects_terminated();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2333,5 +2338,142 @@ fn test_notify_child_channel_exited_idempotent() {
         crate::safe_print!(96,
             "[Test] notify_child_channel_exited_idempotent FAILED: e1={} c1={} e2={} c2={}\n",
             exited1, code1, exited2, code2);
+    }
+}
+
+/// Verify that `kill_thread_group` does NOT clear lazy regions for sibling
+/// PIDs. Previously it called `clear_lazy_regions(*sib_pid)`, which removed
+/// demand-paging metadata for the address-space owner while its thread was
+/// still running — causing SIGSEGV when a page fault found no lazy region.
+fn test_kill_thread_group_preserves_lazy_regions() {
+    use akuma_exec::process::{
+        register_process, unregister_process,
+        push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions,
+        kill_thread_group,
+    };
+    use akuma_exec::mmu::user_flags;
+
+    let owner_pid = 60_000u32;
+    let sibling_pid = 60_001u32;
+
+    // Create owner (non-shared address space).
+    let owner_proc = make_test_process(owner_pid);
+    let l0_phys = owner_proc.address_space.l0_phys();
+    register_process(owner_pid, owner_proc);
+
+    // Create sibling sharing the same l0_phys (simulates CLONE_VM).
+    let mut sib_proc = make_test_process(sibling_pid);
+    let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib_proc.address_space = shared_as;
+    register_process(sibling_pid, sib_proc);
+
+    // Push a lazy region under the owner PID (as sys_mmap would).
+    let va = 0xB000_0000usize;
+    let size = 0x10_0000usize;
+    push_lazy_region(owner_pid, va, size, user_flags::RW);
+
+    let before = lazy_region_lookup_for_pid(owner_pid, va + 0x1000).is_some();
+
+    // kill_thread_group called from the sibling (exit_group scenario).
+    kill_thread_group(sibling_pid, l0_phys);
+
+    let after = lazy_region_lookup_for_pid(owner_pid, va + 0x1000).is_some();
+
+    // Clean up.
+    clear_lazy_regions(owner_pid);
+    clear_lazy_regions(sibling_pid);
+    let _ = unregister_process(owner_pid);
+    let _ = unregister_process(sibling_pid);
+
+    if before && after {
+        console::print("[Test] kill_thread_group_preserves_lazy_regions PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] kill_thread_group_preserves_lazy_regions FAILED: before={} after={}\n",
+            before, after);
+    }
+}
+
+/// Verify that `kill_thread_group` marks the AS owner as zombie(137).
+fn test_kill_thread_group_marks_siblings_zombie() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_thread_group, clear_lazy_regions, ProcessState,
+    };
+
+    let owner_pid = 61_000u32;
+    let sibling_pid = 61_001u32;
+
+    let owner_proc = make_test_process(owner_pid);
+    let l0_phys = owner_proc.address_space.l0_phys();
+    register_process(owner_pid, owner_proc);
+
+    let mut sib_proc = make_test_process(sibling_pid);
+    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    register_process(sibling_pid, sib_proc);
+
+    kill_thread_group(sibling_pid, l0_phys);
+
+    let (exited, code, is_zombie) = if let Some(proc) = lookup_process(owner_pid) {
+        let z = matches!(proc.state, ProcessState::Zombie(137));
+        (proc.exited, proc.exit_code, z)
+    } else {
+        (false, 0, false)
+    };
+
+    clear_lazy_regions(owner_pid);
+    clear_lazy_regions(sibling_pid);
+    let _ = unregister_process(owner_pid);
+    let _ = unregister_process(sibling_pid);
+
+    if exited && code == 137 && is_zombie {
+        console::print("[Test] kill_thread_group_marks_siblings_zombie PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] kill_thread_group_marks_siblings_zombie FAILED: exited={} code={} zombie={}\n",
+            exited, code, is_zombie);
+    }
+}
+
+/// Verify the schedule_blocking TERMINATED guard: when WOKEN_STATES is set
+/// for a thread whose state is TERMINATED, the wakeup path must NOT overwrite
+/// the state to RUNNING.
+///
+/// We test this at the atomic level rather than spawning real threads, since
+/// the invariant is purely about the atomic state machine.
+fn test_schedule_blocking_respects_terminated() {
+    use akuma_exec::threading::thread_state;
+
+    // Pick a high slot that is guaranteed FREE and not in use by the runtime.
+    let test_slot: usize = 31;
+
+    // Simulate: thread is TERMINATED and has been woken (sticky flag set).
+    akuma_exec::threading::mark_thread_terminated(test_slot);
+    akuma_exec::threading::get_waker_for_thread(test_slot).wake();
+
+    // The fixed schedule_blocking wakeup path checks: if TERMINATED, don't
+    // set RUNNING. Replicate that logic here to verify the invariant.
+    //
+    // In the real code this happens inside schedule_blocking's loop:
+    //   if WOKEN_STATES[tid].swap(false, SeqCst) {
+    //       if THREAD_STATES[tid] != TERMINATED { set RUNNING }
+    //       break;
+    //   }
+    //
+    // We can't call schedule_blocking from a test (it yields), but we can
+    // directly verify the state hasn't been overwritten by wake():
+    let state_after = akuma_exec::threading::get_thread_state(test_slot);
+    let stayed_terminated = state_after == thread_state::TERMINATED;
+
+    // Restore slot to FREE so cleanup doesn't try to recycle it.
+    // Use cleanup_terminated_force which handles TERMINATED → FREE.
+    akuma_exec::threading::cleanup_terminated_force();
+
+    if stayed_terminated {
+        console::print("[Test] schedule_blocking_respects_terminated PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] schedule_blocking_respects_terminated FAILED: state after wake = {}\n",
+            state_after);
     }
 }

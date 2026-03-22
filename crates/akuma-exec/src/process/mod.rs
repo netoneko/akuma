@@ -610,7 +610,11 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
         if let Some(proc) = lookup_process(*sib_pid) {
             cleanup_process_fds(proc);
         }
-        clear_lazy_regions(*sib_pid);
+        // DO NOT clear lazy regions here. For CLONE_VM threads the lazy regions
+        // are keyed by the address-space owner PID, so clearing them while
+        // sibling threads are still executing removes demand-paging metadata
+        // for the entire shared address space. Each thread's return_to_kernel
+        // path clears its own lazy regions after deactivating the address space.
 
         if let Some(tid) = sib_tid {
             // DO NOT remove from THREAD_PID_MAP yet - wait for cleanup_callback

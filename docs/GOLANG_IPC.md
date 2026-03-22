@@ -350,3 +350,64 @@ result as soon as the process decides to exit, eliminating the race window.
 
 Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
 The build should progress past the step where it previously hung.
+
+---
+
+## SIGSEGV after exit_group in CLONE_THREAD group
+
+### Symptom
+
+`compile` (pid 138) crashes with SIGSEGV at `fault_pc=0x6006c15c` (kernel
+identity RAM, UXN) and exits with code 137.  The crash happens ~190 ms after a
+sibling thread (pid 141) calls `exit_group(0)`.  The Go build reports
+`exit status 137`.
+
+### Root cause
+
+Two bugs combine to let a killed thread continue running user code with its
+demand-paging metadata removed.
+
+**Bug 1 — premature `clear_lazy_regions` in `kill_thread_group`.**
+`kill_thread_group` called `clear_lazy_regions(*sib_pid)` for every sibling,
+including the address-space owner.  For CLONE_VM threads the lazy regions are
+keyed by the AS owner PID (via `read_current_pid()` from the shared process
+info page).  Clearing the owner's lazy regions removes ALL demand-paging
+metadata for the entire shared address space while sibling threads are still
+executing and may touch pages that haven't been faulted in yet.
+
+**Bug 2 — `schedule_blocking` overwrites TERMINATED with RUNNING.**
+When a thread is in `schedule_blocking` (WAITING state) and `kill_thread_group`
+marks it TERMINATED then sets `WOKEN_STATES[tid] = true`, the
+`schedule_blocking` loop unconditionally set `THREAD_STATES[tid] = RUNNING` —
+overwriting TERMINATED.  The thread then returns from the syscall, re-enters
+user mode, and runs Go code with no demand-paging metadata.  A page fault fails
+(no lazy region), cascading into a wild branch to `0x6006c15c` and SIGSEGV.
+
+### Fix (2026-03-22)
+
+**Fix 1 (`crates/akuma-exec/src/process/mod.rs`):**
+Removed `clear_lazy_regions(*sib_pid)` from the `kill_thread_group` sibling
+loop.  Lazy regions are metadata in a BTreeMap — they don't consume physical
+memory and are cleaned up later by each thread's `return_to_kernel` path.
+
+**Fix 2 (`crates/akuma-exec/src/threading/mod.rs`):**
+Added a TERMINATED guard in `schedule_blocking`'s wakeup path: before setting
+`THREAD_STATES[tid] = RUNNING`, the code now checks whether the state was
+changed to TERMINATED.  If so it breaks without overwriting, ensuring the
+scheduler never re-schedules the thread.
+
+### Kernel tests (in `src/process_tests.rs`)
+
+- `test_kill_thread_group_preserves_lazy_regions` — registers owner + sibling
+  with shared l0_phys, pushes lazy regions under the owner PID, calls
+  `kill_thread_group`, asserts the owner's lazy regions survive.
+- `test_kill_thread_group_marks_siblings_zombie` — verifies the owner is marked
+  zombie(137) with `exited = true` after `kill_thread_group`.
+- `test_schedule_blocking_respects_terminated` — sets a thread slot to
+  TERMINATED and wakes it, verifies the state stays TERMINATED (wake does not
+  overwrite to RUNNING).
+
+### Verification
+
+Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
+The compile step should no longer crash with exit status 137.
