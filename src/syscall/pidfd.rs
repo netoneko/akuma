@@ -7,7 +7,7 @@ struct KernelPidFd {
 static PIDFD_TABLE: Spinlock<BTreeMap<u32, KernelPidFd>> = Spinlock::new(BTreeMap::new());
 static NEXT_PIDFD_ID: AtomicU32 = AtomicU32::new(1);
 
-fn pidfd_create(target_pid: u32) -> u32 {
+pub(crate) fn pidfd_create(target_pid: u32) -> u32 {
     let id = NEXT_PIDFD_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         PIDFD_TABLE.lock().insert(id, KernelPidFd { target_pid });
@@ -22,7 +22,7 @@ pub(super) fn pidfd_get_pid(id: u32) -> Option<u32> {
 }
 
 /// Returns true when the tracked process has exited (pidfd becomes EPOLLIN-readable).
-pub(super) fn pidfd_can_read(id: u32) -> bool {
+pub(crate) fn pidfd_can_read(id: u32) -> bool {
     let pid = match pidfd_get_pid(id) {
         Some(p) => p,
         None => return true, // stale pidfd — report as readable so callers unblock

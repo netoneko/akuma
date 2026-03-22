@@ -7,6 +7,17 @@ use akuma_net::socket::libc_errno;
 // same address space, causing memory corruption.
 static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>> = Spinlock::new(BTreeMap::new());
 
+/// Mark the child channel as exited so `pidfd_can_read` and `find_exited_child`
+/// return immediately.  Called from `sys_exit` / `sys_exit_group` — before
+/// `return_to_kernel` runs — so the parent's epoll + pidfd / wait4 path sees
+/// the exit without a 10ms polling delay.  `set_exited` is idempotent; the
+/// second call from `return_to_kernel` is harmless.
+fn notify_child_channel_exited(pid: u32, code: i32) {
+    if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
+        ch.set_exited(code);
+    }
+}
+
 /// Wake the vfork parent (if any) of the given child PID.
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
@@ -178,6 +189,7 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
+        notify_child_channel_exited(pid, code);
         vfork_complete(pid);
     }
     code as u64
@@ -200,6 +212,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
+        notify_child_channel_exited(pid, code);
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later

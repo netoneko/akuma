@@ -278,3 +278,75 @@ object.
     M-thread wake, goroutines never ran
   - Fix: `(tgid, uaddr)` key in FUTEX_WAITERS, scoping private futex per process
   - Testing pending: boot updated kernel and run `go build`
+
+---
+
+## Post-success hang: parent epoll vs child exit (2026-03-22)
+
+### Symptom
+
+After the SIGSEGV and futex fixes, `compile` now runs to completion and calls
+`exit_group` with code 0.  However `go build` hangs **after** a successful
+`compile` — the parent `go` process never progresses to the next build step
+(`asm`, `link`, or next `compile` invocation).
+
+This is **distinct** from the stuck-compile symptom documented above: here the
+child exits cleanly, but the parent is not notified in time.
+
+### Capture checklist
+
+To reproduce and diagnose, boot Akuma and run:
+
+```
+CGO_ENABLED=0 go build -x -v -o ./hello_go .
+```
+
+While hung, SSH in and capture:
+
+1. `cat /proc/<go_pid>/syscalls` — expected: `epoll_pwait` (22) or
+   `nanosleep` (101) in a loop.
+2. `ps` output — note which PIDs exist and their states.
+3. The last `-x` line printed before the stall (identifies which build step
+   was being attempted).
+4. `cat /proc/<go_pid>/fd/*` — check which fds are open (pipes, pidfds,
+   eventfds).
+
+### Root cause
+
+`ProcessChannel::set_exited()` was called only in `return_to_kernel()` — after
+`sys_exit_group()` had already closed all FDs (pipes) and called
+`vfork_complete()`.  This left a race window where:
+
+1. Pipes are closed → parent's epoll sees EPOLLIN/EOF on the pipe read end.
+2. Parent calls `wait4(-1, WNOHANG)` or checks the pidfd — but
+   `ch.has_exited()` is still false because `set_exited` hasn't been called yet.
+3. `pidfd_can_read()` returns false → epoll EPOLLET edge never fires for pidfd.
+4. Parent loops in epoll, polling every 10ms, but the pidfd transition from
+   not-ready to ready may be missed if `return_to_kernel` runs between the
+   snapshot and the readiness update in the same iteration.
+
+### Fix (2026-03-22, `src/syscall/proc.rs`)
+
+Call `set_exited()` on the child channel **in `sys_exit` and `sys_exit_group`**
+immediately after marking the process as Zombie — before closing FDs and before
+`vfork_complete`.  `set_exited` is idempotent, so the second call from
+`return_to_kernel` is harmless.
+
+This ensures `pidfd_can_read()` and `find_exited_child()` return the correct
+result as soon as the process decides to exit, eliminating the race window.
+
+### Kernel tests (in `src/process_tests.rs`)
+
+- `test_pidfd_can_read_after_set_exited` — pidfd is not readable before
+  `set_exited`, readable after.
+- `test_two_child_sequential_exit` — two children registered to the same
+  parent; exit in order; `find_exited_child` returns the correct one each time.
+- `test_epoll_pidfd_readiness_on_exit` — synthetic `epoll_check_fd_readiness`
+  on a `PidFd` entry: returns 0 before exit, EPOLLIN after.
+- `test_notify_child_channel_exited_idempotent` — calling `set_exited` twice
+  (as `sys_exit_group` + `return_to_kernel` now do) is safe.
+
+### Verification
+
+Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
+The build should progress past the step where it previously hung.

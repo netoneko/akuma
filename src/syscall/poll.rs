@@ -160,7 +160,7 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
     }
 }
 
-fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
+pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
     let fd_entry = akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num));
     let fd_entry = match fd_entry {
         Some(e) => e,

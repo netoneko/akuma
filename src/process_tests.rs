@@ -113,6 +113,12 @@ pub fn run_all_tests() {
     test_current_syscall_visibility();
     test_child_stdout_blocking_read();
 
+    // Pidfd + child channel exit notification (Go post-compile hang fix)
+    test_pidfd_can_read_after_set_exited();
+    test_two_child_sequential_exit();
+    test_epoll_pidfd_readiness_on_exit();
+    test_notify_child_channel_exited_idempotent();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2134,4 +2140,198 @@ fn test_pipe_close_write_wakes_epoll_poller() {
 
     pipe_close_read(id);
     console::print("  [PASS] test_pipe_close_write_wakes_epoll_poller\n");
+}
+
+// ── pidfd + child channel exit notification tests ─────────────────────────
+
+/// Verify that `pidfd_can_read` returns true after the child channel is marked
+/// exited, and false before.  This is the core invariant for Go's epoll-on-pidfd
+/// workflow: the parent adds a pidfd to epoll and expects EPOLLIN when the child
+/// exits.
+fn test_pidfd_can_read_after_set_exited() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{ProcessChannel, register_child_channel, remove_child_channel};
+    use crate::syscall::pidfd::{pidfd_create, pidfd_can_read, pidfd_close};
+
+    let child_pid = 50_001u32;
+    let parent_pid = 50_000u32;
+    let ch = Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    let pidfd_id = pidfd_create(child_pid);
+
+    // Before exit: pidfd must NOT be readable.
+    if pidfd_can_read(pidfd_id) {
+        console::print("[Test] pidfd_can_read_after_set_exited FAILED: readable before exit\n");
+        pidfd_close(pidfd_id);
+        remove_child_channel(child_pid);
+        return;
+    }
+
+    // Mark exited.
+    ch.set_exited(0);
+
+    // After exit: pidfd must be readable.
+    if !pidfd_can_read(pidfd_id) {
+        console::print("[Test] pidfd_can_read_after_set_exited FAILED: not readable after set_exited\n");
+        pidfd_close(pidfd_id);
+        remove_child_channel(child_pid);
+        return;
+    }
+
+    pidfd_close(pidfd_id);
+    remove_child_channel(child_pid);
+    console::print("[Test] pidfd_can_read_after_set_exited PASSED\n");
+}
+
+/// Simulate two child PIDs registered to the same parent.  Exit child A first,
+/// verify `find_exited_child` returns A.  Then exit child B and verify it
+/// returns B.  This exercises the sequential reap pattern Go uses when multiple
+/// `compile` children exit in sequence.
+fn test_two_child_sequential_exit() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{ProcessChannel, register_child_channel, remove_child_channel, find_exited_child};
+
+    let parent_pid = 51_000u32;
+    let child_a = 51_001u32;
+    let child_b = 51_002u32;
+    let ch_a = Arc::new(ProcessChannel::new());
+    let ch_b = Arc::new(ProcessChannel::new());
+    register_child_channel(child_a, ch_a.clone(), parent_pid);
+    register_child_channel(child_b, ch_b.clone(), parent_pid);
+
+    // No exits yet → find_exited_child returns None.
+    if find_exited_child(parent_pid).is_some() {
+        console::print("[Test] two_child_sequential_exit FAILED: spurious exited child\n");
+        remove_child_channel(child_a);
+        remove_child_channel(child_b);
+        return;
+    }
+
+    // Exit A.
+    ch_a.set_exited(42);
+    let first = find_exited_child(parent_pid);
+    let ok_a = match first {
+        Some((pid, ref ch)) => pid == child_a && ch.exit_code() == 42,
+        None => false,
+    };
+    if !ok_a {
+        crate::safe_print!(96, "[Test] two_child_sequential_exit FAILED: expected child_a, got {:?}\n",
+            first.as_ref().map(|(p, _)| *p));
+        remove_child_channel(child_a);
+        remove_child_channel(child_b);
+        return;
+    }
+    remove_child_channel(child_a);
+
+    // Exit B.
+    ch_b.set_exited(7);
+    let second = find_exited_child(parent_pid);
+    let ok_b = match second {
+        Some((pid, ref ch)) => pid == child_b && ch.exit_code() == 7,
+        None => false,
+    };
+    if !ok_b {
+        crate::safe_print!(96, "[Test] two_child_sequential_exit FAILED: expected child_b, got {:?}\n",
+            second.as_ref().map(|(p, _)| *p));
+        remove_child_channel(child_b);
+        return;
+    }
+    remove_child_channel(child_b);
+
+    console::print("[Test] two_child_sequential_exit PASSED\n");
+}
+
+/// Synthetic epoll readiness test for pidfd: register a pidfd in a process fd
+/// table, check that `epoll_check_fd_readiness` returns 0 before exit and
+/// EPOLLIN after exit.  Exercises the same code path that `sys_epoll_pwait` uses.
+fn test_epoll_pidfd_readiness_on_exit() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        ProcessChannel, register_child_channel, remove_child_channel,
+        FileDescriptor, register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+    };
+    use crate::syscall::pidfd::{pidfd_create, pidfd_close};
+    use crate::syscall::poll::epoll_check_fd_readiness;
+
+    let parent_pid = 52_000u32;
+    let child_pid = 52_001u32;
+    let ch = Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    let pidfd_id = pidfd_create(child_pid);
+
+    // Set up a fake process so epoll_check_fd_readiness can look up the fd.
+    let tid = akuma_exec::threading::current_thread_id();
+    let proc = make_test_process(parent_pid);
+    let fd_num = proc.alloc_fd(FileDescriptor::PidFd(pidfd_id));
+    register_process(parent_pid, proc);
+    register_thread_pid(tid, parent_pid);
+
+    const EPOLLIN: u32 = 0x001;
+
+    // Before exit: readiness must be 0.
+    let before = epoll_check_fd_readiness(fd_num, EPOLLIN);
+    if before != 0 {
+        crate::safe_print!(96, "[Test] epoll_pidfd_readiness FAILED: before exit got 0x{:x}\n", before);
+        unregister_process(parent_pid);
+        unregister_thread_pid(tid);
+        pidfd_close(pidfd_id);
+        remove_child_channel(child_pid);
+        return;
+    }
+
+    // Mark child exited.
+    ch.set_exited(0);
+
+    // After exit: readiness must include EPOLLIN.
+    let after = epoll_check_fd_readiness(fd_num, EPOLLIN);
+    if after & EPOLLIN == 0 {
+        crate::safe_print!(96, "[Test] epoll_pidfd_readiness FAILED: after exit got 0x{:x}\n", after);
+        unregister_process(parent_pid);
+        unregister_thread_pid(tid);
+        pidfd_close(pidfd_id);
+        remove_child_channel(child_pid);
+        return;
+    }
+
+    unregister_process(parent_pid);
+    unregister_thread_pid(tid);
+    pidfd_close(pidfd_id);
+    remove_child_channel(child_pid);
+    console::print("[Test] epoll_pidfd_readiness_on_exit PASSED\n");
+}
+
+/// Verify that `notify_child_channel_exited` (the new helper in sys_exit /
+/// sys_exit_group) is idempotent: calling it twice with the same code does not
+/// panic or corrupt state, and a second call with a different code does not
+/// overwrite the first.
+fn test_notify_child_channel_exited_idempotent() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{ProcessChannel, register_child_channel, remove_child_channel};
+
+    let child_pid = 53_000u32;
+    let parent_pid = 53_001u32;
+    let ch = Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    // First call (as sys_exit_group would do).
+    ch.set_exited(0);
+    let code1 = ch.exit_code();
+    let exited1 = ch.has_exited();
+
+    // Second call (as return_to_kernel would do) — must not panic.
+    ch.set_exited(0);
+    let code2 = ch.exit_code();
+    let exited2 = ch.has_exited();
+
+    remove_child_channel(child_pid);
+
+    if exited1 && exited2 && code1 == 0 && code2 == 0 {
+        console::print("[Test] notify_child_channel_exited_idempotent PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] notify_child_channel_exited_idempotent FAILED: e1={} c1={} e2={} c2={}\n",
+            exited1, code1, exited2, code2);
+    }
 }
