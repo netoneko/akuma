@@ -453,7 +453,6 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
-            // Allocate kernel buffer and copy safely
             let mut buf = alloc::vec![0u8; count];
             if unsafe { copy_from_user_safe(buf.as_mut_ptr(), buf_ptr as *const u8, count).is_err() } {
                 return EFAULT;
@@ -478,7 +477,11 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // `fd` itself never reflects those updates. Track write_pos independently so
     // multi-chunk writes advance the offset correctly instead of overwriting offset 0.
     let mut write_pos = if let akuma_exec::process::FileDescriptor::File(ref f) = fd {
-        f.position
+        if f.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
+            crate::fs::file_size(&f.path).unwrap_or(0) as usize
+        } else {
+            f.position
+        }
     } else {
         0
     };
@@ -541,7 +544,14 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 match crate::fs::write_at(&f.path, write_pos, buf_slice) {
                     Ok(n) => {
                         write_pos += n;
-                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                        let new_pos = write_pos;
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
+                            if file.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
+                                file.position = new_pos;
+                            } else {
+                                file.position += n;
+                            }
+                        });
                         n as u64
                     }
                     Err(_) => {

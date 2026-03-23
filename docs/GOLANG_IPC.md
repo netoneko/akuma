@@ -896,34 +896,78 @@ readable form.
 
 ---
 
-## `compile` SIGSEGV → corrupt `internal/cpu` cache → “not the start of an archive”
+## `O_APPEND` not honoured in `sys_write` (2026-03-22) — **FIXED**
+
+### Symptom
+
+Go packages with assembly (e.g. `internal/cpu`, `internal/abi`, `sync/atomic`)
+fail with:
+
+```
+could not import internal/cpu (not the start of an archive file ("cpu.o  0  0  0  644  238  `\n"))
+```
+
+Dependent packages cascade-fail.  The Go driver kills blocked compiles,
+producing `exit status 137`.
+
+### Root cause
+
+Go’s `pack r` tool appends `.o` members to an existing `_pkg_.a` archive by
+opening it with `O_WRONLY|O_APPEND|O_CLOEXEC` (`flags=0x80401`) and writing
+the new ar member.  The kernel’s `sys_write` implementation ignored the
+`O_APPEND` flag entirely — writes always started at the file descriptor’s
+current `position` (typically 0 for a freshly opened file).  This overwrote
+the `!<arch>\n` header with the `.o` member header (e.g. `cpu.o  0  0 ...`),
+corrupting the archive.
+
+### Fix (2026-03-22, `src/syscall/fs.rs`)
+
+In the `sys_write` handler for `FileDescriptor::File`, when the `O_APPEND`
+flag is set, the initial write position is now set to the current file size
+(via `crate::fs::file_size`) instead of the fd’s stored `position`.  After the
+write, the fd position is updated to the new end-of-file.
+
+### Verification (runtime evidence from `[PACK-DBG]` instrumentation)
+
+Before fix: `pack r` opened archives with `O_APPEND` but writes went to
+`pos=0`, overwriting the `!<arch>\n` header.
+
+After fix, all 8 packages with assembly correctly append:
+
+```
+[PACK-DBG] openat path=.../b011/_pkg_.a fd=6 flags=0x80401 size=96998 pid=59
+[PACK-DBG] write  path=.../b011/_pkg_.a pos=96998 len=2990 first8=0x2020206f2e757063
+                                         ^^^^^^^^ = file size (appending, not overwriting)
+```
+
+Subsequent reads show `first8=0x0a3e686372613c21` (`!<arch>\n`) — archive
+header preserved.  57/57 compile and asm tool invocations exit with code=0.
+Zero “not the start of an archive file” errors.  Zero “exit status 137”.
+
+### Host-runnable tests
+
+- `akuma-vfs::tests::memfs_tests::write_at_file_size_simulates_o_append` —
+  simulates `pack r` append pattern on MemoryFilesystem.
+- `akuma-vfs::tests::memfs_tests::write_at_zero_overwrites` — confirms
+  offset-0 writes correctly overwrite (not append).
+- `akuma-ext2::tests::write_at_file_size_appends_without_overwriting` —
+  same pattern on ext2, confirming the filesystem layer was correct and the
+  bug was in the syscall layer.
+
+---
+
+## `compile` SIGSEGV → corrupt cache → “not the start of an archive” (historical)
+
+**Note:** The primary cause of “not the start of an archive file” errors was
+the missing `O_APPEND` support documented above.  This section documents a
+secondary path that can produce the same symptom when a `compile` process
+crashes mid-write.
 
 ### Symptom chain
 
-1. **`/usr/lib/go/pkg/tool/linux_arm64/compile` crashes** with `SIGSEGV` while
-   building an early std package (log often shows `internal/abi` first).
-   `PC=0x20000000` / `fault=0xc40f…` means the **compiler tool** took a bad
-   branch or hit bad memory — not a Go source error.
-
-2. A **partial or corrupt** object/archive is written under **`GOCACHE`**
-   (default `/.cache/go-build/.../...-d` on Akuma).  The next package that
-   imports `internal/cpu` opens that cached path; it is **not** a valid
-   `!<arch>` archive, so the compiler prints:
-
-   `could not import internal/cpu (not the start of an archive file ("cpu.o …"))`
-
-   The quoted `cpu.o … 644 …` fragment looks like **ar** member header / listing
-   text, not a valid archive header — consistent with **garbage or truncated**
-   cache bytes after a crash.
-
-3. **Cascade**: `internal/bytealg`, `internal/chacha8rand`, etc. all fail on the
-   same bad `packagefile internal/cpu=...` line (often **`$WORK/b011/_pkg_.a`**
-   in the **`-x`** log, not only `/.cache/go-build/...`).  The driver can show
-   **`internal/cpu`** as fully built (`go tool pack`, `buildid -w`, **`cp`** to
-   `GOCACHE`) **right before** the failure — the archive on disk is still not a
-   valid `!<arch>` when the **next** `compile` opens it (truncation, partial
-   write, or stale inode read).  Later packages (`math`) may report
-   `compile: exit status 137` when the driver kills the broken tool.
+1. **`compile` crashes** with `SIGSEGV` while building an early std package.
+2. A **partial or corrupt** archive is written under `GOCACHE`.
+3. **Cascade**: dependent packages fail on the bad cached archive.
 
 **Distinguish from orphan / pthread cleanup:** **`error obtaining buildID for go tool compile: exit status 137`**
 right after a kernel change often means **`compile -V=full` was torn down while
@@ -932,16 +976,9 @@ archive.
 
 ### What to do
 
-- **After this error** (even if `internal/cpu` looked successful on `-x`),
-  delete **`$(go env GOCACHE)`** **and** the **`WORK`** tree from the log line
-  `WORK=/tmp/go-build…` (or `rm -rf /tmp/go-build*`) so the next build does not
-  reopen a bad `_pkg_.a` under `$WORK/b011/`.
-- **After any `compile` SIGSEGV**, treat the whole **`GOCACHE` tree** as
-  suspect: delete it (see below) before rebuilding; `go clean -cache` alone
-  may not remove paths if deletes fail.
-- **Root cause** of the SIGSEGV is a **kernel / host** issue for the
-  `compile` binary (demand paging, permissions, bad PC, JIT assumptions), not
-  the Go sources; track it like any other user crash in `compile`.
+- Delete **`$(go env GOCACHE)`** and `rm -rf /tmp/go-build*` before rebuilding.
+- **Root cause** of SIGSEGV crashes is a **kernel** issue (demand paging,
+  icache coherency); see *Demand-paging icache invalidation bug* above.
 
 ### Why `rm -rf /.cache` only removes some files
 

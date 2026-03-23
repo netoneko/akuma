@@ -517,3 +517,27 @@ fn remove_file_on_dir_fails() {
     let err = fs.remove_file("/adir").unwrap_err();
     assert_eq!(err, akuma_vfs::FsError::NotAFile);
 }
+
+/// Simulates the O_APPEND pattern: write initial archive data, then append at
+/// the file size (exactly what Go's `pack r` does with _pkg_.a files).
+#[test]
+fn write_at_file_size_appends_without_overwriting() {
+    let fs = mount_empty();
+    let header = b"!<arch>\n";
+    let original = b"__.PKGDEF compile output";
+    let mut initial = vec![];
+    initial.extend_from_slice(header);
+    initial.extend_from_slice(original);
+    fs.write_file("/pkg.a", &initial).unwrap();
+
+    let meta = fs.metadata("/pkg.a").unwrap();
+    assert_eq!(meta.size as usize, initial.len());
+
+    let appended = b"cpu.o member data";
+    fs.write_at("/pkg.a", initial.len(), appended).unwrap();
+
+    let result = fs.read_file("/pkg.a").unwrap();
+    assert_eq!(&result[..8], b"!<arch>\n", "header must survive");
+    assert_eq!(result.len(), initial.len() + appended.len());
+    assert_eq!(&result[initial.len()..], appended);
+}

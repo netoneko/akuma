@@ -268,4 +268,41 @@ mod memfs_tests {
         assert_eq!(s.block_size, 4096);
         assert_eq!(s.total_blocks, 100);
     }
+
+    /// Simulates O_APPEND: write initial data, then append using write_at at file size.
+    /// This is exactly what Go's `pack r` does with _pkg_.a archives.
+    #[test]
+    fn write_at_file_size_simulates_o_append() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/tmp").unwrap();
+
+        let header = b"!<arch>\n";
+        let member1 = b"__.PKGDEF original compile data";
+        let mut initial = Vec::new();
+        initial.extend_from_slice(header);
+        initial.extend_from_slice(member1);
+        fs.write_file("/tmp/pkg.a", &initial).unwrap();
+
+        let size_before = fs.metadata("/tmp/pkg.a").unwrap().size as usize;
+        assert_eq!(size_before, header.len() + member1.len());
+
+        let new_member = b"cpu.o appended by pack r";
+        fs.write_at("/tmp/pkg.a", size_before, new_member).unwrap();
+
+        let result = fs.read_file("/tmp/pkg.a").unwrap();
+        assert_eq!(&result[..8], b"!<arch>\n", "archive header must be preserved");
+        assert_eq!(result.len(), initial.len() + new_member.len());
+        assert_eq!(&result[initial.len()..], new_member);
+    }
+
+    /// Writing at offset 0 on an existing file must overwrite, not append.
+    #[test]
+    fn write_at_zero_overwrites() {
+        let fs = MemoryFilesystem::new();
+        fs.create_dir("/tmp").unwrap();
+        fs.write_file("/tmp/f", b"AAAAAAAAAA").unwrap();
+        fs.write_at("/tmp/f", 0, b"BB").unwrap();
+        let data = fs.read_file("/tmp/f").unwrap();
+        assert_eq!(&data, b"BBAAAAAAAA");
+    }
 }
