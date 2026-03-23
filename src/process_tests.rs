@@ -141,6 +141,9 @@ pub fn run_all_tests() {
     test_fork_brk_cap_pages_ordering();
     test_syscall_name_linux_nrs();
 
+    // fd allocation
+    test_alloc_fd_lowest_available();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2892,5 +2895,45 @@ fn test_pidfd_cloexec() {
         crate::safe_print!(96,
             "[Test] pidfd_cloexec FAILED: before_cloexec={} after_cloexec={}\n",
             before, after);
+    }
+}
+
+/// alloc_fd must return the lowest available fd number (POSIX), and reuse
+/// freed numbers instead of monotonically incrementing.
+fn test_alloc_fd_lowest_available() {
+    use akuma_exec::process::{register_process, unregister_process, clear_lazy_regions};
+
+    let pid = 68_000u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+
+    let proc_ref = akuma_exec::process::lookup_process(pid).unwrap();
+
+    let fd0 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd1 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd2 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+
+    let seq_ok = fd0 == 0 && fd1 == 1 && fd2 == 2;
+
+    proc_ref.remove_fd(fd1);
+    let fd_reuse = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let reuse_ok = fd_reuse == 1;
+
+    proc_ref.remove_fd(fd0);
+    let fd_reuse0 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let reuse0_ok = fd_reuse0 == 0;
+
+    let fd_from = proc_ref.alloc_fd_from(10, akuma_exec::process::FileDescriptor::DevNull);
+    let from_ok = fd_from == 10;
+
+    clear_lazy_regions(pid);
+    let _ = unregister_process(pid);
+
+    if seq_ok && reuse_ok && reuse0_ok && from_ok {
+        console::print("[Test] alloc_fd_lowest_available PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] alloc_fd_lowest_available FAILED: fd0={} fd1={} fd2={} reuse={} reuse0={} from={}\n",
+            fd0, fd1, fd2, fd_reuse, fd_reuse0, fd_from);
     }
 }

@@ -1,7 +1,6 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::types::FileDescriptor;
@@ -13,7 +12,6 @@ pub struct SharedFdTable {
     pub table: Spinlock<BTreeMap<u32, FileDescriptor>>,
     pub cloexec: Spinlock<BTreeSet<u32>>,
     pub nonblock: Spinlock<BTreeSet<u32>>,
-    pub next_fd: AtomicU32,
 }
 
 impl SharedFdTable {
@@ -22,7 +20,6 @@ impl SharedFdTable {
             table: Spinlock::new(BTreeMap::new()),
             cloexec: Spinlock::new(BTreeSet::new()),
             nonblock: Spinlock::new(BTreeSet::new()),
-            next_fd: AtomicU32::new(3),
         }
     }
 
@@ -35,8 +32,17 @@ impl SharedFdTable {
             table: Spinlock::new(fd_map),
             cloexec: Spinlock::new(BTreeSet::new()),
             nonblock: Spinlock::new(BTreeSet::new()),
-            next_fd: AtomicU32::new(3),
         }
+    }
+
+    /// Find the lowest fd number >= `min_fd` not present in `table`.
+    fn lowest_available_fd(table: &BTreeMap<u32, FileDescriptor>, min_fd: u32) -> u32 {
+        let mut fd = min_fd;
+        for (&key, _) in table.range(min_fd..) {
+            if key != fd { break; }
+            fd += 1;
+        }
+        fd
     }
 
     /// Deep copy for fork (separate fd table, with pipe ref bumps).
@@ -62,7 +68,6 @@ impl SharedFdTable {
             table: Spinlock::new(cloned),
             cloexec: Spinlock::new(cloexec_clone),
             nonblock: Spinlock::new(nonblock_clone),
-            next_fd: AtomicU32::new(self.next_fd.load(Ordering::Relaxed)),
         }
     }
 
@@ -114,14 +119,17 @@ impl Drop for SharedFdTable {
 impl Process {
     // ========== File Descriptor Table Methods ==========
 
-    /// Allocate a new file descriptor and insert the entry atomically
-    ///
-    /// This is the correct pattern to avoid race conditions:
-    /// the FD number is allocated and inserted while holding the lock.
+    /// Allocate the lowest available fd number and insert the entry atomically.
     pub fn alloc_fd(&self, entry: FileDescriptor) -> u32 {
+        self.alloc_fd_from(0, entry)
+    }
+
+    /// Allocate the lowest available fd number >= `min_fd` and insert the entry.
+    /// Used by `fcntl(F_DUPFD)` which specifies a minimum fd.
+    pub fn alloc_fd_from(&self, min_fd: u32, entry: FileDescriptor) -> u32 {
         with_irqs_disabled(|| {
             let mut table = self.fds.table.lock();
-            let fd = self.fds.next_fd.fetch_add(1, Ordering::SeqCst);
+            let fd = SharedFdTable::lowest_available_fd(&table, min_fd);
             table.insert(fd, entry);
             fd
         })

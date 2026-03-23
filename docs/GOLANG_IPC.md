@@ -426,23 +426,26 @@ pack + buildid + cp), and `internal/unsafeheader` (compile).  It then starts `in
 2. Parent `go` (PID 60) processes the exit: `pwait ret … nready=1` (pipe EOF), thread cleanup
    fires (`[Cleanup] Thread 12/14/15/16 recycled`).
 3. `go` opens many new fds for the next steps (epoll `ctl ADD` fd=2136..2155 — **fd numbers in
-   the 2100s**, suggesting hundreds of pidfds accumulated despite the cloexec fix — verify
-   `is_cloexec` is checked on the `execve` path).
+   the 2100s**).
 4. VFORK clone: `[clone] flags=0x4111 stack=0x0`, pipes 48/49 created and clone_ref'd.
 5. `pwait ret … nready=2` (one INOUT + one OUT).
 6. Then **`pwait zero-sample#17 … nready=0 timeout=0ms`** — the parent is polling with no
    events ready.  The **vfork child never calls `execve`** (no `[syscall] execve` line).
 
-**Notable: fd numbers are very high (2136–2155).** `epoll_create1` returned fd=2138, eventfd2
-returned fd=2139 — for the `compile` child (PID 93). After the child exits those fds should be
-gone, but the parent `go` (PID 60) then adds fds 2136–2155 to **its own** epoll (epfd=5). This
-means `go` itself accumulated **~2100+ fds** by this point. Likely cause: pidfds not being
-closed by `exec` (cloexec flag not checked during `do_execve` fd cleanup) or pidfds not being
-closed by `wait4` after reaping.
+**Notable: fd numbers are very high (2136–2155).** Root cause identified: the monotonic
+`alloc_fd` counter never reused freed fd numbers.  See *"Fd number allocation: monotonic
+counter → lowest-available"* below for the fix.  The high numbers are **not** a pidfd or
+cloexec leak — `go` simply cycled through many short-lived pipe/epoll/eventfd fds over its
+lifetime and the counter only went up.
 
 **SSH was unreachable** during the hang; serial was the only output channel and it stopped
 producing new lines after the `pwait zero-sample#17` line — consistent with the kernel itself
 being wedged (no scheduling, or a spinlock deadlock).
+
+**Update (2026-03-22):** The compile crashes (`exit status 137`, SIGSEGV, `index out of range
+[-38]`) observed in the same session are explained by the icache invalidation bug — see
+*"Demand-paging icache invalidation bug"* below.  The kernel hang itself remains under
+investigation; it may be a separate scheduling or spinlock issue.
 
 ### Tracing: `epoll_pwait` + PSTATS
 
@@ -490,6 +493,77 @@ The guest may still be **working** (e.g. **long `brk` fork** with little serial 
 **wedged** in the kernel, or **flooded** so the terminal looks frozen.  Prefer **serial**
 over SSH for diagnosis; see **If SSH stops responding** above.  After adding **`[fork] brk`**
 lines, a **live** serial stream should show periodic progress during long forks.
+
+---
+
+## Demand-paging icache invalidation bug (2026-03-22)
+
+### Symptom
+
+Multiple `compile` processes crash with different manifestations during a single `go build`:
+
+1. **`exit status 137`** on `internal/goarch`, `math`, `unicode` — killed by SIGSEGV.
+2. **SIGSEGV at `PC=0x20000000`** (stack base, not code) in `unicode/utf8` compile —
+   wild jump caused by executing stale instructions.
+3. **`internal compiler error: index out of range [-38]`** in `sync/atomic` compile —
+   `-38 = -ENOSYS`, likely a syscall return value treated as an array index due to
+   executing the wrong code path.
+4. **`could not import internal/cpu (not the start of an archive file ("cpu.o …"))`** —
+   a previous `compile` was killed mid-write leaving a truncated `.a` cache entry.
+5. **`[JIT] IC flush + replay #1 bogus nr=806400176`** (4 occurrences in `full.log`) —
+   the CPU fetched stale bytes from a demand-paged code page and interpreted them as
+   a syscall with a huge, invalid number.
+6. **`[WILD-DA] pid=157 FAR=0x17a ELR=0x103a7e90`** — data abort at a near-NULL address;
+   register dump shows `x0=0xffffffffffffffda` (`-ENOSYS`), consistent with corrupted
+   control flow after an `inotify_add_watch` (nr=27) returned ENOSYS.
+
+### Root cause
+
+The Instruction Abort demand pager (`src/exceptions.rs`) used **`IC IVAU`** on the **kernel
+identity-mapped VA** (`phys_to_virt(phys)`) instead of the **user VA** (`cur_va`) where the
+process would fetch instructions.  `IC IVAU` invalidates the icache by virtual address.
+On QEMU TCG, the translation block (TB) cache is keyed by VA — invalidating the kernel VA
+left the user VA's stale TBs intact.  The CPU continued executing stale/zero bytes from
+previously cached translations.
+
+A secondary issue: `DC CVAU` and `IC IVAU` were interleaved in the same loop without a
+`DSB ISH` barrier between them.  ARM ARM requires DC → DSB → IC → DSB → ISB ordering.
+
+### Fix (2026-03-22, `src/exceptions.rs`)
+
+Two demand-paging sites (Instruction Abort path and Data Abort path) were updated:
+
+1. **`IC IVAU` now targets `cur_va`** (the user VA) instead of `kva`.
+2. **`DC CVAU` loop and `IC IVAU` loop are separated by `DSB ISH`**, matching the
+   ARM Architecture Reference Manual sequence.
+
+The final `DSB ISH` + `ISB` after the readahead loop remains unchanged.
+
+---
+
+## Fd number allocation: monotonic counter → lowest-available (2026-03-22)
+
+### Symptom
+
+During Go build, fd numbers reach **2000+** (observed: `epoll fd=2447`, `eventfd fd=2507`
+in `full.log`).  Each forked `compile` child inherits the parent's inflated fd counter,
+so children also start allocating from high numbers.
+
+### Root cause
+
+`alloc_fd` in `crates/akuma-exec/src/process/fd.rs` used `next_fd.fetch_add(1)` — a
+**monotonically increasing** counter that never reuses freed fd numbers.  POSIX requires
+`open()`, `pipe()`, `dup()`, `socket()` etc. to return the **lowest available** fd number.
+
+Additionally, `fcntl(F_DUPFD, arg)` and `fcntl(F_DUPFD_CLOEXEC, arg)` ignored `arg` and
+used the same monotonic counter instead of finding the lowest available fd >= `arg`.
+
+### Fix (2026-03-22)
+
+- `alloc_fd` now scans the BTreeMap keys for the first gap starting from fd 0.
+- Added `alloc_fd_from(min_fd, entry)` for `F_DUPFD` / `F_DUPFD_CLOEXEC`.
+- Removed the `next_fd: AtomicU32` field from `SharedFdTable`.
+- Updated `fcntl` in `src/syscall/fs.rs` to pass `arg` as `min_fd`.
 
 ---
 

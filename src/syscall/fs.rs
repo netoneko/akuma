@@ -1479,7 +1479,7 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
                 _ => {}
             }
-            let new_fd = proc.alloc_fd(entry);
+            let new_fd = proc.alloc_fd_from(arg as u32, entry);
             if cmd == F_DUPFD_CLOEXEC {
                 proc.set_cloexec(new_fd);
             }

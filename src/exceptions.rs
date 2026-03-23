@@ -1849,10 +1849,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 if is_exec {
                                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                                     for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe {
-                                            core::arch::asm!("dc cvau, {}", in(reg) kva + off);
-                                            core::arch::asm!("ic ivau, {}", in(reg) kva + off);
-                                        }
+                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
+                                    }
+                                    unsafe { core::arch::asm!("dsb ish"); }
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) cur_va + off); }
                                     }
                                 }
 
@@ -2180,10 +2181,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
                                 let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                                 for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe {
-                                        core::arch::asm!("dc cvau, {}", in(reg) kva + off);
-                                        core::arch::asm!("ic ivau, {}", in(reg) kva + off);
-                                    }
+                                    unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
+                                }
+                                unsafe { core::arch::asm!("dsb ish"); }
+                                for off in (0..0x1000_usize).step_by(64) {
+                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) cur_va + off); }
                                 }
 
                                 let (table_frames, installed) = unsafe {
