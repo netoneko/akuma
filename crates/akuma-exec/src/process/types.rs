@@ -151,17 +151,27 @@ pub enum FileDescriptor {
     PidFd(u32),
 }
 
+/// Cached directory entry for stable getdents64 enumeration.
+#[derive(Debug, Clone)]
+pub struct DirCacheEntry {
+    pub name: String,
+    pub d_type: u8,
+}
+
 /// Kernel file handle for open files
 #[derive(Debug, Clone)]
 pub struct KernelFile {
     pub path: String,
     pub position: usize,
     pub flags: u32,
+    /// Snapshot of directory entries taken on the first getdents64 call.
+    /// Prevents position drift when entries are deleted between calls.
+    pub dir_cache: Option<Vec<DirCacheEntry>>,
 }
 
 impl KernelFile {
     pub fn new(path: String, flags: u32) -> Self {
-        Self { path, position: 0, flags }
+        Self { path, position: 0, flags, dir_cache: None }
     }
 }
 

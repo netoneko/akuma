@@ -314,3 +314,206 @@ fn populated_image_has_symlink() {
     let fs = mount_populated();
     assert!(fs.exists("/testdir/link.txt"));
 }
+
+// ── Directory removal edge cases ────────────────────────────────────
+
+#[test]
+fn remove_nonempty_dir_fails() {
+    let fs = mount_empty();
+    fs.create_dir("/parent").unwrap();
+    fs.write_file("/parent/child.txt", b"x").unwrap();
+    let err = fs.remove_dir("/parent").unwrap_err();
+    assert_eq!(err, akuma_vfs::FsError::DirectoryNotEmpty);
+}
+
+#[test]
+fn remove_dir_with_subdirs_fails() {
+    let fs = mount_empty();
+    fs.create_dir("/parent").unwrap();
+    fs.create_dir("/parent/child").unwrap();
+    let err = fs.remove_dir("/parent").unwrap_err();
+    assert_eq!(err, akuma_vfs::FsError::DirectoryNotEmpty);
+}
+
+#[test]
+fn remove_dir_after_clearing_children() {
+    let fs = mount_empty();
+    fs.create_dir("/d").unwrap();
+    fs.write_file("/d/a.txt", b"a").unwrap();
+    fs.write_file("/d/b.txt", b"b").unwrap();
+    fs.write_file("/d/c.txt", b"c").unwrap();
+
+    assert_eq!(
+        fs.remove_dir("/d").unwrap_err(),
+        akuma_vfs::FsError::DirectoryNotEmpty
+    );
+
+    fs.remove_file("/d/a.txt").unwrap();
+    fs.remove_file("/d/b.txt").unwrap();
+    fs.remove_file("/d/c.txt").unwrap();
+
+    fs.remove_dir("/d").unwrap();
+    assert!(!fs.exists("/d"));
+}
+
+#[test]
+fn remove_many_entries_then_rmdir() {
+    let fs = mount_empty();
+    fs.create_dir("/big").unwrap();
+
+    let count = 64;
+    for i in 0..count {
+        let name = alloc::format!("/big/{:02x}", i);
+        fs.create_dir(&name).unwrap();
+    }
+
+    let entries = fs.read_dir("/big").unwrap();
+    assert_eq!(entries.len(), count);
+
+    for i in 0..count {
+        let name = alloc::format!("/big/{:02x}", i);
+        fs.remove_dir(&name).unwrap();
+    }
+
+    let entries = fs.read_dir("/big").unwrap();
+    assert_eq!(entries.len(), 0, "all children should be gone: {entries:?}");
+    fs.remove_dir("/big").unwrap();
+    assert!(!fs.exists("/big"));
+}
+
+#[test]
+fn remove_entries_in_reverse_order() {
+    let fs = mount_empty();
+    fs.create_dir("/rev").unwrap();
+
+    let count = 32;
+    for i in 0..count {
+        let name = alloc::format!("/rev/item_{:02}", i);
+        fs.write_file(&name, b"data").unwrap();
+    }
+
+    for i in (0..count).rev() {
+        let name = alloc::format!("/rev/item_{:02}", i);
+        fs.remove_file(&name).unwrap();
+    }
+
+    let entries = fs.read_dir("/rev").unwrap();
+    assert_eq!(entries.len(), 0);
+    fs.remove_dir("/rev").unwrap();
+}
+
+#[test]
+fn remove_interleaved_files_and_dirs() {
+    let fs = mount_empty();
+    fs.create_dir("/mix").unwrap();
+
+    for i in 0..16u32 {
+        let dname = alloc::format!("/mix/d{:02}", i);
+        let fname = alloc::format!("/mix/f{:02}.txt", i);
+        fs.create_dir(&dname).unwrap();
+        fs.write_file(&fname, b"x").unwrap();
+    }
+
+    let entries = fs.read_dir("/mix").unwrap();
+    assert_eq!(entries.len(), 32);
+
+    for i in 0..16u32 {
+        let dname = alloc::format!("/mix/d{:02}", i);
+        let fname = alloc::format!("/mix/f{:02}.txt", i);
+        fs.remove_file(&fname).unwrap();
+        fs.remove_dir(&dname).unwrap();
+    }
+
+    let entries = fs.read_dir("/mix").unwrap();
+    assert_eq!(entries.len(), 0);
+    fs.remove_dir("/mix").unwrap();
+}
+
+#[test]
+fn remove_first_entry_in_directory() {
+    let fs = mount_empty();
+    fs.create_dir("/first").unwrap();
+    fs.write_file("/first/aaa", b"a").unwrap();
+    fs.write_file("/first/bbb", b"b").unwrap();
+    fs.write_file("/first/ccc", b"c").unwrap();
+
+    fs.remove_file("/first/aaa").unwrap();
+
+    let entries = fs.read_dir("/first").unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(!names.contains(&"aaa"));
+    assert!(names.contains(&"bbb"));
+    assert!(names.contains(&"ccc"));
+}
+
+#[test]
+fn remove_middle_entry_in_directory() {
+    let fs = mount_empty();
+    fs.create_dir("/mid").unwrap();
+    fs.write_file("/mid/aaa", b"a").unwrap();
+    fs.write_file("/mid/bbb", b"b").unwrap();
+    fs.write_file("/mid/ccc", b"c").unwrap();
+
+    fs.remove_file("/mid/bbb").unwrap();
+
+    let entries = fs.read_dir("/mid").unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"aaa"));
+    assert!(!names.contains(&"bbb"));
+    assert!(names.contains(&"ccc"));
+}
+
+#[test]
+fn remove_last_entry_in_directory() {
+    let fs = mount_empty();
+    fs.create_dir("/last").unwrap();
+    fs.write_file("/last/aaa", b"a").unwrap();
+    fs.write_file("/last/bbb", b"b").unwrap();
+    fs.write_file("/last/ccc", b"c").unwrap();
+
+    fs.remove_file("/last/ccc").unwrap();
+
+    let entries = fs.read_dir("/last").unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"aaa"));
+    assert!(names.contains(&"bbb"));
+    assert!(!names.contains(&"ccc"));
+}
+
+#[test]
+fn reuse_space_after_removal() {
+    let fs = mount_empty();
+    fs.create_dir("/reuse").unwrap();
+    fs.write_file("/reuse/old", b"old").unwrap();
+    fs.remove_file("/reuse/old").unwrap();
+    fs.write_file("/reuse/new", b"new").unwrap();
+
+    let entries = fs.read_dir("/reuse").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "new");
+    assert_eq!(fs.read_file("/reuse/new").unwrap(), b"new");
+}
+
+#[test]
+fn remove_file_from_dir_does_not_affect_file() {
+    let fs = mount_empty();
+    fs.write_file("/not_a_dir.txt", b"content").unwrap();
+    let err = fs.remove_dir("/not_a_dir.txt").unwrap_err();
+    assert_eq!(err, akuma_vfs::FsError::NotADirectory);
+}
+
+#[test]
+fn remove_dir_on_file_fails() {
+    let fs = mount_empty();
+    fs.write_file("/regular.txt", b"x").unwrap();
+    let err = fs.remove_dir("/regular.txt").unwrap_err();
+    assert_eq!(err, akuma_vfs::FsError::NotADirectory);
+}
+
+#[test]
+fn remove_file_on_dir_fails() {
+    let fs = mount_empty();
+    fs.create_dir("/adir").unwrap();
+    let err = fs.remove_file("/adir").unwrap_err();
+    assert_eq!(err, akuma_vfs::FsError::NotAFile);
+}

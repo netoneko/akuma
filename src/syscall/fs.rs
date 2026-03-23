@@ -991,7 +991,11 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
             if let akuma_exec::process::FileDescriptor::File(f) = entry {
                 let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
                 new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
-                if new_pos >= 0 { f.position = new_pos as usize; success = true; }
+                if new_pos >= 0 {
+                    f.position = new_pos as usize;
+                    if new_pos == 0 { f.dir_cache = None; }
+                    success = true;
+                }
             }
         });
         if success { new_pos as u64 } else { !0u64 }
@@ -1727,38 +1731,69 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
 
 pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(ptr, size) { return EFAULT; }
-    if let Some(proc) = akuma_exec::process::current_process() {
-        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd) {
-            if let Ok(entries) = crate::fs::list_dir(&f.path) {
-                if f.position >= entries.len() { return 0; }
-                let mut kernel_buf = alloc::vec![0u8; size];
-                let mut written = 0;
-                for entry in entries.iter().skip(f.position) {
-                    let reclen = (19 + entry.name.len() + 1 + 7) & !7;
-                    if written + reclen > size { break; }
-                    let p = unsafe { kernel_buf.as_mut_ptr().add(written) };
-                    unsafe {
-                        core::ptr::write_unaligned(p as *mut u64, 1);
-                        core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
-                        core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
-                        let d_type: u8 = if entry.is_dir { 4 } else if entry.is_symlink { 10 } else { 8 };
-                        p.add(18).write(d_type);
-                        core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
-                        p.add(19 + entry.name.len()).write(0);
-                    }
-                    written += reclen;
-                    proc.update_fd(fd, |e| if let akuma_exec::process::FileDescriptor::File(file) = e { file.position += 1; });
-                }
-                if written > 0 {
-                    if unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
-                        return EFAULT;
-                    }
-                }
-                return written as u64;
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let f = match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => f,
+        _ => return !0u64,
+    };
+
+    let entries = if let Some(ref cached) = f.dir_cache {
+        cached.clone()
+    } else {
+        let dir_entries = match crate::fs::list_dir(&f.path) {
+            Ok(e) => e,
+            Err(_) => return !0u64,
+        };
+        let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dir_entries
+            .iter()
+            .map(|e| akuma_exec::process::types::DirCacheEntry {
+                name: e.name.clone(),
+                d_type: if e.is_dir { 4 } else if e.is_symlink { 10 } else { 8 },
+            })
+            .collect();
+        let snapshot = cache.clone();
+        proc.update_fd(fd, |e| {
+            if let akuma_exec::process::FileDescriptor::File(file) = e {
+                file.dir_cache = Some(snapshot);
             }
+        });
+        cache
+    };
+
+    let position = f.position;
+    if position >= entries.len() { return 0; }
+
+    let mut kernel_buf = alloc::vec![0u8; size];
+    let mut written = 0;
+    let mut count = 0usize;
+    for entry in entries.iter().skip(position) {
+        let reclen = (19 + entry.name.len() + 1 + 7) & !7;
+        if written + reclen > size { break; }
+        let p = unsafe { kernel_buf.as_mut_ptr().add(written) };
+        unsafe {
+            core::ptr::write_unaligned(p as *mut u64, 1);
+            core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
+            core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
+            p.add(18).write(entry.d_type);
+            core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
+            p.add(19 + entry.name.len()).write(0);
+        }
+        written += reclen;
+        count += 1;
+    }
+    if count > 0 {
+        proc.update_fd(fd, |e| {
+            if let akuma_exec::process::FileDescriptor::File(file) = e {
+                file.position += count;
+            }
+        });
+    }
+    if written > 0 {
+        if unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
+            return EFAULT;
         }
     }
-    !0u64
+    written as u64
 }
 
 pub(super) fn sys_fchdir(fd: u32) -> u64 {
