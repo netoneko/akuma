@@ -56,6 +56,8 @@ pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
     !still_present
 }
 
+/// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
+/// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
 fn encode_wait_status(code: i32) -> u32 {
     if code < 0 {
         let sig = (-code) as u32 & 0x7F;
@@ -567,7 +569,8 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 if ch.has_exited() {
                     let code = ch.exit_code();
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                        crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", p, code);
+                        let st = encode_wait_status(code);
+                        crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
                     }
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                         let status = encode_wait_status(code);
@@ -595,7 +598,8 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
                 let code = ch.exit_code();
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] wait4: PID {} exited with code {}\n", child_pid, code);
+                    let st = encode_wait_status(code);
+                    crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
                 }
                 if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                     let status = encode_wait_status(code);

@@ -647,52 +647,138 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
     }
 }
 
-/// Kill all forked child processes of the given parent.
+/// Kill forked children whose `parent_pid` is in `parents`.
 ///
-/// Unlike `kill_thread_group` (which kills CLONE_THREAD siblings sharing an
-/// address space), this targets children created via `fork_process` that have
-/// their own address spaces.  Called from `return_to_kernel` to clean up
-/// orphans that would otherwise leak thread slots and memory.
-///
-/// Recursion is handled naturally: each killed child's thread will eventually
-/// run `return_to_kernel`, which calls `kill_child_processes` for its own
-/// children.
-pub fn kill_child_processes(parent_pid: Pid) {
+/// Used by [`kill_child_processes`] (single parent) and
+/// [`kill_child_processes_for_thread_group`] (all pthread PIDs in a process).
+fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     let children: Vec<(Pid, Option<usize>, usize)> = with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
+        // Do not skip `proc.exited`: children may already be Zombie(137) from a
+        // prior kill_thread_group without unregister_process; they must still be
+        // torn down here or `ps` shows zombies forever.
         table.iter()
-            .filter(|(_, proc)| proc.parent_pid == parent_pid && !proc.exited)
+            .filter(|(_, proc)| parents.contains(&proc.parent_pid))
             .map(|(pid, proc)| (*pid, proc.thread_id, proc.address_space.l0_phys()))
             .collect()
     });
 
-    for (child_pid, child_tid, l0_phys) in &children {
-        if let Some(proc) = lookup_process(*child_pid) {
+    for (child_pid, _, l0_phys) in &children {
+        kill_fork_subtree_recursive(*child_pid, *l0_phys);
+    }
+
+    if !children.is_empty() {
+        log::debug!("[Process] Killed {} forked child process(es) (parent set size {})",
+            children.len(), parents.len());
+    }
+}
+
+/// Tear down one forked process: its pthread group and all `PROCESS_TABLE` rows.
+///
+/// Without this, entries stay `Zombie(137)` until `return_to_kernel` — compile
+/// workers often never get there, so `ps` shows zombies forever.
+///
+/// Drop order: CLONE_THREAD siblings (`shared == true`) first, address-space
+/// owner (`shared == false`) last so `UserAddressSpace::drop` frees L0 once.
+fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
+    let mut members: Vec<(Pid, Option<usize>, bool)> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.address_space.l0_phys() == l0_phys)
+            .map(|(pid, proc)| (*pid, proc.thread_id, proc.address_space.is_shared()))
+            .collect()
+    });
+    if members.is_empty() {
+        return;
+    }
+    members.sort_by_key(|(_, _, shared)| if *shared { 0 } else { 1 });
+
+    kill_thread_group(child_pid, l0_phys);
+
+    for (pid, tid, _) in &members {
+        if let Some(proc) = lookup_process(*pid) {
             cleanup_process_fds(proc);
             proc.exited = true;
             proc.exit_code = 137;
             proc.state = ProcessState::Zombie(137);
             proc.thread_id = None;
         }
-
-        if let Some(ch) = get_child_channel(*child_pid) {
-            ch.set_exited(137);
+        // Same Arc as register_child_channel / notify_child_channel_exited /
+        // return_to_kernel::remove_channel.  If the child already called
+        // exit_group / return_to_kernel, `has_exited` is true with the real code
+        // (e.g. 0).  Do **not** overwrite with 137 — wait4 would report 137
+        // while `[exit_group] … code=0` and confuse `go build` (buildID).
+        if let Some(ch) = get_child_channel(*pid) {
+            if !ch.has_exited() {
+                ch.set_exited(137);
+            }
         }
-
-        kill_thread_group(*child_pid, *l0_phys);
-
-        if let Some(tid) = child_tid {
-            if let Some(channel) = remove_channel(*tid) {
-                channel.set_exited(137);
+        if let Some(tid) = tid {
+            if let Some(ch) = remove_channel(*tid) {
+                if !ch.has_exited() {
+                    ch.set_exited(137);
+                }
             }
             crate::threading::mark_thread_terminated(*tid);
             crate::threading::get_waker_for_thread(*tid).wake();
+            with_irqs_disabled(|| {
+                THREAD_PID_MAP.lock().remove(tid);
+            });
         }
+        clear_lazy_regions(*pid);
+        let _ = table::unregister_process(*pid);
+    }
+}
+
+/// Depth-first: nested forked children (e.g. `go` → `compile` → sub-tools) are
+/// torn down before their parent fork.
+fn kill_fork_subtree_recursive(child_pid: Pid, l0_phys: usize) {
+    let nested: Vec<(Pid, usize)> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.parent_pid == child_pid)
+            .map(|(pid, proc)| (*pid, proc.address_space.l0_phys()))
+            .collect()
+    });
+    for (npid, nl0) in nested {
+        kill_fork_subtree_recursive(npid, nl0);
     }
 
-    if !children.is_empty() {
-        log::debug!("[Process] Killed {} child process(es) for PID {}", children.len(), parent_pid);
+    if lookup_process(child_pid).is_none() {
+        return;
     }
+    teardown_forked_process_thread_group(child_pid, l0_phys);
+}
+
+/// Kill all forked child processes of the given parent PID only.
+///
+/// `fork_process` sets `parent_pid` to the **forking thread's** PID (each
+/// CLONE_THREAD has its own `Process` entry).  Prefer
+/// [`kill_child_processes_for_thread_group`] from `return_to_kernel` so
+/// children forked by worker threads are not missed.
+pub fn kill_child_processes(parent_pid: Pid) {
+    let mut s = BTreeSet::new();
+    s.insert(parent_pid);
+    kill_children_whose_parent_in(&s);
+}
+
+/// Kill forked children whose parent is **any** thread in this address space.
+///
+/// Go and other runtimes call `clone`/`fork` from M-threads; each thread has a
+/// distinct PID in `PROCESS_TABLE`, but `fork_process` records that thread's
+/// PID as `parent_pid`.  When the main thread (TGID) exits, `kill_child_processes(main_pid)`
+/// would miss compiles forked by worker PID 53 because `parent_pid == 53`, not `main_pid`.
+/// This collects every PID sharing `l0_phys` (the whole pthread group) and kills
+/// children of any of them.
+pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
+    let parents: BTreeSet<Pid> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.address_space.l0_phys() == l0_phys)
+            .map(|(pid, _)| *pid)
+            .collect()
+    });
+    kill_children_whose_parent_in(&parents);
 }
 
 /// Exit code is communicated via ProcessChannel for async callers.
@@ -829,17 +915,32 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         }
 
         // Kill forked child processes (different address spaces) so they
-        // don't become orphans.
-        kill_child_processes(pid);
+        // don't become orphans.  `fork()` records the **forking thread's** PID
+        // as parent_pid, not the TGID — so when the **address-space owner**
+        // exits we must scan every pthread PID in the group.
+        //
+        // **Do not** run that full scan on **pthread** exit: CLONE_VM workers
+        // share `l0_phys` with the main thread; `kill_child_processes_for_thread_group`
+        // includes *all* thread PIDs in `parents`, so any child whose parent_pid
+        // is the main thread would be matched whenever *any* worker exits — killing
+        // live `compile` subprocesses still needed by other threads (exit 137).
+        let (l0_phys, is_shared) = match lookup_process(pid) {
+            Some(p) => (p.address_space.l0_phys(), p.address_space.is_shared()),
+            None => (0usize, true),
+        };
+        if l0_phys != 0 {
+            if is_shared {
+                kill_child_processes(pid);
+            } else {
+                kill_child_processes_for_thread_group(l0_phys);
+            }
+        }
 
         // If this process owns the address space (not shared), kill all
         // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
         // all page tables; siblings still using them would cause EL1 faults.
-        if let Some(proc) = lookup_process(pid) {
-            if !proc.address_space.is_shared() {
-                let l0_phys = proc.address_space.l0_phys();
-                kill_thread_group(pid, l0_phys);
-            }
+        if !is_shared && l0_phys != 0 {
+            kill_thread_group(pid, l0_phys);
         }
 
         let (start_us, proc_name) = lookup_process(pid)
@@ -925,13 +1026,20 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
             }
         }
 
-        kill_child_processes(pid);
-
-        if let Some(proc) = lookup_process(pid) {
-            if !proc.address_space.is_shared() {
-                let l0_phys = proc.address_space.l0_phys();
-                kill_thread_group(pid, l0_phys);
+        let (l0_phys, is_shared) = match lookup_process(pid) {
+            Some(p) => (p.address_space.l0_phys(), p.address_space.is_shared()),
+            None => (0usize, true),
+        };
+        if l0_phys != 0 {
+            if is_shared {
+                kill_child_processes(pid);
+            } else {
+                kill_child_processes_for_thread_group(l0_phys);
             }
+        }
+
+        if !is_shared && l0_phys != 0 {
+            kill_thread_group(pid, l0_phys);
         }
 
         let start_us = lookup_process(pid)

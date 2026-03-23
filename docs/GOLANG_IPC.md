@@ -220,7 +220,7 @@ On Linux, **`137 = 128 + 9`** is the usual encoding for a process killed by
 **SIGKILL** (often the **OOM killer** when the parent reports
 `compile: exit status 137`).
 
-**On Akuma**, `exit_code == 137` is set in two places:
+**On Akuma**, `exit_code == 137` is set in these situations:
 
 1. **`kill_process()`** — explicit SIGKILL-style teardown (`sys_kill`, shell
    `kill -9`, `kill_box`, cascading kill). See `crates/akuma-exec/src/process/signal.rs`.
@@ -229,6 +229,9 @@ On Linux, **`137 = 128 + 9`** is the usual encoding for a process killed by
    but have **different PIDs** are marked **zombie with 137** so they stop
    using freed page tables. See `crates/akuma-exec/src/process/mod.rs`
    (`kill_thread_group`).
+3. **Forked-child teardown** — `kill_fork_subtree_recursive` /
+   `teardown_forked_process_thread_group` force **137** when reaping a separate
+   address space (orphan cleanup, same numeric convention as thread-group kill).
 
 Kernel **heap** OOM uses **`return_to_kernel(-12)`** (ENOMEM), not 137
 (`src/allocator.rs`).
@@ -260,6 +263,25 @@ corrupted** (object bytes where a `.a` archive is expected). Fix on that host
 with `go clean -cache` or by removing the bad `GOCACHE`/`~/.cache/go-build`
 object.
 
+**Regression (fixed): `go: error obtaining buildID for go tool compile: exit status 137`.**
+If `return_to_kernel` called **`kill_child_processes_for_thread_group(l0)` on
+every pthread exit**, the parent set included **all** thread PIDs (including
+the main thread). Any forked child whose **`parent_pid` was the main `go` PID**
+was then torn down whenever **any** short-lived worker thread exited — while
+`go` still needed that **`compile -V=full`** subprocess. Fix: run the **full
+thread-group** scan only when the **address-space owner** exits
+(`!address_space.is_shared()`); on **pthread** exit, call
+**`kill_child_processes(exiting_pid)`** only (children parented to that thread).
+
+**Second cause (fixed): `wait4` vs `[exit_group] … code=0`.**  Forked children share one
+**`ProcessChannel`** Arc via `register_child_channel` and `notify_child_channel_exited`
+/`return_to_kernel`.  **`teardown_forked_process_thread_group`** used to always
+**`set_exited(137)`** on that channel.  If **`exit_group` had already set the real
+exit code (e.g. 0)**, teardown could **overwrite** it with **137**, so **`go`**
+saw **exit status 137** while the serial log still showed **`code=0`**.  Fix:
+only **`set_exited(137)`** when **`!ch.has_exited()`**.  With **`SYSCALL_DEBUG_INFO_ENABLED`**,
+**`wait4`** logs **`exit_code=`** and **`wait_status=0x…`** (Linux encoding: `(code&0xff)<<8`).
+
 ---
 
 ## Known Working / Fixed (from GOLANG_MISSING_SYSCALLS.md)
@@ -270,6 +292,10 @@ object.
 - epoll (`EINTR`, `EPOLLET`, edge-triggered drain) — Fixed
 - futex (basic `FUTEX_WAIT`/`FUTEX_WAKE`, `FUTEX_WAKE_OP`, `CMP_REQUEUE`) — Fixed
 - `procfs` fd reads for non-stdio fds — Fixed (2026-03-21)
+- `procfs` **`/proc/<pid>/cmdline`** (NUL-separated argv) and **`/proc/<pid>/status`**
+  (`Name`, `State`, `Pid`, `PPid`, …) — Added (2026-03)
+- **`wait4` / `ProcessChannel`:** teardown no longer overwrites a real exit code with **137**
+  (see *Second cause* under *Exit code 137* above).
 
 ## Fix Applied
 
@@ -301,7 +327,8 @@ To reproduce and diagnose, boot Akuma and run:
 CGO_ENABLED=0 go build -x -v -o ./hello_go .
 ```
 
-While hung, SSH in and capture:
+While hung, SSH in and capture (if the guest still accepts SSH — on a **full kernel freeze**,
+SSH may be unreachable; use **serial** logging instead, see *Stall: `clone` (VFORK)* below):
 
 1. `cat /proc/<go_pid>/syscalls` — expected: `epoll_pwait` (22) or
    `nanosleep` (101) in a loop.
@@ -350,6 +377,42 @@ result as soon as the process decides to exit, eliminating the race window.
 
 Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
 The build should progress past the step where it previously hung.
+
+### Stall: `clone` (VFORK) but no next `execve` (2026-03)
+
+**Symptom:** `go build -x` prints the script for the **next** package (e.g. moving from
+`internal/runtime/math` to `internal/runtime/strconv`), but the build **never advances** —
+the shell appears hung.  Serial **`full.log`** may show **`[exit_group]`** for the previous
+**`compile`** (e.g. **`b022/_pkg_.a`**, PID 150, **code=0**), then **`[clone] flags=0x4111`**
+(VFORK) and **`[pipe] create` / `clone_ref`**, followed by **many** **`[epoll] pwait enter: pid=<go>`**
+lines and **no** **`[syscall] execve(... compile ...)`** for the new action.
+
+**Meaning:** the **vfork** child path started (pipes cloned), but the kernel **never logged**
+**`execve`** for the next **`compile`**.  The parent **`go`** (often **PID** of **`/usr/lib/go/bin/go`**)
+keeps running its **epoll** loop.  This is **not** the same as “compile stuck in user code”
+(there would be **`mmap` / `epoll` on the `compile` PID**).  Here the next **`compile` never
+replaces the address space.
+
+**What to capture:** `ps` (is there a **new child PID** stuck in **Running** vs **zombie**?),
+**`/proc/<pid>/status`** on **`go` and any new `compile` PID**, and whether **`full.log`** gains
+an **`execve`** line if you wait longer (slow disk vs true hang).
+
+**If SSH stops responding:** a hard hang can wedge scheduling, locks, or the network/SSH path so
+**`ssh -p 2222 …` never connects** even though the VM is still running.  Do **not** rely on SSH
+for post-mortem in that case.  Prefer:
+
+- **Serial console** — QEMU is typically started with **`-serial mon:stdio`** (`scripts/run.sh`,
+  `scripts/run_on_kvm.sh`), so kernel **`dmesg`-style** output and **`SYSCALL_DEBUG_INFO`** traces
+  go to the **same terminal** as QEMU.  Redirect that stream to **`full.log`** (`tee`, or run QEMU
+  under `script`) so you still have a trace when SSH is dead.
+- **Reproduce with logging on from boot** — enable whatever serial logging you need *before* the
+  hang; after a freeze you may not get a second chance to open a shell.
+- **Optional:** a **second serial** (`-serial file:full.log` on a second `-chardev` if you split
+  devices) keeps a dedicated log file without fighting the monitor — only worth it if you routinely
+  lose the combined stdio capture.
+
+**Related:** *Post-success hang* above (parent **epoll** vs **exit notification**); this pattern
+is **earlier** in the pipeline (**before** the next **`execve`**).
 
 ---
 
@@ -544,19 +607,30 @@ children — like Go's `compile` processes — have their own address spaces and
 are not affected.
 
 ```
-go build (PID 58)
+go build TGID / main thread PID 58  (shared L0 for all M-threads)
+├── thread 53  (CLONE_THREAD, same L0)  — forked compile → parent_pid=53
 ├── thread 59  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
 ├── thread 60  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
 ├── thread 61  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
 │
-├── compile (PID 98, fork, own L0)      ← NOT killed ✗  (orphan)
+├── compile (PID 98, fork, own L0)      ← NOT killed by kill_child_processes(58) ✗
+│   │   (kernel parent_pid = 53, not 58)
 │   ├── thread 99   (CLONE_THREAD)      ← NOT killed ✗
 │   ├── thread 100  (CLONE_THREAD)      ← NOT killed ✗
 │   └── thread 101  (CLONE_THREAD)      ← NOT killed ✗
 │
-└── compile (PID 102, fork, own L0)     ← NOT killed ✗  (orphan)
+└── compile (PID 102, fork, own L0)     ← same class of leak
     └── ...
 ```
+
+**Follow-up bug:** `fork_process` sets `parent_pid` to the **forking thread's**
+PID (the value from `current_process()` for that M-thread), not the process
+group leader / TGID.  So a `compile` forked by worker thread **53** has
+`parent_pid = 53`, while `exit_group` on the main thread runs
+`return_to_kernel` with `pid = 58`.  `kill_child_processes(58)` therefore
+finds **no** children (none have `parent_pid == 58`), leaving compiles
+orphaned until thread 53's `return_to_kernel` runs — which may not happen
+reliably before the thread pool or `ps` state looks "stuck".
 
 When `go build` exits, its forked children become orphans.  Akuma has no
 `init` process to reparent and reap them, so they continue running (or sit as
@@ -599,29 +673,45 @@ window.
 
 ### Fix 2 (orphan children) — `crates/akuma-exec/src/process/mod.rs`
 
-Added `kill_child_processes(parent_pid)` which iterates `PROCESS_TABLE` for
-entries with `parent_pid == exiting_pid`, marks each as `Zombie(137)`, closes
-fds, kills their CLONE_THREAD siblings via `kill_thread_group`, notifies
-child channels, and terminates + wakes their threads.  Called from both
-`return_to_kernel` and `return_to_kernel_from_fault`, just before
-`kill_thread_group`.
+Added **`kill_child_processes(parent_pid)`** for tests and single-parent kill.
+**`kill_child_processes_for_thread_group(l0_phys)`** collects **every** PID in
+`PROCESS_TABLE` that shares the same `l0_phys` (all pthreads in the group),
+then reaps every forked child whose **`parent_pid` is any** of those PIDs —
+needed because **`fork_process`** stores the **forking thread's** PID, not the
+TGID.
+
+**Critical:** that **full-group** scan must run only when the **address-space
+owner** exits (`UserAddressSpace` with **`is_shared == false`**).  On **pthread**
+exit (`is_shared == true`), `return_to_kernel` must call
+**`kill_child_processes(exiting_pid)`** only — otherwise **any** worker exit
+matches children whose `parent_pid` is the **main** thread and **live**
+`compile` processes are torn down (**137**) while `go` still needs them (see
+**Regression** above).
+
+For each forked child to reap: depth-first nested forks, then
+**`teardown_forked_process_thread_group`**: `kill_thread_group`, fd cleanup,
+**`unregister_process`** (not only a zombie row — otherwise `ps` / `PROCESS_TABLE`
+leaks).  Children already marked **`exited` / `Zombie(137)`** must still be
+included in the scan (do **not** filter `!proc.exited` when collecting children),
+or zombies never unregister.
 
 ```
 return_to_kernel(exit_code)
   │
-  ├── kill_child_processes(pid)      ← NEW: kill forked children
-  │     ├── for each child with parent_pid == pid:
-  │     │     mark Zombie(137), close fds, kill_thread_group,
-  │     │     notify child channel, terminate + wake thread
-  │     └── (child's thread → return_to_kernel → kills grandchildren)
+  ├── l0, is_shared = current process
+  ├── if l0 != 0:
+  │     if is_shared (pthread):
+  │         kill_child_processes(pid)              ← only this thread's forks
+  │     else (owner):
+  │         kill_child_processes_for_thread_group(l0)   ← all pthread PIDs as parents
   │
-  ├── kill_thread_group(pid, l0)     ← existing: kill CLONE_THREAD siblings
+  ├── if !is_shared && l0 != 0: kill_thread_group(pid, l0)
   ├── clear_lazy_regions(pid)
   └── unregister_process(pid)
 ```
 
-Recursion is natural: each killed child's thread will eventually run
-`return_to_kernel` and call `kill_child_processes` for its own children.
+Same fork-child logic is in **`return_to_kernel_from_fault`** (minus user-memory
+cleanup).
 
 ### Fix 3 (pidfd cloexec) — `src/syscall/proc.rs`
 
@@ -633,10 +723,13 @@ Added `proc.set_cloexec(pidfd_fd as u32)` in `sys_clone_pidfd` after
 - `test_fd_table_lock_consistency` — verifies `clone_deep_for_fork` and
   `close_all` complete without deadlocking and produce independent copies.
 - `test_kill_child_processes_basic` — registers parent + child, calls
-  `kill_child_processes`, asserts child is marked `Zombie(137)`.
-- `test_kill_child_processes_recursive` — registers parent → child →
-  grandchild, verifies only the direct child is killed (grandchild survives
-  until the child's `return_to_kernel` runs).
+  `kill_child_processes`, asserts the child is **removed** from `PROCESS_TABLE`.
+- `test_kill_child_processes_recursive` — parent → child → grandchild; asserts
+  **both** nested fork children are gone after `kill_child_processes(parent)`
+  (depth-first teardown).
+- `test_kill_child_processes_thread_group_matches_fork_parent` — main + worker
+  (shared L0) + compile with `parent_pid = worker`; `kill_child_processes(main)`
+  misses compile, `kill_child_processes_for_thread_group(l0)` kills it.
 - `test_pidfd_cloexec` — verifies `set_cloexec` + `is_cloexec` round-trip.
 
 ### Verification
@@ -645,3 +738,69 @@ Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
 After `go build` exits, `ps` should show no orphan `compile` processes.  The
 kernel should not hang during fork or exit.  The compile process's epoll fd
 numbers should stay low (< 100 instead of 2000+).
+
+For debugging: **`cat /proc/<pid>/status`** and **`cat /proc/<pid>/cmdline`**
+(see **Known Working**); **`tr '\0' ' ' < /proc/<pid>/cmdline`** prints argv in a
+readable form.
+
+---
+
+## `compile` SIGSEGV → corrupt `internal/cpu` cache → “not the start of an archive”
+
+### Symptom chain
+
+1. **`/usr/lib/go/pkg/tool/linux_arm64/compile` crashes** with `SIGSEGV` while
+   building an early std package (log often shows `internal/abi` first).
+   `PC=0x20000000` / `fault=0xc40f…` means the **compiler tool** took a bad
+   branch or hit bad memory — not a Go source error.
+
+2. A **partial or corrupt** object/archive is written under **`GOCACHE`**
+   (default `/.cache/go-build/.../...-d` on Akuma).  The next package that
+   imports `internal/cpu` opens that cached path; it is **not** a valid
+   `!<arch>` archive, so the compiler prints:
+
+   `could not import internal/cpu (not the start of an archive file ("cpu.o …"))`
+
+   The quoted `cpu.o … 644 …` fragment looks like **ar** member header / listing
+   text, not a valid archive header — consistent with **garbage or truncated**
+   cache bytes after a crash.
+
+3. **Cascade**: `internal/bytealg`, `internal/chacha8rand`, etc. all fail on the
+   same bad `packagefile internal/cpu=/.cache/go-build/56/...` line.  Later
+   packages (`math`) may report `compile: exit status 137` when the driver
+   kills the broken tool.
+
+**Distinguish from orphan / pthread cleanup:** **`error obtaining buildID for go tool compile: exit status 137`**
+right after a kernel change often means **`compile -V=full` was torn down while
+still needed** (see **Regression** under *Exit code 137*), not a bad cache
+archive.
+
+### What to do
+
+- **After any `compile` SIGSEGV**, treat the whole **`GOCACHE` tree** as
+  suspect: delete it (see below) before rebuilding; `go clean -cache` alone
+  may not remove paths if deletes fail.
+- **Root cause** of the SIGSEGV is a **kernel / host** issue for the
+  `compile` binary (demand paging, permissions, bad PC, JIT assumptions), not
+  the Go sources; track it like any other user crash in `compile`.
+
+### Why `rm -rf /.cache` only removes some files
+
+The ext2 backend only allows **`rmdir` on empty directories** (only `.` and
+`..` besides children).  POSIX `rm -rf` deletes **files first**, then removes
+directories bottom-up; **any step that fails** leaves a non-empty parent, so
+`rmdir` returns **DirectoryNotEmpty** and that subtree remains.
+
+**Common reasons on Akuma:**
+
+1. **Zombie or still-running `compile` / `go` processes** holding open file
+   descriptors under `/.cache/go-build/`.  Unlink may fail or behave oddly
+   until those processes are gone.  **Kill or wait for zombies** (see orphan
+   fixes above), then retry `rm -rf`.
+2. **Silent failures** from `rm` (dash): try `rm -rfv /.cache` to see which path
+   errors.
+3. **Partial run** after a crash — always delete the **same** directory
+   `go env GOCACHE` prints (often `/.cache/go-build`).
+
+**Recommended order:** ensure no `compile`/`go` processes are using the cache
+→ `rm -rf /.cache/go-build` (or `$(go env GOCACHE)`) → run `go build` again.

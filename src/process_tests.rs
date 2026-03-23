@@ -133,6 +133,7 @@ pub fn run_all_tests() {
     test_fd_table_lock_consistency();
     test_kill_child_processes_basic();
     test_kill_child_processes_recursive();
+    test_kill_child_processes_thread_group_matches_fork_parent();
     test_pidfd_cloexec();
 
     console::print("--- Process Execution Tests Done ---\n\n");
@@ -2673,7 +2674,8 @@ fn test_fd_table_lock_consistency() {
     }
 }
 
-/// Verify that `kill_child_processes` marks a direct child as Zombie(137).
+/// Verify that `kill_child_processes` removes a direct child from `PROCESS_TABLE`
+/// (no zombie row left behind).
 fn test_kill_child_processes_basic() {
     use akuma_exec::process::{
         register_process, unregister_process, lookup_process,
@@ -2692,27 +2694,21 @@ fn test_kill_child_processes_basic() {
 
     kill_child_processes(parent_pid);
 
-    let child_exited = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
-    let child_code = lookup_process(child_pid).map(|p| p.exit_code).unwrap_or(0);
+    let child_gone = lookup_process(child_pid).is_none();
 
     clear_lazy_regions(parent_pid);
-    clear_lazy_regions(child_pid);
     let _ = unregister_process(parent_pid);
-    let _ = unregister_process(child_pid);
 
-    if child_exited && child_code == 137 {
+    if child_gone {
         console::print("[Test] kill_child_processes_basic PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] kill_child_processes_basic FAILED: exited={} code={}\n",
-            child_exited, child_code);
+            "[Test] kill_child_processes_basic FAILED: child still in PROCESS_TABLE\n");
     }
 }
 
-/// Verify that `kill_child_processes` does NOT directly recurse into
-/// grandchildren (recursion is handled by each child's `return_to_kernel`).
-/// After killing the parent's direct children, a grandchild should still be
-/// alive (its parent hasn't called return_to_kernel yet).
+/// Verify that `kill_child_processes` tears down nested forks depth-first:
+/// grandchild removed before child, both unregistered from `PROCESS_TABLE`.
 fn test_kill_child_processes_recursive() {
     use akuma_exec::process::{
         register_process, unregister_process, lookup_process,
@@ -2736,25 +2732,64 @@ fn test_kill_child_processes_recursive() {
 
     kill_child_processes(parent_pid);
 
-    let child_exited = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
-    // Grandchild is NOT killed directly: kill_child_processes only kills
-    // direct children of parent_pid. The grandchild will be killed when
-    // the child's thread runs return_to_kernel.
-    let grandchild_alive = lookup_process(grandchild_pid).map(|p| !p.exited).unwrap_or(false);
+    let child_gone = lookup_process(child_pid).is_none();
+    let grandchild_gone = lookup_process(grandchild_pid).is_none();
 
     clear_lazy_regions(parent_pid);
-    clear_lazy_regions(child_pid);
-    clear_lazy_regions(grandchild_pid);
     let _ = unregister_process(parent_pid);
-    let _ = unregister_process(child_pid);
-    let _ = unregister_process(grandchild_pid);
 
-    if child_exited && grandchild_alive {
+    if child_gone && grandchild_gone {
         console::print("[Test] kill_child_processes_recursive PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] kill_child_processes_recursive FAILED: child_exited={} grandchild_alive={}\n",
-            child_exited, grandchild_alive);
+            "[Test] kill_child_processes_recursive FAILED: child_gone={} grandchild_gone={}\n",
+            child_gone, grandchild_gone);
+    }
+}
+
+/// `fork_process` sets parent_pid to the **forking thread's** PID.  A compile
+/// child forked by worker thread 53 has parent_pid=53, not the main TGID 58.
+/// `kill_child_processes(main_pid)` misses it; `kill_child_processes_for_thread_group(l0)`
+/// must not.
+fn test_kill_child_processes_thread_group_matches_fork_parent() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_child_processes, kill_child_processes_for_thread_group, clear_lazy_regions,
+    };
+
+    let main_pid = 68_000u32;
+    let worker_pid = 68_001u32;
+    let compile_pid = 68_002u32;
+
+    let main_proc = make_test_process(main_pid);
+    let l0 = main_proc.address_space.l0_phys();
+    register_process(main_pid, main_proc);
+
+    let mut worker = make_test_process(worker_pid);
+    worker.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(worker_pid, worker);
+
+    let mut compile = make_test_process(compile_pid);
+    compile.parent_pid = worker_pid;
+    register_process(compile_pid, compile);
+
+    kill_child_processes(main_pid);
+    let missed_by_main = lookup_process(compile_pid).map(|p| !p.exited).unwrap_or(false);
+
+    kill_child_processes_for_thread_group(l0);
+    let compile_gone = lookup_process(compile_pid).is_none();
+
+    clear_lazy_regions(main_pid);
+    clear_lazy_regions(worker_pid);
+    let _ = unregister_process(main_pid);
+    let _ = unregister_process(worker_pid);
+
+    if missed_by_main && compile_gone {
+        console::print("[Test] kill_child_processes_thread_group_matches_fork_parent PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] kill_child_processes_thread_group_matches_fork_parent FAILED: missed_by_main={} compile_gone={}\n",
+            missed_by_main, compile_gone);
     }
 }
 

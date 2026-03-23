@@ -4,6 +4,8 @@
 //! Mounted at /proc, provides:
 //! - /proc/<pid>/fd/0 - stdin (readable by all, writable by spawner/kernel)
 //! - /proc/<pid>/fd/1 - stdout (readable by all, writable by owning process)
+//! - /proc/<pid>/cmdline - argv as NUL-separated bytes (Linux-compatible)
+//! - /proc/<pid>/status - human-readable `Name`, `State`, `Pid`, `PPid`, etc.
 //!
 //! # TODO: Rewrite without allocations
 //!
@@ -19,7 +21,48 @@ use alloc::format;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
 use crate::config::PROC_STDOUT_MAX_SIZE;
-use akuma_exec::process::{self, Pid};
+use akuma_exec::process::{self, Pid, ProcessState};
+
+// ============================================================================
+// /proc/<pid>/cmdline + status (Linux-style)
+// ============================================================================
+
+fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
+    if p.args.is_empty() {
+        let mut v: Vec<u8> = p.name.as_bytes().to_vec();
+        v.push(0);
+        return v;
+    }
+    let mut out = Vec::new();
+    for a in &p.args {
+        out.extend_from_slice(a.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+fn proc_status_text(p: &process::Process) -> String {
+    let name = p.name.as_str();
+    let name_field = if name.len() > 15 { &name[..15] } else { name };
+    match p.state {
+        ProcessState::Zombie(code) => format!(
+            "Name:\t{}\nState:\tZ (zombie)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\nExitCode:\t{}\n",
+            name_field, p.pid, p.pid, p.parent_pid, code
+        ),
+        ProcessState::Ready => format!(
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
+            name_field, p.pid, p.pid, p.parent_pid
+        ),
+        ProcessState::Running => format!(
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
+            name_field, p.pid, p.pid, p.parent_pid
+        ),
+        ProcessState::Blocked => format!(
+            "Name:\t{}\nState:\tS (sleeping)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
+            name_field, p.pid, p.pid, p.parent_pid
+        ),
+    }
+}
 
 // ============================================================================
 // ProcFilesystem
@@ -239,6 +282,18 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                pid_entries.push(DirEntry {
+                    name: String::from("cmdline"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
+                pid_entries.push(DirEntry {
+                    name: String::from("status"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
             }
             if crate::config::PROC_SYSCALL_LOG_ENABLED
                 && crate::syscall::log::get_formatted(pid).is_some()
@@ -309,6 +364,32 @@ impl Filesystem for ProcFilesystem {
                 if let Ok(pid) = parts[0].parse::<Pid>() {
                     let data = crate::syscall::log::get_formatted(pid)
                         .ok_or(FsError::NotFound)?;
+                    if offset >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(data.len() - offset);
+                    buf[..n].copy_from_slice(&data[offset..offset + n]);
+                    return Ok(n);
+                }
+            }
+        }
+
+        // Handle <pid>/cmdline and <pid>/status
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+                if let Ok(pid) = parts[0].parse::<Pid>() {
+                    let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                    let current_box_id =
+                        akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                    if current_box_id != 0 && proc.box_id != current_box_id {
+                        return Err(FsError::NotFound);
+                    }
+                    let data = if parts[1] == "cmdline" {
+                        proc_cmdline_bytes(&proc)
+                    } else {
+                        proc_status_text(&proc).into_bytes()
+                    };
                     if offset >= data.len() {
                         return Ok(0);
                     }
@@ -438,6 +519,23 @@ impl Filesystem for ProcFilesystem {
                     }
                     return crate::syscall::log::get_formatted(pid)
                         .ok_or(FsError::NotFound);
+                }
+            }
+        }
+
+        // Handle <pid>/cmdline and <pid>/status
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+                if let Ok(pid) = parts[0].parse::<Pid>() {
+                    let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                    if current_box_id != 0 && proc.box_id != current_box_id {
+                        return Err(FsError::NotFound);
+                    }
+                    if parts[1] == "cmdline" {
+                        return Ok(proc_cmdline_bytes(&proc));
+                    }
+                    return Ok(proc_status_text(&proc).into_bytes());
                 }
             }
         }
@@ -576,6 +674,17 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && parts[1] == "fd" {
                 return Self::process_exists(pid);
             }
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+                if !Self::process_exists(pid) {
+                    return false;
+                }
+                if let Some(proc) = process::lookup_process(pid) {
+                    let current_box_id =
+                        akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                    return current_box_id == 0 || proc.box_id == current_box_id;
+                }
+                return false;
+            }
             if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
                 return crate::syscall::log::get_formatted(pid).is_some();
             }
@@ -711,6 +820,29 @@ impl Filesystem for ProcFilesystem {
                     });
                 }
                 return Err(FsError::NotFound);
+            }
+            // <pid>/cmdline and <pid>/status
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+                let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                let current_box_id =
+                    akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                if current_box_id != 0 && proc.box_id != current_box_id {
+                    return Err(FsError::NotFound);
+                }
+                let size = if parts[1] == "cmdline" {
+                    proc_cmdline_bytes(&proc).len() as u64
+                } else {
+                    proc_status_text(&proc).len() as u64
+                };
+                return Ok(Metadata {
+                    is_dir: false,
+                    size,
+                    inode,
+                    mode: 0o100444,
+                    created: None,
+                    modified: None,
+                    accessed: None,
+                });
             }
             let pid_exists = Self::process_exists(pid)
                 || (crate::config::PROC_SYSCALL_LOG_ENABLED
