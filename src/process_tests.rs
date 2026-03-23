@@ -129,6 +129,12 @@ pub fn run_all_tests() {
     test_entry_point_trampoline_no_zombie_match();
     test_zombie_process_unregistered_after_return_to_kernel();
 
+    // fd table lock consistency + orphan cleanup + pidfd cloexec
+    test_fd_table_lock_consistency();
+    test_kill_child_processes_basic();
+    test_kill_child_processes_recursive();
+    test_pidfd_cloexec();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2624,5 +2630,162 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
         crate::safe_print!(128,
             "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} dropped={} gone={}\n",
             still_registered, is_exited, dropped.is_some(), gone_after);
+    }
+}
+
+/// Structural test: verify that `clone_deep_for_fork` and `close_all` on
+/// `SharedFdTable` acquire the table lock inside `with_irqs_disabled`.
+///
+/// We can't directly observe IRQ state from a test, but we can verify the
+/// methods work without deadlocking on a single-threaded call (a deadlock
+/// would hang the test). We also verify the cloned table is independent.
+fn test_fd_table_lock_consistency() {
+    use akuma_exec::process::{SharedFdTable, FileDescriptor};
+    use alloc::sync::Arc;
+
+    let table = Arc::new(SharedFdTable::with_stdio());
+
+    // Add some fds to the table.
+    crate::irq::with_irqs_disabled(|| {
+        let mut t = table.table.lock();
+        t.insert(10, FileDescriptor::Stdin);
+        t.insert(11, FileDescriptor::Stdout);
+    });
+
+    // clone_deep_for_fork must not deadlock (it now uses with_irqs_disabled).
+    let cloned = table.clone_deep_for_fork();
+
+    // Verify the clone is independent: mutating clone doesn't affect original.
+    let original_count = crate::irq::with_irqs_disabled(|| table.table.lock().len());
+    crate::irq::with_irqs_disabled(|| { cloned.table.lock().remove(&10); });
+    let after_remove = crate::irq::with_irqs_disabled(|| table.table.lock().len());
+
+    // close_all must not deadlock (it now uses with_irqs_disabled).
+    cloned.close_all();
+    let cloned_count = crate::irq::with_irqs_disabled(|| cloned.table.lock().len());
+
+    if original_count == 5 && after_remove == 5 && cloned_count == 0 {
+        console::print("[Test] fd_table_lock_consistency PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] fd_table_lock_consistency FAILED: orig={} after_remove={} cloned_after_close={}\n",
+            original_count, after_remove, cloned_count);
+    }
+}
+
+/// Verify that `kill_child_processes` marks a direct child as Zombie(137).
+fn test_kill_child_processes_basic() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_child_processes, clear_lazy_regions,
+    };
+
+    let parent_pid = 65_000u32;
+    let child_pid = 65_001u32;
+
+    let parent_proc = make_test_process(parent_pid);
+    register_process(parent_pid, parent_proc);
+
+    let mut child_proc = make_test_process(child_pid);
+    child_proc.parent_pid = parent_pid;
+    register_process(child_pid, child_proc);
+
+    kill_child_processes(parent_pid);
+
+    let child_exited = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
+    let child_code = lookup_process(child_pid).map(|p| p.exit_code).unwrap_or(0);
+
+    clear_lazy_regions(parent_pid);
+    clear_lazy_regions(child_pid);
+    let _ = unregister_process(parent_pid);
+    let _ = unregister_process(child_pid);
+
+    if child_exited && child_code == 137 {
+        console::print("[Test] kill_child_processes_basic PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] kill_child_processes_basic FAILED: exited={} code={}\n",
+            child_exited, child_code);
+    }
+}
+
+/// Verify that `kill_child_processes` does NOT directly recurse into
+/// grandchildren (recursion is handled by each child's `return_to_kernel`).
+/// After killing the parent's direct children, a grandchild should still be
+/// alive (its parent hasn't called return_to_kernel yet).
+fn test_kill_child_processes_recursive() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        kill_child_processes, clear_lazy_regions,
+    };
+
+    let parent_pid = 66_000u32;
+    let child_pid = 66_001u32;
+    let grandchild_pid = 66_002u32;
+
+    let parent_proc = make_test_process(parent_pid);
+    register_process(parent_pid, parent_proc);
+
+    let mut child_proc = make_test_process(child_pid);
+    child_proc.parent_pid = parent_pid;
+    register_process(child_pid, child_proc);
+
+    let mut grandchild_proc = make_test_process(grandchild_pid);
+    grandchild_proc.parent_pid = child_pid;
+    register_process(grandchild_pid, grandchild_proc);
+
+    kill_child_processes(parent_pid);
+
+    let child_exited = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
+    // Grandchild is NOT killed directly: kill_child_processes only kills
+    // direct children of parent_pid. The grandchild will be killed when
+    // the child's thread runs return_to_kernel.
+    let grandchild_alive = lookup_process(grandchild_pid).map(|p| !p.exited).unwrap_or(false);
+
+    clear_lazy_regions(parent_pid);
+    clear_lazy_regions(child_pid);
+    clear_lazy_regions(grandchild_pid);
+    let _ = unregister_process(parent_pid);
+    let _ = unregister_process(child_pid);
+    let _ = unregister_process(grandchild_pid);
+
+    if child_exited && grandchild_alive {
+        console::print("[Test] kill_child_processes_recursive PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] kill_child_processes_recursive FAILED: child_exited={} grandchild_alive={}\n",
+            child_exited, grandchild_alive);
+    }
+}
+
+/// Verify that pidfds created via the CLONE_PIDFD path are marked O_CLOEXEC.
+///
+/// We can't call `sys_clone_pidfd` directly from a test, but we can verify
+/// the underlying mechanism: `set_cloexec` + `is_cloexec` on a SharedFdTable.
+/// The real fix adds `proc.set_cloexec(pidfd_fd)` in sys_clone_pidfd.
+fn test_pidfd_cloexec() {
+    use akuma_exec::process::{register_process, unregister_process, clear_lazy_regions};
+
+    let pid = 67_000u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+
+    let proc_ref = akuma_exec::process::lookup_process(pid).unwrap();
+
+    // Simulate what sys_clone_pidfd now does: alloc_fd then set_cloexec.
+    let fd = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::Stdin);
+    let before = proc_ref.is_cloexec(fd);
+    proc_ref.set_cloexec(fd);
+    let after = proc_ref.is_cloexec(fd);
+
+    clear_lazy_regions(pid);
+    let _ = unregister_process(pid);
+
+    if !before && after {
+        console::print("[Test] pidfd_cloexec PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] pidfd_cloexec FAILED: before_cloexec={} after_cloexec={}\n",
+            before, after);
     }
 }

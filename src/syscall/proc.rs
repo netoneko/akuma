@@ -286,7 +286,10 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                     if validate_user_ptr(pidfd_out_ptr, 4) {
                         let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0 /* no flags */);
                         if (pidfd_fd as i64) >= 0 {
-                            // Write the fd number as i32 to the pidfd pointer
+                            // Linux clone3 with CLONE_PIDFD always sets O_CLOEXEC.
+                            if let Some(proc) = akuma_exec::process::current_process() {
+                                proc.set_cloexec(pidfd_fd as u32);
+                            }
                             let fd_i32 = pidfd_fd as i32;
                             let _ = unsafe {
                                 copy_to_user_safe(

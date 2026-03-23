@@ -647,6 +647,54 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
     }
 }
 
+/// Kill all forked child processes of the given parent.
+///
+/// Unlike `kill_thread_group` (which kills CLONE_THREAD siblings sharing an
+/// address space), this targets children created via `fork_process` that have
+/// their own address spaces.  Called from `return_to_kernel` to clean up
+/// orphans that would otherwise leak thread slots and memory.
+///
+/// Recursion is handled naturally: each killed child's thread will eventually
+/// run `return_to_kernel`, which calls `kill_child_processes` for its own
+/// children.
+pub fn kill_child_processes(parent_pid: Pid) {
+    let children: Vec<(Pid, Option<usize>, usize)> = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.iter()
+            .filter(|(_, proc)| proc.parent_pid == parent_pid && !proc.exited)
+            .map(|(pid, proc)| (*pid, proc.thread_id, proc.address_space.l0_phys()))
+            .collect()
+    });
+
+    for (child_pid, child_tid, l0_phys) in &children {
+        if let Some(proc) = lookup_process(*child_pid) {
+            cleanup_process_fds(proc);
+            proc.exited = true;
+            proc.exit_code = 137;
+            proc.state = ProcessState::Zombie(137);
+            proc.thread_id = None;
+        }
+
+        if let Some(ch) = get_child_channel(*child_pid) {
+            ch.set_exited(137);
+        }
+
+        kill_thread_group(*child_pid, *l0_phys);
+
+        if let Some(tid) = child_tid {
+            if let Some(channel) = remove_channel(*tid) {
+                channel.set_exited(137);
+            }
+            crate::threading::mark_thread_terminated(*tid);
+            crate::threading::get_waker_for_thread(*tid).wake();
+        }
+    }
+
+    if !children.is_empty() {
+        log::debug!("[Process] Killed {} child process(es) for PID {}", children.len(), parent_pid);
+    }
+}
+
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
@@ -780,6 +828,10 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
+        // Kill forked child processes (different address spaces) so they
+        // don't become orphans.
+        kill_child_processes(pid);
+
         // If this process owns the address space (not shared), kill all
         // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
         // all page tables; siblings still using them would cause EL1 faults.
@@ -872,6 +924,8 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
                 log::debug!("[Process] Error: Failed to kill box {:08x}: {}", bid, e);
             }
         }
+
+        kill_child_processes(pid);
 
         if let Some(proc) = lookup_process(pid) {
             if !proc.address_space.is_shared() {

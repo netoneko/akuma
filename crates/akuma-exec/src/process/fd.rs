@@ -43,10 +43,12 @@ impl SharedFdTable {
     /// Strips EpollFd entries since epoll instances are not reference-counted.
     #[must_use]
     pub fn clone_deep_for_fork(&self) -> Self {
-        let cloned: BTreeMap<u32, FileDescriptor> = self.table.lock().iter()
-            .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
+        let cloned: BTreeMap<u32, FileDescriptor> = with_irqs_disabled(|| {
+            self.table.lock().iter()
+                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect()
+        });
         for entry in cloned.values() {
             match entry {
                 FileDescriptor::PipeWrite(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, true),
@@ -54,10 +56,12 @@ impl SharedFdTable {
                 _ => {}
             }
         }
+        let cloexec_clone = with_irqs_disabled(|| self.cloexec.lock().clone());
+        let nonblock_clone = with_irqs_disabled(|| self.nonblock.lock().clone());
         Self {
             table: Spinlock::new(cloned),
-            cloexec: Spinlock::new(self.cloexec.lock().clone()),
-            nonblock: Spinlock::new(self.nonblock.lock().clone()),
+            cloexec: Spinlock::new(cloexec_clone),
+            nonblock: Spinlock::new(nonblock_clone),
             next_fd: AtomicU32::new(self.next_fd.load(Ordering::Relaxed)),
         }
     }
@@ -65,12 +69,12 @@ impl SharedFdTable {
     /// Explicitly close all underlying kernel resources and clear the table.
     /// This is used during process exit to ensure immediate cleanup.
     pub fn close_all(&self) {
-        let fds: Vec<FileDescriptor> = {
+        let fds: Vec<FileDescriptor> = with_irqs_disabled(|| {
             let mut table = self.table.lock();
             let items: Vec<FileDescriptor> = table.values().cloned().collect();
-            table.clear(); // Ensure we don't close twice
+            table.clear();
             items
-        };
+        });
         
         for fd in fds {
             match fd {

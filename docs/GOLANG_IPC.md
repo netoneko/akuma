@@ -494,3 +494,154 @@ so the process is properly unregistered, fixing the memory/identity leak.
 Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
 The compile step should no longer crash with exit status 137, and the
 `CLONE_VFORK` parent should not hang.
+
+---
+
+## Kernel hang and orphan children (2026-03-22)
+
+Three separate bugs remain after the fixes above, all observable during a
+full `go build` that spawns 300+ `compile` children.
+
+### Bug 1: fd table spinlock deadlock (kernel hang)
+
+`clone_deep_for_fork()` and `close_all()` in
+`crates/akuma-exec/src/process/fd.rs` acquire `self.table.lock()` (and
+`self.cloexec.lock()` / `self.nonblock.lock()` in `clone_deep_for_fork`)
+**without** `with_irqs_disabled`.  Every other caller of these spinlocks
+(`alloc_fd`, `get_fd`, `remove_fd`, `set_fd`, `set_cloexec`, etc.) wraps the
+lock acquisition in `with_irqs_disabled`.
+
+If Thread A holds the lock *without* IRQ protection and is preempted by the
+timer, Thread B entering `alloc_fd` (which disables IRQs before spinning)
+will spin forever with IRQs masked.  No further timer interrupts fire, no
+context switches happen, and the entire kernel deadlocks.
+
+```
+Thread A (exit_group)              Thread B (sibling, alloc_fd)
+─────────────────────              ────────────────────────────
+close_all()
+  table.lock() ← acquired
+  ... iterating fds ...
+  ── TIMER IRQ ── preempted ──►
+                                   with_irqs_disabled {
+                                     DAIF.I = 1  (IRQs masked)
+                                     table.lock() ← SPINS forever
+                                     ... no timer can fire ...
+                                     ... no context switch ...
+                                     ╳ KERNEL DEADLOCK ╳
+                                   }
+```
+
+**Trigger**: `sys_exit_group` calls `proc.fds.close_all()` (no IRQ guard)
+while a sibling CLONE_THREAD thread concurrently calls `alloc_fd` (with IRQ
+guard).  Also triggered during `fork_process` → `clone_deep_for_fork`.
+
+### Bug 2: orphan children not killed on parent exit
+
+`sys_exit_group` calls `kill_thread_group(pid, l0_phys)` which only kills
+CLONE_THREAD siblings (threads sharing the same L0 page table).  Forked
+children — like Go's `compile` processes — have their own address spaces and
+are not affected.
+
+```
+go build (PID 58)
+├── thread 59  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
+├── thread 60  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
+├── thread 61  (CLONE_THREAD, same L0)  ← killed by kill_thread_group ✓
+│
+├── compile (PID 98, fork, own L0)      ← NOT killed ✗  (orphan)
+│   ├── thread 99   (CLONE_THREAD)      ← NOT killed ✗
+│   ├── thread 100  (CLONE_THREAD)      ← NOT killed ✗
+│   └── thread 101  (CLONE_THREAD)      ← NOT killed ✗
+│
+└── compile (PID 102, fork, own L0)     ← NOT killed ✗  (orphan)
+    └── ...
+```
+
+When `go build` exits, its forked children become orphans.  Akuma has no
+`init` process to reparent and reap them, so they continue running (or sit as
+zombies) consuming thread slots and memory.  After several `go build` runs
+the 32-thread pool fills up and no new processes can be spawned.
+
+### Bug 3: CLONE_PIDFD pidfds not marked O_CLOEXEC
+
+In Linux, `clone3` with `CLONE_PIDFD` always creates the pidfd with
+`O_CLOEXEC`.  In Akuma, `sys_clone_pidfd` (in `src/syscall/proc.rs` line
+~287) calls `sys_pidfd_open(new_pid, 0)` and never calls
+`proc.set_cloexec()`.  Every pidfd the Go parent creates for a child
+therefore survives `exec` in subsequently forked children.
+
+```
+go build (parent fd table)         compile child #300 (after exec)
+──────────────────────────         ────────────────────────────────
+fd 0: stdin                        fd 0: stdin
+fd 1: stdout                       fd 1: stdout (pipe to parent)
+fd 2: stderr                       fd 2: stderr
+fd 3: pidfd(child#1)  ← no CLOEXEC → fd 3: pidfd(child#1)   LEAKED
+fd 4: pipe-r(child#1) ← CLOEXEC   (closed by exec)
+fd 5: pipe-w(child#1) ← CLOEXEC   (closed by exec)
+...                                ...
+fd 302: pidfd(child#300)           fd 302: pidfd(child#300) LEAKED
+                                   fd 303: epoll  ← next_fd = 303+
+                                   ... or worse: next_fd = 2166
+```
+
+After 300 compile children, each new child inherits ~300 stale pidfds,
+inflating `next_fd` into the thousands (observed: 2166), wasting memory
+in `clone_deep_for_fork` copies, and slowing `close_all` on exit.
+
+### Fix 1 (fd lock deadlock) — `crates/akuma-exec/src/process/fd.rs`
+
+Wrapped all lock acquisitions in `clone_deep_for_fork` and `close_all` with
+`with_irqs_disabled`, matching every other caller.  The per-fd cleanup calls
+(pipe_close_write, etc.) remain outside the lock and outside the IRQ-disable
+window.
+
+### Fix 2 (orphan children) — `crates/akuma-exec/src/process/mod.rs`
+
+Added `kill_child_processes(parent_pid)` which iterates `PROCESS_TABLE` for
+entries with `parent_pid == exiting_pid`, marks each as `Zombie(137)`, closes
+fds, kills their CLONE_THREAD siblings via `kill_thread_group`, notifies
+child channels, and terminates + wakes their threads.  Called from both
+`return_to_kernel` and `return_to_kernel_from_fault`, just before
+`kill_thread_group`.
+
+```
+return_to_kernel(exit_code)
+  │
+  ├── kill_child_processes(pid)      ← NEW: kill forked children
+  │     ├── for each child with parent_pid == pid:
+  │     │     mark Zombie(137), close fds, kill_thread_group,
+  │     │     notify child channel, terminate + wake thread
+  │     └── (child's thread → return_to_kernel → kills grandchildren)
+  │
+  ├── kill_thread_group(pid, l0)     ← existing: kill CLONE_THREAD siblings
+  ├── clear_lazy_regions(pid)
+  └── unregister_process(pid)
+```
+
+Recursion is natural: each killed child's thread will eventually run
+`return_to_kernel` and call `kill_child_processes` for its own children.
+
+### Fix 3 (pidfd cloexec) — `src/syscall/proc.rs`
+
+Added `proc.set_cloexec(pidfd_fd as u32)` in `sys_clone_pidfd` after
+`sys_pidfd_open` succeeds, matching Linux `clone3` + `CLONE_PIDFD` semantics.
+
+### Kernel tests (in `src/process_tests.rs`)
+
+- `test_fd_table_lock_consistency` — verifies `clone_deep_for_fork` and
+  `close_all` complete without deadlocking and produce independent copies.
+- `test_kill_child_processes_basic` — registers parent + child, calls
+  `kill_child_processes`, asserts child is marked `Zombie(137)`.
+- `test_kill_child_processes_recursive` — registers parent → child →
+  grandchild, verifies only the direct child is killed (grandchild survives
+  until the child's `return_to_kernel` runs).
+- `test_pidfd_cloexec` — verifies `set_cloexec` + `is_cloexec` round-trip.
+
+### Verification
+
+Boot updated kernel and run `CGO_ENABLED=0 go build -x -v -o ./hello_go .`.
+After `go build` exits, `ps` should show no orphan `compile` processes.  The
+kernel should not hang during fork or exit.  The compile process's epoll fd
+numbers should stay low (< 100 instead of 2000+).
