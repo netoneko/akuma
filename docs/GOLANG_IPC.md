@@ -384,8 +384,8 @@ The build should progress past the step where it previously hung.
 `internal/runtime/math` to `internal/runtime/strconv`), but the build **never advances** —
 the shell appears hung.  Serial **`full.log`** may show **`[exit_group]`** for the previous
 **`compile`** (e.g. **`b022/_pkg_.a`**, PID 150, **code=0**), then **`[clone] flags=0x4111`**
-(VFORK) and **`[pipe] create` / `clone_ref`**, followed by **many** **`[epoll] pwait enter: pid=<go>`**
-lines and **no** **`[syscall] execve(... compile ...)`** for the new action.
+(VFORK) and **`[pipe] create` / `clone_ref`**, followed by **many** **`[epoll] pwait …`**
+lines (see *Tracing: epoll* below) and **no** **`[syscall] execve(... compile ...)`** for the new action.
 
 **Meaning:** the **vfork** child path started (pipes cloned), but the kernel **never logged**
 **`execve`** for the next **`compile`**.  The parent **`go`** (often **PID** of **`/usr/lib/go/bin/go`**)
@@ -413,6 +413,53 @@ for post-mortem in that case.  Prefer:
 
 **Related:** *Post-success hang* above (parent **epoll** vs **exit notification**); this pattern
 is **earlier** in the pipeline (**before** the next **`execve`**).
+
+### Tracing: `epoll_pwait` + PSTATS
+
+When **`SYSCALL_DEBUG_NET_ENABLED`** is on, each **`epoll_pwait`** logs **one return line**:
+**`[epoll] pwait ret pid=… epfd=… timeout_ms=… nready=… iters=… dur_us=… interest_fds=…`**, and
+up to **six** **`ev[i] data=…`** lines when **`nready>0`**.  The hot path **`timeout_ms=0`**, **`nready=0`**
+is **sampled** every **`EPOLL_ZERO_SAMPLE_INTERVAL`** (see `src/config.rs`, default **64**) so
+serial is not flooded.  **`[PSTATS]`** lines label syscall **101** as **`nanosleep`** (not **`nr101`**).
+
+### Why you might see **no** `[epoll] pwait` lines (not a “broken logger”)
+
+These lines are **`tprint!`** from the **kernel** (`src/syscall/poll.rs`) when
+**`SYSCALL_DEBUG_NET_ENABLED`** is **`true`** in **`src/config.rs`**.  They are **not**
+emitted through the Rust **`log`** crate or userspace logging — so there is nothing
+special to “hook up” beyond **rebuilding and booting** a kernel that still has that
+flag set.  If you run an **older** `akuma` binary, a **release** config that turned
+the flag off, or capture only **userspace** output, you will not see **`pwait ret`**.
+
+Because **`timeout_ms=0`** + **`nready=0`** returns are **sampled** (default every **4096**
+such returns), a long stretch of **busy epoll** can produce few **`pwait`** lines even
+when the flag is on — that is expected.  Raise or lower **`EPOLL_ZERO_SAMPLE_INTERVAL`**
+when you need more or fewer samples (currently **64**; was **4096** which was too quiet).
+
+### Fork: serial vs `log::debug` during long **`brk` copy**
+
+While **`fork_process`** eagerly copies the parent **`brk`** range, progress uses
+**`log::debug!`** for page/va detail — that output **often does not appear on QEMU
+serial** unless you have a **`log`** backend wired to the console.  Separately,
+**`FORK_BRK_SERIAL_PROGRESS`** (see **`src/config.rs`**, default **`true`**) prints a
+short **`[fork] brk copy still running…`** line to **serial** every **8192** brk pages
+via **`runtime().print_str`** so you can tell a **multi‑minute fork** from a **dead
+hang**.  Turn it off with **`FORK_BRK_SERIAL_PROGRESS = false`** if the lines are too noisy.
+
+### Capturing **`full.log`** across runs
+
+If you redirect QEMU/serial to **`full.log`**, **each run overwrites** the file unless
+you use **append** (**`tee -a full.log`**) or a **timestamped** name
+(**`full-$(date …).log`**).  After a **freeze**, the file only reflects output **up to
+the point the guest stopped flushing** — not a post‑mortem if the buffer never made it
+to the host.
+
+### Serial “stuck” with no SSH during a freeze
+
+The guest may still be **working** (e.g. **long `brk` fork** with little serial output),
+**wedged** in the kernel, or **flooded** so the terminal looks frozen.  Prefer **serial**
+over SSH for diagnosis; see **If SSH stops responding** above.  After adding **`[fork] brk`**
+lines, a **live** serial stream should show periodic progress during long forks.
 
 ---
 
@@ -766,9 +813,13 @@ readable form.
    cache bytes after a crash.
 
 3. **Cascade**: `internal/bytealg`, `internal/chacha8rand`, etc. all fail on the
-   same bad `packagefile internal/cpu=/.cache/go-build/56/...` line.  Later
-   packages (`math`) may report `compile: exit status 137` when the driver
-   kills the broken tool.
+   same bad `packagefile internal/cpu=...` line (often **`$WORK/b011/_pkg_.a`**
+   in the **`-x`** log, not only `/.cache/go-build/...`).  The driver can show
+   **`internal/cpu`** as fully built (`go tool pack`, `buildid -w`, **`cp`** to
+   `GOCACHE`) **right before** the failure — the archive on disk is still not a
+   valid `!<arch>` when the **next** `compile` opens it (truncation, partial
+   write, or stale inode read).  Later packages (`math`) may report
+   `compile: exit status 137` when the driver kills the broken tool.
 
 **Distinguish from orphan / pthread cleanup:** **`error obtaining buildID for go tool compile: exit status 137`**
 right after a kernel change often means **`compile -V=full` was torn down while
@@ -777,6 +828,10 @@ archive.
 
 ### What to do
 
+- **After this error** (even if `internal/cpu` looked successful on `-x`),
+  delete **`$(go env GOCACHE)`** **and** the **`WORK`** tree from the log line
+  `WORK=/tmp/go-build…` (or `rm -rf /tmp/go-build*`) so the next build does not
+  reopen a bad `_pkg_.a` under `$WORK/b011/`.
 - **After any `compile` SIGSEGV**, treat the whole **`GOCACHE` tree** as
   suspect: delete it (see below) before rebuilding; `go clean -cache` alone
   may not remove paths if deletes fail.

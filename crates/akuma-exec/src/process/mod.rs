@@ -38,6 +38,24 @@ use akuma_terminal as terminal;
 
 use self::image::{compute_heap_lazy_size, LAZY_STACK_MAX};
 
+/// Page count to copy `len` bytes one page at a time. Returns [`None`] if the
+/// computation overflows `usize` (would otherwise wrap and loop forever).
+#[must_use]
+pub fn fork_page_count_for_len(len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    len.checked_add(mmu::PAGE_SIZE - 1)?.checked_div(mmu::PAGE_SIZE)
+}
+
+/// Upper bound on **brk/heap** pages copied eagerly during [`fork_process`].
+/// Without this, a huge `brk` (common for Go) can spend minutes in the copy
+/// loop and appear as a full-system hang. Raise if legitimate workloads exceed
+/// this (clear error instead of silent multi‑minute copy).
+const MAX_FORK_BRK_COPY_PAGES: usize = 8 * 1024 * 1024; // 32 GiB of pages
+
+const FORK_COPY_PROGRESS_INTERVAL_PAGES: usize = 8192;
+
 /// Initialize the process subsystem
 pub fn init() {
     init_box_registry(); // Init Box 0
@@ -1083,7 +1101,13 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
 }
 
 /// Fork the current process (deep copy)
-/// Returns the new PID to the parent
+/// Returns the new PID to the parent.
+///
+/// **Locks:** `clone_deep_for_fork` and the lazy-region snapshot take
+/// `SharedFdTable` / `LAZY_REGION_TABLE` only inside short `with_irqs_disabled`
+/// windows. The long eager copies do **not** hold those locks, so fork is not
+/// expected to deadlock the global lazy-region or fd tables. A pathological
+/// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot fork");
@@ -1167,11 +1191,45 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         mmu::phys_to_virt(l0_addr) as *const u64
     };
 
-    fn copy_range_phys(parent_l0: *const u64, src_va: usize, len: usize, dest_as: &mut mmu::UserAddressSpace) -> Result<(), &'static str> {
-        let pages = (len + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+    fn copy_range_phys(
+        parent_l0: *const u64,
+        src_va: usize,
+        len: usize,
+        dest_as: &mut mmu::UserAddressSpace,
+        max_pages: Option<usize>,
+        label: &'static str,
+    ) -> Result<(), &'static str> {
+        let pages = fork_page_count_for_len(len).ok_or("Fork copy page count overflow")?;
+        if let Some(cap) = max_pages {
+            if pages > cap {
+                return Err("Fork brk copy exceeds kernel page cap");
+            }
+        }
         let mut copied = 0usize;
         for i in 0..pages {
-            let va = src_va + i * mmu::PAGE_SIZE;
+            let page_off = i
+                .checked_mul(mmu::PAGE_SIZE)
+                .ok_or("Fork copy VA overflow")?;
+            let va = src_va
+                .checked_add(page_off)
+                .ok_or("Fork copy VA overflow")?;
+            if i > 0 && (i % FORK_COPY_PROGRESS_INTERVAL_PAGES == 0) {
+                if config().syscall_debug_info_enabled {
+                    log::debug!(
+                        "[fork] {} copy progress: {} / {} pages (va={:#x})",
+                        label,
+                        i,
+                        pages,
+                        va
+                    );
+                }
+                // Serial — `log::debug!` often does not appear on QEMU console; brk is the long path.
+                if label == "brk" && config().fork_brk_serial_progress {
+                    (runtime().print_str)(
+                        "[fork] brk copy still running (enable SYSCALL_DEBUG_INFO for page numbers in log)…\n",
+                    );
+                }
+            }
             if let Some(src_phys) = mmu::translate_user_va(parent_l0, va) {
                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
                 unsafe {
@@ -1183,13 +1241,27 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
         }
         if config().syscall_debug_info_enabled && copied < pages {
-            log::debug!("[fork] copy_range WARNING: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)",
-                src_va, src_va + len, copied, pages, pages - copied);
+            log::debug!(
+                "[fork] copy_range WARNING {}: 0x{:x}..0x{:x}: {}/{} pages copied ({} unmapped)",
+                label,
+                src_va,
+                src_va.saturating_add(len),
+                copied,
+                pages,
+                pages.saturating_sub(copied)
+            );
         }
         Ok(())
     }
 
-    copy_range_phys(parent_l0, stack_start, stack_size, &mut new_proc.address_space)?;
+    copy_range_phys(
+        parent_l0,
+        stack_start,
+        stack_size,
+        &mut new_proc.address_space,
+        None,
+        "stack",
+    )?;
 
     // Copy code+heap range.  Derive code_start from code_end (which is
     // always in the main binary's range) rather than entry_point (which
@@ -1200,7 +1272,15 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         0x400000
     };
     if parent.brk > code_start {
-        copy_range_phys(parent_l0, code_start, parent.brk - code_start, &mut new_proc.address_space)?;
+        let brk_len = parent.brk - code_start;
+        copy_range_phys(
+            parent_l0,
+            code_start,
+            brk_len,
+            &mut new_proc.address_space,
+            Some(MAX_FORK_BRK_COPY_PAGES),
+            "brk",
+        )?;
     }
 
     // Copy dynamic linker / interpreter region (0x3000_0000).  These pages
@@ -1208,7 +1288,14 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let interp_base = 0x3000_0000usize;
     let interp_scan_size = 2 * 1024 * 1024; // 2 MB — covers even large musl builds
     if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-        copy_range_phys(parent_l0, interp_base, interp_scan_size, &mut new_proc.address_space)?;
+        copy_range_phys(
+            parent_l0,
+            interp_base,
+            interp_scan_size,
+            &mut new_proc.address_space,
+            None,
+            "interp",
+        )?;
     }
 
     // Copy mmap regions so forked children can run built-in applets (e.g.
@@ -1280,12 +1367,22 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         });
         let mut lazy_pages_copied = 0usize;
         'lazy_copy: for (va, size) in lazy_ranges {
-            let pages = (size + mmu::PAGE_SIZE - 1) / mmu::PAGE_SIZE;
+            let pages = match fork_page_count_for_len(size) {
+                Some(p) => p,
+                None => continue,
+            };
             for i in 0..pages {
                 if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
                     break 'lazy_copy;
                 }
-                let page_va = va + i * mmu::PAGE_SIZE;
+                let page_off = match i.checked_mul(mmu::PAGE_SIZE) {
+                    Some(o) => o,
+                    None => break 'lazy_copy,
+                };
+                let page_va = match va.checked_add(page_off) {
+                    Some(v) => v,
+                    None => break 'lazy_copy,
+                };
                 if let Some(src_phys) = mmu::translate_user_va(parent_l0, page_va) {
                     if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
                         unsafe {

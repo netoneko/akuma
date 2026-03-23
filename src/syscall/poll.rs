@@ -1,6 +1,7 @@
 use super::*;
 use akuma_net::socket;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+use core::sync::atomic::AtomicU64;
 
 struct EpollEntry {
     events: u32,
@@ -14,6 +15,8 @@ struct EpollInstance {
 
 static EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>> = Spinlock::new(BTreeMap::new());
 static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
+/// Counts `epoll_pwait(timeout=0)` returns with `nready=0` for rate-limited logging.
+static EPOLL_PWAIT_ZERO_ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
@@ -54,6 +57,75 @@ struct EpollEvent {
     events: u32,
     _pad: u32,  // ARM64 ABI padding
     data: u64,
+}
+
+/// One line per epoll_pwait return. Suppresses most `timeout=0, nready=0` returns (see config).
+fn log_epoll_pwait_return(
+    epfd: u32,
+    timeout: i32,
+    ready_count: usize,
+    iterations: u64,
+    start_time: u64,
+    interest_fd_count: usize,
+    kernel_events: &[EpollEvent],
+    note: &'static str,
+) {
+    if !crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        return;
+    }
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let elapsed_us = crate::timer::uptime_us().saturating_sub(start_time);
+    let nready = ready_count;
+    let every = crate::config::EPOLL_ZERO_SAMPLE_INTERVAL.max(1);
+
+    if timeout == 0 && nready == 0 && iterations == 1 && note.is_empty() {
+        let n = EPOLL_PWAIT_ZERO_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % every != 0 {
+            return;
+        }
+        crate::tprint!(
+            224,
+            "[epoll] pwait zero-sample#{} pid={} epfd={} nready=0 timeout=0ms (interval={} ~{} suppressed)\n",
+            n / every,
+            pid,
+            epfd,
+            every,
+            every.saturating_sub(1),
+        );
+        return;
+    }
+
+    crate::tprint!(
+        224,
+        "[epoll] pwait ret pid={} epfd={} timeout_ms={} nready={} iters={} dur_us={} interest_fds={} {}\n",
+        pid,
+        epfd,
+        timeout,
+        nready,
+        iterations,
+        elapsed_us,
+        interest_fd_count,
+        note,
+    );
+    if nready == 0 || kernel_events.is_empty() {
+        return;
+    }
+    for (i, ev) in kernel_events.iter().take(6).enumerate() {
+        let in_flag = if ev.events & EPOLLIN != 0 { "IN" } else { "" };
+        let out_flag = if ev.events & EPOLLOUT != 0 { "OUT" } else { "" };
+        let hup_flag = if ev.events & EPOLLHUP != 0 { "HUP" } else { "" };
+        let err_flag = if ev.events & EPOLLERR != 0 { "ERR" } else { "" };
+        crate::tprint!(
+            128,
+            "[epoll]    ev[{}] data=0x{:x} {}{}{}{}\n",
+            i,
+            ev.data,
+            in_flag,
+            out_flag,
+            hup_flag,
+            err_flag
+        );
+    }
 }
 
 pub fn epoll_destroy(epoll_id: u32) {
@@ -291,12 +363,6 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
     };
     let start_time = crate::timer::uptime_us();
 
-    // Log entry for debugging bun resolution hangs
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        crate::tprint!(128, "[epoll] pwait enter: pid={} epfd={} timeout={}ms\n", pid, epfd, timeout);
-    }
-
     let mut iterations = 0u64;
     loop {
         iterations += 1;
@@ -353,32 +419,46 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
             if unsafe { copy_to_user_safe(events_ptr as *mut u8, kernel_events.as_ptr() as *const u8, ready_count * EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                let elapsed = crate::timer::uptime_us() - start_time;
-                let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                for ev in &kernel_events {
-                    let in_flag = if ev.events & EPOLLIN != 0 { "IN" } else { "" };
-                    let out_flag = if ev.events & EPOLLOUT != 0 { "OUT" } else { "" };
-                    let hup_flag = if ev.events & EPOLLHUP != 0 { "HUP" } else { "" };
-                    let err_flag = if ev.events & EPOLLERR != 0 { "ERR" } else { "" };
-                    crate::tprint!(128, "[epoll] pwait pid={} event: data=0x{:x} {}{}{}{} after {}us\n",
-                        pid, ev.data, in_flag, out_flag, hup_flag, err_flag, elapsed);
-                }
-            }
+            log_epoll_pwait_return(
+                epfd,
+                timeout,
+                ready_count,
+                iterations,
+                start_time,
+                interest_snapshot.len(),
+                &kernel_events,
+                "",
+            );
             return ready_count as u64;
         }
 
         if timeout == 0 {
+            log_epoll_pwait_return(
+                epfd,
+                timeout,
+                0,
+                iterations,
+                start_time,
+                interest_snapshot.len(),
+                &[],
+                "",
+            );
             return 0;
         }
 
         if timeout > 0 {
             let elapsed = crate::timer::uptime_us() - start_time;
             if elapsed >= timeout_us {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations > 100 {
-                    crate::tprint!(128, "[epoll] pwait timeout: {}us elapsed, {} iterations\n", 
-                        elapsed, iterations);
-                }
+                log_epoll_pwait_return(
+                    epfd,
+                    timeout,
+                    0,
+                    iterations,
+                    start_time,
+                    interest_snapshot.len(),
+                    &[],
+                    "timeout_expired",
+                );
                 return 0;
             }
         }
@@ -392,6 +472,16 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         }
 
         if akuma_exec::process::is_current_interrupted() {
+            log_epoll_pwait_return(
+                epfd,
+                timeout,
+                0,
+                iterations,
+                start_time,
+                interest_snapshot.len(),
+                &[],
+                "EINTR",
+            );
             return EINTR;
         }
 
@@ -401,7 +491,19 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         // duration since there is no eventfd wake() for epoll waiters.  We check
         // expiry above so it is safe to poll every 10ms regardless of timeout.
         let abs_deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
-        if abs_deadline == 0 { return 0; }
+        if abs_deadline == 0 {
+            log_epoll_pwait_return(
+                epfd,
+                timeout,
+                0,
+                iterations,
+                start_time,
+                interest_snapshot.len(),
+                &[],
+                "deadline_abs0",
+            );
+            return 0;
+        }
         let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
 
         akuma_exec::threading::schedule_blocking(deadline);

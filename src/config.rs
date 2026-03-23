@@ -206,6 +206,10 @@ pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 /// Option to disable [syscall] debug prints to the kernel log.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
 
+/// During `fork`, print a short line to **serial** every 8192 brk pages copied (Go heaps are huge).
+/// Independent of `SYSCALL_DEBUG_INFO_ENABLED` so QEMU logs show liveness without log::debug routing.
+pub const FORK_BRK_SERIAL_PROGRESS: bool = true;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 
@@ -225,8 +229,12 @@ pub const PROC_SYSVIPC_ENABLED: bool = true;
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
 /// Verbose network/epoll debugging for bun resolution issues.
-/// Logs epoll_pwait enter/exit, UDP recv/send, and DNS traffic.
+/// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
 pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;
+
+/// Log every Nth `epoll_pwait` with **timeout=0** and **nready=0** (hot spin). Others are suppressed
+/// to avoid serial floods; increase for quieter traces, decrease (e.g. 512) while debugging.
+pub const EPOLL_ZERO_SAMPLE_INTERVAL: u64 = 64;
 
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;

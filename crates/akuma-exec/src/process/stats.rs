@@ -136,6 +136,7 @@ pub fn syscall_name(nr: usize) -> &'static str {
         93 => "exit", 94 => "exit_group",
         96 => "set_tid_address", 98 => "futex",
         99 => "set_robust_list",
+        101 => "nanosleep",
         113 => "clock_gettime", 115 => "clock_nanosleep",
         124 => "sched_yield",
         130 => "tkill", 131 => "tgkill",

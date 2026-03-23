@@ -136,6 +136,11 @@ pub fn run_all_tests() {
     test_kill_child_processes_thread_group_matches_fork_parent();
     test_pidfd_cloexec();
 
+    // fork_process copy math (overflow / cap helpers; see fork loop in akuma-exec)
+    test_fork_page_count_for_len();
+    test_fork_brk_cap_pages_ordering();
+    test_syscall_name_linux_nrs();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -2640,6 +2645,71 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
 /// We can't directly observe IRQ state from a test, but we can verify the
 /// methods work without deadlocking on a single-threaded call (a deadlock
 /// would hang the test). We also verify the cloned table is independent.
+/// Pure math for fork eager copy: must not wrap `usize` or fork can loop forever.
+fn test_fork_page_count_for_len() {
+    use akuma_exec::process::fork_page_count_for_len;
+
+    let ps = akuma_exec::mmu::PAGE_SIZE;
+    let ok = fork_page_count_for_len(0) == Some(0)
+        && fork_page_count_for_len(1) == Some(1)
+        && fork_page_count_for_len(ps) == Some(1)
+        && fork_page_count_for_len(ps + 1) == Some(2)
+        && fork_page_count_for_len(usize::MAX).is_none();
+
+    if ok {
+        console::print("[Test] fork_page_count_for_len PASSED\n");
+    } else {
+        crate::safe_print!(128, "[Test] fork_page_count_for_len FAILED\n");
+    }
+}
+
+/// PSTATS / tracing: `syscall_name` must label common Linux AArch64 syscalls (not `nr101=`).
+fn test_syscall_name_linux_nrs() {
+    use akuma_exec::process::syscall_name;
+
+    let ok = syscall_name(101) == "nanosleep"
+        && syscall_name(22) == "epoll_pwait"
+        && syscall_name(113) == "clock_gettime"
+        && syscall_name(214) == "brk"
+        && syscall_name(222) == "mmap"
+        && syscall_name(220) == "clone";
+
+    if ok {
+        console::print("[Test] syscall_name_linux_nrs PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] syscall_name_linux_nrs FAILED: 101={:?} 22={:?} 113={:?}\n",
+            syscall_name(101),
+            syscall_name(22),
+            syscall_name(113),
+        );
+    }
+}
+
+/// Sanity-check that brk span page count compares correctly to the kernel cap constant.
+/// (The cap lives in `akuma_exec::process`; we only verify ordering invariants here.)
+fn test_fork_brk_cap_pages_ordering() {
+    use akuma_exec::process::fork_page_count_for_len;
+
+    // 32 GiB of pages at 4K = 8M pages — same order as MAX_FORK_BRK_COPY_PAGES in fork_process.
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+    const PAGES_32GIB: usize = (32 * GIB) / 4096;
+
+    let pages_32g = fork_page_count_for_len(32 * GIB);
+    let ok = pages_32g == Some(PAGES_32GIB)
+        && PAGES_32GIB == 8 * 1024 * 1024
+        && fork_page_count_for_len(32 * GIB + 1).map(|p| p > PAGES_32GIB) == Some(true);
+
+    if ok {
+        console::print("[Test] fork_brk_cap_pages_ordering PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] fork_brk_cap_pages_ordering FAILED: pages_32g={:?} expect {}\n",
+            pages_32g, PAGES_32GIB);
+    }
+}
+
 fn test_fd_table_lock_consistency() {
     use akuma_exec::process::{SharedFdTable, FileDescriptor};
     use alloc::sync::Arc;

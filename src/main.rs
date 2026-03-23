@@ -421,6 +421,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
             cooperative_main_thread: config::COOPERATIVE_MAIN_THREAD,
             syscall_debug_info_enabled: config::SYSCALL_DEBUG_INFO_ENABLED,
+            fork_brk_serial_progress: config::FORK_BRK_SERIAL_PROGRESS,
             enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
             proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
             proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
