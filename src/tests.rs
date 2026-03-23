@@ -2555,103 +2555,83 @@ fn test_parallel_processes() -> bool {
     // and they both complete successfully proves parallel execution capability.
     // The interleaved output visible in logs provides visual confirmation.
 
-    // Wait for both to complete using channel status
+    // Wait for both to complete using channel status.
+    //
+    // The ps/kthreads checks run on every iteration (no artificial delay) so
+    // they get a chance to observe the running processes even if they finish
+    // quickly.  Once a check passes it is not retried.
     console::print("  Waiting for processes to complete...\n");
-    let complete_timeout = 40_000_000; // 30 seconds (hello runs for ~10 seconds)
+    let complete_timeout = 40_000_000; // 40 seconds
     let complete_start = crate::timer::uptime_us();
-    let mut ps_done = true; // FIXME revert back
+    let mut ps_done = false;
     let mut kthreads_done = false;
+    let mut checks_attempted = false;
 
     loop {
         threading::yield_now();
-        
+
         let p1_done = channel1.has_exited() || akuma_exec::threading::is_thread_terminated(tid1);
         let p2_done = channel2.has_exited() || akuma_exec::threading::is_thread_terminated(tid2);
         let exit_code1 = channel1.exit_code();
         let exit_code2 = channel2.exit_code();
-        if exit_code1 != 0 || exit_code2 != 0 {
+
+        if (exit_code1 != 0 && channel1.has_exited()) || (exit_code2 != 0 && channel2.has_exited()) {
             crate::safe_print!(64, "  Processes failed with exit codes {} and {}\n", exit_code1, exit_code2);
             break;
         }
 
-        if p1_done && p2_done {
-            console::print(" done\n");
-            PROCESS1_DONE.store(true, Ordering::Release);
-            PROCESS2_DONE.store(true, Ordering::Release);
-            break;
-        } else {
-            // Run ps and kthreads checks after a brief delay to let processes start
-            if crate::timer::uptime_us() - complete_start > complete_timeout / 100 && (!ps_done || !kthreads_done) {
-                // Test ps command
-                if !ps_done {
-                    let ps_result =
+        // Run ps/kthreads checks while at least one process is still alive.
+        // No delay gate — try on every iteration until both succeed or
+        // the processes finish.
+        if (!p1_done || !p2_done) && (!ps_done || !kthreads_done) {
+            checks_attempted = true;
+
+            if !ps_done {
+                let ps_result =
                     crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
-
-                    match ps_result {
-                        Ok(value) => {
-                            let value_as_str = String::from_utf8_lossy(&value);
-                            crate::safe_print!(64, "ps output:\n{}\n", value_as_str);
-
-                            let values_split = value_as_str.split('\n').collect::<Vec<&str>>();
-                            let process_name = String::from("/bin/hello");
-                            let process_state = String::from("running");
-
-                            // check if at least one process is visible
-                            if values_split.len() >= 2 {
-                                if values_split[1].contains(&process_name) && values_split[1].contains(&process_state) || 
-                                    values_split[2].contains(&process_name) && values_split[2].contains(&process_state) {
-                                    ps_done = true;
-                                    console::print("  ps check: PASS (both processes visible)\n");
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            console::print("ps failed!\n");
-                        }
+                if let Ok(value) = ps_result {
+                    let value_as_str = String::from_utf8_lossy(&value);
+                    let process_name = "/bin/hello";
+                    let process_state = "running";
+                    if value_as_str.lines().any(|line| line.contains(process_name) && line.contains(process_state)) {
+                        ps_done = true;
+                        console::print("  ps check: PASS\n");
                     }
                 }
+            }
 
-                // Test kthreads command
-                if !kthreads_done {
-                    let kthreads_result =
+            if !kthreads_done {
+                let kthreads_result =
                     crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"kthreads").await });
+                if let Ok(value) = kthreads_result {
+                    let value_as_str = String::from_utf8_lossy(&value);
+                    let tid1_str = format!("{:>4}", tid1);
+                    let tid2_str = format!("{:>4}", tid2);
+                    let user_process = "user-process";
 
-                    match kthreads_result {
-                        Ok(value) => {
-                            let value_as_str = String::from_utf8_lossy(&value);
-                            crate::safe_print!(64, "kthreads output:\n{}\n", value_as_str);
+                    let has_tid1 = value_as_str.lines().any(|line|
+                        line.contains(&tid1_str) && line.contains(user_process));
+                    let has_tid2 = value_as_str.lines().any(|line|
+                        line.contains(&tid2_str) && line.contains(user_process));
 
-                            // Check that both thread IDs appear as user-process threads
-                            let tid1_str = format!("{:>4}", tid1);
-                            let tid2_str = format!("{:>4}", tid2);
-                            let user_process = "user-process";
-                            
-                            let has_tid1 = value_as_str.lines().any(|line| 
-                                line.contains(&tid1_str) && line.contains(user_process));
-                            let has_tid2 = value_as_str.lines().any(|line| 
-                                line.contains(&tid2_str) && line.contains(user_process));
-
-                            // change kthreads to list at least one user-process
-                            if has_tid1 || has_tid2 {
-                                kthreads_done = true;
-                                crate::safe_print!(128, "  kthreads check: PASS (threads {} or {} visible as user-process)\n", tid1, tid2);
-                            } else {
-                                crate::safe_print!(160, "  kthreads check: waiting (tid1={} found={}, tid2={} found={})\n", 
-                                    tid1, has_tid1, tid2, has_tid2);
-                            }
-                        }
-                        Err(_) => {
-                            console::print("kthreads failed!\n");
-                        }
+                    if has_tid1 || has_tid2 {
+                        kthreads_done = true;
+                        crate::safe_print!(128, "  kthreads check: PASS (threads {} or {} visible)\n", tid1, tid2);
                     }
                 }
             }
         }
 
+        if p1_done && p2_done {
+            console::print("  Both processes done\n");
+            PROCESS1_DONE.store(true, Ordering::Release);
+            PROCESS2_DONE.store(true, Ordering::Release);
+            break;
+        }
+
         if crate::timer::uptime_us() - complete_start > complete_timeout {
-            console::print(" TIMEOUT\n");
+            console::print("  TIMEOUT\n");
             crate::safe_print!(96, "    P1 done: {}, P2 done: {}\n", p1_done, p2_done);
-            // Continue to cleanup even on timeout
             break;
         }
     }
@@ -2666,20 +2646,25 @@ fn test_parallel_processes() -> bool {
     // Verify results
     let p1_done = PROCESS1_DONE.load(Ordering::Acquire);
     let p2_done = PROCESS2_DONE.load(Ordering::Acquire);
-    
-    // Success criteria:
-    // 1. Both processes spawned on different threads (tid1 != tid2)
-    // 2. Both processes completed successfully
-    // 3. Both ps and kthreads commands showed the processes/threads
-    // The interleaved output visible in logs proves true parallel execution
+
     let threads_different = tid1 != tid2;
-    let ok = threads_different && p1_done && p2_done && ps_done && kthreads_done;
-    
+
+    // The ps/kthreads checks are best-effort: they can only succeed while at
+    // least one process is still running.  If both processes finished before
+    // the checks had a chance to run, don't penalise.
+    let checks_ok = if checks_attempted {
+        ps_done && kthreads_done
+    } else {
+        true
+    };
+
+    let ok = threads_different && p1_done && p2_done && checks_ok;
+
     if !ok {
-        crate::safe_print!(192, "  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}\n", 
-                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done);
+        crate::safe_print!(192, "  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}, checks_attempted: {}\n",
+                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done, checks_attempted);
     }
-    
+
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
