@@ -414,6 +414,36 @@ for post-mortem in that case.  Prefer:
 **Related:** *Post-success hang* above (parent **epoll** vs **exit notification**); this pattern
 is **earlier** in the pipeline (**before** the next **`execve`**).
 
+### Observed stall point: `internal/cpu` `asm -gensymabis` (2026-03-22)
+
+The build successfully completes `internal/goarch` (compile), `internal/abi` (compile + asm +
+pack + buildid + cp), and `internal/unsafeheader` (compile).  It then starts `internal/cpu`:
+`asm -gensymabis` is the last `-x` line printed before the **freeze**.
+
+**What the serial log shows at the freeze:**
+
+1. Previous `compile` (PID 93, `internal/abi`) exits cleanly: `[exit_group] pid=93 … code=0`.
+2. Parent `go` (PID 60) processes the exit: `pwait ret … nready=1` (pipe EOF), thread cleanup
+   fires (`[Cleanup] Thread 12/14/15/16 recycled`).
+3. `go` opens many new fds for the next steps (epoll `ctl ADD` fd=2136..2155 — **fd numbers in
+   the 2100s**, suggesting hundreds of pidfds accumulated despite the cloexec fix — verify
+   `is_cloexec` is checked on the `execve` path).
+4. VFORK clone: `[clone] flags=0x4111 stack=0x0`, pipes 48/49 created and clone_ref'd.
+5. `pwait ret … nready=2` (one INOUT + one OUT).
+6. Then **`pwait zero-sample#17 … nready=0 timeout=0ms`** — the parent is polling with no
+   events ready.  The **vfork child never calls `execve`** (no `[syscall] execve` line).
+
+**Notable: fd numbers are very high (2136–2155).** `epoll_create1` returned fd=2138, eventfd2
+returned fd=2139 — for the `compile` child (PID 93). After the child exits those fds should be
+gone, but the parent `go` (PID 60) then adds fds 2136–2155 to **its own** epoll (epfd=5). This
+means `go` itself accumulated **~2100+ fds** by this point. Likely cause: pidfds not being
+closed by `exec` (cloexec flag not checked during `do_execve` fd cleanup) or pidfds not being
+closed by `wait4` after reaping.
+
+**SSH was unreachable** during the hang; serial was the only output channel and it stopped
+producing new lines after the `pwait zero-sample#17` line — consistent with the kernel itself
+being wedged (no scheduling, or a spinlock deadlock).
+
 ### Tracing: `epoll_pwait` + PSTATS
 
 When **`SYSCALL_DEBUG_NET_ENABLED`** is on, each **`epoll_pwait`** logs **one return line**:
