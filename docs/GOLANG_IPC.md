@@ -257,11 +257,11 @@ the sigreturn restorer page in `try_deliver_signal` after that fix. True
 recursive delivery while already on the sigaltstack is handled separately
 (re-pend / fail delivery — see `try_deliver_signal`).
 
-**Separate issue (not 137):** errors like `could not import internal/cpu (not
-the start of an archive file ("cpu.o …"))` mean the **Go build cache entry is
-corrupted** (object bytes where a `.a` archive is expected). Fix on that host
-with `go clean -cache` or by removing the bad `GOCACHE`/`~/.cache/go-build`
-object.
+**Separate issue (not 137, now fixed):** errors like `could not import
+internal/cpu (not the start of an archive file ("cpu.o …"))` were caused by
+missing `O_APPEND` support in `sys_write` — see *"`O_APPEND` not honoured in
+`sys_write`"* below.  If stale cache entries remain from a pre-fix kernel, run
+`rm -rf $(go env GOCACHE)` to clear them.
 
 **Regression (fixed): `go: error obtaining buildID for go tool compile: exit status 137`.**
 If `return_to_kernel` called **`kill_child_processes_for_thread_group(l0)` on
@@ -444,8 +444,17 @@ being wedged (no scheduling, or a spinlock deadlock).
 
 **Update (2026-03-22):** The compile crashes (`exit status 137`, SIGSEGV, `index out of range
 [-38]`) observed in the same session are explained by the icache invalidation bug — see
-*"Demand-paging icache invalidation bug"* below.  The kernel hang itself remains under
-investigation; it may be a separate scheduling or spinlock issue.
+*"Demand-paging icache invalidation bug"* below.  The archive corruption (`"not the start of
+an archive file"`) was caused by missing `O_APPEND` support — see *"`O_APPEND` not honoured in
+`sys_write`"* below.  Both are now fixed.
+
+**Current status (2026-03-22, post-O_APPEND fix):** With a clean Go cache, the build compiles
+~35 packages successfully (zero archive errors, zero SIGSEGV), but the kernel still
+crashes/hangs during the build, killing 4–5 compile processes (`exit status 137`) and dropping
+the SSH session (`signal: hangup`).  The kernel serial log shows all completed compiles exiting
+with `code=0` — the 137s come from processes that were killed when the kernel died (they never
+reached `exit_group`).  The kernel hang remains under investigation; it may be a spinlock
+deadlock or scheduling issue.
 
 ### Tracing: `epoll_pwait` + PSTATS
 

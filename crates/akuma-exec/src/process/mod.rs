@@ -38,6 +38,20 @@ use akuma_terminal as terminal;
 
 use self::image::{compute_heap_lazy_size, LAZY_STACK_MAX};
 
+// #region agent log
+struct FmtBuf<'a> { buf: &'a mut [u8], pos: &'a mut usize }
+impl core::fmt::Write for FmtBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let avail = self.buf.len() - *self.pos;
+        let n = bytes.len().min(avail);
+        self.buf[*self.pos..*self.pos + n].copy_from_slice(&bytes[..n]);
+        *self.pos += n;
+        Ok(())
+    }
+}
+// #endregion
+
 /// Page count to copy `len` bytes one page at a time. Returns [`None`] if the
 /// computation overflows `usize` (would otherwise wrap and loop forever).
 #[must_use]
@@ -1109,12 +1123,28 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
 /// expected to deadlock the global lazy-region or fd tables. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] fork_process ENTRY\n");
+    // #endregion
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot fork");
     }
     let parent = current_process().ok_or("No current process")?;
     let parent_pid = parent.pid;
     
+    // #region agent log
+    {
+        let mut buf = [0u8; 128];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[FORK-DBG] pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
+                parent_pid, parent.brk, parent.memory.code_end,
+                parent.mmap_regions.len(),
+                parent.lazy_regions.len()));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
+    // #endregion
+
     // 1. Create new address space
     let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
     
@@ -1254,6 +1284,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         Ok(())
     }
 
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: copying stack\n");
+    // #endregion
     copy_range_phys(
         parent_l0,
         stack_start,
@@ -1262,6 +1295,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         None,
         "stack",
     )?;
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: stack done\n");
+    // #endregion
 
     // Copy code+heap range.  Derive code_start from code_end (which is
     // always in the main binary's range) rather than entry_point (which
@@ -1273,6 +1309,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     };
     if parent.brk > code_start {
         let brk_len = parent.brk - code_start;
+        // #region agent log
+        {
+            let mut buf = [0u8; 96];
+            let mut pos = 0usize;
+            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
+                    code_start, parent.brk, brk_len / mmu::PAGE_SIZE));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        }
+        // #endregion
         copy_range_phys(
             parent_l0,
             code_start,
@@ -1281,10 +1327,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             Some(MAX_FORK_BRK_COPY_PAGES),
             "brk",
         )?;
+        // #region agent log
+        (runtime().print_str)("[FORK-DBG] step4: brk done\n");
+        // #endregion
     }
 
     // Copy dynamic linker / interpreter region (0x3000_0000).  These pages
     // are mapped by the ELF loader but not tracked in mmap_regions.
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: copying interp\n");
+    // #endregion
     let interp_base = 0x3000_0000usize;
     let interp_scan_size = 2 * 1024 * 1024; // 2 MB — covers even large musl builds
     if mmu::translate_user_va(parent_l0, interp_base).is_some() {
@@ -1297,6 +1349,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             "interp",
         )?;
     }
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: interp done\n");
+    // #endregion
 
     // Copy mmap regions so forked children can run built-in applets (e.g.
     // busybox sh pipes) without crashing on unmapped pages.  We cap total
@@ -1349,6 +1404,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.mmap_regions = child_mmap_regions;
     new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap = parent.memory.next_mmap;
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
+    // #endregion
 
     // Copy physically-mapped pages from parent's lazy regions.
     // clone_lazy_regions() (called later) copies only metadata; any pages
@@ -1400,6 +1458,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         }
     }
     
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
+    // #endregion
+
     // 5. Write ProcessInfo to child's process info page
     unsafe {
         let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
@@ -1421,6 +1483,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // Store context in the Process struct (entry_point_trampoline uses proc.context)
     new_proc.context = child_ctx;
 
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step7: spawning child thread\n");
+    // #endregion
     // 7. Allocate thread but keep it INITIALIZING
     let tid = crate::threading::spawn_user_thread_initializing(
         entry_point_trampoline as extern "C" fn() -> !, 
@@ -1445,11 +1510,20 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     register_child_channel(child_pid, exit_channel, parent_pid);
 
     // Register process BEFORE marking thread READY
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step8: registering process\n");
+    // #endregion
     register_process(child_pid, new_proc);
     clone_lazy_regions(parent_pid, child_pid);
     
     // Now safe to start the thread
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] step8: marking child READY\n");
+    // #endregion
     crate::threading::mark_thread_ready(tid);
+    // #region agent log
+    (runtime().print_str)("[FORK-DBG] fork_process EXIT ok\n");
+    // #endregion
     
     Ok(child_pid)
 }
@@ -1577,8 +1651,17 @@ pub fn allocate_pid() -> Pid {
 /// Called by threading::spawn_user_thread
 pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
+    // #region agent log
+    {
+        let mut buf = [0u8; 64];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[FORK-DBG] trampoline ENTRY tid={}\n", tid));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
+    // #endregion
     let mut proc_ptr: *mut Process = core::ptr::null_mut();
-    
+
     with_irqs_disabled(|| {
         let mut processes = PROCESS_TABLE.lock();
         for proc in processes.values_mut() {
@@ -1588,7 +1671,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
             }
         }
     });
-    
+
     if proc_ptr.is_null() {
         log::debug!("[process] FATAL: No process found for thread {}", tid);
         crate::threading::mark_current_terminated();

@@ -85,6 +85,9 @@ fn halt_with_code(code: u32) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // #region agent log
+    console::print("[FORK-DBG] PANIC ENTERED\n");
+    // #endregion
     console::print("\n\n!!! PANIC !!!\n");
     if let Some(location) = info.location() {
         console::print("Location: ");

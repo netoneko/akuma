@@ -1217,6 +1217,9 @@ extern "C" fn el1_fault_recovery_pad() {
 /// Uses static buffers to avoid heap allocation during crash
 #[unsafe(no_mangle)]
 extern "C" fn rust_sync_el1_handler() {
+    // #region agent log
+    crate::console::print("[FORK-DBG] EL1 SYNC EXCEPTION!\n");
+    // #endregion
     use core::fmt::Write;
     
     // Read ESR_EL1 to determine exception type

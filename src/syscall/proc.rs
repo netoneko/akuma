@@ -22,10 +22,16 @@ fn notify_child_channel_exited(pid: u32, code: i32) {
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
 pub(crate) fn vfork_complete(child_pid: u32) {
+    // #region agent log
+    crate::tprint!(96, "[FORK-DBG] vfork_complete child_pid={}\n", child_pid);
+    // #endregion
     let parent_tid = crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().remove(&child_pid)
     });
     if let Some(tid) = parent_tid {
+        // #region agent log
+        crate::tprint!(96, "[FORK-DBG] vfork_complete waking parent tid={}\n", tid);
+        // #endregion
         akuma_exec::threading::get_waker_for_thread(tid).wake();
     }
 }
@@ -309,8 +315,13 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 // in the same address space, corrupting each other's state.
                 // Note: VFORK_WAITERS was already populated above, before fork_process.
                 if flags & CLONE_VFORK != 0 {
-                    crate::tprint!(96, "[clone] CLONE_VFORK: blocking parent tid={} until child pid={} execs/exits\n", parent_tid, new_pid);
+                    // #region agent log
+                    crate::tprint!(128, "[FORK-DBG] VFORK blocking parent tid={} child={}\n", parent_tid, new_pid);
+                    // #endregion
                     akuma_exec::threading::schedule_blocking(u64::MAX);
+                    // #region agent log
+                    crate::tprint!(128, "[FORK-DBG] VFORK parent tid={} RESUMED after child={}\n", parent_tid, new_pid);
+                    // #endregion
                 }
                 return new_pid as u64;
             },
@@ -427,6 +438,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+    // #region agent log
+    crate::tprint!(128, "[FORK-DBG] do_execve ENTRY: {}\n", resolved_path);
+    // #endregion
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,
