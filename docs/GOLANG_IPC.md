@@ -1298,3 +1298,131 @@ experience queuing delay proportional to the epoll congestion.
   scheduler tick) so threads are returned to the pool more promptly.
 - Consider a priority or fairness mechanism for the round-robin scheduler so interactive
   SSH sessions are not crowded out by build-system polling loops.
+
+---
+
+## Go Build SIGSEGV Recurrence (2026-03-26) — Why the crash came back
+
+After the four-bug fix set (MAP_FIXED guard, lazy fault guard, fork copy guard, alloc_mmap
+straddle fix), `go build` still crashes with `PC=0x20000000` and `PC=0x80000000`.
+
+### The PSTATE confusion
+
+The `PC=0x80000000` and `PC=0x20000000` values that appeared in `full.log` on the _previous_
+run are **not code addresses**. They are `PSTATE` condition-flag snapshots printed by the
+sigreturn/crash log path:
+
+- `0x80000000` — N-flag (Negative) set in AArch64 NZCV condition flags
+- `0x20000000` — C-flag (Carry) set in AArch64 NZCV condition flags
+
+Those entries were red herrings from the prior crash log.
+
+### The actual cause in the new run
+
+The new crashes are genuine faults at those virtual addresses. The Go toolchain binaries are
+ELF executables whose `.text` segment happens to be linked at:
+
+| Binary | ELF text VA |
+|--------|-------------|
+| `asm`  | `0x20000000` |
+| `compile` | `0x80000000` |
+
+Both of these fall inside the kernel identity-map range (`0x4000_0000–0xC000_0000`). The ELF
+loader has **no kernel VA guard** — it loads the binary at whatever address the ELF file
+specifies. The pages are registered in the process's mmap table, but when Go tries to execute
+them for the first time (demand-paging the text segment), the **lazy fault guard** we added
+fires:
+
+```
+far_in_kernel_identity_user_range(0x20000000) == true  →  SIGSEGV
+```
+
+Our fix was meant to catch _anonymous_ mmap regions that accidentally ended up at kernel VAs.
+But file-backed ELF text segments at those VAs are equally problematic and also get killed by
+the guard.
+
+### Root cause
+
+The lazy fault guard is too broad: it rejects **all** faults in the kernel identity range,
+including legitimate file-backed demand-paging of ELF text pages at `0x20000000`/`0x80000000`.
+
+The real fix needs to happen earlier — the **ELF loader** should refuse to map a segment whose
+VA overlaps `[KERNEL_VA_START, KERNEL_VA_END)` and fail the exec with `ENOEXEC`. That would
+produce a clear error before any pages are allocated, rather than silently mapping the binary
+and then crashing on first execution.
+
+### Status
+
+Not yet fixed. The lazy fault guard remains in place as a defence-in-depth measure. The ELF
+loader guard is the correct permanent fix.
+
+---
+
+## Kernel Freeze During Go Build (2026-03-26) — Full Analysis
+
+### Symptom
+
+After several minutes of `go build`, both SSH sessions become unresponsive. No new SSH
+connections can be made. The `[TMR]` heartbeat (printed every 500 scheduler ticks, ~5 s)
+stops appearing in the serial log. The system does not recover.
+
+### Timer stop timeline (from `full.log`)
+
+```
+line 8921:  [TMR] t=13000  (≈130 s uptime)   ← last heartbeat
+…
+(silence for ~26 s)
+…
+line 8937:  [FORK] pid=… clone starting       (≈156 s uptime)
+…
+line ~9020: [FORK-PG] r21p16/64 va=…          ← log ends here, fork still running
+```
+
+Key finding: the timer **stops 26 seconds before the fork even begins**. The fork itself
+completes all 22 mmap regions without error. The system froze _before_ the fork, not
+because of it.
+
+### Why the timer stops
+
+The ARM generic timer fires an IRQ that the scheduler handles. The scheduler re-arms the
+timer after each tick to schedule the next interrupt. If:
+
+1. All 32 threads are blocked in long-running syscalls (e.g. `epoll_pwait` with a 37–50 ms
+   timeout), **and**
+2. No timer IRQ fires to preempt them (because the timer was never re-armed after the last
+   tick),
+
+then the kernel enters a state where no thread is runnable, no timer fires, and nothing can
+break the deadlock. The scheduler never gets control again.
+
+The most likely scenario: the ARM timer IRQ fires, the scheduler runs, but the re-arm call
+(`timer_set_next_tick` or equivalent) is not reached because all threads are considered
+"running" (inside a syscall) rather than "waiting". The timer oneshot expires and is never
+rescheduled.
+
+### Connection to epoll starvation
+
+The high-frequency `epoll_pwait` calls from Go's netpoller (see section above) fill the
+thread pool. Each `epoll_pwait` with a 37–50 ms timeout occupies a thread slot for that
+duration. With `go build` spawning `compile`, `asm`, and linker subprocesses — each with
+their own CLONE_VM threads — it is plausible that all 32 slots are occupied, the timer IRQ
+fires but finds nothing to preempt, and the re-arm is skipped or lost.
+
+### Why SSH sessions die
+
+Once the timer stops, the round-robin scheduler stops advancing. Threads already executing
+(inside `epoll_pwait`) run to completion but are never preempted. New runnable threads (the
+SSH session goroutines waiting for input) never get scheduled. From the user's perspective
+both SSH sessions hang, time out, and the daemon stops accepting connections.
+
+### Status
+
+Root cause is timer re-arm loss under full thread-pool load. Not yet fixed.
+
+Potential fixes:
+- Ensure `epoll_pwait` with a long timeout yields its thread slot immediately when no events
+  are ready (i.e. reschedule after returning to the wait loop, not after the full timeout).
+- Re-arm the timer unconditionally in the IRQ handler, not conditionally on finding a
+  runnable thread.
+- Add a watchdog: if no `[TMR]` heartbeat fires within N seconds, force-reset or panic with
+  a diagnostic dump.
