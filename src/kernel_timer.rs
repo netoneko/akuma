@@ -332,6 +332,7 @@ impl Future for Timer {
 // ============================================================================
 
 // Nesting counter approach -- disables IRQs via DAIF and tracks depth.
+// This is necessary because the trait's RawRestoreState is fixed to () in this version.
 
 static CS_NESTING: AtomicU8 = AtomicU8::new(0);
 static CS_SAVED_DAIF: AtomicU64 = AtomicU64::new(0);
@@ -342,7 +343,7 @@ critical_section::set_impl!(CriticalSection);
 
 unsafe impl critical_section::Impl for CriticalSection {
     unsafe fn acquire() -> critical_section::RawRestoreState {
-        // Read current DAIF and disable IRQs atomically, then update nesting.
+        // Read current DAIF and disable IRQs atomically
         let daif: u64;
         unsafe {
             asm!(
@@ -354,6 +355,7 @@ unsafe impl critical_section::Impl for CriticalSection {
             );
         }
 
+        // Only save the FIRST daif state (the one we'll eventually restore)
         let nesting = CS_NESTING.fetch_add(1, Ordering::SeqCst);
         if nesting == 0 {
             CS_SAVED_DAIF.store(daif, Ordering::SeqCst);
@@ -363,6 +365,7 @@ unsafe impl critical_section::Impl for CriticalSection {
     unsafe fn release(_restore_state: critical_section::RawRestoreState) {
         let nesting = CS_NESTING.fetch_sub(1, Ordering::SeqCst);
         if nesting == 1 {
+            // Restore the saved DAIF on the final release
             let daif = CS_SAVED_DAIF.load(Ordering::SeqCst);
             unsafe {
                 asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));

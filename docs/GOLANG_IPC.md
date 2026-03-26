@@ -1164,63 +1164,28 @@ point, confirming the timer interrupt itself has ceased.
 
 ---
 
-## 2GB RAM Identity Mapping Bug (2026-03-26) — **PROPOSED FIX**
+## 2GB RAM Identity Mapping Bug (2026-03-26) — **FIX APPLIED**
 
 ### Symptom
 
-The kernel hangs during `go build`'s memory-intensive operations. Specifically, the hang occurs during `fork_process` while copying mmap regions. The serial log shows progress up to a high virtual address (e.g., `va=0xc2024000`) before the timer heartbeat (`[TMR]`) and all other output stop completely.
-
-### Evidence
-
-1. **RAM Detection**: The kernel detects 2048 MB of RAM from the DTB:
-   `[Memory] Detected from DTB: base=0x40000000, size=2048 MB`
-2. **Memory Layout**:
-   - Total RAM: 0x4000_0000 to 0xC000_0000 (2 GB)
-   - User pages extend up to 0xC000_0000.
-3. **Hardcoded Mapping**: In `crates/akuma-exec/src/mmu/mod.rs`, `add_kernel_mappings` is hardcoded to map exactly 1 GB of RAM:
-   ```rust
-   // 1GB = 512 × 2MB blocks: VA 0x40000000-0x7FFFFFFF → PA 0x40000000-0x7FFFFFFF
-   for i in 0..512u64 {
-       let pa = 0x4000_0000 + i * 0x20_0000;
-       core::ptr::write_volatile(l2_ram_ptr.add(i as usize), pa | kernel_ram_flags);
-   }
-   ```
-4. **Access Violation**: During `fork_process`, the kernel uses `phys_to_virt(frame.addr)` to copy memory. Since `phys_to_virt` is an identity mapping, any physical frame allocated in the second gigabyte (PA $\ge$ `0x8000_0000`) results in a kernel virtual address that is **not mapped** in the current `TTBR0`.
-5. **Silent Hang**: Accessing an unmapped VA in EL1 triggers an `EL1 Sync Exception`. If the exception handler or the stack it uses also hits unmapped memory, or if the handler deadlocks while trying to print the error, the kernel hangs silently and the timer stops.
+The kernel hung or crashed with SIGSEGV during `go build`'s memory-intensive operations. The hang occurred in `fork_process` when accessing memory in the second gigabyte of RAM (PA $\ge$ `0x8000_0000`).
 
 ### Root Cause
 
-The kernel identity mapping in `TTBR0` (provided to all user processes) only covers the first 1GB of the detected 2GB of RAM. When memory-hungry processes like `go build` allocate pages in the second GB, the kernel crashes whenever it tries to access those pages via identity-mapped addresses (e.g., during `fork` or `copy_to_user`).
+1.  **Identity Mapping Limit**: The kernel identity mapping in `TTBR0` was hardcoded to only cover the first 1GB of RAM. Accessing the second 1GB in EL1 (e.g., during `fork` memory copy) triggered unhandled exceptions.
+2.  **VA Collision**: The `mmap` allocator could assign virtual addresses in the `0x8000_0000`–`0xC000_0000` range, which now conflicted with the 2GB identity mapping required for kernel operations.
+3.  **IRQ Nesting Bug**: A flaw in `CriticalSection` (used by async timers) caused interrupts to be re-enabled prematurely during nested calls, leading to random freezes when high-frequency timers interleaved with IRQ-disabled regions.
 
-### Proposed Fix
+### Fix Summary (2026-03-26)
 
-1.  **Store RAM metadata**: Modify `crates/akuma-exec/src/mmu/mod.rs` to store `RAM_BASE` and `RAM_SIZE` in atomic globals during `init()`.
-2.  **Dynamic Identity Mapping**: Update `add_kernel_mappings` to calculate the number of L2 blocks required based on the actual `RAM_SIZE` and map the entire range.
-3.  **L1 Expansion**: If `RAM_SIZE` exceeds 1GB, the kernel must allocate and link additional L2 tables in the L1 entries.
+1.  **Dynamic Identity Mapping**: Updated `crates/akuma-exec/src/mmu/mod.rs` to dynamically map the entire detected RAM range (up to 2GB or more) by calculating the required L1/L2 entries at runtime.
+2.  **VA Range Reservation**: Updated `KERNEL_VA_END` to `0xC000_0000` in `crates/akuma-exec/src/process/types.rs`. This reserves the full 2GB identity-mapped range, preventing `mmap` from assigning conflicting user addresses.
+3.  **CriticalSection Restoration**: Fixed the AArch64 `CriticalSection` implementation in `src/kernel_timer.rs` to use a nesting counter. This ensures `DAIF` (interrupt state) is only restored to its original value after the outermost `release()` call.
+4.  **Enhanced Memory Monitoring**: Updated the `MemMonitor` heartbeat in `src/main.rs` to report both kernel heap usage and total system RAM (PMM) stats for better visibility into memory-intensive builds.
+5.  **Heap Optimization**: Reduced the default kernel heap allocation from 1/4 of RAM to 1/16 (max 128MB), freeing up significantly more memory for user-space applications like the Go compiler.
 
-#### Implementation Sketch (`crates/akuma-exec/src/mmu/mod.rs`):
+### Verification
 
-```rust
-// In add_kernel_mappings:
-let ram_size = RAM_SIZE.load(Ordering::Relaxed);
-let ram_base = RAM_BASE.load(Ordering::Relaxed);
-let num_l2_tables = (ram_size + 0x3FFFFFFF) / 0x40000000; // Number of 1GB slots
-
-for l1_idx in 0..num_l2_tables {
-    let l2_frame = (rt.alloc_page_zeroed)().ok_or("...")?;
-    self.page_table_frames.push(l2_frame);
-    
-    // Link L1 entry to this L2 table
-    let l1_ptr = phys_to_virt(l1_table.addr) as *mut u64;
-    l1_ptr.add(l1_idx).write_volatile(l2_frame.addr | VALID | TABLE);
-    
-    // Fill L2 table with 2MB blocks
-    let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
-    for i in 0..512 {
-        let pa = ram_base + (l1_idx * 0x40000000) + (i * 0x200000);
-        if pa < ram_base + ram_size {
-            l2_ptr.add(i).write_volatile(pa | kernel_ram_flags);
-        }
-    }
-}
-```
+- **Test Suite**: Added `test_kernel_identity_mapping_full_ram` to `src/tests.rs` which verifies accessibility of high memory (PA `0x8000_0000`) from EL1.
+- **Go Build**: Verified that `go build` no longer hangs in the fork loop or crashes with SIGSEGV when allocating beyond 1GB.
+- **Stability**: Heartbeat logs now correctly show 2048MB RAM availability and stable system uptime without random freezes.

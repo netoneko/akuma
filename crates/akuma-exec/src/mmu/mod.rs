@@ -17,13 +17,18 @@ use crate::runtime::{PhysFrame, FrameSource, runtime, with_irqs_disabled, IrqGua
 /// MMU initialization state
 static MMU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+static RAM_BASE: AtomicUsize = AtomicUsize::new(0);
+static RAM_SIZE: AtomicUsize = AtomicUsize::new(0);
+
 /// Check if MMU is initialized
 pub fn is_initialized() -> bool {
     MMU_INITIALIZED.load(Ordering::Acquire)
 }
 
 /// Mark MMU as initialized
-pub fn init(_ram_base: usize, _ram_size: usize) {
+pub fn init(ram_base: usize, ram_size: usize) {
+    RAM_BASE.store(ram_base, Ordering::Release);
+    RAM_SIZE.store(ram_size, Ordering::Release);
     MMU_INITIALIZED.store(true, Ordering::Release);
 }
 
@@ -261,29 +266,43 @@ impl UserAddressSpace {
             }
         }
 
-        // L1[1]: kernel RAM. Use an L2 table with 2MB blocks covering the
-        // full 1GB (512 blocks) instead of a 1GB L1 block, so that
+        // Identity-map the full RAM range.
+        // Use L2 tables with 2MB blocks covering the full RAM size, so that
         // user MAP_FIXED in this range can shatter individual blocks.
-        let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
-        (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable);
-        self.page_table_frames.push(l2_ram_frame);
+        // The full RAM range must be identity-mapped so that phys_to_virt()
+        // works for any PMM-allocated page regardless of which TTBR0 is active.
+        let ram_base = RAM_BASE.load(Ordering::Acquire);
+        let ram_size = RAM_SIZE.load(Ordering::Acquire);
+        let ram_end = ram_base + ram_size;
 
-        unsafe {
-            let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
-            core::ptr::write_volatile(l1_ptr.add(1), l2_ram_entry);
-
-            let l2_ram_ptr = phys_to_virt(l2_ram_frame.addr) as *mut u64;
+        if ram_size > 0 {
             let kernel_ram_flags = flags::VALID | flags::BLOCK | flags::AF
                 | attr_index(MAIR_NORMAL_WB) | flags::UXN | flags::SH_INNER | (0b00 << 6);
 
-            // 1GB = 512 × 2MB blocks: VA 0x40000000-0x7FFFFFFF → PA 0x40000000-0x7FFFFFFF
-            // The full RAM range must be identity-mapped so that phys_to_virt()
-            // works for any PMM-allocated page regardless of which TTBR0 is active.
-            // If user MAP_FIXED lands in this range, get_or_create_table_atomic
-            // shatters the affected 2MB block into 4KB L3 page entries.
-            for i in 0..512u64 {
-                let pa = 0x4000_0000 + i * 0x20_0000;
-                core::ptr::write_volatile(l2_ram_ptr.add(i as usize), pa | kernel_ram_flags);
+            // Calculate range of 1GB L1 entries to fill
+            let start_l1_idx = (ram_base >> 30) & 0x1FF;
+            let end_l1_idx = ((ram_end - 1) >> 30) & 0x1FF;
+
+            for l1_idx in start_l1_idx..=end_l1_idx {
+                let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
+                (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable);
+                self.page_table_frames.push(l2_ram_frame);
+
+                unsafe {
+                    let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
+                    core::ptr::write_volatile(l1_ptr.add(l1_idx), l2_ram_entry);
+
+                    let l2_ram_ptr = phys_to_virt(l2_ram_frame.addr) as *mut u64;
+                    
+                    // Fill this 1GB L2 table with 2MB blocks (up to 512 blocks)
+                    for i in 0..512u64 {
+                        let pa = ((l1_idx as usize) << 30) | ((i as usize) << 21);
+                        // Only map if this 2MB block is within the RAM range
+                        if pa >= ram_base && pa < ram_end {
+                            core::ptr::write_volatile(l2_ram_ptr.add(i as usize), (pa as u64) | kernel_ram_flags);
+                        }
+                    }
+                }
             }
         }
         Ok(())

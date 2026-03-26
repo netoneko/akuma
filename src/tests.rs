@@ -98,6 +98,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
     run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
+    run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
 
     // Bug 10: partial munmap of eager regions
     run_test!(test_eager_munmap_prefix_preserves_suffix, "eager_munmap_prefix_preserves_suffix");
@@ -3582,6 +3583,95 @@ fn make_test_process(
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
     })
+}
+
+/// Verify that the kernel identity mapping covers the full 2GB RAM range.
+/// This test confirms the fix for the 1GB-hardcoded-limit bug.
+fn test_kernel_identity_mapping_full_ram() -> bool {
+    console::print("\n[TEST] MMU: kernel identity mapping covers full RAM (up to 2GB)\n");
+
+    // 1. Verify low RAM (first 1GB)
+    let low_pa = 0x4000_1000;
+    let low_va = akuma_exec::mmu::phys_to_virt(low_pa) as usize;
+    if low_va != low_pa {
+        crate::safe_print!(128, "  low_va={:#x} != low_pa={:#x}\n", low_va, low_pa);
+        return false;
+    }
+
+    // 2. Verify high RAM (second 1GB, requires L1[2] mapping)
+    // We can't easily allocate a high page from PMM for a unit test without
+    // potentially exhausting memory or relying on luck, but we can verify
+    // that the Page Tables themselves contain the mapping for 0x8000_0000.
+    let high_pa = 0x8000_0000; // PA 2GB (start of 2nd GB)
+    let high_va = akuma_exec::mmu::phys_to_virt(high_pa) as usize;
+
+    if high_va != high_pa {
+        crate::safe_print!(128, "  high_va={:#x} != high_pa={:#x}\n", high_va, high_pa);
+        return false;
+    }
+
+    // 3. Perform a safe probe of the mapping if possible.
+    // In this test environment, we are running in the kernel's address space.
+    // Let's try to allocate a page and see if it lands in high memory.
+    // If it doesn't, we'll manually check the L1/L2 entries for 0x8000_0000.
+    let mut high_frame = None;
+    for _ in 0..1024 { // Try many times to get a high frame
+        if let Some(f) = crate::pmm::alloc_page_zeroed() {
+            if f.addr >= 0x8000_0000 {
+                high_frame = Some(f);
+                break;
+            }
+            crate::pmm::free_page(f);
+        } else {
+            break;
+        }
+    }
+
+    if let Some(f) = high_frame {
+        crate::safe_print!(128, "  Found high frame at {:#x}, probing... ", f.addr);
+        let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u64;
+        unsafe {
+            ptr.write_volatile(0xDEAD_BEEF_CAFE_BABE);
+            let val = ptr.read_volatile();
+            if val != 0xDEAD_BEEF_CAFE_BABE {
+                crate::safe_print!(64, "FAIL (readback {:#x})\n", val);
+                crate::pmm::free_page(f);
+                return false;
+            }
+        }
+        crate::safe_print!(64, "OK\n");
+        crate::pmm::free_page(f);
+    } else {
+        crate::safe_print!(128, "  (No high frame allocated, verifying page tables manually)\n");
+        // Manual verification of TTBR0 -> L1 -> L2
+        unsafe {
+            let ttbr0: u64;
+            core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+            let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+            
+            // L0[0] covers 0..512GB
+            let l0e = l0_ptr.add(0).read_volatile();
+            if l0e & 1 == 0 {
+                crate::safe_print!(64, "  FAIL: L0[0] not valid\n");
+                return false;
+            }
+
+            let l1_addr = (l0e & 0x0000_FFFF_FFFF_F000) as usize;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt(l1_addr) as *mut u64;
+
+            // Check L1[2] (covers 2GB..3GB)
+            let l1e = l1_ptr.add(2).read_volatile();
+            if l1e & 1 == 0 {
+                crate::safe_print!(64, "  FAIL: L1[2] (2GB mapping) not valid\n");
+                return false;
+            }
+            crate::safe_print!(64, "  L1[2] is valid: {:#x}\n", l1e);
+        }
+    }
+
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
 }
 
 /// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.

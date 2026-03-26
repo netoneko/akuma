@@ -279,13 +279,16 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: 1/4 of RAM (min 64MB) - kernel data structures
+    // - Heap: 1/16 of RAM (min 64MB, max 128MB) - kernel data structures
     //   Sized dynamically so that memory-hungry workloads (go build, bun, etc.)
-    //   don't exhaust kernel metadata allocations.
+    //   don't exhaust kernel metadata allocations, but capped to save user RAM.
     // - User pages: remaining - for user processes
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = core::cmp::max(ram_size / 4, 64 * 1024 * 1024);
+    let heap_size = core::cmp::min(
+        core::cmp::max(ram_size / 16, 64 * 1024 * 1024),
+        128 * 1024 * 1024
+    );
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
@@ -983,16 +986,21 @@ async fn memory_monitor() -> ! {
         let free_kb = stats.free / 1024;
         let peak_kb = stats.peak_allocated / 1024;
         let heap_mb = stats.heap_size / 1024 / 1024;
+        
+        let (total_pages, allocated_pages, _) = pmm::stats();
+        let total_ram_mb = (total_pages * mmu::PAGE_SIZE) / 1024 / 1024;
+        let free_ram_mb = (total_pages.saturating_sub(allocated_pages) * mmu::PAGE_SIZE) / 1024 / 1024;
+
         let uptime_us = timer::uptime_us();
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | Used: {} KB | Free: {} KB | Peak: {} KB | Heap: {} MB | Allocs: {}\n",
-            uptime_us, allocated_kb, free_kb, peak_kb, heap_mb, stats.allocation_count
+            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {}\n",
+            uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count
         );
         console::print(buf.as_str());
 
-        // Report every 10 seconds
+        // Report every 10 seconds (or period from config)
         Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;
     }
 }

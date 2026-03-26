@@ -319,7 +319,7 @@ impl ProcessMemory {
     }
 
     const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END: usize   = 0x8000_0000;
+    const KERNEL_VA_END: usize   = 0xC000_0000;
 
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
         for i in 0..self.free_regions.len() {
