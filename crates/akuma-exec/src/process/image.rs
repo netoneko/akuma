@@ -26,10 +26,16 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
 impl Process {
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
+        // #region agent log
+        (runtime().print_str)("[FORK-DBG] replace_image: loading ELF\n");
+        // #endregion
         let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)
             .map_err(|e| format!("Failed to load ELF: {}", e))?;
+        // #region agent log
+        (runtime().print_str)("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
+        // #endregion
 
         mmu::UserAddressSpace::deactivate();
         self.address_space = address_space;

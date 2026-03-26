@@ -1009,3 +1009,155 @@ directories bottom-up; **any step that fails** leaves a non-empty parent, so
 
 **Recommended order:** ensure no `compile`/`go` processes are using the cache
 → `rm -rf /.cache/go-build` (or `$(go env GOCACHE)`) → run `go build` again.
+
+## Use-after-free of page tables during `exit_group` (2026-03-22)
+
+### Symptom
+
+EL1 data abort (EC=0x25) with FAR=0x1000 during `go build`:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0xf
+  ELR=0x402ca9dc, FAR=0x1000, SPSR=0x20402345
+  Thread=21, TTBR0=0xb50000752f9000
+  WARNING: Kernel accessing user-space address!
+  EC=0x25 in kernel code — killing current process (EFAULT)
+  Killing PID 328 (/usr/lib/go/pkg/tool/linux_arm64/compile)
+```
+
+The faulting instruction is `ldr w0, [x8]` where x8 = 0x1000 (`PROCESS_INFO_ADDR`).
+This is `read_current_pid()` inlined into the syscall return path, attempting to
+read the current process PID from the process info page.  The read faults because
+TTBR0 points to page tables that have already been freed.
+
+Killed compile processes cascade into Go build failures (`exit status 137`,
+`signal: hangup`) and eventually stall the build entirely — Go waits in futex
+for results that will never arrive.
+
+### Root cause
+
+When the Go runtime's `compile` subprocess creates CLONE_THREAD M-threads, each
+gets a `UserAddressSpace` with `shared: true` (borrows the parent's L0 page
+table).  The original process keeps `shared: false` (owns the page tables).
+
+When any M-thread calls `exit_group`:
+
+1. `sys_exit_group` → `kill_thread_group` marks all sibling threads as terminated
+2. The calling thread returns through `return_to_kernel` → `deactivate()` (switches
+   its own TTBR0 to boot tables) → `unregister_process` → `Drop<UserAddressSpace>`
+3. If the **owner** (shared=false) drops, `Drop` frees all page table frames
+4. Sibling threads still have their TTBR0 pointing to the now-freed page tables
+5. When a sibling makes a syscall (or the scheduler resumes it), the kernel reads
+   `PROCESS_INFO_ADDR` (0x1000) through TTBR0 → translation fault at EL1
+
+The address 0x1000 is **not** a null pointer — it is the fixed address of the
+process info page.  The fault occurs because the page table walk uses freed
+physical pages that may have been recycled by the PMM.
+
+### Fix (2026-03-22)
+
+**Deferred page table freeing** (`crates/akuma-exec/src/mmu/mod.rs`):
+
+Added a global `SHARED_L0_TABLE` (BTreeMap keyed by L0 physical address) that
+tracks reference counts for shared address spaces:
+
+- `new_shared(l0_phys)` increments the refcount for that L0 address
+- Owner `Drop` (shared=false): if refcount > 0 (siblings still alive), **defers**
+  freeing by storing the frame lists (`user_frames`, `page_table_frames`, `l0_frame`)
+  in `SHARED_L0_TABLE` instead of freeing them
+- Shared `Drop` (shared=true): decrements refcount.  If refcount reaches 0 **and**
+  the owner already deferred, the last shared view frees all stored frames
+- If the owner drops last (all shared views already gone), it frees immediately
+  as before
+
+This handles all drop orderings correctly:
+- Owner drops first → defers; last sibling frees
+- Siblings drop first → just decrement; owner frees normally
+
+**Trampoline guard** (`crates/akuma-exec/src/process/mod.rs`):
+
+Added a check in `entry_point_trampoline`: if the thread is already terminated
+or the process is already marked `exited`, skip entering user mode entirely.
+This prevents the race where `clone_thread` spawns a thread that gets scheduled
+after `exit_group` has already killed the thread group.
+
+## Kernel hang during `fork_process` mmap copy (under investigation)
+
+### Symptom
+
+During `go build`, the kernel freezes entirely — no heartbeat, no Thread0
+cleanup, no timer ticks. The hang occurs **inside** `fork_process` during
+the mmap region copy loop, at a non-deterministic page offset (different
+region and page index each run). After the hang, no further kernel output
+appears, indicating the timer interrupt has stopped firing.
+
+Observable pattern from logs:
+```
+[FORK-DBG] mmap region 9/23 va=0xc2024000 pages=256
+[FORK-PG] r9p0/256 va=0xc2024000
+...
+[FORK-PG] r9p160/256 va=0xc20c4000
+<nothing further — kernel frozen>
+```
+
+Previous runs hung at different locations (e.g. region 20/22 page 64).
+In all cases, `[TMR]` timer heartbeat stops appearing after the hang
+point, confirming the timer interrupt itself has ceased.
+
+### What's been ruled out
+
+| Hypothesis | Evidence | Verdict |
+|-----------|----------|---------|
+| PMM exhaustion | PMM shows ~340K free pages (65% of 2 GB) at last stat | **Rejected** |
+| EL1 data abort | No `EL1 SYNC EXCEPTION` during hang (only test-suite faults) | **Rejected** |
+| Kernel panic | No panic output | **Rejected** |
+| OOM in inner loop | `alloc_page_zeroed` never returns None | **Rejected** |
+| Bad physical address | Bounds check (0x40000000–0xC0000000) never triggers | **Rejected** |
+| Vec data race on `mmap_regions` | Snapshotting `.clone()` before iteration did **not** prevent hang | **Rejected** |
+
+### Key observations
+
+1. **Timer stops completely** — the `[TMR]` heartbeat (every 500 ticks /
+   5 s) never prints again after the hang point. This means either IRQs
+   are stuck disabled or the CPU is in an infinite loop inside an
+   IRQ-disabled region.
+
+2. **The hang always occurs during the alloc→copy→map inner loop** in
+   `fork_process`, which calls:
+   - `alloc_page_zeroed()` → `alloc_page()` → `with_irqs_disabled(|| PMM.lock())`
+   - `copy_nonoverlapping` (4 KB memcpy)
+   - `map_page` → `get_or_create_table` → may call `alloc_page_zeroed` again
+
+3. **22 forks complete successfully** before the 23rd hangs, ruling out
+   systematic bugs in the copy loop itself.
+
+4. **Other threads are active during the fork** — epoll activity from
+   Go worker threads appears interleaved with fork progress logs,
+   confirming the scheduler is working up until the hang.
+
+### Current hypotheses
+
+- **Spinlock contention / IRQ masking**: `alloc_page()` acquires
+  `PMM.lock()` inside `with_irqs_disabled`. If a timer fires just as
+  IRQs are re-enabled and the scheduler switches to a thread that is
+  somehow stuck (or another thread holds a contended lock), the fork
+  thread may never be scheduled again.
+
+- **Timer re-arm lost**: If the timer IRQ fires but `dispatch_irq`
+  doesn't call the handler (e.g. `IRQ_HANDLERS` lock contention or
+  spurious IRQ mishandling), the timer is not re-armed and no further
+  preemption occurs.
+
+- **Stack overflow during IRQ in fork context**: The fork thread is
+  deep in kernel mode (syscall → clone → fork_process → inner loop).
+  An 832-byte IRQ frame is pushed onto the kernel stack. If a nested
+  SGI immediately follows (timer triggers SGI), two IRQ frames on
+  the stack could overflow the 32 KB kernel stack under high nesting.
+
+### Mitigations applied (testing)
+
+- `mmap_regions.clone()` snapshot before iteration (protects against
+  concurrent Vec modification, but did not fix the hang)
+- `FORK_IN_PROGRESS` atomic flag with timer heartbeat every 50 ticks
+  (500 ms) during fork — will reveal whether the timer stops during
+  or before the hang

@@ -81,6 +81,19 @@ pub fn timer_irq_handler(_irq: u32) {
     // memory which could deadlock if main code is in the middle of an allocation.
     // Cleanup should be done from user code via threading::cleanup_terminated().
 
+    // #region agent log
+    {
+        static TIMER_TICK: AtomicU64 = AtomicU64::new(0);
+        let tick = TIMER_TICK.fetch_add(1, Ordering::Relaxed);
+        let forking = akuma_exec::process::FORK_IN_PROGRESS.load(Ordering::Relaxed);
+        let interval = if forking { 50 } else { 500 };
+        if tick % interval == 0 {
+            let tid = akuma_exec::threading::current_thread_id();
+            crate::safe_print!(64, "[TMR] t={} T={} f={}\n", tick, tid, forking as u8);
+        }
+    }
+    // #endregion
+
     // Trigger SGI for scheduling - scheduler will decide if switch is needed
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }

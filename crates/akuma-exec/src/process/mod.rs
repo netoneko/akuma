@@ -28,7 +28,11 @@ use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+
+// #region agent log
+pub static FORK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+// #endregion
 use spinning_top::Spinlock;
 
 use crate::elf_loader::{self, ElfError};
@@ -1353,14 +1357,30 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     (runtime().print_str)("[FORK-DBG] step4: interp done\n");
     // #endregion
 
-    // Copy mmap regions so forked children can run built-in applets (e.g.
-    // busybox sh pipes) without crashing on unmapped pages.  We cap total
-    // copied pages to avoid OOM when a parent has huge file mappings.
+    // Snapshot mmap_regions to prevent data races with concurrent
+    // CLONE_THREAD siblings calling mmap/munmap via lookup_process().
+    // Without this snapshot, sibling threads can modify the parent's
+    // mmap_regions Vec while fork iterates it (aliasing &mut references
+    // through PROCESS_TABLE), causing corrupted iteration.
     const MAX_FORK_MMAP_PAGES: usize = 2048; // 8 MB cap
+    let mmap_snapshot: Vec<(usize, Vec<PhysFrame>)> = parent.mmap_regions.clone();
+    // #region agent log
+    FORK_IN_PROGRESS.store(true, Ordering::Release);
+    // #endregion
     let mut total_copied_pages: usize = 0;
     let mut child_mmap_regions: Vec<(usize, Vec<PhysFrame>)> = Vec::new();
 
-    for (va_start, parent_frames) in &parent.mmap_regions {
+    for (region_idx, (va_start, parent_frames)) in mmap_snapshot.iter().enumerate() {
+        // #region agent log
+        {
+            let mut buf = [0u8; 128];
+            let mut pos = 0usize;
+            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[FORK-DBG] mmap region {}/{} va=0x{:x} pages={}\n",
+                    region_idx, mmap_snapshot.len(), va_start, parent_frames.len()));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        }
+        // #endregion
         if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
             if config().syscall_debug_info_enabled {
                 log::debug!("[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap",
@@ -1372,6 +1392,26 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         let mut ok = true;
         for (i, pf) in parent_frames.iter().enumerate() {
             let page_va = va_start + i * mmu::PAGE_SIZE;
+            // #region agent log
+            if parent_frames.len() >= 32 && (i == 0 || i == parent_frames.len() - 1 || i % 16 == 0) {
+                let mut buf = [0u8; 80];
+                let mut pos = 0usize;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-PG] r{}p{}/{} va=0x{:x}\n", region_idx, i, parent_frames.len(), page_va));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            }
+            // #endregion
+            // #region agent log
+            if pf.addr < 0x4000_0000 || pf.addr >= 0xC000_0000 {
+                let mut buf = [0u8; 96];
+                let mut pos = 0usize;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-PG] BAD phys 0x{:x} r{}p{}\n", pf.addr, region_idx, i));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                ok = false;
+                break;
+            }
+            // #endregion
             match (runtime().alloc_page_zeroed)() {
                 Some(frame) => {
                     (runtime().track_frame)(frame, FrameSource::UserData);
@@ -1387,7 +1427,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     new_proc.address_space.track_user_frame(frame);
                     child_frames.push(frame);
                 }
-                None => { ok = false; break; }
+                None => {
+                    // #region agent log
+                    (runtime().print_str)("[FORK-PG] OOM in inner loop\n");
+                    // #endregion
+                    ok = false; break;
+                }
             }
         }
         if ok {
@@ -1405,6 +1450,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap = parent.memory.next_mmap;
     // #region agent log
+    FORK_IN_PROGRESS.store(false, Ordering::Release);
     (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
     // #endregion
 
@@ -1672,13 +1718,20 @@ pub extern "C" fn entry_point_trampoline() -> ! {
         }
     });
 
-    if proc_ptr.is_null() {
-        log::debug!("[process] FATAL: No process found for thread {}", tid);
+    if proc_ptr.is_null() || crate::threading::is_thread_terminated(tid) {
+        if proc_ptr.is_null() {
+            log::debug!("[process] FATAL: No process found for thread {}", tid);
+        }
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
     }
     
     unsafe {
+        let proc = &*proc_ptr;
+        if proc.exited {
+            crate::threading::mark_current_terminated();
+            loop { crate::threading::yield_now(); }
+        }
         (*proc_ptr).run();
     }
 }

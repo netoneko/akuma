@@ -152,12 +152,29 @@ pub fn flush_tlb_page(_va: usize) {}
 // ============================================================================
 
 use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
 use spinning_top::Spinlock;
 
 
 use asid::AsidAllocator;
 
 static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::new());
+
+/// Tracks shared L0 page table reference counts and deferred frame lists.
+///
+/// When CLONE_THREAD creates shared views of an address space, we need to
+/// ensure the page tables aren't freed until the last thread exits.
+/// If the owner (shared=false) drops first, its frames are stored here
+/// for the last shared view to free.
+struct SharedL0Entry {
+    ref_count: usize,
+    deferred_user_frames: Option<Vec<PhysFrame>>,
+    deferred_pt_frames: Option<Vec<PhysFrame>>,
+    deferred_l0: Option<PhysFrame>,
+}
+
+static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
+    Spinlock::new(BTreeMap::new());
 
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
@@ -188,6 +205,17 @@ impl UserAddressSpace {
     /// Uses the same L0 page table; Drop will NOT free the pages.
     pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
         let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        with_irqs_disabled(|| {
+            let mut table = SHARED_L0_TABLE.lock();
+            table.entry(parent_l0_phys)
+                .and_modify(|e| e.ref_count += 1)
+                .or_insert(SharedL0Entry {
+                    ref_count: 1,
+                    deferred_user_frames: None,
+                    deferred_pt_frames: None,
+                    deferred_l0: None,
+                });
+        });
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             page_table_frames: Vec::new(),
@@ -574,11 +602,69 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        let l0_addr = self.l0_frame.addr;
         if !self.shared {
-            let rt = runtime();
-            for frame in &self.user_frames { (rt.free_page)(*frame); }
-            for frame in &self.page_table_frames { (rt.free_page)(*frame); }
-            (rt.free_page)(self.l0_frame);
+            // Owner dropping — check if shared views still exist
+            let has_shared = with_irqs_disabled(|| {
+                let table = SHARED_L0_TABLE.lock();
+                table.get(&l0_addr).is_some_and(|e| e.ref_count > 0)
+            });
+            if has_shared {
+                // #region agent log
+                log::debug!("[FORK-DBG] AS owner L0=0x{:x} DEFERRING free (siblings alive)", l0_addr);
+                // #endregion
+                let user_frames = core::mem::take(&mut self.user_frames);
+                let pt_frames = core::mem::take(&mut self.page_table_frames);
+                let l0 = self.l0_frame;
+                with_irqs_disabled(|| {
+                    let mut table = SHARED_L0_TABLE.lock();
+                    if let Some(entry) = table.get_mut(&l0_addr) {
+                        entry.deferred_user_frames = Some(user_frames);
+                        entry.deferred_pt_frames = Some(pt_frames);
+                        entry.deferred_l0 = Some(l0);
+                    }
+                });
+            } else {
+                // No shared views (or all already dropped) — free immediately
+                let rt = runtime();
+                for frame in &self.user_frames { (rt.free_page)(*frame); }
+                for frame in &self.page_table_frames { (rt.free_page)(*frame); }
+                (rt.free_page)(self.l0_frame);
+                with_irqs_disabled(|| { SHARED_L0_TABLE.lock().remove(&l0_addr); });
+            }
+        } else {
+            // Shared view dropping — decrement refcount
+            let deferred = with_irqs_disabled(|| {
+                let mut table = SHARED_L0_TABLE.lock();
+                if let Some(entry) = table.get_mut(&l0_addr) {
+                    entry.ref_count = entry.ref_count.saturating_sub(1);
+                    if entry.ref_count == 0 && entry.deferred_l0.is_some() {
+                        // Last shared view and owner already deferred — take frames
+                        let uf = entry.deferred_user_frames.take();
+                        let pf = entry.deferred_pt_frames.take();
+                        let l0 = entry.deferred_l0.take();
+                        table.remove(&l0_addr);
+                        return (uf, pf, l0);
+                    }
+                    if entry.ref_count == 0 && entry.deferred_l0.is_none() {
+                        table.remove(&l0_addr);
+                    }
+                }
+                (None, None, None)
+            });
+            // Free deferred frames outside the lock
+            if let (Some(ref uf), Some(ref pf), Some(ref l0)) = deferred {
+                // #region agent log
+                log::debug!("[FORK-DBG] Last shared view L0=0x{:x} freeing {} user + {} pt frames",
+                    l0.addr, uf.len(), pf.len());
+                // #endregion
+            }
+            if let (Some(uf), Some(pf), Some(l0)) = deferred {
+                let rt = runtime();
+                for frame in &uf { (rt.free_page)(*frame); }
+                for frame in &pf { (rt.free_page)(*frame); }
+                (rt.free_page)(l0);
+            }
         }
         with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
         flush_tlb_asid(self.asid);

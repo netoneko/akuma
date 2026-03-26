@@ -477,6 +477,10 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         }
     }
 
+    // #region agent log
+    crate::tprint!(128, "[FORK-DBG] do_execve: calling replace_image (data={})\n",
+        file_data.as_ref().map_or(0, |d| d.len()));
+    // #endregion
     let replace_result = if let Some(ref data) = file_data {
         proc.replace_image(data, &args, &env)
     } else {
@@ -489,6 +493,10 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         };
         proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
     };
+    // #region agent log
+    crate::tprint!(128, "[FORK-DBG] do_execve: replace_image returned {:?}\n",
+        replace_result.is_ok());
+    // #endregion
 
     if let Err(e) = replace_result {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
