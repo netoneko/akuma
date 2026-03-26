@@ -439,9 +439,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     mmu::init_shared_device_tables();
     console::print("MMU enabled with identity mapping\n");
 
-    // TODO: protect_kernel_code() crashes with >256MB RAM — the L2 table
-    // rebuild assumes exactly the L1[1] 1GB block layout. Disabled until fixed.
-    // mmu::protect_kernel_code();
+    console::print("Enabling kernel code protection...\n");
+    mmu::protect_kernel_code();
+    console::print("Kernel code protection enabled\n");
 
     // Print PMM stats
     let (total, allocated, free) = pmm::stats();
@@ -941,7 +941,7 @@ async fn memory_monitor() -> ! {
 
     // Stack-allocated buffer to avoid heap allocation when printing stats
     struct StackBuffer {
-        buf: [u8; 128],
+        buf: [u8; 256],
         pos: usize,
     }
 
@@ -959,7 +959,7 @@ async fn memory_monitor() -> ! {
     impl StackBuffer {
         fn new() -> Self {
             Self {
-                buf: [0; 128],
+                buf: [0; 256],
                 pos: 0,
             }
         }
@@ -991,12 +991,17 @@ async fn memory_monitor() -> ! {
         let total_ram_mb = (total_pages * mmu::PAGE_SIZE) / 1024 / 1024;
         let free_ram_mb = (total_pages.saturating_sub(allocated_pages) * mmu::PAGE_SIZE) / 1024 / 1024;
 
+        let (threads_ready, threads_running, _) = akuma_exec::threading::thread_stats();
+        let threads_used = threads_ready + threads_running;
+        let threads_max = akuma_exec::threading::max_threads();
+
         let uptime_us = timer::uptime_us();
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {}\n",
-            uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count
+            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd)\n",
+            uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
+            threads_used, threads_max, threads_running, threads_ready
         );
         console::print(buf.as_str());
 

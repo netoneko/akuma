@@ -773,7 +773,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
-fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _is_fault: bool) -> bool {
+fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool) -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process(pid) {
         Some(p) => p,
@@ -914,7 +914,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, _
 
         // siginfo_t
         let si = base.add(SIGFRAME_SIGINFO);
-        // ... (existing si and uc writing)
+        core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
+        core::ptr::write(si.add(4) as *mut i32, 0i32);            // si_errno = 0
+        core::ptr::write(si.add(8) as *mut i32,                   // si_code
+            if is_fault { 1i32 } else { 0i32 });                  // SEGV_MAPERR=1, SI_USER=0
         core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
 
         // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)

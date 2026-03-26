@@ -1301,6 +1301,74 @@ experience queuing delay proportional to the epoll congestion.
 
 ---
 
+## Timer Freeze — False Hypotheses Cleared (2026-03-26)
+
+Two initial theories about why `[TMR]` stops firing were investigated and ruled out:
+
+### SGI EOI is correctly handled
+
+Earlier analysis suggested `sgi_scheduler_handler_with_sp` didn't call `end_of_interrupt`.
+This was wrong. The function's **first line** is:
+
+```rust
+// crates/akuma-exec/src/threading/mod.rs:1925
+(runtime().end_of_interrupt)(irq);
+```
+
+The SGI is acknowledged immediately on entry, before any scheduling logic runs. The GIC is
+not left with a stuck active SGI.
+
+### Critical-section race window is benign
+
+The `kernel_timer.rs` implementation of `critical_section::Impl` has a visible race window
+between the `mrs {daif}` and `msr daifset, #2` instructions in `acquire()`. If a timer IRQ
+fires in that window:
+
+1. IRQ handler runs with `CS_NESTING = 0`
+2. Handler calls `critical_section::with`: increments `CS_NESTING` to 1, stores
+   `CS_SAVED_DAIF = 0x80` (I-bit set, because we're in an IRQ handler)
+3. Handler finishes, decrements `CS_NESTING` to 0, restores DAIF=0x80 (still in handler)
+4. `eret` restores PSTATE from SPSR_EL1 (I-bit = 0 → IRQs re-enabled)
+5. Outer `msr daifset` executes; `fetch_add(CS_NESTING)`: 0 → 1
+6. `nesting == 0` → outer acquire **overwrites** `CS_SAVED_DAIF = 0x00` (the pre-IRQ value)
+7. When the outer section eventually releases, it restores DAIF = 0x00 — IRQs enabled ✓
+
+Outcome is correct. No permanent IRQ masking from this race.
+
+Regression tests for both invariants added to `src/tests.rs`:
+`test_critical_section_daif_preserved`, `test_critical_section_nesting`.
+
+### Root cause still unresolved
+
+The timer stops 26 seconds before any fork begins. The two cleared hypotheses leave the
+following candidates:
+
+1. **GIC CPU interface stops delivering IRQ 30** — possible if a GIC register is
+   inadvertently written (e.g., a stray MMIO write from a userspace process that has device
+   pages mapped via VirtIO). No concrete evidence yet.
+
+2. **Full thread-pool starvation** — if all 64 kernel threads are simultaneously blocked
+   inside long-running syscalls (e.g. `epoll_pwait` 37–50 ms), the timer IRQ fires and
+   `trigger_sgi(SGI_SCHEDULER)` runs, but no thread is preemptible. The scheduler keeps
+   returning "no switch needed". Over time if the epoll threads never yield between polls,
+   the async executor (thread 0) never runs, and the heartbeat loop is never polled. The
+   `[TMR]` print is inside the timer IRQ handler itself (not the async loop), so it would
+   still fire — unless the IRQ handler itself is waiting on a spinlock that a blocked thread
+   holds.
+
+3. **Spinlock deadlock in IRQ handler path** — `timer_irq_handler` and
+   `sgi_scheduler_handler_with_sp` both attempt to acquire `POOL.lock()` (in the scheduler)
+   or other spinlocks. If a user-thread holds that spinlock (with IRQs unmasked) and is
+   preempted, the IRQ handler could spin forever with IRQs globally masked.
+
+### Observability improvements added
+
+- `[Mem]` heartbeat now includes `| Threads: {used}/{max} ({run}r {ready}rd)` to make
+  thread-pool occupancy visible during `go build` runs.
+- `test_thread_pool_stats_sane` added to `src/tests.rs` — warns if pool is 100% occupied.
+
+---
+
 ## Go Build SIGSEGV Recurrence (2026-03-26) — Why the crash came back
 
 After the four-bug fix set (MAP_FIXED guard, lazy fault guard, fork copy guard, alloc_mmap
@@ -1426,3 +1494,91 @@ Potential fixes:
   runnable thread.
 - Add a watchdog: if no `[TMR]` heartbeat fires within N seconds, force-reset or panic with
   a diagnostic dump.
+
+---
+
+## siginfo Bug: si_code=0 Causing Go Crash (FIXED)
+
+### Symptom
+
+Go build output showed:
+
+```
+SIGSEGV: segmentation violation
+PC=0x20000000 m=0 sigcode=0
+fault address: 0xffffffffffffffa0 (-96)
+```
+
+`sigcode=0` is the key indicator. Linux defines `SI_USER=0` for user-sent signals and
+`SEGV_MAPERR=1` for hardware memory faults. Go's runtime uses `si.Code` to decide whether
+a SIGSEGV is a hardware fault (which can be converted to a Go panic via `sigpanic()`) or a
+user-sent signal (which is treated as fatal and terminates immediately):
+
+```go
+// runtime/signal_unix.go
+if sig.Code <= 0 { // SI_USER or negative = user-sent
+    // Do NOT call sigpanic; terminate
+}
+```
+
+With `si_code=0`, Go skipped `sigpanic()` and crashed with the raw fault address
+`0xffffffffffffffa0` (-96, which is `-ENOMEM` = errno 12 offset from a null pointer).
+
+### Root Cause
+
+`try_deliver_signal()` in `src/exceptions.rs` was only writing `si_addr` (offset +16) to
+the signal frame's `siginfo_t`. It did not write `si_signo` (offset 0) or `si_code` (offset
+8). Since `write_bytes(base, 0, SIGFRAME_SIZE)` zeroed the whole frame first, both fields
+defaulted to 0.
+
+The function already had an `_is_fault: bool` parameter (unused) to distinguish hardware
+faults from user-sent signals.
+
+### Fix Applied (2026-03-26)
+
+In `try_deliver_signal()`:
+1. Renamed `_is_fault` → `is_fault`
+2. Added writes for all three siginfo_t fields before the existing `si_addr` write:
+   ```rust
+   core::ptr::write(si.add(0) as *mut i32, signal as i32);   // si_signo
+   core::ptr::write(si.add(4) as *mut i32, 0i32);            // si_errno = 0
+   core::ptr::write(si.add(8) as *mut i32,                   // si_code
+       if is_fault { 1i32 } else { 0i32 });                  // SEGV_MAPERR=1, SI_USER=0
+   ```
+3. Call sites: lines 2074/2316 (hardware fault — DA/IA handlers) pass `true`; lines
+   1650/1735 (syscall exit pending-signal delivery) pass `false`.
+
+### Effect
+
+With `si_code=1` (SEGV_MAPERR), Go's runtime calls `sigpanic()` which converts the hardware
+fault into a recoverable Go panic with a proper stack trace, rather than an immediate crash.
+
+---
+
+## Kernel Freeze at T222s (Ongoing)
+
+### Evidence from full.log
+
+```
+line 19359: [TMR] t=18500  (T≈185s)   ← last timer heartbeat
+...
+line 19830: [FORK-DBG] mmap region 14/23 va=0x1022e8000 pages=64  ← log ends, freeze
+```
+
+Key observations:
+- `[Mem]` at last entry: `Threads: 8/64 (1r 7rd)` — NOT starvation (previous hypothesis)
+- RAM: `1564/2048MB free` — NOT OOM
+- Timer died at T185s; freeze at T222s — 37 seconds gap
+- Fork was copying region 14 (64 pages at `0x1022e8000`) when it froze; no `[FORK-PG]`
+  lines appeared for this region, so the freeze happened before the first page copy
+
+### Hypothesis
+
+After timer death (no preemption), the fork page-copy loop holds whichever locks
+`alloc_physical_page()` acquires (PMM lock or page table lock) and is never preempted.
+Any other thread that tries to allocate memory blocks on the same lock and can never
+run to release it either. Classic priority-inversion deadlock under single-core QEMU.
+
+The siginfo fix (above) may prevent the Go crash that triggers the problematic fork call.
+If the freeze persists after the siginfo fix, the next step is to add explicit IRQ-enable
+checkpoints inside the fork page-copy loop so the scheduler can preempt it.

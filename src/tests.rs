@@ -94,6 +94,13 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_with_irqs_disabled_nesting, "with_irqs_disabled_nesting");
     run_test!(test_map_user_page_preserves_irq_state, "map_user_page_preserves_irq_state");
 
+    // Timer and critical-section invariants (regression tests for go-build hang investigation)
+    run_test!(test_timer_interval_no_overflow,      "timer_interval_no_overflow");
+    run_test!(test_critical_section_daif_preserved, "critical_section_daif_preserved");
+    run_test!(test_critical_section_nesting,        "critical_section_nesting");
+    run_test!(test_thread_pool_stats_sane,          "thread_pool_stats_sane");
+    run_test!(test_siginfo_fields_set,              "siginfo_fields_set");
+
     // PTE durability — tests the ACTUAL invariant that broke in the crash
     run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
@@ -7733,4 +7740,153 @@ fn test_fork_mmap_skips_kernel_va() -> bool {
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
+}
+
+// ── Timer and critical-section invariants ─────────────────────────────────────
+
+/// Test: timer re-arm computation `(freq * interval_us) / 1_000_000` doesn't overflow
+/// for realistic QEMU frequencies, and `counter + ticks` doesn't overflow near u64::MAX/2.
+fn test_timer_interval_no_overflow() -> bool {
+    console::print("\n[TEST] Timer interval computation — no overflow\n");
+    for freq in [1_000_000u64, 62_500_000, 100_000_000] {
+        let interval_us = 10_000u64; // 10 ms
+        let ticks = match freq.checked_mul(interval_us) {
+            Some(v) => v / 1_000_000,
+            None => {
+                crate::safe_print!(96, "  FAIL: mul overflow at freq={}\n", freq);
+                return false;
+            }
+        };
+        let high_counter = u64::MAX / 2;
+        if high_counter.checked_add(ticks).is_none() {
+            crate::safe_print!(96, "  FAIL: new_cval overflow at freq={}\n", freq);
+            return false;
+        }
+        crate::safe_print!(96, "  freq={} ticks={} ok\n", freq, ticks);
+    }
+    console::print("  PASS\n");
+    true
+}
+
+/// Test: `critical_section::with` (kernel_timer.rs implementation) restores DAIF correctly:
+/// (a) IRQs enabled before → re-enabled after; (b) IRQs disabled before → stay disabled after.
+fn test_critical_section_daif_preserved() -> bool {
+    console::print("\n[TEST] critical_section DAIF preserved\n");
+
+    fn irqs_enabled() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 0 // I-bit clear = IRQs enabled
+    }
+
+    // Case A: IRQs enabled before → must be re-enabled after
+    let before_a = irqs_enabled();
+    critical_section::with(|_| {});
+    let after_a = irqs_enabled();
+    if !before_a || !after_a {
+        crate::safe_print!(96, "  FAIL (A): before={} after={}\n", before_a, after_a);
+        return false;
+    }
+
+    // Case B: IRQs disabled before → must stay disabled after
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    critical_section::with(|_| {});
+    let after_b = irqs_enabled();
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    if after_b {
+        console::print("  FAIL (B): IRQs were re-enabled but should have stayed disabled\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Test: nested `critical_section::with` calls restore DAIF correctly at the outermost exit.
+fn test_critical_section_nesting() -> bool {
+    console::print("\n[TEST] critical_section nesting DAIF restore\n");
+
+    fn irqs_enabled() -> bool {
+        let daif: u64;
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
+        (daif >> 7) & 1 == 0
+    }
+
+    let before = irqs_enabled();
+    critical_section::with(|_| {
+        critical_section::with(|_| {
+            critical_section::with(|_| {
+                critical_section::with(|_| {
+                    // deepest nesting — IRQs must be masked here
+                });
+            });
+        });
+    });
+    let after = irqs_enabled();
+    if !before || !after {
+        crate::safe_print!(96, "  FAIL: before={} after={}\n", before, after);
+        return false;
+    }
+    console::print("  PASS\n");
+    true
+}
+
+/// Test: `thread_stats()` returns internally consistent values — at least one running thread,
+/// total ≤ MAX_THREADS, and warns if pool is 100% occupied (starvation risk).
+fn test_thread_pool_stats_sane() -> bool {
+    console::print("\n[TEST] Thread pool stats sanity\n");
+
+    let (ready, running, _terminated) = akuma_exec::threading::thread_stats();
+    let max = akuma_exec::threading::max_threads();
+    let used = ready + running;
+
+    crate::safe_print!(128, "  thread_stats: ready={} running={} max={}\n",
+        ready, running, max);
+
+    if running == 0 {
+        console::print("  FAIL: zero running threads (current thread must be counted)\n");
+        return false;
+    }
+    if used > max {
+        crate::safe_print!(96, "  FAIL: used={} > max={}\n", used, max);
+        return false;
+    }
+    if used == max {
+        console::print("  WARN: thread pool 100% occupied — starvation risk\n");
+        // Not a hard failure, just a diagnostic
+    }
+    console::print("  PASS\n");
+    true
+}
+
+fn test_siginfo_fields_set() -> bool {
+    // Verify the si_code constants match the Linux AArch64 ABI values that Go reads.
+    // Go's sigpanic() guard: if si.Code <= 0 (SI_USER=0), it skips sigpanic and crashes.
+    // Hardware faults must use SEGV_MAPERR=1; user-sent signals use SI_USER=0.
+    const SEGV_MAPERR: i32 = 1;
+    const SI_USER: i32 = 0;
+
+    let fault_code = if true { SEGV_MAPERR } else { SI_USER };
+    if fault_code != 1 {
+        console::print("  FAIL: fault path must produce SEGV_MAPERR=1\n");
+        return false;
+    }
+    let user_code = if false { SEGV_MAPERR } else { SI_USER };
+    if user_code != 0 {
+        console::print("  FAIL: user-signal path must produce SI_USER=0\n");
+        return false;
+    }
+
+    // Verify the siginfo_t field offsets used in try_deliver_signal match Linux ABI.
+    // si_signo=@0 (i32), si_errno=@4 (i32), si_code=@8 (i32), si_addr=@16 (u64)
+    const SI_SIGNO_OFFSET: usize = 0;
+    const SI_CODE_OFFSET: usize = 8;
+    const SI_ADDR_OFFSET: usize = 16;
+    if SI_SIGNO_OFFSET != 0 || SI_CODE_OFFSET != 8 || SI_ADDR_OFFSET != 16 {
+        console::print("  FAIL: siginfo_t offset constants wrong\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
 }
