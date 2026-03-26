@@ -1164,28 +1164,137 @@ point, confirming the timer interrupt itself has ceased.
 
 ---
 
-## 2GB RAM Identity Mapping Bug (2026-03-26) — **FIX APPLIED**
+---
+
+## SIGSEGV / Hang Investigation Update (2026-03-26) — **FIX APPLIED**
+
+### Symptom
+Kernel crashes (`exit status 137`) and `SIGSEGV`s in `go build` continued after the previous 2GB RAM mapping fix. The crashes were traced to address space collisions where the Go runtime would branch into the newly mapped identity-RAM region (`0x8000_0000`).
+
+### Root Cause
+1.  **Address Overlap**: The `mmap` allocator for user-space was not aware of the kernel's expanded identity-map (now up to `0xC000_0000`), allowing processes to allocate memory in regions the kernel treats as identity-mapped.
+2.  **Kernel Heap Exhaustion**: The 128MB kernel heap was insufficient for large builds, causing OOM-driven process kills (`exit status 137`) when internal metadata (page tables) needed expansion.
+
+### Fix Summary
+1.  **VA Reservation**: Updated `KERNEL_VA_END` to `0xC000_0000` and enforced strict range checks in `ProcessMemory::alloc_mmap` to ensure user-space never allocates memory within the identity-map range.
+2.  **Kernel Heap Expansion**: Increased the dynamic kernel heap limit to 256MB to provide adequate headroom for metadata.
+3.  **Kernel Tests**: Added `test_mmap_does_not_overlap_identity_map` to `src/tests.rs` to verify that the mmap allocator effectively reserves the identity-mapped RAM range.
+
+---
+
+## Go Build SIGSEGV — Four-Bug Follow-up (2026-03-26) — **FIX APPLIED**
 
 ### Symptom
 
-The kernel hung or crashed with SIGSEGV during `go build`'s memory-intensive operations. The hang occurred in `fork_process` when accessing memory in the second gigabyte of RAM (PA $\ge$ `0x8000_0000`).
+After the VA reservation fix above, `go build` still crashed: `compile` tool exited with
+`SIGSEGV: segmentation violation PC=0x80000000`. Several other `compile` invocations exited
+with status 137. The kernel froze during a subsequent fork.
 
-### Root Cause
+`0x80000000` is inside the kernel identity-map range (`0x4000_0000–0xC000_0000`). The Go
+runtime's program counter ended up there because user pages were mapped at that VA,
+overlapping physical RAM that the kernel also accesses via its identity map.
 
-1.  **Identity Mapping Limit**: The kernel identity mapping in `TTBR0` was hardcoded to only cover the first 1GB of RAM. Accessing the second 1GB in EL1 (e.g., during `fork` memory copy) triggered unhandled exceptions.
-2.  **VA Collision**: The `mmap` allocator could assign virtual addresses in the `0x8000_0000`–`0xC000_0000` range, which now conflicted with the 2GB identity mapping required for kernel operations.
-3.  **IRQ Nesting Bug**: A flaw in `CriticalSection` (used by async timers) caused interrupts to be re-enabled prematurely during nested calls, leading to random freezes when high-frequency timers interleaved with IRQ-disabled regions.
+### Root Causes
 
-### Fix Summary (2026-03-26)
+Four separate gaps allowed the overlap:
 
-1.  **Dynamic Identity Mapping**: Updated `crates/akuma-exec/src/mmu/mod.rs` to dynamically map the entire detected RAM range (up to 2GB or more) by calculating the required L1/L2 entries at runtime.
-2.  **VA Range Reservation**: Updated `KERNEL_VA_END` to `0xC000_0000` in `crates/akuma-exec/src/process/types.rs`. This reserves the full 2GB identity-mapped range, preventing `mmap` from assigning conflicting user addresses.
-3.  **CriticalSection Restoration**: Fixed the AArch64 `CriticalSection` implementation in `src/kernel_timer.rs` to use a nesting counter. This ensures `DAIF` (interrupt state) is only restored to its original value after the outermost `release()` call.
-4.  **Enhanced Memory Monitoring**: Updated the `MemMonitor` heartbeat in `src/main.rs` to report both kernel heap usage and total system RAM (PMM) stats for better visibility into memory-intensive builds.
-5.  **Heap Optimization**: Reduced the default kernel heap allocation from 1/4 of RAM to 1/16 (max 128MB), freeing up significantly more memory for user-space applications like the Go compiler.
+**Bug 1 — MAP_FIXED bypass** (`src/syscall/mem.rs`):
+When `mmap` was called with `MAP_FIXED`, the requested address was used verbatim with no
+kernel VA range check. The Go runtime uses `MAP_FIXED` to commit its heap arenas. If any
+earlier `mmap` hint returned an address in `0x4000_0000–0xC000_0000`, the subsequent
+`MAP_FIXED` commit would land there.
 
-### Verification
+**Bug 2 — `far_in_kernel_identity_user_range` wrong upper bound** (`src/exceptions.rs`):
+The helper that guards stale-TLB / demand-page paths used `0x8000_0000` as its upper bound
+instead of `ProcessMemory::KERNEL_VA_END` (`0xC000_0000`). Faults at addresses
+`0x8000_0000–0xBFFF_FFFF` were not recognised as kernel-range faults.
 
-- **Test Suite**: Added `test_kernel_identity_mapping_full_ram` to `src/tests.rs` which verifies accessibility of high memory (PA `0x8000_0000`) from EL1.
-- **Go Build**: Verified that `go build` no longer hangs in the fork loop or crashes with SIGSEGV when allocating beyond 1GB.
-- **Stability**: Heartbeat logs now correctly show 2048MB RAM availability and stable system uptime without random freezes.
+**Bug 3 — Lazy fault handler not guarded** (`src/exceptions.rs`):
+The DA and IA translation-fault handlers demand-paged lazy regions without checking whether
+the faulting VA was in the kernel identity range. A lazy region registered at a kernel-range
+VA (e.g. from Bug 1) would be demand-paged, mapping user pages over kernel physical RAM.
+
+**Bug 4 — Fork mmap copy loop not guarded** (`crates/akuma-exec/src/process/mod.rs`):
+`fork_process` copied all `mmap_regions` from the parent without validating `page_va` against
+the kernel range. A corrupted or MAP_FIXED-placed region at a kernel VA would be silently
+copied into the child.
+
+### alloc_mmap straddle bug (also fixed)
+
+A related `ProcessMemory::alloc_mmap` bug: the skip check only fired when `next_mmap` was
+already *inside* the hole, but not when an allocation *started before* the hole and *straddled*
+the boundary (e.g. `next_mmap = KERNEL_VA_START - 4096`, alloc size = 2 pages). The condition
+was corrected to `candidate < KERNEL_VA_END && candidate + size > KERNEL_VA_START`.
+
+### Fix Summary
+
+1. **`alloc_mmap` straddle fix** — `crates/akuma-exec/src/process/types.rs`:
+   condition changed so any allocation overlapping the hole is bumped to `KERNEL_VA_END`.
+
+2. **MAP_FIXED guard** — `src/syscall/mem.rs`:
+   Before accepting a MAP_FIXED address, check `addr < KERNEL_VA_END && map_end > KERNEL_VA_START`;
+   return `EINVAL` if it overlaps. Uses `ProcessMemory::KERNEL_VA_{START,END}` constants directly.
+
+3. **`far_in_kernel_identity_user_range` upper bound** — `src/exceptions.rs`:
+   Changed to use `ProcessMemory::KERNEL_VA_START/END` constants so it stays in sync
+   automatically. Upper bound corrected from `0x8000_0000` → `0xC000_0000`.
+
+4. **Lazy fault guard (DA + IA)** — `src/exceptions.rs`:
+   Both data-abort and instruction-abort translation-fault handlers now call
+   `far_in_kernel_identity_user_range(far)` before demand-paging. A fault in the kernel range
+   falls through to the existing SIGSEGV delivery path.
+
+5. **Fork copy guard** — `crates/akuma-exec/src/process/mod.rs`:
+   Added `page_va >= KERNEL_VA_START && page_va < KERNEL_VA_END` check before mapping each
+   page in the mmap copy loop; logs `[FORK-PG] SKIP kernel VA` and aborts the region copy.
+
+### Tests Added
+
+- `test_alloc_mmap_straddle_kernel_va_start` (`crates/akuma-exec/src/process/types.rs`) —
+  unit test for the straddle fix.
+- `test_mmap_fixed_kernel_va_guard` (`src/tests.rs`) — verifies the MAP_FIXED guard logic
+  against 8 address/length pairs spanning all boundary cases.
+- `test_lazy_fault_kernel_va_guard` (`src/tests.rs`) — verifies `far_in_kernel_identity_user_range`
+  covers the full `0x4000_0000–0xC000_0000` range including the previously-missed upper half.
+- `test_fork_mmap_skips_kernel_va` (`src/tests.rs`) — verifies the fork copy guard logic.
+- Updated `test_far_kernel_identity_range_policy` (`src/process_tests.rs`) to expect
+  `0x8000_0000` and `0xBFFF_FFFF` to be *in* range and `0xC000_0000` to be *out* of range.
+4.  **Monitoring**: Enhanced `MemMonitor` heartbeat with PMM stats (Total/Free RAM) to verify that system memory (2GB) is fully available and utilized.
+
+---
+
+## epoll Scheduler Starvation (observed 2026-03-26) — under investigation
+
+### Symptom
+
+While `go build` is running in one SSH session, an unrelated `ls` command in a **separate
+SSH session** takes noticeably longer than normal — it still completes but with significant
+latency. Execution is not blocked, but response time degrades.
+
+### Hypothesis
+
+`go build` issues a high volume of `epoll_pwait` calls as part of its netpoller / sysmon
+loop (see the `compile` process pattern at the top of this document). Each `epoll_pwait`
+syscall may hold a scheduler slot or spin in the kernel for the duration of its timeout
+(up to ~37–50 ms), effectively starving other threads — including the SSH session's shell
+thread — of CPU time.
+
+On the fixed 32-thread pool, if several threads are simultaneously blocked in `epoll_pwait`
+with a long timeout, the remaining threads compete for fewer scheduling opportunities.
+Short-lived commands like `ls` that need only one or two scheduler ticks to complete will
+experience queuing delay proportional to the epoll congestion.
+
+### Observations
+
+- Effect is present but mild — `ls` still executes, just slowly.
+- Disappears once `go build` exits.
+- Not observed with lighter workloads that don't use epoll heavily.
+
+### Next steps (not yet fixed)
+
+- Investigate whether `epoll_pwait` releases its thread slot (yields) when no events are
+  ready, or whether it busy-waits / holds the slot for the full timeout.
+- Consider capping the `epoll_pwait` timeout in the kernel to a shorter interval (e.g. one
+  scheduler tick) so threads are returned to the pool more promptly.
+- Consider a priority or fairness mechanism for the round-robin scheduler so interactive
+  SSH sessions are not crowded out by build-system polling loops.

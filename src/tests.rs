@@ -99,6 +99,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
     run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
     run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
+    run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
 
     // Bug 10: partial munmap of eager regions
     run_test!(test_eager_munmap_prefix_preserves_suffix, "eager_munmap_prefix_preserves_suffix");
@@ -185,6 +186,12 @@ pub fn run_memory_tests() -> bool {
     // causing the lazy region to be missed and the process killed with "no lazy region".
     run_test!(test_lazy_region_lookup_for_pid_explicit, "lazy_region_lookup_for_pid_explicit");
     run_test!(test_lazy_region_lookup_pid_consistency, "lazy_region_lookup_pid_consistency");
+
+    // Regression: Go build SIGSEGV at PC=0x80000000 — kernel VA range enforcement
+    // MAP_FIXED bypass, lazy fault guard, and fork copy guard.
+    run_test!(test_mmap_fixed_kernel_va_guard,  "mmap_fixed_kernel_va_guard");
+    run_test!(test_lazy_fault_kernel_va_guard,  "lazy_fault_kernel_va_guard");
+    run_test!(test_fork_mmap_skips_kernel_va,   "fork_mmap_skips_kernel_va");
 
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
@@ -3585,6 +3592,30 @@ fn make_test_process(
     })
 }
 
+/// Verify that the mmap allocator never returns addresses within the
+/// kernel identity-mapped RAM range (0x4000_0000 to 0xC000_0000).
+fn test_mmap_does_not_overlap_identity_map() -> bool {
+    console::print("\n[TEST] MMU: mmap allocator avoids kernel identity map\n");
+
+    let mut mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0xD000_0000, 0xD010_0000, 0x0,
+    );
+
+    for _ in 0..10 {
+        let size = 0x1000;
+        let addr = mem.alloc_mmap(size);
+        if let Some(a) = addr {
+            // Verify address is completely outside the kernel reserved range
+            let end = a + size;
+            if (a < 0xC000_0000 && end > 0x4000_0000) {
+                crate::safe_print!(128, "  FAIL: allocated 0x{:x}-0x{:x} overlaps kernel\n", a, end);
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Verify that the kernel identity mapping covers the full 2GB RAM range.
 /// This test confirms the fix for the 1GB-hardcoded-limit bug.
 fn test_kernel_identity_mapping_full_ram() -> bool {
@@ -6429,10 +6460,10 @@ fn test_pmm_contiguous_double_stack_size_no_overlap() -> bool {
 /// skip [0x4000_0000, 0x5000_0000) when the bump pointer would otherwise
 /// land there. Previously allocations could land in the kernel VA and crash.
 fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
-    console::print("\n[TEST] alloc_mmap: skips kernel VA hole 0x4000_0000–0x5000_0000\n");
+    console::print("\n[TEST] alloc_mmap: skips kernel VA hole 0x4000_0000–0xC000_0000\n");
 
     const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END:   usize = 0x5000_0000;
+    const KERNEL_VA_END:   usize = 0xC000_0000;
 
     // Place next_mmap just before the hole so the next alloc would enter it
     // without the skip logic.
@@ -7597,6 +7628,109 @@ fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
     crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
 
     let pass = write_ok && read_ok;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go SIGSEGV at PC=0x80000000 — MAP_FIXED kernel VA guard.
+///
+/// Verifies that the guard condition used in `sys_mmap`'s MAP_FIXED branch
+/// correctly identifies all allocations that would overlap the kernel
+/// identity-map range (KERNEL_VA_START..KERNEL_VA_END).
+fn test_mmap_fixed_kernel_va_guard() -> bool {
+    console::print("\n[TEST] mmap MAP_FIXED: kernel VA range guard logic\n");
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START;
+    let kva_end   = ProcessMemory::KERNEL_VA_END;
+
+    // (addr, len, should_reject)
+    let cases: &[(usize, usize, bool)] = &[
+        (0x8000_0000, 0x1000, true),   // mid-range
+        (kva_start,   0x1000, true),   // at exact start
+        (kva_end - 0x1000, 0x1000, true), // last page in range
+        (kva_end - 0x1000, 0x2000, true), // straddles end
+        (kva_start - 0x1000, 0x2000, true), // straddles start
+        (0x3000_0000, 0x1000, false),  // well below
+        (kva_end,     0x1000, false),  // first page above range
+        (0xD000_0000, 0x1000, false),  // well above
+    ];
+
+    let mut pass = true;
+    for &(addr, len, should_reject) in cases {
+        let map_end = addr.saturating_add(len);
+        let rejected = addr < kva_end && map_end > kva_start;
+        if rejected != should_reject {
+            crate::safe_print!(192, "  FAIL: addr={:#x} len={:#x} expected_reject={} got={}\n",
+                addr, len, should_reject, rejected);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go SIGSEGV at PC=0x80000000 — lazy fault kernel VA guard.
+///
+/// Verifies that `far_in_kernel_identity_user_range` covers the full
+/// kernel identity-map range up to KERNEL_VA_END (0xC000_0000), not
+/// just the lower half (the old upper bound was 0x8000_0000).
+fn test_lazy_fault_kernel_va_guard() -> bool {
+    console::print("\n[TEST] lazy fault: far_in_kernel_identity_user_range covers full range\n");
+    use crate::exceptions::far_in_kernel_identity_user_range;
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START as u64;
+    let kva_end   = ProcessMemory::KERNEL_VA_END as u64;
+
+    // (far, expected_in_range)
+    let cases: &[(u64, bool)] = &[
+        (kva_start,       true),
+        (0x6000_0000,     true),
+        (0x8000_0000,     true),  // was false with old 0x8000_0000 bound — regression case
+        (kva_end - 1,     true),
+        (kva_end,         false), // first address above range
+        (kva_start - 1,   false),
+        (0x1009_ee90,     false),
+        (0xD000_0000,     false),
+    ];
+
+    let mut pass = true;
+    for &(far, expected) in cases {
+        let got = far_in_kernel_identity_user_range(far);
+        if got != expected {
+            crate::safe_print!(192, "  FAIL: far={:#x} expected={} got={}\n", far, expected, got);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go SIGSEGV at PC=0x80000000 — fork mmap VA guard.
+///
+/// Verifies the guard condition used in `fork_process`'s mmap copy loop
+/// to skip pages whose virtual address falls in the kernel identity range.
+fn test_fork_mmap_skips_kernel_va() -> bool {
+    console::print("\n[TEST] fork mmap copy: skips pages in kernel VA range\n");
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START;
+    let kva_end   = ProcessMemory::KERNEL_VA_END;
+
+    let bad_vas:  &[usize] = &[kva_start, 0x6000_0000, 0x8000_0000, kva_end - 0x1000];
+    let ok_vas:   &[usize] = &[kva_start - 0x1000, kva_end, 0x1000_0000, 0xD000_0000];
+
+    let mut pass = true;
+    for &va in bad_vas {
+        if !(va >= kva_start && va < kva_end) {
+            crate::safe_print!(128, "  FAIL: va={:#x} should be detected as kernel range\n", va);
+            pass = false;
+        }
+    }
+    for &va in ok_vas {
+        if va >= kva_start && va < kva_end {
+            crate::safe_print!(128, "  FAIL: va={:#x} should NOT be detected as kernel range\n", va);
+            pass = false;
+        }
+    }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

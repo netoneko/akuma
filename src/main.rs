@@ -279,15 +279,15 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: 1/16 of RAM (min 64MB, max 128MB) - kernel data structures
+    // - Heap: 1/8 of RAM (min 64MB, max 256MB) - kernel data structures
     //   Sized dynamically so that memory-hungry workloads (go build, bun, etc.)
     //   don't exhaust kernel metadata allocations, but capped to save user RAM.
     // - User pages: remaining - for user processes
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
     let heap_size = core::cmp::min(
-        core::cmp::max(ram_size / 16, 64 * 1024 * 1024),
-        128 * 1024 * 1024
+        core::cmp::max(ram_size / 8, 64 * 1024 * 1024),
+        256 * 1024 * 1024
     );
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);

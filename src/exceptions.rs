@@ -669,7 +669,8 @@ pub(crate) const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 #[inline]
 pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
     let a = far as usize;
-    a >= 0x4000_0000 && a < 0x8000_0000
+    a >= akuma_exec::process::types::ProcessMemory::KERNEL_VA_START
+        && a < akuma_exec::process::types::ProcessMemory::KERNEL_VA_END
 }
 
 /// Ensure a userspace page is mapped. If it's in a lazy anonymous region and
@@ -1771,6 +1772,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
+                    } else if far_in_kernel_identity_user_range(far) {
+                        // Fault VA is in the kernel identity-map range — demand-paging here
+                        // would corrupt kernel memory.  Fall through to SIGSEGV.
+                        crate::tprint!(128, "[DA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
+                            pid, far_usize);
                     } else {
                     let page_va = far_usize & !(0xFFF);
                     let map_flags = match source {
@@ -2118,9 +2124,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
+                    } else if far_in_kernel_identity_user_range(far) {
+                        // Fault VA is in the kernel identity-map range — demand-paging
+                        // would corrupt kernel memory.  Fall through to SIGSEGV.
+                        crate::tprint!(128, "[IA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
+                            pid, far_usize);
                     } else {
                     let page_va = far_usize & !(0xFFF);
-                    
+
                     // Serialize page fault handling for this process
                     if let Some(proc) = akuma_exec::process::lookup_process(pid) {
                         loop {

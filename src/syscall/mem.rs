@@ -30,6 +30,21 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
         if addr & 0xFFF != 0 { return !0u64; }
+        // Reject MAP_FIXED mappings that overlap the kernel identity-map range.
+        // The Go runtime uses MAP_FIXED to commit its heap arenas; without this
+        // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
+        // kernel's physical-RAM identity map and causing silent memory corruption.
+        {
+            use akuma_exec::process::types::ProcessMemory;
+            let map_end = addr.saturating_add(pages * 4096);
+            if addr < ProcessMemory::KERNEL_VA_END
+                && map_end > ProcessMemory::KERNEL_VA_START
+            {
+                crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
+                    proc.pid, addr, pages * 4096);
+                return EINVAL;
+            }
+        }
         if is_fixed {
             let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
             let _ = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);

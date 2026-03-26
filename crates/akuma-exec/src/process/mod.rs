@@ -1411,6 +1411,18 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 ok = false;
                 break;
             }
+            // Guard: skip pages whose VA falls in the kernel identity-map range.
+            // Such a mapping would overlap physical RAM seen by the kernel's TTBR1,
+            // causing silent memory corruption if the child touches that VA.
+            if page_va >= ProcessMemory::KERNEL_VA_START && page_va < ProcessMemory::KERNEL_VA_END {
+                let mut buf = [0u8; 96];
+                let mut pos = 0usize;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-PG] SKIP kernel VA 0x{:x} r{}p{}\n", page_va, region_idx, i));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                ok = false;
+                break;
+            }
             // #endregion
             match (runtime().alloc_page_zeroed)() {
                 Some(frame) => {

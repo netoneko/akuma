@@ -1426,8 +1426,16 @@ fn test_far_kernel_identity_range_policy() {
         crate::safe_print!(64, "[Test] far_kernel_identity_range: below 0x4000_0000\n");
         ok = false;
     }
-    if far_in_kernel_identity_user_range(0x8000_0000) {
-        crate::safe_print!(64, "[Test] far_kernel_identity_range: boundary 0x8000_0000\n");
+    if !far_in_kernel_identity_user_range(0x8000_0000) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: 0x8000_0000 should be in range (identity map extends to 0xC000_0000)\n");
+        ok = false;
+    }
+    if !far_in_kernel_identity_user_range(0xBFFF_FFFF) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: 0xBFFF_FFFF should be in range\n");
+        ok = false;
+    }
+    if far_in_kernel_identity_user_range(0xC000_0000) {
+        crate::safe_print!(64, "[Test] far_kernel_identity_range: 0xC000_0000 should be outside range\n");
         ok = false;
     }
     if ok {

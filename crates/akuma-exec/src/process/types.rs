@@ -318,16 +318,19 @@ impl ProcessMemory {
         addr < self.stack_top && end > self.stack_bottom
     }
 
-    const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END: usize   = 0xC000_0000;
+    pub const KERNEL_VA_START: usize = 0x4000_0000;
+    pub const KERNEL_VA_END: usize   = 0xC000_0000;
 
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
         for i in 0..self.free_regions.len() {
             let (start, f_size) = self.free_regions[i];
+            
+            // Skip regions that overlap with the 2GB kernel identity map
+            if start < Self::KERNEL_VA_END && start + f_size > Self::KERNEL_VA_START {
+                continue;
+            }
+
             if f_size >= size {
-                if start >= Self::KERNEL_VA_START && start < Self::KERNEL_VA_END {
-                    continue;
-                }
                 self.free_regions.remove(i);
                 if f_size > size {
                     self.free_regions.push((start + size, f_size - size));
@@ -336,13 +339,10 @@ impl ProcessMemory {
             }
         }
 
-        let addr = self.next_mmap;
-        let mut candidate = addr;
+        let mut candidate = self.next_mmap;
 
-        if candidate >= Self::KERNEL_VA_START && candidate < Self::KERNEL_VA_END {
-            candidate = Self::KERNEL_VA_END;
-        }
-        if candidate + size > Self::KERNEL_VA_START && candidate < Self::KERNEL_VA_START {
+        // Skip over the kernel reserved range if the allocation would overlap it
+        if candidate < Self::KERNEL_VA_END && candidate + size > Self::KERNEL_VA_START {
             candidate = Self::KERNEL_VA_END;
         }
 
@@ -484,11 +484,25 @@ mod tests {
 
     #[test]
     fn process_memory_alloc_mmap_skips_kernel_va() {
-        let mut mem = ProcessMemory::new(0x3FFF_0000, 0x6000_0000, 0x6010_0000, 0);
+        let mut mem = ProcessMemory::new(0x3FFF_0000, 0xD000_0000, 0xD010_0000, 0);
         let addr = mem.alloc_mmap(0x1000);
         if let Some(a) = addr {
-            assert!(a < 0x4000_0000 || a >= 0x5000_0000);
+            assert!(a < ProcessMemory::KERNEL_VA_START || a >= ProcessMemory::KERNEL_VA_END);
         }
+    }
+
+    #[test]
+    fn process_memory_alloc_mmap_straddle_kernel_va_start() {
+        // Regression: allocation starting one page before KERNEL_VA_START with size > 1 page
+        // would straddle the boundary and land inside the kernel VA hole.
+        let mut mem = ProcessMemory::new(0x1000_0000, 0xD000_0000, 0xD010_0000, 0);
+        mem.next_mmap = ProcessMemory::KERNEL_VA_START - 0x1000;
+        let addr = mem.alloc_mmap(2 * 0x1000).unwrap();
+        assert!(
+            addr >= ProcessMemory::KERNEL_VA_END,
+            "alloc straddled kernel VA hole: {:#x}",
+            addr
+        );
     }
 
     #[test]
