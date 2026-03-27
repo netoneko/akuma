@@ -101,6 +101,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_thread_pool_stats_sane,          "thread_pool_stats_sane");
     run_test!(test_siginfo_fields_set,              "siginfo_fields_set");
     run_test!(test_reentrant_signal_repend,         "reentrant_signal_repend");
+    run_test!(test_eventfd_refcount,                "eventfd_refcount");
 
     // PTE durability — tests the ACTUAL invariant that broke in the crash
     run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
@@ -7884,6 +7885,39 @@ fn test_reentrant_signal_repend() -> bool {
         crate::safe_print!(96, "  FAIL: second take returned {:?}, expected None\n", taken2);
         return false;
     }
+    console::print("  PASS\n");
+    true
+}
+
+fn test_eventfd_refcount() -> bool {
+    // Verify that eventfd reference counting prevents use-after-exec EBADF.
+    // Bug: clone_deep_for_fork() shared the same eventfd id with the child;
+    // child exec() closed it (EFD_CLOEXEC), destroying it from the global table;
+    // parent then got EBADF on write → Go's netpollBreak fatal error.
+
+    // Create an eventfd (ref_count starts at 1)
+    let id = crate::syscall::eventfd::eventfd_create(0, 0);
+
+    // Simulate fork: bump ref_count to 2
+    crate::syscall::eventfd::eventfd_clone_ref(id);
+
+    // First close (simulates child exec CLOEXEC close): ref_count → 1
+    // eventfd must still be alive
+    crate::syscall::eventfd::eventfd_close(id);
+    if crate::syscall::eventfd::eventfd_write(id, 1).is_err() {
+        crate::safe_print!(96, "  FAIL: eventfd_write after first close returned error (id={})\n", id);
+        crate::syscall::eventfd::eventfd_close(id); // cleanup
+        return false;
+    }
+
+    // Second close (parent closes): ref_count → 0, eventfd is destroyed
+    crate::syscall::eventfd::eventfd_close(id);
+    // Write must now fail with EBADF
+    if crate::syscall::eventfd::eventfd_write(id, 1).is_ok() {
+        crate::safe_print!(96, "  FAIL: eventfd_write after destroy succeeded (expected EBADF, id={})\n", id);
+        return false;
+    }
+
     console::print("  PASS\n");
     true
 }

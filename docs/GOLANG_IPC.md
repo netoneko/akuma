@@ -1697,3 +1697,55 @@ distinguish genuine vs. spurious wakeup:
 This also fixes the lost-wakeup window in the retry path: the futex value is
 re-read under the `FUTEX_WAITERS` lock before re-enqueueing, so a concurrent
 `FUTEX_WAKE` that changed the value is detected as `EAGAIN` rather than missed.
+
+---
+
+## EventFd Use-After-Exec EBADF (FIXED 2026-03-27)
+
+### Crash
+
+```
+runtime: netpollBreak write failed with 9
+fatal error: runtime: netpollBreak write failed
+```
+
+Stack: `bgscavenge → scavengerState.sleep → timer.modify → wakeNetPoller →
+netpollBreak → write(netpollBreakWr, ...) → EBADF`
+
+### Root Cause
+
+EventFd had no reference counting. When `clone_deep_for_fork()` copied the parent's
+fd table into the child, `FileDescriptor::EventFd(id)` was cloned as a plain integer
+— no refcount bump, unlike pipes which call `pipe_clone_ref()`.
+
+Crash sequence:
+
+1. `go build` (PID 52) calls `eventfd2(0, EFD_CLOEXEC|EFD_NONBLOCK)` → kernel creates
+   `id=1`, assigns `fd=5`
+2. PID 52 forks child (PID 56) → `clone_deep_for_fork()` copies `EventFd(1)` — no
+   refcount bump
+3. PID 56 exec's the compiler binary → `close_cloexec_fds()` closes all CLOEXEC fds
+   including the inherited eventfd
+4. `eventfd_close(1)` → **unconditionally removes `id=1` from global `EVENTFDS` BTreeMap**
+5. PID 52 still has `FileDescriptor::EventFd(1)` in its fd table
+6. bgscavenge goroutine calls `netpollBreak()` → write to fd=5 → `eventfd_write(1)` →
+   `id=1` not in `EVENTFDS` → **EBADF** → `runtime.throw("netpollBreak write failed")`
+
+Pipes were immune because `KernelPipe` has `write_count`/`read_count` and
+`clone_deep_for_fork()` calls `pipe_clone_ref(id, is_write)` to bump the count.
+`pipe_close_write/read` decrement before destroying.
+
+### Fix
+
+- `src/syscall/eventfd.rs`: Added `ref_count: u32` to `KernelEventFd` (starts at 1).
+  Added `pub fn eventfd_clone_ref(id: u32)` to increment on fork. Modified
+  `eventfd_close(id)` to decrement and only remove at zero.
+- `crates/akuma-exec/src/runtime.rs`: Added `eventfd_clone_ref: fn(u32)` to
+  `ExecRuntime`.
+- `src/main.rs`: Registered the function pointer.
+- `crates/akuma-exec/src/process/fd.rs`: `clone_deep_for_fork()` now calls
+  `eventfd_clone_ref` for each `FileDescriptor::EventFd` entry, matching the pipe
+  pattern.
+
+Log after fix: `[eventfd] close id=N ref_count=1` when child exec's (decrement without
+destroy); `[eventfd] close id=N ref_count=0` only when parent also closes.

@@ -4,6 +4,7 @@ struct KernelEventFd {
     counter: u64,
     flags: u32,
     reader_thread: Option<usize>,
+    ref_count: u32,
 }
 
 static EVENTFDS: Spinlock<BTreeMap<u32, KernelEventFd>> = Spinlock::new(BTreeMap::new());
@@ -13,13 +14,14 @@ pub(super) const EFD_SEMAPHORE: u32 = 1;
 pub(super) const EFD_NONBLOCK: u32 = 0x800;
 pub(super) const EFD_CLOEXEC: u32 = 0x80000;
 
-pub(super) fn eventfd_create(initval: u32, flags: u32) -> u32 {
+pub(crate) fn eventfd_create(initval: u32, flags: u32) -> u32 {
     let id = NEXT_EVENTFD_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().insert(id, KernelEventFd {
             counter: initval as u64,
             flags,
             reader_thread: None,
+            ref_count: 1,
         });
     });
     id
@@ -47,7 +49,7 @@ pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
     })
 }
 
-pub(super) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
+pub(crate) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
     crate::irq::with_irqs_disabled(|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
@@ -80,9 +82,30 @@ pub(super) fn eventfd_is_nonblock(id: u32) -> bool {
     })
 }
 
+/// Increment the reference count for a shared eventfd (called on fork).
+/// Mirrors `pipe_clone_ref` in the pipe subsystem.
+pub fn eventfd_clone_ref(id: u32) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut efds = EVENTFDS.lock();
+        if let Some(efd) = efds.get_mut(&id) {
+            efd.ref_count += 1;
+            crate::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
+        }
+    });
+}
+
+/// Decrement the reference count. Destroys the eventfd only when ref_count reaches 0.
+/// Previously this blindly removed the entry, breaking parent processes after fork+exec.
 pub fn eventfd_close(id: u32) {
     crate::irq::with_irqs_disabled(|| {
-        EVENTFDS.lock().remove(&id);
+        let mut efds = EVENTFDS.lock();
+        if let Some(efd) = efds.get_mut(&id) {
+            efd.ref_count = efd.ref_count.saturating_sub(1);
+            crate::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
+            if efd.ref_count == 0 {
+                efds.remove(&id);
+            }
+        }
     });
 }
 

@@ -402,6 +402,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             pipe_close_read: crate::syscall::pipe::pipe_close_read,
             pipe_clone_ref: crate::syscall::pipe::pipe_clone_ref,
             eventfd_close: crate::syscall::eventfd::eventfd_close,
+            eventfd_clone_ref: crate::syscall::eventfd::eventfd_clone_ref,
             epoll_destroy: crate::syscall::poll::epoll_destroy,
             pidfd_close: crate::syscall::pidfd::pidfd_close,
             resolve_symlinks: |path| crate::vfs::resolve_symlinks(path),
