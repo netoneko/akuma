@@ -100,6 +100,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_critical_section_nesting,        "critical_section_nesting");
     run_test!(test_thread_pool_stats_sane,          "thread_pool_stats_sane");
     run_test!(test_siginfo_fields_set,              "siginfo_fields_set");
+    run_test!(test_reentrant_signal_repend,         "reentrant_signal_repend");
 
     // PTE durability — tests the ACTUAL invariant that broke in the crash
     run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
@@ -7854,6 +7855,34 @@ fn test_thread_pool_stats_sane() -> bool {
     if used == max {
         console::print("  WARN: thread pool 100% occupied — starvation risk\n");
         // Not a hard failure, just a diagnostic
+    }
+    console::print("  PASS\n");
+    true
+}
+
+fn test_reentrant_signal_repend() -> bool {
+    // Verify pend_signal_for_thread and take_pending_signal round-trip correctly.
+    // The actual re-entrant re-pend path (non-fault signal on sigaltstack) uses
+    // these same primitives; this test confirms the API contract.
+    let slot = akuma_exec::threading::current_thread_id();
+    if slot >= akuma_exec::threading::max_threads() {
+        crate::safe_print!(96, "  FAIL: slot={} >= max={}\n", slot,
+            akuma_exec::threading::max_threads());
+        return false;
+    }
+    // Pend SIGURG (signal 23 = Go's async preemption signal) then take it back.
+    // mask=0 means no signals are blocked; a set bit blocks that signal.
+    akuma_exec::threading::pend_signal_for_thread(slot, 23);
+    let taken = akuma_exec::threading::take_pending_signal(0u64);
+    if taken != Some(23) {
+        crate::safe_print!(96, "  FAIL: take_pending_signal returned {:?}, expected Some(23)\n", taken);
+        return false;
+    }
+    // A second take should return None (queue is empty).
+    let taken2 = akuma_exec::threading::take_pending_signal(0u64);
+    if taken2.is_some() {
+        crate::safe_print!(96, "  FAIL: second take returned {:?}, expected None\n", taken2);
+        return false;
     }
     console::print("  PASS\n");
     true

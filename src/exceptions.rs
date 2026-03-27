@@ -869,10 +869,27 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         let alt_lo = alt_sp as usize;
         let alt_hi = alt_lo + alt_size as usize;
         if user_sp >= alt_lo && user_sp < alt_hi {
-            crate::tprint!(128,
-                "[signal] sig {} re-entrant fault at {:#x} (sp={:#x} on sigaltstack [{:#x},{:#x})) — killing process\n",
-                signal, fault_addr, user_sp, alt_lo, alt_hi);
-            return false; // caller will kill the process
+            if !is_fault {
+                // Non-fault signal (e.g. SIGURG async preemption) arrived while Go's
+                // signal handler is running on sigaltstack.  Re-pend it for delivery
+                // after sigreturn instead of silently dropping it.  Mirrors the
+                // existing re-pend path for when sigaltstack isn't configured yet
+                // (lines above).  The caller will NOT kill the process.
+                crate::tprint!(128,
+                    "[signal] sig {} re-entrant on sigaltstack (sp={:#x} in [{:#x},{:#x})) \
+                     — re-pending\n",
+                    signal, user_sp, alt_lo, alt_hi);
+                akuma_exec::threading::pend_signal_for_thread(thread_slot, signal);
+            } else {
+                // Fatal signal (e.g. re-entrant SIGSEGV) while inside a signal handler —
+                // genuine unrecoverable crash.  The data-abort caller falls through to
+                // return_to_kernel(-11).
+                crate::tprint!(128,
+                    "[signal] sig {} re-entrant FAULT at {:#x} (sp={:#x} on sigaltstack \
+                     [{:#x},{:#x})) — killing process\n",
+                    signal, fault_addr, user_sp, alt_lo, alt_hi);
+            }
+            return false;
         }
     }
 

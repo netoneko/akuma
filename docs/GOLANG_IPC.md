@@ -1582,3 +1582,118 @@ run to release it either. Classic priority-inversion deadlock under single-core 
 The siginfo fix (above) may prevent the Go crash that triggers the problematic fork call.
 If the freeze persists after the siginfo fix, the next step is to add explicit IRQ-enable
 checkpoints inside the fork page-copy loop so the scheduler can preempt it.
+
+---
+
+## FAR=0x0 Null Dereference in Go `asm` Tool (FIXED via siginfo + re-entrant handler)
+
+### Crash Sequence (full.log lines 6928–7426)
+
+```
+[T93.51] [WILD-DA] pid=88 FAR=0x0 ELR=0x10085568 last_sc=18446744073709551615
+         x0=0x0 x28=0x104ebca0 (g register)
+[T93.66] [signal] deliver sig=11 slot=12 handler=0x10085d00 fault_pc=0x10085568
+[T93.68] [signal] sig 23 re-entrant fault at 0x0 (sp=0x10400b970 on sigaltstack) — killing process
+[T122.24] [exit_group] pid=88 name=.../asm code=2 after 30.18s
+```
+
+pid=88 = `/usr/lib/go/pkg/tool/linux_arm64/asm` (Go assembler tool).
+
+### Root Cause 1: nil g.m dereference
+
+- `last_sc = u64::MAX` → crash happened **between syscalls**, not inside one
+- x0=0x0, x28 = Go's `g` register → the code at ELR tried to read `g.m` (stored in x0),
+  which was nil
+- ELR=0x10085568 is in Go's runtime initialization code (~480 KB into the text segment)
+- **Mechanism**: SIGURG (async preemption signal, sig=23) arrived during the goroutine/M
+  initialization window — between when the goroutine struct was allocated and when `g.m`
+  was assigned. Go's `asyncPreempt` handler read `g.m` via x0 and faulted.
+- Last syscall was `io_setup` (ARM64 syscall 0) at T93.51 — Go initializes goroutine
+  structures immediately after io_setup.
+
+### Root Cause 2: "killing process" was a lie
+
+At T93.68, SIGURG arrived while Go's SIGSEGV handler was running on sigaltstack:
+
+```rust
+// OLD code (src/exceptions.rs:871-876):
+if user_sp >= alt_lo && user_sp < alt_hi {
+    tprint!("...killing process...");
+    return false;  // caller will kill the process
+}
+```
+
+For the SIGURG delivery path (syscall-exit pending signal check), `try_deliver_signal`
+returning false means the signal is **silently dropped** — the process is NOT killed.
+The log message was wrong. pid=88 ran for another **28 seconds** after the "killing
+process" message and exited with code=2 (Go's build failure exit code).
+
+### Fix Applied (2026-03-26)
+
+In `try_deliver_signal` (`src/exceptions.rs`), the re-entrant check now distinguishes
+fault vs. non-fault signals:
+
+- **Non-fault signal (SIGURG)** on sigaltstack → **re-pended** via
+  `pend_signal_for_thread(slot, signal)` for delivery after `sigreturn`. Log: `re-pending`.
+  The caller does NOT kill the process.
+- **Fault signal (SIGSEGV)** on sigaltstack → genuine crash, log still says
+  `killing process`, caller calls `return_to_kernel(-11)`.
+
+This mirrors the existing re-pend behavior for SIGURG when sigaltstack is not yet
+configured (the `alt_sp == 0` case).
+
+### Connection to Exit 137
+
+When `return_to_kernel(-11)` fires for a re-entrant SIGSEGV:
+1. Process exits with -11 (SIGSEGV)
+2. If `teardown_forked_process_thread_group` races with the exit and the channel
+   is not yet marked `has_exited`, it overwrites the exit code with 137
+3. Parent's `wait4` sees 137 instead of the signal exit status
+
+This is the same 137 race documented in the teardown section. Both the SIGSEGV
+re-entrant path and the compile subprocess kill path share the same race window.
+
+---
+
+## Spurious Wakeup in FUTEX_WAIT (FIXED 2026-03-26)
+
+### Symptom
+
+`test_futex_timeout` panic:
+```
+test_futex_timeout: expected ETIMEDOUT (0xffffffffffffff92) got 0x0
+```
+
+A `FUTEX_WAIT_PRIVATE` with a 10 ms timeout returned 0 (success) instead of
+`ETIMEDOUT`. The test has no competing `FUTEX_WAKE` caller.
+
+### Root Cause
+
+`schedule_blocking` can return early before the deadline via multiple paths:
+
+1. **Stale sticky-wake flag** (`WOKEN_STATES[tid]` set by a prior test or system
+   event before `schedule_blocking` is entered) — returns immediately at the first
+   `swap(false)` check.
+2. **`is_current_interrupted()`** returning true — breaks from the WFI loop.
+
+In both cases `crate::timer::uptime_us() < deadline`, so the previous code fell
+through to `return 0` (success), which is a spurious result.
+
+### Fix
+
+`src/syscall/sync.rs` — the `FUTEX_WAIT | FUTEX_WAIT_BITSET` branch now uses an
+internal retry loop (`loop { schedule_blocking(deadline); … }`).
+
+After each `schedule_blocking` return the code checks queue membership to
+distinguish genuine vs. spurious wakeup:
+
+- **Not in queue** → removed by `futex_do_wake` → **genuine wake → return 0**
+- **Still in queue** → spurious:
+  - Pending signal → `EINTR`
+  - Deadline expired → `ETIMEDOUT`
+  - Otherwise: re-check futex value under lock and re-enqueue; if value changed
+    return `EAGAIN`, else loop back to `schedule_blocking`
+
+This also fixes the lost-wakeup window in the retry path: the futex value is
+re-read under the `FUTEX_WAITERS` lock before re-enqueueing, so a concurrent
+`FUTEX_WAKE` that changed the value is detected as `EAGAIN` rather than missed.

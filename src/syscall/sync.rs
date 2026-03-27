@@ -130,28 +130,60 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 u64::MAX
             };
 
-            akuma_exec::threading::schedule_blocking(deadline);
+            // Main wait loop — handles spurious wakeups from schedule_blocking.
+            //
+            // We distinguish genuine FUTEX_WAKE from spurious by checking queue
+            // membership after schedule_blocking returns:
+            //   - NOT in queue → removed by futex_do_wake → genuine wake → return 0
+            //   - Still in queue → spurious wakeup → check deadline/signal, retry
+            loop {
+                akuma_exec::threading::schedule_blocking(deadline);
 
-            {
-                let mut waiters = FUTEX_WAITERS.lock();
-                if let Some(queue) = waiters.get_mut(&key) {
-                    queue.retain(|&t| t != tid);
-                    if queue.is_empty() {
-                        waiters.remove(&key);
+                // Check whether we were genuinely woken (removed from queue by FUTEX_WAKE).
+                let woken_by_futex = {
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    let in_queue = waiters.get(&key).map_or(false, |q| q.contains(&tid));
+                    if in_queue {
+                        // Spurious: remove ourselves so we can re-check / re-enqueue below.
+                        if let Some(queue) = waiters.get_mut(&key) {
+                            queue.retain(|&t| t != tid);
+                            if queue.is_empty() { waiters.remove(&key); }
+                        }
                     }
+                    !in_queue
+                };
+
+                // If we were woken by a pending signal, return EINTR (Linux spec).
+                if akuma_exec::threading::peek_pending_signal(tid) != 0 {
+                    return EINTR;
+                }
+
+                if woken_by_futex {
+                    return 0;
+                }
+
+                // Not a genuine FUTEX_WAKE — check terminal conditions.
+                if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {
+                    return ETIMEDOUT;
+                }
+
+                // Spurious wakeup before deadline.  Re-check the futex value
+                // (under the lock to avoid lost-wakeup races) and re-enqueue.
+                {
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    let mut current_val: u32 = 0;
+                    if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                        return EFAULT;
+                    }
+                    if current_val != val {
+                        // Value changed — wakeup condition was met; report as EAGAIN
+                        // so the caller re-evaluates its own condition variable.
+                        return EAGAIN;
+                    }
+                    let queue = waiters.entry(key).or_insert_with(Vec::new);
+                    queue.push(tid);
                 }
             }
-
-            // If we were woken by a pending signal, return EINTR (Linux spec).
-            if akuma_exec::threading::peek_pending_signal(tid) != 0 {
-                return EINTR;
-            }
-
-            if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {
-                return ETIMEDOUT;
-            }
-
-            0
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let tgid = futex_key_tgid(is_private);
