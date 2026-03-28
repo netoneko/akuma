@@ -74,9 +74,11 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
 
-    // MAP_SHARED on file-backed mappings is not yet supported; log and treat as MAP_PRIVATE.
-    if flags & MAP_SHARED != 0 && is_file_backed {
-        crate::tprint!(192, "[mmap] MAP_SHARED file-backed unsupported (MAP_PRIVATE semantics): pid={} fd={}\n",
+    // MAP_SHARED on file-backed mappings: read-only MAP_SHARED is semantically identical
+    // to MAP_PRIVATE (no writes → no CoW divergence), so we handle it silently.
+    // Only warn for writable MAP_SHARED, which would require true shared-page semantics.
+    if flags & MAP_SHARED != 0 && is_file_backed && (prot & 0x2) != 0 {
+        crate::tprint!(192, "[mmap] MAP_SHARED file-backed writable unsupported (MAP_PRIVATE semantics): pid={} fd={}\n",
             proc.pid, fd);
     }
 

@@ -755,7 +755,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // Linux AIO syscalls (io_setup=0, io_destroy=1, io_submit=2, io_cancel=3, io_getevents=4)
         0 => aio::sys_io_setup(args[0], args[1]),
         1 => aio::sys_io_destroy(args[0]),
-        2 | 3 | 4 => ENOSYS,
+        2 => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
+        3 => aio::sys_io_cancel(args[0], args[1], args[2]),
+        4 => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
         // Extended attributes syscalls (5-16) - return ENOTSUP (not supported on this fs)
         5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
@@ -794,6 +796,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0 {
             log::record(owner_pid, syscall_num, t0, elapsed, result);
         }
+    }
+
+    // Log when a syscall returns a dangerous negative error code.  Go's runtime may
+    // not check the error and dereference the negative return value as a pointer,
+    // causing a WILD-DA crash (FAR = the error code).
+    if result == EFAULT || result == ENOSYS {
+        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let err_name = if result == EFAULT { "EFAULT" } else { "ENOSYS" };
+        crate::safe_print!(128,
+            "[{}] nr={} pid={} args=[{:#x}, {:#x}, {:#x}, {:#x}]\n",
+            err_name, syscall_num, owner_pid, args[0], args[1], args[2], args[3]);
     }
 
     CURRENT_SYSCALL_NR.store(!0u64, Ordering::Relaxed);

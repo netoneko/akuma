@@ -206,7 +206,42 @@ signal is pending (e.g. SIGURG), deliver it immediately via `try_deliver_signal`
 
 ---
 
-## Phase 9: Copy-on-Write Fork (future)
+## Phase 9: AIO Stubs + MAP_SHARED Read-Only ✅
+
+### 9A: io_getevents / io_submit / io_cancel stubs ✅
+
+**Problem:** Go compile worker (PID 143) crashed because syscall 4 (io_getevents) returned
+ENOSYS (-38). Go treated the return value as a pointer, causing WILD-DA at
+FAR=0xffffffffffffffda. The crash killed PID 143; Go build saw the failure and exited code=1
+without ever invoking the linker. All other ~60 compile workers succeeded.
+
+Syscalls 0 (io_setup) and 1 (io_destroy) were already implemented with a proper AIO ring
+buffer, but syscalls 2/3/4 returned ENOSYS — inconsistent with a working io_setup.
+
+**Fix:** Added stub implementations:
+- `sys_io_submit`: validates ctx, returns 0 (no events submitted)
+- `sys_io_cancel`: returns EINVAL (no outstanding requests)
+- `sys_io_getevents`: returns 0 (no events ready, consistent with empty ring head==tail)
+
+All stubs return proper error codes (EINVAL) for invalid contexts, never ENOSYS.
+
+**Files changed:** `src/syscall/aio.rs`, `src/syscall/mod.rs`
+
+### 9B: MAP_SHARED file-backed read-only ✅
+
+**Problem:** 76 `MAP_SHARED file-backed unsupported` warnings during go build. Go's build
+system mmaps compiled object files with MAP_SHARED for reading. While MAP_PRIVATE fallback
+is functionally correct for read-only access, the warnings are noisy and misleading.
+
+**Fix:** Suppress warning for read-only MAP_SHARED file-backed mappings (PROT_WRITE not set).
+Only warn for writable MAP_SHARED, which would require true shared-page semantics not yet
+implemented.
+
+**Files changed:** `src/syscall/mem.rs`
+
+---
+
+## Phase 10: Copy-on-Write Fork (future)
 
 **Not yet implemented.** Highest impact (eliminates the multi-second fork copy for Go's 50+ MB
 heap) but most complex. Requires:
@@ -215,7 +250,7 @@ heap) but most complex. Requires:
 3. Write permission fault handler in DA path
 4. Feature gate behind `config::COW_FORK_ENABLED`
 
-Deferred until Phases 1–8 have stabilized the system under `go build`.
+Deferred until Phases 1–9 have stabilized the system under `go build`.
 
 ---
 
