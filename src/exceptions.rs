@@ -673,6 +673,60 @@ pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
         && a < akuma_exec::process::types::ProcessMemory::KERNEL_VA_END
 }
 
+/// Pre-resolve a CoW write barrier: if the page at `page_va` in the current
+/// TTBR0 address space is a CoW-demoted RO page (cow_ref_get > 0), allocate a
+/// private copy, remap it RW, and update frame tracking.
+///
+/// Returns true if the page is now writable (either already was, or just resolved).
+/// Returns false only on OOM or if no process owner is found.
+///
+/// Must be called AFTER ensure_user_page_mapped so the page table entry exists.
+/// Prevents EL1 data aborts when kernel code writes to user memory (signal frame
+/// delivery, futex wake writes, etc.) that hits a CoW-demoted RO page.
+fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
+    let ttbr0: u64;
+    #[cfg(target_os = "none")]
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
+    if ttbr0 == 0 { return true; } // no user page tables — no CoW pages possible
+
+    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+
+    let old_pa = match akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
+        Some(pa) => pa & !0xFFF,
+        None => return true, // page not mapped — not a CoW page
+    };
+
+    if crate::pmm::cow_ref_get(old_pa) == 0 { return true; } // not CoW, already writable
+
+    // CoW page: allocate a private copy and remap as RW.
+    let new_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => return false, // OOM
+    };
+    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+    unsafe {
+        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
+        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
+    }
+    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+        let _ = owner.address_space.map_page(
+            page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
+        akuma_exec::mmu::flush_tlb_page(page_va);
+        owner.address_space.track_user_frame(new_frame);
+        owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        crate::pmm::cow_ref_dec(old_pa);
+        true
+    } else {
+        crate::pmm::free_page(new_frame); // no owner — free to avoid leak
+        false
+    }
+}
+
 /// Ensure a userspace page is mapped. If it's in a lazy anonymous region and
 /// not yet mapped, allocates and maps a zeroed page. Returns true if the page
 /// is mapped after this call (either was already mapped, or was just demand-paged).
@@ -920,10 +974,15 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, first_page);
         return false;
     }
+    // Pre-resolve CoW: ensure the page is writable before the kernel writes the
+    // signal frame from EL1. Without this, a CoW-demoted altstack page (mapped RO)
+    // causes EC=0x25 (EL1 data abort) when write_bytes runs below.
+    ensure_cow_page_writable(pid, first_page);
     if last_page != first_page && !ensure_user_page_mapped(pid, last_page) {
         crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, last_page);
         return false;
     }
+    if last_page != first_page { ensure_cow_page_writable(pid, last_page); }
 
     unsafe {
         let base = new_sp as *mut u8;
@@ -1306,9 +1365,15 @@ fn try_resolve_el1_cow_fault() -> bool {
         akuma_exec::mmu::flush_tlb_page(page_va);
         owner.address_space.track_user_frame(new_frame);
         owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        crate::pmm::cow_ref_dec(old_pa);
+        true // Caller returns; ERET retries the faulting instruction
+    } else {
+        // No process owner found: cannot remap — free the new frame to avoid a leak.
+        // Do NOT cow_ref_dec: the page is still mapped RO with the original refcount.
+        // Returning false lets the EL1 handler kill the process via the normal path.
+        crate::pmm::free_page(new_frame);
+        false
     }
-    crate::pmm::cow_ref_dec(old_pa);
-    true // Caller returns; ERET retries the faulting instruction
 }
 
 /// Synchronous exception handler from EL1 (kernel mode)

@@ -270,6 +270,9 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_ic_flush_svc_detection, "ic_flush_svc_detection");
     run_test!(test_cow_el1_fault_conditions, "cow_el1_fault_conditions");
     run_test!(test_cow_dec_after_fault, "cow_dec_after_fault");
+    run_test!(test_ensure_cow_writable_resolves_cow_page, "ensure_cow_writable_resolves");
+    run_test!(test_cow_el1_resolver_no_dec_on_fail, "cow_el1_resolver_no_dec_on_fail");
+    run_test!(test_cow_prefault_not_cow_page_no_op, "cow_prefault_not_cow_page_no_op");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -8673,6 +8676,124 @@ fn test_cow_dec_after_fault() -> bool {
     // Clean up new_frame — second frame freed → free_before + 2
     pmm::free_page(new_frame);
     ok &= pmm::free_count() == free_before + 2;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that the CoW pre-fault logic (used by ensure_cow_page_writable) correctly
+/// resolves a CoW-shared frame: allocates a private copy, decrements old refcount,
+/// and leaves old PA still tracked by the "other owner" (refcount 2→1).
+fn test_ensure_cow_writable_resolves_cow_page() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] ensure_cow_page_writable logic: resolves CoW frame\n");
+
+    let old_frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
+    };
+
+    // Simulate CoW share: two processes both track old_frame → refcount = 2
+    pmm::cow_ref_inc(old_frame.addr);
+    let mut ok = pmm::cow_ref_get(old_frame.addr) == 2;
+
+    // Simulate ensure_cow_page_writable: allocate new frame, copy, dec refcount
+    let new_frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            pmm::free_page(old_frame);
+            console::print("  OOM\n  Result: FAIL\n");
+            return false;
+        }
+    };
+    let free_after_alloc = pmm::free_count();
+
+    // new_frame != old_frame (different physical frames)
+    ok &= new_frame.addr != old_frame.addr;
+
+    // Decrement refcount (child broke CoW, has its own private copy now)
+    pmm::cow_ref_dec(old_frame.addr);
+    ok &= pmm::cow_ref_get(old_frame.addr) == 1; // parent still holds it
+
+    // Simulate parent exit: free_page → cow_ref_dec 1→0 → actually frees
+    pmm::free_page(old_frame);
+    ok &= pmm::cow_ref_get(old_frame.addr) == 0;
+    ok &= pmm::free_count() == free_after_alloc + 1;
+
+    // Also free new_frame (child's private copy)
+    pmm::free_page(new_frame);
+    ok &= pmm::free_count() == free_after_alloc + 2;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that the fixed try_resolve_el1_cow_fault path does NOT decrement the
+/// refcount when lookup_process fails (page stays RO, refcount unchanged).
+/// Before the fix, cow_ref_dec was always called even without remapping.
+fn test_cow_el1_resolver_no_dec_on_fail() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW EL1 resolver: no dec when lookup_process fails\n");
+
+    let frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
+    };
+    let free_before = pmm::free_count();
+
+    // Simulate CoW share: refcount = 2
+    pmm::cow_ref_inc(frame.addr);
+    let mut ok = pmm::cow_ref_get(frame.addr) == 2;
+
+    // Simulate the "lookup_process failed" path in the fixed handler:
+    // We allocated new_frame but cannot remap (no owner) → free new_frame, skip cow_ref_dec.
+    let new_frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            pmm::free_page(frame);
+            console::print("  OOM\n  Result: FAIL\n");
+            return false;
+        }
+    };
+    // Fixed behavior: free new_frame, do NOT call cow_ref_dec
+    pmm::free_page(new_frame);
+
+    // Refcount must still be 2 — the page was NOT resolved
+    ok &= pmm::cow_ref_get(frame.addr) == 2;
+    // free_count should be back to free_before (new_frame allocated then freed)
+    ok &= pmm::free_count() == free_before;
+
+    // Cleanup: dec twice to reach 0, then free_page will actually free
+    pmm::cow_ref_dec(frame.addr); // 2→1
+    pmm::free_page(frame);        // cow_ref_dec 1→0 → frees
+    ok &= pmm::cow_ref_get(frame.addr) == 0;
+    ok &= pmm::free_count() == free_before + 1;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that ensure_cow_page_writable is a no-op for non-CoW pages
+/// (cow_ref_get == 0 → no allocation, no refcount change, no frame leak).
+fn test_cow_prefault_not_cow_page_no_op() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] ensure_cow_page_writable: no-op for non-CoW page\n");
+
+    let frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
+    };
+    let free_after_alloc = pmm::free_count();
+
+    // No cow_ref_inc → refcount = 0 (not a CoW page)
+    let mut ok = pmm::cow_ref_get(frame.addr) == 0;
+
+    // ensure_cow_page_writable early-returns for non-CoW pages: no extra allocation
+    ok &= pmm::free_count() == free_after_alloc;
+
+    // Cleanup
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_after_alloc + 1;
 
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok

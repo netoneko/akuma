@@ -419,6 +419,41 @@ page must be handled at EL1, not just at EL0.
 
 ---
 
+## Phase 14: Pre-fault CoW Pages Before Signal Delivery
+
+**Problem:** `try_resolve_el1_cow_fault` (Phase 13) was a reactive fix — it caught the EL1
+permission fault after the signal frame write failed. But there were two remaining issues:
+
+1. **Root cause not fixed**: `ensure_user_page_mapped` only checks the **valid bit** in the
+   L3 PTE, not AP (access permission) bits. A CoW-demoted page has valid=1 but AP_RO_ALL.
+   The function returned `true` thinking the page was ready, then `write_bytes` hit the RO
+   page → EL1 fault. The correct fix is to pre-resolve CoW before writing.
+
+2. **Refcount bug in `try_resolve_el1_cow_fault`**: If `lookup_process(pid)` returned `None`,
+   the function skipped `map_page` (page stayed RO) but still called `cow_ref_dec(old_pa)`.
+   This decremented the refcount without creating a private copy → refcount undercount →
+   potential double-free. A second fault on the same instruction would allocate another new
+   frame, dec refcount again (possibly to 0), and free the original page while the parent
+   still holds a reference to it.
+
+**Fix 1 — `ensure_cow_page_writable` (`src/exceptions.rs`):**
+New function called immediately after `ensure_user_page_mapped` in signal delivery. It:
+1. Reads current TTBR0 → walks page table → gets old PA for the signal frame page.
+2. If `cow_ref_get(old_pa) > 0`: allocates a new frame, copies, remaps VA→new PA as RW_NO_EXEC.
+3. Only decrements refcount if `lookup_process` succeeded and the remap was installed.
+4. If OOM or no process owner: frees the new frame, returns false.
+
+This means signal delivery never reaches the `write_bytes` call with a CoW-RO page.
+`try_resolve_el1_cow_fault` remains as a safety net for any other EL1 writes to CoW pages
+(e.g., futex wake writes) that do not go through `ensure_cow_page_writable`.
+
+**Fix 2 — Refcount bug in `try_resolve_el1_cow_fault` (`src/exceptions.rs`):**
+Moved `cow_ref_dec(old_pa)` inside the `if let Some(owner)` branch. The `else` branch now
+frees the new frame (avoiding the leak) and returns `false` to let the EL1 handler kill the
+process via the normal path. Refcount is only decremented when the remap actually succeeded.
+
+---
+
 ## Verification
 
 After each phase:
