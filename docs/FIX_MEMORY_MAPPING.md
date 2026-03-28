@@ -202,6 +202,12 @@ next normal syscall, adding up to 10ms latency to Go's goroutine preemption.
 **Fix:** Added pending signal check after IC flush + ELR backup, before returning. If a
 signal is pending (e.g. SIGURG), deliver it immediately via `try_deliver_signal`.
 
+**IMPORTANT constraint:** Only async/preemption signals may be delivered here. Fault signals
+(SIGSEGV=11, SIGBUS=7, SIGFPE=8, SIGILL=4) carry specific `si_addr` from the original fault.
+Delivering them with the IC flush's fault_pc causes Go's `sigpanic` handler to try patching
+code at the wrong address, which itself faults → re-entrant SIGSEGV → process killed.
+Implementation uses `effective_mask = sig_mask | FAULT_SIGNALS` when calling `take_pending_signal`.
+
 **Files changed:** `src/exceptions.rs` — IC flush path in `sync_el0_handler`
 
 ---
@@ -241,7 +247,59 @@ implemented.
 
 ---
 
-## Phase 10: Copy-on-Write Fork (future)
+## Phase 10: IC Flush Regressions ✅
+
+Two regressions introduced by Phase 8C's IC flush signal delivery, both triggered by
+Go's compile workers during heavy JIT compilation.
+
+### 10A: IC flush delivers SIGSEGV with wrong context ✅
+
+**Problem:** `take_pending_signal` in the IC flush path could return SIGSEGV (sig=11). The
+signal was delivered with the IC flush's `fault_pc` (the SVC instruction address), not the
+original fault address. Go's `sigpanic` handler received SIGSEGV, looked at `fault_pc` ≈ JIT
+code, and tried to patch the instruction at that address (a code page → read-only). Write
+fault at the code address → second SIGSEGV → re-entrant SIGSEGV → process killed.
+
+Crash signature: `[signal] sig 11 re-entrant FAULT at 0x1002a11c` with ISS=0x4f (L3
+permission fault, write attempt). Killed PID 55 (/usr/lib/go/bin/go) after 0.25s.
+
+**Fix:** Block fault signals in the IC flush signal delivery path:
+```
+const FAULT_SIGNALS: u64 = (1 << 4) | (1 << 7) | (1 << 8) | (1 << 11); // SIGILL,SIGBUS,SIGFPE,SIGSEGV
+let effective_mask = sig_mask | FAULT_SIGNALS;
+```
+Fault signals are left pending and delivered at the next normal signal delivery point
+(after syscall return, after exception handler) where `si_addr` is correct.
+
+**Files changed:** `src/exceptions.rs` — IC flush path in `sync_el0_handler`
+
+### 10B: IC flush replays SVC with wrong register state → spurious io_setup ✅
+
+**Problem:** IC flush backs up `ELR -= 4` to replay the instruction before the bogus SVC.
+If that instruction is also a SVC (a different syscall), it fires with the IC flush
+trampoline's register state instead of the registers Go prepared for that syscall.
+
+Observed: IC flush at ELR=0x1009e478, ELR-4=0x1009e474 contained an `io_setup` SVC (x8=0).
+io_setup was called with `x0=0x20175d008, x1=0x1` (IC flush trampoline values) instead of
+the intended args. `validate_user_ptr(ctx_idp=0x1, 8)` failed → EFAULT. Go stored the EFAULT
+return value, later dereferenced it as a pointer → WILD-DA at FAR=0xfffffffffffffff2.
+
+**Fix:** Before setting `ELR -= 4`, peek at the instruction at ELR-4 using
+`copy_from_user_safe`. If it matches the AArch64 SVC encoding
+`(instr & 0xFFE0001F) == 0xD4000001`, skip the ELR backup. The IC flush clears QEMU's TB;
+on resume, QEMU retranslates from the unchanged ELR and executes the new code correctly.
+
+Log output distinguishes the two cases:
+```
+[JIT] IC flush + replay #1 bogus nr=... ELR=0x... prev=replay   ← normal, ELR backed up
+[JIT] IC flush + replay #1 bogus nr=... ELR=0x... prev=SVC(skip) ← new case, ELR unchanged
+```
+
+**Files changed:** `src/exceptions.rs` — IC flush path in `sync_el0_handler`
+
+---
+
+## Phase 11: Copy-on-Write Fork (future)
 
 **Not yet implemented.** Highest impact (eliminates the multi-second fork copy for Go's 50+ MB
 heap) but most complex. Requires:
@@ -250,7 +308,7 @@ heap) but most complex. Requires:
 3. Write permission fault handler in DA path
 4. Feature gate behind `config::COW_FORK_ENABLED`
 
-Deferred until Phases 1–9 have stabilized the system under `go build`.
+Deferred until Phases 1–10 have stabilized the system under `go build`.
 
 ---
 

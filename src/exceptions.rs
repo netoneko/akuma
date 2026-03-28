@@ -1642,24 +1642,60 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let count = JIT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
                     if count < 16 {
                         let elr = frame_ref.elr_el1;
-                        crate::safe_print!(128, "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x}\n",
-                            count + 1, syscall_num, elr);
+                        // AArch64 SVC encoding: bits[31:24]=0xD4, bits[23:21]=0b000,
+                        // bits[4:0]=0b00001.  Mask: 0xFFE0001F == 0xD4000001.
+                        // If the instruction at ELR-4 is itself a SVC, we MUST NOT
+                        // back up ELR: the registers at IC flush entry are for the
+                        // IC flush trampoline, not for the preceding syscall.
+                        // Re-executing that SVC with wrong registers causes spurious
+                        // syscalls (e.g. io_setup with ctx_idp=0x1 → EFAULT → WILD-DA).
+                        // In that case just flush the IC and return to ELR (skip replay).
+                        let prev_instr = elr.checked_sub(4).and_then(|prev_va| {
+                            let mut buf = [0u8; 4];
+                            unsafe {
+                                akuma_exec::mmu::user_access::copy_from_user_safe(
+                                    buf.as_mut_ptr(), prev_va as *const u8, 4,
+                                ).ok()
+                            }
+                            .map(|_| u32::from_le_bytes(buf))
+                        });
+                        let prev_is_svc = prev_instr
+                            .map(|instr| (instr & 0xFFE0001F) == 0xD4000001)
+                            .unwrap_or(false);
+                        crate::safe_print!(128,
+                            "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x} prev={}\n",
+                            count + 1, syscall_num, elr,
+                            if prev_is_svc { "SVC(skip)" } else { "replay" });
                         unsafe {
                             core::arch::asm!("ic iallu");
                             core::arch::asm!("dsb ish");
                             core::arch::asm!("isb");
-                            (*frame).elr_el1 = elr.wrapping_sub(4);
+                            if !prev_is_svc {
+                                (*frame).elr_el1 = elr.wrapping_sub(4);
+                            }
+                            // If prev_is_svc: ELR stays at the IC flush SVC itself.
+                            // QEMU will retranslate from that address with the cleared TB.
                         }
                         // Check for pending signals before replaying — without this,
                         // SIGURG preemption is delayed until the next normal syscall,
                         // adding up to 10ms latency to Go's goroutine preemption.
+                        //
+                        // IMPORTANT: Only deliver async signals here (SIGURG=23 and similar).
+                        // Fault signals (SIGSEGV=11, SIGBUS=7, SIGFPE=8, SIGILL=4) carry
+                        // specific si_addr from the original fault.  Delivering them in the
+                        // IC flush path gives the wrong fault_pc/si_addr context, causing
+                        // Go's sigpanic handler to try patching code at the wrong address,
+                        // which itself faults → re-entrant SIGSEGV → process killed.
+                        const FAULT_SIGNALS: u64 = (1 << 4) | (1 << 7) | (1 << 8) | (1 << 11);
                         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
                         let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
                             p.signal_mask
                         } else {
                             0
                         };
-                        if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
+                        // Block fault signals in this path by adding them to the effective mask.
+                        let effective_mask = sig_mask | FAULT_SIGNALS;
+                        if let Some(sig) = akuma_exec::threading::take_pending_signal(effective_mask) {
                             unsafe { (*frame).x0 = frame_ref.x0; }
                             if try_deliver_signal(frame, sig, 0, false) {
                                 return sig as u64;
