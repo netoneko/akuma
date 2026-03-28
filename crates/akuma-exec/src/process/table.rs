@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use spinning_top::Spinlock;
 
@@ -31,10 +30,11 @@ pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
     Spinlock::new(BTreeMap::new());
 
 
-/// Global lazy region table, keyed by PID.
+/// Global lazy region table, keyed by PID then by start_va.
+/// The inner BTreeMap allows O(log n) range lookups via `range(..=va).next_back()`.
 /// Stored separately from Process to avoid aliasing/corruption issues
 /// with &mut Process references from current_process().
-pub static LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, Vec<LazyRegion>>> =
+pub static LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, BTreeMap<usize, LazyRegion>>> =
     Spinlock::new(BTreeMap::new());
 
 /// Register a process in the table (takes ownership)

@@ -1478,7 +1478,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
             let table = LAZY_REGION_TABLE.lock();
             table.get(&parent_pid)
-                .map(|regions| regions.iter().map(|r| (r.start_va, r.size)).collect())
+                .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
                 .unwrap_or_default()
         });
         let mut lazy_pages_copied = 0usize;

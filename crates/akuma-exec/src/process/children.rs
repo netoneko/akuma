@@ -224,8 +224,9 @@ pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> 
     with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            for r in regions {
-                if va >= r.start_va && va < r.start_va + r.size {
+            // O(log n): last region whose start_va <= va, then range-check.
+            if let Some((_key, r)) = regions.range(..=va).next_back() {
+                if va < r.start_va + r.size {
                     return Some((r.flags, r.source.clone(), r.start_va, r.size));
                 }
             }
@@ -246,8 +247,9 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
     with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {
-            for r in regions {
-                if va >= r.start_va && va < r.start_va + r.size {
+            // O(log n): find the last region whose start_va <= va, then range-check.
+            if let Some((_key, r)) = regions.range(..=va).next_back() {
+                if va < r.start_va + r.size {
                     return Some((r.flags, r.source.clone(), r.start_va, r.size));
                 }
             }
@@ -289,7 +291,7 @@ pub fn lazy_region_debug(va: usize) {
         if let Some(regions) = table.get(&pid) {
             let mut w = LazyDebugWriter::<256>::new();
             let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
-            for (i, r) in regions.iter().enumerate().take(8) {
+            for (i, (_, r)) in regions.iter().enumerate().take(8) {
                 if i > 0 { let _ = w.write_str(","); }
                 let _ = write!(w, "{:#x}+{:#x}", r.start_va, r.size);
             }
@@ -310,8 +312,8 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
     let len = with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
-        let regions = table.entry(pid).or_insert_with(Vec::new);
-        regions.push(LazyRegion { start_va, size, flags: page_flags, source });
+        let regions = table.entry(pid).or_insert_with(alloc::collections::BTreeMap::new);
+        regions.insert(start_va, LazyRegion { start_va, size, flags: page_flags, source });
         regions.len()
     });
     len
@@ -323,51 +325,55 @@ pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize,
     with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
-            let mut i = 0;
-            while i < regions.len() {
-                let r_start = regions[i].start_va;
-                let r_end = r_start + regions[i].size;
-                if r_start >= range_end || r_end <= range_start {
-                    i += 1;
-                    continue;
-                }
+            // Collect keys of regions that overlap [range_start, range_end).
+            // Any overlapping region must have start_va < range_end AND start_va + size > range_start.
+            let keys: alloc::vec::Vec<usize> = regions
+                .range(..range_end)
+                .filter(|x| *x.0 + x.1.size > range_start)
+                .map(|x| *x.0)
+                .collect();
+
+            for key in keys {
+                let r_start = key;
+                let r_size = regions[&key].size;
+                let r_end = r_start + r_size;
+                let r_flags = regions[&key].flags;
+                let r_source = regions[&key].source.clone();
+
                 let clip_start = r_start.max(range_start);
                 let clip_end = r_end.min(range_end);
+
                 if clip_start == r_start && clip_end == r_end {
                     // Fully contained: update in place.
-                    regions[i].flags = new_flags;
-                    i += 1;
+                    regions.get_mut(&key).unwrap().flags = new_flags;
                 } else {
-                    // Partially overlapping: split into up to 3 pieces.
-                    let old_flags = regions[i].flags;
-                    let old_source = regions[i].source.clone();
-                    regions.remove(i);
+                    // Partially overlapping: remove and re-insert up to 3 pieces.
+                    regions.remove(&key);
                     // "before" tail keeps old flags.
                     if clip_start > r_start {
-                        regions.push(LazyRegion {
+                        regions.insert(r_start, LazyRegion {
                             start_va: r_start,
                             size: clip_start - r_start,
-                            flags: old_flags,
-                            source: old_source.clone(),
+                            flags: r_flags,
+                            source: r_source.clone(),
                         });
                     }
                     // Overlapping slice gets new flags.
-                    regions.push(LazyRegion {
+                    regions.insert(clip_start, LazyRegion {
                         start_va: clip_start,
                         size: clip_end - clip_start,
                         flags: new_flags,
-                        source: old_source.clone(),
+                        source: r_source.clone(),
                     });
                     // "after" tail keeps old flags.
                     if clip_end < r_end {
-                        regions.push(LazyRegion {
+                        regions.insert(clip_end, LazyRegion {
                             start_va: clip_end,
                             size: r_end - clip_end,
-                            flags: old_flags,
-                            source: old_source,
+                            flags: r_flags,
+                            source: r_source,
                         });
                     }
-                    // i unchanged: former index i now holds the next original region.
                 }
             }
         }
@@ -375,21 +381,14 @@ pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize,
 }
 
 pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
-    let result = with_irqs_disabled(|| {
+    with_irqs_disabled(|| {
         let mut table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get_mut(&pid) {
-            if let Some(idx) = regions.iter().position(|r| r.start_va == start_va) {
-                let removed = regions.remove(idx);
-                return Some((removed, regions.len()));
-            }
+            regions.remove(&start_va)
+        } else {
+            None
         }
-        None
-    });
-    if let Some((removed, _remaining)) = result {
-        Some(removed)
-    } else {
-        None
-    }
+    })
 }
 
 /// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
@@ -412,39 +411,51 @@ fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize
         let mut table = LAZY_REGION_TABLE.lock();
         let regions = table.get_mut(&pid)?;
 
-        let idx = regions.iter().position(|r| {
-            let reg_end = r.start_va + r.size;
-            r.start_va < range_end && reg_end > range_start
-        })?;
+        // Find the first region overlapping [range_start, range_end).
+        // A region overlaps if start_va < range_end AND start_va + size > range_start.
+        let key = regions
+            .range(..range_end)
+            .filter(|x| *x.0 + x.1.size > range_start)
+            .map(|x| *x.0)
+            .next()?;
 
-        let reg_start = regions[idx].start_va;
-        let reg_size = regions[idx].size;
+        let reg_start = key;
+        let reg_size = regions[&key].size;
         let reg_end = reg_start + reg_size;
+        let reg_flags = regions[&key].flags;
+        let reg_source = regions[&key].source.clone();
 
-        let clip_start = if range_start > reg_start { range_start } else { reg_start };
-        let clip_end = if range_end < reg_end { range_end } else { reg_end };
+        let clip_start = range_start.max(reg_start);
+        let clip_end = range_end.min(reg_end);
 
         if clip_start == reg_start && clip_end == reg_end {
-            regions.remove(idx);
+            regions.remove(&key);
             Some(('F', reg_start, reg_size / 4096))
         } else if clip_start == reg_start {
-            regions[idx].start_va = clip_end;
-            regions[idx].size = reg_end - clip_end;
+            // Trim prefix: remove old entry, insert remainder at new start_va.
+            regions.remove(&key);
+            regions.insert(clip_end, LazyRegion {
+                start_va: clip_end,
+                size: reg_end - clip_end,
+                flags: reg_flags,
+                source: reg_source,
+            });
             let freed = (clip_end - clip_start) / 4096;
             Some(('P', clip_start, freed))
         } else if clip_end == reg_end {
-            regions[idx].size = clip_start - reg_start;
+            // Trim suffix: shorten the existing entry in place (key unchanged).
+            regions.get_mut(&key).unwrap().size = clip_start - reg_start;
             let freed = (reg_end - clip_start) / 4096;
             Some(('S', clip_start, freed))
         } else {
-            let right = LazyRegion {
+            // Middle split: shorten left piece, insert right piece.
+            regions.get_mut(&key).unwrap().size = clip_start - reg_start;
+            regions.insert(clip_end, LazyRegion {
                 start_va: clip_end,
                 size: reg_end - clip_end,
-                flags: regions[idx].flags,
-                source: regions[idx].source.clone(),
-            };
-            regions[idx].size = clip_start - reg_start;
-            regions.push(right);
+                flags: reg_flags,
+                source: reg_source,
+            });
             let freed = (clip_end - clip_start) / 4096;
             Some(('M', clip_start, freed))
         }

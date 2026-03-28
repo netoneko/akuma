@@ -16,11 +16,16 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     const MAP_FIXED: u32 = 0x10;
     const MAP_NORESERVE: u32 = 0x4000;
     const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+    const MAP_POPULATE: u32 = 0x8000;
+    const MAP_STACK: u32 = 0x20000;   // hint-only on Linux; ignored here
+    const MAP_SHARED: u32 = 0x01;
     const PROT_NONE: u32 = 0;
+    let _ = MAP_STACK; // silence unused-variable lint
 
     let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    let map_populate = flags & MAP_POPULATE != 0;
 
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
@@ -69,7 +74,15 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
 
-    let use_lazy = !is_file_backed && (
+    // MAP_SHARED on file-backed mappings is not yet supported; log and treat as MAP_PRIVATE.
+    if flags & MAP_SHARED != 0 && is_file_backed {
+        crate::tprint!(192, "[mmap] MAP_SHARED file-backed unsupported (MAP_PRIVATE semantics): pid={} fd={}\n",
+            proc.pid, fd);
+    }
+
+    // MAP_POPULATE requests eager pre-faulting; it suppresses lazy allocation.
+    // MADV_WILLNEED can also trigger pre-faulting on existing lazy regions.
+    let use_lazy = !is_file_backed && !map_populate && (
         is_lazy ||
         (flags & MAP_NORESERVE != 0) ||
         pages > 256
@@ -89,23 +102,39 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         page_flags
     };
 
-    let mut frames = alloc::vec::Vec::new();
-    for i in 0..pages {
-        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-            frames.push(frame);
-            let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(mmap_addr + i * 4096, frame.addr, initial_flags) };
-            proc.address_space.track_user_frame(frame);
-            for tf in table_frames {
-                proc.address_space.track_page_table_frame(tf);
+    // Batch-allocate all pages in a single PMM lock acquisition, then map
+    // them with no_flush and issue a single TLB flush after the loop.
+    let frame_batch = match crate::pmm::alloc_pages_zeroed(pages) {
+        Some(b) => b,
+        None => {
+            if map_populate {
+                // MAP_POPULATE is advisory — fall back to lazy rather than failing the call.
+                let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
+                let count = akuma_exec::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+                crate::tprint!(128, "[mmap] MAP_POPULATE OOM, lazy fallback: pid={} pages={} ({} regions)\n",
+                    proc.pid, pages, count);
+                return mmap_addr as u64;
             }
-        } else {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM at page {}/{}\n",
-                    proc.pid, len, i, pages);
+                crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM (batch alloc)\n",
+                    proc.pid, len);
             }
             return !0u64;
         }
+    };
+    let mut frames = alloc::vec::Vec::with_capacity(pages);
+    for (i, frame) in frame_batch.into_iter().enumerate() {
+        let (table_frames, _) = unsafe {
+            akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, initial_flags)
+        };
+        proc.address_space.track_user_frame(frame);
+        for tf in table_frames {
+            proc.address_space.track_page_table_frame(tf);
+        }
+        frames.push(frame);
     }
+    // Single TLB flush for the entire mmap range.
+    akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
     if is_file_backed {
         if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
@@ -246,10 +275,58 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
 }
 
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
+    const MADV_WILLNEED: i32 = 3;
     const MADV_DONTNEED: i32 = 4;
     const MADV_FREE: i32 = 8;
 
     match advice {
+        MADV_WILLNEED => {
+            // Pre-fault pages in lazy regions that aren't yet mapped.
+            // This is advisory; OOM during pre-faulting is silently ignored.
+            let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let proc = match akuma_exec::process::lookup_process(owner_pid) {
+                Some(p) => p,
+                None => return 0,
+            };
+            let aligned_addr = addr & !0xFFF;
+            let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
+
+            // Collect (va, flags) pairs for pages in lazy regions not yet mapped.
+            let mut prefault: alloc::vec::Vec<(usize, u64)> = alloc::vec::Vec::new();
+            let mut va = aligned_addr;
+            while va < end {
+                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
+                    if let Some((flags, _, _, _)) =
+                        akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, va)
+                    {
+                        prefault.push((va, flags));
+                    }
+                }
+                va += 4096;
+            }
+            if prefault.is_empty() {
+                return 0;
+            }
+
+            // Batch-allocate and map with deferred TLB flush.
+            let frames = match crate::pmm::alloc_pages_zeroed(prefault.len()) {
+                Some(v) => v,
+                None => return 0, // advisory — ignore OOM
+            };
+            for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
+                let frame = frames[idx];
+                let (table_frames, _) = unsafe {
+                    akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
+                };
+                proc.address_space.track_user_frame(frame);
+                for tf in table_frames {
+                    proc.address_space.track_page_table_frame(tf);
+                }
+            }
+            // Flush the entire requested range (covers all newly mapped pages).
+            akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);
+            0
+        }
         MADV_DONTNEED => {
             let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
@@ -299,11 +376,19 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         akuma_exec::process::update_lazy_region_flags(owner_pid, addr, pages * 4096, new_flags);
 
+        // Update all page table entries with no_flush, then issue a single
+        // TLB range flush. Previously each update_page_flags call issued its
+        // own dsb+tlbi+dsb+isb, causing O(pages) expensive barrier sequences.
+        let mut any_updated = false;
         for i in 0..pages {
             let va = addr + i * 4096;
             if proc.address_space.is_mapped(va) {
-                let _ = proc.address_space.update_page_flags(va, new_flags);
+                let _ = proc.address_space.update_page_flags_no_flush(va, new_flags);
+                any_updated = true;
             }
+        }
+        if any_updated {
+            akuma_exec::mmu::flush_tlb_range(addr, pages);
         }
         if adding_exec {
             for i in 0..pages {

@@ -532,6 +532,38 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Same as `update_page_flags` but skips the TLB flush.
+    ///
+    /// Use when updating a large range of pages (e.g. mprotect over many pages).
+    /// After calling this for all pages, issue a single `flush_tlb_range` or
+    /// `flush_tlb_asid` to make the permission changes visible to userspace.
+    pub fn update_page_flags_no_flush(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+        let _irq_guard = IrqGuard::new();
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
+        unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 { return Ok(()); }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 { return Ok(()); }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 { return Ok(()); }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let old_entry = l3_ptr.add(l3_idx).read_volatile();
+            if old_entry & flags::VALID == 0 { return Ok(()); }
+            let entry = (old_entry & !PERM_MASK) | new_flags;
+            l3_ptr.add(l3_idx).write_volatile(entry);
+        }
+        // No TLB flush — caller must call flush_tlb_range after the batch.
+        Ok(())
+    }
+
     /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
     /// Used by kernel tests and diagnostics (e.g. verify `UXN` after `update_page_flags`).
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
@@ -758,6 +790,82 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
         (allocated_tables, false)
     }
 }}
+
+/// Same as `map_user_page` but **skips the per-page TLB invalidation**.
+///
+/// Use this when mapping multiple pages in a batch.  After all pages are
+/// mapped, call `flush_tlb_range` (or `flush_tlb_asid`) once to flush the
+/// entire range with a single DSB+ISB sequence instead of N full barriers.
+///
+/// The caller is responsible for issuing the TLB flush before the new
+/// mappings can be safely used by userspace.
+pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) { unsafe {
+    let _irq_guard = IrqGuard::new();
+    let mut allocated_tables = Vec::new();
+    let ttbr0: u64;
+    #[cfg(target_os = "none")]
+    { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
+    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
+    let (l1_addr, l1_frame) = get_or_create_table_atomic(l0_ptr, l0_idx);
+    if let Some(frame) = l1_frame { allocated_tables.push(frame); }
+    let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
+    let (l2_addr, l2_frame) = get_or_create_table_atomic(l1_ptr, l1_idx);
+    if let Some(frame) = l2_frame { allocated_tables.push(frame); }
+    let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
+    let (l3_addr, l3_frame) = get_or_create_table_atomic(l2_ptr, l2_idx);
+    if let Some(frame) = l3_frame { allocated_tables.push(frame); }
+    let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
+    let pte_atomic = &*((l3_ptr.add(l3_idx)) as *const core::sync::atomic::AtomicU64);
+    let existing = pte_atomic.load(core::sync::atomic::Ordering::Acquire);
+    if existing & flags::VALID != 0 {
+        let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
+        if existing_pa != pa {
+            log::debug!("[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}",
+                va, existing_pa, pa);
+        }
+        return (allocated_tables, false);
+    }
+    let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
+    let cas_result = pte_atomic.compare_exchange(existing, entry,
+        core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
+    if cas_result.is_ok() {
+        // No TLB flush here — caller must call flush_tlb_range after mapping all pages.
+        (allocated_tables, true)
+    } else {
+        (allocated_tables, false)
+    }
+}}
+
+/// Flush TLB entries for a contiguous range of virtual addresses.
+///
+/// Issues `tlbi vale1is` for each page in [start_va, start_va + pages*4096),
+/// then a single `dsb ish` + `isb` barrier pair.  Use after a batch of
+/// `map_user_page_no_flush` calls to avoid N×(dsb+isb) overhead.
+#[inline]
+pub fn flush_tlb_range(start_va: usize, pages: usize) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        // Store-barrier before invalidations so PTEs are visible to other CPUs.
+        core::arch::asm!("dsb ishst");
+        let mut va = start_va;
+        for _ in 0..pages {
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va >> 12);
+            va += 0x1000;
+        }
+        // Completion barrier: wait for all invalidations, then pipeline sync.
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (start_va, pages);
+}
 
 /// Atomically get or create a page table at `table_ptr[idx]`.
 ///

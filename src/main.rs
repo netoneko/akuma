@@ -617,6 +617,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
                             // Run shell tests (pipelines with /bin binaries)
                             shell_tests::run_all_tests();
+
+                            // Run memory benchmarks (always prints, never fails)
+                            tests::run_benchmarks();
                         }
                     }
                     Err(e) => {

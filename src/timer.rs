@@ -55,6 +55,11 @@ pub fn timer_irq_handler(_irq: u32) {
 
     unsafe {
         asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
+        // Defensively re-enable the timer on every tick: bit 0 = enable, bit 1 = !mask.
+        // If cntp_ctl_el0 ever gets corrupted (enable cleared or mask set), no further
+        // IRQs would fire, causing a permanent freeze. Writing 1 here ensures the timer
+        // keeps ticking even if something corrupted the control register.
+        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
     }
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long

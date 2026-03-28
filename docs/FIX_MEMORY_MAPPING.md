@@ -1,0 +1,186 @@
+# Fix Memory Mapping: Correctness, Performance, and Missing Flags
+
+## Background
+
+Kernel freezes kept recurring during `go build` despite 15+ fixes since 2026-03-21. Root-cause
+analysis of `docs/GOLANG_IPC.md` identified three classes of remaining problems:
+
+1. **Correctness bugs** — OOM in fault handlers, timer loss, fault_mutex leaks causing permanent deadlock
+2. **Performance bottlenecks** — per-page TLB flushes, no batch allocation in IA handler, eager full fork copy
+3. **Missing syscall flags** — CLONE_SETTLS, CLONE_CHILD_CLEARTID, MAP_POPULATE silently ignored
+
+See also `proposals/FASTER_MEMORY_MAPPING.md` for the original CoW/huge-page/background-zeroing proposal.
+
+---
+
+## Phase 1: Correctness Fixes
+
+### 1A: OOM fallback in demand-paging readahead ✅
+
+**Problem:** In both the Data Abort (`EC_DATA_ABORT_LOWER`) and Instruction Abort
+(`EC_INST_ABORT_LOWER`) file-backed readahead paths, if `frame_pool` runs out before the
+*faulting* page itself (`page_va`) is mapped, `any_mapped` stays false and the handler falls
+through to SIGSEGV delivery. The fault re-triggers immediately → infinite loop → kernel freeze.
+
+**Fix:** After the readahead loop, if `!any_mapped`, attempt a single `alloc_page_zeroed()` for
+just `page_va` before falling through to SIGSEGV.
+
+**Files changed:** `src/exceptions.rs`
+- DA file-backed path: after the `if any_mapped { return }` block
+- IA file-backed path: same fallback
+
+### 1B: fault_mutex RAII guard ✅
+
+**Problem:** Instruction abort handler inserts `page_va` into `fault_mutex` BTreeSet at line ~2161
+and removes it at line ~2178 (before the actual mapping work). Any early return or panic between
+those two points leaks the entry permanently, deadlocking that page address forever.
+
+**Fix:** Use a struct `FaultGuard` that removes the entry in `Drop`, ensuring cleanup on all paths.
+
+**Files changed:** `src/exceptions.rs`
+
+### 1C: Timer re-arm hardening ✅
+
+**Problem:** Per `GOLANG_IPC.md` "Kernel Freeze at T222s" and "Kernel Freeze During Go Build":
+the `[TMR]` heartbeat stops ~26 seconds before the visible hang. If `cntp_ctl_el0` ever gets
+corrupted (enable=0 or mask=1), no further timer IRQs fire, no preemption, system dies.
+
+**Fix:** At the end of `timer_irq_handler`, write `cntp_ctl_el0 = 1` to keep enable=1, mask=0,
+even if something corrupted it.
+
+**Files changed:** `src/interrupts.rs` or `src/timer.rs` (wherever `timer_irq_handler` lives)
+
+---
+
+## Phase 2: Batch TLB Invalidation ✅
+
+**Problem:** `map_user_page` does `dsb ishst + tlbi vale1is + dsb ish + isb` per page. For
+256-page readahead that is 256 full barrier sequences. `dsb ish` stalls the entire pipeline on
+AArch64.
+
+**Fix:**
+- Add `map_user_page_no_flush(va, pa, flags)` — skips TLB invalidation
+- Add `flush_tlb_range(asid, start_va, pages)` — loops `tlbi vale1is` then single `dsb ish + isb`
+- Update DA readahead, IA readahead, `sys_mmap` eager loop, and `sys_mprotect` to use
+  `map_user_page_no_flush` inside loops + `flush_tlb_range` after
+
+**Files changed:**
+- `crates/akuma-exec/src/mmu/mod.rs` — new functions
+- `src/exceptions.rs` — DA and IA readahead loops
+- `src/syscall/mem.rs` — `sys_mmap` eager path, `sys_mprotect`
+
+**Expected impact:** ~100x fewer pipeline-stalling barriers for large mappings.
+
+---
+
+## Phase 3+4: Batch Allocations ✅
+
+**Phase 3 — IA handler batch alloc:**
+Port the DA handler's `alloc_pages_zeroed(needed)` pattern to the Instruction Abort handler.
+Previously IA allocated one page at a time (acquiring PMM spinlock 256 times for readahead).
+
+**Phase 4 — eager mmap batch alloc:**
+Replace `sys_mmap`'s per-page `alloc_page_zeroed()` loop with a single `alloc_pages_zeroed(pages)`
+call, falling back to per-page only if the batch fails.
+
+**Files changed:** `src/exceptions.rs` (IA handler), `src/syscall/mem.rs` (sys_mmap)
+
+---
+
+## Phase 5: Fork/Clone Benchmark ✅
+
+Added kernel benchmarks to `src/tests.rs`:
+
+- **`bench_fork_clone`** — creates a process with 1 MB brk + 10 mmap regions of 256 pages,
+  measures `fork_process` wall time via `uptime_us()`, reports MB/s throughput
+- **`bench_mmap_eager`** — times eager `sys_mmap` for 256 pages
+- **`bench_demand_page`** — times single-page demand-paging fault handling
+
+Run with the kernel test harness. Use before/after to quantify improvement from Phase 2+3+4.
+
+**Files changed:** `src/tests.rs`
+
+---
+
+## Phase 6: Missing Syscall Flags ✅
+
+### CLONE flags — already implemented
+
+Investigation showed all key CLONE flags were already handled:
+
+- **CLONE_SETTLS (0x80000):** `clone_thread` sets `child_ctx.tpidr = tls` — already correct.
+- **CLONE_PARENT_SETTID (0x100000):** `clone_thread` writes child PID to `parent_tid_ptr` — already correct.
+- **CLONE_CHILD_SETTID (0x1000000):** `clone_thread` writes child PID to `child_tid_ptr` — already correct.
+- **CLONE_CHILD_CLEARTID (0x200000):** `clone_thread` stores pointer in `proc.clear_child_tid`;
+  `return_to_kernel` writes 0 and calls `futex_wake` — already correct.
+- `sys_set_tid_address` updates `proc.clear_child_tid` — already correct.
+- `replace_image` (execve) resets `clear_child_tid = 0` — already correct.
+
+### MAP_POPULATE (0x8000) — added
+
+When set, `sys_mmap` skips the lazy-region path even for large allocations (`pages > 256`).
+If the batch PMM allocation fails, gracefully falls back to lazy rather than returning ENOMEM.
+
+### MADV_WILLNEED (advice=3) — added
+
+`sys_madvise` now pre-faults pages in `[addr, addr+len)` that are in lazy regions but not yet
+mapped. Uses batch allocation (`alloc_pages_zeroed`) + `map_user_page_no_flush` per page +
+single `flush_tlb_range` after. OOM is silently ignored (advisory syscall).
+
+### MAP_SHARED warning — added
+
+`sys_mmap` logs a warning when `MAP_SHARED` is used on file-backed mappings (unsupported; treated
+as `MAP_PRIVATE`). `MAP_SHARED | MAP_ANONYMOUS` is safe — equivalent to `MAP_PRIVATE`.
+
+### MAP_STACK (0x20000) — noted
+
+Hint-only on Linux; safe to ignore. Added as a comment in the constant definitions.
+
+**Files changed:** `src/syscall/mem.rs`
+
+---
+
+## Phase 7: Lazy Region O(log n) Lookup ✅
+
+**Problem:** `lazy_region_lookup_for_pid` does BTreeMap lookup by PID, then linear scan of
+`Vec<LazyRegion>`. Go processes create 100+ lazy regions (one per heap arena), making each page
+fault O(n) in region count.
+
+**Fix:** Change per-PID storage from `Vec<LazyRegion>` to `BTreeMap<usize /*start_va*/, LazyRegion>`.
+Use `range(..=va).next_back()` for O(log n) lookup: find the region with the largest `start_va ≤ va`,
+then verify `va < start_va + size`.
+
+**Files changed:**
+- `crates/akuma-exec/src/process/children.rs` — all LAZY_REGION_TABLE functions
+- `crates/akuma-exec/src/process/table.rs` — type definition update
+
+---
+
+## Phase 8: Copy-on-Write Fork (future)
+
+**Not yet implemented.** Highest impact (eliminates the multi-second fork copy for Go's 50+ MB
+heap) but most complex. Requires:
+1. PMM frame reference counting
+2. CoW page table duplication in `fork_process`
+3. Write permission fault handler in DA path
+4. Feature gate behind `config::COW_FORK_ENABLED`
+
+Deferred until Phases 1–7 have stabilized the system under `go build`.
+
+---
+
+## Verification
+
+After each phase:
+```
+cargo check
+cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+```
+
+Boot QEMU and run:
+```
+go version                                          # smoke test
+CGO_ENABLED=0 go build -x -v -o ./hello_go .       # stress test
+```
+
+Check serial log: `[TMR]` heartbeat must never stop; no demand-paging SIGSEGV.

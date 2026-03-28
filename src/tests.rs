@@ -423,6 +423,7 @@ pub fn run_all() -> bool {
     let mut all_pass = true;
     all_pass &= run_memory_tests();
     all_pass &= run_threading_tests();
+    run_benchmarks(); // always passes, just prints numbers
     all_pass
 }
 
@@ -3094,7 +3095,7 @@ fn test_lazy_region_push_lookup() -> bool {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&TEST_PID) {
             let mid = start + size / 2;
-            regions.iter().any(|r| mid >= r.start_va && mid < r.start_va + r.size)
+            regions.values().any(|r| mid >= r.start_va && mid < r.start_va + r.size)
         } else {
             false
         }
@@ -3105,7 +3106,7 @@ fn test_lazy_region_push_lookup() -> bool {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&TEST_PID) {
             let outside_va = start + size + 0x1000;
-            regions.iter().any(|r| outside_va >= r.start_va && outside_va < r.start_va + r.size)
+            regions.values().any(|r| outside_va >= r.start_va && outside_va < r.start_va + r.size)
         } else {
             false
         }
@@ -3155,7 +3156,10 @@ fn test_lazy_region_munmap_prefix() -> bool {
     let (start, size) = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         match table.get(&TEST_PID) {
-            Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
+            Some(regions) if regions.len() == 1 => {
+                let r = regions.values().next().unwrap();
+                (r.start_va, r.size)
+            }
             _ => (0, 0),
         }
     });
@@ -3182,7 +3186,10 @@ fn test_lazy_region_munmap_suffix() -> bool {
     let (start, size) = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         match table.get(&TEST_PID) {
-            Some(regions) if regions.len() == 1 => (regions[0].start_va, regions[0].size),
+            Some(regions) if regions.len() == 1 => {
+                let r = regions.values().next().unwrap();
+                (r.start_va, r.size)
+            }
             _ => (0, 0),
         }
     });
@@ -3209,7 +3216,7 @@ fn test_lazy_region_munmap_middle() -> bool {
     let regions = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&TEST_PID).map_or(Vec::new(), |r| {
-            r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
+            r.values().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
         })
     });
 
@@ -3241,7 +3248,7 @@ fn test_lazy_region_munmap_multi() -> bool {
     let remaining = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&TEST_PID).map_or(Vec::new(), |r| {
-            r.iter().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
+            r.values().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
         })
     });
 
@@ -4847,7 +4854,7 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     let region_exists = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
         table.get(&test_pid).map_or(false, |r| {
-            r.iter().any(|lr| lr.start_va == base_va && lr.size == region_size)
+            r.values().any(|lr| lr.start_va == base_va && lr.size == region_size)
         })
     });
 
@@ -8016,4 +8023,126 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
 
     console::print("  PASS\n");
     true
+}
+
+// =============================================================================
+// Benchmarks (not correctness tests — they always return true)
+// =============================================================================
+
+/// Run kernel memory benchmarks.  Prints throughput numbers to serial.
+/// Safe to call after scheduler init.  Always returns true.
+pub fn run_benchmarks() -> bool {
+    console::print("\n========== Memory Benchmarks ==========\n");
+    bench_mmap_eager();
+    bench_demand_page();
+    bench_fork_clone();
+    console::print("========================================\n\n");
+    true
+}
+
+/// Benchmark: eager mmap alloc cost — allocate 256 pages as a batch vs single,
+/// then free them.  Measures PMM throughput before/after batch optimisation.
+fn bench_mmap_eager() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const PAGES: usize = 256;
+    console::print("[BENCH] mmap_eager_alloc: ");
+
+    // Warm up PMM
+    if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); }
+
+    let t0 = uptime_us();
+    let frames = match pmm::alloc_pages_zeroed(PAGES) {
+        Some(f) => f,
+        None => {
+            console::print("SKIP (OOM)\n");
+            return;
+        }
+    };
+    let t_alloc = uptime_us();
+
+    for frame in frames { pmm::free_page(frame); }
+
+    let t_end = uptime_us();
+    let alloc_us = t_alloc.saturating_sub(t0);
+    let free_us  = t_end.saturating_sub(t_alloc);
+    let total_us = t_end.saturating_sub(t0);
+    let kb = (PAGES * 4) as u64;
+    let throughput = if alloc_us > 0 { kb * 1_000_000 / alloc_us } else { 0 };
+
+    crate::safe_print!(128,
+        "{} pages ({}KB): alloc={}µs free={}µs total={}µs alloc_throughput={}KB/s\n",
+        PAGES, kb, alloc_us, free_us, total_us, throughput);
+}
+
+/// Benchmark: single-page alloc+free round-trip latency (PMM hot path).
+fn bench_demand_page() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const ITERATIONS: u64 = 256;
+    console::print("[BENCH] demand_page_alloc: ");
+
+    // Warm up
+    if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); }
+
+    let t0 = uptime_us();
+    let mut done = 0u64;
+    for i in 0..ITERATIONS {
+        match pmm::alloc_page_zeroed() {
+            Some(f) => { pmm::free_page(f); done += 1; }
+            None    => { crate::safe_print!(32, "OOM at {}\n", i); break; }
+        }
+    }
+    let elapsed_us = uptime_us().saturating_sub(t0);
+    let per_page_ns = if done > 0 { elapsed_us * 1000 / done } else { 0 };
+
+    crate::safe_print!(128,
+        "{} iters in {}µs = {}ns/page\n",
+        done, elapsed_us, per_page_ns);
+}
+
+/// Benchmark: fork page-copy throughput (alloc + 4KB memcpy per page).
+/// This is the dominant cost in fork_process before Copy-on-Write.
+/// Use the numbers here to measure improvement after CoW is implemented.
+fn bench_fork_clone() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const PAGES: usize = 512; // 2 MB
+    console::print("[BENCH] fork_copy (alloc+memcpy): ");
+
+    let src_frames = match pmm::alloc_pages_zeroed(PAGES) {
+        Some(f) => f,
+        None => { console::print("SKIP (OOM for src 2MB)\n"); return; }
+    };
+
+    let t0 = uptime_us();
+    let mut copied = 0usize;
+    let mut dst_frames: alloc::vec::Vec<akuma_exec::PhysFrame> = alloc::vec::Vec::new();
+
+    for src_frame in &src_frames {
+        match pmm::alloc_page_zeroed() {
+            Some(dst_frame) => {
+                let src = akuma_exec::mmu::phys_to_virt(src_frame.addr) as *const u8;
+                let dst = akuma_exec::mmu::phys_to_virt(dst_frame.addr) as *mut u8;
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, 4096); }
+                dst_frames.push(dst_frame);
+                copied += 1;
+            }
+            None => break,
+        }
+    }
+
+    let elapsed_us = uptime_us().saturating_sub(t0);
+    for f in src_frames { pmm::free_page(f); }
+    for f in dst_frames { pmm::free_page(f); }
+
+    let total_kb = (copied * 4) as u64;
+    let mb_s = if elapsed_us > 0 { total_kb * 1_000_000 / elapsed_us / 1024 } else { 0 };
+
+    crate::safe_print!(128,
+        "{} pages ({}KB) copied in {}µs = {}MB/s\n",
+        copied, total_kb, elapsed_us, mb_s);
 }
