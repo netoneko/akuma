@@ -190,7 +190,7 @@ pub fn alloc_mmap(size: usize) -> usize {
         Some(addr) => addr,
         None => {
             log::debug!("[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}",
-                proc.pid, size, proc.memory.next_mmap, proc.memory.mmap_limit);
+                proc.pid, size, proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed), proc.memory.mmap_limit);
             0
         }
     }

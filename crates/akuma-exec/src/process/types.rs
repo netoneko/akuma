@@ -9,6 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 /// Default environment variables for new processes when none are provided.
@@ -285,15 +286,32 @@ impl SignalAction {
 }
 
 /// Memory regions for a process
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProcessMemory {
     pub code_end: usize,
     pub brk: usize,
     pub stack_bottom: usize,
     pub stack_top: usize,
-    pub next_mmap: usize,
+    /// Next available mmap VA. AtomicUsize so CLONE_VM goroutine threads
+    /// (which share the parent Process via lookup_process) can race-free
+    /// advance it using CAS without disabling IRQs.
+    pub next_mmap: AtomicUsize,
     pub mmap_limit: usize,
     pub free_regions: Vec<(usize, usize)>,
+}
+
+impl Clone for ProcessMemory {
+    fn clone(&self) -> Self {
+        Self {
+            code_end: self.code_end,
+            brk: self.brk,
+            stack_bottom: self.stack_bottom,
+            stack_top: self.stack_top,
+            next_mmap: AtomicUsize::new(self.next_mmap.load(Ordering::Relaxed)),
+            mmap_limit: self.mmap_limit,
+            free_regions: self.free_regions.clone(),
+        }
+    }
 }
 
 impl ProcessMemory {
@@ -307,7 +325,7 @@ impl ProcessMemory {
             brk: code_end,
             stack_bottom,
             stack_top,
-            next_mmap: mmap_start,
+            next_mmap: AtomicUsize::new(mmap_start),
             mmap_limit,
             free_regions: Vec::new(),
         }
@@ -339,22 +357,35 @@ impl ProcessMemory {
             }
         }
 
-        let mut candidate = self.next_mmap;
+        // CAS loop: race-free advance of next_mmap vs CLONE_VM sibling goroutine threads.
+        // All goroutine threads share the parent Process via lookup_process(owner_pid),
+        // so next_mmap is genuinely shared. CAS prevents two goroutines from receiving
+        // the same VA (goroutine stack aliasing → WILD-IA crash).
+        loop {
+            let cur = self.next_mmap.load(Ordering::Relaxed);
+            let mut candidate = cur;
 
-        // Skip over the kernel reserved range if the allocation would overlap it
-        if candidate < Self::KERNEL_VA_END && candidate + size > Self::KERNEL_VA_START {
-            candidate = Self::KERNEL_VA_END;
-        }
+            // Skip over the kernel reserved range if the allocation would overlap it
+            if candidate < Self::KERNEL_VA_END && candidate + size > Self::KERNEL_VA_START {
+                candidate = Self::KERNEL_VA_END;
+            }
 
-        if self.overlaps_stack(candidate, size) {
-            return None;
-        }
-        if candidate + size > self.mmap_limit {
-            return None;
-        }
+            if self.overlaps_stack(candidate, size) {
+                return None;
+            }
+            if candidate + size > self.mmap_limit {
+                return None;
+            }
 
-        self.next_mmap = candidate + size;
-        Some(candidate)
+            if self.next_mmap
+                .compare_exchange(cur, candidate + size, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(candidate);
+            }
+            // CAS failed: a CLONE_VM sibling updated next_mmap concurrently.
+            // Reload and retry — they got a different address, so will we.
+        }
     }
 
     pub fn free_mmap(&mut self, start: usize, size: usize) {
@@ -496,7 +527,7 @@ mod tests {
         // Regression: allocation starting one page before KERNEL_VA_START with size > 1 page
         // would straddle the boundary and land inside the kernel VA hole.
         let mut mem = ProcessMemory::new(0x1000_0000, 0xD000_0000, 0xD010_0000, 0);
-        mem.next_mmap = ProcessMemory::KERNEL_VA_START - 0x1000;
+        mem.next_mmap.store(ProcessMemory::KERNEL_VA_START - 0x1000, Ordering::Relaxed);
         let addr = mem.alloc_mmap(2 * 0x1000).unwrap();
         assert!(
             addr >= ProcessMemory::KERNEL_VA_END,
@@ -512,6 +543,37 @@ mod tests {
         mem.free_mmap(a1, 0x1000);
         let a2 = mem.alloc_mmap(0x1000).unwrap();
         assert_eq!(a2, a1);
+    }
+
+    #[test]
+    fn process_memory_alloc_no_duplicate_addresses() {
+        // Two sequential alloc_mmap calls must return different addresses.
+        // Regression: a race between CLONE_VM goroutine threads reading
+        // next_mmap before either write could return the same VA to both.
+        let mut mem = ProcessMemory::new(0x10000, 0x3000_0000, 0x3010_0000, 0);
+        let a1 = mem.alloc_mmap(0x1000).unwrap();
+        let a2 = mem.alloc_mmap(0x1000).unwrap();
+        assert_ne!(a1, a2, "alloc_mmap returned same address twice: {:#x}", a1);
+    }
+
+    #[test]
+    fn process_memory_lazy_munmap_no_recycle() {
+        // Verifies that NOT calling free_mmap after a lazy munmap causes the
+        // next alloc to advance past the freed range (no recycling loop).
+        // Contrast with eager munmap where free_mmap IS called and reuse occurs.
+        let mut mem = ProcessMemory::new(0x10000, 0x3000_0000, 0x3010_0000, 0);
+
+        // Eager munmap pattern: free_mmap called → address reused.
+        let a1 = mem.alloc_mmap(0x1000).unwrap();
+        mem.free_mmap(a1, 0x1000);
+        let a2 = mem.alloc_mmap(0x1000).unwrap();
+        assert_eq!(a2, a1, "eager freed region should be reused");
+
+        // Lazy munmap pattern: free_mmap NOT called → next alloc advances.
+        let b1 = mem.alloc_mmap(0x1000).unwrap();
+        // (simulate lazy munmap: skip free_mmap)
+        let b2 = mem.alloc_mmap(0x1000).unwrap();
+        assert_ne!(b2, b1, "lazy VA range must not be recycled without free_mmap");
     }
 
     fn noop_waker() -> Waker {

@@ -18,7 +18,7 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
 
     let (_, _, free) = (runtime().pmm_stats)();
     let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
-    let va_cap = memory.next_mmap.saturating_sub(brk);
+    let va_cap = memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(brk);
 
     core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
 }

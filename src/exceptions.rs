@@ -1558,7 +1558,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
             0 // SP outside expected range (might be corrupted)
         };
         let heap_used = proc.brk.saturating_sub(proc.initial_brk);
-        let mmap_used = mem.next_mmap.saturating_sub(0x1000_0000);
+        let mmap_used = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(0x1000_0000);
         
         // Print in smaller chunks to fit in static buffer
         let _ = write!(w, "  Process PID={} '{}'\n", proc.pid, proc.name);
@@ -1582,7 +1582,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         w.flush();
         
         let _ = write!(w, "    Mmap: next={:#x}, limit={:#x}, used={} bytes\n",
-            mem.next_mmap, mem.mmap_limit, mmap_used
+            mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit, mmap_used
         );
         w.flush();
         

@@ -59,7 +59,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             Some(a) => a,
             None => {
                 crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
-                    proc.pid, pages * 4096, proc.memory.next_mmap, proc.memory.mmap_limit);
+                    proc.pid, pages * 4096,
+                    proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
+                    proc.memory.mmap_limit);
                 return !0u64;
             }
         }
@@ -376,12 +378,22 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let results = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
+            let mut had_physical = false;
             for i in 0..freed_pages {
                 if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
                     crate::pmm::free_page(frame);
+                    had_physical = true;
                 }
             }
-            proc.memory.free_regions.push((freed_start, freed_pages * 4096));
+            // Only recycle the VA range when physical pages were actually freed.
+            // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
+            // back in free_regions: alloc_mmap prefers free_regions over
+            // next_mmap, which causes an infinite mmap→reject→munmap→same-addr
+            // loop (observed with Go's heap prober returning 0x100000000 60+
+            // times in succession).
+            if had_physical {
+                proc.memory.free_regions.push((freed_start, freed_pages * 4096));
+            }
         }
         return 0;
     }

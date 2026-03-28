@@ -229,7 +229,7 @@ impl Process {
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
-            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
+            pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
 
         // Register demand-paged regions for heap and stack growth.
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
@@ -329,7 +329,7 @@ impl Process {
         let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
 
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
-            pid, brk, stack_bottom, stack_top, memory.next_mmap, memory.mmap_limit);
+            pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
         push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
@@ -1460,7 +1460,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     new_proc.mmap_regions = child_mmap_regions;
     new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
-    new_proc.memory.next_mmap = parent.memory.next_mmap;
+    new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
     // #region agent log
     FORK_IN_PROGRESS.store(false, Ordering::Release);
     (runtime().print_str)("[FORK-DBG] step4: mmap done\n");

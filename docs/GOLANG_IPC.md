@@ -1749,3 +1749,70 @@ Pipes were immune because `KernelPipe` has `write_count`/`read_count` and
 
 Log after fix: `[eventfd] close id=N ref_count=1` when child exec's (decrement without
 destroy); `[eventfd] close id=N ref_count=0` only when parent also closes.
+
+## mmap VA Recycling + alloc_mmap Race (FIXED 2026-03-27)
+
+### Crash
+
+```
+[WILD-IA] pid=303 FAR=0x458a000001ef8 ELR=0x458a000001ef8
+[signal] deliver sig=11 slot=15 handler=0x1009ee90 fault_pc=0x458a000001ef8
+[WILD-DA] pid=303 FAR=0x458a000001ee8 ELR=0x10074218
+```
+
+`0x458a000001ef8` is a 52-bit address — outside the 48-bit user VA space. This is a
+corrupted function pointer or return address. Process: `compile` (the Go compiler subprocess).
+
+### Root Cause A — free_regions recycling causes infinite mmap-munmap loop
+
+Go's `mallocinit` probes for heap arena addresses by calling `mmap(PROT_NONE)`.
+If the returned address doesn't fit its constraints, Go calls `munmap` and retries.
+
+`sys_munmap` was adding freed lazy regions to `ProcessMemory.free_regions`
+unconditionally. Because `alloc_mmap` scans `free_regions` *before* advancing
+`next_mmap`, every subsequent mmap call returned the exact same address
+(`0x100000000` in the log, 60+ times in a tight loop):
+
+```
+[mmap] pid=303 len=0x4000000 prot=0x0 flags=0x22 = 0x100000000 (lazy, 17 regions)
+[mmap] pid=303 len=0x4000000 prot=0x0 flags=0x22 = 0x100000000 (lazy, 17 regions)
+... (dozens more)
+```
+
+For PROT_NONE lazy regions no physical pages are ever allocated, so there is nothing
+meaningful to recycle. Adding them back to `free_regions` only creates the loop.
+
+### Root Cause B — alloc_mmap is not IRQ-safe for CLONE_VM goroutine threads
+
+`ProcessMemory::alloc_mmap` reads and writes `next_mmap` without holding a lock.
+`lookup_process` returns `&'static mut Process`; with CLONE_VM threads, multiple kernel
+threads hold aliased `&mut Process` references to the same process.
+
+A timer preemption between the `candidate = self.next_mmap` read and the
+`self.next_mmap = candidate + size` write causes two goroutine threads to both receive
+the same VA. If one goroutine uses the VA as its goroutine stack and the other uses it
+as heap data, memory is aliased and the stack's return address can be overwritten with
+a heap value → corrupted PC → WILD-IA at `0x458a000001ef8`.
+
+### Fix
+
+1. **`src/syscall/mem.rs` — `sys_munmap`**: only push freed VA to `free_regions` when
+   at least one physical page was freed (`had_physical` flag). Pure PROT_NONE lazy
+   regions (never demand-paged) are not recycled.
+
+2. **`crates/akuma-exec/src/process/types.rs` — `ProcessMemory::next_mmap`**: changed
+   from `usize` to `AtomicUsize`. `alloc_mmap` uses a CAS loop
+   (`compare_exchange(cur, candidate + size, SeqCst, Relaxed)`) to atomically advance
+   `next_mmap`. On AArch64 this compiles to `ldaxr/stlxr` exclusive-access instructions
+   which are inherently race-free without disabling preemption.
+
+   **Regression note**: an earlier attempt used `with_irqs_disabled(...)` around
+   `alloc_mmap` in `sys_mmap`. This caused a permanent kernel hang during the second
+   `go build` fork (process stuck at `[FORK-DBG] mmap region 11/22`). The hang was
+   caused by holding IRQs disabled across `alloc_page_zeroed` (which itself acquires the
+   PMM spinlock inside `with_irqs_disabled`). The AtomicUsize CAS approach avoids any
+   IRQ-disable window and does not block preemption.
+
+Files changed: `src/syscall/mem.rs`, `src/tests.rs`, `src/exceptions.rs`,
+`crates/akuma-exec/src/process/types.rs`, `crates/akuma-exec/src/process/mod.rs`,
+`crates/akuma-exec/src/process/children.rs`, `crates/akuma-exec/src/process/image.rs`

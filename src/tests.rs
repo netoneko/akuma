@@ -249,6 +249,9 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_pipe_write_with_readers_succeeds, "pipe_write_with_readers_succeeds");
     run_test!(test_pipe_cloexec_cleanup_preserves_live_writer, "pipe_cloexec_preserves_writer");
 
+    // Regression: Go heap prober mmap-munmap loop + alloc_mmap race (go build WILD-IA crash)
+    run_test!(test_mmap_lazy_munmap_no_recycle, "mmap_lazy_munmap_no_recycle");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -3014,7 +3017,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
             Some(a) => addrs.push((a, sz)),
             None => {
                 crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
-                    sz, mem.next_mmap, mem.mmap_limit);
+                    sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
                 return false;
             }
         }
@@ -3050,13 +3053,13 @@ fn test_alloc_mmap_free_region_recycling() -> bool {
 
     let a1 = mem.alloc_mmap(0x4000).unwrap();
     let _a2 = mem.alloc_mmap(0x4000).unwrap();
-    let bump_after = mem.next_mmap;
+    let bump_after = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
 
     mem.free_regions.push((a1, 0x4000));
 
     // Should reuse the freed region, not bump
     let a3 = mem.alloc_mmap(0x2000).unwrap();
-    let ok1 = a3 == a1 && mem.next_mmap == bump_after;
+    let ok1 = a3 == a1 && mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed) == bump_after;
 
     // Remaining 0x2000 should also come from the split free region
     let a4 = mem.alloc_mmap(0x2000).unwrap();
@@ -3064,7 +3067,7 @@ fn test_alloc_mmap_free_region_recycling() -> bool {
 
     // After free_regions exhausted, bump should advance
     let a5 = mem.alloc_mmap(0x1000).unwrap();
-    let ok3 = a5 == bump_after;
+    let ok3 = a5 == bump_after; // bump_after is already a usize
 
     let pass = ok1 && ok2 && ok3;
     if !pass {
@@ -6135,8 +6138,8 @@ fn test_large_mmap_limit() -> bool {
     
     let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
     
-    crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n", 
-        mem.next_mmap, mem.mmap_limit);
+    crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n",
+        mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
     
     // Bun allocates a 1GB arena + 64GB Gigacage (not 128GB contiguous)
     let arena_size = 1usize * 1024 * 1024 * 1024;
@@ -6484,7 +6487,7 @@ fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
     let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
 
     // Manually bump next_mmap to just before kernel hole
-    mem.next_mmap = KERNEL_VA_START - 4096; // one page before hole
+    mem.next_mmap.store(KERNEL_VA_START - 4096, core::sync::atomic::Ordering::Relaxed); // one page before hole
 
     // A 2-page alloc would straddle [KERNEL_VA_START-4096, KERNEL_VA_START+4096)
     // which enters the hole. The allocator must jump past KERNEL_VA_END.
@@ -7947,6 +7950,67 @@ fn test_siginfo_fields_set() -> bool {
     const SI_ADDR_OFFSET: usize = 16;
     if SI_SIGNO_OFFSET != 0 || SI_CODE_OFFSET != 8 || SI_ADDR_OFFSET != 16 {
         console::print("  FAIL: siginfo_t offset constants wrong\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Regression test: Go heap prober infinite mmap-munmap loop.
+///
+/// Go's `mallocinit` calls mmap(PROT_NONE) to probe for arena addresses.
+/// If the returned address doesn't suit it, Go calls munmap and retries.
+/// The bug: sys_munmap was adding pure-lazy (PROT_NONE, never demand-paged)
+/// regions back to free_regions. Since alloc_mmap scans free_regions FIRST,
+/// the exact same address was returned on every subsequent mmap call — a loop
+/// of 60+ identical addresses observed in the go-build crash log.
+///
+/// Fix (src/syscall/mem.rs): only push to free_regions when `had_physical`.
+/// This test exercises the ProcessMemory layer to confirm that NOT calling
+/// free_mmap after a lazy munmap causes the next alloc to advance past the
+/// freed range, never returning the same address twice in succession.
+fn test_mmap_lazy_munmap_no_recycle() -> bool {
+    console::print("\n[TEST] mmap lazy munmap does not recycle VA (Go heap prober fix)\n");
+
+    // Stack-top chosen to give plenty of mmap space without needing huge VA.
+    let mut mem = akuma_exec::process::ProcessMemory::new(
+        0x10000, 0x3000_0000, 0x3010_0000, 0,
+    );
+
+    // Step 1: alloc → simulated lazy munmap (no free_mmap called)
+    let a1 = match mem.alloc_mmap(0x4000) {
+        Some(a) => a,
+        None => { console::print("  SKIP: alloc_mmap failed\n"); return true; }
+    };
+    // Do NOT call mem.free_mmap(a1, ...) — this is the lazy-munmap path.
+
+    // Step 2: next alloc must be a DIFFERENT address.
+    let a2 = match mem.alloc_mmap(0x4000) {
+        Some(a) => a,
+        None => { console::print("  SKIP: second alloc_mmap failed\n"); return true; }
+    };
+
+    if a1 == a2 {
+        crate::safe_print!(128,
+            "  FAIL: alloc_mmap returned same addr=0x{:x} twice after lazy munmap\n", a1);
+        return false;
+    }
+
+    // Step 3: eager munmap (free_mmap called) → the address IS reused.
+    let b1 = match mem.alloc_mmap(0x4000) {
+        Some(a) => a,
+        None => { console::print("  SKIP: third alloc_mmap failed\n"); return true; }
+    };
+    mem.free_mmap(b1, 0x4000); // eager path: physical pages freed → recycle VA
+    let b2 = match mem.alloc_mmap(0x4000) {
+        Some(a) => a,
+        None => { console::print("  SKIP: fourth alloc_mmap failed\n"); return true; }
+    };
+
+    if b1 != b2 {
+        crate::safe_print!(128,
+            "  FAIL: eager freed region should be reused, got 0x{:x} != 0x{:x}\n", b2, b1);
         return false;
     }
 
