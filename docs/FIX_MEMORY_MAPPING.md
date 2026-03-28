@@ -376,6 +376,49 @@ dereferences a zero return value.
 
 ---
 
+## Phase 13: CoW EL1 Signal Delivery Crash
+
+**Problem:** After CoW fork, the Go runtime sends `SIGURG` (GC preemption signal) to a thread.
+The kernel signal delivery code writes the signal frame to the thread's altstack from EL1
+(kernel mode). The altstack page was demoted to RO during CoW fork. The EL1 store triggers
+an EC=0x25 (data abort from current EL) instead of an EL0 data abort, bypassing the normal
+CoW fault handler, and the EL1 handler kills the process.
+
+**Crash signature:**
+```
+[signal] frame: stack_top=0x20000c000 new_sp=0x20000bba0 on_altstack=true
+[FORK-DBG] EL1 SYNC EXCEPTION!
+[Exception] Sync from EL1: EC=0x25, ISS=0x4f
+  ELR=0x40432d68, FAR=0x20000bbac
+  EC=0x25 in kernel code — killing current process (EFAULT)
+```
+
+ISS=0x4F decodes as: DFSC=0x0F (permission fault L3), bit 6=1 (write). FAR=0x20000bbac is
+inside the altstack page (new_sp=0x20000bba0).
+
+**Fix (`src/exceptions.rs`):** Added `try_resolve_el1_cow_fault()` called at the very top of
+`rust_sync_el1_handler`, before the debug print and before the "kill process" path:
+
+1. Check: `EC=0x25 && DFSC=0x0F && ISS_bit6=1 (WnR = write) && ELR in kernel text range`
+2. Walk TTBR0 page table (`translate_user_va`) → get old PA. Returns `None` for non-user addresses,
+   so no explicit FAR range check is needed (user VA space is 0..512 GB on this AArch64 kernel).
+3. If `cow_ref_get(old_pa) > 0`: allocate new frame, copy, `map_page` → new PA as RW_NO_EXEC,
+   flush TLB, track new frame, remove old frame from user_frames, `cow_ref_dec(old_pa)`
+4. Return `true` → caller returns immediately. ERET retries the faulting instruction on the
+   now-writable page.
+
+The check runs before the debug dump, so resolved CoW faults produce no log noise.
+
+**Note on FAR range check:** User altstack is at ~8 GB (0x20000_bbac); the stack is at ~137 GB.
+Both are above the old (incorrect) 1 GB threshold that was initially tested. The correct guard is
+`translate_user_va()` returning `None` for kernel/MMIO addresses.
+
+**Root cause summary:** CoW fork demotes ALL user RW pages to RO, including the altstack.
+Any kernel write to user memory (signal frames, futex operations, etc.) that hits a CoW-RO
+page must be handled at EL1, not just at EL0.
+
+---
+
 ## Verification
 
 After each phase:

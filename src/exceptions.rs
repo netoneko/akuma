@@ -1246,10 +1246,82 @@ extern "C" fn el1_fault_recovery_pad() {
     akuma_exec::process::return_to_kernel_from_fault(-14);
 }
 
+/// Fast-path CoW write fault resolver for EL1 kernel code.
+///
+/// Returns true if the fault was a CoW write permission fault, the CoW page was
+/// successfully resolved (new frame allocated, old PA remapped), and the caller
+/// should return immediately to retry the faulting instruction via ERET.
+///
+/// Called before the full EL1 debug dump so normal CoW faults produce no log noise.
+fn try_resolve_el1_cow_fault() -> bool {
+    // Read necessary system registers.
+    let fault_esr: u64;
+    let fault_far: u64;
+    let fault_ttbr0: u64;
+    let fault_pc: u64; // ELR_EL1 = faulting instruction address
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1",   out(reg) fault_esr);
+        core::arch::asm!("mrs {}, far_el1",   out(reg) fault_far);
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) fault_ttbr0);
+        core::arch::asm!("mrs {}, elr_el1",   out(reg) fault_pc);
+    }
+
+    let ec = (fault_esr >> 26) & 0x3F;
+    let iss = fault_esr & 0x01FF_FFFF;
+    let dfsc = iss & 0x3F;
+
+    // Must be: data abort from EL1 (0x25) + permission fault L3 (0x0F) + write (WnR=bit6)
+    // + kernel code is executing (ELR in kernel text range).
+    // No FAR range check — user VA space spans 0..512GB; translate_user_va() handles
+    // unmapped/kernel addresses by returning None.
+    if ec != 0x25 || dfsc != 0x0F || (iss & (1 << 6)) == 0 { return false; }
+    if !((0x4020_0000..0x6000_0000).contains(&fault_pc)) { return false; }
+
+    let l0_addr = (fault_ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+    let page_va = fault_far as usize & !(0xFFF);
+
+    let old_pa = match akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
+        Some(pa) => pa & !(0xFFF),
+        None => return false,
+    };
+
+    if crate::pmm::cow_ref_get(old_pa) == 0 { return false; }
+
+    let new_frame = match crate::pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => return false, // OOM — fall through to kill-process path
+    };
+
+    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+    unsafe {
+        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
+        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
+    }
+
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+        let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+        akuma_exec::mmu::flush_tlb_page(page_va);
+        owner.address_space.track_user_frame(new_frame);
+        owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+    }
+    crate::pmm::cow_ref_dec(old_pa);
+    true // Caller returns; ERET retries the faulting instruction
+}
+
 /// Synchronous exception handler from EL1 (kernel mode)
 /// Uses static buffers to avoid heap allocation during crash
 #[unsafe(no_mangle)]
 extern "C" fn rust_sync_el1_handler() {
+    // Quick CoW pre-check: avoid the full debug dump for expected CoW write faults.
+    // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → almost certainly CoW.
+    // Quick CoW pre-check: resolve CoW write faults before full debug dump.
+    // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → CoW from kernel code.
+    if try_resolve_el1_cow_fault() {
+        return;
+    }
     // #region agent log
     crate::console::print("[FORK-DBG] EL1 SYNC EXCEPTION!\n");
     // #endregion

@@ -268,6 +268,8 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_cow_refcount_multi, "cow_refcount_multi");
     run_test!(test_cow_free_page_respects_refcount, "cow_free_page_respects_refcount");
     run_test!(test_ic_flush_svc_detection, "ic_flush_svc_detection");
+    run_test!(test_cow_el1_fault_conditions, "cow_el1_fault_conditions");
+    run_test!(test_cow_dec_after_fault, "cow_dec_after_fault");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -8587,6 +8589,90 @@ fn test_ic_flush_svc_detection() -> bool {
     ok &= !svc_mask(0xD4200000); // BRK #0
     ok &= !svc_mask(0xD65F03C0); // RET
     ok &= !svc_mask(0xD2800000); // MOV x0, #0
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test the ISS condition used to detect CoW faults in the EL1 sync handler.
+///
+/// The EL1 CoW handler checks:
+///   DFSC = ISS & 0x3F == 0x0F  (permission fault level 3)
+///   ISS bit 6 == 1               (WnR = write fault)
+///
+/// No FAR range check — user VA space is 0..512GB on AArch64 (39-bit VAs);
+/// translate_user_va() returning None is the correct guard for non-user addresses.
+///
+/// This test verifies the ISS pattern matches real CoW scenarios and doesn't
+/// false-positive on translation faults or read faults.
+fn test_cow_el1_fault_conditions() -> bool {
+    console::print("\n[TEST] CoW EL1 fault conditions\n");
+
+    let is_cow_el1_fault = |iss: u32| -> bool {
+        let dfsc = iss & 0x3F;
+        dfsc == 0x0F && (iss & (1 << 6)) != 0
+        // No FAR check — user VA is 0..512GB; translate_user_va handles non-user addresses
+    };
+
+    let mut ok = true;
+
+    // ISS=0x4F: DFSC=0x0F (perm fault L3), bit6=1 (write)
+    // Matches the exact crash: EC=0x25, ISS=0x4f, FAR=0x20000bbac (altstack at ~8GB)
+    ok &= is_cow_el1_fault(0x4F);
+
+    // ISS=0x0F: DFSC=0x0F (perm fault L3), bit6=0 (READ fault) — NOT a write, no CoW
+    ok &= !is_cow_el1_fault(0x0F);
+
+    // ISS=0x45: DFSC=0x05 (translation fault L1), bit6=1 — not a permission fault
+    ok &= !is_cow_el1_fault(0x45);
+
+    // ISS=0x5: DFSC=0x05, bit6=0 — translation fault, read
+    ok &= !is_cow_el1_fault(0x05);
+
+    // ISS=0x4E: DFSC=0x0E (perm fault L2), bit6=1 — L2, not L3
+    ok &= !is_cow_el1_fault(0x4E);
+
+    // ISS=0x4D: DFSC=0x0D (perm fault L1), bit6=1 — L1, not L3
+    ok &= !is_cow_el1_fault(0x4D);
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that after a simulated CoW fault (alloc new, dec old), the old PA is
+/// freed when its refcount reaches zero, and the new frame is tracked correctly.
+fn test_cow_dec_after_fault() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW dec after fault lifecycle\n");
+
+    let (old_frame, new_frame) = match (pmm::alloc_page_zeroed(), pmm::alloc_page_zeroed()) {
+        (Some(o), Some(n)) => (o, n),
+        _ => {
+            console::print("  OOM\n  Result: FAIL\n");
+            return false;
+        }
+    };
+    let free_before = pmm::free_count();
+
+    // Simulate CoW share: refcount = 2 (parent + child both track old_frame)
+    pmm::cow_ref_inc(old_frame.addr);
+    let mut ok = pmm::cow_ref_get(old_frame.addr) == 2;
+
+    // Simulate CoW fault in child:
+    // cow_ref_dec(old_pa): 2→1 (parent still has it)
+    let freed = pmm::cow_ref_dec(old_frame.addr);
+    ok &= !freed; // should NOT free — parent still has it
+    ok &= pmm::cow_ref_get(old_frame.addr) == 1;
+
+    // Parent exits: free_page(old_pa) → cow_ref_dec 1→0 → frees
+    // free_before was measured after both allocs, so freeing one frame → free_before + 1
+    pmm::free_page(old_frame);
+    ok &= pmm::free_count() == free_before + 1;
+    ok &= pmm::cow_ref_get(old_frame.addr) == 0;
+
+    // Clean up new_frame — second frame freed → free_before + 2
+    pmm::free_page(new_frame);
+    ok &= pmm::free_count() == free_before + 2;
 
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok

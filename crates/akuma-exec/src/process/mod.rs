@@ -1348,7 +1348,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         }
 
         // Share mmap regions
-        for (va_start, parent_frames) in parent.mmap_regions.iter() {
+        for (va_start, parent_frames) in &parent.mmap_regions {
             let len = parent_frames.len() * mmu::PAGE_SIZE;
             if len > 0 {
                 total_shared += cow_share_range(parent_l0, *va_start, len,
@@ -1393,7 +1393,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 mmu::demote_range_to_ro(parent_l0_mut, interp_base, interp_pages);
             }
 
-            for (va_start, parent_frames) in parent.mmap_regions.iter() {
+            for (va_start, parent_frames) in &parent.mmap_regions {
                 mmu::demote_range_to_ro(parent_l0_mut, *va_start, parent_frames.len());
             }
 
