@@ -411,6 +411,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             set_spawn_namespace: crate::vfs::set_spawn_namespace,
             clear_spawn_namespace: crate::vfs::clear_spawn_namespace,
             print_str: console::print,
+            cow_ref_inc: pmm::cow_ref_inc,
+            cow_ref_dec: pmm::cow_ref_dec,
+            cow_ref_get: pmm::cow_ref_get,
         },
         akuma_exec::ExecConfig {
             max_threads: config::MAX_THREADS,
@@ -432,6 +435,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
             proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
             proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
+            cow_fork_enabled: config::COW_FORK_ENABLED,
         },
     );
     akuma_exec::process::enable_process_syscall_stats(config::PROCESS_SYSCALL_STATS);

@@ -459,8 +459,17 @@ pub fn alloc_page() -> Option<PhysFrame> {
     })
 }
 
-/// Free a single physical page
+/// Free a single physical page.
+/// If the frame is CoW-shared (refcount > 0), only decrements the refcount
+/// instead of actually freeing.  The physical frame is freed when the last
+/// reference is dropped.
 pub fn free_page(frame: PhysFrame) {
+    // Check CoW refcount: if shared, just decrement instead of freeing.
+    if !cow_ref_dec(frame.addr) {
+        // Still shared by other processes — don't free the physical page.
+        return;
+    }
+
     // Untrack BEFORE freeing to prevent race condition:
     // If we free first then untrack, another CPU could reallocate the same
     // frame and track it before we untrack, causing us to remove their tracking.
@@ -588,5 +597,62 @@ pub fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
         core::arch::asm!("dsb ish");
     }
     Some(frames)
+}
+
+// ============================================================================
+// Copy-on-Write Reference Counting
+// ============================================================================
+
+/// Tracks CoW-shared physical frames.  Only pages that are actually shared
+/// between parent and child after fork get entries here.  Non-shared pages
+/// have no overhead.
+static COW_REFCOUNTS: Spinlock<BTreeMap<usize, u16>> = Spinlock::new(BTreeMap::new());
+
+#[allow(dead_code)]
+/// Increment the CoW reference count for a physical address.
+/// First call for a new address inserts it with count=2 (parent + child).
+/// Subsequent calls increment by 1 (additional fork children).
+pub fn cow_ref_inc(pa: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = COW_REFCOUNTS.lock();
+        let entry = table.entry(pa).or_insert(1);
+        *entry = entry.saturating_add(1);
+    });
+}
+
+/// Decrement the CoW reference count.  Returns true if the count reached 0
+/// (meaning the caller should free the physical frame).  Removes the entry
+/// from the table when count reaches 0 to avoid unbounded growth.
+pub fn cow_ref_dec(pa: usize) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = COW_REFCOUNTS.lock();
+        match table.get_mut(&pa) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    table.remove(&pa);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true, // Not tracked → single owner → safe to free
+        }
+    })
+}
+
+#[allow(dead_code)]
+/// Get the current CoW reference count for a physical address.
+/// Returns 0 if the address is not in the CoW table (not shared).
+pub fn cow_ref_get(pa: usize) -> u16 {
+    crate::irq::with_irqs_disabled(|| {
+        COW_REFCOUNTS.lock().get(&pa).copied().unwrap_or(0)
+    })
+}
+
+#[allow(dead_code)]
+/// Number of entries in the CoW refcount table (for diagnostics).
+pub fn cow_ref_count() -> usize {
+    crate::irq::with_irqs_disabled(|| COW_REFCOUNTS.lock().len())
 }
 

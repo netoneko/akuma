@@ -210,6 +210,11 @@ pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
 /// Independent of `SYSCALL_DEBUG_INFO_ENABLED` so QEMU logs show liveness without log::debug routing.
 pub const FORK_BRK_SERIAL_PROGRESS: bool = true;
 
+/// Enable Copy-on-Write fork.  When true, fork shares physical pages read-only
+/// instead of copying them.  Write faults allocate new pages on demand.
+/// Set to false to fall back to the old eager-copy fork if regressions appear.
+pub const COW_FORK_ENABLED: bool = true;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 

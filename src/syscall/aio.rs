@@ -137,46 +137,43 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
 
 /// io_submit(ctx: aio_context_t, nr: long, iocbpp: **iocb) -> long
 ///
-/// Stub: validates ctx exists, returns 0 (no events submitted).
-/// We never actually submit I/O; this prevents ENOSYS crashes in Go/glibc
-/// that probe for AIO support.
+/// Stub: always returns 0 (no events submitted).  We never actually submit I/O.
+/// CRITICAL: Must never return a negative value.  Go treats negative returns as
+/// pointers (e.g. EINVAL=-22, then Go accesses *(x0+16) = *(-6) → WILD-DA).
 pub(super) fn sys_io_submit(ctx: u64, _nr: i64, _iocbpp: u64) -> u64 {
     let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
     if !exists {
-        crate::tprint!(96, "[io_submit] ctx=0x{:x} not found\n", ctx);
-        return EINVAL;
+        crate::tprint!(96, "[io_submit] ctx=0x{:x} not found → 0\n", ctx);
+    } else {
+        crate::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
     }
-    crate::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub returns 0\n", ctx, _nr);
     0
 }
 
 /// io_cancel(ctx: aio_context_t, iocb: *iocb, result: *io_event) -> long
 ///
-/// Stub: returns EINVAL (no outstanding requests to cancel since we never submit).
+/// Stub: always returns 0.  We never submit I/O so there is nothing to cancel.
+/// CRITICAL: Must never return a negative value — same WILD-DA risk as io_submit.
 pub(super) fn sys_io_cancel(ctx: u64, _iocb: u64, _result: u64) -> u64 {
     let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
     if !exists {
-        return EINVAL;
+        crate::tprint!(128, "[io_cancel] ctx=0x{:x} not found → 0\n", ctx);
+    } else {
+        crate::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
     }
-    crate::tprint!(128, "[io_cancel] ctx=0x{:x} → no outstanding requests\n", ctx);
-    EINVAL // EAGAIN would also be valid; EINVAL = "no such request"
+    0
 }
 
 /// io_getevents(ctx: aio_context_t, min_nr: long, nr: long, events: *io_event, timeout: *timespec) -> long
 ///
-/// Stub: returns 0 (no events ready). Consistent with an empty ring (head == tail).
-/// This is the critical fix for the Go compile crash: returning ENOSYS (-38) caused Go
-/// to treat the return value as a pointer, triggering WILD-DA at FAR=0xffffffffffffffda.
+/// Stub: always returns 0 (no events ready).  Ring is always empty (head == tail).
+/// CRITICAL: Must never return a negative value.  Returning ENOSYS (-38) caused Go
+/// to dereference it as a pointer → WILD-DA at FAR=0xffffffffffffffda.  Returning
+/// EINVAL (-22) has the same risk: Go accesses *(x0+offset) → WILD-DA.
 pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _timeout: u64) -> u64 {
-    // If ctx is 0 or not registered, return EINVAL (not ENOSYS!)
-    if ctx == 0 {
-        return EINVAL;
-    }
     let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
     if !exists {
-        // Context not found — but still return EINVAL, not ENOSYS.
-        // ENOSYS is dangerous because Go/userspace may treat negative returns as pointers.
-        return EINVAL;
+        crate::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
     }
     // Ring is always empty (head == tail), so 0 events are ready.
     0

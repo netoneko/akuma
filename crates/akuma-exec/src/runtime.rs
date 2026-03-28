@@ -99,6 +99,11 @@ pub struct ExecRuntime {
 
     // Console fallback
     pub print_str: fn(&str),
+
+    // Copy-on-Write fork
+    pub cow_ref_inc: fn(usize),
+    pub cow_ref_dec: fn(usize) -> bool,
+    pub cow_ref_get: fn(usize) -> u16,
 }
 
 /// Compile-time kernel configuration, passed once at init.
@@ -124,6 +129,7 @@ pub struct ExecConfig {
     pub enable_sgi_debug_prints: bool,
     pub proc_stdin_max_size: usize,
     pub proc_stdout_max_size: usize,
+    pub cow_fork_enabled: bool,
 }
 
 static RUNTIME: Spinlock<Option<ExecRuntime>> = Spinlock::new(None);

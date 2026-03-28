@@ -1288,260 +1288,329 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         Ok(())
     }
 
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step4: copying stack\n");
-    // #endregion
-    copy_range_phys(
-        parent_l0,
-        stack_start,
-        stack_size,
-        &mut new_proc.address_space,
-        None,
-        "stack",
-    )?;
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step4: stack done\n");
-    // #endregion
+    if config().cow_fork_enabled {
+        // ── CoW fork: share physical pages read-only instead of copying ──
+        (runtime().print_str)("[FORK-DBG] step4: CoW fork\n");
+        FORK_IN_PROGRESS.store(true, Ordering::Release);
+        let cow_start_us = (runtime().uptime_us)();
+        let mut total_shared: usize = 0;
 
-    // Copy code+heap range.  Derive code_start from code_end (which is
-    // always in the main binary's range) rather than entry_point (which
-    // points into the interpreter for dynamically-linked binaries).
-    let code_start = if parent.memory.code_end >= 0x1000_0000 {
-        0x1000_0000 // PIE binary base
-    } else {
-        0x400000
-    };
-    if parent.brk > code_start {
-        let brk_len = parent.brk - code_start;
-        // #region agent log
+        // Helper: share a VA range via CoW.  For each mapped page in parent,
+        // increment the CoW refcount, map the same PA into the child as RO
+        // (preserving UXN/PXN), and track the frame in the child's address
+        // space.  Returns the number of pages shared.
+        fn cow_share_range(
+            parent_l0: *const u64,
+            va_start: usize,
+            len: usize,
+            child_as: &mut mmu::UserAddressSpace,
+            label: &str,
+        ) -> Result<usize, &'static str> {
+            let pages = fork_page_count_for_len(len).ok_or("CoW share page count overflow")?;
+            let mapped = mmu::collect_mapped_pages_with_flags(parent_l0, va_start, pages);
+            let count = mapped.len();
+            for (va, pa, pte_flags) in mapped {
+                // Increment CoW refcount (inserts with count=2 on first share)
+                (runtime().cow_ref_inc)(pa);
+                // Force AP to RO, preserving UXN/PXN from the original PTE
+                let child_flags = (pte_flags & !(mmu::flags::AP_RO_ALL)) | mmu::flags::AP_RO_ALL;
+                child_as.map_page(va, pa, child_flags)?;
+                child_as.track_user_frame(PhysFrame::new(pa));
+            }
+            if config().syscall_debug_info_enabled && count > 0 {
+                log::debug!("[fork-cow] {} shared {} pages", label, count);
+            }
+            Ok(count)
+        }
+
+        // Share stack
+        total_shared += cow_share_range(parent_l0, stack_start, stack_size,
+            &mut new_proc.address_space, "stack")?;
+
+        // Share code+brk
+        let code_start = if parent.memory.code_end >= 0x1000_0000 {
+            0x1000_0000
+        } else {
+            0x400000
+        };
+        if parent.brk > code_start {
+            let brk_len = parent.brk - code_start;
+            total_shared += cow_share_range(parent_l0, code_start, brk_len,
+                &mut new_proc.address_space, "brk")?;
+        }
+
+        // Share interpreter region
+        let interp_base = 0x3000_0000usize;
+        let interp_scan_size = 2 * 1024 * 1024;
+        if mmu::translate_user_va(parent_l0, interp_base).is_some() {
+            total_shared += cow_share_range(parent_l0, interp_base, interp_scan_size,
+                &mut new_proc.address_space, "interp")?;
+        }
+
+        // Share mmap regions
+        for (va_start, parent_frames) in parent.mmap_regions.iter() {
+            let len = parent_frames.len() * mmu::PAGE_SIZE;
+            if len > 0 {
+                total_shared += cow_share_range(parent_l0, *va_start, len,
+                    &mut new_proc.address_space, "mmap")?;
+            }
+        }
+        // CoW fork doesn't track per-region frame lists — frames are shared,
+        // not owned.  On write fault, new frames are allocated and tracked in
+        // user_frames.  We keep the mmap region VA ranges for munmap.
+        new_proc.mmap_regions = parent.mmap_regions.iter()
+            .map(|(va, frames)| (*va, Vec::with_capacity(frames.len())))
+            .collect();
+
+        // Share lazy region pages (demand-paged pages in parent)
+        {
+            let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+                let table = LAZY_REGION_TABLE.lock();
+                table.get(&parent_pid)
+                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
+                    .unwrap_or_default()
+            });
+            for (va, size) in lazy_ranges {
+                total_shared += cow_share_range(parent_l0, va, size,
+                    &mut new_proc.address_space, "lazy")?;
+            }
+        }
+
+        // Demote ALL parent RW pages to RO so writes in the parent also
+        // trigger CoW faults.  We demote the same ranges we just shared.
+        unsafe {
+            let parent_l0_mut = parent_l0 as *mut u64;
+            let stack_pages = fork_page_count_for_len(stack_size).unwrap_or(0);
+            mmu::demote_range_to_ro(parent_l0_mut, stack_start, stack_pages);
+
+            if parent.brk > code_start {
+                let brk_pages = fork_page_count_for_len(parent.brk - code_start).unwrap_or(0);
+                mmu::demote_range_to_ro(parent_l0_mut, code_start, brk_pages);
+            }
+
+            if mmu::translate_user_va(parent_l0, interp_base).is_some() {
+                let interp_pages = interp_scan_size / mmu::PAGE_SIZE;
+                mmu::demote_range_to_ro(parent_l0_mut, interp_base, interp_pages);
+            }
+
+            for (va_start, parent_frames) in parent.mmap_regions.iter() {
+                mmu::demote_range_to_ro(parent_l0_mut, *va_start, parent_frames.len());
+            }
+
+            let lazy_ranges2: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+                let table = LAZY_REGION_TABLE.lock();
+                table.get(&parent_pid)
+                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
+                    .unwrap_or_default()
+            });
+            for (va, size) in lazy_ranges2 {
+                let pages = fork_page_count_for_len(size).unwrap_or(0);
+                mmu::demote_range_to_ro(parent_l0_mut, va, pages);
+            }
+        }
+
+        // Flush parent TLB so demoted PTEs take effect
+        mmu::flush_tlb_asid(0); // flush all — parent ASID may vary
+
+        new_proc.lazy_regions = Vec::new();
+        new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        let cow_elapsed_us = (runtime().uptime_us)() - cow_start_us;
         {
             let mut buf = [0u8; 96];
             let mut pos = 0usize;
             let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
-                    code_start, parent.brk, brk_len / mmu::PAGE_SIZE));
+                format_args!("[FORK-COW] shared {} pages in {}µs\n", total_shared, cow_elapsed_us));
             if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
         }
-        // #endregion
+        FORK_IN_PROGRESS.store(false, Ordering::Release);
+    } else {
+        // ── Eager-copy fork (legacy path) ──
+        (runtime().print_str)("[FORK-DBG] step4: copying stack\n");
         copy_range_phys(
             parent_l0,
-            code_start,
-            brk_len,
-            &mut new_proc.address_space,
-            Some(MAX_FORK_BRK_COPY_PAGES),
-            "brk",
-        )?;
-        // #region agent log
-        (runtime().print_str)("[FORK-DBG] step4: brk done\n");
-        // #endregion
-    }
-
-    // Copy dynamic linker / interpreter region (0x3000_0000).  These pages
-    // are mapped by the ELF loader but not tracked in mmap_regions.
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step4: copying interp\n");
-    // #endregion
-    let interp_base = 0x3000_0000usize;
-    let interp_scan_size = 2 * 1024 * 1024; // 2 MB — covers even large musl builds
-    if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-        copy_range_phys(
-            parent_l0,
-            interp_base,
-            interp_scan_size,
+            stack_start,
+            stack_size,
             &mut new_proc.address_space,
             None,
-            "interp",
+            "stack",
         )?;
-    }
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step4: interp done\n");
-    // #endregion
+        (runtime().print_str)("[FORK-DBG] step4: stack done\n");
 
-    // Snapshot mmap_regions to prevent data races with concurrent
-    // CLONE_THREAD siblings calling mmap/munmap via lookup_process().
-    // Without this snapshot, sibling threads can modify the parent's
-    // mmap_regions Vec while fork iterates it (aliasing &mut references
-    // through PROCESS_TABLE), causing corrupted iteration.
-    const MAX_FORK_MMAP_PAGES: usize = 2048; // 8 MB cap
-    let mmap_snapshot: Vec<(usize, Vec<PhysFrame>)> = parent.mmap_regions.clone();
-    // #region agent log
-    FORK_IN_PROGRESS.store(true, Ordering::Release);
-    // #endregion
-    let mut total_copied_pages: usize = 0;
-    let mut child_mmap_regions: Vec<(usize, Vec<PhysFrame>)> = Vec::new();
-
-    for (region_idx, (va_start, parent_frames)) in mmap_snapshot.iter().enumerate() {
-        // #region agent log
-        {
-            let mut buf = [0u8; 128];
-            let mut pos = 0usize;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[FORK-DBG] mmap region {}/{} va=0x{:x} pages={}\n",
-                    region_idx, mmap_snapshot.len(), va_start, parent_frames.len()));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-        }
-        // #endregion
-        if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
-            if config().syscall_debug_info_enabled {
-                log::debug!("[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap",
-                    va_start, parent_frames.len());
-            }
-            continue;
-        }
-        let mut child_frames: Vec<PhysFrame> = Vec::new();
-        let mut ok = true;
-        for (i, pf) in parent_frames.iter().enumerate() {
-            let page_va = va_start + i * mmu::PAGE_SIZE;
-            // #region agent log
-            if parent_frames.len() >= 32 && (i == 0 || i == parent_frames.len() - 1 || i % 16 == 0) {
-                let mut buf = [0u8; 80];
-                let mut pos = 0usize;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-PG] r{}p{}/{} va=0x{:x}\n", region_idx, i, parent_frames.len(), page_va));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-            }
-            // #endregion
-            // #region agent log
-            if pf.addr < 0x4000_0000 || pf.addr >= 0xC000_0000 {
-                let mut buf = [0u8; 96];
-                let mut pos = 0usize;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-PG] BAD phys 0x{:x} r{}p{}\n", pf.addr, region_idx, i));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-                ok = false;
-                break;
-            }
-            // Guard: skip pages whose VA falls in the kernel identity-map range.
-            // Such a mapping would overlap physical RAM seen by the kernel's TTBR1,
-            // causing silent memory corruption if the child touches that VA.
-            if page_va >= ProcessMemory::KERNEL_VA_START && page_va < ProcessMemory::KERNEL_VA_END {
-                let mut buf = [0u8; 96];
-                let mut pos = 0usize;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-PG] SKIP kernel VA 0x{:x} r{}p{}\n", page_va, region_idx, i));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-                ok = false;
-                break;
-            }
-            // #endregion
-            match (runtime().alloc_page_zeroed)() {
-                Some(frame) => {
-                    (runtime().track_frame)(frame, FrameSource::UserData);
-                    unsafe {
-                        let src = mmu::phys_to_virt(pf.addr) as *const u8;
-                        let dst = mmu::phys_to_virt(frame.addr);
-                        core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
-                    }
-                    if new_proc.address_space.map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
-                        ok = false;
-                        break;
-                    }
-                    new_proc.address_space.track_user_frame(frame);
-                    child_frames.push(frame);
-                }
-                None => {
-                    // #region agent log
-                    (runtime().print_str)("[FORK-PG] OOM in inner loop\n");
-                    // #endregion
-                    ok = false; break;
-                }
-            }
-        }
-        if ok {
-            total_copied_pages += child_frames.len();
-            child_mmap_regions.push((*va_start, child_frames));
+        let code_start = if parent.memory.code_end >= 0x1000_0000 {
+            0x1000_0000
         } else {
-            if config().syscall_debug_info_enabled {
-                log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);
+            0x400000
+        };
+        if parent.brk > code_start {
+            let brk_len = parent.brk - code_start;
+            {
+                let mut buf = [0u8; 96];
+                let mut pos = 0usize;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
+                        code_start, parent.brk, brk_len / mmu::PAGE_SIZE));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
             }
-            break;
+            copy_range_phys(
+                parent_l0,
+                code_start,
+                brk_len,
+                &mut new_proc.address_space,
+                Some(MAX_FORK_BRK_COPY_PAGES),
+                "brk",
+            )?;
+            (runtime().print_str)("[FORK-DBG] step4: brk done\n");
         }
-    }
 
-    new_proc.mmap_regions = child_mmap_regions;
-    new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
-    new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
-    // #region agent log
-    // Keep FORK_IN_PROGRESS=true during lazy copy so TMR heartbeat prints
-    // every 0.5s instead of 5s — makes the slow lazy-copy phase visible.
-    (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
-    // #endregion
-
-    // Copy physically-mapped pages from parent's lazy regions.
-    // clone_lazy_regions() (called later) copies only metadata; any pages
-    // already demand-paged in the parent (e.g. Go goroutine structs in the
-    // Go heap arena) must be explicitly copied so the child doesn't get
-    // zeroed pages and dereference a nil goroutine pointer.
-    // We cap total pages to avoid excessive copy time for large heaps.
-    {
-        const MAX_FORK_LAZY_PAGES: usize = 4096; // 16 MB cap
-        let lazy_start_us = (runtime().uptime_us)();
-        let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
-            let table = LAZY_REGION_TABLE.lock();
-            table.get(&parent_pid)
-                .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
-                .unwrap_or_default()
-        });
-        let num_regions = lazy_ranges.len();
-        let mut lazy_pages_copied = 0usize;
-        let mut lazy_pages_scanned = 0usize;
-        // #region agent log
-        {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[FORK-DBG] lazy: {} regions\n", num_regions));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        (runtime().print_str)("[FORK-DBG] step4: copying interp\n");
+        let interp_base = 0x3000_0000usize;
+        let interp_scan_size = 2 * 1024 * 1024;
+        if mmu::translate_user_va(parent_l0, interp_base).is_some() {
+            copy_range_phys(
+                parent_l0,
+                interp_base,
+                interp_scan_size,
+                &mut new_proc.address_space,
+                None,
+                "interp",
+            )?;
         }
-        // #endregion
-        'lazy_copy: for (region_idx, (va, size)) in lazy_ranges.into_iter().enumerate() {
-            let pages = match fork_page_count_for_len(size) {
-                Some(p) => p,
-                None => continue,
-            };
-            // Use L2-level skip: check at 2MB (512 page) granularity first
-            let mapped_pages = mmu::collect_mapped_pages_sparse(parent_l0, va, pages);
-            lazy_pages_scanned += pages;
-            for (page_va, src_phys) in mapped_pages {
-                if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
-                    break 'lazy_copy;
+        (runtime().print_str)("[FORK-DBG] step4: interp done\n");
+
+        const MAX_FORK_MMAP_PAGES: usize = 2048;
+        let mmap_snapshot: Vec<(usize, Vec<PhysFrame>)> = parent.mmap_regions.clone();
+        FORK_IN_PROGRESS.store(true, Ordering::Release);
+        let mut total_copied_pages: usize = 0;
+        let mut child_mmap_regions: Vec<(usize, Vec<PhysFrame>)> = Vec::new();
+
+        for (region_idx, (va_start, parent_frames)) in mmap_snapshot.iter().enumerate() {
+            {
+                let mut buf = [0u8; 128];
+                let mut pos = 0usize;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-DBG] mmap region {}/{} va=0x{:x} pages={}\n",
+                        region_idx, mmap_snapshot.len(), va_start, parent_frames.len()));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            }
+            if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
+                if config().syscall_debug_info_enabled {
+                    log::debug!("[fork] skipping mmap region 0x{:x} ({} pages) — would exceed cap",
+                        va_start, parent_frames.len());
                 }
-                if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
-                    unsafe {
-                        let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
-                        let dst = mmu::phys_to_virt(frame.addr);
-                        core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                continue;
+            }
+            let mut child_frames: Vec<PhysFrame> = Vec::new();
+            let mut ok = true;
+            for (i, pf) in parent_frames.iter().enumerate() {
+                let page_va = va_start + i * mmu::PAGE_SIZE;
+                if pf.addr < 0x4000_0000 || pf.addr >= 0xC000_0000 {
+                    ok = false;
+                    break;
+                }
+                if page_va >= ProcessMemory::KERNEL_VA_START && page_va < ProcessMemory::KERNEL_VA_END {
+                    ok = false;
+                    break;
+                }
+                match (runtime().alloc_page_zeroed)() {
+                    Some(frame) => {
+                        (runtime().track_frame)(frame, FrameSource::UserData);
+                        unsafe {
+                            let src = mmu::phys_to_virt(pf.addr) as *const u8;
+                            let dst = mmu::phys_to_virt(frame.addr);
+                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                        }
+                        if new_proc.address_space.map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
+                            ok = false;
+                            break;
+                        }
+                        new_proc.address_space.track_user_frame(frame);
+                        child_frames.push(frame);
                     }
-                    lazy_pages_copied += 1;
+                    None => {
+                        (runtime().print_str)("[FORK-PG] OOM in inner loop\n");
+                        ok = false; break;
+                    }
                 }
             }
-            // Progress logging every 4 regions
-            if region_idx % 4 == 3 || region_idx == num_regions - 1 {
+            if ok {
+                total_copied_pages += child_frames.len();
+                child_mmap_regions.push((*va_start, child_frames));
+            } else {
+                if config().syscall_debug_info_enabled {
+                    log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);
+                }
+                break;
+            }
+        }
+
+        new_proc.mmap_regions = child_mmap_regions;
+        new_proc.lazy_regions = Vec::new();
+        new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
+        (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
+
+        {
+            const MAX_FORK_LAZY_PAGES: usize = 4096;
+            let lazy_start_us = (runtime().uptime_us)();
+            let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+                let table = LAZY_REGION_TABLE.lock();
+                table.get(&parent_pid)
+                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
+                    .unwrap_or_default()
+            });
+            let num_regions = lazy_ranges.len();
+            let mut lazy_pages_copied = 0usize;
+            let mut lazy_pages_scanned = 0usize;
+            {
+                let mut buf = [0u8; 64];
+                let mut pos = 0usize;
+                let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-DBG] lazy: {} regions\n", num_regions));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            }
+            'lazy_copy: for (region_idx, (va, size)) in lazy_ranges.into_iter().enumerate() {
+                let pages = match fork_page_count_for_len(size) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let mapped_pages = mmu::collect_mapped_pages_sparse(parent_l0, va, pages);
+                lazy_pages_scanned += pages;
+                for (page_va, src_phys) in mapped_pages {
+                    if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
+                        break 'lazy_copy;
+                    }
+                    if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
+                        unsafe {
+                            let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
+                            let dst = mmu::phys_to_virt(frame.addr);
+                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                        }
+                        lazy_pages_copied += 1;
+                    }
+                }
+                if region_idx % 4 == 3 || region_idx == num_regions - 1 {
+                    let mut buf = [0u8; 96];
+                    let mut pos = 0usize;
+                    let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                        format_args!("[FORK-DBG] lazy {}/{} copied={} scanned={}\n",
+                            region_idx + 1, num_regions, lazy_pages_copied, lazy_pages_scanned));
+                    if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                }
+            }
+            let lazy_elapsed_us = (runtime().uptime_us)() - lazy_start_us;
+            {
                 let mut buf = [0u8; 96];
                 let mut pos = 0usize;
                 let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-DBG] lazy {}/{} copied={} scanned={}\n",
-                        region_idx + 1, num_regions, lazy_pages_copied, lazy_pages_scanned));
+                    format_args!("[FORK-DBG] lazy: {} pages copied, {} scanned in {}µs\n",
+                        lazy_pages_copied, lazy_pages_scanned, lazy_elapsed_us));
                 if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
             }
         }
-        let lazy_elapsed_us = (runtime().uptime_us)() - lazy_start_us;
-        // #region agent log
-        {
-            let mut buf = [0u8; 96];
-            let mut pos = 0usize;
-            let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[FORK-DBG] lazy: {} pages copied, {} scanned in {}µs\n",
-                    lazy_pages_copied, lazy_pages_scanned, lazy_elapsed_us));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-        }
-        // #endregion
-    }
 
-    // #region agent log
-    FORK_IN_PROGRESS.store(false, Ordering::Release);
-    (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
-    // #endregion
+        FORK_IN_PROGRESS.store(false, Ordering::Release);
+        (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
+    }
 
     // 5. Write ProcessInfo to child's process info page
     unsafe {

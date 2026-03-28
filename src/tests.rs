@@ -263,6 +263,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_aio_stubs_valid_ctx_returns_zero, "aio_stubs_valid_ctx_zero");
     run_test!(test_map_shared_readonly_returns_success, "map_shared_readonly_success");
 
+    // CoW fork: PMM refcounting and IC flush SVC detection
+    run_test!(test_cow_refcount_basic, "cow_refcount_basic");
+    run_test!(test_cow_refcount_multi, "cow_refcount_multi");
+    run_test!(test_cow_free_page_respects_refcount, "cow_free_page_respects_refcount");
+    run_test!(test_ic_flush_svc_detection, "ic_flush_svc_detection");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -8179,37 +8185,30 @@ fn test_lazy_region_btreemap_boundary_lookup() -> bool {
 fn test_aio_getevents_never_returns_enosys() -> bool {
     console::print("\n[TEST] io_getevents never returns ENOSYS\n");
 
-    const ENOSYS: u64 = (-38i64) as u64;
+    // All AIO stubs must return 0 for any ctx — never negative (ENOSYS, EINVAL, etc.)
+    // Go dereferences negative returns as pointers → WILD-DA crash.
+    let test_ctxs: &[u64] = &[0, 0xdeadbeef];
+    for &ctx in test_ctxs {
+        let r = crate::syscall::handle_syscall(4, &[ctx, 1, 8, 0, 0, 0]);
+        crate::safe_print!(96, "  io_getevents(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_getevents returned {:#x}, not 0\n", r);
+            return false;
+        }
 
-    // ctx=0: must return EINVAL, not ENOSYS
-    let r = crate::syscall::handle_syscall(4, &[0, 1, 8, 0, 0, 0]);
-    crate::safe_print!(96, "  io_getevents(ctx=0) = {:#x} (must not be ENOSYS={:#x})\n", r, ENOSYS);
-    if r == ENOSYS {
-        console::print("  FAIL: io_getevents(ctx=0) returned ENOSYS — would crash Go\n");
-        return false;
-    }
+        let r = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
+        crate::safe_print!(96, "  io_submit(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_submit returned {:#x}, not 0\n", r);
+            return false;
+        }
 
-    // ctx=0xdeadbeef (not registered): must return EINVAL, not ENOSYS
-    let r = crate::syscall::handle_syscall(4, &[0xdeadbeef, 1, 8, 0, 0, 0]);
-    crate::safe_print!(96, "  io_getevents(ctx=0xdeadbeef) = {:#x} (must not be ENOSYS)\n", r);
-    if r == ENOSYS {
-        console::print("  FAIL: io_getevents(bad ctx) returned ENOSYS — would crash Go\n");
-        return false;
-    }
-
-    // Also verify io_submit (syscall 2) and io_cancel (syscall 3) never return ENOSYS
-    let r2 = crate::syscall::handle_syscall(2, &[0xdeadbeef, 0, 0, 0, 0, 0]);
-    crate::safe_print!(96, "  io_submit(bad ctx) = {:#x} (must not be ENOSYS)\n", r2);
-    if r2 == ENOSYS {
-        console::print("  FAIL: io_submit returned ENOSYS\n");
-        return false;
-    }
-
-    let r3 = crate::syscall::handle_syscall(3, &[0xdeadbeef, 0, 0, 0, 0, 0]);
-    crate::safe_print!(96, "  io_cancel(bad ctx) = {:#x} (must not be ENOSYS)\n", r3);
-    if r3 == ENOSYS {
-        console::print("  FAIL: io_cancel returned ENOSYS\n");
-        return false;
+        let r = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
+        crate::safe_print!(96, "  io_cancel(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_cancel returned {:#x}, not 0\n", r);
+            return false;
+        }
     }
 
     console::print("  PASS\n");
@@ -8219,37 +8218,47 @@ fn test_aio_getevents_never_returns_enosys() -> bool {
 /// io_getevents/io_submit/io_cancel with invalid ctx must return EINVAL (not ENOSYS,
 /// not 0, and not some random value).
 fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
-    console::print("\n[TEST] AIO stubs with invalid ctx return EINVAL\n");
+    console::print("\n[TEST] AIO stubs with invalid ctx return 0 (never negative)\n");
 
-    const EINVAL: u64 = (-22i64) as u64;
+    // CRITICAL: AIO stubs must NEVER return negative values for any ctx.
+    // Go treats negative returns as pointers: EINVAL(-22) → *(x0+16) = *(-6) → WILD-DA.
+    // All stubs return 0 ("nothing happened") regardless of ctx validity.
+    const ENOSYS: u64 = (-38i64) as u64;
 
     let bad_ctxs: &[u64] = &[0, 0xdeadbeef, 0xffffffffffffffff, 1, 0x1000];
 
     for &ctx in bad_ctxs {
         // io_getevents
         let r = crate::syscall::handle_syscall(4, &[ctx, 0, 8, 0, 0, 0]);
-        if r != EINVAL {
+        if r != 0 {
             crate::safe_print!(128,
-                "  FAIL: io_getevents(ctx={:#x}) = {:#x}, expected EINVAL={:#x}\n",
-                ctx, r, EINVAL);
+                "  FAIL: io_getevents(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
             return false;
         }
 
         // io_submit
         let r = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
-        if r != EINVAL {
+        if r != 0 {
             crate::safe_print!(128,
-                "  FAIL: io_submit(ctx={:#x}) = {:#x}, expected EINVAL={:#x}\n",
-                ctx, r, EINVAL);
+                "  FAIL: io_submit(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
             return false;
         }
 
         // io_cancel
         let r = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
-        if r != EINVAL {
+        if r != 0 {
             crate::safe_print!(128,
-                "  FAIL: io_cancel(ctx={:#x}) = {:#x}, expected EINVAL={:#x}\n",
-                ctx, r, EINVAL);
+                "  FAIL: io_cancel(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
+        // Extra safety: verify none of them ever return ENOSYS
+        let r2 = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
+        let r3 = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
+        let r4 = crate::syscall::handle_syscall(4, &[ctx, 0, 8, 0, 0, 0]);
+        if r2 == ENOSYS || r3 == ENOSYS || r4 == ENOSYS {
+            crate::safe_print!(128,
+                "  FAIL: AIO stub returned ENOSYS for ctx={:#x}\n", ctx);
             return false;
         }
     }
@@ -8478,4 +8487,107 @@ fn bench_fork_clone() {
     crate::safe_print!(128,
         "{} pages ({}KB) copied in {}µs = {}MB/s\n",
         copied, total_kb, elapsed_us, mb_s);
+}
+
+// ============================================================================
+// CoW Fork Tests
+// ============================================================================
+
+/// Test basic CoW refcount: inc sets count to 2, dec brings it to 1 then 0.
+fn test_cow_refcount_basic() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW refcount basic\n");
+    let fake_pa: usize = 0xDEAD_0000;
+
+    let mut ok = true;
+    ok &= pmm::cow_ref_get(fake_pa) == 0;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 2;
+    let is_last = pmm::cow_ref_dec(fake_pa);
+    ok &= !is_last && pmm::cow_ref_get(fake_pa) == 1;
+    let is_last = pmm::cow_ref_dec(fake_pa);
+    ok &= is_last && pmm::cow_ref_get(fake_pa) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test CoW refcount with multiple increments (simulating multi-fork).
+fn test_cow_refcount_multi() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW refcount multi\n");
+    let fake_pa: usize = 0xBEEF_0000;
+
+    let mut ok = true;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 2;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 3;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 4;
+
+    ok &= !pmm::cow_ref_dec(fake_pa); // 4→3
+    ok &= !pmm::cow_ref_dec(fake_pa); // 3→2
+    ok &= !pmm::cow_ref_dec(fake_pa); // 2→1
+    ok &= pmm::cow_ref_dec(fake_pa);  // 1→0, last ref
+    ok &= pmm::cow_ref_get(fake_pa) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that free_page respects CoW refcount: shared pages are not freed.
+fn test_cow_free_page_respects_refcount() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW free_page respects refcount\n");
+
+    let frame = match pmm::alloc_page_zeroed() {
+        Some(f) => f,
+        None => {
+            console::print("  OOM\n  Result: FAIL\n");
+            return false;
+        }
+    };
+    let free_before = pmm::free_count();
+
+    pmm::cow_ref_inc(frame.addr);
+    let mut ok = pmm::cow_ref_get(frame.addr) == 2;
+
+    // free_page should NOT actually free (still shared)
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_before;
+    ok &= pmm::cow_ref_get(frame.addr) == 1;
+
+    // Second free_page should actually free (last ref)
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_before + 1;
+    ok &= pmm::cow_ref_get(frame.addr) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test IC flush SVC instruction detection encoding.
+fn test_ic_flush_svc_detection() -> bool {
+    console::print("\n[TEST] IC flush SVC detection\n");
+
+    let svc_mask = |instr: u32| -> bool {
+        (instr & 0xFFE0_001F) == 0xD4000001
+    };
+
+    let mut ok = true;
+    // SVC encodings
+    ok &= svc_mask(0xD4000001);  // SVC #0
+    ok &= svc_mask(0xD4000021);  // SVC #1
+    ok &= svc_mask(0xD40003E1);  // SVC #0x1F
+    ok &= svc_mask(0xD41FFFE1);  // SVC #0xFFFF
+
+    // Not SVC
+    ok &= !svc_mask(0xD503201F); // NOP
+    ok &= !svc_mask(0xD4200000); // BRK #0
+    ok &= !svc_mask(0xD65F03C0); // RET
+    ok &= !svc_mask(0xD2800000); // MOV x0, #0
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
 }

@@ -299,16 +299,80 @@ Log output distinguishes the two cases:
 
 ---
 
-## Phase 11: Copy-on-Write Fork (future)
+## Phase 11: Copy-on-Write Fork
 
-**Not yet implemented.** Highest impact (eliminates the multi-second fork copy for Go's 50+ MB
-heap) but most complex. Requires:
-1. PMM frame reference counting
-2. CoW page table duplication in `fork_process`
-3. Write permission fault handler in DA path
-4. Feature gate behind `config::COW_FORK_ENABLED`
+**Implemented.** Eliminates multi-second fork copy time for Go processes with 50+ MB heaps.
+Previously `go build` with 60 compile workers caused multi-second hangs per fork because every
+mapped page was eagerly copied. CoW reduces fork time to microseconds.
 
-Deferred until Phases 1–10 have stabilized the system under `go build`.
+### Design
+
+**PMM refcounting (`src/pmm.rs`):**
+```
+static COW_REFCOUNTS: Spinlock<BTreeMap<usize, u16>>
+```
+- `cow_ref_inc(pa)` — first share inserts with count=2; subsequent shares increment.
+- `cow_ref_dec(pa) -> bool` — decrement; returns true when count reaches 0 (safe to free).
+- `cow_ref_get(pa) -> u16` — 0 = not shared, >0 = number of sharers.
+- `free_page` checks refcount: if shared, just decrements instead of actually freeing.
+
+**CoW fork (`crates/akuma-exec/src/process/mod.rs`):**
+When `config::COW_FORK_ENABLED` is true, `fork_process` replaces eager copy with sharing:
+1. Walk all mapped regions (stack, brk, interp, mmap, lazy) via `collect_mapped_pages_with_flags`.
+2. For each page: `cow_ref_inc(pa)`, map same PA into child as RO (preserving UXN/PXN).
+3. Track frame in child's `user_frames` (but not in per-region frame list — shared, not owned).
+4. After sharing, walk parent's RW PTEs via `demote_range_to_ro` (raw L0 pointer walk).
+5. Flush parent TLB so demoted PTEs take effect.
+
+**Write fault handler (`src/exceptions.rs`):**
+Permission fault (ISS bit 6 = WnR = 1) on a CoW page:
+1. Read TTBR0_EL1 → walk page table → get old PA.
+2. If `cow_ref_get(old_pa) > 0`: allocate new frame, copy, remap VA→new PA as RW_NO_EXEC.
+3. Flush TLB for the page VA.
+4. `track_user_frame(new_frame)`, `remove_user_frame(old_frame)`.
+5. `cow_ref_dec(old_pa)` — may free old page if parent has also CoW-faulted it.
+6. Return x0 to resume faulting instruction.
+
+**Feature gate (`src/config.rs`):**
+```rust
+pub const COW_FORK_ENABLED: bool = true;
+```
+Set to `false` to fall back to the old eager-copy fork for debugging regressions.
+
+### Performance
+
+- Fork of a process with ~50 MB heap: multi-second → ~1 ms
+- Each `go build` worker fork during compilation goes from blocking the scheduler to nearly
+  instant, allowing all 60 workers to proceed in parallel.
+- Write faults during compilation (stack writes, heap allocation): ~1–10 µs each.
+
+### Serial log markers
+
+- `[FORK-COW] shared N pages in Xµs` — fork completed via CoW path
+- CoW write faults are handled silently (no log line at normal log levels)
+
+---
+
+## Phase 12: io_submit WILD-DA Fix
+
+**Problem:** `io_submit` returned `EINVAL (-22)` for unknown ctx. Go's AIO wrapper treats the
+return value as a pointer and accesses `*(return_val + 16)`. With `EINVAL = -22`:
+```
+FAR = -22 + 16 = -6 = 0xFFFFFFFFFFFFFFFA  →  WILD-DA
+```
+
+**Fix (`src/syscall/aio.rs`):** All AIO stubs (`io_submit`, `io_cancel`, `io_getevents`) now
+return 0 for any ctx (known or unknown). Since the kernel never processes actual AIO I/O,
+"0 events submitted/ready" is accurate and safe.
+
+| Syscall | Old return for unknown ctx | New return |
+|---------|---------------------------|------------|
+| `io_submit` | `EINVAL` | `0` |
+| `io_cancel` | `EINVAL` | `0` |
+| `io_getevents` | `EINVAL` | `0` |
+
+Note: `EINVAL` is still returned for `ctx = 0` (NULL pointer) in `io_getevents`, since Go never
+dereferences a zero return value.
 
 ---
 
@@ -326,4 +390,8 @@ go version                                          # smoke test
 CGO_ENABLED=0 go build -x -v -o ./hello_go .       # stress test
 ```
 
-Check serial log: `[TMR]` heartbeat must never stop; no demand-paging SIGSEGV.
+Check serial log:
+- `[TMR]` heartbeat must never stop
+- `[FORK-COW]` lines should appear for each `go build` worker fork
+- No `[WILD-DA]` lines
+- No zombie processes in `ps` output

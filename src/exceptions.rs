@@ -1840,6 +1840,44 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
+                let is_write = (iss & (1 << 6)) != 0; // ISS bit 6 = WnR
+                // CoW write fault: write to a shared read-only page
+                if is_write {
+                    let page_va = far_usize & !(0xFFF);
+                    let ttbr0: u64;
+                    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+                    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+                    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+                    if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
+                        let old_pa = old_pa_with_offset & !(0xFFF);
+                        let cow_ref = crate::pmm::cow_ref_get(old_pa);
+                        if cow_ref > 0 {
+                            // CoW fault: allocate new page, copy data, remap RW
+                            if let Some(new_frame) = crate::pmm::alloc_page_zeroed() {
+                                crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+                                unsafe {
+                                    let src = akuma_exec::mmu::phys_to_virt(old_pa) as *const u8;
+                                    let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+                                    core::ptr::copy_nonoverlapping(src, dst, 0x1000);
+                                }
+                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    // Overwrite PTE: same VA, new PA, RW permissions
+                                    let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                                    akuma_exec::mmu::flush_tlb_page(page_va);
+                                    // Track new frame, remove old shared frame
+                                    owner.address_space.track_user_frame(new_frame);
+                                    owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+                                }
+                                // Decrement CoW refcount (may free old page if last ref)
+                                crate::pmm::cow_ref_dec(old_pa);
+                                return unsafe { (*frame).x0 };
+                            }
+                            // OOM: fall through to SIGSEGV
+                        }
+                    }
+                }
+
+                // Lazy region permission upgrade (e.g. demand-paged RO → RW after mprotect)
                 if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
                     if !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);

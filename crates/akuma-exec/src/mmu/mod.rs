@@ -1132,6 +1132,133 @@ pub fn collect_mapped_pages_sparse(
     result
 }
 
+/// Collect (va, pa, pte_flags) triples for mapped pages, including the raw PTE
+/// attribute bits (AP, UXN, PXN, etc.).  Used by CoW fork to reproduce the
+/// original permission set in the child's page table.
+pub fn collect_mapped_pages_with_flags(
+    l0_ptr: *const u64,
+    va_start: usize,
+    pages: usize,
+) -> alloc::vec::Vec<(usize, usize, u64)> {
+    let mut result = alloc::vec::Vec::new();
+    if pages == 0 { return result; }
+    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
+        Some(e) => e,
+        None => return result,
+    };
+    let mut va = va_start;
+    while va < va_end {
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        unsafe {
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 {
+                va = ((va | 0x7F_FFFF_FFFF) + 1).min(va_end); continue;
+            }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 {
+                va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
+            }
+            if l1_entry & flags::TABLE == 0 {
+                va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
+            }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 {
+                va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
+            }
+            if l2_entry & flags::TABLE == 0 {
+                va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
+            }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l3_start = (va >> 12) & 0x1FF;
+            let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
+            let l3_end_idx = if l2_range_end == va_end {
+                ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
+            } else {
+                512
+            };
+            for l3_idx in l3_start..l3_end_idx {
+                let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+                if l3_entry & flags::VALID != 0 {
+                    let page_va = (va & !0x1F_FFFF) | (l3_idx << 12);
+                    let pa = (l3_entry & 0x0000_FFFF_FFFF_F000) as usize;
+                    // Extract only user-relevant permission bits (AP + UXN + PXN).
+                    // map_page() adds VALID/TABLE/AF/NG/attr_index/SH_INNER itself.
+                    let pte_flags = l3_entry & (flags::AP_RO_ALL | flags::UXN | flags::PXN);
+                    result.push((page_va, pa, pte_flags));
+                }
+            }
+            va = l2_range_end;
+        }
+    }
+    result
+}
+
+/// Demote all RW L3 PTEs in [va_start, va_start + pages*PAGE_SIZE) to RO.
+///
+/// Walks the page table via raw L0 pointer (no `&mut UserAddressSpace` needed).
+/// Returns the number of PTEs actually demoted.  Caller must flush the TLB
+/// after calling this (e.g. `flush_tlb_asid`).
+pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize) -> usize { unsafe {
+    const AP_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL; // bits [7:6]
+    let mut demoted = 0usize;
+    if pages == 0 { return 0; }
+    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let mut va = va_start;
+    while va < va_end {
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+        if l0_entry & flags::VALID == 0 {
+            va = ((va | 0x7F_FFFF_FFFF) + 1).min(va_end); continue;
+        }
+        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+        if l1_entry & flags::VALID == 0 {
+            va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
+        }
+        if l1_entry & flags::TABLE == 0 {
+            va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
+        }
+        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+        if l2_entry & flags::VALID == 0 {
+            va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
+        }
+        if l2_entry & flags::TABLE == 0 {
+            va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
+        }
+        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        let l3_start = (va >> 12) & 0x1FF;
+        let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
+        let l3_end_idx = if l2_range_end == va_end {
+            ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
+        } else {
+            512
+        };
+        for l3_idx in l3_start..l3_end_idx {
+            let entry = l3_ptr.add(l3_idx).read_volatile();
+            if entry & flags::VALID == 0 { continue; }
+            let ap = entry & AP_MASK;
+            if ap == flags::AP_RW_ALL {
+                // Demote RW → RO: clear AP_RW_ALL, set AP_RO_ALL
+                let new_entry = (entry & !AP_MASK) | flags::AP_RO_ALL;
+                l3_ptr.add(l3_idx).write_volatile(new_entry);
+                demoted += 1;
+            }
+        }
+        va = l2_range_end;
+    }
+    demoted
+}}
+
 fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
