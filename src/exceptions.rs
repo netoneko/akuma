@@ -937,6 +937,18 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
             if is_fault { 1i32 } else { 0i32 });                  // SEGV_MAPERR=1, SI_USER=0
         core::ptr::write(si.add(16) as *mut u64, fault_addr);     // si_addr
 
+        // ucontext.uc_stack (stack_t) — Go runtime reads this to determine
+        // whether the signal arrived on the sigaltstack.  All-zero confuses
+        // Go's panic recovery and can produce corrupted SP/PSTATE on sigreturn.
+        let uc = base.add(SIGFRAME_UCONTEXT);
+        let on_altstack = stack_top != user_sp;
+        core::ptr::write(uc.add(16) as *mut u64, alt_sp);                   // ss_sp
+        core::ptr::write(uc.add(24) as *mut i32,
+            if on_altstack { 1i32 } else { 0i32 });                          // ss_flags (SS_ONSTACK=1)
+        core::ptr::write(uc.add(32) as *mut u64, alt_size);                  // ss_size
+        // uc_sigmask — save the signal mask *before* we block the delivered signal
+        core::ptr::write(uc.add(40) as *mut u64, proc.signal_mask);          // uc_sigmask
+
         // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)
         let mc = base.add(SIGFRAME_MCONTEXT);
         core::ptr::write(mc as *mut u64, fault_addr);
@@ -1637,6 +1649,21 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             core::arch::asm!("dsb ish");
                             core::arch::asm!("isb");
                             (*frame).elr_el1 = elr.wrapping_sub(4);
+                        }
+                        // Check for pending signals before replaying — without this,
+                        // SIGURG preemption is delayed until the next normal syscall,
+                        // adding up to 10ms latency to Go's goroutine preemption.
+                        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                        let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
+                            p.signal_mask
+                        } else {
+                            0
+                        };
+                        if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
+                            unsafe { (*frame).x0 = frame_ref.x0; }
+                            if try_deliver_signal(frame, sig, 0, false) {
+                                return sig as u64;
+                            }
                         }
                         return frame_ref.x0;
                     }

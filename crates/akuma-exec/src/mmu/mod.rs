@@ -1051,6 +1051,87 @@ pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
     }
 }
 
+/// Collect (va, pa) pairs for mapped pages in [va_start, va_start + pages*PAGE_SIZE),
+/// skipping empty L2 entries (2MB / 512 pages at a time).  Much faster than calling
+/// `translate_user_va` per page for sparse regions (e.g. Go heap arenas).
+pub fn collect_mapped_pages_sparse(
+    l0_ptr: *const u64,
+    va_start: usize,
+    pages: usize,
+) -> alloc::vec::Vec<(usize, usize)> {
+    let mut result = alloc::vec::Vec::new();
+    if pages == 0 { return result; }
+    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
+        Some(e) => e,
+        None => return result,
+    };
+
+    // Walk at L2 granularity (2MB = 512 pages).
+    let mut va = va_start;
+    while va < va_end {
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+
+        unsafe {
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 {
+                // Skip entire L0 region (512GB) — clamp to va_end
+                let next = (va | 0x7F_FFFF_FFFF) + 1;
+                va = next.min(va_end);
+                continue;
+            }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 {
+                // Skip entire L1 region (1GB) — clamp to va_end
+                let next = (va | 0x3FFF_FFFF) + 1;
+                va = next.min(va_end);
+                continue;
+            }
+            if l1_entry & flags::TABLE == 0 {
+                // 1GB block mapping — unlikely for user pages, skip
+                let next = (va | 0x3FFF_FFFF) + 1;
+                va = next.min(va_end);
+                continue;
+            }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 {
+                // Skip entire 2MB L2 region (512 pages)
+                let next = (va | 0x1F_FFFF) + 1;
+                va = next.min(va_end);
+                continue;
+            }
+            if l2_entry & flags::TABLE == 0 {
+                // 2MB block mapping — unlikely for user pages, skip
+                let next = (va | 0x1F_FFFF) + 1;
+                va = next.min(va_end);
+                continue;
+            }
+            // Valid L3 table — scan pages within this 2MB range
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let l3_start = (va >> 12) & 0x1FF;
+            let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
+            let l3_end_idx = if l2_range_end == va_end {
+                ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
+            } else {
+                512
+            };
+            for l3_idx in l3_start..l3_end_idx {
+                let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+                if l3_entry & flags::VALID != 0 {
+                    let page_va = (va & !0x1F_FFFF) | (l3_idx << 12);
+                    let pa = ((l3_entry & 0x0000_FFFF_FFFF_F000) as usize) | (page_va & 0xFFF);
+                    result.push((page_va, pa));
+                }
+            }
+            va = l2_range_end;
+        }
+    }
+    result
+}
+
 fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;

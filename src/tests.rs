@@ -252,6 +252,10 @@ pub fn run_memory_tests() -> bool {
     // Regression: Go heap prober mmap-munmap loop + alloc_mmap race (go build WILD-IA crash)
     run_test!(test_mmap_lazy_munmap_no_recycle, "mmap_lazy_munmap_no_recycle");
 
+    // Signal frame layout tests (go build crash: corrupted SP/PSTATE after sigreturn)
+    run_test!(test_signal_frame_uc_stack_offsets, "signal_frame_uc_stack_offsets");
+    run_test!(test_lazy_region_btreemap_boundary_lookup, "lazy_region_btreemap_boundary_lookup");
+
     console::print("\n==================================\n");
     if all_pass {
         console::print("Memory Tests: ALL PASSED\n");
@@ -8027,6 +8031,134 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
 
 // =============================================================================
 // Benchmarks (not correctness tests — they always return true)
+// =============================================================================
+// Signal frame and lazy region regression tests
+// =============================================================================
+
+/// Verify signal frame ucontext layout matches Linux AArch64 ABI.
+/// uc_stack (stack_t) must be at ucontext+16 with fields:
+///   +16: ss_sp (u64), +24: ss_flags (i32 + 4 pad), +32: ss_size (u64)
+/// uc_sigmask at ucontext+40.
+/// mcontext at ucontext+168.
+fn test_signal_frame_uc_stack_offsets() -> bool {
+    use crate::exceptions::{
+        TEST_SIGFRAME_UCONTEXT, TEST_SIGFRAME_MCONTEXT,
+        TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_SIZE,
+    };
+    console::print("  signal_frame_uc_stack_offsets: ");
+
+    // ucontext layout:
+    //   +0:  uc_flags (u64)
+    //   +8:  uc_link  (u64)
+    //   +16: uc_stack.ss_sp    (u64)
+    //   +24: uc_stack.ss_flags (i32 + 4 pad)
+    //   +32: uc_stack.ss_size  (u64)
+    //   +40: uc_sigmask        (u64)
+    //   +48..+168: padding / __reserved
+    //   +168: uc_mcontext (sigcontext)
+
+    let uc_stack_ss_sp = TEST_SIGFRAME_UCONTEXT + 16;
+    let uc_stack_ss_flags = TEST_SIGFRAME_UCONTEXT + 24;
+    let uc_stack_ss_size = TEST_SIGFRAME_UCONTEXT + 32;
+    let uc_sigmask = TEST_SIGFRAME_UC_SIGMASK;
+
+    // uc_sigmask should be at ucontext + 40
+    if uc_sigmask != TEST_SIGFRAME_UCONTEXT + 40 {
+        crate::safe_print!(64, "FAIL: uc_sigmask offset {} != ucontext+40 ({})\n",
+            uc_sigmask, TEST_SIGFRAME_UCONTEXT + 40);
+        return false;
+    }
+
+    // mcontext should be at ucontext + 168 (per Linux AArch64 ABI)
+    if TEST_SIGFRAME_MCONTEXT != TEST_SIGFRAME_UCONTEXT + 168 {
+        crate::safe_print!(64, "FAIL: mcontext offset {} != ucontext+168 ({})\n",
+            TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_UCONTEXT + 168);
+        return false;
+    }
+
+    // ss_sp should be before ss_flags, which is before ss_size, which is before uc_sigmask
+    if !(uc_stack_ss_sp < uc_stack_ss_flags
+        && uc_stack_ss_flags < uc_stack_ss_size
+        && uc_stack_ss_size < uc_sigmask
+        && uc_sigmask < TEST_SIGFRAME_MCONTEXT)
+    {
+        crate::safe_print!(64, "FAIL: uc_stack field ordering broken: ss_sp={} ss_flags={} ss_size={} sigmask={} mctx={}\n",
+            uc_stack_ss_sp, uc_stack_ss_flags, uc_stack_ss_size, uc_sigmask, TEST_SIGFRAME_MCONTEXT);
+        return false;
+    }
+
+    // Frame size must accommodate all sections
+    if TEST_SIGFRAME_SIZE < TEST_SIGFRAME_MCONTEXT + 280 {
+        crate::safe_print!(64, "FAIL: sigframe too small: {} < mcontext+280 ({})\n",
+            TEST_SIGFRAME_SIZE, TEST_SIGFRAME_MCONTEXT + 280);
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Test BTreeMap-based lazy region lookup at boundaries: exact start, last byte,
+/// one-past-end (miss), adjacent regions, and middle-of-region.
+fn test_lazy_region_btreemap_boundary_lookup() -> bool {
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    console::print("  lazy_region_btreemap_boundary: ");
+
+    let test_pid = 99990;
+    clear_lazy_regions(test_pid);
+
+    // Region A: [0x1000_0000, 0x1000_0000 + 0x10000) = 16 pages
+    push_lazy_region(test_pid, 0x1000_0000, 0x10000, 0x3);
+    // Region B: [0x2000_0000, 0x2000_0000 + 0x8000) = 8 pages
+    push_lazy_region(test_pid, 0x2000_0000, 0x8000, 0x3);
+
+    // Exact start of region A
+    if lazy_region_lookup_for_pid(test_pid, 0x1000_0000).is_none() {
+        console::print("FAIL: miss at exact start of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Last byte of region A (last page start)
+    if lazy_region_lookup_for_pid(test_pid, 0x1000_F000).is_none() {
+        console::print("FAIL: miss at last page of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // One past end of region A — should NOT match
+    if lazy_region_lookup_for_pid(test_pid, 0x1001_0000).is_some() {
+        console::print("FAIL: false hit past end of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Before any region
+    if lazy_region_lookup_for_pid(test_pid, 0x0FFF_F000).is_some() {
+        console::print("FAIL: false hit before region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Between regions A and B
+    if lazy_region_lookup_for_pid(test_pid, 0x1800_0000).is_some() {
+        console::print("FAIL: false hit between regions A and B\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Middle of region B
+    if lazy_region_lookup_for_pid(test_pid, 0x2000_4000).is_none() {
+        console::print("FAIL: miss in middle of region B\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    clear_lazy_regions(test_pid);
+    console::print("  PASS\n");
+    true
+}
+
 // =============================================================================
 
 /// Run kernel memory benchmarks.  Prints throughput numbers to serial.

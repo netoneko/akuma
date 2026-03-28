@@ -1462,7 +1462,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_proc.lazy_regions = Vec::new(); // managed via LAZY_REGION_TABLE
     new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
     // #region agent log
-    FORK_IN_PROGRESS.store(false, Ordering::Release);
+    // Keep FORK_IN_PROGRESS=true during lazy copy so TMR heartbeat prints
+    // every 0.5s instead of 5s — makes the slow lazy-copy phase visible.
     (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
     // #endregion
 
@@ -1471,52 +1472,74 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // already demand-paged in the parent (e.g. Go goroutine structs in the
     // Go heap arena) must be explicitly copied so the child doesn't get
     // zeroed pages and dereference a nil goroutine pointer.
-    // copy_range_phys skips unmapped pages, so sparse regions are cheap.
     // We cap total pages to avoid excessive copy time for large heaps.
     {
         const MAX_FORK_LAZY_PAGES: usize = 4096; // 16 MB cap
+        let lazy_start_us = (runtime().uptime_us)();
         let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
             let table = LAZY_REGION_TABLE.lock();
             table.get(&parent_pid)
                 .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
                 .unwrap_or_default()
         });
+        let num_regions = lazy_ranges.len();
         let mut lazy_pages_copied = 0usize;
-        'lazy_copy: for (va, size) in lazy_ranges {
+        let mut lazy_pages_scanned = 0usize;
+        // #region agent log
+        {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[FORK-DBG] lazy: {} regions\n", num_regions));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        }
+        // #endregion
+        'lazy_copy: for (region_idx, (va, size)) in lazy_ranges.into_iter().enumerate() {
             let pages = match fork_page_count_for_len(size) {
                 Some(p) => p,
                 None => continue,
             };
-            for i in 0..pages {
+            // Use L2-level skip: check at 2MB (512 page) granularity first
+            let mapped_pages = mmu::collect_mapped_pages_sparse(parent_l0, va, pages);
+            lazy_pages_scanned += pages;
+            for (page_va, src_phys) in mapped_pages {
                 if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
                     break 'lazy_copy;
                 }
-                let page_off = match i.checked_mul(mmu::PAGE_SIZE) {
-                    Some(o) => o,
-                    None => break 'lazy_copy,
-                };
-                let page_va = match va.checked_add(page_off) {
-                    Some(v) => v,
-                    None => break 'lazy_copy,
-                };
-                if let Some(src_phys) = mmu::translate_user_va(parent_l0, page_va) {
-                    if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
-                        unsafe {
-                            let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
-                            let dst = mmu::phys_to_virt(frame.addr);
-                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
-                        }
-                        lazy_pages_copied += 1;
+                if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
+                    unsafe {
+                        let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
+                        let dst = mmu::phys_to_virt(frame.addr);
+                        core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
                     }
+                    lazy_pages_copied += 1;
                 }
             }
+            // Progress logging every 4 regions
+            if region_idx % 4 == 3 || region_idx == num_regions - 1 {
+                let mut buf = [0u8; 96];
+                let mut pos = 0usize;
+                let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[FORK-DBG] lazy {}/{} copied={} scanned={}\n",
+                        region_idx + 1, num_regions, lazy_pages_copied, lazy_pages_scanned));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            }
         }
-        if config().syscall_debug_info_enabled && lazy_pages_copied > 0 {
-            log::debug!("[fork] copied {} lazy pages from pid={}", lazy_pages_copied, parent_pid);
+        let lazy_elapsed_us = (runtime().uptime_us)() - lazy_start_us;
+        // #region agent log
+        {
+            let mut buf = [0u8; 96];
+            let mut pos = 0usize;
+            let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[FORK-DBG] lazy: {} pages copied, {} scanned in {}µs\n",
+                    lazy_pages_copied, lazy_pages_scanned, lazy_elapsed_us));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
         }
+        // #endregion
     }
-    
+
     // #region agent log
+    FORK_IN_PROGRESS.store(false, Ordering::Release);
     (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
     // #endregion
 

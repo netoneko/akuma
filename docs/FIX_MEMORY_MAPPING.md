@@ -156,7 +156,57 @@ then verify `va < start_va + size`.
 
 ---
 
-## Phase 8: Copy-on-Write Fork (future)
+## Phase 8: Fork Lazy Copy Performance + Signal Frame Fixes
+
+### 8A: Fork lazy copy hang ✅
+
+**Problem:** Fork's lazy page copy iterates every page in every lazy region calling
+`translate_user_va` individually. A mature Go process has 30+ lazy regions totaling hundreds of
+MB of virtual space (Go heap arenas are 64MB each). On QEMU TCG each translate costs ~2–10µs,
+so iterating 50,000–250,000+ pages causes a multi-second hang with no progress output.
+The log ends at `[FORK-DBG] step4: mmap done` and never reaches `step4: lazy done`.
+
+**Fix:**
+1. Keep `FORK_IN_PROGRESS=true` during lazy copy (was set to false before the slow section)
+2. Added per-region progress logging (every 4 regions)
+3. Replaced per-page `translate_user_va` with `collect_mapped_pages_sparse()` — walks page
+   tables at L2 granularity (2MB = 512 pages), skipping empty L0/L1/L2 entries entirely.
+   For a 256MB sparse region with 1% density: 65,536 → ~128 L2 checks + ~650 L3 lookups.
+4. Added timing to lazy copy section.
+
+**Files changed:**
+- `crates/akuma-exec/src/process/mod.rs` — fork lazy copy rewrite
+- `crates/akuma-exec/src/mmu/mod.rs` — new `collect_mapped_pages_sparse()` function
+
+### 8B: Signal frame uc_stack ✅
+
+**Problem:** Signal frame construction zeroes the entire frame but never fills
+`ucontext.uc_stack` (ss_sp, ss_flags, ss_size) or `uc_sigmask`. Go's runtime reads uc_stack
+to determine if the signal arrived on the sigaltstack. All-zero uc_stack confuses Go's panic
+recovery, causing corrupted SP (0x80000000) and PSTATE (all DAIF masked) on sigreturn.
+
+**Fix:** After zeroing the frame, write sigaltstack info into uc_stack fields:
+- `ss_sp` at ucontext+16 (alt_sp)
+- `ss_flags` at ucontext+24 (SS_ONSTACK=1 if on altstack, else 0)
+- `ss_size` at ucontext+32 (alt_size)
+- `uc_sigmask` at ucontext+40 (proc.signal_mask before blocking)
+
+**Files changed:** `src/exceptions.rs` — signal frame construction in `try_deliver_signal`
+
+### 8C: IC flush + signal delivery ✅
+
+**Problem:** JIT IC flush replay path (bogus syscall nr > 500) returns early from the SVC
+handler, bypassing the pending signal delivery check. SIGURG preemption is delayed until the
+next normal syscall, adding up to 10ms latency to Go's goroutine preemption.
+
+**Fix:** Added pending signal check after IC flush + ELR backup, before returning. If a
+signal is pending (e.g. SIGURG), deliver it immediately via `try_deliver_signal`.
+
+**Files changed:** `src/exceptions.rs` — IC flush path in `sync_el0_handler`
+
+---
+
+## Phase 9: Copy-on-Write Fork (future)
 
 **Not yet implemented.** Highest impact (eliminates the multi-second fork copy for Go's 50+ MB
 heap) but most complex. Requires:
@@ -165,7 +215,7 @@ heap) but most complex. Requires:
 3. Write permission fault handler in DA path
 4. Feature gate behind `config::COW_FORK_ENABLED`
 
-Deferred until Phases 1–7 have stabilized the system under `go build`.
+Deferred until Phases 1–8 have stabilized the system under `go build`.
 
 ---
 
