@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+WITH_FORKTEST=false
+for arg in "$@"; do
+    case "$arg" in
+        --with-forktest) WITH_FORKTEST=true ;;
+    esac
+done
+
 # List of members to build (excluding those known to fail with std issues)
 MEMBERS=(
     "libakuma"
@@ -131,6 +138,19 @@ cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
 DASH_BIN="../bootstrap/bin/dash"
 if [ -f "$DASH_BIN" ]; then
     cp "$DASH_BIN" "../bootstrap/bin/sh"
+fi
+
+# Build forktest (Go, opt-in via --with-forktest)
+if [ "$WITH_FORKTEST" = true ]; then
+    echo "Building forktest (Go)..."
+    (
+        cd forktest
+        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_child ./child
+        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_parent ./parent
+    )
+    cp forktest/forktest_child ../bootstrap/bin/
+    cp forktest/forktest_parent ../bootstrap/bin/
+    echo "forktest binaries copied to bootstrap/bin/"
 fi
 
 echo "Build process completed."
