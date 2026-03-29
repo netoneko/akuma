@@ -1,9 +1,10 @@
+use alloc::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 struct KernelEventFd {
     counter: u64,
     flags: u32,
-    reader_thread: Option<usize>,
+    pollers: BTreeSet<usize>,
     ref_count: u32,
 }
 
@@ -20,7 +21,7 @@ pub(crate) fn eventfd_create(initval: u32, flags: u32) -> u32 {
         EVENTFDS.lock().insert(id, KernelEventFd {
             counter: initval as u64,
             flags,
-            reader_thread: None,
+            pollers: BTreeSet::new(),
             ref_count: 1,
         });
     });
@@ -42,6 +43,13 @@ pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
                 efd.counter = 0;
                 v
             };
+            
+            // Wake other pollers (e.g. ones waiting for it to become writable,
+            // though eventfd is always writable in this implementation).
+            while let Some(tid) = efd.pollers.pop_first() {
+                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            }
+
             Ok(val)
         } else {
             Err(akuma_net::socket::libc_errno::EBADF)
@@ -57,17 +65,17 @@ pub(crate) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                 crate::tprint!(96, "[eventfd] write id={} val={} counter={}\n", id, val, efd.counter);
             }
-            if let Some(tid) = efd.reader_thread.take() {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(64, "[eventfd] waking reader thread {}\n", tid);
-                }
+            
+            // Wake all pollers
+            while let Some(tid) = efd.pollers.pop_first() {
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
-            Ok(())
+
+            Ok(val)
         } else {
             Err(akuma_net::socket::libc_errno::EBADF)
         }
-    })
+    }).map(|_| ())
 }
 
 pub(super) fn eventfd_can_read(id: u32) -> bool {
@@ -109,10 +117,10 @@ pub fn eventfd_close(id: u32) {
     });
 }
 
-pub(super) fn eventfd_set_reader_thread(id: u32, tid: usize) {
+pub(crate) fn eventfd_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
-            efd.reader_thread = Some(tid);
+            efd.pollers.insert(tid);
         }
     });
 }

@@ -2,6 +2,8 @@ use super::*;
 use akuma_net::socket;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use core::sync::atomic::AtomicU64;
+use core::task::Waker;
+use alloc::collections::BTreeMap;
 
 struct EpollEntry {
     events: u32,
@@ -53,10 +55,10 @@ struct PollFd {
 // Layout: events (4 bytes) + padding (4 bytes) + data (8 bytes) = 16 bytes total
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct EpollEvent {
-    events: u32,
-    _pad: u32,  // ARM64 ABI padding
-    data: u64,
+pub(crate) struct EpollEvent {
+    pub(crate) events: u32,
+    pub(crate) _pad: u32,  // ARM64 ABI padding
+    pub(crate) data: u64,
 }
 
 /// One line per epoll_pwait return. Suppresses most `timeout=0, nready=0` returns (see config).
@@ -137,11 +139,20 @@ pub fn epoll_destroy(epoll_id: u32) {
 /// Without this, if new data arrives within the same 10ms poll window as the drain,
 /// the transition is missed and EPOLLIN never re-fires.
 pub(super) fn epoll_on_fd_drained(fd: u32) {
-    let mut table = EPOLL_TABLE.lock();
-    for inst in table.values_mut() {
-        if let Some(entry) = inst.interest_list.get_mut(&fd) {
-            if entry.events & EPOLLET != 0 {
-                entry.last_ready &= !EPOLLIN;
+    // Snapshot IDs to avoid holding EPOLL_TABLE lock during the entire iteration
+    // (though not strictly necessary for this simple function yet, good practice)
+    let ids: alloc::vec::Vec<u32> = {
+        let table = EPOLL_TABLE.lock();
+        table.keys().copied().collect()
+    };
+
+    for epoll_id in ids {
+        let mut table = EPOLL_TABLE.lock();
+        if let Some(inst) = table.get_mut(&epoll_id) {
+            if let Some(entry) = inst.interest_list.get_mut(&fd) {
+                if entry.events & EPOLLET != 0 {
+                    entry.last_ready &= !EPOLLIN;
+                }
             }
         }
     }
@@ -149,7 +160,7 @@ pub(super) fn epoll_on_fd_drained(fd: u32) {
 
 const EPOLL_CLOEXEC: u32 = 0o2000000;
 
-pub(super) fn sys_epoll_create1(flags: u32) -> u64 {
+pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
@@ -166,7 +177,7 @@ pub(super) fn sys_epoll_create1(flags: u32) -> u64 {
     }
 }
 
-pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
+pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
@@ -232,7 +243,7 @@ pub(super) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
     }
 }
 
-pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
+pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
     let fd_entry = akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num));
     let fd_entry = match fd_entry {
         Some(e) => e,
@@ -240,9 +251,14 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
     };
 
     let mut ready = 0u32;
+    let tid = akuma_exec::threading::current_thread_id();
 
     match fd_entry {
         akuma_exec::process::FileDescriptor::Socket(idx) => {
+            if let Some(w) = waker {
+                socket::socket_add_waker(idx, w.clone());
+            }
+
             if socket::is_udp_socket(idx) {
                 if let Some(handle) = super::net::socket_get_udp_handle(idx) {
                     let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
@@ -276,6 +292,9 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
             }
         }
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+            if waker.is_some() {
+                super::eventfd::eventfd_add_poller(efd_id, tid);
+            }
             let can_read = super::eventfd::eventfd_can_read(efd_id);
             if requested & EPOLLIN != 0 && can_read {
                 ready |= EPOLLIN;
@@ -287,6 +306,9 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
             if requested & EPOLLIN != 0 {
                 if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
+                    if waker.is_some() {
+                        ch.add_poller(tid);
+                    }
                     if ch.has_stdout_data() || ch.has_exited() {
                         ready |= EPOLLIN;
                     }
@@ -298,31 +320,53 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             if requested & EPOLLIN != 0 {
                 // Register for wakeup notifications
-                super::pipe::pipe_add_poller(pipe_id, akuma_exec::threading::current_thread_id());
+                if waker.is_some() {
+                    super::pipe::pipe_add_poller(pipe_id, tid);
+                }
                 if super::pipe::pipe_can_read(pipe_id) {
                     ready |= EPOLLIN;
                 }
             }
         }
         akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-            if requested & EPOLLOUT != 0 && super::pipe::pipe_can_write(pipe_id) {
-                ready |= EPOLLOUT;
+            if requested & EPOLLOUT != 0 {
+                super::pipe::pipe_add_poller(pipe_id, tid);
+                if super::pipe::pipe_can_write(pipe_id) {
+                    ready |= EPOLLOUT;
+                }
             }
         }
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
-            if requested & EPOLLIN != 0 && super::timerfd::timerfd_can_read(timer_id) {
-                ready |= EPOLLIN;
+            if requested & EPOLLIN != 0 {
+                if waker.is_some() {
+                    super::timerfd::timerfd_add_poller(timer_id, tid);
+                }
+                if super::timerfd::timerfd_can_read(timer_id) {
+                    ready |= EPOLLIN;
+                }
             }
         }
         akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
             // A pidfd becomes readable (EPOLLIN) when the tracked process has exited.
-            if requested & EPOLLIN != 0 && super::pidfd::pidfd_can_read(pidfd_id) {
-                ready |= EPOLLIN;
+            if requested & EPOLLIN != 0 {
+                if let Some(target_pid) = super::pidfd::pidfd_get_pid(pidfd_id) {
+                    if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
+                        if waker.is_some() {
+                            ch.add_poller(tid);
+                        }
+                    }
+                }
+                if super::pidfd::pidfd_can_read(pidfd_id) {
+                    ready |= EPOLLIN;
+                }
             }
         }
         akuma_exec::process::FileDescriptor::Stdin => {
             if requested & EPOLLIN != 0 {
                 if let Some(ch) = akuma_exec::process::current_channel() {
+                    if waker.is_some() {
+                        ch.add_poller(tid);
+                    }
                     if ch.has_stdin_data() {
                         ready |= EPOLLIN;
                     }
@@ -343,7 +387,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32) -> u32 {
     ready
 }
 
-pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+pub(crate) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
     const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
     
     if maxevents <= 0 { return EINVAL; }
@@ -362,36 +406,81 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         0
     };
     let start_time = crate::timer::uptime_us();
+    let waker = akuma_exec::threading::current_thread_waker();
 
     let mut iterations = 0u64;
     loop {
         iterations += 1;
+        
+        // Drive network stack (only once per loop)
         akuma_net::smoltcp_net::poll();
 
-        let interest_snapshot: Vec<(u32, u32, u64, u32)> = {
+        let mut kernel_events = alloc::vec![];
+        let mut ready_count = 0usize;
+
+        // Snapshot interest list to avoid holding EPOLL_TABLE lock during readiness checks.
+        // This prevents deadlock with PROCESS_TABLE lock (which readiness checks need).
+        // We use a stack-allocated array for common small interest lists (up to 128).
+        const STACK_SNAPSHOT_SIZE: usize = 128;
+        let mut stack_snapshot = [0u32; STACK_SNAPSHOT_SIZE];
+        let mut heap_snapshot = None;
+        let snapshot_count;
+
+        {
             let table = EPOLL_TABLE.lock();
-            match table.get(&epoll_id) {
-                Some(inst) => inst.interest_list.iter()
-                    .map(|(&fd, entry)| (fd, entry.events, entry.data, entry.last_ready))
-                    .collect(),
+            let instance = match table.get(&epoll_id) {
+                Some(inst) => inst,
                 None => return EBADF,
+            };
+
+            snapshot_count = instance.interest_list.len();
+            if snapshot_count <= STACK_SNAPSHOT_SIZE {
+                for (i, (&fd, _)) in instance.interest_list.iter().enumerate() {
+                    stack_snapshot[i] = fd;
+                }
+            } else {
+                heap_snapshot = Some(instance.interest_list.keys().copied().collect::<alloc::vec::Vec<u32>>());
             }
+        }
+
+        let fds: &[u32] = if let Some(ref h) = heap_snapshot { 
+            h 
+        } else { 
+            &stack_snapshot[..snapshot_count] 
         };
 
-        let mut ready_count = 0usize;
-        let mut kernel_events = alloc::vec![];
-        let mut readiness_updates: Vec<(u32, u32)> = alloc::vec![];
-
-        for &(fd, raw_events, data, last_ready) in &interest_snapshot {
+        for &fd in fds {
             if ready_count >= maxevents { break; }
+
+            // Re-acquire lock to get entry details (MUST NOT hold during readiness check)
+            let entry_info = {
+                let table = EPOLL_TABLE.lock();
+                table.get(&epoll_id).and_then(|inst| inst.interest_list.get(&fd)).map(|e| (e.events, e.data, e.last_ready))
+            };
+
+            let (raw_events, data, last_ready) = match entry_info {
+                Some(info) => info,
+                None => continue, // FD removed from epoll interest during loop
+            };
 
             let is_et = raw_events & EPOLLET != 0;
             let requested = raw_events & EPOLL_EVENT_MASK;
-            let revents = epoll_check_fd_readiness(fd, requested);
+            
+            // Pass waker to register interest for event-driven wakeups.
+            // epoll_check_fd_readiness locks PROCESS_TABLE.
+            let revents = epoll_check_fd_readiness(fd, requested, Some(&waker));
 
             if is_et {
                 let new_bits = revents & !last_ready;
-                readiness_updates.push((fd, revents));
+                // Update last_ready in the table
+                {
+                    let mut table = EPOLL_TABLE.lock();
+                    if let Some(inst) = table.get_mut(&epoll_id) {
+                        if let Some(entry) = inst.interest_list.get_mut(&fd) {
+                            entry.last_ready = revents;
+                        }
+                    }
+                }
                 if new_bits != 0 {
                     kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
                     ready_count += 1;
@@ -400,17 +489,6 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 if revents != 0 {
                     kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
                     ready_count += 1;
-                }
-            }
-        }
-
-        if !readiness_updates.is_empty() {
-            let mut table = EPOLL_TABLE.lock();
-            if let Some(inst) = table.get_mut(&epoll_id) {
-                for (fd, cur_ready) in readiness_updates {
-                    if let Some(entry) = inst.interest_list.get_mut(&fd) {
-                        entry.last_ready = cur_ready;
-                    }
                 }
             }
         }
@@ -425,7 +503,7 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 ready_count,
                 iterations,
                 start_time,
-                interest_snapshot.len(),
+                0,
                 &kernel_events,
                 "",
             );
@@ -439,7 +517,7 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 0,
                 iterations,
                 start_time,
-                interest_snapshot.len(),
+                0,
                 &[],
                 "",
             );
@@ -455,7 +533,7 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                     0,
                     iterations,
                     start_time,
-                    interest_snapshot.len(),
+                    0,
                     &[],
                     "timeout_expired",
                 );
@@ -467,8 +545,8 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations % 500 == 0 {
             let elapsed = crate::timer::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed, {} fds\n", 
-                pid, epfd, elapsed, interest_snapshot.len());
+            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n", 
+                pid, epfd, elapsed);
         }
 
         if akuma_exec::process::is_current_interrupted() {
@@ -478,18 +556,17 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 0,
                 iterations,
                 start_time,
-                interest_snapshot.len(),
+                0,
                 &[],
                 "EINTR",
             );
             return EINTR;
         }
 
-        // Always cap the per-iteration sleep to BLOCKING_POLL_INTERVAL_US (10ms).
-        // For positive timeouts, epoll_wait_deadline returns start_time + timeout_us
-        // which can be hours/days away — schedule_blocking would then sleep the entire
-        // duration since there is no eventfd wake() for epoll waiters.  We check
-        // expiry above so it is safe to poll every 10ms regardless of timeout.
+        // With the waker mechanism, we can now block more efficiently.
+        // We still use a 10ms cap for safety and for resources that don't
+        // yet support wakers (like TimerFd), but network events will
+        // now wake us up IMMEDIATELY.
         let abs_deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
         if abs_deadline == 0 {
             log_epoll_pwait_return(
@@ -498,7 +575,7 @@ pub(super) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 0,
                 iterations,
                 start_time,
-                interest_snapshot.len(),
+                0,
                 &[],
                 "deadline_abs0",
             );
@@ -562,7 +639,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             let in_write = orig_write[word] & mask != 0;
             if !in_read && !in_write { continue; }
 
-            let socket_idx = if fd > 2 {
+            let _socket_idx = if fd > 2 {
                 if let Some(proc) = akuma_exec::process::current_process() {
                     if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
                         Some(idx)
@@ -570,33 +647,13 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
                 } else { None }
             } else { None };
 
-            if in_read {
-                let readable = if fd == 0 {
-                    akuma_exec::process::current_channel().map_or(false, |ch| ch.has_stdin_data())
-                } else if let Some(idx) = socket_idx {
-                    if socket::is_udp_socket(idx) {
-                        super::net::socket_get_udp_handle(idx).map_or(false, |h| akuma_net::smoltcp_net::udp_can_recv(h))
-                    } else {
-                        super::net::socket_can_recv_tcp(idx)
-                    }
-                } else {
-                    fd > 2
-                };
-                if readable { out_read[word] |= mask; ready_count += 1; }
-            }
+            let mut requested = 0u32;
+            if in_read { requested |= EPOLLIN; }
+            if in_write { requested |= EPOLLOUT; }
 
-            if in_write {
-                let writable = if let Some(idx) = socket_idx {
-                    if socket::is_udp_socket(idx) {
-                        super::net::socket_get_udp_handle(idx).map_or(false, |h| akuma_net::smoltcp_net::udp_can_send(h))
-                    } else {
-                        super::net::socket_can_send_tcp(idx)
-                    }
-                } else {
-                    true
-                };
-                if writable { out_write[word] |= mask; ready_count += 1; }
-            }
+            let revents = epoll_check_fd_readiness(fd as u32, requested, None);
+            if in_read && (revents & EPOLLIN != 0) { out_read[word] |= mask; ready_count += 1; }
+            if in_write && (revents & EPOLLOUT != 0) { out_write[word] |= mask; ready_count += 1; }
         }
 
         if ready_count > 0 {
@@ -668,69 +725,18 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         
         for fd in kernel_fds.iter_mut() {
             fd.revents = 0;
-
             if fd.fd < 0 { continue; }
 
-            let fd_entry = if fd.fd > 2 {
-                akuma_exec::process::current_process().and_then(|p| p.get_fd(fd.fd as u32))
-            } else {
-                None
-            };
+            let mut requested = 0u32;
+            if fd.events & 1 != 0 { requested |= EPOLLIN; }
+            if fd.events & 4 != 0 { requested |= EPOLLOUT; }
 
-            let socket_idx = match &fd_entry {
-                Some(akuma_exec::process::FileDescriptor::Socket(idx)) => Some(*idx),
-                _ => None,
-            };
-            let eventfd_id = match &fd_entry {
-                Some(akuma_exec::process::FileDescriptor::EventFd(id)) => Some(*id),
-                _ => None,
-            };
-
-            if fd.events & 1 != 0 {
-                if fd.fd == 0 {
-                    if let Some(ch) = akuma_exec::process::current_channel() {
-                        if ch.has_stdin_data() {
-                            fd.revents |= 1;
-                        }
-                    }
-                } else if let Some(efd_id) = eventfd_id {
-                    if super::eventfd::eventfd_can_read(efd_id) {
-                        fd.revents |= 1;
-                    }
-                } else if let Some(idx) = socket_idx {
-                    if socket::is_udp_socket(idx) {
-                        if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                            if akuma_net::smoltcp_net::udp_can_recv(handle) {
-                                fd.revents |= 1;
-                            }
-                        }
-                    } else {
-                        if super::net::socket_can_recv_tcp(idx) {
-                            fd.revents |= 1;
-                        }
-                    }
-                } else if fd.fd > 2 {
-                    fd.revents |= 1;
-                }
-            }
-
-            if fd.events & 4 != 0 {
-                if eventfd_id.is_some() {
-                    fd.revents |= 4;
-                } else if let Some(idx) = socket_idx {
-                    if socket::is_udp_socket(idx) {
-                        if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                            if akuma_net::smoltcp_net::udp_can_send(handle) {
-                                fd.revents |= 4;
-                            }
-                        }
-                    } else if super::net::socket_can_send_tcp(idx) {
-                        fd.revents |= 4;
-                    }
-                } else if fd.fd == 1 || fd.fd == 2 || fd.fd > 2 {
-                    fd.revents |= 4;
-                }
-            }
+            let revents = epoll_check_fd_readiness(fd.fd as u32, requested, None);
+            
+            if (revents & EPOLLIN != 0) && (fd.events & 1 != 0) { fd.revents |= 1; }
+            if (revents & EPOLLOUT != 0) && (fd.events & 4 != 0) { fd.revents |= 4; }
+            if revents & EPOLLHUP != 0 { fd.revents |= 16; } // POLLHUP = 0x10
+            if revents & EPOLLERR != 0 { fd.revents |= 8; }  // POLLERR = 0x08
 
             if fd.revents != 0 {
                 ready_count += 1;

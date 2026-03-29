@@ -10,6 +10,15 @@ use alloc::string::ToString;
 use alloc::collections::BTreeSet;
 use alloc::format;
 
+/// Run process tests that require the network stack (call after network init)
+pub fn run_network_tests() {
+    console::print("\n--- Process Network Tests ---\n");
+
+    test_epoll_socket_waker();
+    test_epoll_poll_socket_readiness_no_deadlock();
+    test_epoll_check_fd_readiness_unknown_fd();
+}
+
 /// Run all process tests
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
@@ -28,6 +37,9 @@ pub fn run_all_tests() {
 
     // Test Linux compatibility bridging (vfork/execve)
     test_linux_process_abi();
+
+    // Test epoll multi poller pipe
+    test_epoll_multi_poller_pipe();
 
     // Test waitid WNOHANG with no children returns ECHILD
     test_waitid_stub();
@@ -1846,7 +1858,8 @@ fn test_pipe_check_set_reader_data_available() {
     let tid = akuma_exec::threading::current_thread_id();
     let should_not_block = pipe_check_set_reader(id, tid);
     // reader_thread must NOT be set (we returned early)
-    let reader_set = pipe_reader_thread(id).is_some();
+    let tid = akuma_exec::threading::current_thread_id();
+    let reader_set = pipe_is_poller_registered(id, tid);
     if should_not_block && !reader_set {
         console::print("[Test] pipe_check_set_reader_data_available PASSED\n");
     } else {
@@ -1881,7 +1894,7 @@ fn test_pipe_check_set_reader_no_data_registers() {
     let id = pipe_create(); // write_count=1, buffer empty
     let tid = akuma_exec::threading::current_thread_id();
     let should_block = !pipe_check_set_reader(id, tid);
-    let registered = pipe_reader_thread(id) == Some(tid);
+    let registered = pipe_is_poller_registered(id, tid);
     if should_block && registered {
         console::print("[Test] pipe_check_set_reader_no_data_registers PASSED\n");
     } else {
@@ -1923,11 +1936,12 @@ fn test_pipe_write_wakes_registered_reader() {
     }
     // Write — should clear reader_thread via take()
     pipe_write(id, b"wake").unwrap();
-    let reader_still_set = pipe_reader_thread(id).is_some();
+    let tid = akuma_exec::threading::current_thread_id();
+    let reader_still_set = pipe_is_poller_registered(id, tid);
     if !reader_still_set {
         console::print("[Test] pipe_write_wakes_registered_reader PASSED\n");
     } else {
-        console::print("[Test] pipe_write_wakes_registered_reader FAILED: reader_thread still set after write\n");
+        console::print("[Test] pipe_write_wakes_registered_reader FAILED: reader still in poller set after write\n");
     }
     pipe_close_write(id);
     pipe_close_read(id);
@@ -2275,6 +2289,277 @@ fn test_two_child_sequential_exit() {
     console::print("[Test] two_child_sequential_exit PASSED\n");
 }
 
+/// Test that epoll_pwait is woken immediately by a socket event.
+fn test_epoll_socket_waker() {
+    use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+    
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8001u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    // Create epoll instance
+    let epfd = sys_epoll_create1(0);
+    if epfd >= 1024 {
+        crate::safe_print!(128, "[Test] test_epoll_socket_waker FAILED: sys_epoll_create1 returned error 0x{:x}\n", epfd);
+        unregister_process(pid);
+        unregister_thread_pid(tid);
+        return;
+    }
+
+    let current_proc = akuma_exec::process::current_process().unwrap();
+
+    let sock_idx = akuma_net::socket::alloc_socket(1).expect("Failed to create socket");
+    let fd = current_proc.alloc_fd(FileDescriptor::Socket(sock_idx));
+
+    // Register socket for EPOLLIN
+    let mut ev = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 0xDEADBEEF };
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd, &mut ev as *mut _ as usize);
+
+    // In a background thread, wait 5ms then simulate data arrival
+    akuma_exec::threading::spawn_user_thread_fn(move || {
+        let start = crate::timer::uptime_us();
+        while crate::timer::uptime_us() - start < 5000 {
+            akuma_exec::threading::yield_now();
+        }
+        
+        // Simulate data arrival by waking wakers
+        akuma_net::socket::with_socket(sock_idx, |sock| {
+            sock.wake_all();
+        });
+
+        loop { akuma_exec::threading::yield_now(); }
+    }).expect("Failed to spawn waker thread");
+
+    // Wait for event with a large timeout (1s)
+    let mut out_events = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
+    let start = crate::timer::uptime_us();
+    let nready = sys_epoll_pwait(epfd as u32, out_events.as_mut_ptr() as usize, 1, 1000);
+    let end = crate::timer::uptime_us();
+    
+    let elapsed = end - start;
+    
+    // Cleanup
+    akuma_net::socket::remove_socket(sock_idx);
+    current_proc.remove_fd(fd);
+    if let Some(FileDescriptor::EpollFd(ep_id)) = current_proc.remove_fd(epfd as u32) {
+        crate::syscall::poll::epoll_destroy(ep_id);
+    }
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if nready == 1 && out_events[0].data == 0xDEADBEEF {
+        // We expect it to take slightly more than 5ms (because of the delay in the thread),
+        // but it should NOT take 10ms (the old poll interval) if it was woken immediately.
+        // If it takes >10ms, it might have missed the immediate wakeup.
+        if elapsed < 8000 {
+            console::print("[Test] test_epoll_socket_waker PASSED\n");
+        } else {
+            crate::safe_print!(128, "[Test] test_epoll_socket_waker FAILED: latency too high ({}us)\n", elapsed);
+        }
+    } else {
+        crate::safe_print!(128, "[Test] test_epoll_socket_waker FAILED: nready={} data=0x{:x}\n", nready, out_events[0].data);
+    }
+}
+
+/// Test that concurrent smoltcp::poll() and epoll_check_fd_readiness (socket path)
+/// don't deadlock. poll() acquires NETWORK→SOCKET_TABLE; socket readiness helpers
+/// acquire SOCKET_TABLE→NETWORK. This is an AB-BA deadlock if both run concurrently.
+fn test_epoll_poll_socket_readiness_no_deadlock() {
+    use crate::syscall::poll::epoll_check_fd_readiness;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8010u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    let current_proc = akuma_exec::process::current_process().unwrap();
+    let sock_idx = akuma_net::socket::alloc_socket(1).expect("Failed to create socket for deadlock test");
+    let fd = current_proc.alloc_fd(FileDescriptor::Socket(sock_idx));
+
+    static POLL_ITERS: AtomicU32 = AtomicU32::new(0);
+    static CHECK_ITERS: AtomicU32 = AtomicU32::new(0);
+    POLL_ITERS.store(0, Ordering::SeqCst);
+    CHECK_ITERS.store(0, Ordering::SeqCst);
+    const TARGET_ITERS: u32 = 200;
+
+    let _poller_thread = akuma_exec::threading::spawn_user_thread_fn(move || {
+        for _ in 0..TARGET_ITERS {
+            akuma_net::smoltcp_net::poll();
+            POLL_ITERS.fetch_add(1, Ordering::SeqCst);
+            akuma_exec::threading::yield_now();
+        }
+        loop { akuma_exec::threading::yield_now(); }
+    }).expect("Failed to spawn poller thread");
+
+    let _checker_thread = akuma_exec::threading::spawn_user_thread_fn(move || {
+        let my_tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::process::register_thread_pid(my_tid, pid);
+        for _ in 0..TARGET_ITERS {
+            let _ = epoll_check_fd_readiness(fd, 0x001 | 0x004, None);
+            CHECK_ITERS.fetch_add(1, Ordering::SeqCst);
+            akuma_exec::threading::yield_now();
+        }
+        akuma_exec::process::unregister_thread_pid(my_tid);
+        loop { akuma_exec::threading::yield_now(); }
+    }).expect("Failed to spawn checker thread");
+
+    let start = crate::timer::uptime_us();
+    let timeout_us = 5_000_000; // 5 seconds
+    loop {
+        let p = POLL_ITERS.load(Ordering::SeqCst);
+        let c = CHECK_ITERS.load(Ordering::SeqCst);
+        if p >= TARGET_ITERS && c >= TARGET_ITERS {
+            break;
+        }
+        if crate::timer::uptime_us() - start > timeout_us {
+            crate::safe_print!(
+                192,
+                "[Test] test_epoll_poll_socket_readiness_no_deadlock FAILED: likely deadlock poll_iters={} check_iters={}\n",
+                p, c
+            );
+            akuma_net::socket::remove_socket(sock_idx);
+            current_proc.remove_fd(fd);
+            unregister_process(pid);
+            unregister_thread_pid(tid);
+            return;
+        }
+        akuma_exec::threading::yield_now();
+    }
+
+    akuma_net::socket::remove_socket(sock_idx);
+    current_proc.remove_fd(fd);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+    console::print("[Test] test_epoll_poll_socket_readiness_no_deadlock PASSED\n");
+}
+
+/// Test that epoll_check_fd_readiness returns EPOLLHUP|EPOLLERR for an fd number
+/// that doesn't exist in the process fd table, rather than hanging or panicking.
+fn test_epoll_check_fd_readiness_unknown_fd() {
+    use crate::syscall::poll::epoll_check_fd_readiness;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8011u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLHUP: u32 = 0x010;
+    const EPOLLERR: u32 = 0x008;
+
+    let result = epoll_check_fd_readiness(999, EPOLLIN, None);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if result == (EPOLLHUP | EPOLLERR) {
+        console::print("[Test] test_epoll_check_fd_readiness_unknown_fd PASSED\n");
+    } else {
+        crate::safe_print!(
+            128,
+            "[Test] test_epoll_check_fd_readiness_unknown_fd FAILED: got 0x{:x} expected 0x{:x}\n",
+            result, EPOLLHUP | EPOLLERR
+        );
+    }
+}
+
+/// Test that multiple epoll instances waiting on the same pipe are all woken.
+fn test_epoll_multi_poller_pipe() {
+    use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    use crate::syscall::pipe::{pipe_create, pipe_write, pipe_close_write, pipe_close_read};
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8002u32;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    let pipe_id = pipe_create();
+    let current_proc = akuma_exec::process::current_process().unwrap();
+    let fd_r = current_proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    // Create two epoll instances
+    let epfd1 = sys_epoll_create1(0);
+    let epfd2 = sys_epoll_create1(0);
+
+    // Register pipe for EPOLLIN in both
+    let mut ev1 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 1 };
+    sys_epoll_ctl(epfd1 as u32, 1 /* ADD */, fd_r, &mut ev1 as *mut _ as usize);
+    let mut ev2 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 2 };
+    sys_epoll_ctl(epfd2 as u32, 1 /* ADD */, fd_r, &mut ev2 as *mut _ as usize);
+
+    static WOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
+    WOKEN_COUNT.store(0, Ordering::SeqCst);
+
+    // Spawn two threads to wait on the two epoll instances.
+    // Each thread must register with the process so sys_epoll_pwait can
+    // find the fd table via current_process().
+    let _thread1 = akuma_exec::threading::spawn_user_thread_fn(move || {
+        let my_tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::process::register_thread_pid(my_tid, pid);
+        let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
+        if sys_epoll_pwait(epfd1 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
+            WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        akuma_exec::process::unregister_thread_pid(my_tid);
+        loop { akuma_exec::threading::yield_now(); }
+    }).expect("thread 1 spawn failed");
+
+    let _thread2 = akuma_exec::threading::spawn_user_thread_fn(move || {
+        let my_tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::process::register_thread_pid(my_tid, pid);
+        let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
+        if sys_epoll_pwait(epfd2 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
+            WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        akuma_exec::process::unregister_thread_pid(my_tid);
+        loop { akuma_exec::threading::yield_now(); }
+    }).expect("thread 2 spawn failed");
+
+    // Small delay to ensure they are waiting
+    let wait_start = crate::timer::uptime_us();
+    while crate::timer::uptime_us() - wait_start < 2000 { akuma_exec::threading::yield_now(); }
+
+    // Trigger event
+    pipe_write(pipe_id, b"data").unwrap();
+
+    // Wait for both to be woken
+    let wait_start = crate::timer::uptime_us();
+    while WOKEN_COUNT.load(Ordering::SeqCst) < 2 && (crate::timer::uptime_us() - wait_start < 10000) {
+        akuma_exec::threading::yield_now();
+    }
+
+    let final_count = WOKEN_COUNT.load(Ordering::SeqCst);
+
+    // Cleanup
+    pipe_close_write(pipe_id);
+    pipe_close_read(pipe_id);
+    current_proc.remove_fd(fd_r);
+    if let Some(FileDescriptor::EpollFd(ep_id)) = current_proc.remove_fd(epfd1 as u32) {
+        crate::syscall::poll::epoll_destroy(ep_id);
+    }
+    if let Some(FileDescriptor::EpollFd(ep_id)) = current_proc.remove_fd(epfd2 as u32) {
+        crate::syscall::poll::epoll_destroy(ep_id);
+    }
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if final_count == 2 {
+        console::print("[Test] test_epoll_multi_poller_pipe PASSED\n");
+    } else {
+        crate::safe_print!(128, "[Test] test_epoll_multi_poller_pipe FAILED: woken={} (expected 2)\n", final_count);
+    }
+}
+
 /// Synthetic epoll readiness test for pidfd: register a pidfd in a process fd
 /// table, check that `epoll_check_fd_readiness` returns 0 before exit and
 /// EPOLLIN after exit.  Exercises the same code path that `sys_epoll_pwait` uses.
@@ -2304,7 +2589,7 @@ fn test_epoll_pidfd_readiness_on_exit() {
     const EPOLLIN: u32 = 0x001;
 
     // Before exit: readiness must be 0.
-    let before = epoll_check_fd_readiness(fd_num, EPOLLIN);
+    let before = epoll_check_fd_readiness(fd_num, EPOLLIN, None);
     if before != 0 {
         crate::safe_print!(96, "[Test] epoll_pidfd_readiness FAILED: before exit got 0x{:x}\n", before);
         unregister_process(parent_pid);
@@ -2318,7 +2603,7 @@ fn test_epoll_pidfd_readiness_on_exit() {
     ch.set_exited(0);
 
     // After exit: readiness must include EPOLLIN.
-    let after = epoll_check_fd_readiness(fd_num, EPOLLIN);
+    let after = epoll_check_fd_readiness(fd_num, EPOLLIN, None);
     if after & EPOLLIN == 0 {
         crate::safe_print!(96, "[Test] epoll_pidfd_readiness FAILED: after exit got 0x{:x}\n", after);
         unregister_process(parent_pid);

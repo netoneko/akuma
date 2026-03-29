@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -26,8 +26,8 @@ pub struct ProcessChannel {
     raw_mode: AtomicBool,
     /// Stdin closed flag (true if no more data will be written to stdin)
     stdin_closed: AtomicBool,
-    /// Thread ID of a blocking reader waiting for output
-    reader_thread: Spinlock<Option<usize>>,
+    /// Threads waiting for output (epoll, blocking read)
+    pollers: Spinlock<BTreeSet<usize>>,
 }
 
 /// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
@@ -44,7 +44,7 @@ impl ProcessChannel {
             interrupted: AtomicBool::new(false),
             raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
-            reader_thread: Spinlock::new(None),
+            pollers: Spinlock::new(BTreeSet::new()),
         }
     }
 
@@ -104,8 +104,9 @@ impl ProcessChannel {
             }
         });
 
-        // Wake any blocking reader waiting for this data
-        if let Some(tid) = self.reader_thread.lock().take() {
+        // Wake all pollers waiting for output
+        let mut pollers = self.pollers.lock();
+        while let Some(tid) = pollers.pop_first() {
             crate::threading::get_waker_for_thread(tid).wake();
         }
     }
@@ -140,9 +141,19 @@ impl ProcessChannel {
 
         if n == 0 {
             // Register current thread as reader so it can be woken by next write
-            *self.reader_thread.lock() = Some(crate::threading::current_thread_id());
+            self.add_poller(crate::threading::current_thread_id());
         }
         n
+    }
+
+    /// Register a thread to be woken when new data arrives or the process exits.
+    pub fn add_poller(&self, tid: usize) {
+        self.pollers.lock().insert(tid);
+    }
+
+    /// Check if a thread is registered as a poller (test helper).
+    pub fn is_poller_registered(&self, tid: usize) -> bool {
+        self.pollers.lock().contains(&tid)
     }
 
     pub fn has_stdout_data(&self) -> bool {
@@ -220,6 +231,12 @@ impl ProcessChannel {
     pub fn set_exited(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
         self.exited.store(true, Ordering::Release);
+        
+        // Wake all pollers waiting for output (EOF/exit is an event)
+        let mut pollers = self.pollers.lock();
+        while let Some(tid) = pollers.pop_first() {
+            crate::threading::get_waker_for_thread(tid).wake();
+        }
     }
 
     /// Check if the process has exited

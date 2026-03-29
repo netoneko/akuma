@@ -1,15 +1,25 @@
 use super::*;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 struct TimerFdState {
     armed_at_us: u64,
     initial_us: u64,
     interval_us: u64,
     expirations_consumed: u64,
+    pollers: BTreeSet<usize>,
 }
 
 static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTreeMap::new());
 static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn timerfd_add_poller(id: u32, tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        if let Some(state) = TIMERFD_TABLE.lock().get_mut(&id) {
+            state.pollers.insert(tid);
+        }
+    });
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -117,6 +127,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             initial_us: effective_initial,
             interval_us,
             expirations_consumed: 0,
+            pollers: BTreeSet::new(),
         });
     }
 

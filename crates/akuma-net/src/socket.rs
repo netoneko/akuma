@@ -6,6 +6,7 @@
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU16, Ordering};
+use core::task::Waker;
 use spinning_top::Spinlock;
 
 use crate::smoltcp_net::{self, SocketHandle, with_network};
@@ -122,6 +123,8 @@ pub struct KernelSocket {
     pub tcp_nodelay: bool,
     /// `SO_KEEPALIVE` option
     pub keepalive: bool,
+    /// Threads waiting for I/O on this socket (epoll, blocking recv/send)
+    pub wakers: Spinlock<Vec<Waker>>,
 }
 
 impl KernelSocket {
@@ -135,6 +138,7 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: true,  // We disable Nagle by default
             keepalive: false,
+            wakers: Spinlock::new(Vec::new()),
         })
     }
 
@@ -148,6 +152,7 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: false,
             keepalive: false,
+            wakers: Spinlock::new(Vec::new()),
         })
     }
 
@@ -178,7 +183,25 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: true,
             keepalive: false,
+            wakers: Spinlock::new(Vec::new()),
         })
+    }
+
+    /// Register a waker for the current thread to be notified of I/O events.
+    pub fn add_waker(&self, waker: Waker) {
+        let mut wakers = self.wakers.lock();
+        // Avoid duplicates (wakers for the same thread)
+        if !wakers.iter().any(|w| w.will_wake(&waker)) {
+            wakers.push(waker);
+        }
+    }
+
+    /// Wake all threads waiting for I/O on this socket.
+    pub fn wake_all(&self) {
+        let mut wakers = self.wakers.lock();
+        for waker in wakers.drain(..) {
+            waker.wake();
+        }
     }
 }
 
@@ -204,7 +227,7 @@ fn alloc_ephemeral_port() -> u16 {
 /// Global table of sockets (indexed by integer "socket descriptor")
 static SOCKET_TABLE: Spinlock<Option<Vec<Option<KernelSocket>>>> = Spinlock::new(None);
 
-fn with_table<F, R>(f: F) -> R 
+pub(crate) fn with_table<F, R>(f: F) -> R 
 where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R 
 {
     let mut guard = SOCKET_TABLE.lock();
@@ -245,6 +268,14 @@ where F: FnOnce(&KernelSocket) -> R
     with_table(|table| {
         table.get(idx).and_then(|slot| slot.as_ref()).map(f)
     })
+}
+
+pub fn socket_add_waker(idx: usize, waker: Waker) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            sock.add_waker(waker);
+        }
+    });
 }
 
 pub fn remove_socket(idx: usize) {
@@ -426,6 +457,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         box_id: current_box_id,
         tcp_nodelay: true,
         keepalive: false,
+        wakers: Spinlock::new(Vec::new()),
     };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {
@@ -527,6 +559,14 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
         socket.send_slice(buf).map_err(|_| libc_errno::EIO)
     });
     
+    if matches!(res, Some(Ok(_))) {
+        with_table(|table| {
+            if let Some(Some(sock)) = table.get(idx) {
+                sock.wake_all();
+            }
+        });
+    }
+
     smoltcp_net::poll();
     
     res.unwrap_or(Err(libc_errno::ENETDOWN))
@@ -561,6 +601,14 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
             }).map_err(|_| libc_errno::EIO)
         } else if !socket.is_active() || !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
     });
+
+    if matches!(res, Some(Ok(_))) {
+        with_table(|table| {
+            if let Some(Some(sock)) = table.get(idx) {
+                sock.wake_all();
+            }
+        });
+    }
     
     smoltcp_net::poll();
     
@@ -591,6 +639,13 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
     };
 
     smoltcp_net::udp_socket_send(handle, buf, endpoint).map_err(|()| libc_errno::EIO)?;
+
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            sock.wake_all();
+        }
+    });
+
     smoltcp_net::poll();
     Ok(buf.len())
 }
@@ -617,6 +672,13 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
     }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|()| libc_errno::EIO)?;
+
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            sock.wake_all();
+        }
+    });
+
     let smoltcp::wire::IpAddress::Ipv4(ip) = endpoint.addr;
     let src = SocketAddrV4::new(ip.octets(), endpoint.port);
     Ok((len, src))

@@ -800,6 +800,10 @@ fn run_async_main() -> ! {
         network_tests::run_tests();
     }
 
+    if !config::DISABLE_ALL_TESTS {
+        process_tests::run_network_tests();
+    }
+
     // Initialize SSH host key
     ssh::init_host_key();
 

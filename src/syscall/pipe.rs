@@ -7,8 +7,7 @@ struct KernelPipe {
     buffer: VecDeque<u8>,
     write_count: u32,
     read_count: u32,
-    reader_thread: Option<usize>,
-    /// Threads waiting on this pipe via epoll/poll
+    /// Threads waiting on this pipe via read() or epoll/poll
     pollers: BTreeSet<usize>,
 }
 
@@ -22,7 +21,6 @@ pub(crate) fn pipe_create() -> u32 {
             buffer: VecDeque::new(),
             write_count: 1,
             read_count: 1,
-            reader_thread: None,
             pollers: BTreeSet::new(),
         });
     });
@@ -70,15 +68,7 @@ pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             }
             pipe.buffer.extend(data);
             
-            // Wake blocking reader
-            if let Some(tid) = pipe.reader_thread.take() {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
-            }
-
-            // Wake async pollers (epoll/poll)
-            // We drain the set because the pollers will re-register if they
-            // wake up and see no events (or spurious wake), or simply loop.
-            // This prevents the set from growing indefinitely.
+            // Wake all async pollers (epoll/poll/read)
             while let Some(tid) = pipe.pollers.pop_first() {
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
             }
@@ -123,9 +113,6 @@ pub fn pipe_close_write(id: u32) {
             
             // Notify waiters (EOF is an event)
             if pipe.write_count == 0 {
-                if let Some(tid) = pipe.reader_thread.take() {
-                    akuma_exec::threading::get_waker_for_thread(tid).wake();
-                }
                 while let Some(tid) = pipe.pollers.pop_first() {
                     akuma_exec::threading::get_waker_for_thread(tid).wake();
                 }
@@ -174,7 +161,7 @@ pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
             if !pipe.buffer.is_empty() || pipe.write_count == 0 {
                 return true;
             }
-            pipe.reader_thread = Some(tid);
+            pipe.pollers.insert(tid);
             false
         } else {
             true // pipe gone → treat as EOF, don't block
@@ -183,9 +170,10 @@ pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
 }
 
 /// Test helper: return the current reader_thread tid registered on `id`.
-pub(crate) fn pipe_reader_thread(id: u32) -> Option<usize> {
+/// For the new poller-based implementation, we return true if tid is in the set.
+pub(crate) fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        PIPES.lock().get(&id).and_then(|p| p.reader_thread)
+        PIPES.lock().get(&id).map_or(false, |p| p.pollers.contains(&tid))
     })
 }
 

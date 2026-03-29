@@ -485,87 +485,105 @@ pub fn init(mmio_addrs: &[usize], enable_dhcp: bool) -> Result<(), &'static str>
 
 #[allow(clippy::cast_possible_wrap)]
 pub fn poll() -> bool {
-    if let Some(net) = NETWORK.lock().as_mut() {
-        let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
-        
-        let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
-        
-        // Handle DHCP
-        let mut dhcp_changed = false;
-        if let Some(handle) = net.dhcp_handle {
-            let event = net.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
-            if let Some(event) = event {
-                match event {
-                    dhcpv4::Event::Configured(config) => {
-                        log::info!("[SmolNet] DHCP configured");
-                        net.iface.update_ip_addrs(|addrs| {
-                            addrs.clear();
-                            addrs.push(IpCidr::Ipv4(config.address)).unwrap();
-                            addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
-                        });
-                        if let Some(router) = config.router {
-                            let _ = net.iface.routes_mut().add_default_ipv4_route(router);
-                        }
-
-                        log::info!("[SmolNet] IP: {}", config.address);
-                        DHCP_CONFIGURED.store(true, Ordering::Release);
-                    }
-                    dhcpv4::Event::Deconfigured => {
-                        DHCP_CONFIGURED.store(false, Ordering::Release);
-                        log::info!("[SmolNet] DHCP deconfigured - reverting to static fallback");
-                        net.iface.update_ip_addrs(|addrs| {
-                            addrs.clear();
-                            addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-                            addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
-                        });
-                        let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
-                    }
-                }
-                dhcp_changed = true;
-            }
-        }
-
-        // Re-poll after DHCP reconfiguration so the stack immediately processes
-        // any in-flight packets (e.g. loopback TCP handshake) with the updated
-        // IP configuration. Without this, the address change isn't picked up
-        // until the next external poll() call, which can cause loopback TCP
-        // connections to stall (server stuck in SynReceived).
-        if dhcp_changed {
+    let socket_state_changed = {
+        if let Some(net) = NETWORK.lock().as_mut() {
             let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
-            net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
-        }
+            
+            let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
+            
+            // Handle DHCP
+            let mut dhcp_changed = false;
+            if let Some(handle) = net.dhcp_handle {
+                let event = net.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
+                if let Some(event) = event {
+                    match event {
+                        dhcpv4::Event::Configured(config) => {
+                            log::info!("[SmolNet] DHCP configured");
+                            net.iface.update_ip_addrs(|addrs| {
+                                addrs.clear();
+                                addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                                addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+                            });
+                            if let Some(router) = config.router {
+                                let _ = net.iface.routes_mut().add_default_ipv4_route(router);
+                            }
 
-        // Garbage collect pending removals.
-        // Force-abort sockets stuck in non-Closed states for longer than
-        // SOCKET_GC_TIMEOUT_US to prevent slot exhaustion.
-        let now_us = (runtime().uptime_us)();
-        let mut i = 0;
-        while i < net.pending_removal.len() {
-            let (handle, added_at) = net.pending_removal[i];
-            if !is_valid_handle(handle) {
-                log::warn!("[NET] CORRUPT HANDLE in poll GC: handle={handle}");
-                net.pending_removal.swap_remove(i);
-                continue;
-            }
-            let state = net.sockets.get::<tcp::Socket>(handle).state();
-            let timed_out = now_us.saturating_sub(added_at) > SOCKET_GC_TIMEOUT_US;
-            if state == tcp::State::Closed || timed_out {
-                if timed_out && state != tcp::State::Closed {
-                    net.sockets.get_mut::<tcp::Socket>(handle).abort();
+                            log::info!("[SmolNet] IP: {}", config.address);
+                            DHCP_CONFIGURED.store(true, Ordering::Release);
+                        }
+                        dhcpv4::Event::Deconfigured => {
+                            DHCP_CONFIGURED.store(false, Ordering::Release);
+                            log::info!("[SmolNet] DHCP deconfigured - reverting to static fallback");
+                            net.iface.update_ip_addrs(|addrs| {
+                                addrs.clear();
+                                addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+                                addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+                            });
+                            let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
+                        }
+                    }
+                    dhcp_changed = true;
                 }
-                net.sockets.remove(handle);
-                net.pending_removal.swap_remove(i);
-            } else {
-                i += 1;
             }
-        }
 
-        if matches!(p1, PollResult::SocketStateChanged) {
-            POLL_COUNT.fetch_add(1, Ordering::Release);
-            return true;
+            // Re-poll after DHCP reconfiguration so the stack immediately processes
+            // any in-flight packets (e.g. loopback TCP handshake) with the updated
+            // IP configuration. Without this, the address change isn't picked up
+            // until the next external poll() call, which can cause loopback TCP
+            // connections to stall (server stuck in SynReceived).
+            if dhcp_changed {
+                let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
+                net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
+            }
+
+            // Garbage collect pending removals.
+            // Force-abort sockets stuck in non-Closed states for longer than
+            // SOCKET_GC_TIMEOUT_US to prevent slot exhaustion.
+            let now_us = (runtime().uptime_us)();
+            let mut i = 0;
+            while i < net.pending_removal.len() {
+                let (handle, added_at) = net.pending_removal[i];
+                if !is_valid_handle(handle) {
+                    log::warn!("[NET] CORRUPT HANDLE in poll GC: handle={handle}");
+                    net.pending_removal.swap_remove(i);
+                    continue;
+                }
+                let state = net.sockets.get::<tcp::Socket>(handle).state();
+                let timed_out = now_us.saturating_sub(added_at) > SOCKET_GC_TIMEOUT_US;
+                if state == tcp::State::Closed || timed_out {
+                    if timed_out && state != tcp::State::Closed {
+                        net.sockets.get_mut::<tcp::Socket>(handle).abort();
+                    }
+                    net.sockets.remove(handle);
+                    net.pending_removal.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            if matches!(p1, PollResult::SocketStateChanged) {
+                POLL_COUNT.fetch_add(1, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    // NETWORK lock is released here — safe to acquire SOCKET_TABLE.
+    // Acquiring SOCKET_TABLE while holding NETWORK causes AB-BA deadlock
+    // with socket_can_recv_tcp et al. which hold SOCKET_TABLE→NETWORK.
+
+    if socket_state_changed {
+        crate::socket::with_table(|table| {
+            for slot in table.iter().flatten() {
+                slot.wake_all();
+            }
+        });
     }
-    false
+
+    socket_state_changed
 }
 
 pub fn with_network<F, R>(f: F) -> Option<R>

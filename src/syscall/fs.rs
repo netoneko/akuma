@@ -366,7 +366,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         if nonblock { return EAGAIN; }
                         if akuma_exec::process::is_current_interrupted() { return EINTR; }
                         let tid = akuma_exec::threading::current_thread_id();
-                        super::eventfd::eventfd_set_reader_thread(efd_id, tid);
+                        super::eventfd::eventfd_add_poller(efd_id, tid);
                         akuma_exec::threading::schedule_blocking(u64::MAX);
                     }
                 }
