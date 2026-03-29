@@ -18,6 +18,13 @@ fn notify_child_channel_exited(pid: u32, code: i32) {
     }
 }
 
+/// Public wrapper for crash paths in exceptions.rs that need to notify the
+/// parent before `return_to_kernel` runs.  Idempotent — the second call from
+/// `return_to_kernel::remove_channel` is harmless.
+pub(crate) fn notify_child_channel_exited_pub(pid: u32, code: i32) {
+    notify_child_channel_exited(pid, code);
+}
+
 /// Wake the vfork parent (if any) of the given child PID.
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.

@@ -1489,7 +1489,7 @@ extern "C" fn rust_sync_el1_handler() {
                 proc.exit_code = -14; // EFAULT
                 proc.state = akuma_exec::process::ProcessState::Zombie(-14);
                 akuma_exec::process::kill_thread_group(pid, l0_phys);
-                // Wake any CLONE_VFORK parent waiting for this child to exec/exit.
+                crate::syscall::proc::notify_child_channel_exited_pub(pid, -14);
                 crate::syscall::proc::vfork_complete(pid);
             }
             // Redirect ELR to the recovery landing pad so that ERET does NOT
@@ -1874,6 +1874,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     return saved_x0;
                 }
                 if let Some(pid) = akuma_exec::process::read_current_pid() {
+                    crate::syscall::proc::notify_child_channel_exited_pub(pid, -11);
                     crate::syscall::proc::vfork_complete(pid);
                 }
                 akuma_exec::process::return_to_kernel(-11);
@@ -2419,6 +2420,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
+                // #region agent log
+                crate::safe_print!(128, "[DBG-8b7016] DA crash notify pid={}\n", proc.pid);
+                // #endregion
+                crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -11);
                 crate::syscall::proc::vfork_complete(proc.pid);
             }
             akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
@@ -2771,6 +2776,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
+                // #region agent log
+                crate::safe_print!(128, "[DBG-8b7016] IA crash notify pid={}\n", proc.pid);
+                // #endregion
+                crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -11);
                 crate::syscall::proc::vfork_complete(proc.pid);
             }
             akuma_exec::process::return_to_kernel(-11) // never returns
@@ -2828,6 +2837,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
         esr::EC_BRK_AARCH64 => {
             // BRK instruction — intentional trap/abort from user code
             if let Some(pid) = akuma_exec::process::read_current_pid() {
+                crate::syscall::proc::notify_child_channel_exited_pub(pid, -5);
                 crate::syscall::proc::vfork_complete(pid);
             }
             akuma_exec::process::return_to_kernel(-5) // SIGTRAP
@@ -2859,6 +2869,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if let Some(pid) = akuma_exec::process::read_current_pid() {
+                // #region agent log
+                crate::safe_print!(128, "[DBG-8b7016] unknown-EC crash notify pid={}\n", pid);
+                // #endregion
+                crate::syscall::proc::notify_child_channel_exited_pub(pid, -1);
                 crate::syscall::proc::vfork_complete(pid);
             }
             akuma_exec::process::return_to_kernel(-1) // never returns
