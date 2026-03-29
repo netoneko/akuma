@@ -251,6 +251,18 @@ recycler.  The zombie persistence window is bounded by the thread recycler's
 cooldown (~35ms), but during heavy Go builds with all thread slots occupied,
 recycling can be delayed.
 
+### Current Status
+
+After the crash-path notification fix, `go build` no longer hangs indefinitely
+with zombie processes. Compile processes that crash are now properly reaped by
+the parent. The build now progresses further and exits with code 1 (Go-reported
+build failure) rather than hanging forever — a significant improvement from the
+previous state where the kernel appeared frozen.
+
+The remaining exit-code-1 failures are Go compiler internal errors caused by
+the JIT IC flush + signal delivery interaction (see Issue 2 / Issue 5 above),
+not a kernel zombie/epoll bug.
+
 ### Epoll Advanced Tests Added
 
 Six new tests exercise the epoll subsystem and the zombie notification path:
