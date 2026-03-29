@@ -3500,7 +3500,11 @@ fn test_map_user_page_roundtrip() -> bool {
 
     let after_map = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
-    // Clear the PTE directly
+    // Clear all page table entries for test_va, from L3 up to L1, to fully
+    // restore the boot TTBR0. Without this, the boot L1[idx] entry would keep
+    // pointing to the freed L2 frame. If that freed frame is later reused (e.g.,
+    // as a new UserAddressSpace's L1), the boot TTBR0 would alias the new AS's
+    // tables, causing spurious translation faults in subsequent tests.
     unsafe {
         let ttbr0: u64;
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
@@ -3516,6 +3520,10 @@ fn test_map_user_page_roundtrip() -> bool {
                 if l2e & 1 != 0 {
                     let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
                     l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
+                    // Also clear L2 and L1 entries so freed table frames are no
+                    // longer reachable from the boot TTBR0.
+                    l2_ptr.add((test_va >> 21) & 0x1FF).write_volatile(0);
+                    l1_ptr.add((test_va >> 30) & 0x1FF).write_volatile(0);
                     akuma_exec::mmu::flush_tlb_page(test_va);
                 }
             }
