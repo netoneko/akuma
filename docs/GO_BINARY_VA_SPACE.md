@@ -140,3 +140,21 @@ binary (musl, uclibc, TCC) approaches 512 KB.  No Go binary can be built below
 - `docs/EPOLL_EL1_CRASH_FIX.md` — related process crash fixes
 - `src/syscall/mem.rs` — `sys_mmap` REJECT logging and lazy-PROT_NONE non-recycling
 - `crates/akuma-exec/src/process/types.rs` — `ProcessMemory::alloc_mmap` bump allocator
+
+## Future work
+
+```bash
+akuma:/> forktest_parent -combined_stress -duration 5m
+forktest_parent: Starting with 3 children, duration=5m0s (deadline 2026-03-30T22:15:43Z).
+forktest_parent: Launching child 0...
+forktest_parent: Launching child 1...
+forktest_parent: Launching child 2...
+forktest_parent: Duration elapsed, killing 3 remaining children.
+forktest_parent: Child 0 finished with error: signal: segmentation fault
+forktest_parent: Child 0 final output:
+forktest_parent: Child 1 finished with error: signal: segmentation fault
+forktest_parent: Child 1 final output:
+forktest_parent: Child 2 finished with error: signal: segmentation fault
+forktest_parent: Child 2 final output:
+forktest_parent: All children processed via epoll. Parent exiting.
+```

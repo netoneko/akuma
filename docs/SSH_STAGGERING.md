@@ -44,6 +44,58 @@ probability and worsening the spikes.
 The 25ms echo write delay (`[SSH-ECHO-SLOW]`) is the same problem on the write side: sent bytes
 sit in the smoltcp TX buffer until TN's next scheduling slot.
 
+## Remaining stagger (post-fix)
+
+The boost fix is confirmed working — `[TMR]` entries now show `T=1` (TN) frequently. But
+800ms–1.4s spikes persist. Two compounding causes remain:
+
+### 1. No-op waker in `block_on` (`src/ssh/server.rs:121–126`)
+
+```rust
+static VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(core::ptr::null(), &VTABLE),
+    |_| {},   // wake      — no-op
+    |_| {},   // wake_by_ref — no-op
+    |_| {},
+);
+```
+
+When `TcpStream::read` suspends, it calls `socket.register_recv_waker(cx.waker())`
+(`smoltcp_net.rs:924`). When TN later calls `smoltcp_net::poll()` and delivers the
+packet to the socket, smoltcp fires that waker. But the waker does nothing — it does
+not re-queue the SSH session thread. The SSH thread only discovers the data on its next
+scheduled slot (~100ms with the boost in place).
+
+**What needs investigating:**
+- Implement a real waker that stores the SSH session thread's TID and calls
+  `threading::mark_thread_ready(tid)` when fired. This would let smoltcp notify the SSH
+  thread immediately when data arrives instead of relying on round-robin scheduling.
+- The waker data pointer (`core::ptr::null()` today) should carry the thread ID or a
+  pointer to an atomic flag the SSH thread checks.
+- Edge case: the waker may be called from TN's context (inside `smoltcp_net::poll()`
+  which holds the NETWORK spinlock). `mark_thread_ready` must be safe to call while
+  the NETWORK lock is held — check for lock ordering issues.
+- Edge case: the waker may be called after the SSH session has already been rescheduled
+  and read the data. The implementation must be idempotent (calling wake on an already-
+  ready thread is a no-op).
+
+### 2. Multi-await chain in `read_until_channel_data` (`src/ssh/protocol.rs:91`)
+
+Each call to `self.stream.read(&mut buf).await` at line 101 is a suspend point. One
+SSH channel data message (a single keystroke) may require the loop to iterate multiple
+times if non-data SSH packets (window adjustments, keepalives, etc.) arrive first. Each
+iteration that suspends costs one full scheduling round (~100ms). Multiple iterations
+multiply the latency: 3 iterations = up to 300ms from this source alone, on top of the
+waker issue above.
+
+**What needs investigating:**
+- Whether SSH keepalives or window-adjust messages arrive frequently between keystrokes
+  (add a counter/log for non-data messages processed in `read_until_channel_data`).
+- Whether batching the TCP reads (larger buffer, or reading all available TCP data before
+  processing SSH packets) would reduce the number of await suspensions per keystroke.
+
+---
+
 ## Fix (implemented)
 
 Replaced the hardcoded slot-0 boost with a registered network thread ID:
