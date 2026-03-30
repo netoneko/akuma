@@ -429,7 +429,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             network_thread_ratio: config::NETWORK_THREAD_RATIO,
             deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
             thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
-            cooperative_main_thread: config::COOPERATIVE_MAIN_THREAD,
             syscall_debug_info_enabled: config::SYSCALL_DEBUG_INFO_ENABLED,
             fork_brk_serial_progress: config::FORK_BRK_SERIAL_PROGRESS,
             enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
@@ -645,11 +644,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         console::print("[FS] Filesystem SKIPPED via config::SKIP_FILESYSTEM_INIT\n");
     }
 
-    if crate::config::COOPERATIVE_MAIN_THREAD {
-        run_async_main();
-    } else {
-        run_async_main_preemptive();
-    }
+    run_async_main_preemptive();
 }
 
 fn run_async_main_preemptive() -> ! {
@@ -736,6 +731,9 @@ fn run_async_main() -> ! {
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+    // Register this thread as the network poller so the scheduler boost targets it.
+    threading::set_network_thread_id(threading::current_thread_id());
 
     // =========================================================================
     // Skip async network if disabled (for debugging)

@@ -79,6 +79,14 @@ pub fn set_cleanup_callback(cb: fn(usize)) {
     CLEANUP_CALLBACK.store(cb as usize, Ordering::SeqCst);
 }
 
+/// Thread ID of the network polling loop (run_async_main).
+/// Set at boot by set_network_thread_id(). usize::MAX means not yet registered.
+static NETWORK_THREAD_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn set_network_thread_id(tid: usize) {
+    NETWORK_THREAD_ID.store(tid, Ordering::Relaxed);
+}
+
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
 static THREAD_STATES: [AtomicU8; MAX_THREADS] = {
@@ -1432,31 +1440,28 @@ impl ThreadPool {
             }
         }
 
-        // Proportional scheduling for thread 0 (network loop)
-        // Thread 0 gets boosted every NETWORK_THREAD_RATIO scheduler ticks.
-        // This gives thread 0 a 1/N share of CPU time (e.g., 25% with ratio=4).
-        if current_idx != 0 {
+        // Proportional scheduling for the network polling thread (run_async_main).
+        // The network thread gets boosted every NETWORK_THREAD_RATIO scheduler ticks,
+        // giving it a 1/N share of CPU time (e.g., 25% with ratio=4).
+        let net_tid = NETWORK_THREAD_ID.load(Ordering::Relaxed);
+        if net_tid != usize::MAX && current_idx != net_tid {
             self.network_boost_counter += 1;
             if self.network_boost_counter >= config().network_thread_ratio {
                 self.network_boost_counter = 0;
-                let thread0_state = THREAD_STATES[0].load(Ordering::SeqCst);
-                if thread0_state == thread0_state { // Always true, just to keep structure
-                    let thread0_state_val = THREAD_STATES[0].load(Ordering::SeqCst);
-                    if thread0_state_val == thread_state::READY {
-                        if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
-                            THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
-                        }
-                        THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
-                        let now = (runtime().uptime_us)();
-                        self.slots[0].start_time_us = now;
-                        set_current_thread_register(0);
-                        self.current_idx = 0;
-                        return Some((current_idx, 0));
+                if THREAD_STATES[net_tid].load(Ordering::SeqCst) == thread_state::READY {
+                    if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
+                        THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                     }
+                    THREAD_STATES[net_tid].store(thread_state::RUNNING, Ordering::SeqCst);
+                    let now = (runtime().uptime_us)();
+                    self.slots[net_tid].start_time_us = now;
+                    set_current_thread_register(net_tid);
+                    self.current_idx = net_tid;
+                    return Some((current_idx, net_tid));
                 }
             }
         }
-        // If current_idx == 0 or counter hasn't reached ratio, use round-robin below
+        // If current thread is the network thread, or counter hasn't reached ratio, use round-robin below
 
         // First pass: Wake any WAITING threads whose wake time has passed
         let now = (runtime().uptime_us)();
@@ -2900,10 +2905,11 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         };
 
         // Thread name based on index range and state
+        let net_tid = NETWORK_THREAD_ID.load(Ordering::Relaxed);
         let name = match i {
             0 => "bootstrap",
-            1 => if config().cooperative_main_thread { "system-thread" } else { "network" },
-            2..=7 => "system-thread",
+            _ if i == net_tid => "network",
+            1..=7 => "system-thread",
             _ if snapshot.cooperative[i] => "cooperative",
             _ => "user-process",
         };

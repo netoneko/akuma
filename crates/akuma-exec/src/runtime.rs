@@ -122,7 +122,6 @@ pub struct ExecConfig {
     pub network_thread_ratio: u32,
     pub deferred_thread_cleanup: bool,
     pub thread_cleanup_cooldown_us: u64,
-    pub cooperative_main_thread: bool,
     pub syscall_debug_info_enabled: bool,
     /// Print a line to serial every N pages while copying brk during fork (slow on large heaps).
     pub fork_brk_serial_progress: bool,
