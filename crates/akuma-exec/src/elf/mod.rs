@@ -552,13 +552,26 @@ pub fn setup_linux_stack(
 
 /// Compute user stack top address dynamically based on binary layout.
 ///
-/// Small static binaries get the default 1GB address space.
-/// Large binaries or dynamically-linked ones (with interpreter) get expanded
-/// space to accommodate arena allocators that reserve GBs of VA upfront.
+/// Truly tiny static binaries (musl/TCC C programs, typically < 200 KB) get
+/// the default 1 GB address space.  Any static binary >= 512 KB — in
+/// particular Go programs, whose embedded runtime is ~1–3 MB minimum — gets
+/// the same large VA space (128 GB mmap + 256 GB stack top) as dynamically-
+/// linked binaries.
+///
+/// Threshold rationale: the Go runtime probes heap arena addresses
+/// (`arenaHints`) via `mmap(hint=4GB+k*64MB, PROT_NONE)`.  On Akuma the
+/// kernel ignores hints and returns the next available VA; Go then munmaps
+/// the wrong address.  PROT_NONE frees do NOT recycle VA (to prevent
+/// infinite mmap→reject→munmap loops), so each probe permanently consumes
+/// 64 MB.  With 1 GB of VA: 1 GB / 64 MB ≈ 15 probes before exhaustion —
+/// Go tries up to 128 hints and panics with "out of memory".  At 512 KB the
+/// threshold sits safely between tiny C programs (< 200 KB) and the smallest
+/// possible Go binary (> 1 MB).
 fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
-    const DEFAULT: usize = 0x4000_0000; // 1GB — original default
+    const DEFAULT: usize = 0x4000_0000; // 1 GB — for truly tiny static binaries
+    const SMALL_STATIC_THRESHOLD: usize = 0x8_0000; // 512 KB
 
-    if !has_interp && brk < 0x400_0000 {
+    if !has_interp && brk < SMALL_STATIC_THRESHOLD {
         return DEFAULT;
     }
 

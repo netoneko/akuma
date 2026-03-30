@@ -23,6 +23,7 @@ var (
 	sendSignal      = flag.Bool("send_signal", false, "Send SIGINT to one child to test signal handling")
 	goroutineStress = flag.Bool("goroutine_stress", false, "Enable goroutine/channel stress testing for children")
 	combinedStress  = flag.Bool("combined_stress", false, "Enable all stress modes concurrently for children")
+	durationFlag    = flag.Duration("duration", 0, "Total test duration (e.g. 30s, 1m). 0 = run until all children finish")
 )
 
 type ChildInfo struct {
@@ -36,6 +37,9 @@ type ChildInfo struct {
 
 func buildChildArgs() []string {
 	var args []string
+	if *durationFlag > 0 {
+		args = append(args, fmt.Sprintf("-duration=%s", durationFlag.String()))
+	}
 	if *combinedStress {
 		args = append(args, "-combined_stress=true")
 	} else {
@@ -60,7 +64,14 @@ func main() {
 		numChildren = 1
 	}
 
-	fmt.Printf("forktest_parent: Starting parent process with epoll monitoring (%d children).\n", numChildren)
+	var deadline time.Time
+	if *durationFlag > 0 {
+		deadline = time.Now().Add(*durationFlag)
+		fmt.Printf("forktest_parent: Starting with %d children, duration=%s (deadline %s).\n",
+			numChildren, durationFlag.String(), deadline.Format(time.RFC3339))
+	} else {
+		fmt.Printf("forktest_parent: Starting parent process with epoll monitoring (%d children).\n", numChildren)
+	}
 
 	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -131,6 +142,17 @@ func main() {
 	activeChildrenCount := numChildren
 
 	for activeChildrenCount > 0 {
+		// Check deadline before blocking on epoll.
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			fmt.Printf("forktest_parent: Duration elapsed, killing %d remaining children.\n", activeChildrenCount)
+			for _, child := range children {
+				if !child.Done && child.Cmd.Process != nil {
+					_ = child.Cmd.Process.Signal(syscall.SIGTERM)
+				}
+			}
+			break
+		}
+
 		n, err := unix.EpollWait(epollFD, events, 100)
 		if err != nil {
 			if err == syscall.EINTR {

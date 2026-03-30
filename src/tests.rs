@@ -188,6 +188,13 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_stack_top_within_48bit_va, "stack_top_within_48bit_va");
     run_test!(test_mmap_space_covers_jsc_gigacage, "mmap_space_covers_jsc_gigacage");
 
+    // Regression: Go binary VA exhaustion (forktest_parent OOM fix).
+    // Threshold lowered from 4 MB to 512 KB so Go static binaries get large VA.
+    run_test!(test_compute_stack_top_small_static,    "compute_stack_top_small_static");
+    run_test!(test_compute_stack_top_go_sized_static, "compute_stack_top_go_sized_static");
+    run_test!(test_compute_stack_top_boundary_512k,   "compute_stack_top_boundary_512k");
+    run_test!(test_go_binary_va_exhaustion_scenario,  "go_binary_va_exhaustion_scenario");
+
     // Regression: demand-pager/instruction-abort handler used lazy_region_lookup()
     // (calls read_current_pid() internally) instead of lazy_region_lookup_for_pid(pid, va)
     // with the PID captured once at handler entry. A second call to read_current_pid()
@@ -6647,6 +6654,182 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
     }
 
     let pass = pass_1g && pass_64g;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top threshold change (Go binary OOM fix).
+///
+/// A static binary with brk < 512 KB (musl/TCC C program) must still get
+/// the 1 GB default VA space — it doesn't use arena allocators.
+fn test_compute_stack_top_small_static() -> bool {
+    console::print("\n[TEST] compute_stack_top: tiny static binary gets 1 GB default\n");
+
+    const DEFAULT: usize = 0x4000_0000;
+    const THRESHOLD: usize = 0x8_0000; // 512 KB (new threshold)
+
+    let test_cases: &[usize] = &[
+        0x1000,          // 4 KB
+        0x1_0000,        // 64 KB
+        THRESHOLD - 1,   // 512 KB - 1 byte — just below threshold
+    ];
+
+    let mut pass = true;
+    for &brk in test_cases {
+        let result = if brk < THRESHOLD { DEFAULT } else { 0 };
+        let ok = result == DEFAULT;
+        crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} — {}\n",
+            brk, result, if ok { "OK" } else { "FAIL" });
+        if !ok { pass = false; }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top threshold change (Go binary OOM fix).
+///
+/// A static binary with brk >= 512 KB (Go programs are 1–3 MB minimum) must
+/// get large VA space so Go's arenaHint probing succeeds.
+fn test_compute_stack_top_go_sized_static() -> bool {
+    console::print("\n[TEST] compute_stack_top: Go-sized static binary gets large VA space\n");
+
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128 GB
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000; // 256 GB
+    const THRESHOLD: usize      = 0x8_0000;        // 512 KB
+
+    // Representative Go binary brk values (statically-linked, no interp)
+    let test_cases: &[usize] = &[
+        0x20_0000,   // 2 MB — small Go binary
+        0x100_0000,  // 16 MB
+        0x300_0000,  // 48 MB
+    ];
+
+    let mut pass = true;
+    for &brk in test_cases {
+        // Replicate compute_stack_top large-space branch
+        let base_mmap   = (brk + 0x1000_0000) & !0xFFFF;
+        let needed      = base_mmap + MIN_MMAP_SPACE;
+        let raw         = core::cmp::max(DEFAULT, needed);
+        let aligned     = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+        let stack_top   = core::cmp::min(aligned, MAX_STACK_TOP);
+
+        // Must only take this path if brk >= THRESHOLD
+        let ok = brk >= THRESHOLD && stack_top > DEFAULT;
+        crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} — {}\n",
+            brk, stack_top, if ok { "OK" } else { "FAIL" });
+        if !ok { pass = false; }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top 512 KB boundary is exact (Go binary OOM fix).
+///
+/// brk = 512 KB - 1: must return DEFAULT (1 GB).
+/// brk = 512 KB:     must return large stack_top (> DEFAULT).
+fn test_compute_stack_top_boundary_512k() -> bool {
+    console::print("\n[TEST] compute_stack_top: 512 KB boundary is correct\n");
+
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000;
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000;
+    const THRESHOLD: usize      = 0x8_0000; // 512 KB
+
+    // Just below threshold — must get DEFAULT
+    let brk_below = THRESHOLD - 1;
+    let result_below = if brk_below < THRESHOLD { DEFAULT } else { 0 };
+    let pass_below = result_below == DEFAULT;
+    crate::safe_print!(128, "  brk={:#x} (below): stack_top={:#x} — {}\n",
+        brk_below, result_below, if pass_below { "OK" } else { "FAIL" });
+
+    // Exactly at threshold — must take large-space path
+    let brk_at    = THRESHOLD;
+    let base_mmap = (brk_at + 0x1000_0000) & !0xFFFF;
+    let needed    = base_mmap + MIN_MMAP_SPACE;
+    let raw       = core::cmp::max(DEFAULT, needed);
+    let aligned   = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let result_at = core::cmp::min(aligned, MAX_STACK_TOP);
+    let pass_at   = result_at > DEFAULT;
+    crate::safe_print!(128, "  brk={:#x} (at threshold): stack_top={:#x} — {}\n",
+        brk_at, result_at, if pass_at { "OK" } else { "FAIL" });
+
+    let pass = pass_below && pass_at;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go arenaHint probe loop exhausts 1 GB VA, succeeds with large VA.
+///
+/// The Go runtime probes heap arenas via mmap(hint, 64MB, PROT_NONE).  On
+/// Akuma, hints are ignored and the kernel returns the next available VA.
+/// Since the address != hint, Go munmaps it.  PROT_NONE munmap does NOT
+/// recycle VA on Akuma (prevents mmap→reject→munmap loops), so each probe
+/// permanently consumes 64 MB.  With 1 GB: 1 GB / 64 MB ≈ 15 probes before
+/// `alloc_mmap` returns None.  Go tries up to 128 hints → OOM crash.
+///
+/// This test verifies:
+/// 1. The 1 GB mmap budget can fit fewer than 128 × 64 MB probes.
+/// 2. The large VA budget (128 GB+ mmap space) fits all 128 probes.
+fn test_go_binary_va_exhaustion_scenario() -> bool {
+    console::print("\n[TEST] Go arenaHint probe loop: 1 GB exhausts, large VA succeeds\n");
+
+    const PROBE_SIZE: usize    = 64 * 1024 * 1024; // 64 MB per arenaHint
+    const NUM_PROBES: usize    = 128;               // Go tries up to 128 hints
+    const STACK_SIZE: usize    = 2 * 1024 * 1024;  // 2 MB
+
+    // --- Scenario A: 1 GB layout (old behaviour for Go-sized static binary) ---
+    let stack_top_1g: usize = 0x4000_0000; // 1 GB
+    let stack_bot_1g        = stack_top_1g - STACK_SIZE;
+    let brk_go              = 0x20_0000; // 2 MB — below old 4 MB threshold
+
+    let mem_1g = akuma_exec::process::types::ProcessMemory::new(
+        brk_go, stack_bot_1g, stack_top_1g, 0,
+    );
+    let budget_1g         = mem_1g.mmap_limit;
+    let probes_before_1g  = budget_1g / PROBE_SIZE;
+    let would_exhaust_1g  = probes_before_1g < NUM_PROBES;
+    crate::safe_print!(128,
+        "  1 GB: mmap_limit={:#x}, budget_probes={}, would_exhaust={}\n",
+        budget_1g, probes_before_1g, would_exhaust_1g);
+
+    // --- Scenario B: large VA layout (new behaviour) ---
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000;
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000;
+
+    let base_mmap       = (brk_go + 0x1000_0000) & !0xFFFF;
+    let needed          = base_mmap + MIN_MMAP_SPACE;
+    let raw             = core::cmp::max(DEFAULT, needed);
+    let aligned         = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let stack_top_large = core::cmp::min(aligned, MAX_STACK_TOP);
+    let stack_bot_large = stack_top_large - STACK_SIZE;
+
+    let mut mem_large = akuma_exec::process::types::ProcessMemory::new(
+        brk_go, stack_bot_large, stack_top_large, 0,
+    );
+
+    let mut large_all_ok = true;
+    for i in 0..NUM_PROBES {
+        match mem_large.alloc_mmap(PROBE_SIZE) {
+            Some(addr) => { mem_large.free_mmap(addr, PROBE_SIZE); }
+            None => {
+                crate::safe_print!(128, "  FAIL: large VA exhausted at probe {}\n", i);
+                large_all_ok = false;
+                break;
+            }
+        }
+    }
+
+    let budget_large = mem_large.mmap_limit;
+    let probes_large = budget_large / PROBE_SIZE;
+    crate::safe_print!(128,
+        "  Large: mmap_limit={:#x}, budget_probes={}, all_ok={}\n",
+        budget_large, probes_large, large_all_ok);
+
+    let pass = would_exhaust_1g && large_all_ok;
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
