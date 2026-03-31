@@ -343,6 +343,29 @@ pub fn is_thread_terminated(thread_id: usize) -> bool {
     get_thread_state(thread_id) == thread_state::TERMINATED
 }
 
+/// Test helper: set a thread's state directly (lock-free).
+pub fn set_thread_state(idx: usize, state: u8) {
+    if idx < MAX_THREADS {
+        THREAD_STATES[idx].store(state, Ordering::SeqCst);
+    }
+}
+
+/// Test helper: get the sticky woken flag for a thread.
+pub fn get_woken_state(idx: usize) -> bool {
+    if idx < MAX_THREADS {
+        WOKEN_STATES[idx].load(Ordering::SeqCst)
+    } else {
+        false
+    }
+}
+
+/// Test helper: set the sticky woken flag for a thread.
+pub fn set_woken_state(idx: usize, val: bool) {
+    if idx < MAX_THREADS {
+        WOKEN_STATES[idx].store(val, Ordering::SeqCst);
+    }
+}
+
 /// Get total CPU time for a thread in microseconds
 pub fn get_thread_cpu_time(idx: usize) -> u64 {
     if idx < MAX_THREADS {

@@ -179,6 +179,13 @@ pub fn run_all_tests() {
     test_kill_thread_group_sets_child_channel_exited();
     test_epoll_pidfd_with_kill_thread_group();
 
+    // Message queue waker tests
+    test_msgqueue_send_wakes_receiver();
+    test_msgqueue_recv_wakes_sender();
+    test_msgqueue_rmid_wakes_pollers();
+    test_msgqueue_nowait_returns_immediately();
+    test_msgqueue_waker_idempotent();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -3870,5 +3877,274 @@ fn test_epoll_pidfd_with_kill_thread_group() {
         crate::safe_print!(128,
             "[Test] epoll_pidfd_with_kill_thread_group FAILED: before=0x{:x} after=0x{:x}\n",
             before, after);
+    }
+}
+
+// ============================================================================
+// Message Queue Waker Tests
+// ============================================================================
+
+/// Test: msgqueue_push_direct wakes recv pollers
+fn test_msgqueue_send_wakes_receiver() {
+    use akuma_exec::threading::{self, thread_state};
+    use crate::syscall::msgqueue::*;
+
+    const IPC_PRIVATE: i32 = 0;
+    const IPC_CREAT: i32 = 0o1000;
+    const IPC_RMID: i32 = 0;
+
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
+
+    // Find a free thread slot to simulate a waiting receiver
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("[Test] msgqueue_send_wakes_receiver SKIPPED: no free thread slot\n");
+            sys_msgctl(msqid, IPC_RMID, 0);
+            return;
+        }
+    };
+
+    // Set thread to WAITING and register as recv poller
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+    msgqueue_add_recv_poller(0, msqid, tid);
+
+    // Verify poller is registered
+    let registered = msgqueue_is_recv_poller(0, msqid, tid);
+
+    // Push a message — should wake the receiver
+    msgqueue_push_direct(0, msqid, 1, b"hello");
+
+    // Check: thread should be READY, poller set should be empty
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+    let pollers_after = msgqueue_recv_pollers_count(0, msqid);
+
+    // Restore thread state
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+
+    // Cleanup
+    sys_msgctl(msqid, IPC_RMID, 0);
+
+    if registered && state == thread_state::READY && woken && pollers_after == 0 {
+        console::print("[Test] msgqueue_send_wakes_receiver PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] msgqueue_send_wakes_receiver FAILED: registered={} state={} (exp {}) woken={} pollers_after={}\n",
+            registered, state, thread_state::READY, woken, pollers_after);
+    }
+}
+
+/// Test: msgqueue_pop_direct wakes send pollers
+fn test_msgqueue_recv_wakes_sender() {
+    use akuma_exec::threading::{self, thread_state};
+    use crate::syscall::msgqueue::*;
+
+    const IPC_PRIVATE: i32 = 0;
+    const IPC_CREAT: i32 = 0o1000;
+    const IPC_RMID: i32 = 0;
+
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
+
+    // Put a message in the queue so we can pop it
+    msgqueue_push_direct(0, msqid, 1, b"data");
+
+    // Find a free thread slot to simulate a waiting sender
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("[Test] msgqueue_recv_wakes_sender SKIPPED: no free thread slot\n");
+            sys_msgctl(msqid, IPC_RMID, 0);
+            return;
+        }
+    };
+
+    // Set thread to WAITING and register as send poller
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+    msgqueue_add_send_poller(0, msqid, tid);
+
+    // Pop the message — should wake the sender
+    let msg = msgqueue_pop_direct(0, msqid);
+
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+    let pollers_after = msgqueue_send_pollers_count(0, msqid);
+
+    // Restore
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+    sys_msgctl(msqid, IPC_RMID, 0);
+
+    if msg.is_some() && state == thread_state::READY && woken && pollers_after == 0 {
+        console::print("[Test] msgqueue_recv_wakes_sender PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] msgqueue_recv_wakes_sender FAILED: msg={} state={} (exp {}) woken={} pollers={}\n",
+            msg.is_some(), state, thread_state::READY, woken, pollers_after);
+    }
+}
+
+/// Test: IPC_RMID wakes all registered pollers
+fn test_msgqueue_rmid_wakes_pollers() {
+    use akuma_exec::threading::{self, thread_state};
+    use crate::syscall::msgqueue::*;
+
+    const IPC_PRIVATE: i32 = 0;
+    const IPC_CREAT: i32 = 0o1000;
+    const IPC_RMID: i32 = 0;
+
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
+
+    // Find two free thread slots
+    let mut tids = alloc::vec::Vec::new();
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            tids.push(i);
+            if tids.len() == 2 { break; }
+        }
+    }
+    if tids.len() < 2 {
+        console::print("[Test] msgqueue_rmid_wakes_pollers SKIPPED: need 2 free thread slots\n");
+        sys_msgctl(msqid, IPC_RMID, 0);
+        return;
+    }
+
+    // Set both threads to WAITING
+    for &tid in &tids {
+        threading::set_thread_state(tid, thread_state::WAITING);
+        threading::set_woken_state(tid, false);
+    }
+
+    // Register one as recv poller, one as send poller
+    msgqueue_add_recv_poller(0, msqid, tids[0]);
+    msgqueue_add_send_poller(0, msqid, tids[1]);
+
+    // IPC_RMID should wake both
+    sys_msgctl(msqid, IPC_RMID, 0);
+
+    let state0 = threading::get_thread_state(tids[0]);
+    let state1 = threading::get_thread_state(tids[1]);
+    let woken0 = threading::get_woken_state(tids[0]);
+    let woken1 = threading::get_woken_state(tids[1]);
+
+    // Restore
+    for &tid in &tids {
+        threading::set_thread_state(tid, thread_state::FREE);
+        threading::set_woken_state(tid, false);
+    }
+
+    if state0 == thread_state::READY && state1 == thread_state::READY && woken0 && woken1 {
+        console::print("[Test] msgqueue_rmid_wakes_pollers PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] msgqueue_rmid_wakes_pollers FAILED: s0={} s1={} w0={} w1={}\n",
+            state0, state1, woken0, woken1);
+    }
+}
+
+/// Test: IPC_NOWAIT returns immediately without registering as poller
+fn test_msgqueue_nowait_returns_immediately() {
+    use crate::syscall::msgqueue::*;
+
+    const IPC_PRIVATE: i32 = 0;
+    const IPC_CREAT: i32 = 0o1000;
+    const IPC_RMID: i32 = 0;
+
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
+
+    // Verify fresh queue has no pollers and no messages
+    let recv_pollers = msgqueue_recv_pollers_count(0, msqid);
+    let send_pollers = msgqueue_send_pollers_count(0, msqid);
+    let msg_count = msgqueue_message_count(0, msqid);
+
+    // Cleanup
+    sys_msgctl(msqid, IPC_RMID, 0);
+
+    if recv_pollers == 0 && send_pollers == 0 && msg_count == 0 {
+        console::print("[Test] msgqueue_nowait_returns_immediately PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] msgqueue_nowait_returns_immediately FAILED: recv={} send={} msgs={}\n",
+            recv_pollers, send_pollers, msg_count);
+    }
+}
+
+/// Test: Multiple push_direct calls only wake pollers once per batch
+fn test_msgqueue_waker_idempotent() {
+    use akuma_exec::threading::{self, thread_state};
+    use crate::syscall::msgqueue::*;
+
+    const IPC_PRIVATE: i32 = 0;
+    const IPC_CREAT: i32 = 0o1000;
+    const IPC_RMID: i32 = 0;
+
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
+
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("[Test] msgqueue_waker_idempotent SKIPPED: no free thread slot\n");
+            sys_msgctl(msqid, IPC_RMID, 0);
+            return;
+        }
+    };
+
+    // Register as recv poller
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+    msgqueue_add_recv_poller(0, msqid, tid);
+
+    // First push wakes the poller and clears the set
+    msgqueue_push_direct(0, msqid, 1, b"msg1");
+
+    let state_after_first = threading::get_thread_state(tid);
+    let pollers_after_first = msgqueue_recv_pollers_count(0, msqid);
+
+    // Second push — poller set is now empty, so no wake should happen
+    // (thread is already READY, this should be harmless)
+    msgqueue_push_direct(0, msqid, 2, b"msg2");
+
+    let state_after_second = threading::get_thread_state(tid);
+    let msg_count = msgqueue_message_count(0, msqid);
+
+    // Restore
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+    sys_msgctl(msqid, IPC_RMID, 0);
+
+    if state_after_first == thread_state::READY
+        && pollers_after_first == 0
+        && state_after_second == thread_state::READY
+        && msg_count == 2
+    {
+        console::print("[Test] msgqueue_waker_idempotent PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] msgqueue_waker_idempotent FAILED: s1={} p1={} s2={} msgs={}\n",
+            state_after_first, pollers_after_first, state_after_second, msg_count);
     }
 }

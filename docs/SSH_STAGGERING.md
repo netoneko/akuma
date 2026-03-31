@@ -49,35 +49,23 @@ sit in the smoltcp TX buffer until TN's next scheduling slot.
 The boost fix is confirmed working — `[TMR]` entries now show `T=1` (TN) frequently. But
 800ms–1.4s spikes persist. Two compounding causes remain:
 
-### 1. No-op waker in `block_on` (`src/ssh/server.rs:121–126`)
+### 1. No-op waker in `block_on` — FIXED
 
-```rust
-static VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| RawWaker::new(core::ptr::null(), &VTABLE),
-    |_| {},   // wake      — no-op
-    |_| {},   // wake_by_ref — no-op
-    |_| {},
-);
-```
+The no-op waker was replaced with a real `ThreadWaker` via `current_thread_waker()`.
+The real waker properly registers the SSH thread with smoltcp, and `block_on` now
+checks the return value of `smoltcp_net::poll()` to re-poll immediately when data
+arrives (avoiding unnecessary yields).
 
-When `TcpStream::read` suspends, it calls `socket.register_recv_waker(cx.waker())`
-(`smoltcp_net.rs:924`). When TN later calls `smoltcp_net::poll()` and delivers the
-packet to the socket, smoltcp fires that waker. But the waker does nothing — it does
-not re-queue the SSH session thread. The SSH thread only discovers the data on its next
-scheduled slot (~100ms with the boost in place).
+**Critical constraint discovered:** The SSH `block_on` must use `yield_now()`, NOT
+`schedule_blocking()`. `schedule_blocking` sets the thread to WAITING state, which
+causes `ThreadWaker::wake()` to trigger SGI for an immediate context switch. If the
+waker fires during `iface.poll()` (while the NETWORK spinlock is held by the network
+thread), the SGI context-switches to the SSH thread, which then tries to acquire
+NETWORK in its `future.poll()` → single-core spinlock deadlock.
 
-**What needs investigating:**
-- Implement a real waker that stores the SSH session thread's TID and calls
-  `threading::mark_thread_ready(tid)` when fired. This would let smoltcp notify the SSH
-  thread immediately when data arrives instead of relying on round-robin scheduling.
-- The waker data pointer (`core::ptr::null()` today) should carry the thread ID or a
-  pointer to an atomic flag the SSH thread checks.
-- Edge case: the waker may be called from TN's context (inside `smoltcp_net::poll()`
-  which holds the NETWORK spinlock). `mark_thread_ready` must be safe to call while
-  the NETWORK lock is held — check for lock ordering issues.
-- Edge case: the waker may be called after the SSH session has already been rescheduled
-  and read the data. The implementation must be idempotent (calling wake on an already-
-  ready thread is a no-op).
+With `yield_now()`, the thread stays READY, so `wake()` skips the SGI trigger
+(it only fires SGI for WAITING threads). The waker still sets `WOKEN_STATES` as a
+notification flag.
 
 ### 2. Multi-await chain in `read_until_channel_data` (`src/ssh/protocol.rs:91`)
 

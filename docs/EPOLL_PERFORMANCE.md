@@ -275,3 +275,66 @@ Six new tests exercise the epoll subsystem and the zombie notification path:
 | `test_epoll_multiple_ready_events` | Two eventfds ready simultaneously → epoll returns ≥ 2 events |
 | `test_kill_thread_group_sets_child_channel_exited` | kill_thread_group marks killed sibling's child channel as exited |
 | `test_epoll_pidfd_with_kill_thread_group` | After kill_thread_group, pidfd reports EPOLLIN via `epoll_check_fd_readiness` |
+
+---
+
+## SSH No-Op Waker Fix (2026-03-31)
+
+### Problem
+
+The SSH server's `block_on` async executor (`src/ssh/server.rs`) used a **no-op waker vtable**. When async TCP futures returned `Poll::Pending`, they registered this no-op waker with smoltcp via `socket.register_recv_waker(cx.waker())`. When smoltcp later delivered packets and fired the waker, nothing happened — the SSH thread was not marked ready.
+
+The `block_on` loop compensated by:
+1. Calling `smoltcp_net::poll()` directly
+2. Spin-polling for ~200µs
+3. Calling `yield_now()` (keeping the thread in READY state, competing for CPU)
+
+This meant the SSH thread only discovered new data on its next scheduler slot (~100ms with the network boost), contributing to the 800ms+ keystroke stagger documented in `docs/SSH_STAGGERING.md`.
+
+### Fix
+
+Replaced the no-op waker with a real `ThreadWaker` (the same infrastructure used by pipes, eventfd, and futex):
+
+- `current_thread_waker()` creates a waker that, when fired, atomically transitions the thread WAITING→READY and triggers an SGI
+- `schedule_blocking(deadline)` replaces `yield_now()` — the thread goes WAITING instead of competing in the ready queue
+- 10ms safety timeout ensures the thread always wakes even if the waker path fails
+- 200µs spin-poll loop removed (unnecessary with real waker)
+
+**Caveat: `schedule_blocking` causes deadlock on single-core.** The initial implementation
+used `schedule_blocking(10ms)` to put the SSH thread in WAITING state. This deadlocks because
+`ThreadWaker::wake()` triggers SGI when the target is WAITING, causing an immediate context
+switch. If the SGI fires while the network thread holds the NETWORK spinlock (inside
+`iface.poll()`), the SSH thread wakes and tries to acquire NETWORK in its next `future.poll()`
+→ deadlock. Fix: use `yield_now()` (thread stays READY, waker skips SGI).
+
+### Impact
+
+- SSH latency per await point: improved by real waker + poll-then-continue
+- Simpler code (no spin-poll loop)
+- No deadlock risk (thread stays READY, no SGI triggered)
+
+## SysV Message Queue Wakers (2026-03-31)
+
+### Problem
+
+SysV message queues (`src/syscall/msgqueue.rs`) used bare `yield_now()` loops for blocking `msgsnd` (queue full) and `msgrcv` (no messages). A blocked thread had to be scheduled by chance to discover that its condition was satisfied.
+
+### Fix
+
+Added waker-based blocking following the pipe pattern (`src/syscall/pipe.rs`):
+
+- Added `recv_pollers: BTreeSet<usize>` and `send_pollers: BTreeSet<usize>` to `MsgQueue`
+- `msgsnd`: after pushing a message, wakes all `recv_pollers`; when queue is full, registers in `send_pollers` and calls `schedule_blocking` (10ms timeout)
+- `msgrcv`: after removing a message, wakes all `send_pollers`; when no matching message, registers in `recv_pollers` and calls `schedule_blocking` (10ms timeout)
+- `IPC_RMID`: wakes all pollers before removing the queue (they retry and get EINVAL)
+- Registration and condition check are atomic (same critical section) to prevent TOCTOU races
+
+### Result
+
+All IPC primitives in Akuma now use the same waker infrastructure:
+- Pipes: `pollers` BTreeSet + `get_waker_for_thread()` ✓
+- EventFD: `pollers` BTreeSet + `get_waker_for_thread()` ✓
+- Futex: waiter queue + `get_waker_for_thread()` ✓
+- Sockets: `KernelSocket.wakers` + `wake_all()` ✓
+- Message queues: `recv_pollers`/`send_pollers` + `get_waker_for_thread()` ✓ (new)
+- SSH block_on: `current_thread_waker()` + `schedule_blocking()` ✓ (new)

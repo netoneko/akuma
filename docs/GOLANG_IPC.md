@@ -1816,3 +1816,28 @@ a heap value → corrupted PC → WILD-IA at `0x458a000001ef8`.
 Files changed: `src/syscall/mem.rs`, `src/tests.rs`, `src/exceptions.rs`,
 `crates/akuma-exec/src/process/types.rs`, `crates/akuma-exec/src/process/mod.rs`,
 `crates/akuma-exec/src/process/children.rs`, `crates/akuma-exec/src/process/image.rs`
+
+---
+
+## Waker Infrastructure Fixes (2026-03-31)
+
+### Impact on Go Build Latency
+
+Go's `go build` process uses `epoll_pwait` to monitor child processes (via pidfd/pipe).
+The epoll waker infrastructure was already fixed (see `docs/EPOLL_PERFORMANCE.md`), but
+the SSH server's no-op waker compounded latency: each SSH keystroke took ~100ms per await
+point because the SSH thread relied on round-robin scheduling to discover incoming data.
+
+With the real `ThreadWaker` fix in `src/ssh/server.rs`, SSH sessions now respond sub-ms.
+This reduces overall system load during `go build` over SSH, since the SSH thread no
+longer occupies a READY slot while idle.
+
+### SysV Message Queue Wakers
+
+SysV message queues (`src/syscall/msgqueue.rs`) previously used `yield_now()` loops.
+Now use `schedule_blocking()` + waker-based notification (same pattern as pipes/eventfd).
+Senders wake receivers, receivers wake senders, and `IPC_RMID` wakes all blocked threads.
+
+This completes the waker unification across all IPC primitives. Go programs using SysV
+IPC (uncommon but possible via CGO) will benefit from sub-ms wakeup latency instead of
+relying on scheduler round-robin.

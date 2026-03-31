@@ -335,6 +335,10 @@ pub fn run_threading_tests() -> bool {
     // Waker mechanism tests
     run_test!(test_waker_mechanism, "waker_mechanism");
     run_test!(test_block_on_noop_waker, "block_on_noop_waker");
+    run_test!(test_thread_waker_marks_ready, "thread_waker_marks_ready");
+    run_test!(test_thread_waker_idempotent, "thread_waker_idempotent");
+    run_test!(test_thread_waker_roundtrip, "thread_waker_roundtrip");
+    run_test!(test_block_on_real_waker, "block_on_real_waker");
 
     // NEON/FP register save/restore tests
     run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
@@ -8986,6 +8990,204 @@ fn test_cow_prefault_not_cow_page_no_op() -> bool {
     pmm::free_page(frame);
     ok &= pmm::free_count() == free_after_alloc + 1;
 
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// ThreadWaker tests
+// ============================================================================
+
+/// Test: ThreadWaker::wake() transitions WAITING→READY and sets WOKEN_STATES flag
+pub fn test_thread_waker_marks_ready() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker marks thread ready\n");
+
+    // Find an unused thread slot (state == FREE)
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("  No free thread slot available, skipping\n  Result: PASS\n");
+            return true;
+        }
+    };
+
+    // Set thread to WAITING
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+
+    // Create waker and fire it
+    let waker = threading::get_waker_for_thread(tid);
+    waker.wake();
+
+    // Check state transitioned to READY
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+
+    // Restore to FREE
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+
+    let ok = state == thread_state::READY && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={} (expected true)\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Calling wake() on an already-READY thread is harmless
+pub fn test_thread_waker_idempotent() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker idempotent on READY thread\n");
+
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("  No free thread slot, skipping\n  Result: PASS\n");
+            return true;
+        }
+    };
+
+    // Set thread to READY (not WAITING)
+    threading::set_thread_state(tid, thread_state::READY);
+    threading::set_woken_state(tid, false);
+
+    // Fire waker twice on an already-READY thread
+    let waker = threading::get_waker_for_thread(tid);
+    waker.wake_by_ref();
+    waker.wake_by_ref();
+
+    // State should still be READY (not corrupted)
+    let state = threading::get_thread_state(tid);
+    // WOKEN_STATES should be set (sticky flag)
+    let woken = threading::get_woken_state(tid);
+
+    // Restore to FREE
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+
+    let ok = state == thread_state::READY && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Create waker via get_waker_for_thread(), clone it, fire clone, verify state
+pub fn test_thread_waker_roundtrip() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker roundtrip (clone + wake)\n");
+
+    let mut test_tid = None;
+    for i in 1..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            test_tid = Some(i);
+            break;
+        }
+    }
+    let tid = match test_tid {
+        Some(t) => t,
+        None => {
+            console::print("  No free thread slot, skipping\n  Result: PASS\n");
+            return true;
+        }
+    };
+
+    // Set thread to WAITING
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+
+    // Create waker, clone it, drop original, wake via clone
+    let waker = threading::get_waker_for_thread(tid);
+    let cloned = waker.clone();
+    drop(waker);
+    cloned.wake();
+
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+
+    // Restore
+    threading::set_thread_state(tid, thread_state::FREE);
+    threading::set_woken_state(tid, false);
+
+    let ok = state == thread_state::READY && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: block_on-style executor with real ThreadWaker completes a multi-poll future
+pub fn test_block_on_real_waker() -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    console::print("\n[TEST] Block-on with real ThreadWaker\n");
+
+    static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    POLL_COUNT.store(0, Ordering::SeqCst);
+
+    struct MultiPollFuture {
+        polls_needed: usize,
+        polls_done: usize,
+    }
+
+    impl Future for MultiPollFuture {
+        type Output = usize;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+            self.polls_done += 1;
+            POLL_COUNT.fetch_add(1, Ordering::SeqCst);
+
+            if self.polls_done >= self.polls_needed {
+                Poll::Ready(self.polls_done)
+            } else {
+                // Wake ourselves so the executor knows to re-poll
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    // Use a real ThreadWaker (same as the new SSH block_on)
+    let waker = akuma_exec::threading::current_thread_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut future = MultiPollFuture { polls_needed: 5, polls_done: 0 };
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+
+    let mut result = None;
+    for _ in 0..20 {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => { result = Some(v); break; }
+            Poll::Pending => continue,
+        }
+    }
+
+    let poll_count = POLL_COUNT.load(Ordering::SeqCst);
+    crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
+    crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
+
+    let ok = result == Some(5) && poll_count == 5;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }

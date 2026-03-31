@@ -113,45 +113,28 @@ fn create_listener() -> Option<SocketHandle> {
 
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::task::{Context, Poll};
 
 fn block_on<F: Future>(mut future: F) -> F::Output {
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
-    
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-    
+
+    // Real waker so smoltcp properly tracks this thread. We use yield_now()
+    // instead of schedule_blocking() because schedule_blocking sets the thread
+    // WAITING, which causes ThreadWaker::wake() to trigger SGI for an immediate
+    // context switch. If that SGI fires while the network thread holds the
+    // NETWORK spinlock (inside iface.poll()), we context-switch here and
+    // deadlock trying to acquire NETWORK in the next future.poll().
+    let waker = akuma_exec::threading::current_thread_waker();
+    let mut cx = Context::from_waker(&waker);
+
     loop {
-        let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
-        let mut cx = Context::from_waker(&waker);
-        
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
             Poll::Pending => {
                 if smoltcp_net::poll() {
                     continue;
                 }
-                // Brief spin-poll to catch packets arriving just after our
-                // poll returned false. Without this, yield_now() can defer
-                // the thread for 20-60ms while the data is already sitting
-                // in VirtIO's RX ring. ~200us of spinning costs < 2% CPU.
-                let deadline = crate::timer::uptime_us() + 200;
-                let mut caught = false;
-                while crate::timer::uptime_us() < deadline {
-                    if smoltcp_net::poll() {
-                        caught = true;
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
-                if !caught {
-                    akuma_exec::threading::yield_now();
-                }
+                akuma_exec::threading::yield_now();
             }
         }
     }
