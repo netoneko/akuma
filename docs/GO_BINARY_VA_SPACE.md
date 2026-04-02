@@ -436,4 +436,48 @@ no wasted thread slots.
 | Test | What it verifies |
 |------|-----------------|
 | `test_clone_thread_rejects_zero_stack` | -ENOSYS has CLONE_THREAD\|CLONE_VM bits; stack=0 would crash; guard catches it |
-| `test_clone_enosys_cascade_no_crash` | Full cascade: flags=0→ENOSYS, flags=-38→clone_thread(stack=0)→rejected |
+| `test_clone_garbage_flags_cascade` | Full cascade: -38 and -11 caught by bits-32+ guard; PID-as-flags has no THREAD bits |
+
+---
+
+## Current state: vfork child clone loop (2026-04-02, open issue)
+
+After all the fixes above, `forktest_parent` no longer crashes.  The kernel is stable:
+no SIGSEGV, no EL1 exceptions, no thread slot exhaustion.  Shell commands, elftest, and
+hello_musl work correctly through fork+execve.
+
+However, `forktest_parent`'s vfork child (PID 53) never calls `execve`.  Instead it
+enters an infinite `clone(-38) → ENOSYS → clone(-38) → ENOSYS` loop.  The parent stays
+blocked on `VFORK_WAITERS` forever.
+
+### What happens
+
+1. Parent calls `clone3(CLONE_VFORK|CLONE_VM|CLONE_PIDFD|SIGCHLD)` → child PID 53
+2. Child starts at the instruction after `SVC` in Go's `rawVforkSyscall`
+3. Child writes `r1=0, err=0` to the stack → enters Go's child path
+4. **Instead of calling `close/dup2/execve`, the child calls `clone(flags=0)`**
+5. `clone(0)` → ENOSYS (-38)
+6. Go uses -38 as the next clone flags → `clone(-38)` → ENOSYS (bits-32+ guard)
+7. Loop forever
+
+### Likely root cause
+
+The vfork child's Go heap data (pointers to the exec path string, fd arrays, and
+`SysProcAttr` struct) resides in CoW-shared or demand-paged memory.  Some of this data
+may be zeroed in the child's address space if the backing pages were in lazy regions
+that didn't get properly CoW-shared.  With zeroed pointers, `execve(nil)` would fail,
+and Go's `childerror` path calls `exit(253)` — but the thread somehow doesn't terminate,
+or the child takes the wrong branch before reaching `execve`.
+
+The relative exec path `./forktest_child` also contributes: if the working directory is
+`/`, the path resolves to `/forktest_child` which doesn't exist (the binary is at
+`/bin/forktest_child`).
+
+### What works
+
+| Operation | Status |
+|-----------|--------|
+| Kernel boot + all tests | PASS |
+| Shell fork+exec (elftest, hello_musl) | PASS |
+| Go binary startup + goroutine threads | PASS |
+| forktest_parent vfork child → execve | **Stuck in clone loop** |

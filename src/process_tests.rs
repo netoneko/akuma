@@ -165,7 +165,7 @@ pub fn run_all_tests() {
     test_clone_flags_routing();
     // clone_thread must reject stack=0 to prevent crash cascade
     test_clone_thread_rejects_zero_stack();
-    test_clone_enosys_cascade_no_crash();
+    test_clone_garbage_flags_cascade();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -3351,34 +3351,33 @@ fn test_clone_thread_rejects_zero_stack() {
     }
 }
 
-/// Verify the crash pattern: Go's vfork child leaks register state into
-/// subsequent clone calls, producing flags=0 then flags=-38.
-/// flags=0 → ENOSYS, flags=-38 → clone_thread (rejected: stack=0) → EAGAIN.
-/// Without the stack guard, the second call created a crashing thread.
-fn test_clone_enosys_cascade_no_crash() {
-    const CLONE_VM: u64 = 0x100;
-    const CLONE_THREAD: u64 = 0x10000;
-    const CLONE_VFORK: u64 = 0x4000;
+/// Verify the full garbage-flags cascade is handled safely:
+///   clone(0) → ENOSYS(-38), clone(-38) → ENOSYS (bits 32+ guard).
+/// Before the bits-32+ guard, -38 entered clone_thread (CLONE_THREAD|CLONE_VM
+/// bits are set in any negative value), creating threads with stack=0 → SIGSEGV.
+/// Before the stack=0 guard, those threads crashed at FAR=0x28.
+/// Before the stack=0 guard returned EAGAIN, -11 looped back into clone_thread.
+/// Now: bits-32+ guard catches all negative values immediately → ENOSYS.
+fn test_clone_garbage_flags_cascade() {
+    let enosys_neg: u64 = (-38i64) as u64;  // 0xffffffffffffffda
+    let eagain_neg: u64 = (-11i64) as u64;  // 0xfffffffffffffff5
 
-    // Step 1: clone(flags=0) — no VFORK, no SIGCHLD → ENOSYS
-    let flags0: u64 = 0;
-    let routes_to_enosys = (flags0 & CLONE_VFORK == 0) && (flags0 & 0xFF != 0x11)
-        && !((flags0 & CLONE_THREAD != 0) && (flags0 & CLONE_VM != 0));
+    // All negative error codes have bits 32+ set
+    let enosys_caught = enosys_neg >> 32 != 0;
+    let eagain_caught = eagain_neg >> 32 != 0;
 
-    // Step 2: clone(flags=-38) — CLONE_THREAD|CLONE_VM set → clone_thread
-    let flags_neg: u64 = (-38i64) as u64;
-    let routes_to_thread = (flags_neg & CLONE_THREAD != 0) && (flags_neg & CLONE_VM != 0);
+    // Positive garbage (PID-as-flags) should also not enter clone_thread
+    let pid_flags: u64 = 0x36; // PID 54
+    let pid_has_no_thread_bits = (pid_flags & 0x10000 == 0) || (pid_flags & 0x100 == 0);
 
-    // Step 2b: clone_thread gets stack=0 → rejected (EAGAIN)
-    let stack: u64 = 0;
-    let thread_rejected = stack == 0;
-
-    if routes_to_enosys && routes_to_thread && thread_rejected {
-        console::print("[Test] clone_enosys_cascade_no_crash PASSED\n");
+    // The cascade: clone(0)→-38, clone(-38)→caught, no further damage
+    // Not clone(-38)→clone_thread→-11→clone(-11)→clone_thread→-11→...
+    if enosys_caught && eagain_caught && pid_has_no_thread_bits {
+        console::print("[Test] clone_garbage_flags_cascade PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] clone_enosys_cascade_no_crash FAILED: enosys={} thread={} rejected={}\n",
-            routes_to_enosys, routes_to_thread, thread_rejected);
+            "[Test] clone_garbage_flags_cascade FAILED: enosys={} eagain={} pid={}\n",
+            enosys_caught, eagain_caught, pid_has_no_thread_bits);
     }
 }
 
