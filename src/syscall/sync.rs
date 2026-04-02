@@ -79,7 +79,10 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         // returning EFAULT breaks Go's exit path and leaves goroutine
         // threads stuck.
         if cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET || cmd == FUTEX_WAKE_OP {
-            return 0;
+            return 0; // no waiters on unmapped address
+        }
+        if cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET {
+            return EAGAIN; // "value changed" — Go retries and proceeds with exit
         }
         return EFAULT;
     }

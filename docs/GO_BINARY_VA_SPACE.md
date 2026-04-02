@@ -793,11 +793,19 @@ target thread.  `kill_thread_group` also uses `tgid` instead of `l0_phys` matchi
 This is how Linux works: `kill()` targets the thread group, `exit_group()` kills the
 thread group.
 
-### Fix: futex WAKE on unmapped address → return 0 (2026-04-03)
+### Fix: futex on unmapped address → non-fatal return (2026-04-03)
 
-Go's exit coordination calls `futex(0xfffffffffffffffc, FUTEX_WAKE)`.  Returning
-EFAULT broke Go's exit path.  Now returns 0 (no waiters) for WAKE on unmapped
-addresses.
+Go's exit coordination calls `futex(0xfffffffffffffffc, op)` with both WAIT and WAKE
+operations.  Address -4 is unmapped.  Returning EFAULT broke Go's exit path — goroutine
+threads stayed blocked and `exit_group` was never called.
+
+Initial fix only handled FUTEX_WAKE (cmd=1).  But Go also calls `FUTEX_WAIT |
+FUTEX_PRIVATE_FLAG` (op=0x80, cmd=0 after stripping private flag).
+
+**Fix:** For unmapped addresses:
+- `FUTEX_WAKE` / `FUTEX_WAKE_BITSET` / `FUTEX_WAKE_OP` → return 0 (no waiters)
+- `FUTEX_WAIT` / `FUTEX_WAIT_BITSET` → return EAGAIN (value mismatch — normal retry)
+- Other ops → EFAULT (preserve Linux behavior)
 
 ### Follow-up: is_interrupted flag never cleared → infinite EINTR loop (2026-04-03)
 
