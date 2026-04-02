@@ -132,6 +132,12 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
 pub struct Process {
     pub pid: Pid,
     pub pgid: Pid,
+    /// Thread group leader PID (like Linux's tgid).
+    /// For the group leader: tgid == pid.
+    /// For clone_thread children: tgid == parent's tgid.
+    /// kill() delivers signals to all threads with matching tgid.
+    /// exit_group() kills all threads with matching tgid.
+    pub tgid: Pid,
     pub name: String,
     pub state: ProcessState,
     pub address_space: UserAddressSpace,
@@ -240,6 +246,7 @@ impl Process {
         Ok(Self {
             pid,
             pgid: pid,
+            tgid: pid, // group leader = self
             name: String::from(name),
             state: ProcessState::Ready,
             address_space,
@@ -339,6 +346,7 @@ impl Process {
         Ok(Self {
             pid,
             pgid: pid,
+            tgid: pid, // group leader = self
             name: String::from(name),
             state: ProcessState::Ready,
             address_space,
@@ -630,14 +638,19 @@ pub extern "C" fn check_process_exit() -> bool {
 /// context system (THREAD_CONTEXTS vs KernelContext) that was a source of bugs.
 /// 
 /// The thread is marked as terminated and the scheduler will reclaim it.
-/// Kill all threads sharing the same address space (L0 page table).
+/// Kill all threads in the same thread group (matching tgid).
 /// Used by exit_group and when the address-space owner exits to prevent
 /// sibling threads from running with freed page tables.
-pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
+pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
+    // Find tgid for the calling process
+    let tgid = with_irqs_disabled(|| {
+        let table = PROCESS_TABLE.lock();
+        table.get(&my_pid).map(|p| p.tgid).unwrap_or(my_pid)
+    });
     let siblings: Vec<(Pid, Option<usize>)> = with_irqs_disabled(|| {
         let table = PROCESS_TABLE.lock();
         table.iter()
-            .filter(|(pid, proc)| **pid != my_pid && proc.address_space.l0_phys() == l0_phys)
+            .filter(|(pid, proc)| **pid != my_pid && proc.tgid == tgid)
             .map(|(pid, proc)| (*pid, proc.thread_id))
             .collect()
     });
@@ -1169,6 +1182,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let mut new_proc = Box::try_new(Process {
         pid: child_pid,
         pgid: parent.pgid,
+        tgid: child_pid, // fork creates a new thread group
         name: parent.name.clone(),
         parent_pid: parent_pid,
         state: ProcessState::Ready,
@@ -1730,9 +1744,11 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
         .ok_or("Failed to create shared address space")?;
 
+    let parent_tgid = parent.tgid; // inherit thread group leader
     let mut new_proc = Box::try_new(Process {
         pid: child_pid,
         pgid: parent.pgid,
+        tgid: parent_tgid, // same thread group as parent
         name: parent.name.clone(),
         parent_pid: parent_pid,
         state: ProcessState::Ready,

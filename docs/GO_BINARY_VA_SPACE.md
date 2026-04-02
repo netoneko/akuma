@@ -761,6 +761,53 @@ The exception return path then delivers the signal to Go's handler.
 |------|-----------------|
 | `test_sys_kill_sets_interrupted_flag` | pend_signal + interrupt_thread → is_current_interrupted() = true |
 | `test_nanosleep_returns_eintr_on_interrupt` | EINTR constant matches Linux ARM64 value |
+| `test_sys_kill_interrupts_thread_group` | l0_phys matching for sibling thread lookup |
+
+### Fix: futex WAKE on unmapped address returned EFAULT (2026-04-03)
+
+Go's exit coordination calls `futex(0xfffffffffffffffc, FUTEX_WAKE)` to wake goroutine
+threads during process exit.  The address `0xfffffffffffffffc` (-4) is unmapped, so
+Akuma returned EFAULT.  Go's exit path then stalled — goroutine threads never woke,
+`exit_group` was never called, and the process hung.
+
+**Root cause:** For `FUTEX_WAKE` on an unmapped address, there can't be any waiters.
+Returning EFAULT is technically correct (Linux does the same) but breaks Go's exit
+coordination.  Returning 0 (zero waiters woken) is functionally equivalent and lets
+Go's exit path complete.
+
+**Fix:** `sys_futex` now returns 0 for `FUTEX_WAKE`/`FUTEX_WAKE_BITSET`/`FUTEX_WAKE_OP`
+when the address is unmapped, instead of EFAULT.  Other futex ops (WAIT, REQUEUE, etc.)
+still return EFAULT for unmapped addresses.
+
+The hard-kill approach was reverted — signal delivery + interrupt is sufficient when
+futex WAKE works correctly.
+
+### Fix: added tgid (thread group leader ID) — like Linux (2026-04-03)
+
+Each Process now has a `tgid` field:
+- `from_elf` / `fork_process`: `tgid = pid` (new group leader)
+- `clone_thread`: `tgid = parent.tgid` (inherits group)
+
+`sys_kill(pid, sig)` now interrupts ALL threads with matching `tgid`, not just the
+target thread.  `kill_thread_group` also uses `tgid` instead of `l0_phys` matching.
+This is how Linux works: `kill()` targets the thread group, `exit_group()` kills the
+thread group.
+
+### Fix: futex WAKE on unmapped address → return 0 (2026-04-03)
+
+Go's exit coordination calls `futex(0xfffffffffffffffc, FUTEX_WAKE)`.  Returning
+EFAULT broke Go's exit path.  Now returns 0 (no waiters) for WAKE on unmapped
+addresses.
+
+### Follow-up: is_interrupted flag never cleared → infinite EINTR loop (2026-04-03)
+
+`interrupt_thread` set the channel's interrupted flag, but `is_interrupted()` only
+loaded the flag without clearing it.  Every subsequent blocking syscall (nanosleep,
+futex, epoll) returned EINTR immediately, causing an infinite loop.  This also broke
+SSH because the interrupted flag leaked across syscall boundaries.
+
+**Fix:** `is_interrupted()` now auto-clears using `swap(false)` instead of `load()`.
+Each signal delivery produces exactly one EINTR, then the flag resets.
 
 Also fixed remaining hardcoded `137` values in `kill_thread_group` → `-9`.
 

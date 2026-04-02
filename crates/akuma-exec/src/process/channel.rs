@@ -254,9 +254,11 @@ impl ProcessChannel {
         self.interrupted.store(true, Ordering::Release);
     }
 
-    /// Check if the process has been interrupted
+    /// Check if the process has been interrupted (auto-clears the flag).
+    /// This ensures blocking syscalls see EINTR exactly once per signal,
+    /// not on every subsequent call.
     pub fn is_interrupted(&self) -> bool {
-        self.interrupted.load(Ordering::Acquire)
+        self.interrupted.swap(false, Ordering::AcqRel)
     }
 
     /// Clear the interrupt flag

@@ -3621,7 +3621,7 @@ fn make_test_process(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
     alloc::boxed::Box::new(akuma_exec::process::Process {
-        pid, pgid: pid, name: String::from("test"),
+        pid, pgid: pid, tgid: pid, name: String::from("test"),
         state: akuma_exec::process::ProcessState::Ready,
         address_space: addr_space,
         context: akuma_exec::process::UserContext::new(0, 0),

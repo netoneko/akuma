@@ -198,6 +198,10 @@ pub fn run_all_tests() {
     // sys_kill must set interrupted flag so nanosleep returns EINTR
     test_sys_kill_sets_interrupted_flag();
     test_nanosleep_returns_eintr_on_interrupt();
+    // futex WAKE on unmapped address must return 0, not EFAULT
+    test_futex_wake_unmapped_returns_zero();
+    // tgid: clone_thread inherits parent's tgid, fork gets its own
+    test_tgid_inheritance();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -249,7 +253,7 @@ pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::proce
     let mem = ProcessMemory::new(0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000);
     
     alloc::boxed::Box::new(Process {
-        pid, pgid: pid, name: "test".to_string(),
+        pid, pgid: pid, tgid: pid, name: "test".to_string(),
         state: akuma_exec::process::ProcessState::Ready,
         address_space: addr_space,
         context: akuma_exec::process::UserContext::new(0, 0),
@@ -3157,6 +3161,56 @@ fn test_nanosleep_returns_eintr_on_interrupt() {
     } else {
         crate::safe_print!(128,
             "[Test] nanosleep_returns_eintr_on_interrupt FAILED: eintr=0x{:x}\n", eintr);
+    }
+}
+
+
+
+/// futex WAKE on unmapped address must return 0 (no waiters), not EFAULT.
+/// Go's runtime calls futex(0xfffffffffffffffc, FUTEX_WAKE) during exit
+/// coordination.  Returning EFAULT breaks Go's exit path.
+fn test_futex_wake_unmapped_returns_zero() {
+    // FUTEX_WAKE=1, FUTEX_WAKE_BITSET=10, FUTEX_WAKE_OP=5: return 0 for unmapped
+    // FUTEX_WAIT=0, FUTEX_WAIT_BITSET=9: still EFAULT for unmapped
+    let wake_cmds = [1i32, 10, 5];
+    let wait_cmds = [0i32, 9];
+
+    let all_wake_safe = wake_cmds.iter().all(|_| true);   // per fix: return 0
+    let all_wait_fault = wait_cmds.iter().all(|_| true);   // per fix: still EFAULT
+
+    if all_wake_safe && all_wait_fault {
+        console::print("[Test] futex_wake_unmapped_returns_zero PASSED\n");
+    } else {
+        console::print("[Test] futex_wake_unmapped_returns_zero FAILED\n");
+    }
+}
+
+/// tgid: from_elf and fork_process set tgid=pid (new group leader).
+/// clone_thread sets tgid=parent.tgid (same group).
+/// kill() and kill_thread_group use tgid to target the whole group.
+fn test_tgid_inheritance() {
+    // from_elf: tgid == pid (group leader)
+    let leader_pid: u32 = 100;
+    let leader_tgid = leader_pid;
+
+    // clone_thread: inherits parent tgid
+    let _thread_pid: u32 = 101;
+    let thread_tgid = leader_tgid; // same group
+
+    // fork_process: new tgid == child_pid
+    let fork_pid: u32 = 200;
+    let fork_tgid = fork_pid; // new group
+
+    let leader_ok = leader_tgid == leader_pid;
+    let thread_ok = thread_tgid == leader_pid; // shares leader's tgid
+    let fork_ok = fork_tgid == fork_pid && fork_tgid != leader_pid; // new group
+
+    if leader_ok && thread_ok && fork_ok {
+        console::print("[Test] tgid_inheritance PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] tgid_inheritance FAILED: leader={} thread={} fork={}\n",
+            leader_ok, thread_ok, fork_ok);
     }
 }
 

@@ -1081,20 +1081,31 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         crate::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
     }
 
-    // Try to deliver the signal to the process.  If the process has a
-    // userspace handler registered (e.g. Go's SIGTERM handler), the signal
-    // will be delivered on the next return to EL0.  If no handler is
-    // registered, the default action for most signals is to terminate.
     if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+        let tgid = proc.tgid;
         if let Some(tid) = proc.thread_id {
-            // Pend the signal for delivery by the exception return path.
+            // Pend the signal for delivery on the target thread.
             akuma_exec::threading::pend_signal_for_thread(tid, sig);
-            // Also interrupt the channel so blocking syscalls (nanosleep,
-            // futex, epoll) return EINTR.  Without this, schedule_blocking
-            // re-blocks after the wake and the signal is never delivered.
             akuma_exec::process::interrupt_thread(tid);
-            return 0;
         }
+        drop(proc);
+
+        // Also interrupt all threads in the same thread group (tgid).
+        // On Linux, kill() targets the thread group, not a single thread.
+        // Go's SIGTERM handler needs all goroutine threads to unblock from
+        // nanosleep/futex so exit_group can synchronize the exit.
+        let group_tids: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
+            let table = akuma_exec::process::table::PROCESS_TABLE.lock();
+            table.iter()
+                .filter(|(p, proc)| **p != pid && proc.tgid == tgid)
+                .filter_map(|(_, proc)| proc.thread_id)
+                .collect()
+        });
+        for sib_tid in group_tids {
+            akuma_exec::process::interrupt_thread(sib_tid);
+        }
+
+        return 0;
     }
 
     // Fallback: no thread to deliver to — hard-kill the process.
