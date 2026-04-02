@@ -186,6 +186,29 @@ and the Go compiler was still running when the parent exited.
 
 ---
 
+## Reproducing the unicode compile crash
+
+The `go build` toolchain crashed compiling the `unicode` package. To reproduce
+without running a full `go build`, run the compile step directly:
+
+```bash
+mkdir -p /tmp/b046
+echo '# import config' > /tmp/b046/importcfg
+/usr/lib/go/pkg/tool/linux_arm64/compile -o /tmp/b046/_pkg_.a -trimpath "/tmp/b046=>" -p unicode -lang=go1.25 -std -complete -buildid test/test -goversion go1.25.8 -nolocalimports -importcfg /tmp/b046/importcfg -pack /usr/lib/go/src/unicode/casetables.go /usr/lib/go/src/unicode/digit.go /usr/lib/go/src/unicode/graphic.go /usr/lib/go/src/unicode/letter.go /usr/lib/go/src/unicode/tables.go
+echo "exit code: $?"
+```
+
+**Expected:** exit code 0 (compile succeeds).  May take 10+ seconds under QEMU.
+
+**Observed:** The compile process was killed after ~5s when the parent `go build`
+tool exited.  Running it standalone (above) removes the parent timeout and lets the
+compiler run to completion.
+
+`unicode/tables.go` is the stress test — it's ~1 MB of source generating enormous
+Unicode lookup tables.  If this compiles, everything smaller will too.
+
+---
+
 ## Current State
 
 | Operation | Status |
