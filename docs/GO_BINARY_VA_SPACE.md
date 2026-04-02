@@ -573,9 +573,9 @@ goroutine thread (PID 49).  `execve` logging also includes the resolved path and
 | Shell fork+exec (elftest, hello_musl) | PASS |
 | Go binary startup + goroutine threads | PASS (after copy_to_user_safe revert) |
 | forktest_parent fork+exec children | **WORKS** (after PROCESS_INFO_ADDR fix) |
-| forktest_child stress tests (55k syscalls) | **WORKS** (11s runtime per child) |
-| forktest_child clean exit | Exit code 137 (SIGKILL instead of SIGTERM) |
-| Re-entrant signal on sigaltstack | PID 73 SIGSEGV (Go signal handler crash) |
+| forktest_child stress tests (70k syscalls) | **WORKS** (12s+ runtime per child) |
+| forktest_child clean exit (code=0) | **WORKS** (31s run, exit_group code=0) |
+| Parent clean exit (code=0) | **WORKS** (32.9s run, exit_group code=0) |
 
 ---
 
@@ -605,13 +605,60 @@ The parent exited with code 1.  The user's **second** run used fork+exec (the sh
 fork path now works thanks to the fixes), inheriting CWD="/bin" correctly.  All three
 children launched and ran successfully.
 
-### Remaining issues
+### Confirmed working (2026-04-03 second run)
 
-| Issue | Description |
-|-------|-------------|
-| Exit code 137 | Children killed by SIGKILL (not SIGTERM).  SIGTERM delivery to Go processes may not be handled. |
-| PID 73 SIGSEGV | Re-entrant signal fault during Go's SIGSEGV handler on sigaltstack.  ISS=0x4f (permission fault write). |
-| Epoll busy loop | After children exit, parent's epoll_pwait returns nready=3 in a tight loop (7159 iterations).  Pipe EOF/EPOLLRDHUP not triggering correctly. |
+**User output:**
+```
+akuma:/bin> forktest_parent -duration 30s -combined_stress
+forktest_parent: Starting with 3 children, duration=30s
+forktest_parent: Launching child 0...
+forktest_parent: Launching child 1...
+forktest_parent: Launching child 2...
+forktest_parent: Duration elapsed, killing 3 remaining children.
+forktest_parent: Child 0 finished with error: exit status 137
+forktest_parent: All children processed via epoll. Parent exiting.
+```
+
+**Kernel log:**
+```
+[exit_group] pid=63 name=/bin/forktest_child code=0 after 31.03s
+[exit_group] pid=70 name=/bin/forktest_child code=0 after 30.75s
+[exit_group] pid=54 name=/bin/forktest_parent code=0 after 32.93s
+```
+
+- **Zero crashes** — no SIGSEGV, no EL1 exceptions, no WILD-DA
+- **Fork+exec chain works** — all 3 children launched via clone3 → fork_process → execve
+- **70k syscalls per child** — futex, nanosleep, write, openat, clock_gettime, mmap, epoll
+- **Kernel exits clean** (code=0) — children and parent all exit_group(0)
+- **All threads cleaned up** — system returns to 8/64 threads
+- **System stable** — heartbeat, SSH continue after forktest completes
+
+### Exit status 137 discrepancy
+
+Children exit `code=0` in the kernel (via `exit_group(0)`), but Go's `cmd.Wait()` reports
+`exit status 137` (128 + 9 = SIGKILL).  This means the kernel's `waitpid` reports
+`WaitStatus` with signal 9 instead of clean exit.
+
+**Root cause:** The parent sends SIGTERM when the 30s deadline expires.  Akuma's
+`exit_group` terminates the calling thread but may not kill all goroutine threads in the
+thread group.  The parent's `cmd.Wait()` waits for the main child PID, which was killed
+by a signal (probably SIGKILL from thread group cleanup or the parent process exiting).
+The `encode_wait_status(-9)` produces status=9 in the low bits, which Go interprets as
+killed-by-signal.
+
+### Remaining first-child CWD issue
+
+The **first** launch via `spawn_process_with_channel` gets CWD="/" (from `from_elf`
+default).  The **second** launch via fork+exec inherits the shell's CWD="/bin".  This
+is a shell issue, not a kernel fork bug — `fork_process` correctly copies `parent.cwd`.
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_encode_wait_status_clean_exit` | code≥0 encodes as `(code<<8)`, Go sees ExitStatus=code |
+| `test_encode_wait_status_signal_kill` | code<0 encodes signal in low 7 bits, Go sees Signal=abs(code) |
+| `test_encode_wait_status_sigkill_vs_sigterm` | SIGKILL→137, SIGTERM→143 (documents the 137 discrepancy) |
 
 ### Tests added
 

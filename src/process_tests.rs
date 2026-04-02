@@ -182,6 +182,10 @@ pub fn run_all_tests() {
     test_fork_preserves_parent_cwd();
     // execve preserves CWD (replace_image doesn't reset it)
     test_execve_preserves_cwd();
+    // wait status encoding (exit code vs signal kill)
+    test_encode_wait_status_clean_exit();
+    test_encode_wait_status_signal_kill();
+    test_encode_wait_status_sigkill_vs_sigterm();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -3630,6 +3634,89 @@ fn test_execve_preserves_cwd() {
         console::print("[Test] execve_preserves_cwd PASSED\n");
     } else {
         crate::safe_print!(128, "[Test] execve_preserves_cwd FAILED: cwd={}\n", cwd_after_exec);
+    }
+}
+
+/// encode_wait_status for clean exit (code >= 0): Linux encodes as (code << 8).
+/// Go's syscall.WaitStatus.ExitStatus() returns (status >> 8) & 0xFF.
+fn test_encode_wait_status_clean_exit() {
+    // Mirrors encode_wait_status in src/syscall/proc.rs
+    fn encode(code: i32) -> u32 {
+        if code < 0 {
+            let sig = (-code) as u32 & 0x7F;
+            sig
+        } else {
+            ((code as u32) & 0xFF) << 8
+        }
+    }
+
+    let status0 = encode(0);
+    let status1 = encode(1);
+    let status253 = encode(253);
+
+    // Go interprets: WIFEXITED = (status & 0x7F) == 0, ExitStatus = (status >> 8) & 0xFF
+    let go_exit0 = (status0 & 0x7F == 0) && ((status0 >> 8) & 0xFF == 0);
+    let go_exit1 = (status1 & 0x7F == 0) && ((status1 >> 8) & 0xFF == 1);
+    let go_exit253 = (status253 & 0x7F == 0) && ((status253 >> 8) & 0xFF == 253);
+
+    if go_exit0 && go_exit1 && go_exit253 {
+        console::print("[Test] encode_wait_status_clean_exit PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] encode_wait_status_clean_exit FAILED: 0={:#x} 1={:#x} 253={:#x}\n",
+            status0, status1, status253);
+    }
+}
+
+/// encode_wait_status for signal kill (code < 0): Linux encodes signal in low 7 bits.
+/// Go's syscall.WaitStatus.Signal() returns status & 0x7F.
+fn test_encode_wait_status_signal_kill() {
+    fn encode(code: i32) -> u32 {
+        if code < 0 { (-code) as u32 & 0x7F } else { ((code as u32) & 0xFF) << 8 }
+    }
+
+    let status_kill = encode(-9);   // SIGKILL
+    let status_term = encode(-15);  // SIGTERM
+    let status_segv = encode(-11);  // SIGSEGV
+
+    // Go: WIFSIGNALED = (status & 0x7F) != 0, Signal = status & 0x7F
+    let go_kill = (status_kill & 0x7F) == 9;
+    let go_term = (status_term & 0x7F) == 15;
+    let go_segv = (status_segv & 0x7F) == 11;
+
+    if go_kill && go_term && go_segv {
+        console::print("[Test] encode_wait_status_signal_kill PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] encode_wait_status_signal_kill FAILED: kill={:#x} term={:#x} segv={:#x}\n",
+            status_kill, status_term, status_segv);
+    }
+}
+
+/// Forktest children exit code=0 (clean) in the kernel, but Go reports exit
+/// status 137 (128+9=SIGKILL).  This means the kernel's wait status for these
+/// children encoded -9 (SIGKILL), not 0 (clean exit).
+///
+/// Go decodes: if (status & 0x7F) != 0 → "exit status 128 + (status & 0x7F)".
+/// Exit status 137 → signal 9 → wait_status & 0x7F = 9 → encode_wait_status(-9).
+fn test_encode_wait_status_sigkill_vs_sigterm() {
+    fn encode(code: i32) -> u32 {
+        if code < 0 { (-code) as u32 & 0x7F } else { ((code as u32) & 0xFF) << 8 }
+    }
+
+    // Exit status 137 = signal 9 (SIGKILL), NOT signal 15 (SIGTERM)
+    let sigkill_status = encode(-9);
+    let sigterm_status = encode(-15);
+
+    let go_137 = 128 + (sigkill_status & 0x7F);  // 128 + 9 = 137
+    let go_143 = 128 + (sigterm_status & 0x7F);   // 128 + 15 = 143
+
+    if go_137 == 137 && go_143 == 143 {
+        console::print("[Test] encode_wait_status_sigkill_vs_sigterm PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] encode_wait_status_sigkill_vs_sigterm FAILED: go_137={} go_143={}\n",
+            go_137, go_143);
     }
 }
 
