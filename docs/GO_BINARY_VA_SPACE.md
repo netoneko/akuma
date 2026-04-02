@@ -500,6 +500,65 @@ goroutine thread startup → crash at FAR=0x88 (nil + struct field offset 0x88).
 **Fix:** reverted to `core::ptr::write`.  The CoW-RO scenario that motivated
 `copy_to_user_safe` can no longer occur thanks to the bits-32+ guard.
 
+---
+
+## Follow-up Fix: PROCESS_INFO_ADDR overwritten by cow_share_range (2026-04-03)
+
+### Problem
+
+The diagnostic `[clone] tid=17 pid=49` revealed the root cause of the vfork child's
+clone loop: the child was reading `pid=49` (parent) from `PROCESS_INFO_ADDR` instead of
+`pid=53` (child).  The child was running with the **parent's** process info mapping.
+
+### Root cause
+
+`PROCESS_INFO_ADDR = 0x1000 = PAGE_SIZE`.  For Go ARM64 binaries, `code_start = PAGE_SIZE`
+because `code_end < 0x400000`.  The CoW fork's `cow_share_range(code_start, brk_len, ...)`
+walks from `0x1000` to `0x229000`, copying parent PTEs to the child — including the PTE
+at `0x1000` (PROCESS_INFO_ADDR).
+
+fork_process allocated a new process info frame and mapped it at 0x1000 **before** the CoW
+fork (step 2).  `cow_share_range` then **overwrote** this mapping with the parent's PTE
+(step 4).  The child's process info frame was orphaned — correctly written with `pid=53`
+via `phys_to_virt`, but unmapped from the child's address space.
+
+The child read `pid=49` from PROCESS_INFO_ADDR → `current_process()` returned the parent →
+`vfork_complete(wrong_pid)` → parent never unblocked.  The child also ran Go code in the
+wrong process context, causing the clone(0) loop.
+
+### Fix
+
+Re-map `PROCESS_INFO_ADDR` to the child's own frame **after** all CoW sharing is done
+(step 5, before writing the child PID).  This overwrites whatever PTE `cow_share_range`
+installed.
+
+```rust
+// 5. Re-map PROCESS_INFO_ADDR after CoW (cow_share_range may have overwritten it)
+let _ = new_proc.address_space.map_page(
+    PROCESS_INFO_ADDR,
+    new_proc.process_info_phys,
+    mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+);
+// Then write child PID to the frame
+```
+
+Standard musl/TCC binaries (code_start=0x400000) are unaffected because 0x400000 > 0x1000.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `crates/akuma-exec/src/process/mod.rs` | `fork_process`: re-map PROCESS_INFO_ADDR after CoW sharing |
+| `src/syscall/proc.rs` | `[clone]` log now includes tid and pid for diagnostics |
+| `src/process_tests.rs` | Two new regression tests (see below) |
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_process_info_addr_cow_overwrite` | For Go binaries: code_start=PAGE_SIZE=PROCESS_INFO_ADDR → overlap confirmed |
+| `test_process_info_addr_not_in_code_range_standard` | For musl/PIE binaries: code_start > PROCESS_INFO_ADDR → no overlap |
+
 ### Diagnostic: clone debug now includes tid and pid
 
 `[clone]` log lines now include the calling thread ID and PID, making it possible to

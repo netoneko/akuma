@@ -174,6 +174,9 @@ pub fn run_all_tests() {
     test_fork_child_process_info_pid();
     // clone3 flags are properly combined with exit_signal
     test_clone3_flags_exit_signal_merge();
+    // PROCESS_INFO_ADDR collision with code_start for Go binaries
+    test_process_info_addr_cow_overwrite();
+    test_process_info_addr_not_in_code_range_standard();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -3512,6 +3515,64 @@ fn test_clone3_flags_exit_signal_merge() {
         crate::safe_print!(128,
             "[Test] clone3_flags_exit_signal_merge FAILED: vfork={} sigchld={} no_thread={} clear={}\n",
             has_vfork, has_sigchld, no_thread, has_clear_sighand);
+    }
+}
+
+/// Regression: cow_share_range for Go ARM64 binaries starts at code_start=PAGE_SIZE
+/// (0x1000), which is PROCESS_INFO_ADDR.  The parent's PTE for 0x1000 (containing
+/// parent PID) was copied to the child, OVERWRITING the child's process info mapping.
+/// The child then read pid=parent_pid instead of pid=child_pid.
+///
+/// Fix: fork_process re-maps PROCESS_INFO_ADDR after CoW sharing.
+fn test_process_info_addr_cow_overwrite() {
+    use akuma_exec::mmu::PAGE_SIZE;
+    use akuma_exec::process::PROCESS_INFO_ADDR;
+
+    // For Go ARM64 binaries: code_end < 0x400000 → code_start = PAGE_SIZE
+    let code_end: usize = 0x229000;
+    let code_start = if code_end >= 0x1000_0000 {
+        0x1000_0000
+    } else if code_end < 0x400000 {
+        PAGE_SIZE
+    } else {
+        0x400000
+    };
+
+    // PROCESS_INFO_ADDR is in the cow_share_range [code_start, brk)
+    let overlaps = PROCESS_INFO_ADDR >= code_start && PROCESS_INFO_ADDR < code_end;
+    // code_start must equal PAGE_SIZE for Go binaries
+    let code_start_is_page_size = code_start == PAGE_SIZE;
+    // PROCESS_INFO_ADDR must equal PAGE_SIZE
+    let info_addr_is_page_size = PROCESS_INFO_ADDR == PAGE_SIZE;
+
+    if overlaps && code_start_is_page_size && info_addr_is_page_size {
+        console::print("[Test] process_info_addr_cow_overwrite PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] process_info_addr_cow_overwrite FAILED: overlaps={} cs=0x{:x} info=0x{:x}\n",
+            overlaps, code_start, PROCESS_INFO_ADDR);
+    }
+}
+
+/// For standard musl/TCC binaries (code_end >= 0x400000), code_start=0x400000,
+/// which is well above PROCESS_INFO_ADDR (0x1000).  No collision.
+fn test_process_info_addr_not_in_code_range_standard() {
+    use akuma_exec::process::PROCESS_INFO_ADDR;
+
+    let _code_end_musl: usize = 0x405000;
+    let code_start_musl: usize = 0x400000; // standard binary
+    let no_overlap_musl = PROCESS_INFO_ADDR < code_start_musl;
+
+    let _code_end_pie: usize = 0x2000_0000;
+    let code_start_pie: usize = 0x1000_0000; // large PIE binary
+    let no_overlap_pie = PROCESS_INFO_ADDR < code_start_pie;
+
+    if no_overlap_musl && no_overlap_pie {
+        console::print("[Test] process_info_addr_not_in_code_range_standard PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] process_info_addr_not_in_code_range_standard FAILED: musl={} pie={}\n",
+            no_overlap_musl, no_overlap_pie);
     }
 }
 

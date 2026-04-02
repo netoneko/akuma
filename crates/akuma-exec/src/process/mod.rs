@@ -1621,7 +1621,21 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
     }
 
-    // 5. Write ProcessInfo to child's process info page
+    // 5. Write ProcessInfo to child's process info page.
+    //
+    // CRITICAL: Re-map PROCESS_INFO_ADDR AFTER the CoW fork.  For Go ARM64
+    // binaries, code_start = PAGE_SIZE = 0x1000 = PROCESS_INFO_ADDR.
+    // cow_share_range copies the parent's PTE for 0x1000 into the child,
+    // overwriting the child's process info mapping.  Without this re-map,
+    // the child reads the PARENT's PID from PROCESS_INFO_ADDR, causing
+    // current_process() / read_current_pid() to return the wrong PID.
+    // This broke vfork_complete (wrong child PID → parent never unblocked)
+    // and the CoW fault handler (resolved pages in the wrong address space).
+    let _ = new_proc.address_space.map_page(
+        PROCESS_INFO_ADDR,
+        new_proc.process_info_phys,
+        mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+    );
     unsafe {
         let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
