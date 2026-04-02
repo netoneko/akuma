@@ -715,6 +715,18 @@ Without this, the normal cleanup path (`return_to_kernel`) never runs, so caller
 waiting on `ch.has_exited()` hang forever.  The child exit channel (used by
 `waitpid`/`wait4`) is notified separately via `notify_child_channel_exited`.
 
+**Zombie prevention:** Before terminating, `unregister_process(pid)` is called to
+remove the process from PROCESS_TABLE.  Without this, `on_thread_cleanup` can't reap
+the process because `spawn_process_with_channel` doesn't register in THREAD_PID_MAP.
+The process stays as a zombie entry visible in `ps` forever.
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_exit_terminates_calling_thread` | Test runner thread is NOT terminated (guard works) |
+| `test_exit_unregisters_process` | unregister_process for non-existent PID returns None |
+
 Also fixed remaining hardcoded `137` values in `kill_thread_group` → `-9`.
 
 ### Files changed

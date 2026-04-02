@@ -221,18 +221,17 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         vfork_complete(pid);
 
         // Terminate the calling thread — exit() must never return to EL0.
-        // Only do this if the calling thread IS the process's own thread;
-        // kernel helpers (test runner, spawn callbacks) call sys_exit on
-        // behalf of a process but must NOT be terminated themselves.
+        // Only do this if the calling thread IS the process's own thread.
         let tid = akuma_exec::threading::current_thread_id();
         if proc_tid == Some(tid) {
-            // Also notify the I/O channel (registered by tid) so that
-            // spawn_process_with_channel callers see the exit.  The
-            // normal cleanup path (return_to_kernel) won't run because
-            // we're terminating the thread here.
+            // Notify I/O channel and clean up the process before terminating.
+            // The normal return_to_kernel path won't run.
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
+            // Drop the proc borrow, then unregister to avoid zombie.
+            drop(proc);
+            let _ = akuma_exec::process::table::unregister_process(pid);
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
         }
@@ -275,6 +274,8 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
+            drop(proc);
+            let _ = akuma_exec::process::table::unregister_process(pid);
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
         }

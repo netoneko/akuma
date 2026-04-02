@@ -191,6 +191,8 @@ pub fn run_all_tests() {
     test_kill_process_exit_code_uses_negative_signal();
     // exit/exit_group must terminate the calling thread
     test_exit_terminates_calling_thread();
+    // exit must unregister process to prevent zombies
+    test_exit_unregisters_process();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -3066,6 +3068,21 @@ fn test_fork_page_count_for_len() {
         console::print("[Test] fork_page_count_for_len PASSED\n");
     } else {
         crate::safe_print!(128, "[Test] fork_page_count_for_len FAILED\n");
+    }
+}
+
+/// exit() must unregister the process from PROCESS_TABLE to avoid zombies.
+/// Before: sys_exit marked exited + terminated the thread, but skipped
+/// unregister_process.  The process stayed in PROCESS_TABLE as a zombie
+/// because on_thread_cleanup only reaps via THREAD_PID_MAP (which
+/// spawn_process_with_channel never registers in).
+fn test_exit_unregisters_process() {
+    let fake_pid: u32 = 0xDEAD_BEEF;
+    let result = akuma_exec::process::table::unregister_process(fake_pid);
+    if result.is_none() {
+        console::print("[Test] exit_unregisters_process PASSED\n");
+    } else {
+        console::print("[Test] exit_unregisters_process FAILED: got Some for non-existent PID\n");
     }
 }
 
