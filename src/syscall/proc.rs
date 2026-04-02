@@ -264,7 +264,9 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     const CLONE_PIDFD: u64 = 0x1000;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::tprint!(128, "[clone] flags=0x{:x} stack=0x{:x}\n", flags, stack);
+        let tid = akuma_exec::threading::current_thread_id();
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        crate::tprint!(128, "[clone] tid={} pid={} flags=0x{:x} stack=0x{:x}\n", tid, pid, flags, stack);
     }
 
     // Bits 32+ are unused by any valid clone flag.  Garbage values like
@@ -432,16 +434,17 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(128, "[syscall] execve(path_ptr=0x{:x}, argv_ptr=0x{:x}, envp_ptr=0x{:x})\n", path_ptr, argv_ptr, envp_ptr);
-    }
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => {
-            crate::safe_print!(64, "[syscall] execve: path copy failed with {}\n", e as i64);
+            crate::safe_print!(64, "[syscall] execve: path copy failed with {} pid={}\n", e as i64, pid);
             return e;
         },
     };
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::tprint!(128, "[syscall] execve(path=\"{}\", argv_ptr=0x{:x}, envp_ptr=0x{:x}) PID {}\n", path, argv_ptr, envp_ptr, pid);
+    }
 
     let resolved_path = if path.starts_with('/') {
         path

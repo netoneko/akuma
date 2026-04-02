@@ -1799,26 +1799,18 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     clone_lazy_regions(parent_pid, child_pid);
 
     // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID).
-    // Must use copy_to_user_safe: if the caller is a vfork child, its pages may be
-    // CoW-marked RO; a plain EL1 `str` would fault with EC=0x25.
+    // Plain EL1 store is safe here: the bits-32+ guard in sys_clone_pidfd
+    // prevents garbage flags from entering clone_thread, so the caller is
+    // always a legitimate CLONE_THREAD|CLONE_VM request with writable pages.
+    // copy_to_user_safe was tried here but its byte-by-byte strb through
+    // the fault-handler mechanism silently returned EFAULT on some pages,
+    // leaving mp.procid=0 and crashing the Go runtime.
     if parent_tid_ptr != 0 {
-        let _ = unsafe {
-            crate::mmu::user_access::copy_to_user_safe(
-                parent_tid_ptr as *mut u8,
-                &child_pid as *const u32 as *const u8,
-                core::mem::size_of::<u32>(),
-            )
-        };
+        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_pid); }
     }
     // Write child TID/PID to child_tid_ptr (CLONE_CHILD_CLEARTID).
     if child_tid_ptr != 0 {
-        let _ = unsafe {
-            crate::mmu::user_access::copy_to_user_safe(
-                child_tid_ptr as *mut u8,
-                &child_pid as *const u32 as *const u8,
-                core::mem::size_of::<u32>(),
-            )
-        };
+        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_pid); }
     }
 
     crate::threading::mark_thread_ready(tid);

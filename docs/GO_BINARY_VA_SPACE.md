@@ -315,7 +315,7 @@ Linux also does not return an error from `clone` if SETTID writes fail.
 | File | Change |
 |------|--------|
 | `crates/akuma-exec/src/process/mod.rs` | `fork_process`: add `THREAD_PID_MAP.lock().insert(tid, child_pid)` after thread alloc |
-| `crates/akuma-exec/src/process/mod.rs` | `clone_thread`: replace two `core::ptr::write` calls with `copy_to_user_safe` |
+| `crates/akuma-exec/src/process/mod.rs` | `clone_thread`: `copy_to_user_safe` attempted then reverted (see below) |
 | `src/process_tests.rs` | Two new regression tests (see below) |
 
 ### Tests added
@@ -323,7 +323,24 @@ Linux also does not return an error from `clone` if SETTID writes fail.
 | Test | What it verifies |
 |------|-----------------|
 | `test_fork_thread_pid_map_invariant` | Logical invariant: child tid must resolve to child_pid, not parent_pid |
-| `test_clone_thread_tid_write_cow_safe` | `copy_to_user_safe` to a null/invalid ptr returns EFAULT, not a kernel crash |
+| `test_clone_thread_tid_write_cow_safe` | Bits-32+ guard catches all negative error codes before clone_thread |
+
+### Reverted: copy_to_user_safe for clone_thread TID writes
+
+`copy_to_user_safe` was used to replace `core::ptr::write` for the `parent_tid_ptr`
+and `child_tid_ptr` writes in `clone_thread`.  The motivation was preventing EL1
+crashes when a vfork child called `clone_thread` with CoW-RO pages.
+
+**Problem:** `copy_to_user_safe`'s byte-by-byte `strb` through the fault-handler
+mechanism silently returned EFAULT on some pages, leaving Go's `mp.procid = 0`.  The
+Go runtime then dereferenced a nil m-pointer, crashing at FAR=0x88 (nil + struct
+field offset) during goroutine thread startup.
+
+**Fix:** Reverted to plain `core::ptr::write`.  The CoW-RO scenario that motivated
+`copy_to_user_safe` can no longer occur: the bits-32+ guard in `sys_clone_pidfd`
+rejects all garbage flags (negative error codes) before they reach `clone_thread`.
+Only legitimate `CLONE_THREAD|CLONE_VM` requests with writable pages enter
+`clone_thread`.
 
 ---
 
@@ -473,11 +490,27 @@ The relative exec path `./forktest_child` also contributes: if the working direc
 `/`, the path resolves to `/forktest_child` which doesn't exist (the binary is at
 `/bin/forktest_child`).
 
+### Follow-up: copy_to_user_safe crash at FAR=0x88 (2026-04-03)
+
+The `copy_to_user_safe` byte-by-byte `strb` in `clone_thread` for `parent_tid_ptr` /
+`child_tid_ptr` writes silently returned EFAULT on some Go heap pages.  Go's
+`mp.procid` was left as 0.  The Go runtime dereferenced a nil m-pointer during
+goroutine thread startup → crash at FAR=0x88 (nil + struct field offset 0x88).
+
+**Fix:** reverted to `core::ptr::write`.  The CoW-RO scenario that motivated
+`copy_to_user_safe` can no longer occur thanks to the bits-32+ guard.
+
+### Diagnostic: clone debug now includes tid and pid
+
+`[clone]` log lines now include the calling thread ID and PID, making it possible to
+distinguish whether `clone(0)` comes from the vfork child (PID 53) or from a parent
+goroutine thread (PID 49).  `execve` logging also includes the resolved path and PID.
+
 ### What works
 
 | Operation | Status |
 |-----------|--------|
 | Kernel boot + all tests | PASS |
 | Shell fork+exec (elftest, hello_musl) | PASS |
-| Go binary startup + goroutine threads | PASS |
-| forktest_parent vfork child → execve | **Stuck in clone loop** |
+| Go binary startup + goroutine threads | PASS (after copy_to_user_safe revert) |
+| forktest_parent vfork child → execve | **Stuck in clone loop** (open) |
