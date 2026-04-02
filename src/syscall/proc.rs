@@ -1089,6 +1089,10 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         if let Some(tid) = proc.thread_id {
             // Pend the signal for delivery by the exception return path.
             akuma_exec::threading::pend_signal_for_thread(tid, sig);
+            // Also interrupt the channel so blocking syscalls (nanosleep,
+            // futex, epoll) return EINTR.  Without this, schedule_blocking
+            // re-blocks after the wake and the signal is never delivered.
+            akuma_exec::process::interrupt_thread(tid);
             return 0;
         }
     }

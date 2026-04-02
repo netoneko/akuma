@@ -727,6 +727,41 @@ The process stays as a zombie entry visible in `ps` forever.
 | `test_exit_terminates_calling_thread` | Test runner thread is NOT terminated (guard works) |
 | `test_exit_unregisters_process` | unregister_process for non-existent PID returns None |
 
+---
+
+## Current state: forktest results (2026-04-03)
+
+### What works
+
+- **Fork+exec chain** — all 3 children launch via clone3 → fork_process → execve
+- **Stress tests** — 70k+ syscalls per child (futex, nanosleep, write, mmap, epoll)
+- **Signal delivery** — `sys_kill` delivers SIGTERM via `pend_signal_for_thread`
+- **Clean exit** — 2 of 3 children exit with `signal: terminated` (correct encoding)
+- **No zombies** — `unregister_process` cleans up exited processes immediately
+- **Thread cleanup** — threads terminated and recycled, system returns to idle
+
+### Fix: SIGTERM didn't interrupt blocking syscalls (2026-04-03)
+
+1 of 3 children stayed stuck in nanosleep after SIGTERM.
+
+**Root cause:** `sys_kill` called `pend_signal_for_thread(tid, sig)` + `wake()`, but
+did NOT set the channel's interrupted flag.  Blocking syscalls (nanosleep, futex, epoll)
+check `is_current_interrupted()` to decide whether to return EINTR.  The flag was never
+set, so the syscall re-entered `schedule_blocking` and the signal was never delivered.
+
+**Fix:** Added `interrupt_thread(tid)` after `pend_signal_for_thread` in `sys_kill`.
+This sets the channel's interrupted flag, causing the blocked syscall to return EINTR.
+The exception return path then delivers the signal to Go's handler.
+
+| File | Change |
+|------|--------|
+| `src/syscall/proc.rs` | `sys_kill`: add `interrupt_thread(tid)` after `pend_signal_for_thread` |
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sys_kill_sets_interrupted_flag` | pend_signal + interrupt_thread → is_current_interrupted() = true |
+| `test_nanosleep_returns_eintr_on_interrupt` | EINTR constant matches Linux ARM64 value |
+
 Also fixed remaining hardcoded `137` values in `kill_thread_group` → `-9`.
 
 ### Files changed
