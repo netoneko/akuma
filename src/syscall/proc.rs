@@ -69,6 +69,18 @@ pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
     !still_present
 }
 
+/// Kernel test helper: insert a fake vfork entry without invoking vfork_complete.
+/// Used to simulate the "parent inserted, signal fired, child not done yet" scenario.
+pub(crate) fn vfork_waiters_insert_for_test(child_pid: u32) {
+    let tid = akuma_exec::threading::current_thread_id();
+    VFORK_WAITERS.lock().insert(child_pid, tid);
+}
+
+/// Kernel test helper: check whether a child PID is still in VFORK_WAITERS.
+pub(crate) fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
+    VFORK_WAITERS.lock().contains_key(&child_pid)
+}
+
 /// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
 /// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
 fn encode_wait_status(code: i32) -> u32 {
@@ -270,7 +282,12 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         }
     }
 
-    if flags & CLONE_VFORK != 0 || flags & 0x11 == 0x11 {
+    // Everything that is not CLONE_THREAD|CLONE_VM is a fork.
+    // This covers CLONE_VFORK, plain fork (flags=0 / SIGCHLD), and any other
+    // combination that doesn't request shared-memory thread semantics.
+    // Returning ENOSYS for unsupported flag combos causes Go to reuse the
+    // error code (-38) as flags for the next clone call, creating cascading crashes.
+    {
         let parent_proc = match akuma_exec::process::current_process() {
             Some(p) => p,
             None => return !0u64,
@@ -279,7 +296,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         let child_pid = akuma_exec::process::allocate_pid();
 
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (vfork-like)\n", parent_proc.pid, child_pid);
+            crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (flags=0x{:x})\n", parent_proc.pid, child_pid, flags);
         }
 
         // CLONE_VFORK: register the parent TID in VFORK_WAITERS *before* fork_process
@@ -325,7 +342,18 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                     // #region agent log
                     crate::tprint!(128, "[FORK-DBG] VFORK blocking parent tid={} child={}\n", parent_tid, new_pid);
                     // #endregion
-                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    // Loop to absorb spurious wakeups caused by signal delivery.
+                    // pend_signal_for_thread() calls wake() which sets the sticky
+                    // WOKEN_STATES flag, making schedule_blocking() return even though
+                    // the child hasn't called execve/exit yet.  Re-block until
+                    // vfork_complete() removes the VFORK_WAITERS entry.
+                    loop {
+                        akuma_exec::threading::schedule_blocking(u64::MAX);
+                        let still_pending = crate::irq::with_irqs_disabled(|| {
+                            VFORK_WAITERS.lock().contains_key(&new_pid)
+                        });
+                        if !still_pending { break; }
+                    }
                     // #region agent log
                     crate::tprint!(128, "[FORK-DBG] VFORK parent tid={} RESUMED after child={}\n", parent_tid, new_pid);
                     // #endregion
@@ -344,11 +372,6 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             }
         }
     }
-
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone: flags not supported, returning ENOSYS\n");
-    }
-    ENOSYS
 }
 
 pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {

@@ -1387,6 +1387,24 @@ extern "C" fn rust_sync_el1_handler() {
     if try_resolve_el1_cow_fault() {
         return;
     }
+
+    // Fast path: if a user-copy fault handler is registered, redirect to it
+    // immediately — no debug dump needed. This avoids noise from expected
+    // EFAULT returns in copy_to_user_safe / copy_from_user_safe.
+    {
+        let quick_esr: u64;
+        unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) quick_esr); }
+        let quick_ec = (quick_esr >> 26) & 0x3F;
+        if quick_ec == 0x25 {
+            let fault_handler = akuma_exec::threading::get_user_copy_fault_handler();
+            if fault_handler != 0 {
+                unsafe { core::arch::asm!("msr elr_el1, {}", in(reg) fault_handler); }
+                akuma_exec::threading::set_user_copy_fault_handler(0);
+                return;
+            }
+        }
+    }
+
     // #region agent log
     crate::console::print("[FORK-DBG] EL1 SYNC EXCEPTION!\n");
     // #endregion

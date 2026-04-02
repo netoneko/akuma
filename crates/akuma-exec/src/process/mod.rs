@@ -1327,9 +1327,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         total_shared += cow_share_range(parent_l0, stack_start, stack_size,
             &mut new_proc.address_space, "stack")?;
 
-        // Share code+brk
+        // Share code+brk.
+        // code_start is the lowest VA we need to scan for code/data pages:
+        //   - Large binaries (code_end >= 256 MB): loaded at or above 0x1000_0000.
+        //   - Typical musl/TCC binaries: loaded at 0x400000, scan from 0x400000.
+        //   - Go ARM64 binaries: loaded at ~0x40000 (code_end < 0x400000), so
+        //     scan from PAGE_SIZE to cover the actual text segment.
         let code_start = if parent.memory.code_end >= 0x1000_0000 {
             0x1000_0000
+        } else if parent.memory.code_end < 0x400000 {
+            mmu::PAGE_SIZE  // binary loads below 4 MB (e.g. Go ARM64 at ~0x40000)
         } else {
             0x400000
         };
@@ -1439,6 +1446,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
         let code_start = if parent.memory.code_end >= 0x1000_0000 {
             0x1000_0000
+        } else if parent.memory.code_end < 0x400000 {
+            mmu::PAGE_SIZE
         } else {
             0x400000
         };
@@ -1638,13 +1647,21 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // #endregion
     // 7. Allocate thread but keep it INITIALIZING
     let tid = crate::threading::spawn_user_thread_initializing(
-        entry_point_trampoline as extern "C" fn() -> !, 
-        core::ptr::null_mut(), 
+        entry_point_trampoline as extern "C" fn() -> !,
+        core::ptr::null_mut(),
         false
     )?;
-    
+
     new_proc.thread_id = Some(tid);
-    
+
+    // Register in THREAD_PID_MAP so current_process() returns child PID for this thread.
+    // Without this, current_process() falls back to reading the parent's PROCESS_INFO_ADDR
+    // (not yet updated) and returns the parent PID, causing vfork_complete to fire on the
+    // wrong child PID and leaving the parent permanently blocked.
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(tid, child_pid);
+    });
+
     // Copy sigaltstack from parent thread to child thread
     let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
     crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
@@ -1774,13 +1791,27 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     register_process(child_pid, new_proc);
     clone_lazy_regions(parent_pid, child_pid);
 
-    // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID)
+    // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID).
+    // Must use copy_to_user_safe: if the caller is a vfork child, its pages may be
+    // CoW-marked RO; a plain EL1 `str` would fault with EC=0x25.
     if parent_tid_ptr != 0 {
-        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_pid); }
+        let _ = unsafe {
+            crate::mmu::user_access::copy_to_user_safe(
+                parent_tid_ptr as *mut u8,
+                &child_pid as *const u32 as *const u8,
+                core::mem::size_of::<u32>(),
+            )
+        };
     }
-    // Write child TID/PID to child_tid_ptr (CLONE_CHILD_CLEARTID)
+    // Write child TID/PID to child_tid_ptr (CLONE_CHILD_CLEARTID).
     if child_tid_ptr != 0 {
-        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_pid); }
+        let _ = unsafe {
+            crate::mmu::user_access::copy_to_user_safe(
+                child_tid_ptr as *mut u8,
+                &child_pid as *const u32 as *const u8,
+                core::mem::size_of::<u32>(),
+            )
+        };
     }
 
     crate::threading::mark_thread_ready(tid);
