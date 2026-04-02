@@ -327,72 +327,113 @@ Linux also does not return an error from `clone` if SETTID writes fail.
 
 ---
 
-## Follow-up Fix: clone(flags=0) → ENOSYS cascade crash (2026-04-02)
+## Follow-up Fix: clone flag routing and EL1 fault handler (2026-04-02)
 
-After the previous fixes, `forktest_parent` still crashed when a Go goroutine thread called
-`clone(flags=0, stack=0, parent_tid=0x1e0086ba8, ...)`.
+### Problem 1: clone(flags=0) fork bomb
 
-### Root cause
+Go's vfork child calls `clone(flags=0)` due to register-state leakage in the
+`rawVforkSyscall` → `forkAndExecInChild1` path.  The initial fix routed all
+non-`CLONE_THREAD|CLONE_VM` flags to `fork_process`, which turned `clone(0)` into a
+successful fork.  Each fork child ran the Go scheduler, calling `newosproc` → `clone` →
+another fork, creating an infinite fork loop.
 
-`sys_clone_pidfd` only routed to `fork_process` when:
-1. `CLONE_VFORK` was set, OR
-2. The low bits contained `SIGCHLD` (0x11)
+The old behaviour (ENOSYS) was actually correct for this case: Go's error handling
+absorbed the -38 return and the vfork child continued to `execve`.  The SIGSEGV from
+the accidental `clone_thread(stack=0)` was on a **different** thread and didn't affect
+the calling thread's execution.
 
-`clone(flags=0)` matched neither condition and fell through to ENOSYS.
+**Fix (routing):** Restored the original fork-routing condition.  Only `CLONE_VFORK` or
+`SIGCHLD` (0x11 in the low byte) routes to `fork_process`.  `clone(flags=0)` returns
+ENOSYS as before.
 
-On Linux, `clone(flags=0)` is a valid operation equivalent to `fork()` with no signal on
-child exit.  Returning ENOSYS triggered a cascade:
+**Fix (garbage flags):** Added an early check: `if flags >> 32 != 0 { return ENOSYS; }`.
+No valid clone flag uses bits 32+.  Garbage values like -ENOSYS (0xffffffffffffffda) and
+-EAGAIN (0xfffffffffffffff5) have those bits set.  Without this guard, the error code
+became the next clone's flags, which still matched `CLONE_THREAD|CLONE_VM`, creating an
+infinite loop: clone(-38)→EAGAIN(-11)→clone(-11)→EAGAIN(-11)→...
 
-1. Go gets -38 (ENOSYS) in R0 from the first clone call
-2. Go's retry or error path issues a second clone with the leftover R0 value as flags
-3. `flags=0xffffffffffffffda` (-38) happens to have `CLONE_THREAD|CLONE_VM` bits set
-4. `clone_thread(stack=0, ...)` creates a new thread with SP=0
-5. The new thread immediately crashes at FAR=0x28 (null-pointer + field offset)
+### Problem 2: EL1 user-copy fault handler noise (NOT fixed — deadlock risk)
 
-### Fix
+The EL1 sync exception handler prints a debug dump before checking the user-copy
+fault handler.  `copy_to_user_safe` faults produce noisy output even when handled.
 
-The fork path is now the **default** for any flags that don't have `CLONE_THREAD|CLONE_VM`.
-Instead of:
-
-```rust
-if flags & CLONE_VFORK != 0 || flags & 0x11 == 0x11 {
-    // fork_process ...
-}
-// else: ENOSYS  ← BUG
-```
-
-It is now:
-
-```rust
-if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
-    // clone_thread ...
-} else {
-    // fork_process (covers CLONE_VFORK, SIGCHLD, flags=0, any combo)
-}
-```
-
-### Additional fix: EL1 user-copy fault handler fast path
-
-The EL1 sync exception handler in `exceptions.rs` was printing a full debug dump
-(`[FORK-DBG] EL1 SYNC EXCEPTION! ...`) even when `copy_to_user_safe` had a registered
-fault handler that would handle the EFAULT gracefully.  The fault handler check was
-after the debug dump.
-
-Moved the `get_user_copy_fault_handler()` check to immediately after
-`try_resolve_el1_cow_fault()`, before the debug dump.  Expected faults from
-`copy_to_user_safe` / `copy_from_user_safe` now return EFAULT silently.
+An initial fix moved `get_user_copy_fault_handler()` before the debug dump, but this
+caused a **deadlock**: `get_user_copy_fault_handler()` acquires POOL lock inside
+`with_irqs_disabled`.  If an EL1 data abort fires while POOL lock is already held
+(e.g. during context switch or thread spawn), the nested lock acquisition hangs the
+kernel.  The fix was reverted; the debug dump noise is acceptable.
 
 ### Files changed
 
 | File | Change |
 |------|--------|
-| `src/syscall/proc.rs` | `sys_clone_pidfd`: fork path is now the else-default; removed ENOSYS fallthrough |
-| `src/exceptions.rs` | `rust_sync_el1_handler`: user_copy_fault_handler check moved before debug dump |
+| `src/syscall/proc.rs` | `sys_clone_pidfd`: restored CLONE_VFORK\|SIGCHLD fork condition; unknown flags → ENOSYS |
+| `src/exceptions.rs` | `rust_sync_el1_handler`: fast-path attempted then reverted (deadlock risk documented) |
+| `src/process_tests.rs` | New regression test (see below) |
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_clone_flags_routing` | Verifies routing: VFORK/SIGCHLD→fork, THREAD\|VM→thread, flags=0→enosys, garbage→enosys |
+
+---
+
+## Follow-up Fix: clone_thread stack=0 crash guard (2026-04-02)
+
+### Problem
+
+After the clone flag routing fix, the ENOSYS cascade still produces `clone(flags=-38)`
+calls that enter `clone_thread` (because 0xffffffffffffffda has `CLONE_THREAD|CLONE_VM`
+bits set).  `clone_thread` accepted `stack=0`, creating a thread with SP=0 that
+immediately crashed at FAR=0x28 (null-pointer + struct field offset) with SIGSEGV.
+
+The crash pattern repeats every ~0.3s:
+
+```
+[clone] flags=0x0 stack=0x0           → ENOSYS
+[clone] flags=0xffffffffffffffda      → clone_thread(stack=0)
+[FORK-DBG] trampoline ENTRY tid=18
+[DP] no lazy region for FAR=0x28      → SIGSEGV
+[Fault] Process 54 (/bin/forktest_parent) SIGSEGV after 0.24s
+```
+
+Each bogus thread consumes a thread slot and triggers `vfork_complete(wrong_pid)` —
+never the vfork child's PID — so the parent stays permanently blocked.
+
+### Root cause
+
+Go's vfork child leaks register state: after `rawVforkSyscall(SYS_CLONE3, ...)`,
+the child's R0=0 and R8=435 (SYS_CLONE3).  Go's child path code eventually makes
+syscalls where leftover register values produce `clone(flags=0, stack=0)`.  The
+ENOSYS return (-38) in R0 becomes the flags for the next clone call.  `-38` =
+`0xffffffffffffffda` has bits 8 (`CLONE_VM`) and 16 (`CLONE_THREAD`) set, so the
+kernel enters `clone_thread` with `stack=0`.
+
+### Fix
+
+`clone_thread` now rejects `stack=0` with an error:
+
+```rust
+if stack == 0 {
+    return Err("clone_thread: stack must be non-zero");
+}
+```
+
+The caller (`sys_clone_pidfd`) returns EAGAIN (-11), which Go handles as a
+non-fatal thread-creation failure.  No bogus thread is created, no SIGSEGV,
+no wasted thread slots.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `crates/akuma-exec/src/process/mod.rs` | `clone_thread`: reject stack=0 at entry |
 | `src/process_tests.rs` | Two new regression tests (see below) |
 
 ### Tests added
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_clone_flags_zero_routes_to_fork` | flags=0, SIGCHLD, CLONE_VFORK all route to fork; CLONE_THREAD\|CLONE_VM routes to thread |
-| `test_clone_garbage_flags_no_thread_with_zero_stack` | Documents that -ENOSYS (0xffffffffffffffda) has CLONE_THREAD\|CLONE_VM bits set → crash with stack=0 |
+| `test_clone_thread_rejects_zero_stack` | -ENOSYS has CLONE_THREAD\|CLONE_VM bits; stack=0 would crash; guard catches it |
+| `test_clone_enosys_cascade_no_crash` | Full cascade: flags=0→ENOSYS, flags=-38→clone_thread(stack=0)→rejected |

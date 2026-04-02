@@ -267,6 +267,14 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         crate::tprint!(128, "[clone] flags=0x{:x} stack=0x{:x}\n", flags, stack);
     }
 
+    // Bits 32+ are unused by any valid clone flag.  Garbage values like
+    // -ENOSYS (0xffffffffffffffda) or -EAGAIN (0xfffffffffffffff5) have them
+    // set and coincidentally match CLONE_THREAD|CLONE_VM, causing an infinite
+    // error→retry loop.  Reject early.
+    if flags >> 32 != 0 {
+        return ENOSYS;
+    }
+
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
         match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid) {
             Ok(tid) => {
@@ -282,12 +290,16 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         }
     }
 
-    // Everything that is not CLONE_THREAD|CLONE_VM is a fork.
-    // This covers CLONE_VFORK, plain fork (flags=0 / SIGCHLD), and any other
-    // combination that doesn't request shared-memory thread semantics.
-    // Returning ENOSYS for unsupported flag combos causes Go to reuse the
-    // error code (-38) as flags for the next clone call, creating cascading crashes.
-    {
+    // Route to fork_process for known fork-like flag combinations:
+    //   - CLONE_VFORK (with or without CLONE_VM / SIGCHLD)
+    //   - SIGCHLD (0x11) in the low 8 bits (standard fork)
+    //
+    // Other flag combos (including flags=0) return ENOSYS.  Go's runtime
+    // may accidentally call clone(0) due to register-state leakage in the
+    // vfork child; returning ENOSYS allows Go's error handling to continue
+    // to the next syscall.  Routing clone(0) to fork_process creates a
+    // fork bomb: each fork child runs the Go scheduler → newosproc → clone.
+    if flags & CLONE_VFORK != 0 || flags & 0xFF == 0x11 {
         let parent_proc = match akuma_exec::process::current_process() {
             Some(p) => p,
             None => return !0u64,
@@ -372,6 +384,11 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             }
         }
     }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[syscall] clone: flags=0x{:x} not supported, returning ENOSYS\n", flags);
+    }
+    ENOSYS
 }
 
 pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {

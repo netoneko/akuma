@@ -1698,6 +1698,13 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
 pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
+    // Reject stack=0: a thread with SP=0 will immediately crash at a near-zero
+    // address (e.g. FAR=0x28) when it tries to access stack variables.  This
+    // happens when Go's vfork child leaks -ENOSYS into clone flags, causing
+    // clone_thread to be entered with garbage arguments.
+    if stack == 0 {
+        return Err("clone_thread: stack must be non-zero");
+    }
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot clone thread");
     }
