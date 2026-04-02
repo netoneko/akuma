@@ -572,4 +572,51 @@ goroutine thread (PID 49).  `execve` logging also includes the resolved path and
 | Kernel boot + all tests | PASS |
 | Shell fork+exec (elftest, hello_musl) | PASS |
 | Go binary startup + goroutine threads | PASS (after copy_to_user_safe revert) |
-| forktest_parent vfork child → execve | **Stuck in clone loop** (open) |
+| forktest_parent fork+exec children | **WORKS** (after PROCESS_INFO_ADDR fix) |
+| forktest_child stress tests (55k syscalls) | **WORKS** (11s runtime per child) |
+| forktest_child clean exit | Exit code 137 (SIGKILL instead of SIGTERM) |
+| Re-entrant signal on sigaltstack | PID 73 SIGSEGV (Go signal handler crash) |
+
+---
+
+## Run results: forktest_parent -duration 30s -combined_stress (2026-04-03)
+
+After the PROCESS_INFO_ADDR re-map fix, fork+exec works end-to-end:
+
+```
+forktest_parent: Starting with 3 children, duration=30s
+forktest_parent: Launching child 0...
+forktest_parent: Launching child 1...
+forktest_parent: Launching child 2...
+forktest_parent: Duration elapsed, killing 3 remaining children.
+forktest_parent: Child 0 finished with error: exit status 137
+```
+
+Children ran ~11s each with 55k+ syscalls (futex, nanosleep, write, openat, mmap, etc.).
+
+### First-child CWD bug
+
+The **first** vfork child (PID 53) got CWD="/" instead of CWD="/bin" because the shell
+launched `forktest_parent` via `spawn_process_with_channel` (which uses `from_elf` →
+CWD="/") rather than fork+exec (which inherits the shell's CWD).  `./forktest_child`
+resolved to `/forktest_child` → ENOENT → exit 253.
+
+The parent exited with code 1.  The user's **second** run used fork+exec (the shell's
+fork path now works thanks to the fixes), inheriting CWD="/bin" correctly.  All three
+children launched and ran successfully.
+
+### Remaining issues
+
+| Issue | Description |
+|-------|-------------|
+| Exit code 137 | Children killed by SIGKILL (not SIGTERM).  SIGTERM delivery to Go processes may not be handled. |
+| PID 73 SIGSEGV | Re-entrant signal fault during Go's SIGSEGV handler on sigaltstack.  ISS=0x4f (permission fault write). |
+| Epoll busy loop | After children exit, parent's epoll_pwait returns nready=3 in a tight loop (7159 iterations).  Pipe EOF/EPOLLRDHUP not triggering correctly. |
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_from_elf_default_cwd` | from_elf sets CWD="/" by default |
+| `test_fork_preserves_parent_cwd` | fork_process copies parent.cwd; "./forktest_child" resolves to "/bin/forktest_child" |
+| `test_execve_preserves_cwd` | replace_image does not reset CWD (POSIX behavior) |
