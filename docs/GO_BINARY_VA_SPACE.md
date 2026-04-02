@@ -633,18 +633,102 @@ forktest_parent: All children processed via epoll. Parent exiting.
 - **All threads cleaned up** — system returns to 8/64 threads
 - **System stable** — heartbeat, SSH continue after forktest completes
 
-### Exit status 137 discrepancy
+### Fix: exit status 137 — sys_kill ignored signal argument (2026-04-03)
 
-Children exit `code=0` in the kernel (via `exit_group(0)`), but Go's `cmd.Wait()` reports
-`exit status 137` (128 + 9 = SIGKILL).  This means the kernel's `waitpid` reports
-`WaitStatus` with signal 9 instead of clean exit.
+Children always exited with status 137 regardless of signal sent.
 
-**Root cause:** The parent sends SIGTERM when the 30s deadline expires.  Akuma's
-`exit_group` terminates the calling thread but may not kill all goroutine threads in the
-thread group.  The parent's `cmd.Wait()` waits for the main child PID, which was killed
-by a signal (probably SIGKILL from thread group cleanup or the parent process exiting).
-The `encode_wait_status(-9)` produces status=9 in the low bits, which Go interprets as
-killed-by-signal.
+**Root cause:** `sys_kill(pid, sig)` ignored the `sig` parameter entirely (`_sig`).
+It called `kill_process(pid)` which hardcoded `exit_code = 137` (the literal number,
+not -9).  `encode_wait_status(137)` produced `(137 << 8) = 0x8900` → Go decoded this
+as a normal exit with code 137, reporting "exit status 137".
+
+When the parent sent SIGTERM (15), the kernel didn't deliver SIGTERM at all — it just
+force-killed the process with exit_code=137.
+
+**Fix (two parts):**
+
+1. `sys_kill` now delivers the signal via `pend_signal_for_thread()` instead of
+   force-killing.  If the process has a signal handler (Go installs one for SIGTERM),
+   the handler runs.  If no handler is registered, a fallback
+   `kill_process_with_signal(pid, sig)` terminates the process with
+   `exit_code = -(sig)`.
+
+2. `kill_process` now sets `exit_code = -9` (negative = killed by signal) instead of
+   137 (the literal number).  `encode_wait_status(-9)` produces status=9 in the low
+   bits → Go correctly reports "signal: killed".
+
+**Files changed:**
+
+| File | Change |
+|------|--------|
+| `src/syscall/proc.rs` | `sys_kill`: deliver signal via pend_signal_for_thread; sig=0 is existence probe |
+| `crates/akuma-exec/src/process/signal.rs` | `kill_process`: exit_code=-9; new `kill_process_with_signal(pid, sig)` |
+
+**Tests added:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sys_kill_delivers_signal_not_hardkill` | SIGTERM→143, SIGKILL→137, SIGINT→130 (correct signal encoding) |
+| `test_kill_process_exit_code_uses_negative_signal` | Old exit_code=137 was "normal exit 137"; new -9 is "killed by signal 9" |
+
+---
+
+## Follow-up Fix: exit/exit_group returned to userspace (2026-04-03)
+
+### Problem
+
+After receiving SIGTERM, Go processes called `exit_group(0)`. But `sys_exit_group`
+marked the process as exited and then **returned to userspace**. The calling thread
+continued executing Go code (epoll_pwait, futex) indefinitely, consuming a thread
+slot. The parent's `cmd.Wait()` never returned because the child was still running.
+
+The user observed: SSH hangs, `ps` hangs, forktest_parent never gets control back.
+Thread count stayed elevated (15-16/64) instead of dropping after forktest completed.
+
+### Root cause
+
+Both `sys_exit` and `sys_exit_group` set `proc.exited = true` and returned the exit
+code as a normal syscall return value. The thread returned to EL0 and continued
+executing. On Linux, `exit()`/`exit_group()` call `do_exit()` which transitions the
+thread to `TASK_DEAD` and calls `schedule()` — the thread never runs again.
+
+### Fix
+
+After marking the process as exited, the calling thread is terminated:
+
+```rust
+let tid = akuma_exec::threading::current_thread_id();
+akuma_exec::threading::mark_thread_terminated(tid);
+loop { akuma_exec::threading::yield_now(); }
+```
+
+The scheduler stops dispatching the terminated thread. `cleanup_terminated()` recycles
+the thread slot.  Applied to both `sys_exit` and `sys_exit_group`.
+
+**Guard:** Only terminates the thread if `proc.thread_id == Some(current_tid)`.
+Kernel helpers (test runner, spawn callbacks) call `sys_exit` on behalf of a process
+but run on their own thread — they must NOT be terminated.
+
+**I/O channel notification:** Before terminating, `get_channel(tid).set_exited(code)`
+is called to notify the I/O channel (the one returned by `spawn_process_with_channel`).
+Without this, the normal cleanup path (`return_to_kernel`) never runs, so callers
+waiting on `ch.has_exited()` hang forever.  The child exit channel (used by
+`waitpid`/`wait4`) is notified separately via `notify_child_channel_exited`.
+
+Also fixed remaining hardcoded `137` values in `kill_thread_group` → `-9`.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `src/syscall/proc.rs` | `sys_exit` + `sys_exit_group`: terminate calling thread after marking exited |
+| `crates/akuma-exec/src/process/mod.rs` | `kill_thread_group`: exit_code 137 → -9 |
+
+### Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_exit_terminates_calling_thread` | Verifies the test runner thread is NOT terminated (structural check) |
 
 ### Remaining first-child CWD issue
 

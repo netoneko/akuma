@@ -85,10 +85,10 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Clean up all open FDs for this process
     cleanup_process_fds(proc);
     
-    // Mark process as killed (using signal 9 = SIGKILL)
+    // Mark process as killed by SIGKILL
     proc.exited = true;
-    proc.exit_code = 137; // 128 + SIGKILL(9)
-    proc.state = ProcessState::Zombie(137);
+    proc.exit_code = -9; // negative = killed by signal (SIGKILL)
+    proc.state = ProcessState::Zombie(-9);
     
     // Clear lazy region metadata before dropping the process.
     // Without this, the LAZY_REGION_TABLE BTreeMap entry leaks.
@@ -100,14 +100,49 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Remove and notify the process channel
     if let Some(tid) = thread_id {
         if let Some(channel) = remove_channel(tid) {
-            channel.set_exited(137);
+            channel.set_exited(-9);
         }
 
         // Mark the thread as terminated so scheduler stops scheduling it
         threading::mark_thread_terminated(tid);
     }
-    
+
     log::debug!("[kill] Killed PID {} (thread {:?})", pid, thread_id);
-    
+
+    Ok(())
+}
+
+/// Kill a process with a specific signal number.
+/// The exit code is set to -(signal) so encode_wait_status reports the correct signal.
+pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> {
+    let proc = lookup_process(pid).ok_or("Process not found")?;
+    let thread_id = proc.thread_id;
+
+    if let Some(tid) = thread_id {
+        if let Some(channel) = get_channel(tid) {
+            channel.set_interrupted();
+        }
+        for _ in 0..5 {
+            threading::yield_now();
+        }
+    }
+
+    cleanup_process_fds(proc);
+
+    let exit_code = -(sig as i32);
+    proc.exited = true;
+    proc.exit_code = exit_code;
+    proc.state = ProcessState::Zombie(exit_code);
+
+    clear_lazy_regions(pid);
+    let _dropped = crate::process::table::unregister_process(pid);
+
+    if let Some(tid) = thread_id {
+        if let Some(channel) = remove_channel(tid) {
+            channel.set_exited(exit_code);
+        }
+        threading::mark_thread_terminated(tid);
+    }
+
     Ok(())
 }

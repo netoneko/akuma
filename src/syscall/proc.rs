@@ -210,6 +210,7 @@ pub(super) fn sys_exit(code: i32) -> u64 {
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.name, code, secs, frac);
         }
         let pid = proc.pid;
+        let proc_tid = proc.thread_id;
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
@@ -218,6 +219,23 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         }
         notify_child_channel_exited(pid, code);
         vfork_complete(pid);
+
+        // Terminate the calling thread — exit() must never return to EL0.
+        // Only do this if the calling thread IS the process's own thread;
+        // kernel helpers (test runner, spawn callbacks) call sys_exit on
+        // behalf of a process but must NOT be terminated themselves.
+        let tid = akuma_exec::threading::current_thread_id();
+        if proc_tid == Some(tid) {
+            // Also notify the I/O channel (registered by tid) so that
+            // spawn_process_with_channel callers see the exit.  The
+            // normal cleanup path (return_to_kernel) won't run because
+            // we're terminating the thread here.
+            if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
+                io_ch.set_exited(code);
+            }
+            akuma_exec::threading::mark_thread_terminated(tid);
+            loop { akuma_exec::threading::yield_now(); }
+        }
     }
     code as u64
 }
@@ -232,6 +250,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
                 proc.pid, proc.name, code, secs, frac);
         }
         let pid = proc.pid;
+        let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
         proc.exited = true;
         proc.exit_code = code;
@@ -247,6 +266,18 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         proc.fds.close_all();
         akuma_exec::process::kill_thread_group(pid, l0_phys);
         vfork_complete(pid);
+
+        // Terminate the calling thread — exit_group() must never return to EL0.
+        // Only do this if the calling thread IS the process's own thread;
+        // kernel helpers must NOT be terminated.
+        let tid = akuma_exec::threading::current_thread_id();
+        if proc_tid == Some(tid) {
+            if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
+                io_ch.set_exited(code);
+            }
+            akuma_exec::threading::mark_thread_terminated(tid);
+            loop { akuma_exec::threading::yield_now(); }
+        }
     }
     code as u64
 }
@@ -1036,10 +1067,33 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     !0u64
 }
 
-pub(super) fn sys_kill(pid: u32, _sig: u32) -> u64 {
+pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if pid == 0 { return 0; }
     if pid <= 1 { return !0u64; }
-    if akuma_exec::process::kill_process(pid).is_ok() { 0 } else { !0u64 }
+
+    // sig=0 is a "does the process exist?" probe — don't actually send anything.
+    if sig == 0 {
+        return if akuma_exec::process::lookup_process(pid).is_some() { 0 } else { ESRCH };
+    }
+
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
+    }
+
+    // Try to deliver the signal to the process.  If the process has a
+    // userspace handler registered (e.g. Go's SIGTERM handler), the signal
+    // will be delivered on the next return to EL0.  If no handler is
+    // registered, the default action for most signals is to terminate.
+    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+        if let Some(tid) = proc.thread_id {
+            // Pend the signal for delivery by the exception return path.
+            akuma_exec::threading::pend_signal_for_thread(tid, sig);
+            return 0;
+        }
+    }
+
+    // Fallback: no thread to deliver to — hard-kill the process.
+    if akuma_exec::process::kill_process_with_signal(pid, sig).is_ok() { 0 } else { ESRCH }
 }
 
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {

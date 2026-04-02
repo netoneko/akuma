@@ -655,7 +655,7 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
         if let Some(tid) = sib_tid {
             // DO NOT remove from THREAD_PID_MAP yet - wait for cleanup_callback
             if let Some(channel) = remove_channel(*tid) {
-                channel.set_exited(137);
+                channel.set_exited(-9); // killed by SIGKILL (thread group cleanup)
             }
         }
 
@@ -663,8 +663,8 @@ pub fn kill_thread_group(my_pid: Pid, l0_phys: usize) {
         // Just mark as exited/zombie so wait4 can see it
         if let Some(proc) = lookup_process(*sib_pid) {
              proc.exited = true;
-             proc.exit_code = 137;
-             proc.state = ProcessState::Zombie(137);
+             proc.exit_code = -9; // killed by SIGKILL (thread group cleanup)
+             proc.state = ProcessState::Zombie(-9);
              // Clear thread_id so entry_point_trampoline won't match this
              // zombie when a new process is spawned on the same thread slot.
              proc.thread_id = None;
