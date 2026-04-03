@@ -330,6 +330,22 @@ pub const PROC_STDIN_MAX_SIZE: usize = 8 * 1024; // 8KB
 /// Note: A single write larger than this limit is still accepted in full.
 pub const PROC_STDOUT_MAX_SIZE: usize = 8 * 1024; // 8KB
 
+/// Enable workarounds for QEMU HVF on Apple Silicon.
+///
+/// When true: skips GIC init (avoids ISV=0 abort), uses virtual timer,
+/// flushes new page tables to PoC, uses phys_to_virt for cache maintenance.
+///
+/// **Current status (QEMU 10.x):** HVF mode is non-functional for full OS
+/// operation because the GIC distributor MMIO is completely inaccessible
+/// (ISV=0 abort regardless of instruction type). Without GIC there is no
+/// interrupt delivery, no preemptive scheduling, and no SGI for cooperative
+/// scheduling. See docs/APPLE_M4_QEMU_HVF.md for details and the QEMU
+/// patch that fixes this.
+///
+/// Set to false for normal `-accel tcg` builds (default, fully functional).
+/// Set to true only when testing with a patched QEMU that fixes the ISV=0 bug.
+pub const QEMU_HVF_FIX_ENABLED: bool = false;
+
 // ============================================================================
 // SSH Server Configuration
 // ============================================================================

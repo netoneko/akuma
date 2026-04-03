@@ -916,7 +916,17 @@ unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize,
     }
 }}
 
-pub fn protect_kernel_code() {
+#[cfg(target_os = "none")]
+unsafe fn flush_page_to_poc(addr: usize, size: usize) {
+    const CACHE_LINE: usize = 64;
+    let mut cur = addr;
+    while cur < addr + size {
+        core::arch::asm!("dc civac, {}", in(reg) cur, options(nostack, preserves_flags));
+        cur += CACHE_LINE;
+    }
+}
+
+pub fn protect_kernel_code(hvf_fix: bool) {
     unsafe extern "C" {
         static _text_start: u8; static _text_end: u8;
         static _rodata_start: u8; static _rodata_end: u8;
@@ -978,6 +988,18 @@ pub fn protect_kernel_code() {
         }
     }
     
+    // DC CIVAC: flush new page tables to PoC so the HW page-table walker sees them.
+    // Required for QEMU HVF (real hardware); skipped under TCG.
+    if hvf_fix {
+        #[cfg(target_os = "none")]
+        unsafe {
+            flush_page_to_poc(l2_table, PAGE_SIZE);
+            for i in 0..num_l3_blocks {
+                flush_page_to_poc(l3_tables[i], PAGE_SIZE);
+            }
+        }
+    }
+
     let l0_table = get_boot_ttbr0() as *mut u64;
     unsafe {
         let l1_table = ((*l0_table) & 0x0000_FFFF_FFFF_F000) as *mut u64;

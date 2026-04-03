@@ -5216,11 +5216,17 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     // Update flags to RX (simulating mprotect PROT_READ|PROT_EXEC)
     let update_ok = addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX).is_ok();
 
-    // Run the IC IALLU cache maintenance path (as sys_mprotect now does)
+    // Run the IC IALLU cache maintenance path (as sys_mprotect now does).
+    // Use the physical identity address (phys_to_virt) instead of test_va because
+    // this test runs in kernel context where the kernel's TTBR0 is active. test_va
+    // is only mapped in addr_space (a separate UserAddressSpace), not in the
+    // kernel's boot page table. On real hardware (HVF) dc cvau faults on unmapped
+    // VAs; phys_to_virt is always accessible from EL1.
+    let phys_ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as usize;
     unsafe {
         let mut off = 0usize;
         while off < 4096 {
-            core::arch::asm!("dc cvau, {}", in(reg) (test_va + off) as u64);
+            core::arch::asm!("dc cvau, {}", in(reg) (phys_ptr + off) as u64);
             off += 64;
         }
         core::arch::asm!("dsb ish");
@@ -5274,13 +5280,16 @@ fn test_mprotect_large_region_completes() -> bool {
         let _ = addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     }
 
-    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU
-    for i in 0..num_pages {
-        let va = base_va + i * 4096;
+    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU.
+    // Use phys_to_virt (identity mapping) instead of the user VA: this test runs
+    // in kernel context with the kernel's TTBR0 active, so user VAs are not
+    // accessible. On real hardware (HVF) dc cvau faults on unmapped VAs.
+    for f in &frames {
+        let phys_ptr = akuma_exec::mmu::phys_to_virt(f.addr) as usize;
         unsafe {
             let mut off = 0usize;
             while off < 4096 {
-                core::arch::asm!("dc cvau, {}", in(reg) (va + off) as u64);
+                core::arch::asm!("dc cvau, {}", in(reg) (phys_ptr + off) as u64);
                 off += 64;
             }
         }

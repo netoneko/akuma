@@ -1271,7 +1271,7 @@ extern "C" fn rust_default_exception_handler() {
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // Acknowledge the interrupt and get IRQ number
     let irq_opt = crate::gic::acknowledge_irq();
-    
+
     if let Some(irq) = irq_opt {
         // Special handling for scheduler SGI
         if irq == crate::gic::SGI_SCHEDULER {

@@ -2,8 +2,16 @@ use alloc::string::String;
 use alloc::format;
 use arm_pl031::Rtc;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+
+/// When true, use CNTV (virtual timer) registers instead of CNTP (physical).
+/// Required under QEMU HVF where physical timer MSR/MRS are trapped by EL2.
+static TIMER_USING_VIRTUAL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_use_virtual_timer() {
+    TIMER_USING_VIRTUAL.store(true, Ordering::Release);
+}
 
 // UTC offset in microseconds since Unix epoch (1970-01-01 00:00:00)
 // Can be set via set_utc_offset() to sync with real time
@@ -36,11 +44,15 @@ pub fn enable_timer_interrupts(interval_us: u64) {
     let new_cval = counter + ticks;
 
     unsafe {
-        // Set the timer compare value
-        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
-
-        // Enable the timer (bit 0 = enable, bit 1 = !mask)
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        if TIMER_USING_VIRTUAL.load(Ordering::Acquire) {
+            asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
+            asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
+        } else {
+            // Set the timer compare value
+            asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
+            // Enable the timer (bit 0 = enable, bit 1 = !mask)
+            asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        }
     }
 }
 
@@ -54,12 +66,14 @@ pub fn timer_irq_handler(_irq: u32) {
     let new_cval = counter + interval_ticks;
 
     unsafe {
-        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
-        // Defensively re-enable the timer on every tick: bit 0 = enable, bit 1 = !mask.
-        // If cntp_ctl_el0 ever gets corrupted (enable cleared or mask set), no further
-        // IRQs would fire, causing a permanent freeze. Writing 1 here ensures the timer
-        // keeps ticking even if something corrupted the control register.
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        if TIMER_USING_VIRTUAL.load(Ordering::Acquire) {
+            asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
+            asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
+        } else {
+            asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
+            // Defensively re-enable the timer on every tick: bit 0 = enable, bit 1 = !mask.
+            asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        }
     }
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
@@ -107,7 +121,11 @@ pub fn timer_irq_handler(_irq: u32) {
 pub fn read_counter() -> u64 {
     let counter: u64;
     unsafe {
-        asm!("mrs {}, cntpct_el0", out(reg) counter);
+        if TIMER_USING_VIRTUAL.load(Ordering::Acquire) {
+            asm!("mrs {}, cntvct_el0", out(reg) counter);
+        } else {
+            asm!("mrs {}, cntpct_el0", out(reg) counter);
+        }
     }
     counter
 }

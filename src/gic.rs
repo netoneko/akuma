@@ -49,7 +49,6 @@ impl Gic {
     /// Write to a distributor register
     #[inline]
     fn write_dist(&self, offset: usize, value: u32) {
-        // SAFETY: Writing to GIC distributor register at known QEMU virt machine address
         unsafe {
             core::ptr::write_volatile((self.dist_base + offset) as *mut u32, value);
         }
@@ -58,7 +57,6 @@ impl Gic {
     /// Write a byte to a distributor register
     #[inline]
     fn write_dist_byte(&self, offset: usize, value: u8) {
-        // SAFETY: Writing to GIC distributor register at known address
         unsafe {
             core::ptr::write_volatile((self.dist_base + offset) as *mut u8, value);
         }
@@ -67,7 +65,6 @@ impl Gic {
     /// Write to a CPU interface register
     #[inline]
     fn write_cpu(&self, offset: usize, value: u32) {
-        // SAFETY: Writing to GIC CPU interface register at known QEMU virt machine address
         unsafe {
             core::ptr::write_volatile((self.cpu_base + offset) as *mut u32, value);
         }
@@ -76,13 +73,20 @@ impl Gic {
     /// Read from a CPU interface register
     #[inline]
     fn read_cpu(&self, offset: usize) -> u32 {
-        // SAFETY: Reading from GIC CPU interface register at known QEMU virt machine address
         unsafe { core::ptr::read_volatile((self.cpu_base + offset) as *const u32) }
     }
 
     // ========================================================================
     // High-level GIC operations (safe wrappers)
     // ========================================================================
+
+    /// Initialize only the CPU interface (no distributor writes).
+    /// Used under QEMU HVF where distributor MMIO causes ISV=0 aborts.
+    #[allow(dead_code)]
+    fn init_cpu_interface_only(&self) {
+        self.write_cpu(cpu::PMR, 0xFF);
+        self.write_cpu(cpu::CTLR, 1);
+    }
 
     /// Initialize the GIC
     fn init(&self) {
@@ -169,6 +173,12 @@ impl Gic {
 /// Global GIC instance at remapped VAs (physical 0x0800_0000 / 0x0801_0000 via L0[1])
 static GIC: Gic = Gic::new(akuma_exec::mmu::DEV_GIC_DIST_VA, akuma_exec::mmu::DEV_GIC_CPU_VA);
 
+/// Set to true once GIC has been fully initialized.
+/// When false (e.g. under QEMU HVF where GIC MMIO causes ISV=0 aborts),
+/// all GIC operations become no-ops.
+static GIC_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // ============================================================================
 // Public API - Safe wrappers around GIC operations
 // ============================================================================
@@ -179,20 +189,24 @@ pub const SGI_SCHEDULER: u32 = 0; // SGI 0 for scheduling
 /// Initialize the GIC
 pub fn init() {
     GIC.init();
+    GIC_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Enable a specific IRQ
 pub fn enable_irq(irq: u32) {
+    if !GIC_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) { return; }
     GIC.enable_irq(irq);
 }
 
 /// Acknowledge an interrupt and return its IRQ number
 pub fn acknowledge_irq() -> Option<u32> {
+    if !GIC_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) { return None; }
     GIC.acknowledge_irq()
 }
 
 /// Signal end of interrupt handling
 pub fn end_of_interrupt(irq: u32) {
+    if !GIC_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) { return; }
     GIC.end_of_interrupt(irq);
 }
 
@@ -200,6 +214,7 @@ pub fn end_of_interrupt(irq: u32) {
 ///
 /// SGI 0-15 are available. This sends the interrupt to the current CPU.
 pub fn trigger_sgi(sgi_id: u32) {
+    if !GIC_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) { return; }
     GIC.trigger_sgi(sgi_id);
 }
 

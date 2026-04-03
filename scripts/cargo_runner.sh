@@ -15,6 +15,7 @@ rust-objcopy -O binary "$ELF" "$BIN"
 
 exec qemu-system-aarch64 \
   -semihosting \
+  -accel tcg \
   -machine virt \
   -cpu max \
   -m "$MEMORY" \
@@ -24,7 +25,7 @@ exec qemu-system-aarch64 \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080,hostfwd=tcp::44-:44,hostfwd=tcp::4444-:4444 \
   -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
-  -drive file=disk.img,if=none,format=raw,id=hd0 \
+  -drive file=disk.img,if=none,format=raw,id=hd0,cache=unsafe \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \

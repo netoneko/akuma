@@ -444,7 +444,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("MMU enabled with identity mapping\n");
 
     console::print("Enabling kernel code protection...\n");
-    mmu::protect_kernel_code();
+    mmu::protect_kernel_code(config::QEMU_HVF_FIX_ENABLED);
     console::print("Kernel code protection enabled\n");
 
     // Print PMM stats
@@ -458,7 +458,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" free\n");
 
     // Initialize GIC (Generic Interrupt Controller)
-    gic::init();
+    // Skipped under QEMU HVF: GIC distributor MMIO at 0x0800_0000 causes
+    // ISV=0 data aborts that QEMU's HVF handler cannot decode (asserts).
+    // This is a QEMU 10.x bug — the GIC region exits through a different
+    // hypervisor mechanism than regular MMIO regardless of instruction type.
+    // All GIC functions become no-ops via the GIC_INITIALIZED guard.
+    if !config::QEMU_HVF_FIX_ENABLED {
+        gic::init();
+    }
     console::print("GIC initialized\n");
 
     // Set up exception vectors and enable IRQs
@@ -533,14 +540,23 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     gic::enable_irq(gic::SGI_SCHEDULER);
 
     console::print("Registering timer IRQ...\n");
-    irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
-    
-    // Register virtual timer IRQ (27) for kernel timer async wakeups
-    // CNTV (virtual timer) avoids conflict with scheduler's CNTP
-    irq::register_handler(27, |_irq| {
-        kernel_timer::on_timer_interrupt();
-    });
-    gic::enable_irq(27); // Enable virtual timer interrupt
+    if config::QEMU_HVF_FIX_ENABLED {
+        // Under HVF the physical timer (IRQ 30 / CNTP) is trapped by EL2.
+        // Use the virtual timer (IRQ 27 / CNTV) for both scheduling and async wakeups.
+        timer::set_use_virtual_timer();
+        irq::register_handler(27, |irq| {
+            kernel_timer::on_timer_interrupt();
+            timer::timer_irq_handler(irq);
+        });
+    } else {
+        irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
+        // Register virtual timer IRQ (27) for kernel timer async wakeups
+        // CNTV (virtual timer) avoids conflict with scheduler's CNTP
+        irq::register_handler(27, |_irq| {
+            kernel_timer::on_timer_interrupt();
+        });
+        gic::enable_irq(27); // Enable virtual timer interrupt
+    }
 
     console::print("Enabling timer...\n");
     timer::enable_timer_interrupts(config::TIMER_INTERVAL_US); // 10ms intervals

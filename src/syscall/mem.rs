@@ -395,6 +395,12 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         if adding_exec {
             for i in 0..pages {
                 let va = addr + i * 4096;
+                // Skip DC CVAU for lazy (not yet demand-paged) pages — on real
+                // AArch64 hardware (HVF) a DC CVAU on an unmapped VA faults with
+                // EC=0x25. Unmapped pages have no cached data to flush anyway.
+                if !proc.address_space.is_mapped(va) {
+                    continue;
+                }
                 unsafe {
                     let mut off = 0usize;
                     while off < 4096 {
