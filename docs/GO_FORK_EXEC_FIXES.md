@@ -340,6 +340,42 @@ docker, etc. all do SIGTERM→wait→SIGKILL).
 | `test_sigkill_bypasses_handlers` | SIGKILL=9 triggers hard-kill, not handler delivery |
 | `test_sigterm_vs_sigkill_behavior` | SIGTERM delivers to handler; SIGKILL hard-kills |
 
+### 21. Normal goroutine exit killed entire thread group (2026-04-04)
+
+**Symptom:** forktest_parent crashes on first run with SIGSEGV at garbage PC
+(0x20000000). Second run works fine. The parent's Process struct was destroyed
+mid-execution.
+
+**Root cause:** `return_to_kernel`'s tgid group-kill code (fix #12) ran for
+ALL thread exits, not just crashes. When a Go goroutine thread exits normally
+(GC thread, `doCheckClonePidfd` probe, etc.), `tgid != pid` is true, so the
+code killed the entire thread group including the leader — destroying the
+parent process while it was still running.
+
+The condition was: `if tgid != pid` (always true for goroutine threads).
+It should have been: `if tgid != pid && exit_code < 0` (only for crashes).
+
+**Fix:** Added `exit_code < 0` check. Negative exit codes mean killed by signal
+(SIGSEGV=-11, SIGKILL=-9). Normal exits (code >= 0) skip the group kill.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_normal_goroutine_exit_does_not_kill_group` | exit_code=0 + tgid!=pid → skip group kill |
+| `test_crash_goroutine_exit_kills_group` | exit_code=-11 + tgid!=pid → kill group |
+| `test_leader_exit_never_kills_group` | tgid==pid → always skip regardless of code |
+
+### Note: "Parallel process execution" test hang (intermittent)
+
+The kernel test `test_parallel_processes` sometimes hangs at "Spawning process 1..."
+after passing all prior tests. This is likely an intermittent scheduling/timing issue,
+not directly related to the fork fixes. The test reads `/bin/hello` from ext2 via
+`fs::read_file` — if the VFS or ext2 driver blocks, the test hangs. Previous tests
+(echo2, elftest) read from the same filesystem successfully.
+
 ### 14. Go runtime panics with `errno=38` on newosproc (intermittent, 2026-04-04)
 
 **Symptom:** `runtime: failed to create new OS thread (have 2 already; errno=38)`

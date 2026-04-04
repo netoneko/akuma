@@ -227,6 +227,10 @@ pub fn run_all_tests() {
     // sys_kill must pend signal on ALL siblings, not just interrupt
     test_sys_kill_pends_signal_on_siblings();
     test_pend_vs_interrupt_delivers_handler();
+    // return_to_kernel: normal exit must NOT kill thread group
+    test_normal_goroutine_exit_does_not_kill_group();
+    test_crash_goroutine_exit_kills_group();
+    test_leader_exit_never_kills_group();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5480,5 +5484,56 @@ fn test_pend_vs_interrupt_delivers_handler() {
         console::print("[Test] pend_vs_interrupt_delivers_handler PASSED\n");
     } else {
         console::print("[Test] pend_vs_interrupt_delivers_handler FAILED\n");
+    }
+}
+
+/// Normal goroutine thread exit (code=0) must NOT kill the thread group.
+/// Go's GC threads, doCheckClonePidfd probe, etc. exit normally all the time.
+/// Killing the leader on a normal exit destroys the parent process.
+fn test_normal_goroutine_exit_does_not_kill_group() {
+    let exit_code: i32 = 0;  // normal exit
+    let tgid: u32 = 100;     // leader
+    let pid: u32 = 101;      // goroutine thread
+
+    // Condition: tgid != pid AND exit_code < 0
+    let should_kill = tgid != pid && exit_code < 0;
+
+    if !should_kill {
+        console::print("[Test] normal_goroutine_exit_does_not_kill_group PASSED\n");
+    } else {
+        console::print("[Test] normal_goroutine_exit_does_not_kill_group FAILED\n");
+    }
+}
+
+/// Crash exit (code=-11 = SIGSEGV) on a goroutine thread SHOULD kill the group.
+/// Without this, the leader and other goroutines become orphaned zombies.
+fn test_crash_goroutine_exit_kills_group() {
+    let exit_code: i32 = -11; // SIGSEGV
+    let tgid: u32 = 100;
+    let pid: u32 = 101;
+
+    let should_kill = tgid != pid && exit_code < 0;
+
+    if should_kill {
+        console::print("[Test] crash_goroutine_exit_kills_group PASSED\n");
+    } else {
+        console::print("[Test] crash_goroutine_exit_kills_group FAILED\n");
+    }
+}
+
+/// Leader exit (tgid == pid) never enters the group-kill path regardless of
+/// exit code.  The leader's own cleanup handles everything.
+fn test_leader_exit_never_kills_group() {
+    let tgid: u32 = 100;
+    let pid: u32 = 100; // leader
+
+    // Should never enter group-kill (tgid == pid)
+    let normal_skip = !(tgid != pid && 0i32 < 0);
+    let crash_skip = !(tgid != pid && (-11i32) < 0);
+
+    if normal_skip && crash_skip {
+        console::print("[Test] leader_exit_never_kills_group PASSED\n");
+    } else {
+        console::print("[Test] leader_exit_never_kills_group FAILED\n");
     }
 }

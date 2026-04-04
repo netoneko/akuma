@@ -1012,13 +1012,14 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         let _dropped_process = unregister_process(pid);
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
 
-        // If this was a goroutine thread (tgid != pid), a crash should kill
-        // the entire thread group — not leave the leader and siblings as zombies.
+        // If this was a goroutine thread (tgid != pid) that CRASHED (exit_code < 0),
+        // kill the entire thread group — don't leave the leader and siblings as zombies.
+        // Normal exits (code >= 0) must NOT kill the group — the leader is still running.
+        // Go goroutine threads exit normally all the time (GC, doCheckClonePidfd probe);
+        // killing the leader on a normal goroutine exit destroys the parent process.
         if let Some(tgid) = tgid {
-            if tgid != pid {
-                // Kill siblings (other goroutine threads with same tgid)
+            if tgid != pid && exit_code < 0 {
                 kill_thread_group(tgid, 0);
-                // Kill the group leader itself
                 if let Some(leader) = lookup_process(tgid) {
                     cleanup_process_fds(leader);
                     leader.exited = true;
