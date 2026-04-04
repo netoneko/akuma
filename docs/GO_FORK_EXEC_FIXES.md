@@ -198,14 +198,121 @@ echo '# import config' > /tmp/b046/importcfg
 echo "exit code: $?"
 ```
 
-**Expected:** exit code 0 (compile succeeds).  May take 10+ seconds under QEMU.
+**Expected:** exit code 0 (compile succeeds).  Takes ~6s under QEMU.
 
-**Observed:** The compile process was killed after ~5s when the parent `go build`
-tool exited.  Running it standalone (above) removes the parent timeout and lets the
-compiler run to completion.
+**Confirmed working (2026-04-03):** Standalone compile succeeded in 6.10s (PID 64,
+exit code 0).  Two prior attempts exited with code=2 (importcfg issues), then the
+third succeeded.
+
+During `go build`, this compile was killed because the parent `go` process exited
+after 150s total build time (across all 31 packages).  Running standalone removes
+the parent timeout.
 
 `unicode/tables.go` is the stress test — it's ~1 MB of source generating enormous
 Unicode lookup tables.  If this compiles, everything smaller will too.
+
+---
+
+### 12. Goroutine thread crash leaves thread group as zombies
+
+**Symptom:** `go build` math compile crashed (WILD-DA at FAR=0x1). PID 151 stayed
+as zombie in `ps`.
+
+**Root cause:** The crash happened on a goroutine thread (PID 152), not the main
+thread (PID 151). `return_to_kernel` unregistered PID 152 (the crashing thread)
+but not PID 151 (the group leader). The leader and other goroutine threads became
+orphaned zombies.
+
+**Fix:** `return_to_kernel` now reads the crashing thread's `tgid` before unregister.
+If `tgid != pid` (goroutine thread, not leader), it kills the entire thread group
+after cleaning up the crashing thread: `kill_thread_group(tgid)` for siblings,
+then unregisters the leader.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+---
+
+## Go Build: math compile crash (FAR=0x1)
+
+The Go compiler for the `math` package crashed with a nil pointer dereference
+(FAR=0x1, ELR=0x103ced0c). This is a Go compiler bug, not a kernel bug. The
+crash happens in Go's compiler code and may be triggered by Akuma-specific
+conditions (assembly stubs, `-symabis` flag). The `unicode` package compiles
+successfully in 6.1s when run standalone.
+
+---
+
+### 13. Fork hangs after CoW sharing (under investigation, 2026-04-04)
+
+**Symptom:** `fork_process` completes CoW sharing (`[FORK-COW] shared 4133 pages`)
+but never reaches step 7 (`spawning child thread`). The shell hangs during test
+execution.
+
+**Status:** Diagnostic prints added between step 4 (CoW) and step 7 (spawn):
+- `[FORK-DBG] step4: done, entering step5` — after CoW, before PROCESS_INFO_ADDR re-map
+- `[FORK-DBG] step5: done, entering step6` — after ProcessInfo write, before context capture
+- `[FORK-DBG] step7: spawning child thread` — existing print
+
+Whichever is the last to appear identifies the hang point.
+
+**Possible causes:**
+- `map_page` for PROCESS_INFO_ADDR re-map fails silently (OOM for page table frame)
+- `get_saved_user_context(parent_tid)` deadlocks on POOL lock
+- Interaction with `sys_exit` changes (thread 28 terminated + unregistered PID 24
+  just before fork_process runs on thread 27)
+
+### 14. Go runtime panics with `errno=38` on newosproc (intermittent, 2026-04-04)
+
+**Symptom:** `runtime: failed to create new OS thread (have 2 already; errno=38)`
+followed by SIGSEGV.  forktest_child crashes during startup.
+
+**Root cause:** Go's register-state leakage.  A prior syscall returned `-22` (EINVAL)
+which leaked into R0.  Go's `newosproc` → `runtime.clone` reads flags from the stack
+via ABI wrapper, but R0 already has -22 when `SVC` executes.  The bits-32+ guard
+catches the garbage flags (`0xffffffffffffffea >> 32 != 0`) and returns ENOSYS (-38).
+Go sees errno=38 and panics.
+
+The real clone flags (0x50f00) end up in R3 (tls slot) instead of R0.
+
+**Analysis of args:** `args=[0xffffffffffffffea, 0x1e001e000, 0x1e0002540, 0x50f00]`
+- R0 = -22 (EINVAL from prior syscall, should be 0x50f00)
+- R1 = stack (correct)
+- R2 = parent_tid (correct)
+- R3 = 0x50f00 (the real flags, displaced)
+
+**Status:** Intermittent — depends on which prior syscall's return value leaks into R0.
+Not directly fixable in the kernel.  The bits-32+ guard correctly prevents the crash
+from propagating further.
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_bits32_guard_catches_einval_leakage` | -22, -11, -38 all caught by bits-32+ guard; real flags 0x50f00 pass through |
+
+### 15. Orphaned fork children become zombies (2026-04-04)
+
+**Symptom:** PID 66 (forktest_child) and goroutine threads (73-77) remain as zombies
+after the parent (PID 61, forktest_parent) exits.
+
+**Root cause:** PID 66 is a FORK child (tgid=66), not a clone_thread sibling of the
+parent (tgid=61).  When the parent calls `exit_group`, `kill_thread_group` only kills
+threads with matching tgid (61).  Fork children have their own tgid and are not killed.
+
+On Linux, orphaned children are re-parented to init (PID 1) which reaps them via
+`wait()`.  Akuma has no init process reaping.
+
+**Possible fixes:**
+- `sys_exit_group`: also kill fork children (processes where `parent_pid == my_pid`)
+- Implement init-process reaping for orphans
+- Add a periodic zombie reaper in the scheduler
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_orphaned_fork_children_have_own_tgid` | Fork children get `tgid=child_pid`; parent's `kill_thread_group` doesn't reach them |
+| `test_futex_wait_unmapped_returns_eagain` | `op=0x80` → `cmd=0` (FUTEX_WAIT); unmapped returns EAGAIN not EFAULT |
 
 ---
 

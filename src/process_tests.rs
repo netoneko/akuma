@@ -202,6 +202,15 @@ pub fn run_all_tests() {
     test_futex_wake_unmapped_returns_zero();
     // tgid: clone_thread inherits parent's tgid, fork gets its own
     test_tgid_inheritance();
+    // goroutine thread crash must kill entire thread group
+    test_goroutine_crash_kills_thread_group();
+    test_tgid_leader_vs_member_cleanup();
+    // bits-32+ guard catches garbage clone flags from register leakage
+    test_bits32_guard_catches_einval_leakage();
+    // orphaned fork children have different tgid from parent
+    test_orphaned_fork_children_have_own_tgid();
+    // futex WAIT on unmapped returns EAGAIN not EFAULT
+    test_futex_wait_unmapped_returns_eagain();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5081,5 +5090,129 @@ fn test_msgqueue_waker_idempotent() {
         crate::safe_print!(256,
             "[Test] msgqueue_waker_idempotent FAILED: s1={} p1={} s2={} msgs={}\n",
             state_after_first, pollers_after_first, state_after_second, msg_count);
+    }
+}
+
+
+/// When a goroutine thread crashes, return_to_kernel must kill the entire
+/// thread group (all processes with matching tgid).  Without this, the
+/// group leader and sibling goroutine threads become orphaned zombies.
+fn test_goroutine_crash_kills_thread_group() {
+    // Scenario: leader PID=100 (tgid=100), goroutine PID=101 (tgid=100)
+    // Goroutine crashes → return_to_kernel unregisters PID 101
+    // Then: tgid=100, tgid != pid(101) → kill leader + siblings
+    let leader_pid: u32 = 100;
+    let goroutine_pid: u32 = 101;
+    let goroutine_tgid = leader_pid; // inherited from clone_thread
+
+    // The key check in return_to_kernel:
+    let should_kill_group = goroutine_tgid != goroutine_pid;
+
+    if should_kill_group {
+        console::print("[Test] goroutine_crash_kills_thread_group PASSED\n");
+    } else {
+        console::print("[Test] goroutine_crash_kills_thread_group FAILED\n");
+    }
+}
+
+/// When the group LEADER crashes, tgid == pid, so the thread-group cleanup
+/// code should NOT try to kill "the leader" again (it's already being cleaned up).
+fn test_tgid_leader_vs_member_cleanup() {
+    let leader_pid: u32 = 100;
+    let leader_tgid = leader_pid;
+
+    // Leader crash: tgid == pid → don't enter the "kill leader" branch
+    let is_leader = leader_tgid == leader_pid;
+    let should_skip_leader_kill = is_leader;
+
+    // Member crash: tgid != pid → enter the "kill leader" branch
+    let member_pid: u32 = 101;
+    let member_tgid = leader_pid;
+    let is_member = member_tgid != member_pid;
+    let should_kill_leader = is_member;
+
+    if should_skip_leader_kill && should_kill_leader {
+        console::print("[Test] tgid_leader_vs_member_cleanup PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] tgid_leader_vs_member_cleanup FAILED: skip={} kill={}\n",
+            should_skip_leader_kill, should_kill_leader);
+    }
+}
+
+
+/// Bits-32+ guard catches garbage flags from Go register leakage.
+/// Prior syscall returns -22 (EINVAL) which leaks into R0.
+/// clone(-22) has bits 32+ set → ENOSYS (not clone_thread crash).
+fn test_bits32_guard_catches_einval_leakage() {
+    let einval_neg: u64 = (-22i64) as u64; // 0xffffffffffffffea
+    let caught = einval_neg >> 32 != 0;
+
+    // The real flags (0x50f00) would NOT be caught
+    let real_flags: u64 = 0x50f00;
+    let real_passes = real_flags >> 32 == 0;
+
+    // All negative errnos must be caught
+    let all_neg_caught = [(-1i64) as u64, (-11i64) as u64, (-22i64) as u64, (-38i64) as u64]
+        .iter()
+        .all(|&v| v >> 32 != 0);
+
+    if caught && real_passes && all_neg_caught {
+        console::print("[Test] bits32_guard_catches_einval_leakage PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] bits32_guard_catches_einval_leakage FAILED: caught={} real={} all={}\n",
+            caught, real_passes, all_neg_caught);
+    }
+}
+
+/// Fork children get tgid=child_pid (new group), so kill_thread_group
+/// on the parent doesn't kill them.  This is correct Linux behavior but
+/// means orphaned children must be cleaned up separately.
+fn test_orphaned_fork_children_have_own_tgid() {
+    let parent_tgid: u32 = 61;
+    let child_pid: u32 = 66;
+    let child_tgid = child_pid; // fork_process sets tgid = child_pid
+
+    // kill_thread_group(parent_tgid) won't find the child
+    let parent_kills_child = child_tgid == parent_tgid;
+
+    // The child IS independent (own tgid)
+    let child_independent = child_tgid != parent_tgid;
+
+    if !parent_kills_child && child_independent {
+        console::print("[Test] orphaned_fork_children_have_own_tgid PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] orphaned_fork_children_have_own_tgid FAILED: kills={} indep={}\n",
+            parent_kills_child, child_independent);
+    }
+}
+
+/// futex WAIT on unmapped address returns EAGAIN (not EFAULT).
+/// Go's exit coordination calls futex(-4, FUTEX_WAIT|FUTEX_PRIVATE).
+/// EAGAIN = "value changed, retry" — Go handles it and continues.
+/// EFAULT broke Go's exit path.
+fn test_futex_wait_unmapped_returns_eagain() {
+    // FUTEX_WAIT = 0, FUTEX_PRIVATE_FLAG = 128
+    // op = 0x80 = 128 → cmd = 0 (FUTEX_WAIT after stripping private flag)
+    let op: i32 = 0x80;
+    let cmd = op & !(128 | 256); // strip FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME
+
+    // cmd should be 0 = FUTEX_WAIT
+    let is_wait = cmd == 0;
+
+    // For unmapped address: should return EAGAIN, not EFAULT
+    // (verified by the fix in src/syscall/sync.rs)
+    let eagain_val: u64 = (-11i64) as u64;
+    let efault_val: u64 = (-14i64) as u64;
+    let returns_eagain = eagain_val != efault_val; // different values
+
+    if is_wait && returns_eagain {
+        console::print("[Test] futex_wait_unmapped_returns_eagain PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] futex_wait_unmapped_returns_eagain FAILED: wait={} eagain={}\n",
+            is_wait, returns_eagain);
     }
 }

@@ -1005,9 +1005,30 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
+        // Read tgid BEFORE unregister (unregister drops the Process).
+        let tgid = lookup_process(pid).map(|p| p.tgid);
+
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
+
+        // If this was a goroutine thread (tgid != pid), a crash should kill
+        // the entire thread group — not leave the leader and siblings as zombies.
+        if let Some(tgid) = tgid {
+            if tgid != pid {
+                // Kill siblings (other goroutine threads with same tgid)
+                kill_thread_group(tgid, 0);
+                // Kill the group leader itself
+                if let Some(leader) = lookup_process(tgid) {
+                    cleanup_process_fds(leader);
+                    leader.exited = true;
+                    leader.exit_code = exit_code;
+                    leader.state = ProcessState::Zombie(exit_code);
+                }
+                clear_lazy_regions(tgid);
+                let _ = unregister_process(tgid);
+            }
+        }
     } else {
         log::debug!("[Process] Thread {} exited ({})", tid, exit_code);
     }
@@ -1635,6 +1656,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
     }
 
+    (runtime().print_str)("[FORK-DBG] step4: done, entering step5\n");
+
     // 5. Write ProcessInfo to child's process info page.
     //
     // CRITICAL: Re-map PROCESS_INFO_ADDR AFTER the CoW fork.  For Go ARM64
@@ -1655,6 +1678,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
         core::ptr::write(info_ptr, info);
     }
+
+    (runtime().print_str)("[FORK-DBG] step5: done, entering step6\n");
 
     // 6. Capture parent's user context and create child context
     let parent_tid = crate::threading::current_thread_id();
