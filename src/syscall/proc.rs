@@ -1080,6 +1080,18 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
 
     if let Some(proc) = akuma_exec::process::lookup_process(pid) {
         let tgid = proc.tgid;
+        let l0_phys = proc.address_space.l0_phys();
+
+        // SIGKILL (9) is unconditional — bypass signal delivery entirely.
+        // On Linux, SIGKILL cannot be caught or ignored.  Hard-kill the
+        // entire thread group immediately.
+        if sig == 9 {
+            drop(proc);
+            akuma_exec::process::kill_thread_group(pid, l0_phys);
+            akuma_exec::process::kill_process_with_signal(pid, 9).ok();
+            return 0;
+        }
+
         if let Some(tid) = proc.thread_id {
             // Pend the signal for delivery on the target thread.
             akuma_exec::threading::pend_signal_for_thread(tid, sig);
@@ -1097,6 +1109,10 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
                 .collect()
         });
         for sib_tid in group_tids {
+            // Pend the SAME signal on siblings so Go's exception return path
+            // delivers it.  Just interrupting without pending means the thread
+            // gets EINTR but no signal handler runs.
+            akuma_exec::threading::pend_signal_for_thread(sib_tid, sig);
             akuma_exec::process::interrupt_thread(sib_tid);
         }
 

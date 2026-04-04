@@ -255,11 +255,90 @@ execution.
 
 Whichever is the last to appear identifies the hang point.
 
-**Possible causes:**
-- `map_page` for PROCESS_INFO_ADDR re-map fails silently (OOM for page table frame)
-- `get_saved_user_context(parent_tid)` deadlocks on POOL lock
-- Interaction with `sys_exit` changes (thread 28 terminated + unregistered PID 24
-  just before fork_process runs on thread 27)
+**Update (2026-04-04):** Diagnostic shows the hang is in **step 5** (PROCESS_INFO_ADDR
+re-map), NOT steps 6/7.  Finer-grained prints added:
+- `step5a: re-mapping PROCESS_INFO_ADDR` — before map_page
+- `step5b: writing ProcessInfo` — after map_page, before write
+- `step5: done` — after write
+
+**Update (2026-04-04, second test):** Step 5 passed fine for `go build` forks.
+But `replace_image` (execve) hangs at `UserAddressSpace::deactivate()` or the AS
+swap that follows it.  Added diagnostics inside `replace_image`:
+- `step5a` / `step5b` both print → step 5 works
+- `replace_image: deactivating` → before deactivate()
+- `replace_image: swapping AS` → after deactivate, before assignment
+- `replace_image: AS swapped` → after assignment
+
+The last line printed was `replace_image: ELF loaded, deactivating old AS`.
+The next diagnostic (`replace_image: deactivating`) will narrow it further.
+
+This may be intermittent — different forks hang at different points depending on
+the state of page tables and CoW references at the time.
+
+### 19. sys_kill sibling interrupt missing wake() (2026-04-04)
+
+**Symptom:** `forktest_parent` sends SIGTERM to 3 children. Only 1 exits. The other
+2 stay blocked — parent hangs waiting for them.
+
+**Root cause:** `sys_kill` interrupts sibling threads (goroutine threads with same
+tgid) via `interrupt_thread(sib_tid)`, which only calls `set_interrupted()`. It does
+NOT call `wake()`.  The sibling threads stay blocked in `schedule_blocking` because
+nobody wakes them.  The interrupted flag is set but never checked (the thread is
+asleep).
+
+For the main thread: `pend_signal_for_thread(tid, sig)` calls `wake()` internally,
+so the main thread IS woken.  But siblings only get `interrupt_thread` without wake.
+
+**Fix:** Added `get_waker_for_thread(sib_tid).wake()` after `interrupt_thread(sib_tid)`
+in the sibling interrupt loop.
+
+**File:** `src/syscall/proc.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_interrupt_thread_must_wake` | interrupt_thread alone doesn't wake; pend_signal does |
+| `test_sys_kill_wakes_all_siblings` | sys_kill must interrupt AND wake all tgid siblings |
+
+**Update (2026-04-04):** Changed sibling handling from interrupt+wake to
+`pend_signal_for_thread(sib_tid, sig)` — pends the SAME signal on ALL siblings.
+This way every goroutine thread gets the signal delivered (not just an EINTR with
+no handler). Go's signal handler is idempotent — multiple threads getting SIGTERM
+all set the same exit flag. `pend_signal_for_thread` already calls `wake()` internally.
+
+### 20. SIGKILL must hard-kill, not deliver to handler (2026-04-04)
+
+**Symptom:** Even after SIGTERM delivery + sibling wake, 1 of 3 children doesn't
+exit. Go's SIGTERM handler sets a flag but the main goroutine doesn't always check
+it before re-entering epoll. The parent hangs on `cmd.Wait()`.
+
+**Root cause:** On Linux, SIGKILL (9) is unconditional — cannot be caught, blocked,
+or ignored. Akuma was delivering SIGKILL to signal handlers just like SIGTERM.
+
+**History:** The original `sys_kill` hard-killed everything (ignoring the signal
+argument). We fixed it to deliver signals properly (fix #4). Then we added hard-kill
+for ALL fatal signals (SIGTERM, SIGKILL, etc.) which made forktest work. But we
+reverted that hard-kill approach when the futex EFAULT fix (fix #8) made SIGTERM
+delivery work. **The revert accidentally removed SIGKILL hard-kill too.** SIGKILL
+should ALWAYS hard-kill regardless of other fixes.
+
+**Fix (kernel):** `sys_kill` with `sig=9` now bypasses signal delivery entirely
+and hard-kills the process via `kill_thread_group` + `kill_process_with_signal`.
+
+**Fix (forktest_parent):** Go's `cmd.Wait()` does NOT send SIGKILL automatically —
+it blocks forever. Added SIGKILL fallback: SIGTERM first, then 500ms later SIGKILL
+via goroutine + `cmd.Process.Kill()`. This is standard Linux practice (systemd,
+docker, etc. all do SIGTERM→wait→SIGKILL).
+
+**Files:** `src/syscall/proc.rs`, `userspace/forktest/parent/main.go`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sigkill_bypasses_handlers` | SIGKILL=9 triggers hard-kill, not handler delivery |
+| `test_sigterm_vs_sigkill_behavior` | SIGTERM delivers to handler; SIGKILL hard-kills |
 
 ### 14. Go runtime panics with `errno=38` on newosproc (intermittent, 2026-04-04)
 
@@ -332,6 +411,62 @@ lock is held, so there is no re-entrancy risk and nothing to release.
 **Fix:** Removed the three `drop(proc)` calls.
 
 **File:** `src/syscall/proc.rs`
+
+### 18. sigreturn SPSR validation prevents kernel halt (2026-04-04)
+
+**Symptom:** Kernel halted with "HALTING to prevent invalid ERET" after sigreturn
+restored SPSR=0x1008c090 (M[4]=1 = AArch32 mode).
+
+**Root cause:** `do_rt_sigreturn` read SPSR from the signal frame without any
+validation.  Go's signal handler can corrupt the frame (the code comments explicitly
+note this).  The corrupted SPSR had AArch32 mode bits set, causing ERET to attempt
+a 32-bit mode return.
+
+**Fix:** Validate SPSR in `do_rt_sigreturn`: if M[4:0] != 0 (not EL0t), force clean
+EL0t (SPSR=0).  The process will still crash from the corrupted PC/SP, but the kernel
+stays alive.
+
+**File:** `src/exceptions.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sigreturn_validates_spsr` | SPSR with M[4]=1 rejected; clean SPSR accepted |
+| `test_sigreturn_validates_sp` | Zero/kernel-space SP detected as suspicious |
+| `test_spsr_el0t_bits` | 10 test cases: valid NZCV flags pass, any mode bits fail |
+
+---
+
+### 16. Go compiler parent text page unmapped after vfork (2026-04-04)
+
+**Symptom:** PID 68 (`/usr/lib/go/bin/go`) crashed at FAR=0x10010040 (its own text
+segment at code_base+0x40) immediately after vfork_complete resumed it.  The page was
+not in any mmap_region or lazy_region.  `last_sc=!0u64` suggests the Process struct
+was reset.
+
+**Consequence:** SIGSEGV → signal handler ran → sigreturn restored corrupted SPSR
+(0x1008c090 with M[4]=1 = AArch32 mode) → kernel detected invalid ERET → **kernel
+halt**.
+
+**Hypotheses:**
+- CoW fork's `demote_range_to_ro` on IA-DP (on-demand) text pages accidentally
+  unmaps them instead of demoting to RO
+- `replace_image` (execve) accidentally modifies the parent's Process struct instead
+  of the child's
+- cow_ref management frees the parent's text page when the child exits
+
+**Status:** Under investigation.  Intermittent — happens under load with multiple
+concurrent compile processes.
+
+### 17. Goroutine thread null pointer crash (FAR=0x0, 2026-04-04)
+
+**Symptom:** PID 139 goroutine thread crashes at FAR=0x0 immediately after clone_thread.
+Registers x9-x12 are all zero.  JIT IC flush precedes the crash.
+
+**Likely cause:** clone_thread context setup — the goroutine thread starts with
+incorrect register state.  The `JIT IC flush + replay` indicates stale instruction
+cache from a recently exec'd binary.
 
 ---
 

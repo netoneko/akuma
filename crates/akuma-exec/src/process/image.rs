@@ -37,8 +37,11 @@ impl Process {
         (runtime().print_str)("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
         // #endregion
 
+        (runtime().print_str)("[FORK-DBG] replace_image: deactivating\n");
         mmu::UserAddressSpace::deactivate();
+        (runtime().print_str)("[FORK-DBG] replace_image: swapping AS\n");
         self.address_space = address_space;
+        (runtime().print_str)("[FORK-DBG] replace_image: AS swapped\n");
         self.entry_point = entry_point;
         self.brk = brk;
         self.initial_brk = brk;

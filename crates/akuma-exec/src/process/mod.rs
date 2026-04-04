@@ -1668,11 +1668,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // current_process() / read_current_pid() to return the wrong PID.
     // This broke vfork_complete (wrong child PID → parent never unblocked)
     // and the CoW fault handler (resolved pages in the wrong address space).
-    let _ = new_proc.address_space.map_page(
+    (runtime().print_str)("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
+    let map_result = new_proc.address_space.map_page(
         PROCESS_INFO_ADDR,
         new_proc.process_info_phys,
         mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
     );
+    if map_result.is_err() {
+        (runtime().print_str)("[FORK-DBG] step5a: map_page FAILED\n");
+    }
+    (runtime().print_str)("[FORK-DBG] step5b: writing ProcessInfo\n");
     unsafe {
         let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
@@ -1683,7 +1688,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     // 6. Capture parent's user context and create child context
     let parent_tid = crate::threading::current_thread_id();
+    (runtime().print_str)("[FORK-DBG] step6a: getting context\n");
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+    (runtime().print_str)("[FORK-DBG] step6b: context captured\n");
     
     let mut child_ctx = parent_ctx;
     child_ctx.x0 = 0;    // fork returns 0 to child

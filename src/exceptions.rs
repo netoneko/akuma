@@ -1157,7 +1157,21 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
 
         (*frame).sp_el0 = core::ptr::read(mc.add(256) as *const u64);
         (*frame).elr_el1 = core::ptr::read(mc.add(264) as *const u64);
-        (*frame).spsr_el1 = core::ptr::read(mc.add(272) as *const u64);
+        let restored_spsr = core::ptr::read(mc.add(272) as *const u64);
+
+        // Validate SPSR: must be EL0t (M[4:0] = 0).  Go's signal handler can
+        // corrupt the signal frame (the code above notes "Go's panic recovery
+        // can produce corrupted SP/PSTATE on sigreturn").  If M[4]=1 (AArch32
+        // mode) or any other invalid mode bits are set, ERET would crash the
+        // kernel.  Force clean EL0t instead.
+        if restored_spsr & 0x1F != 0 {
+            crate::tprint!(128,
+                "[sigreturn] WARNING: corrupted SPSR={:#x} (mode bits={:#x}), forcing EL0t\n",
+                restored_spsr, restored_spsr & 0x1F);
+            (*frame).spsr_el1 = 0; // Clean EL0t, all flags cleared
+        } else {
+            (*frame).spsr_el1 = restored_spsr;
+        }
 
         crate::tprint!(256,
             "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
