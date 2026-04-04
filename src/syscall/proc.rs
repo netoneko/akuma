@@ -229,8 +229,6 @@ pub(super) fn sys_exit(code: i32) -> u64 {
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
-            // Drop the proc borrow, then unregister to avoid zombie.
-            drop(proc);
             let _ = akuma_exec::process::table::unregister_process(pid);
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
@@ -274,7 +272,6 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
-            drop(proc);
             let _ = akuma_exec::process::table::unregister_process(pid);
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
@@ -1088,8 +1085,6 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
             akuma_exec::threading::pend_signal_for_thread(tid, sig);
             akuma_exec::process::interrupt_thread(tid);
         }
-        drop(proc);
-
         // Also interrupt all threads in the same thread group (tgid).
         // On Linux, kill() targets the thread group, not a single thread.
         // Go's SIGTERM handler needs all goroutine threads to unblock from

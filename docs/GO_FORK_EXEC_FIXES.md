@@ -314,6 +314,25 @@ On Linux, orphaned children are re-parented to init (PID 1) which reaps them via
 | `test_orphaned_fork_children_have_own_tgid` | Fork children get `tgid=child_pid`; parent's `kill_thread_group` doesn't reach them |
 | `test_futex_wait_unmapped_returns_eagain` | `op=0x80` → `cmd=0` (FUTEX_WAIT); unmapped returns EAGAIN not EFAULT |
 
+### 16. No-op `drop(proc)` calls in sys_exit / sys_exit_group / sys_kill (2026-04-04)
+
+**Symptom:** Compiler warning: "calls to `std::mem::drop` with a reference instead
+of an owned value does nothing" at `src/syscall/proc.rs:233, 277, 1091`.
+
+**Root cause:** `current_process()` and `lookup_process()` lock `PROCESS_TABLE`
+inside `with_irqs_disabled`, extract a raw pointer (`&mut *ptr`), then release the
+lock before returning. The returned type is `Option<&'static mut Process>` — a bare
+reference, not a `MutexGuard`. Calling `drop(proc)` on a reference is a no-op; the
+lock was already released.
+
+The comments ("Drop the proc borrow, then unregister to avoid zombie") and the
+`drop(proc)` before `PROCESS_TABLE.lock()` in `sys_kill` were both misleading: no
+lock is held, so there is no re-entrancy risk and nothing to release.
+
+**Fix:** Removed the three `drop(proc)` calls.
+
+**File:** `src/syscall/proc.rs`
+
 ---
 
 ## Current State
