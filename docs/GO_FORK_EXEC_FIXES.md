@@ -383,9 +383,39 @@ It should have been: `if tgid != pid && exit_code < 0` (only for crashes).
 **Fix:** Set ALL interrupted flags FIRST (for target + all siblings), THEN
 pend signals (which call wake). When the thread wakes, the flag is already set.
 
-**Known limitation:** Each thread has a single `AtomicU32` pending signal slot.
-`pend_signal_for_thread` overwrites the previous signal. Linux uses a 64-bit bitmask.
-Back-to-back `sys_kill` on overlapping thread groups can lose signals.
+### 23. Signal bitmask: replaced single-slot AtomicU32 with AtomicU64 bitmask (2026-04-05)
+
+**Problem:** Each thread had a single `AtomicU32` for pending signals. A second
+`pend_signal_for_thread` overwrote the first. When `sys_kill` targeted overlapping
+thread groups, signals were lost.
+
+**Fix:** Replaced `PENDING_SIGNAL: [AtomicU32; MAX_THREADS]` with
+`PENDING_SIGNALS: [AtomicU64; MAX_THREADS]`. Bit N set = signal (N+1) pending.
+
+- `pend_signal_for_thread`: `fetch_or(bit)` — OR semantics, never overwrites
+- `peek_pending_signal`: `trailing_zeros()` — returns lowest pending signal
+- `take_pending_signal`: `fetch_and(!bit)` — clears only the taken signal's bit
+- SIGKILL(9) and SIGSTOP(19) bypass the mask (forced delivery)
+
+**File:** `crates/akuma-exec/src/threading/mod.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_pending_signal_bitmask_multiple` | Pend 15 then 23 → both visible, take returns lowest first |
+| `test_pending_signal_take_clears_one` | Take 3 signals in order: 2, 15, 23 → fourth take is None |
+| `test_pending_signal_mask_blocks` | Masked sig 15 skipped, unmasked sig 23 taken |
+| `test_sigkill_bypasses_mask` | SIGKILL taken even with all-bits mask |
+| `test_pend_signal_or_semantics` | Second pend doesn't overwrite first |
+
+### Diagnostic: pend_signal_for_thread logging (2026-04-05)
+
+Added `[pend-sig]` log line for every `pend_signal_for_thread` call showing:
+`tid`, `sig`, thread state (0=FREE, 1=READY, 2=RUNNING, 3=WAITING, 4=TERMINATED),
+`woken` flag, and previously pending signals bitmask. This traces exactly which
+threads receive signals and in what state, to diagnose why 1 of 3 children
+doesn't respond to SIGTERM.
 
 **File:** `src/syscall/proc.rs`
 

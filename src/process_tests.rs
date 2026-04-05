@@ -233,8 +233,12 @@ pub fn run_all_tests() {
     test_leader_exit_never_kills_group();
     // sys_kill must set interrupted BEFORE wake to avoid race
     test_interrupt_before_wake_ordering();
-    // single pending signal is a known limitation
-    test_pending_signal_is_single_slot();
+    // signal bitmask: multiple signals can be pending simultaneously
+    test_pending_signal_bitmask_multiple();
+    test_pending_signal_take_clears_one();
+    test_pending_signal_mask_blocks();
+    test_sigkill_bypasses_mask();
+    test_pend_signal_or_semantics();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5563,33 +5567,109 @@ fn test_interrupt_before_wake_ordering() {
     }
 }
 
-/// KNOWN LIMITATION: each thread has a single AtomicU32 pending signal slot.
-/// pend_signal_for_thread overwrites the previous signal.  Linux uses a 64-bit
-/// bitmask (one bit per signal number) so multiple signals can be pending.
-/// This means back-to-back sys_kill calls on overlapping thread groups can
-/// lose signals.
-fn test_pending_signal_is_single_slot() {
+// test_pending_signal_is_single_slot removed — replaced by bitmask tests below.
+fn _removed_single_slot_test() {
+    // The single-slot AtomicU32 was replaced with AtomicU64 bitmask.
+    // See test_pending_signal_bitmask_multiple etc.
+}
+
+/// Multiple signals can be pending simultaneously (bitmask, not single slot).
+fn test_pending_signal_bitmask_multiple() {
     let tid = akuma_exec::threading::current_thread_id();
-
-    // Pend signal 15 (SIGTERM)
+    // Pend SIGTERM (15) and SIGURG (23)
     akuma_exec::threading::pend_signal_for_thread(tid, 15);
-    let first = akuma_exec::threading::peek_pending_signal(tid);
-
-    // Pend signal 23 (SIGURG) — OVERWRITES signal 15
     akuma_exec::threading::pend_signal_for_thread(tid, 23);
+    // Both should be visible — peek returns lowest
+    let first = akuma_exec::threading::peek_pending_signal(tid);
+    // Take the first (15), second (23) should still be pending
+    let taken = akuma_exec::threading::take_pending_signal(!0u64);
     let second = akuma_exec::threading::peek_pending_signal(tid);
-
-    // Clean up
+    // Cleanup
     let _ = akuma_exec::threading::take_pending_signal(!0u64);
 
-    // First signal was 15, second overwrote to 23. Signal 15 is LOST.
-    let overwrites = first == 15 && second == 23;
-
-    if overwrites {
-        console::print("[Test] pending_signal_is_single_slot PASSED (known limitation)\n");
+    if first == 15 && taken == Some(15) && second == 23 {
+        console::print("[Test] pending_signal_bitmask_multiple PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] pending_signal_is_single_slot FAILED: first={} second={}\n",
-            first, second);
+            "[Test] pending_signal_bitmask_multiple FAILED: first={} taken={:?} second={}\n",
+            first, taken, second);
+    }
+}
+
+/// take_pending_signal clears only the taken signal's bit, not all.
+fn test_pending_signal_take_clears_one() {
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::pend_signal_for_thread(tid, 2);  // SIGINT
+    akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
+    akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG
+
+    let t1 = akuma_exec::threading::take_pending_signal(!0u64); // takes 2 (lowest)
+    let t2 = akuma_exec::threading::take_pending_signal(!0u64); // takes 15
+    let t3 = akuma_exec::threading::take_pending_signal(!0u64); // takes 23
+    let t4 = akuma_exec::threading::take_pending_signal(!0u64); // none left
+
+    if t1 == Some(2) && t2 == Some(15) && t3 == Some(23) && t4.is_none() {
+        console::print("[Test] pending_signal_take_clears_one PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pending_signal_take_clears_one FAILED: {:?} {:?} {:?} {:?}\n",
+            t1, t2, t3, t4);
+    }
+}
+
+/// Masked signals are not taken. Unmasked signals are.
+fn test_pending_signal_mask_blocks() {
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
+    akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG
+
+    // Mask SIGTERM (bit 14), leave SIGURG unmasked
+    let mask = 1u64 << 14; // blocks signal 15
+    let taken = akuma_exec::threading::take_pending_signal(mask);
+
+    // Should skip 15 (masked) and take 23 (unmasked)
+    // Cleanup
+    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+
+    if taken == Some(23) {
+        console::print("[Test] pending_signal_mask_blocks PASSED\n");
+    } else {
+        crate::safe_print!(128, "[Test] pending_signal_mask_blocks FAILED: taken={:?}\n", taken);
+    }
+}
+
+/// SIGKILL (9) bypasses the signal mask — cannot be blocked.
+fn test_sigkill_bypasses_mask() {
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::pend_signal_for_thread(tid, 9); // SIGKILL
+
+    // Mask ALL signals
+    let mask = !0u64;
+    let taken = akuma_exec::threading::take_pending_signal(mask);
+
+    if taken == Some(9) {
+        console::print("[Test] sigkill_bypasses_mask PASSED\n");
+    } else {
+        crate::safe_print!(128, "[Test] sigkill_bypasses_mask FAILED: taken={:?}\n", taken);
+    }
+}
+
+/// pend_signal_for_thread uses OR semantics — doesn't overwrite existing signals.
+fn test_pend_signal_or_semantics() {
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
+    akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG — must NOT overwrite 15
+
+    let has_15 = akuma_exec::threading::peek_pending_signal(tid) == 15; // lowest pending
+    let taken_15 = akuma_exec::threading::take_pending_signal(!0u64);
+    let has_23 = akuma_exec::threading::peek_pending_signal(tid) == 23;
+    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+
+    if has_15 && taken_15 == Some(15) && has_23 {
+        console::print("[Test] pend_signal_or_semantics PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pend_signal_or_semantics FAILED: has_15={} taken={:?} has_23={}\n",
+            has_15, taken_15, has_23);
     }
 }

@@ -1178,33 +1178,40 @@ fn test_take_pending_signal_sigkill_ignores_mask() {
 ");
 }
 
-/// Verify the single-slot limitation: a second pend overwrites the first.
+/// Verify bitmask semantics: both signals are kept, lowest taken first.
 ///
-/// Only one pending signal slot exists per thread (PENDING_SIGNAL[tid] is a
-/// single u32).  If two signals arrive rapidly, only the last one survives.
-/// This test documents this limitation explicitly.
+/// PENDING_SIGNALS[tid] is an AtomicU64 bitmask.  pend_signal_for_thread uses
+/// fetch_or, so a second pend does NOT overwrite the first — both bits are set.
+/// take_pending_signal returns the lowest-numbered pending signal.
 fn test_pending_signal_overwrite() {
     let slot = akuma_exec::threading::current_thread_id();
 
     // Start clean.
     akuma_exec::threading::pend_signal_for_thread(slot, 0);
 
-    // Pend SIGUSR1 (10), then immediately pend SIGURG (23).
+    // Pend SIGUSR1 (10), then SIGURG (23).  Both are kept (OR semantics).
     akuma_exec::threading::pend_signal_for_thread(slot, 10); // SIGUSR1
-    akuma_exec::threading::pend_signal_for_thread(slot, 23); // SIGURG — overwrites
+    akuma_exec::threading::pend_signal_for_thread(slot, 23); // SIGURG — does NOT overwrite
 
-    // take must return 23 (SIGURG), not 10 (SIGUSR1).
-    let taken = akuma_exec::threading::take_pending_signal(0);
+    // take returns lowest first: 10 (SIGUSR1), then 23 (SIGURG).
+    let first = akuma_exec::threading::take_pending_signal(0);
     assert!(
-        taken == Some(23),
-        "test_pending_signal_overwrite: expected Some(23) after overwrite, got {:?}",
-        taken
+        first == Some(10),
+        "test_pending_signal_overwrite: expected Some(10) first, got {:?}",
+        first
     );
 
-    // Queue must now be empty (SIGUSR1 was silently dropped).
+    let second = akuma_exec::threading::take_pending_signal(0);
+    assert!(
+        second == Some(23),
+        "test_pending_signal_overwrite: expected Some(23) second, got {:?}",
+        second
+    );
+
+    // Now empty.
     assert!(
         akuma_exec::threading::take_pending_signal(0).is_none(),
-        "test_pending_signal_overwrite: queue should be empty after single-slot drain"
+        "test_pending_signal_overwrite: queue should be empty after draining both"
     );
 
     console::print("  [PASS] test_pending_signal_overwrite

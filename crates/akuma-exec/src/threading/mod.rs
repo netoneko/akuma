@@ -120,11 +120,12 @@ static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
-/// Per-thread pending signal number (0 = none).
-/// Set by sys_tkill/sys_tgkill when a UserFn signal handler is registered.
-/// Cleared and delivered at the next syscall return for that thread.
-static PENDING_SIGNAL: [AtomicU32; MAX_THREADS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
+/// Per-thread pending signal bitmask.  Bit N set = signal (N+1) pending.
+/// Multiple signals can be pending simultaneously (unlike the old single-slot).
+/// Set by pend_signal_for_thread via fetch_or.
+/// Cleared one-at-a-time by take_pending_signal via fetch_and.
+static PENDING_SIGNALS: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_THREADS]
 };
 
@@ -494,7 +495,7 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // would be delivered to the next process that runs on this thread slot,
             // triggering signal delivery code in an unexpected context (e.g. /bin/hello
             // which never registered a signal handler), causing an EL1 data abort.
-            PENDING_SIGNAL[i].store(0, Ordering::Release);
+            PENDING_SIGNALS[i].store(0, Ordering::Release);
             // Reset per-thread sigaltstack so the next occupant starts clean.
             THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
@@ -2343,18 +2344,30 @@ pub fn current_thread_id() -> usize {
 /// The signal will be delivered at the next syscall return for that thread.
 /// Overwrites any previously pending signal (only one pending signal supported).
 /// Also wakes the thread if it is sleeping (e.g. in FUTEX_WAIT).
+/// sig=0 clears all pending signals (used by tests and cleanup).
 pub fn pend_signal_for_thread(tid: usize, sig: u32) {
-    if tid < MAX_THREADS {
-        PENDING_SIGNAL[tid].store(sig, Ordering::Release);
+    if tid >= MAX_THREADS { return; }
+    if sig == 0 {
+        PENDING_SIGNALS[tid].store(0, Ordering::Release);
+        return;
+    }
+    if sig <= 64 {
+        let bit = 1u64 << (sig - 1);
+        let old_pending = PENDING_SIGNALS[tid].fetch_or(bit, Ordering::Release);
+        let state = THREAD_STATES[tid].load(Ordering::SeqCst);
+        let woken = WOKEN_STATES[tid].load(Ordering::SeqCst);
+        safe_print!(128, "[pend-sig] tid={} sig={} state={} woken={} old_pending={:#x}\n",
+            tid, sig, state, woken, old_pending);
         get_waker_for_thread(tid).wake();
     }
 }
 
-/// Peek at the pending signal for a thread slot without consuming it.
-/// Returns 0 if no signal is pending.
+/// Peek at pending signals for a thread slot without consuming.
+/// Returns the lowest pending signal number, or 0 if none.
 pub fn peek_pending_signal(slot: usize) -> u32 {
     if slot < MAX_THREADS {
-        PENDING_SIGNAL[slot].load(Ordering::Acquire)
+        let bits = PENDING_SIGNALS[slot].load(Ordering::Acquire);
+        if bits != 0 { bits.trailing_zeros() as u32 + 1 } else { 0 }
     } else {
         0
     }
@@ -2383,25 +2396,22 @@ pub fn set_sigaltstack(slot: usize, sp: u64, size: u64, flags: i32) {
     }
 }
 
-/// Take the pending signal for the current thread, if any, provided it is not
-/// masked by the given signal mask.  Returns Some(sig) and clears the pending
-/// signal, or None.
+/// Take the lowest-numbered pending signal for the current thread that is not
+/// masked.  Returns Some(sig) and clears that signal's bit, or None.
+/// SIGKILL (9) and SIGSTOP (19) bypass the mask entirely.
 pub fn take_pending_signal(mask: u64) -> Option<u32> {
     let tid = get_current_thread_register();
-    if tid < MAX_THREADS {
-        let sig = PENDING_SIGNAL[tid].load(Ordering::Acquire);
-        if sig != 0 {
-            // Signals 9 (SIGKILL) and 19 (SIGSTOP) cannot be masked.
-            if sig == 9 || sig == 19 {
-                return Some(PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel));
-            }
-            let bit = 1u64 << (sig - 1);
-            if (mask & bit) == 0 {
-                return Some(PENDING_SIGNAL[tid].swap(0, Ordering::AcqRel));
-            }
-        }
-    }
-    None
+    if tid >= MAX_THREADS { return None; }
+    let pending = PENDING_SIGNALS[tid].load(Ordering::Acquire);
+    if pending == 0 { return None; }
+    // SIGKILL and SIGSTOP bits cannot be blocked
+    let force_bits: u64 = (1u64 << 8) | (1u64 << 18); // bits for sig 9 and 19
+    let deliverable = pending & (!mask | force_bits);
+    if deliverable == 0 { return None; }
+    let sig = deliverable.trailing_zeros() as u32 + 1;
+    let bit = 1u64 << (sig - 1);
+    PENDING_SIGNALS[tid].fetch_and(!bit, Ordering::AcqRel);
+    Some(sig)
 }
 
 /// Get max thread count
