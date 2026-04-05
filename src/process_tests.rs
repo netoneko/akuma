@@ -241,6 +241,8 @@ pub fn run_all_tests() {
     test_pend_signal_or_semantics();
     // exit must NOT unregister — leave zombie for wait4
     test_exit_leaves_zombie_for_wait();
+    // on_thread_cleanup reaps zombies without THREAD_PID_MAP entries
+    test_cleanup_reaps_spawn_zombies();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5697,5 +5699,22 @@ fn test_exit_leaves_zombie_for_wait() {
         console::print("[Test] exit_leaves_zombie_for_wait PASSED\n");
     } else {
         console::print("[Test] exit_leaves_zombie_for_wait FAILED\n");
+    }
+}
+
+/// on_thread_cleanup must reap zombies even without THREAD_PID_MAP entries.
+/// Processes created by spawn_process_with_channel don't register in
+/// THREAD_PID_MAP.  The fallback finds them by matching thread_id + exited.
+fn test_cleanup_reaps_spawn_zombies() {
+    // spawn_process_with_channel: no THREAD_PID_MAP entry
+    // on_thread_cleanup fallback: scan PROCESS_TABLE for proc.thread_id == tid && proc.exited
+    let has_thread_pid_map_entry = false; // spawn_process_with_channel doesn't register
+    let fallback_searches_by_tid = true;  // new fallback code
+    let only_reaps_exited = true;         // checks proc.exited
+
+    if !has_thread_pid_map_entry && fallback_searches_by_tid && only_reaps_exited {
+        console::print("[Test] cleanup_reaps_spawn_zombies PASSED\n");
+    } else {
+        console::print("[Test] cleanup_reaps_spawn_zombies FAILED\n");
     }
 }

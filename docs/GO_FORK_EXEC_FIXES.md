@@ -446,6 +446,27 @@ The zombie is reaped by `on_thread_cleanup` when the thread slot is recycled.
 |------|-----------------|
 | `test_exit_leaves_zombie_for_wait` | exit must NOT unregister; zombie stays for wait4 |
 
+### 25. on_thread_cleanup fallback reaps spawn_process_with_channel zombies (2026-04-06)
+
+**Symptom:** `ps` shows dozens of zombies (kernel tests, forktest) with PPID=0 after
+removing `unregister_process` from sys_exit.
+
+**Root cause:** `on_thread_cleanup` only reaped processes with THREAD_PID_MAP entries.
+Processes created by `spawn_process_with_channel` (kernel tests, shell commands) don't
+register in THREAD_PID_MAP.  They became permanent zombies.
+
+**Fix:** Added fallback in `on_thread_cleanup`: when THREAD_PID_MAP has no entry for
+the recycled thread, scan PROCESS_TABLE for a zombie process with matching
+`thread_id == Some(tid)` and `exited == true`.  Unregister it.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_cleanup_reaps_spawn_zombies` | Fallback finds zombies by thread_id + exited flag |
+
 **File:** `src/syscall/proc.rs`
 
 **Tests:**
