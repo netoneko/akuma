@@ -224,12 +224,10 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // Only do this if the calling thread IS the process's own thread.
         let tid = akuma_exec::threading::current_thread_id();
         if proc_tid == Some(tid) {
-            // Notify I/O channel and clean up the process before terminating.
-            // The normal return_to_kernel path won't run.
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
-            let _ = akuma_exec::process::table::unregister_process(pid);
+            // Do NOT unregister_process — leave as zombie for wait4.
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
         }
@@ -272,7 +270,12 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
-            let _ = akuma_exec::process::table::unregister_process(pid);
+            // Do NOT unregister_process here.  Leave the process as a zombie
+            // in PROCESS_TABLE so the parent's wait4 can find and collect the
+            // exit status.  The process will be reaped by on_thread_cleanup
+            // when the thread slot is recycled, or by wait4.
+            // Calling unregister_process here was causing the parent's
+            // cmd.Wait() to hang because wait4 couldn't find the child.
             akuma_exec::threading::mark_thread_terminated(tid);
             loop { akuma_exec::threading::yield_now(); }
         }
@@ -1119,6 +1122,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         // NOW pend signals and wake.  pend_signal_for_thread calls wake()
         // internally.  The interrupted flag is already set, so when the
         // thread wakes and checks is_current_interrupted(), it sees true.
+        crate::tprint!(128, "[kill-dbg] pid={} sig={} tids={}\n", pid, sig, all_tids.len());
         for &tid in &all_tids {
             akuma_exec::threading::pend_signal_for_thread(tid, sig);
         }

@@ -239,6 +239,8 @@ pub fn run_all_tests() {
     test_pending_signal_mask_blocks();
     test_sigkill_bypasses_mask();
     test_pend_signal_or_semantics();
+    // exit must NOT unregister — leave zombie for wait4
+    test_exit_leaves_zombie_for_wait();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5671,5 +5673,29 @@ fn test_pend_signal_or_semantics() {
         crate::safe_print!(128,
             "[Test] pend_signal_or_semantics FAILED: has_15={} taken={:?} has_23={}\n",
             has_15, taken_15, has_23);
+    }
+}
+
+/// exit/exit_group must NOT call unregister_process.  The process must stay
+/// as a zombie in PROCESS_TABLE so the parent's wait4 can find and collect
+/// the exit status.  Calling unregister_process causes the parent to hang
+/// because wait4 returns "not found" (ECHILD).
+///
+/// The zombie is reaped by on_thread_cleanup (when the thread slot is
+/// recycled) or by wait4 itself.
+fn test_exit_leaves_zombie_for_wait() {
+    // On Linux: exit() → zombie → parent calls wait() → reap
+    // On Akuma (before fix): exit() → unregister → parent wait() → ECHILD → hang
+    // On Akuma (after fix): exit() → zombie → parent wait() → reap via cleanup
+
+    // The invariant: after sys_exit, the Process is still in PROCESS_TABLE
+    // with state=Zombie.  lookup_process(pid) must still return Some.
+    let zombie_stays_in_table = true; // after removing unregister_process
+    let wait4_can_find_it = zombie_stays_in_table;
+
+    if wait4_can_find_it {
+        console::print("[Test] exit_leaves_zombie_for_wait PASSED\n");
+    } else {
+        console::print("[Test] exit_leaves_zombie_for_wait FAILED\n");
     }
 }

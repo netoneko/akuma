@@ -2353,11 +2353,7 @@ pub fn pend_signal_for_thread(tid: usize, sig: u32) {
     }
     if sig <= 64 {
         let bit = 1u64 << (sig - 1);
-        let old_pending = PENDING_SIGNALS[tid].fetch_or(bit, Ordering::Release);
-        let state = THREAD_STATES[tid].load(Ordering::SeqCst);
-        let woken = WOKEN_STATES[tid].load(Ordering::SeqCst);
-        safe_print!(128, "[pend-sig] tid={} sig={} state={} woken={} old_pending={:#x}\n",
-            tid, sig, state, woken, old_pending);
+        PENDING_SIGNALS[tid].fetch_or(bit, Ordering::Release);
         get_waker_for_thread(tid).wake();
     }
 }

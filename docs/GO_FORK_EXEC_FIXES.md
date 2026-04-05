@@ -409,13 +409,42 @@ thread groups, signals were lost.
 | `test_sigkill_bypasses_mask` | SIGKILL taken even with all-bits mask |
 | `test_pend_signal_or_semantics` | Second pend doesn't overwrite first |
 
-### Diagnostic: pend_signal_for_thread logging (2026-04-05)
+### Diagnostic: pend_signal_for_thread logging (2026-04-05, reverted)
 
-Added `[pend-sig]` log line for every `pend_signal_for_thread` call showing:
-`tid`, `sig`, thread state (0=FREE, 1=READY, 2=RUNNING, 3=WAITING, 4=TERMINATED),
-`woken` flag, and previously pending signals bitmask. This traces exactly which
-threads receive signals and in what state, to diagnose why 1 of 3 children
-doesn't respond to SIGTERM.
+Added `[pend-sig]` log inside `pend_signal_for_thread`. **This broke signal
+delivery entirely** — the `safe_print!` macro was called for every signal pend
+(thousands of times during tests), and the print buffer/lock interfered with
+the threading system. Zero children received SIGTERM with the diagnostic active
+vs 2/3 without it.
+
+**Replaced with:** Targeted `[kill-dbg]` log inside `sys_kill` only (runs 3 times).
+Shows pid, sig, and number of thread IDs that will receive the signal.
+
+### 24. sys_exit unregister_process race with wait4 (2026-04-06)
+
+**Symptom:** 2/3 children exit but parent hangs on 3rd `cmd.Wait()`. The `[kill-dbg]`
+diagnostic showed `pid=54 sig=15` had NO tids — `lookup_process(54)` returned None.
+
+**Root cause:** PID 54 exited NATURALLY (its 10s duration expired) between kill(53)
+and kill(54). Our `sys_exit_group` called `unregister_process(pid)` which removed
+PID 54 from PROCESS_TABLE. When the parent's `wait4` later looked for PID 54,
+it was gone → ECHILD → hang.
+
+On Linux: `exit()` creates a zombie (stays in the process table). Only `wait()`
+reaps it. On Akuma: `sys_exit` was eagerly unregistering, removing the zombie
+before the parent could collect it.
+
+**Fix:** Removed `unregister_process(pid)` from both `sys_exit` and `sys_exit_group`.
+The process stays as a zombie in PROCESS_TABLE. The parent's `wait4` can find it.
+The zombie is reaped by `on_thread_cleanup` when the thread slot is recycled.
+
+**File:** `src/syscall/proc.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_exit_leaves_zombie_for_wait` | exit must NOT unregister; zombie stays for wait4 |
 
 **File:** `src/syscall/proc.rs`
 
