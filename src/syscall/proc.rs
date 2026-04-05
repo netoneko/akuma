@@ -1092,28 +1092,35 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
             return 0;
         }
 
+        // Collect ALL thread IDs in the group (target + siblings) FIRST.
+        let mut all_tids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         if let Some(tid) = proc.thread_id {
-            // Pend the signal for delivery on the target thread.
-            akuma_exec::threading::pend_signal_for_thread(tid, sig);
+            all_tids.push(tid);
+        }
+        {
+            let sibling_tids: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
+                let table = akuma_exec::process::table::PROCESS_TABLE.lock();
+                table.iter()
+                    .filter(|(p, proc)| **p != pid && proc.tgid == tgid)
+                    .filter_map(|(_, proc)| proc.thread_id)
+                    .collect()
+            });
+            all_tids.extend(sibling_tids);
+        }
+
+        // Set ALL interrupted flags FIRST — before any wake() call.
+        // This prevents a race where a thread wakes from schedule_blocking,
+        // checks is_current_interrupted() (false — not set yet), and
+        // re-enters schedule_blocking before we set the flag.
+        for &tid in &all_tids {
             akuma_exec::process::interrupt_thread(tid);
         }
-        // Also interrupt all threads in the same thread group (tgid).
-        // On Linux, kill() targets the thread group, not a single thread.
-        // Go's SIGTERM handler needs all goroutine threads to unblock from
-        // nanosleep/futex so exit_group can synchronize the exit.
-        let group_tids: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
-            let table = akuma_exec::process::table::PROCESS_TABLE.lock();
-            table.iter()
-                .filter(|(p, proc)| **p != pid && proc.tgid == tgid)
-                .filter_map(|(_, proc)| proc.thread_id)
-                .collect()
-        });
-        for sib_tid in group_tids {
-            // Pend the SAME signal on siblings so Go's exception return path
-            // delivers it.  Just interrupting without pending means the thread
-            // gets EINTR but no signal handler runs.
-            akuma_exec::threading::pend_signal_for_thread(sib_tid, sig);
-            akuma_exec::process::interrupt_thread(sib_tid);
+
+        // NOW pend signals and wake.  pend_signal_for_thread calls wake()
+        // internally.  The interrupted flag is already set, so when the
+        // thread wakes and checks is_current_interrupted(), it sees true.
+        for &tid in &all_tids {
+            akuma_exec::threading::pend_signal_for_thread(tid, sig);
         }
 
         return 0;

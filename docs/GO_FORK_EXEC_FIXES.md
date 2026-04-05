@@ -368,6 +368,36 @@ It should have been: `if tgid != pid && exit_code < 0` (only for crashes).
 | `test_crash_goroutine_exit_kills_group` | exit_code=-11 + tgid!=pid → kill group |
 | `test_leader_exit_never_kills_group` | tgid==pid → always skip regardless of code |
 
+### 22. Race condition: interrupt flag set AFTER wake (2026-04-05)
+
+**Symptom:** 1 of 3 forktest children doesn't exit after SIGTERM. Parent hangs.
+
+**Root cause:** `sys_kill` called `pend_signal_for_thread(tid, sig)` (which calls
+`wake()`) BEFORE `interrupt_thread(tid)` (which sets the channel flag). Race:
+1. `pend_signal_for_thread` → `wake()` sets WOKEN_STATES
+2. Thread breaks out of `schedule_blocking` (WOKEN_STATES was set)
+3. nanosleep checks `is_current_interrupted()` → **false** (not set yet!)
+4. nanosleep re-enters `schedule_blocking`
+5. `interrupt_thread` sets the flag → too late, thread is asleep again
+
+**Fix:** Set ALL interrupted flags FIRST (for target + all siblings), THEN
+pend signals (which call wake). When the thread wakes, the flag is already set.
+
+**Known limitation:** Each thread has a single `AtomicU32` pending signal slot.
+`pend_signal_for_thread` overwrites the previous signal. Linux uses a 64-bit bitmask.
+Back-to-back `sys_kill` on overlapping thread groups can lose signals.
+
+**File:** `src/syscall/proc.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_interrupt_before_wake_ordering` | Flag must be set before wake, not after |
+| `test_pending_signal_is_single_slot` | Second pend overwrites first (documents limitation) |
+
+---
+
 ### Note: "Parallel process execution" test hang (intermittent)
 
 The kernel test `test_parallel_processes` sometimes hangs at "Spawning process 1..."

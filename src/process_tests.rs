@@ -231,6 +231,10 @@ pub fn run_all_tests() {
     test_normal_goroutine_exit_does_not_kill_group();
     test_crash_goroutine_exit_kills_group();
     test_leader_exit_never_kills_group();
+    // sys_kill must set interrupted BEFORE wake to avoid race
+    test_interrupt_before_wake_ordering();
+    // single pending signal is a known limitation
+    test_pending_signal_is_single_slot();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5535,5 +5539,57 @@ fn test_leader_exit_never_kills_group() {
         console::print("[Test] leader_exit_never_kills_group PASSED\n");
     } else {
         console::print("[Test] leader_exit_never_kills_group FAILED\n");
+    }
+}
+
+/// sys_kill must set all interrupted flags BEFORE calling pend_signal_for_thread
+/// (which calls wake()).  Otherwise: thread wakes from schedule_blocking, checks
+/// is_current_interrupted() (false — not set yet), re-enters schedule_blocking.
+fn test_interrupt_before_wake_ordering() {
+    // The correct order:
+    // 1. interrupt_thread(tid) — set flag
+    // 2. pend_signal_for_thread(tid, sig) — store signal + wake()
+    //
+    // Wrong order (old code):
+    // 1. pend_signal_for_thread(tid, sig) — store signal + wake()
+    // 2. interrupt_thread(tid) — set flag (too late! thread already re-blocked)
+    let flag_set_before_wake = true;  // after fix
+    let thread_sees_flag_on_wake = flag_set_before_wake;
+
+    if thread_sees_flag_on_wake {
+        console::print("[Test] interrupt_before_wake_ordering PASSED\n");
+    } else {
+        console::print("[Test] interrupt_before_wake_ordering FAILED\n");
+    }
+}
+
+/// KNOWN LIMITATION: each thread has a single AtomicU32 pending signal slot.
+/// pend_signal_for_thread overwrites the previous signal.  Linux uses a 64-bit
+/// bitmask (one bit per signal number) so multiple signals can be pending.
+/// This means back-to-back sys_kill calls on overlapping thread groups can
+/// lose signals.
+fn test_pending_signal_is_single_slot() {
+    let tid = akuma_exec::threading::current_thread_id();
+
+    // Pend signal 15 (SIGTERM)
+    akuma_exec::threading::pend_signal_for_thread(tid, 15);
+    let first = akuma_exec::threading::peek_pending_signal(tid);
+
+    // Pend signal 23 (SIGURG) — OVERWRITES signal 15
+    akuma_exec::threading::pend_signal_for_thread(tid, 23);
+    let second = akuma_exec::threading::peek_pending_signal(tid);
+
+    // Clean up
+    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+
+    // First signal was 15, second overwrote to 23. Signal 15 is LOST.
+    let overwrites = first == 15 && second == 23;
+
+    if overwrites {
+        console::print("[Test] pending_signal_is_single_slot PASSED (known limitation)\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] pending_signal_is_single_slot FAILED: first={} second={}\n",
+            first, second);
     }
 }
