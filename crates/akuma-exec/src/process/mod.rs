@@ -96,19 +96,9 @@ fn on_thread_cleanup(tid: usize) {
             if let Some(_proc) = table::unregister_process(pid) {
             }
         }
-    } else {
-        // Fallback: processes created by spawn_process_with_channel don't
-        // register in THREAD_PID_MAP.  Find the zombie by matching thread_id.
-        let zombie_pid = with_irqs_disabled(|| {
-            let table = table::PROCESS_TABLE.lock();
-            table.iter()
-                .find(|(_, proc)| proc.thread_id == Some(tid) && proc.exited)
-                .map(|(&pid, _)| pid)
-        });
-        if let Some(pid) = zombie_pid {
-            let _ = table::unregister_process(pid);
-        }
     }
+    // No fallback scan needed: spawn_process_with_channel now registers
+    // in THREAD_PID_MAP, so the primary path above handles all processes.
 }
 
 // Box registry re-exports

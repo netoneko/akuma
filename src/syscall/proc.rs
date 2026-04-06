@@ -217,6 +217,10 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
+        // Close all fds NOW so the SharedFdTable is empty before the thread
+        // terminates.  on_thread_cleanup → unregister_process → Box drop runs
+        // in scheduler context; if close_all runs there, it can deadlock.
+        proc.fds.close_all();
         notify_child_channel_exited(pid, code);
         vfork_complete(pid);
 

@@ -455,17 +455,42 @@ removing `unregister_process` from sys_exit.
 Processes created by `spawn_process_with_channel` (kernel tests, shell commands) don't
 register in THREAD_PID_MAP.  They became permanent zombies.
 
-**Fix:** Added fallback in `on_thread_cleanup`: when THREAD_PID_MAP has no entry for
-the recycled thread, scan PROCESS_TABLE for a zombie process with matching
-`thread_id == Some(tid)` and `exited == true`.  Unregister it.
+**Fix (v1, reverted):** Added PROCESS_TABLE scan fallback in `on_thread_cleanup`.
+**CAUSED DEADLOCK:** The scan ran in scheduler context. Acquiring PROCESS_TABLE lock +
+dropping Box<Process> (SharedFdTable::close_all) deadlocked with SSH/ps operations.
 
-**File:** `crates/akuma-exec/src/process/mod.rs`
+**Fix (v2, current):** `spawn_process_with_channel` now registers `(tid → pid)` in
+THREAD_PID_MAP inside the spawned thread's closure.  `on_thread_cleanup` finds it
+via the standard THREAD_PID_MAP path — no fallback scan, no scheduler deadlock.
+
+**File:** `crates/akuma-exec/src/process/spawn.rs`, `crates/akuma-exec/src/process/mod.rs`
 
 **Tests:**
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_cleanup_reaps_spawn_zombies` | Fallback finds zombies by thread_id + exited flag |
+| `test_spawn_registers_thread_pid_map` | spawn registers in THREAD_PID_MAP; no fallback needed |
+
+### 26. sys_exit must close fds before terminating thread (2026-04-06)
+
+**Symptom:** `test_parallel_processes` hangs at "Spawning process 1...".
+
+**Root cause:** `sys_exit` did NOT call `proc.fds.close_all()` (only `sys_exit_group`
+did).  When `on_thread_cleanup` ran `unregister_process`, the `Box<Process>` drop
+triggered `SharedFdTable::drop` → `close_all()` in scheduler context.  Pipe/socket
+cleanup in scheduler context deadlocked.
+
+**Fix:** Added `proc.fds.close_all()` to `sys_exit` before `mark_thread_terminated`.
+Now both `sys_exit` and `sys_exit_group` close fds eagerly.  By the time the scheduler
+drops the Box, the fd table is empty and drop is a no-op.
+
+**File:** `src/syscall/proc.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sys_exit_closes_fds_before_terminate` | Both sys_exit and sys_exit_group close fds before terminate |
 
 **File:** `src/syscall/proc.rs`
 

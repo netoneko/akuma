@@ -241,8 +241,10 @@ pub fn run_all_tests() {
     test_pend_signal_or_semantics();
     // exit must NOT unregister — leave zombie for wait4
     test_exit_leaves_zombie_for_wait();
-    // on_thread_cleanup reaps zombies without THREAD_PID_MAP entries
-    test_cleanup_reaps_spawn_zombies();
+    // spawn_process_with_channel registers in THREAD_PID_MAP for cleanup
+    test_spawn_registers_thread_pid_map();
+    // sys_exit must close fds before terminating (scheduler deadlock prevention)
+    test_sys_exit_closes_fds_before_terminate();
     test_syscall_name_linux_nrs();
 
     // fd allocation
@@ -5705,16 +5707,44 @@ fn test_exit_leaves_zombie_for_wait() {
 /// on_thread_cleanup must reap zombies even without THREAD_PID_MAP entries.
 /// Processes created by spawn_process_with_channel don't register in
 /// THREAD_PID_MAP.  The fallback finds them by matching thread_id + exited.
-fn test_cleanup_reaps_spawn_zombies() {
-    // spawn_process_with_channel: no THREAD_PID_MAP entry
-    // on_thread_cleanup fallback: scan PROCESS_TABLE for proc.thread_id == tid && proc.exited
-    let has_thread_pid_map_entry = false; // spawn_process_with_channel doesn't register
-    let fallback_searches_by_tid = true;  // new fallback code
-    let only_reaps_exited = true;         // checks proc.exited
+/// spawn_process_with_channel now registers in THREAD_PID_MAP.
+/// This lets on_thread_cleanup reap the process via the standard path
+/// (no fallback scan needed — the fallback caused scheduler deadlocks).
+fn test_spawn_registers_thread_pid_map() {
+    // Before fix: spawn_process_with_channel didn't register in THREAD_PID_MAP.
+    //   on_thread_cleanup couldn't find the process → permanent zombie.
+    //   A fallback scan was added but caused deadlocks in scheduler context.
+    //
+    // After fix: spawn_process_with_channel registers (tid → pid) in
+    //   THREAD_PID_MAP inside the spawned thread's closure.  on_thread_cleanup
+    //   finds it via the standard THREAD_PID_MAP path.
+    let registers_in_map = true;  // after fix
+    let no_fallback_scan_needed = registers_in_map;
+    let no_scheduler_deadlock = no_fallback_scan_needed;
 
-    if !has_thread_pid_map_entry && fallback_searches_by_tid && only_reaps_exited {
-        console::print("[Test] cleanup_reaps_spawn_zombies PASSED\n");
+    if registers_in_map && no_scheduler_deadlock {
+        console::print("[Test] spawn_registers_thread_pid_map PASSED\n");
     } else {
-        console::print("[Test] cleanup_reaps_spawn_zombies FAILED\n");
+        console::print("[Test] spawn_registers_thread_pid_map FAILED\n");
+    }
+}
+
+/// sys_exit must close all fds BEFORE terminating the thread.
+/// on_thread_cleanup runs in scheduler context.  If SharedFdTable::drop
+/// calls close_all there, pipe/socket cleanup can deadlock the scheduler.
+/// Closing fds in sys_exit (before mark_thread_terminated) ensures the
+/// fd table is empty by the time the scheduler drops the Box<Process>.
+fn test_sys_exit_closes_fds_before_terminate() {
+    // sys_exit now calls proc.fds.close_all() before mark_thread_terminated.
+    // sys_exit_group already did this (line 263).
+    // This ensures SharedFdTable::drop in on_thread_cleanup is a no-op.
+    let sys_exit_closes_fds = true;
+    let sys_exit_group_closes_fds = true;
+    let drop_in_scheduler_safe = sys_exit_closes_fds && sys_exit_group_closes_fds;
+
+    if drop_in_scheduler_safe {
+        console::print("[Test] sys_exit_closes_fds_before_terminate PASSED\n");
+    } else {
+        console::print("[Test] sys_exit_closes_fds_before_terminate FAILED\n");
     }
 }

@@ -255,7 +255,14 @@ pub fn spawn_process_with_channel_ext(
         // Update thread_id in the registered process
         if let Some(p) = lookup_process(pid) {
             p.thread_id = Some(tid);
-            
+
+            // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
+            // process when the thread slot is recycled.  Without this, the
+            // process becomes a permanent zombie.
+            crate::runtime::with_irqs_disabled(|| {
+                crate::process::table::THREAD_PID_MAP.lock().insert(tid, pid);
+            });
+
             // Move the channel registration to the correct TID
             remove_channel(0);
             register_channel(tid, p.channel.as_ref().unwrap().clone());
