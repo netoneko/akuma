@@ -2,7 +2,7 @@
 
 ## Date
 
-2026-04-02 to 2026-04-03
+2026-04-02 to 2026-04-07
 
 ---
 
@@ -641,14 +641,103 @@ cache from a recently exec'd binary.
 
 ---
 
+### 27. sys_wait4 / sys_waitid busy spin starved thread pool (2026-04-07)
+
+**Symptom:** forktest hangs on `cmd.Wait()` with 3 children running combined_stress
+(50-worker goroutine pools × 3 children). The parent never returns from wait4.
+
+**Root cause:** `sys_wait4` and `sys_waitid` used `yield_now()` busy spins while
+waiting for children to exit. `yield_now()` keeps the thread in the RUNNING state
+(it only triggers an SGI; the thread stays scheduled). With three parent goroutine
+threads permanently RUNNING and consuming thread slots, combined with 50 goroutine
+workers per child, the 32-slot kernel thread pool was exhausted. Even when
+`set_exited()` fired on a ProcessChannel, the waiting thread was never registered
+as a poller, so it was never directly woken.
+
+**Fix — `pid > 0` path (`sys_wait4` and P_PID/P_PIDFD `sys_waitid`):**
+```rust
+let waiter_tid = akuma_exec::threading::current_thread_id();
+ch.add_poller(waiter_tid);
+// Double-check after registering to avoid missed-wakeup race.
+if ch.has_exited() { /* collect and return */ }
+akuma_exec::threading::schedule_blocking(u64::MAX);
+if akuma_exec::process::is_current_interrupted() { return EINTR; }
+```
+The poller is registered before the has_exited check to close the race where the
+child exits between the check and the add_poller call.
+
+**Fix — `pid == -1` path (`sys_wait4`) and P_ALL `sys_waitid`:**
+```rust
+akuma_exec::threading::schedule_blocking(
+    (akuma_exec::runtime::runtime().uptime_us)() + 10_000
+);
+if akuma_exec::process::is_current_interrupted() { return EINTR; }
+```
+10ms sleep per iteration — the wait-any path can't register a single poller since
+it doesn't know which child will exit first.
+
+**File:** `src/syscall/proc.rs`
+
+### 28. sys_exit_group goroutine thread didn't notify tgid channel (2026-04-07)
+
+**Symptom:** Parent's `wait4(child_pid)` hangs when exit_group is called by a
+goroutine thread (tgid=child_pid, pid=goroutine_pid). The parent waits on
+`CHILD_CHANNELS[child_pid]`, but only `CHILD_CHANNELS[goroutine_pid]` was notified.
+
+**Root cause:** `sys_exit_group` called `notify_child_channel_exited(pid, code)`
+where `pid` is the calling thread's pid, not its tgid. When the calling thread is
+a goroutine (tgid != pid), `CHILD_CHANNELS[tgid]` — the one the parent actually
+waits on — was never explicitly set.
+
+The implicit path (via `kill_thread_group` → `remove_channel(tgid_leader_tid)` →
+`channel.set_exited`) is fragile: if the group leader was already cleaned up,
+the implicit notification is skipped.
+
+**Fix:**
+```rust
+let tgid = proc.tgid;
+// ... existing exit_group logic ...
+notify_child_channel_exited(pid, code);
+if tgid != pid {
+    notify_child_channel_exited(tgid, code);
+}
+```
+
+**File:** `src/syscall/proc.rs`
+
+---
+
+## Known Remaining Issue: handle_syscall early interrupt kills with code 130
+
+**Symptom:** Children report exit code 130 instead of 0 after SIGTERM. The
+`cmd.Wait()` call in the parent returns an error (non-zero exit).
+
+**Root cause:** `handle_syscall` checks `is_current_interrupted()` at the top of
+every syscall. If true, it sets `proc.exited = true; proc.exit_code = 130` and
+returns EINTR. `sys_kill` calls `interrupt_thread(tid)` which sets the interrupted
+flag. The next syscall entry by any goroutine thread fires this early-exit path,
+killing the process with code 130 before Go's SIGTERM signal handler runs and calls
+`os.Exit(0)`.
+
+**This does NOT cause a hang** — the child channel IS set via `return_to_kernel`,
+so `cmd.Wait()` unblocks. But it makes every child report a non-zero exit code.
+
+**Why not fixed:** The early interrupt path is also used for SSH Ctrl+C (`is_current_interrupted`
+is set by the SSH Ctrl+C handler). Changing this path to pend SIGTERM instead of
+hard-killing would affect interactive session behavior and needs careful design.
+
+---
+
 ## Current State
 
 | Operation | Status |
 |-----------|--------|
 | Fork+exec chain | WORKS |
 | Go goroutine thread creation | WORKS |
-| SIGTERM delivery to Go processes | WORKS (all 3 children exit gracefully) |
+| SIGTERM delivery to Go processes | WORKS (all 3 children exit) |
 | Process cleanup (no zombies) | WORKS |
+| wait4 / waitid blocking | WORKS (proper sleep/wake, no busy spin) |
+| Child exit code after SIGTERM | BROKEN (code 130 instead of 0) |
 | Go build (compiler toolchain) | 30/31 packages compiled |
 | SSH stability after forktest | WORKS |
 
@@ -661,7 +750,7 @@ cache from a recently exec'd binary.
 | `crates/akuma-exec/src/process/mod.rs` | PROCESS_INFO_ADDR re-map after CoW; tgid field; clone_thread stack=0 guard; kill_thread_group uses tgid; reverted copy_to_user_safe |
 | `crates/akuma-exec/src/process/signal.rs` | exit_code=-9 (not 137); kill_process_with_signal() |
 | `crates/akuma-exec/src/process/channel.rs` | is_interrupted() auto-clears via swap(false) |
-| `src/syscall/proc.rs` | sys_kill delivers signals properly; sys_exit/exit_group terminate thread + unregister; clone flag routing + bits-32+ guard; tgid-based thread group interrupt |
+| `src/syscall/proc.rs` | sys_kill delivers signals properly; sys_exit/exit_group terminate thread + notify tgid channel; clone flag routing + bits-32+ guard; tgid-based thread group interrupt; wait4/waitid use schedule_blocking + add_poller (no busy spin) |
 | `src/syscall/sync.rs` | futex WAKE/WAIT on unmapped address: non-fatal returns |
 | `src/exceptions.rs` | EL1 fault handler fast path attempted then reverted |
 | `src/process_tests.rs` | ~20 new regression tests |

@@ -249,6 +249,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
                 proc.pid, proc.name, code, secs, frac);
         }
         let pid = proc.pid;
+        let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
         proc.exited = true;
@@ -258,6 +259,14 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             crate::syscall::log::mark_exited(pid);
         }
         notify_child_channel_exited(pid, code);
+        // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
+        // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
+        // the tgid leader's channel now so the parent doesn't hang.
+        // kill_thread_group will remove the tgid leader's I/O channel (same Arc),
+        // but an explicit notify here is race-free and idempotent.
+        if tgid != pid {
+            notify_child_channel_exited(tgid, code);
+        }
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later
@@ -670,6 +679,8 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         None => return (-libc_errno::ECHILD as i64) as u64,
     };
 
+    let waiter_tid = akuma_exec::threading::current_thread_id();
+
     if pid > 0 {
         let p = pid as u32;
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
@@ -691,7 +702,23 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 if wnohang {
                     return 0;
                 }
-                akuma_exec::threading::yield_now();
+                // Register as a poller so set_exited() wakes us instead of busy-spinning.
+                ch.add_poller(waiter_tid);
+                // Double-check after registering to avoid missed wakeup race.
+                if ch.has_exited() {
+                    let code = ch.exit_code();
+                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                        let status = encode_wait_status(code);
+                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                    }
+                    akuma_exec::process::remove_child_channel(p);
+                    return p as u64;
+                }
+                akuma_exec::threading::schedule_blocking(u64::MAX);
+                // If interrupted (signal or Ctrl+C), return EINTR so the caller retries.
+                if akuma_exec::process::is_current_interrupted() {
+                    return EINTR;
+                }
             }
         }
     } else if pid == -1 || pid == 0 {
@@ -720,7 +747,15 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if wnohang {
                 return 0;
             }
-            akuma_exec::threading::yield_now();
+            // No specific child to poll on — fall back to a short timed sleep.
+            // The child's set_exited() will wake us if we registered as a poller
+            // on an individual channel; for the "any child" case we use a timeout.
+            akuma_exec::threading::schedule_blocking(
+                (akuma_exec::runtime::runtime().uptime_us)() + 10_000 // 10ms
+            );
+            if akuma_exec::process::is_current_interrupted() {
+                return EINTR;
+            }
         }
     }
 
@@ -761,6 +796,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
         None => return (-libc_errno::ECHILD as i64) as u64,
     };
 
+    let waiter_tid = akuma_exec::threading::current_thread_id();
     let result: Option<(u32, i32)> = match idtype {
         P_PID => {
             if let Some(ch) = akuma_exec::process::get_child_channel(id) {
@@ -769,7 +805,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                         break Some((id, ch.exit_code()));
                     }
                     if wnohang { break None; }
-                    akuma_exec::threading::yield_now();
+                    ch.add_poller(waiter_tid);
+                    if ch.has_exited() { break Some((id, ch.exit_code())); }
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
                 return (-libc_errno::ECHILD as i64) as u64;
@@ -784,7 +823,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     break Some((cpid, ch.exit_code()));
                 }
                 if wnohang { break None; }
-                akuma_exec::threading::yield_now();
+                akuma_exec::threading::schedule_blocking(
+                    (akuma_exec::runtime::runtime().uptime_us)() + 10_000
+                );
+                if akuma_exec::process::is_current_interrupted() { return EINTR; }
             }
         }
         P_PIDFD => {
@@ -808,7 +850,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                         break Some((target_pid, ch.exit_code()));
                     }
                     if wnohang { break None; }
-                    akuma_exec::threading::yield_now();
+                    ch.add_poller(waiter_tid);
+                    if ch.has_exited() { break Some((target_pid, ch.exit_code())); }
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                    if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
                 return (-libc_errno::ECHILD as i64) as u64;
