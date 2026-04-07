@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 spinning_top = "0.3"
+lock_api = "0.4"
 log = { version = "0.4", default-features = false }
 elf = { version = "0.7", default-features = false }
 akuma-terminal = { path = "../akuma-terminal" }

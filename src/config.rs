@@ -100,6 +100,10 @@ pub const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
 /// 8 words = 64 bytes of canary.
 pub const CANARY_WORDS: usize = 8;
 
+/// Enable [futex-dbg] trace logging for wait/wake pairs with timestamps.
+/// Zero cost when false (LLVM eliminates const-false branches).
+pub const FUTEX_DBG_ENABLED: bool = false;
+
 /// Fail tests if test binaries are missing
 ///
 /// When enabled, tests that require binaries (elftest, stdcheck, hello, echo2)

@@ -84,6 +84,7 @@
 extern crate alloc;
 
 pub mod runtime;
+pub mod sync;
 pub mod mmu;
 #[path = "elf/mod.rs"]
 pub mod elf_loader;

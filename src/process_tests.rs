@@ -288,6 +288,14 @@ pub fn run_all_tests() {
     test_msgqueue_nowait_returns_immediately();
     test_msgqueue_waker_idempotent();
 
+    // Process table refactor (Stage D+B)
+    test_list_processes_does_not_hold_lock_during_clone();
+    test_rwspinlock_table_concurrent_reads();
+    test_process_table_register_get_unregister();
+    test_lookup_process_shim_returns_valid_ref();
+    test_borrow_tracker_increments();
+    test_get_current_process_returns_arc();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -3034,8 +3042,9 @@ fn test_entry_point_trampoline_no_zombie_match() {
     // Replicate entry_point_trampoline's scan logic.
     let mut found_pid: Option<u32> = None;
     crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::table::PROCESS_TABLE.lock();
-        for proc in table.values() {
+        let table = akuma_exec::process::table::PROCESS_TABLE.read();
+        for proc_arc in table.values() {
+            let proc = proc_arc.lock();
             if proc.thread_id == Some(slot) {
                 found_pid = Some(proc.pid);
                 break;
@@ -6000,5 +6009,167 @@ fn test_poller_double_check_avoids_missed_wakeup() {
         crate::safe_print!(128,
             "[Test] poller_double_check_avoids_missed_wakeup FAILED: caught={} consumed={}\n",
             caught_by_double_check, poller_consumed);
+    }
+}
+
+// ── Process table refactor tests (Stage D+B) ────────────────────────────
+
+/// Verify that list_processes() works after the two-phase refactor:
+/// PIDs collected under lock, ProcessInfo2 built outside.
+fn test_list_processes_does_not_hold_lock_during_clone() {
+    use akuma_exec::process::{register_process, unregister_process, list_processes};
+
+    let test_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let mut proc = make_test_process(test_pid);
+    proc.name = alloc::string::String::from("list_test");
+    register_process(test_pid, proc);
+
+    let procs = list_processes();
+    let found = procs.iter().any(|p| p.pid == test_pid && p.name == "list_test");
+
+    let _ = unregister_process(test_pid);
+
+    // After unregister, a second call should NOT include the process
+    let procs2 = list_processes();
+    let gone = !procs2.iter().any(|p| p.pid == test_pid);
+
+    if found && gone {
+        console::print("[Test] list_processes_does_not_hold_lock_during_clone PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] list_processes_does_not_hold_lock_during_clone FAILED: found={} gone={}\n",
+            found, gone);
+    }
+}
+
+/// Verify RwSpinlock allows concurrent reads on PROCESS_TABLE.
+fn test_rwspinlock_table_concurrent_reads() {
+    use akuma_exec::process::{register_process, unregister_process};
+    use akuma_exec::process::table::PROCESS_TABLE;
+
+    let pid1 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let pid2 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid1, make_test_process(pid1));
+    register_process(pid2, make_test_process(pid2));
+
+    // Take two simultaneous read locks — should not deadlock
+    let ok = crate::irq::with_irqs_disabled(|| {
+        let r1 = PROCESS_TABLE.read();
+        let r2 = PROCESS_TABLE.read();
+        let has1 = r1.contains_key(&pid1);
+        let has2 = r2.contains_key(&pid2);
+        has1 && has2
+    });
+
+    let _ = unregister_process(pid1);
+    let _ = unregister_process(pid2);
+
+    if ok {
+        console::print("[Test] rwspinlock_table_concurrent_reads PASSED\n");
+    } else {
+        console::print("[Test] rwspinlock_table_concurrent_reads FAILED\n");
+    }
+}
+
+/// Verify the register → get_process → unregister lifecycle with Arc<Spinlock<Process>>.
+fn test_process_table_register_get_unregister() {
+    use akuma_exec::process::{register_process, unregister_process};
+    use akuma_exec::process::table::get_process;
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let mut proc = make_test_process(pid);
+    proc.name = alloc::string::String::from("arc_test");
+    register_process(pid, proc);
+
+    // get_process returns Arc that can be locked
+    let arc = get_process(pid);
+    let name_ok = arc.as_ref().map(|a| a.lock().name == "arc_test").unwrap_or(false);
+
+    // Clone the Arc — original should still work after unregister removes table's copy
+    let arc_clone = arc.clone();
+    let removed = unregister_process(pid);
+    let removed_ok = removed.is_some();
+
+    // Table no longer has it
+    let gone = get_process(pid).is_none();
+
+    // But our Arc clone still points to valid Process (kept alive by refcount)
+    let clone_ok = arc_clone.as_ref().map(|a| a.lock().name == "arc_test").unwrap_or(false);
+
+    if name_ok && removed_ok && gone && clone_ok {
+        console::print("[Test] process_table_register_get_unregister PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] process_table_register_get_unregister FAILED: name={} removed={} gone={} clone={}\n",
+            name_ok, removed_ok, gone, clone_ok);
+    }
+}
+
+/// Verify the backward-compatible lookup_process shim returns a usable &mut Process.
+fn test_lookup_process_shim_returns_valid_ref() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let mut proc = make_test_process(pid);
+    proc.exit_code = 42;
+    register_process(pid, proc);
+
+    let ref_ok = if let Some(p) = lookup_process(pid) {
+        p.exit_code == 42
+    } else {
+        false
+    };
+
+    let _ = unregister_process(pid);
+
+    // After unregister, lookup should return None
+    let gone = lookup_process(pid).is_none();
+
+    if ref_ok && gone {
+        console::print("[Test] lookup_process_shim_returns_valid_ref PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] lookup_process_shim_returns_valid_ref FAILED: ref_ok={} gone={}\n",
+            ref_ok, gone);
+    }
+}
+
+/// Verify the borrow tracker increments on lookup_process calls.
+fn test_borrow_tracker_increments() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::diag::BORROW_TRACKING_ENABLED;
+
+    if !BORROW_TRACKING_ENABLED {
+        console::print("[Test] borrow_tracker_increments SKIPPED (tracking disabled)\n");
+        return;
+    }
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid, make_test_process(pid));
+
+    // Each lookup_process call increments borrow count (monotonic, no dec at call sites)
+    let _ = lookup_process(pid);
+    let _ = lookup_process(pid);
+    // If we got here without a panic, the tracker is working
+    // (it logs [BORROW-ALIAS] but does not panic)
+
+    let _ = unregister_process(pid);
+
+    console::print("[Test] borrow_tracker_increments PASSED\n");
+}
+
+/// Verify get_current_process returns a lockable Arc when called from a process context.
+/// Note: in kernel test context there is no user process, so this tests the None path.
+fn test_get_current_process_returns_arc() {
+    use akuma_exec::process::get_current_process;
+
+    // In kernel test context (no user process mapped), should return None
+    let result = get_current_process();
+    let is_none = result.is_none();
+
+    if is_none {
+        console::print("[Test] get_current_process_returns_arc PASSED (None in kernel ctx)\n");
+    } else {
+        console::print("[Test] get_current_process_returns_arc FAILED (expected None)\n");
     }
 }

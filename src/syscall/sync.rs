@@ -93,6 +93,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let tgid = futex_key_tgid(is_private);
             let key = (tgid, uaddr);
 
+            if crate::config::FUTEX_DBG_ENABLED {
+                let ts = crate::timer::uptime_us();
+                tprint!(128, "[futex-dbg] WAIT tid={} tgid={} addr={:#x} val={} ts={}us\n", tid, tgid, uaddr, val, ts);
+            }
+
             // FUTEX_WAIT_BITSET with val3==0 is invalid per spec.
             if cmd == FUTEX_WAIT_BITSET && val3 == 0 {
                 return EINVAL;
@@ -165,15 +170,24 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
                 // If we were woken by a pending signal, return EINTR (Linux spec).
                 if akuma_exec::threading::peek_pending_signal(tid) != 0 {
+                    if crate::config::FUTEX_DBG_ENABLED {
+                        tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=EINTR ts={}us\n", tid, uaddr, crate::timer::uptime_us());
+                    }
                     return EINTR;
                 }
 
                 if woken_by_futex {
+                    if crate::config::FUTEX_DBG_ENABLED {
+                        tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=0 ts={}us\n", tid, uaddr, crate::timer::uptime_us());
+                    }
                     return 0;
                 }
 
                 // Not a genuine FUTEX_WAKE — check terminal conditions.
                 if deadline != u64::MAX && crate::timer::uptime_us() >= deadline {
+                    if crate::config::FUTEX_DBG_ENABLED {
+                        tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=ETIMEDOUT ts={}us\n", tid, uaddr, crate::timer::uptime_us());
+                    }
                     return ETIMEDOUT;
                 }
 
@@ -197,7 +211,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let tgid = futex_key_tgid(is_private);
-            futex_do_wake(tgid, uaddr, val)
+            let woken = futex_do_wake(tgid, uaddr, val);
+            if crate::config::FUTEX_DBG_ENABLED {
+                tprint!(128, "[futex-dbg] WAKE addr={:#x} max={} woken={} ts={}us\n", uaddr, val, woken, crate::timer::uptime_us());
+            }
+            woken
         }
         FUTEX_REQUEUE => {
             // Wake up to val waiters, requeue rest to uaddr2
@@ -251,6 +269,9 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 akuma_exec::threading::get_waker_for_thread(*tid).wake();
             }
 
+            if crate::config::FUTEX_DBG_ENABLED {
+                tprint!(128, "[futex-dbg] REQUEUE addr={:#x} addr2={:#x} woken={} requeued={} ts={}us\n", uaddr, uaddr2, woken, requeued, crate::timer::uptime_us());
+            }
             (woken + requeued) as u64
         }
         FUTEX_CMP_REQUEUE => {

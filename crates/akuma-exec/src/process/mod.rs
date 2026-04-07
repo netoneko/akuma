@@ -12,6 +12,7 @@ pub mod fd;
 pub mod image;
 pub mod spawn;
 pub mod exec;
+pub mod diag;
 
 pub use types::*;
 pub use table::*;
@@ -194,9 +195,9 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
 
     // 1. Get list of PIDs in this box
     let pids: Vec<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(_, proc)| proc.box_id == box_id)
+            .filter(|(_, proc_arc)| proc_arc.lock().box_id == box_id)
             .map(|(&pid, _)| pid)
             .collect()
     });
@@ -646,14 +647,17 @@ pub extern "C" fn check_process_exit() -> bool {
 pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
     // Find tgid for the calling process
     let tgid = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        table.get(&my_pid).map(|p| p.tgid).unwrap_or(my_pid)
+        let table = PROCESS_TABLE.read();
+        table.get(&my_pid).map(|arc| arc.lock().tgid).unwrap_or(my_pid)
     });
     let siblings: Vec<(Pid, Option<usize>)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(pid, proc)| **pid != my_pid && proc.tgid == tgid)
-            .map(|(pid, proc)| (*pid, proc.thread_id))
+            .filter(|(pid, proc_arc)| {
+                let p = proc_arc.lock();
+                **pid != my_pid && p.tgid == tgid
+            })
+            .map(|(pid, proc_arc)| (*pid, proc_arc.lock().thread_id))
             .collect()
     });
 
@@ -704,13 +708,16 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
 /// [`kill_child_processes_for_thread_group`] (all pthread PIDs in a process).
 fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     let children: Vec<(Pid, Option<usize>, usize)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         // Do not skip `proc.exited`: children may already be Zombie(137) from a
         // prior kill_thread_group without unregister_process; they must still be
         // torn down here or `ps` shows zombies forever.
         table.iter()
-            .filter(|(_, proc)| parents.contains(&proc.parent_pid))
-            .map(|(pid, proc)| (*pid, proc.thread_id, proc.address_space.l0_phys()))
+            .filter(|(_, proc_arc)| parents.contains(&proc_arc.lock().parent_pid))
+            .map(|(pid, proc_arc)| {
+                let p = proc_arc.lock();
+                (*pid, p.thread_id, p.address_space.l0_phys())
+            })
             .collect()
     });
 
@@ -733,10 +740,13 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
 /// owner (`shared == false`) last so `UserAddressSpace::drop` frees L0 once.
 fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
     let mut members: Vec<(Pid, Option<usize>, bool)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(_, proc)| proc.address_space.l0_phys() == l0_phys)
-            .map(|(pid, proc)| (*pid, proc.thread_id, proc.address_space.is_shared()))
+            .filter(|(_, proc_arc)| proc_arc.lock().address_space.l0_phys() == l0_phys)
+            .map(|(pid, proc_arc)| {
+                let p = proc_arc.lock();
+                (*pid, p.thread_id, p.address_space.is_shared())
+            })
             .collect()
     });
     if members.is_empty() {
@@ -785,10 +795,10 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
 /// torn down before their parent fork.
 fn kill_fork_subtree_recursive(child_pid: Pid, l0_phys: usize) {
     let nested: Vec<(Pid, usize)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(_, proc)| proc.parent_pid == child_pid)
-            .map(|(pid, proc)| (*pid, proc.address_space.l0_phys()))
+            .filter(|(_, proc_arc)| proc_arc.lock().parent_pid == child_pid)
+            .map(|(pid, proc_arc)| (*pid, proc_arc.lock().address_space.l0_phys()))
             .collect()
     });
     for (npid, nl0) in nested {
@@ -823,9 +833,9 @@ pub fn kill_child_processes(parent_pid: Pid) {
 /// children of any of them.
 pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
     let parents: BTreeSet<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(_, proc)| proc.address_space.l0_phys() == l0_phys)
+            .filter(|(_, proc_arc)| proc_arc.lock().address_space.l0_phys() == l0_phys)
             .map(|(pid, _)| *pid)
             .collect()
     });
@@ -1908,10 +1918,10 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     let mut proc_ptr: *mut Process = core::ptr::null_mut();
 
     with_irqs_disabled(|| {
-        let mut processes = PROCESS_TABLE.lock();
-        for proc in processes.values_mut() {
-            if proc.thread_id == Some(tid) {
-                proc_ptr = &mut **proc as *mut Process;
+        let table = PROCESS_TABLE.read();
+        for proc_arc in table.values() {
+            if proc_arc.lock().thread_id == Some(tid) {
+                proc_ptr = spinning_top::Spinlock::data_ptr(proc_arc) as *mut Process;
                 break;
             }
         }

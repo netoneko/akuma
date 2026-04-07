@@ -43,11 +43,11 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Kill direct children first so parent-kill semantics cascade and avoid
     // leaving orphaned workers running after the parent exits.
     let child_pids: Vec<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table
             .iter()
-            .filter_map(|(&child_pid, p)| {
-                if p.parent_pid == pid {
+            .filter_map(|(&child_pid, p_arc)| {
+                if p_arc.lock().parent_pid == pid {
                     Some(child_pid)
                 } else {
                     None

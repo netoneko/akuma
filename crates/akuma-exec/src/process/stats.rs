@@ -108,10 +108,16 @@ impl ProcessSyscallStats {
 pub fn dump_running_process_stats() {
     if !process_syscall_stats_enabled() { return; }
     let pids: Vec<(Pid, String, u64)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
+        let table = PROCESS_TABLE.read();
         table.iter()
-            .filter(|(_, p)| !p.exited && p.start_time_us > 0)
-            .map(|(&pid, p)| (pid, p.name.clone(), p.start_time_us))
+            .filter(|(_, p_arc)| {
+                let p = p_arc.lock();
+                !p.exited && p.start_time_us > 0
+            })
+            .map(|(&pid, p_arc)| {
+                let p = p_arc.lock();
+                (pid, p.name.clone(), p.start_time_us)
+            })
             .collect()
     });
     let now = (runtime().uptime_us)();

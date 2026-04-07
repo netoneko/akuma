@@ -1,27 +1,28 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use spinning_top::Spinlock;
 
 use crate::process::Process;
 use crate::process::types::{Pid, LazyRegion};
+use crate::sync::RwSpinlock;
 use crate::runtime::with_irqs_disabled;
 
 /// Next available PID
 pub static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-/// Process table: maps PID to owned Process
+/// Process table: maps PID to shared Process wrapped in per-process lock.
 ///
-/// Processes are stored here when created and removed when they exit.
-/// Syscall handlers use read_current_pid() + lookup_process() to find
-/// the calling process.
+/// Uses `RwSpinlock` for the outer table: readers (lookups, iteration) can
+/// proceed concurrently; only insert/remove takes the write lock.
+/// Each Process is behind its own `Spinlock` inside an `Arc` for safe sharing.
 ///
-/// IMPORTANT: The table owns the Process via Box. When unregister_process
-/// is called, the Box<Process> is returned and dropped, which triggers
-/// UserAddressSpace::drop() to free all physical pages. This prevents
-/// memory leaks when processes exit.
-pub static PROCESS_TABLE: Spinlock<BTreeMap<Pid, Box<Process>>> =
-    Spinlock::new(BTreeMap::new());
+/// When `unregister_process` is called, the `Arc<Spinlock<Process>>` is removed.
+/// When the last `Arc` reference is dropped, `Process::drop()` runs, which triggers
+/// `UserAddressSpace::drop()` to free all physical pages.
+pub static PROCESS_TABLE: RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>> =
+    RwSpinlock::new(BTreeMap::new());
 
 /// Maps kernel thread IDs to PIDs for CLONE_THREAD children.
 /// Needed because thread clones share the parent's ProcessInfo page, so
@@ -39,18 +40,32 @@ pub static LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, BTreeMap<usize, LazyRegion>
 
 /// Register a process in the table (takes ownership)
 pub fn register_process(pid: Pid, proc: Box<Process>) {
+    let arc = Arc::new(Spinlock::new(*proc));
     with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().insert(pid, proc);
+        let t0 = crate::process::diag::lock_timer_start();
+        PROCESS_TABLE.write().insert(pid, arc);
+        crate::process::diag::lock_timer_end("register", t0);
     })
 }
 
 /// Unregister a process from the table
 ///
-/// Returns the owned Process so it can be dropped, freeing all memory
-/// including the UserAddressSpace and all its physical pages.
-pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
+/// Returns the Arc<Spinlock<Process>> so the caller controls when it is dropped.
+/// When the last Arc reference is dropped, Process::drop() runs, freeing all
+/// memory including the UserAddressSpace and all its physical pages.
+pub fn unregister_process(pid: Pid) -> Option<Arc<Spinlock<Process>>> {
     with_irqs_disabled(|| {
-        PROCESS_TABLE.lock().remove(&pid)
+        let t0 = crate::process::diag::lock_timer_start();
+        let result = PROCESS_TABLE.write().remove(&pid);
+        crate::process::diag::lock_timer_end("unregister", t0);
+        result
+    })
+}
+
+/// Get an Arc handle to a process by PID (read-locks the table briefly).
+pub fn get_process(pid: Pid) -> Option<Arc<Spinlock<Process>>> {
+    with_irqs_disabled(|| {
+        PROCESS_TABLE.read().get(&pid).cloned()
     })
 }
 

@@ -803,6 +803,48 @@ hard-killing would affect interactive session behavior and needs careful design.
 
 ---
 
+## Process Table Refactor (2026-04-07)
+
+Recurring `ps` hangs during Go workloads led to a structural refactor of the
+process table. See `docs/PROCESS_TABLE.md` for full architecture.
+
+### Problem
+
+`PROCESS_TABLE` was a single `Spinlock<BTreeMap<Pid, Box<Process>>>`.
+`list_processes()` held the lock while cloning `String`/`Vec<String>` for every
+process, blocking all concurrent `lookup_process()` calls from syscall handlers.
+Under Go's goroutine-heavy workloads (50+ threads per child, 3 children), this
+caused `ps` to hang indefinitely.
+
+Additionally, `lookup_process()` returned `&'static mut Process` via unsafe
+pointer escape after releasing the lock, creating aliasing UB potential across
+218+ call sites.
+
+### Fix
+
+**Stage D** -- Immediate instrumentation:
+- Rewrote `list_processes()` to two-phase: collect PIDs under lock, build
+  ProcessInfo2 outside. Directly fixes the `ps` hang.
+- Added lock-hold-time tracking (`[PTLOCK]` warnings when >100us)
+- Added borrow-aliasing detector (`[BORROW-ALIAS]` warnings)
+- Added futex compliance logging (`[futex-dbg]` traces, const-gated)
+
+**Stage B** -- Structural refactor:
+- Implemented `RwSpinlock` via `lock_api::RawRwLock` (reader-writer spinlock)
+- Changed table to `RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>>`
+- Readers (syscall handlers) now proceed concurrently
+- Writers (fork, exit) take exclusive lock only for insert/remove
+- Added `get_process()` / `get_current_process()` as new safe API
+- Preserved `lookup_process()` / `current_process()` as backward-compatible shims
+
+### Tests added
+
+- 9 host-level RwSpinlock tests (multiple readers, exclusion, state encoding)
+- 6 kernel-level tests (list_processes two-phase, concurrent reads, Arc
+  lifecycle, shim validity, borrow tracker, get_current_process)
+
+---
+
 ## Files Changed
 
 | File | Changes |
@@ -817,3 +859,7 @@ hard-killing would affect interactive session behavior and needs careful design.
 | `src/tests.rs` | tgid field in test Process structs |
 | `crates/akuma-exec/src/process/children.rs` | add_poller_to_all_children() for wait-any wakeup |
 | `userspace/forktest/parent/main.go` | Fixed EPOLLONESHOT re-arm dead code |
+| `crates/akuma-exec/src/sync.rs` | **NEW** RwSpinlock implementation (lock_api RawRwLock) |
+| `crates/akuma-exec/src/process/diag.rs` | **NEW** Lock timing, borrow tracker diagnostics |
+| `crates/akuma-exec/src/process/table.rs` | PROCESS_TABLE changed to RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>> |
+| `src/config.rs` | Added FUTEX_DBG_ENABLED const |

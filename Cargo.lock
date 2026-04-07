@@ -91,6 +91,7 @@ dependencies = [
  "akuma-terminal",
  "elf",
  "embedded-io-async",
+ "lock_api",
  "log",
  "spinning_top",
 ]

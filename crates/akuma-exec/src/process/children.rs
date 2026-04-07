@@ -6,7 +6,7 @@ use spinning_top::Spinlock;
 use crate::process::Process;
 use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, ProcessInfo2, ProcessState};
 use crate::process::channel::{ProcessChannel, get_channel};
-use crate::process::table::{PROCESS_TABLE, LAZY_REGION_TABLE, THREAD_PID_MAP};
+use crate::process::table::{PROCESS_TABLE, LAZY_REGION_TABLE, THREAD_PID_MAP, get_process};
 use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
 use akuma_terminal as terminal;
 
@@ -138,24 +138,36 @@ pub fn read_current_pid() -> Option<Pid> {
     if pid == 0 { None } else { Some(pid) }
 }
 
-/// Look up a process by PID
-///
-/// Returns a mutable reference to the process if found.
-/// SAFETY: The caller must ensure no other code is mutating the process.
-pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
-    with_irqs_disabled(|| {
-        let mut table = PROCESS_TABLE.lock();
-        table.get_mut(&pid).map(|boxed| {
-            // SAFETY: We return a 'static reference because:
-            // 1. The Process is heap-allocated via Box and won't move
-            // 2. The process remains in the table until unregister_process
-            // 3. Callers must not hold reference across unregister_process
-            unsafe { &mut *(&mut **boxed as *mut Process) }
-        })
-    })
+/// Get an Arc handle to the current process (new safe API).
+pub fn get_current_process() -> Option<Arc<Spinlock<Process>>> {
+    let tid = crate::threading::current_thread_id();
+    let thread_pid = with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().get(&tid).copied()
+    });
+    if let Some(pid) = thread_pid {
+        return get_process(pid);
+    }
+    let pid = read_current_pid()?;
+    get_process(pid)
 }
 
-/// Get the current process (for syscall handlers)
+/// Look up a process by PID (backward-compatible shim).
+///
+/// Returns a mutable reference to the process if found.
+/// SAFETY: Transitional shim — bypasses the per-process Spinlock to match
+/// old calling convention. Callers should migrate to `get_process()`.
+pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
+    let arc = get_process(pid)?;
+    // SAFETY: Same unsafety as the old code. The Arc keeps the Process alive
+    // while it remains in the table. We bypass the per-process Spinlock via
+    // data_ptr() (no lock acquired) to match the old behavior where the table
+    // lock was released and a bare &mut was returned.
+    let ptr = spinning_top::Spinlock::data_ptr(&*arc);
+    crate::process::diag::borrow_inc(pid);
+    Some(unsafe { &mut *ptr })
+}
+
+/// Get the current process (backward-compatible shim).
 ///
 /// For CLONE_THREAD children, uses the thread-to-PID map since they share
 /// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
@@ -540,12 +552,20 @@ pub fn get_stack_bounds() -> (usize, usize) {
 
 
 /// List all running processes
+///
+/// Two-phase approach: collect PIDs under lock (fast, bounded allocation),
+/// then build full ProcessInfo2 per-PID outside the lock to avoid holding
+/// the PROCESS_TABLE spinlock during String/Vec clones.
 pub fn list_processes() -> Vec<ProcessInfo2> {
-    with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        let mut result = Vec::new();
+    // Phase 1: collect PIDs under read lock (~256 bytes for 64 processes max)
+    let pids: Vec<Pid> = with_irqs_disabled(|| {
+        PROCESS_TABLE.read().keys().copied().collect()
+    });
 
-        for (&pid, proc) in table.iter() {
+    // Phase 2: build info per-PID outside the lock
+    let mut result = Vec::with_capacity(pids.len());
+    for pid in pids {
+        if let Some(proc) = lookup_process(pid) {
             let state = match proc.state {
                 ProcessState::Ready => "ready",
                 ProcessState::Running => "running",
@@ -563,16 +583,18 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
                 args: proc.args.clone(),
             });
         }
+        // Process exited between phase 1 and 2 — skip
+    }
 
-        result
-    })
+    result
 }
 
 /// Find a process PID by thread ID
 pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
     with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.lock();
-        for (&pid, proc) in table.iter() {
+        let table = PROCESS_TABLE.read();
+        for (&pid, proc_arc) in table.iter() {
+            let proc = proc_arc.lock();
             if proc.thread_id == Some(thread_id) {
                 return Some(pid);
             }
