@@ -202,9 +202,12 @@ func main() {
 				}
 			}
 
-			if !childInfo.Done && (event.Events&unix.EPOLLONESHOT) != 0 {
-				event.Events = unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLONESHOT
-				if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_MOD, childFd, &event); err != nil {
+			if !childInfo.Done {
+				rearm := unix.EpollEvent{
+					Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLONESHOT,
+					Fd:     int32(childFd),
+				}
+				if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_MOD, childFd, &rearm); err != nil {
 					fmt.Fprintf(os.Stderr, "forktest_parent: Failed to re-arm epoll for child %d: %v\n", childInfo.ID, err)
 				}
 			}

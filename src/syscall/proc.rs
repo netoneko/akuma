@@ -747,12 +747,23 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if wnohang {
                 return 0;
             }
-            // No specific child to poll on — fall back to a short timed sleep.
-            // The child's set_exited() will wake us if we registered as a poller
-            // on an individual channel; for the "any child" case we use a timeout.
-            akuma_exec::threading::schedule_blocking(
-                (akuma_exec::runtime::runtime().uptime_us)() + 10_000 // 10ms
-            );
+            // Register as poller on ALL children so any exit wakes us immediately.
+            akuma_exec::process::add_poller_to_all_children(current_pid, waiter_tid);
+            // Double-check after registering to avoid missed-wakeup race.
+            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+                let code = ch.exit_code();
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    let st = encode_wait_status(code);
+                    crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
+                }
+                if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                    let status = encode_wait_status(code);
+                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                }
+                akuma_exec::process::remove_child_channel(child_pid);
+                return child_pid as u64;
+            }
+            akuma_exec::threading::schedule_blocking(u64::MAX);
             if akuma_exec::process::is_current_interrupted() {
                 return EINTR;
             }
@@ -823,9 +834,11 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     break Some((cpid, ch.exit_code()));
                 }
                 if wnohang { break None; }
-                akuma_exec::threading::schedule_blocking(
-                    (akuma_exec::runtime::runtime().uptime_us)() + 10_000
-                );
+                akuma_exec::process::add_poller_to_all_children(current_pid, waiter_tid);
+                if let Some((cpid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+                    break Some((cpid, ch.exit_code()));
+                }
+                akuma_exec::threading::schedule_blocking(u64::MAX);
                 if akuma_exec::process::is_current_interrupted() { return EINTR; }
             }
         }

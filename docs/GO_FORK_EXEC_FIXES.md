@@ -668,15 +668,58 @@ child exits between the check and the add_poller call.
 
 **Fix — `pid == -1` path (`sys_wait4`) and P_ALL `sys_waitid`:**
 ```rust
-akuma_exec::threading::schedule_blocking(
-    (akuma_exec::runtime::runtime().uptime_us)() + 10_000
-);
+akuma_exec::process::add_poller_to_all_children(current_pid, waiter_tid);
+// Double-check after registering to avoid missed-wakeup race.
+if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+    /* collect and return */
+}
+akuma_exec::threading::schedule_blocking(u64::MAX);
 if akuma_exec::process::is_current_interrupted() { return EINTR; }
 ```
-10ms sleep per iteration — the wait-any path can't register a single poller since
-it doesn't know which child will exit first.
+Registers the waiter as a poller on ALL children of the current process. When any
+child exits, `set_exited()` wakes the waiter immediately — no polling delay.
 
-**File:** `src/syscall/proc.rs`
+**File:** `src/syscall/proc.rs`, `crates/akuma-exec/src/process/children.rs`
+
+### 29. wait4 pid==-1 10ms polling caused flaky shell pipeline tests (2026-04-07)
+
+**Symptom:** Shell test `mixed pipeline (echo | echo2 | grep)` flaky — sometimes
+grep hangs waiting for input.
+
+**Root cause:** The initial fix for bug #27's `pid == -1` path used a blind 10ms
+`schedule_blocking` timeout instead of registering pollers. The shell reaps pipeline
+children via `wait4(-1)`. With the 10ms delay, the shell was slow to complete its
+reap loop, which delayed closing inherited pipe file descriptors. If `grep` started
+reading before the shell closed the write end of pipe2, `grep` saw an extra open
+writer and didn't get EOF even after `echo2` exited.
+
+**Fix:** Replaced the 10ms timed sleep with `add_poller_to_all_children()` +
+`schedule_blocking(u64::MAX)`. New helper function iterates `CHILD_CHANNELS` and
+calls `ch.add_poller(waiter_tid)` on every child belonging to the parent. Any
+child's `set_exited()` wakes the parent immediately.
+
+**File:** `src/syscall/proc.rs`, `crates/akuma-exec/src/process/children.rs`
+
+### 30. forktest_parent EPOLLONESHOT re-arm dead code (2026-04-07)
+
+**Symptom:** Second run of forktest_parent hangs — parent stuck in Go-level futex,
+no child processes visible in `ps`. Terminal freezes (shell waiting for foreground
+process).
+
+**Root cause:** The epoll re-arm condition checked `event.Events & unix.EPOLLONESHOT`,
+but Linux/Akuma never set `EPOLLONESHOT` in the *returned* event bitmask from
+`EpollWait`. The condition was always false — dead code. After the first `EPOLLIN`
+event, the fd was disarmed by `EPOLLONESHOT` and never re-armed, so `EPOLLRDHUP`
+(pipe close) never fired. The parent sat in `EpollWait` forever.
+
+First run sometimes worked due to timing: if children closed pipes before any data
+was read (EPOLLRDHUP fires simultaneously with or before first EPOLLIN), the pipe
+close was detected in the same event batch.
+
+**Fix:** Changed re-arm condition from `event.Events & unix.EPOLLONESHOT` to
+`!childInfo.Done`. Always re-arm active fds after processing events.
+
+**File:** `userspace/forktest/parent/main.go`
 
 ### 28. sys_exit_group goroutine thread didn't notify tgid channel (2026-04-07)
 
@@ -755,3 +798,5 @@ hard-killing would affect interactive session behavior and needs careful design.
 | `src/exceptions.rs` | EL1 fault handler fast path attempted then reverted |
 | `src/process_tests.rs` | ~20 new regression tests |
 | `src/tests.rs` | tgid field in test Process structs |
+| `crates/akuma-exec/src/process/children.rs` | add_poller_to_all_children() for wait-any wakeup |
+| `userspace/forktest/parent/main.go` | Fixed EPOLLONESHOT re-arm dead code |

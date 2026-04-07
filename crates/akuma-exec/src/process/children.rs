@@ -50,6 +50,19 @@ pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> 
     })
 }
 
+/// Register `poller_tid` as a poller on every child channel of `parent_pid`.
+/// When any child exits, `set_exited()` wakes the poller.
+pub fn add_poller_to_all_children(parent_pid: Pid, poller_tid: usize) {
+    with_irqs_disabled(|| {
+        let channels = CHILD_CHANNELS.lock();
+        for (ch, ppid) in channels.values() {
+            if *ppid == parent_pid {
+                ch.add_poller(poller_tid);
+            }
+        }
+    })
+}
+
 /// Check if the given parent has any children registered.
 pub fn has_children(parent_pid: Pid) -> bool {
     with_irqs_disabled(|| {
