@@ -663,33 +663,26 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
         if let Some(proc) = lookup_process(*sib_pid) {
             cleanup_process_fds(proc);
         }
-        // DO NOT clear lazy regions here. For CLONE_VM threads the lazy regions
-        // are keyed by the address-space owner PID, so clearing them while
-        // sibling threads are still executing removes demand-paging metadata
-        // for the entire shared address space. Each thread's return_to_kernel
-        // path clears its own lazy regions after deactivating the address space.
 
         if let Some(tid) = sib_tid {
-            // DO NOT remove from THREAD_PID_MAP yet - wait for cleanup_callback
             if let Some(channel) = remove_channel(*tid) {
-                channel.set_exited(-9); // killed by SIGKILL (thread group cleanup)
+                channel.set_exited(-9);
             }
         }
 
-        // DO NOT unregister process yet - wait for cleanup_callback
-        // Just mark as exited/zombie so wait4 can see it
-        if let Some(proc) = lookup_process(*sib_pid) {
-             proc.exited = true;
-             proc.exit_code = -9; // killed by SIGKILL (thread group cleanup)
-             proc.state = ProcessState::Zombie(-9);
-             // Clear thread_id so entry_point_trampoline won't match this
-             // zombie when a new process is spawned on the same thread slot.
-             proc.thread_id = None;
-        }
+        // CLONE_THREAD siblings are NOT fork children — they don't need wait4
+        // to reap them. On Linux, CLONE_THREAD children are auto-reaped.
+        // Unregister immediately to prevent zombie accumulation that fills
+        // the 256-slot table and causes ps/list_processes to hang.
+        // DO NOT clear lazy regions here — they're keyed by the address-space
+        // owner PID, and the owner is still alive.
+        let _ = table::unregister_process(*sib_pid);
 
         if let Some(tid) = sib_tid {
+            with_irqs_disabled(|| {
+                THREAD_PID_MAP.lock().remove(tid);
+            });
             crate::threading::mark_thread_terminated(*tid);
-            // Wake the thread so it exits naturally
             crate::threading::get_waker_for_thread(*tid).wake();
         }
     }

@@ -81,27 +81,50 @@ pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     None
 }
 
+/// Access a process by PID within a callback. **This is the safe API.**
+///
+/// The callback runs with IRQs disabled, guaranteeing the Process pointer
+/// is valid for the entire duration (no other thread can free it).
+///
+/// The callback MUST NOT allocate on the heap. For operations that need
+/// allocation, copy scalar fields inside the callback and allocate outside.
+///
+/// # Example
+/// ```ignore
+/// let name = table::with_process(pid, |p| p.name.clone()); // OK for short strings
+/// let exit_code = table::with_process(pid, |p| p.exit_code); // preferred for scalars
+/// ```
+#[inline]
+pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
+    with_irqs_disabled(|| {
+        let ptr = get_process_ptr_inner(pid)?;
+        Some(f(unsafe { &mut *ptr }))
+    })
+}
+
 /// Look up a process by PID. Returns a raw pointer.
 ///
-/// Uses `with_irqs_disabled` to prevent preemption between pointer load
-/// and dereference — without this, `unregister_process` on another thread
-/// could free the Process between load and use (use-after-free).
-///
-/// The pointer is valid as long as the process remains registered.
-/// Callers must not hold the pointer across `unregister_process`.
+/// # Safety
+/// The pointer is valid only while IRQs are disabled or no other thread
+/// can call `unregister_process`. Prefer `with_process()` for safe access.
+/// This function exists for the 218+ legacy call sites that use
+/// `lookup_process() -> &'static mut Process`.
 pub fn get_process_ptr(pid: Pid) -> Option<*mut Process> {
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() && unsafe { (*ptr).pid } == pid {
-                return Some(ptr);
-            }
+    with_irqs_disabled(|| get_process_ptr_inner(pid))
+}
+
+/// Inner scan (no IRQ guard — caller must ensure IRQs disabled).
+fn get_process_ptr_inner(pid: Pid) -> Option<*mut Process> {
+    for i in 0..MAX_PROCESSES {
+        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+            continue;
         }
-        None
-    })
+        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+        if !ptr.is_null() && unsafe { (*ptr).pid } == pid {
+            return Some(ptr);
+        }
+    }
+    None
 }
 
 /// Iterate all active processes, calling `f` for each.

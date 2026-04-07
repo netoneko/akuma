@@ -138,10 +138,18 @@ pub fn read_current_pid() -> Option<Pid> {
     if pid == 0 { None } else { Some(pid) }
 }
 
-/// Look up a process by PID (lock-free).
+/// Look up a process by PID.
 ///
-/// Returns a mutable reference to the process if found.
-/// The pointer is valid as long as the process remains registered in the table.
+/// # Safety warning
+/// Returns `&'static mut Process` that is ONLY valid while the process stays
+/// registered. If another thread calls `unregister_process` between this call
+/// and your use of the reference, you get use-after-free.
+///
+/// **Prefer `crate::process::table::with_process(pid, |p| ...)` for safe access.**
+///
+/// This function exists for the 218+ legacy call sites in syscall handlers.
+/// Most are safe in practice because syscall handlers run in a single thread
+/// context and the process can't be freed during a syscall by its own thread.
 pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
     let ptr = crate::process::table::get_process_ptr(pid)?;
     crate::process::diag::borrow_inc(pid);
@@ -152,6 +160,8 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
 ///
 /// For CLONE_THREAD children, uses the thread-to-PID map since they share
 /// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
+///
+/// Same safety caveats as `lookup_process`. Prefer `with_process` for new code.
 pub fn current_process() -> Option<&'static mut Process> {
     let tid = crate::threading::current_thread_id();
     let thread_pid = with_irqs_disabled(|| {
@@ -162,6 +172,17 @@ pub fn current_process() -> Option<&'static mut Process> {
     }
     let pid = read_current_pid()?;
     lookup_process(pid)
+
+}
+
+/// Resolve the current process PID (checking THREAD_PID_MAP first, then ProcessInfo page).
+pub fn current_pid() -> Option<Pid> {
+    let tid = crate::threading::current_thread_id();
+    let thread_pid = with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().get(&tid).copied()
+    });
+    if thread_pid.is_some() { return thread_pid; }
+    read_current_pid()
 }
 
 /// Get the current process's TerminalState (for syscall handlers)
@@ -534,30 +555,64 @@ pub fn get_stack_bounds() -> (usize, usize) {
 
 /// List all running processes.
 ///
-/// Two-phase: collect PIDs with IRQs disabled (fast), then build
-/// ProcessInfo2 per PID outside IRQ-disabled context (allows heap alloc).
+/// Collects scalar fields with IRQs disabled (safe from use-after-free),
+/// then does a second pass to clone Strings per PID.
+/// The String clone uses lookup_process which re-validates the pointer.
 pub fn list_processes() -> Vec<ProcessInfo2> {
-    let pids = crate::process::table::collect_pids(|_| true);
-    let mut result = Vec::with_capacity(pids.len());
-    for pid in pids {
-        if let Some(proc) = lookup_process(pid) {
-            let state = match proc.state {
-                ProcessState::Ready => "ready",
-                ProcessState::Running => "running",
-                ProcessState::Blocked => "blocked",
-                ProcessState::Zombie(_) => "zombie",
-            };
-            result.push(ProcessInfo2 {
-                pid,
-                ppid: proc.parent_pid,
-                box_id: proc.box_id,
-                name: proc.name.clone(),
-                state,
-                current_syscall: proc.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
-                last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
-                args: proc.args.clone(),
-            });
-        }
+    // Phase 1: collect scalar fields atomically (IRQs disabled, no allocation)
+    #[derive(Copy, Clone, Default)]
+    struct Info {
+        pid: u32,
+        ppid: u32,
+        box_id: u64,
+        state: u8, // 0=ready 1=running 2=blocked 3=zombie
+        current_syscall: u64,
+        last_syscall: u64,
+    }
+    let infos = crate::process::table::collect_process_info(|p| {
+        let st = match p.state {
+            ProcessState::Ready => 0u8,
+            ProcessState::Running => 1,
+            ProcessState::Blocked => 2,
+            ProcessState::Zombie(_) => 3,
+        };
+        Some(Info {
+            pid: p.pid,
+            ppid: p.parent_pid,
+            box_id: p.box_id,
+            state: st,
+            current_syscall: p.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
+            last_syscall: p.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
+        })
+    });
+
+    // Phase 2: clone Strings per PID (IRQs enabled, safe to allocate).
+    // lookup_process re-validates the pointer; if the process was freed
+    // between phase 1 and 2, lookup returns None and we use fallback values.
+    let mut result = Vec::with_capacity(infos.len());
+    for info in &infos {
+        let state_str = match info.state {
+            0 => "ready", 1 => "running", 2 => "blocked", _ => "zombie",
+        };
+        let (name, args) = if let Some(proc) = lookup_process(info.pid) {
+            if proc.name.len() <= 4096 && proc.args.len() <= 256 {
+                (proc.name.clone(), proc.args.clone())
+            } else {
+                (alloc::string::String::from("?"), Vec::new())
+            }
+        } else {
+            (alloc::string::String::from("?"), Vec::new())
+        };
+        result.push(ProcessInfo2 {
+            pid: info.pid,
+            ppid: info.ppid,
+            box_id: info.box_id,
+            name,
+            state: state_str,
+            current_syscall: info.current_syscall,
+            last_syscall: info.last_syscall,
+            args,
+        });
     }
     result
 }

@@ -935,11 +935,81 @@ This is the third instance of the same pattern:
 
 **File:** `crates/akuma-exec/src/process/mod.rs`
 
+### 34. wait4/waitid/waitpid never reaped zombies (2026-04-07)
+
+**Symptom:** Zombie processes accumulate in the 256-slot table. `ps` hangs
+because the table is scanned with IRQs disabled and dangling/zombie entries
+slow it down. go build stalls because slots are exhausted.
+
+**Root cause:** `sys_wait4`, `sys_waitid`, and `sys_waitpid` collected exit
+status from the child channel but never called `unregister_process` to remove
+the zombie from the process table. On Linux, `waitpid` is the ONLY way to
+reap a zombie — the zombie is removed from the table when the parent collects it.
+
+**Fix:** Added `clear_lazy_regions(pid) + unregister_process(pid)` to all 6
+wait paths (wait4 pid>0 × 2, wait4 pid==-1 × 2, waitid × 1, waitpid × 1).
+
+**File:** `src/syscall/proc.rs`
+
+### 35. CLONE_THREAD siblings left as zombies by kill_thread_group (2026-04-07)
+
+**Symptom:** After forktest exits, `ps` hangs SSH. Goroutine thread zombies
+fill the process table slots. They're TERMINATED (never reach return_to_kernel)
+so nobody unregisters them.
+
+**Root cause:** `kill_thread_group` marked siblings as Zombie but didn't
+unregister them, saying "wait for cleanup_callback." But:
+1. The thread is immediately TERMINATED (`mark_thread_terminated`)
+2. A TERMINATED thread never runs again — never reaches `return_to_kernel`
+3. `on_thread_cleanup` only fires when the slot is recycled (timing-dependent)
+4. Nobody calls wait4 for CLONE_THREAD siblings (they're not fork children)
+
+On Linux, CLONE_THREAD children are auto-reaped — they don't become zombies.
+Only fork children (CLONE_SIGCHLD) need wait() to reap.
+
+**Fix:** `kill_thread_group` now calls `unregister_process(sib_pid)` and
+removes from `THREAD_PID_MAP` immediately for siblings. This matches Linux's
+auto-reap behavior for CLONE_THREAD.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+### Linux Process Lifecycle Compliance Analysis (2026-04-07)
+
+The complete Linux lifecycle that Go expects:
+
+```
+fork()    → child registered in table (parent_pid set)
+exec()    → child replaces image
+exit()    → child becomes zombie (stays in table, resources partially freed)
+              child channel notified (set_exited)
+              fds closed, thread terminated
+              process NOT removed from table
+waitpid() → parent collects exit status
+              zombie REMOVED from table (reaped)
+              child channel removed
+```
+
+**Key rules enforced:**
+1. kill() makes zombies — does NOT unregister
+2. exit()/exit_group() makes zombies — does NOT unregister
+3. ONLY waitpid()/wait4()/waitid() reaps zombies (unregisters)
+4. CLONE_THREAD siblings are auto-reaped (no zombie, no wait needed)
+5. Child channel notified on EVERY exit path (kill, exit, crash, group-kill)
+
+**Syscall audit findings:**
+- wait4 (260): pid>0, pid==-1, pid==0 all correct. pid<-1 (process group) returns ECHILD.
+- waitid (95): P_PID, P_ALL, WNOHANG, WNOWAIT all correct.
+- clone (220): CLONE_VM|CLONE_THREAD, CLONE_VFORK|SIGCHLD both handled.
+- exit_group (94): Zombie + channel notify, no unregister. Correct.
+- kill (129): SIGKILL hard-kills, SIGTERM delivers to handler. Correct.
+- wstatus encoding: WIFEXITED (code<<8), WIFSIGNALED (sig&0x7F). Correct.
+
 ### Tests added
 
 - 11 host-level RwSpinlock tests (kept for the sync primitive itself)
-- 9 kernel-level tests (lock-free iteration, slot recycling, register/unregister
-  lifecycle, concurrent lookups, borrow tracker, kill child channel notify)
+- 13 kernel-level tests (lock-free table, zombie lifecycle, wait4 reaping,
+  kill child channel notify, SIGKILL/SIGTERM tgid group-kill, orphan handling,
+  borrow tracker, process table capacity)
 
 ---
 

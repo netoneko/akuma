@@ -74,15 +74,52 @@ use a two-phase approach:
 
 ## API
 
-```rust
-// Lookup (IRQs disabled during scan, returns raw pointer)
-lookup_process(pid) -> Option<&'static mut Process>
-current_process() -> Option<&'static mut Process>
+### Safe API (preferred for new code)
 
-// Table operations
-register_process(pid: Pid, proc: Box<Process>)   // CAS to claim slot
-unregister_process(pid: Pid) -> Option<Box<Process>>  // swap to null
+```rust
+// Callback runs with IRQs disabled — pointer guaranteed valid.
+// Callback MUST NOT allocate. Copy scalars inside, allocate outside.
+table::with_process(pid, |p: &mut Process| -> T) -> Option<T>
+
+// Iterate all processes (IRQs disabled, no allocation in callback)
+table::for_each_process(|p: &Process| { ... })
+table::find_process(|p: &Process| -> Option<T>) -> Option<T>
+table::collect_pids(|p: &Process| -> bool) -> Vec<Pid>
+table::collect_process_info(|p: &Process| -> Option<T>) -> Vec<T>
 ```
+
+### Legacy API (unsafe, for existing 218+ call sites)
+
+```rust
+// Returns &'static mut Process — ONLY valid until next preemption point.
+// Use-after-free if another thread calls unregister_process.
+// Safe in practice for syscall handlers (own thread can't free itself).
+lookup_process(pid) -> Option<&'static mut Process>    // DEPRECATED
+current_process() -> Option<&'static mut Process>      // DEPRECATED
+```
+
+### Table operations
+
+```rust
+register_process(pid: Pid, proc: Box<Process>)         // CAS to claim slot
+unregister_process(pid: Pid) -> Option<Box<Process>>    // swap to null
+```
+
+## Use-After-Free Prevention
+
+The fundamental rule: **never hold a `&Process` reference across a preemption
+point** (any place where IRQs are enabled and a timer interrupt could fire).
+
+| Pattern | Safe? | Why |
+|---------|-------|-----|
+| `with_process(pid, \|p\| p.exit_code)` | YES | IRQs disabled for duration |
+| `let p = lookup_process(pid); p.exit_code` | USUALLY | Safe if no yield between |
+| `let p = lookup_process(pid); yield(); p.name.clone()` | NO | Process may be freed during yield |
+| `collect_pids(\|_\| true); for pid in pids { lookup_process(pid)... }` | RISKY | Process may be freed between collect and lookup |
+
+The `list_processes` function uses the safe two-phase pattern:
+1. `collect_process_info` copies scalar fields with IRQs disabled
+2. `lookup_process` per-PID re-validates before cloning Strings
 
 ## History
 
