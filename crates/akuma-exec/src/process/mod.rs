@@ -651,6 +651,14 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
         }
     });
 
+    {
+        let mut buf = [0u8; 128];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[ktg-dbg] pid={} tgid={} siblings={}\n", my_pid, tgid, siblings.len()));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
+
     for (sib_pid, sib_tid) in &siblings {
         if let Some(proc) = lookup_process(*sib_pid) {
             cleanup_process_fds(proc);
@@ -1001,22 +1009,30 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         let _dropped_process = unregister_process(pid);
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
 
-        // If this was a goroutine thread (tgid != pid) that CRASHED (exit_code < 0),
-        // kill the entire thread group — don't leave the leader and siblings as zombies.
-        // Normal exits (code >= 0) must NOT kill the group — the leader is still running.
-        // Go goroutine threads exit normally all the time (GC, doCheckClonePidfd probe);
-        // killing the leader on a normal goroutine exit destroys the parent process.
+        // If this was a goroutine thread (tgid != pid) that CRASHED with SIGSEGV/SIGBUS/etc,
+        // kill the entire thread group. But do NOT trigger for SIGKILL (-9) — when the
+        // parent sends SIGKILL, kill_process_with_signal handles the leader. If we also
+        // kill the leader here, we race with the leader still executing user code, freeing
+        // its page tables while it's running → SIGSEGV at PC=0x20000000 (bug #33).
+        //
+        // Normal exits (code >= 0) must NOT kill the group either — the leader is still
+        // running. Go goroutine threads exit normally all the time (GC, probes).
         if let Some(tgid) = tgid {
-            if tgid != pid && exit_code < 0 {
+            // Only for true crashes: SIGSEGV(-11), SIGBUS(-7), SIGABRT(-6), SIGFPE(-8), SIGILL(-4)
+            // Skip SIGKILL(-9) and SIGTERM(-15) — these are deliberate kills handled elsewhere.
+            let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
+            if tgid != pid && is_crash {
                 kill_thread_group(tgid, 0);
                 if let Some(leader) = lookup_process(tgid) {
                     cleanup_process_fds(leader);
                     leader.exited = true;
                     leader.exit_code = exit_code;
                     leader.state = ProcessState::Zombie(exit_code);
+                    leader.thread_id = None;
                 }
-                clear_lazy_regions(tgid);
-                let _ = unregister_process(tgid);
+                if let Some(ch) = get_child_channel(tgid) {
+                    ch.set_exited(exit_code);
+                }
             }
         }
     } else {

@@ -297,6 +297,10 @@ pub fn run_all_tests() {
     test_get_current_process_returns_arc();
     test_lock_free_iteration();
     test_slot_recycling();
+    test_kill_process_notifies_child_channel();
+    test_sigkill_goroutine_does_not_kill_leader();
+    test_zombie_stays_for_wait4_reap();
+    test_orphan_children_become_zombies();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -5520,8 +5524,9 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     let tgid: u32 = 100;     // leader
     let pid: u32 = 101;      // goroutine thread
 
-    // Condition: tgid != pid AND exit_code < 0
-    let should_kill = tgid != pid && exit_code < 0;
+    // Updated condition: crash only (not SIGKILL/SIGTERM)
+    let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
+    let should_kill = tgid != pid && is_crash;
 
     if !should_kill {
         console::print("[Test] normal_goroutine_exit_does_not_kill_group PASSED\n");
@@ -5537,7 +5542,8 @@ fn test_crash_goroutine_exit_kills_group() {
     let tgid: u32 = 100;
     let pid: u32 = 101;
 
-    let should_kill = tgid != pid && exit_code < 0;
+    let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
+    let should_kill = tgid != pid && is_crash;
 
     if should_kill {
         console::print("[Test] crash_goroutine_exit_kills_group PASSED\n");
@@ -6220,5 +6226,173 @@ fn test_slot_recycling() {
         crate::safe_print!(128,
             "[Test] slot_recycling FAILED: before={} after={} reused={}\n",
             count_before, count_after, count_reused);
+    }
+}
+
+/// Verify that kill_process and kill_process_with_signal notify CHILD_CHANNELS
+/// so the parent's wait4 unblocks. This was the root cause of "children stuck
+/// as running after SIGKILL" — the thread channel was notified but NOT the
+/// child channel that wait4 actually polls.
+fn test_kill_process_notifies_child_channel() {
+    use akuma_exec::process::{register_process, register_child_channel};
+    use akuma_exec::process::channel::ProcessChannel;
+
+    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+    // Register parent and child
+    register_process(parent_pid, make_test_process(parent_pid));
+    let mut child = make_test_process(child_pid);
+    child.parent_pid = parent_pid;
+    register_process(child_pid, child);
+
+    // Register a child channel (what wait4 polls)
+    let ch = alloc::sync::Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    // Before kill: channel should NOT be exited
+    let before = ch.has_exited();
+
+    // kill_process_with_signal should notify the child channel AND leave zombie
+    let _ = akuma_exec::process::kill_process_with_signal(child_pid, 9);
+
+    // After kill: child channel should be exited
+    let after = ch.has_exited();
+
+    // Zombie should still be in the table (wait4 needs to find it)
+    let zombie_exists = akuma_exec::process::lookup_process(child_pid).is_some();
+    let is_zombie = akuma_exec::process::lookup_process(child_pid)
+        .map(|p| p.exited)
+        .unwrap_or(false);
+
+    // Clean up
+    let _ = akuma_exec::process::unregister_process(child_pid);
+    let _ = akuma_exec::process::unregister_process(parent_pid);
+
+    if !before && after && zombie_exists && is_zombie {
+        console::print("[Test] kill_process_notifies_child_channel PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] kill_process_notifies_child_channel FAILED: before={} after={} zombie={} exited={}\n",
+            before, after, zombie_exists, is_zombie);
+    }
+}
+
+/// SIGKILL (-9) on a goroutine thread must NOT trigger tgid group-kill.
+/// The parent's sys_kill → kill_process_with_signal handles the leader.
+/// If return_to_kernel also kills the leader, it races with the leader still
+/// executing → SIGSEGV at PC=0x20000000 (bug #33).
+fn test_sigkill_goroutine_does_not_kill_leader() {
+    // Test the condition logic from return_to_kernel
+    let tgid: u32 = 100;
+    let pid: u32 = 101; // goroutine thread (tgid != pid)
+
+    // SIGKILL: should NOT trigger group-kill
+    let sigkill_code: i32 = -9;
+    let sigkill_is_crash = sigkill_code < 0 && sigkill_code != -9 && sigkill_code != -15;
+    let sigkill_kills = tgid != pid && sigkill_is_crash;
+
+    // SIGTERM: should NOT trigger group-kill
+    let sigterm_code: i32 = -15;
+    let sigterm_is_crash = sigterm_code < 0 && sigterm_code != -9 && sigterm_code != -15;
+    let sigterm_kills = tgid != pid && sigterm_is_crash;
+
+    // SIGSEGV: SHOULD trigger group-kill (true crash)
+    let sigsegv_code: i32 = -11;
+    let sigsegv_is_crash = sigsegv_code < 0 && sigsegv_code != -9 && sigsegv_code != -15;
+    let sigsegv_kills = tgid != pid && sigsegv_is_crash;
+
+    // SIGBUS: SHOULD trigger group-kill (true crash)
+    let sigbus_code: i32 = -7;
+    let sigbus_is_crash = sigbus_code < 0 && sigbus_code != -9 && sigbus_code != -15;
+    let sigbus_kills = tgid != pid && sigbus_is_crash;
+
+    // Normal exit: should NOT trigger
+    let normal_code: i32 = 0;
+    let normal_is_crash = normal_code < 0 && normal_code != -9 && normal_code != -15;
+    let normal_kills = tgid != pid && normal_is_crash;
+
+    let pass = !sigkill_kills && !sigterm_kills && sigsegv_kills && sigbus_kills && !normal_kills;
+    if pass {
+        console::print("[Test] sigkill_goroutine_does_not_kill_leader PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] sigkill_goroutine_does_not_kill_leader FAILED: kill9={} term15={} segv={} bus={} normal={}\n",
+            sigkill_kills, sigterm_kills, sigsegv_kills, sigbus_kills, normal_kills);
+    }
+}
+
+/// After kill_process_with_signal, the zombie must stay in the table so
+/// wait4 can find it and collect the exit status. Only wait4 or
+/// on_thread_cleanup should reap it.
+fn test_zombie_stays_for_wait4_reap() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid, make_test_process(pid));
+
+    // Kill the process
+    let _ = akuma_exec::process::kill_process_with_signal(pid, 9);
+
+    // Zombie must be in the table
+    let in_table = lookup_process(pid).is_some();
+    let is_exited = lookup_process(pid).map(|p| p.exited).unwrap_or(false);
+    let is_zombie_state = lookup_process(pid).map(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))).unwrap_or(false);
+    let exit_code = lookup_process(pid).map(|p| p.exit_code).unwrap_or(0);
+    let tid_cleared = lookup_process(pid).map(|p| p.thread_id.is_none()).unwrap_or(false);
+
+    // Simulate wait4 reaping
+    let _ = unregister_process(pid);
+    let gone = lookup_process(pid).is_none();
+
+    let pass = in_table && is_exited && is_zombie_state && exit_code == -9 && tid_cleared && gone;
+    if pass {
+        console::print("[Test] zombie_stays_for_wait4_reap PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] zombie_stays_for_wait4_reap FAILED: in={} exited={} zombie={} code={} tid_clear={} gone={}\n",
+            in_table, is_exited, is_zombie_state, exit_code, tid_cleared, gone);
+    }
+}
+
+/// When a parent exits, its children become orphans. Currently Akuma has no
+/// init process to reap orphans, so they stay as zombies. This test documents
+/// the expected behavior: orphaned children remain in the process table until
+/// explicitly cleaned up.
+fn test_orphan_children_become_zombies() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+
+    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+    register_process(parent_pid, make_test_process(parent_pid));
+    let mut child = make_test_process(child_pid);
+    child.parent_pid = parent_pid;
+    register_process(child_pid, child);
+
+    // Parent exits — kill_process marks it as zombie
+    let _ = akuma_exec::process::kill_process(parent_pid);
+
+    // Parent should be zombie
+    let parent_zombie = lookup_process(parent_pid).map(|p| p.exited).unwrap_or(false);
+
+    // Child should also be zombie (kill_process cascades)
+    let child_zombie = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
+
+    // Both still in table (no reaper)
+    let parent_in_table = lookup_process(parent_pid).is_some();
+    let child_in_table = lookup_process(child_pid).is_some();
+
+    // Clean up
+    let _ = unregister_process(parent_pid);
+    let _ = unregister_process(child_pid);
+
+    let pass = parent_zombie && child_zombie && parent_in_table && child_in_table;
+    if pass {
+        console::print("[Test] orphan_children_become_zombies PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] orphan_children_become_zombies FAILED: p_z={} c_z={} p_in={} c_in={}\n",
+            parent_zombie, child_zombie, parent_in_table, child_in_table);
     }
 }

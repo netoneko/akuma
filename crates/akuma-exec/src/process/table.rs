@@ -81,66 +81,130 @@ pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
     None
 }
 
-/// Look up a process by PID. Returns a raw pointer (lock-free read).
+/// Look up a process by PID. Returns a raw pointer.
+///
+/// Uses `with_irqs_disabled` to prevent preemption between pointer load
+/// and dereference — without this, `unregister_process` on another thread
+/// could free the Process between load and use (use-after-free).
 ///
 /// The pointer is valid as long as the process remains registered.
 /// Callers must not hold the pointer across `unregister_process`.
 pub fn get_process_ptr(pid: Pid) -> Option<*mut Process> {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() && unsafe { (*ptr).pid } == pid {
+                return Some(ptr);
+            }
         }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if !ptr.is_null() && unsafe { (*ptr).pid } == pid {
-            return Some(ptr);
-        }
-    }
-    None
+        None
+    })
 }
 
 /// Iterate all active processes, calling `f` for each.
 ///
-/// Lock-free: scans the slot array, reads each pointer atomically.
-/// The callback receives `(slot_index, &Process)`.
+/// Runs entirely with IRQs disabled — the callback MUST NOT allocate.
+/// For iteration that needs allocation, use `collect_pids` + per-PID lookup.
 #[inline]
 pub fn for_each_process<F: FnMut(&Process)>(mut f: F) {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                f(unsafe { &*ptr });
+            }
         }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if !ptr.is_null() {
-            f(unsafe { &*ptr });
-        }
-    }
+    });
 }
 
 /// Iterate all active processes, calling `f` for each. Returns early if `f` returns Some.
+///
+/// Runs entirely with IRQs disabled — the callback MUST NOT allocate.
 #[inline]
 pub fn find_process<T, F: FnMut(&Process) -> Option<T>>(mut f: F) -> Option<T> {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
-        }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if !ptr.is_null() {
-            if let Some(result) = f(unsafe { &*ptr }) {
-                return Some(result);
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                if let Some(result) = f(unsafe { &*ptr }) {
+                    return Some(result);
+                }
             }
         }
-    }
-    None
+        None
+    })
 }
 
-/// Collect PIDs matching a predicate (lock-free scan).
+/// Collect PIDs matching a predicate.
+///
+/// Two-phase: scan with IRQs disabled (no allocation), then collect PIDs
+/// into a Vec with IRQs enabled. Safe because PIDs are just u32 values
+/// copied out during the scan.
 pub fn collect_pids<F: FnMut(&Process) -> bool>(mut pred: F) -> Vec<Pid> {
-    let mut pids = Vec::new();
-    for_each_process(|p| {
-        if pred(p) {
-            pids.push(p.pid);
+    // Phase 1: scan into fixed-size stack buffer (no heap allocation)
+    let mut buf = [0u32; MAX_PROCESSES];
+    let mut count = 0usize;
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                let p = unsafe { &*ptr };
+                if pred(p) && count < MAX_PROCESSES {
+                    buf[count] = p.pid;
+                    count += 1;
+                }
+            }
         }
     });
-    pids
+    // Phase 2: copy to Vec with IRQs enabled (safe to allocate)
+    buf[..count].to_vec()
+}
+
+/// Collect (PID, thread_id, extra_field) tuples matching a predicate.
+///
+/// Same two-phase approach as `collect_pids` but captures additional fields.
+/// Stack buffer holds up to MAX_PROCESSES entries.
+pub fn collect_process_info<T: Copy + Default, F>(mut f: F) -> Vec<T>
+where
+    F: FnMut(&Process) -> Option<T>,
+{
+    let mut buf: [core::mem::MaybeUninit<T>; MAX_PROCESSES] = unsafe {
+        core::mem::MaybeUninit::uninit().assume_init()
+    };
+    let mut count = 0usize;
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                if let Some(val) = f(unsafe { &*ptr }) {
+                    if count < MAX_PROCESSES {
+                        buf[count] = core::mem::MaybeUninit::new(val);
+                        count += 1;
+                    }
+                }
+            }
+        }
+    });
+    let mut result = Vec::with_capacity(count);
+    for item in &buf[..count] {
+        result.push(unsafe { item.assume_init() });
+    }
+    result
 }
 
 /// Number of active processes.

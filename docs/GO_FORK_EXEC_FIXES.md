@@ -795,8 +795,10 @@ hard-killing would affect interactive session behavior and needs careful design.
 | Fork+exec chain | WORKS |
 | Go goroutine thread creation | WORKS |
 | SIGTERM delivery to Go processes | WORKS (all 3 children exit) |
+| SIGKILL hard-kill | WORKS (child channel notified, wait4 unblocks) |
 | Process cleanup (no zombies) | WORKS |
 | wait4 / waitid blocking | WORKS (proper sleep/wake, no busy spin) |
+| Process table (ps, iteration) | WORKS (atomic array, no locks for reads) |
 | Child exit code after SIGTERM | BROKEN (code 130 instead of 0) |
 | Go build (compiler toolchain) | 30/31 packages compiled |
 | SSH stability after forktest | WORKS |
@@ -834,18 +836,110 @@ Introduced `RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>>`. Caused two
 deadlock classes: writer starvation (no writer priority) and per-process
 Spinlock vs `data_ptr()` shim mismatch. Reverted in favor of Stage C.
 
-**Stage C** -- Lock-free array (current):
+**Stage C** -- Atomic array (current):
 - Replaced entire table with `[AtomicPtr<Process>; 256]` + `[AtomicU8; 256]`
-- Zero locks for reads: `lookup_process`, `list_processes` are pure atomic scans
+- Reads use `with_irqs_disabled` per-slot to prevent use-after-free
 - CAS for writes: `register_process` claims slot via `compare_exchange`
 - Back to `Box<Process>` ownership (no Arc, no per-process Spinlock)
+- Iteration API: `for_each_process`, `find_process`, `collect_pids` (stack buffer),
+  `collect_process_info` — all run callbacks with IRQs disabled (must not allocate)
+- Two-phase pattern for `list_processes`: collect PIDs (IRQs disabled), then build
+  ProcessInfo2 per-PID (IRQs enabled, safe to allocate/clone Strings)
 - Matches the proven `THREAD_STATES` lock-free pattern from the thread pool
+
+**Bugs fixed during Stage C:**
+- SIGSEGV at PC=0x20000000: use-after-free in lock-free scan (no IRQ protection
+  between atomic load and pointer dereference). Fixed by `with_irqs_disabled`.
+- Children stuck as "running" after SIGKILL: `for_each_process` wrapped entire
+  scan + callback in `with_irqs_disabled`, causing `Vec::push` (heap alloc) with
+  IRQs disabled — stalled the allocator. Fixed by stack-buffer collection.
+
+### 31. kill_process / kill_process_with_signal missing child channel notify (2026-04-07)
+
+**Symptom:** 2/3 forktest children exit after SIGTERM, parent hangs waiting
+for the 3rd. SIGKILL is sent but parent's `cmd.Wait()` (wait4) never returns.
+SSH blocked.
+
+**Root cause:** `kill_process_with_signal` in `signal.rs` notified the
+**thread channel** (`remove_channel(tid).set_exited()`) but never notified the
+**child channel** (`CHILD_CHANNELS[child_pid]`). The parent's `wait4` waits on
+`CHILD_CHANNELS[child_pid]`, not on the thread channel. Children that exited
+gracefully via `return_to_kernel` (which calls `notify_child_channel_exited`)
+worked fine. But a child hard-killed via `kill_process_with_signal` left the
+parent stuck because its child channel was never marked exited.
+
+**Fix:** Added `get_child_channel(pid).set_exited(exit_code)` to both
+`kill_process` and `kill_process_with_signal` in `signal.rs`.
+
+**File:** `crates/akuma-exec/src/process/signal.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_kill_process_notifies_child_channel` | kill_process_with_signal sets child channel exited; wait4 would unblock |
+
+### 32. kill_process / kill_process_with_signal eager unregister caused ECHILD (2026-04-07)
+
+**Symptom:** Parent gets "waitid: no child processes" (ECHILD) for one child,
+hangs on wait4 for another. `ps` shows children stuck as "running".
+
+**Root cause:** `kill_process` and `kill_process_with_signal` called
+`unregister_process(pid)` which removed the zombie from the process table
+before the parent's `wait4` could find it. This is the same class of bug
+as #24 (sys_exit eager unregister) but in the signal-kill path.
+
+On Linux, `kill(pid, SIGKILL)` terminates the process but leaves a zombie.
+Only `waitpid` reaps the zombie. Akuma's kill functions were eagerly
+unregistering, removing the zombie before the parent could collect it.
+
+**Fix:** Removed `unregister_process` and `clear_lazy_regions` from both
+`kill_process` and `kill_process_with_signal`. The process stays as a zombie
+(exited=true, state=Zombie) in the table. The zombie is reaped by
+`return_to_kernel` → `on_thread_cleanup` when the thread slot is recycled.
+
+Also set `proc.thread_id = None` to prevent `entry_point_trampoline` from
+matching the zombie when a new process is spawned on the same thread slot.
+
+**File:** `crates/akuma-exec/src/process/signal.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_kill_process_notifies_child_channel` | kill leaves zombie in table + child channel exited |
+
+### 33. return_to_kernel tgid group-kill missing child channel notify + eager unregister (2026-04-07)
+
+**Symptom:** 2/3 forktest children never finish. Parent hangs on wait4 for
+children 1 and 2 even after SIGKILL. SSH blocked.
+
+**Root cause:** When a goroutine thread exits with `exit_code < 0` (killed by
+SIGKILL), `return_to_kernel` at line 1017-1028 kills the thread group leader:
+```
+kill_thread_group(tgid, 0);
+leader.exited = true; leader.state = Zombie;
+unregister_process(tgid);  // <-- leader removed from table
+```
+This removed the leader WITHOUT notifying `CHILD_CHANNELS[tgid]`. The parent's
+wait4 polls the child channel, which was never marked exited → hang forever.
+
+This is the third instance of the same pattern:
+- Bug #31: `kill_process_with_signal` notified thread channel but not child channel
+- Bug #32: `kill_process` eagerly unregistered zombie before wait4 could reap
+- Bug #33: `return_to_kernel` tgid path eagerly unregistered + no child channel
+
+**Fix:** Added `get_child_channel(tgid).set_exited(exit_code)` and removed
+`unregister_process(tgid)` / `clear_lazy_regions(tgid)`. Set
+`leader.thread_id = None`. Zombie stays for wait4 to reap.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
 
 ### Tests added
 
 - 11 host-level RwSpinlock tests (kept for the sync primitive itself)
-- 8 kernel-level tests (lock-free iteration, slot recycling, register/unregister
-  lifecycle, concurrent lookups, borrow tracker, current_process in kernel ctx)
+- 9 kernel-level tests (lock-free iteration, slot recycling, register/unregister
+  lifecycle, concurrent lookups, borrow tracker, kill child channel notify)
 
 ---
 
@@ -854,7 +948,7 @@ Spinlock vs `data_ptr()` shim mismatch. Reverted in favor of Stage C.
 | File | Changes |
 |------|---------|
 | `crates/akuma-exec/src/process/mod.rs` | PROCESS_INFO_ADDR re-map after CoW; tgid field; clone_thread stack=0 guard; kill_thread_group uses tgid; reverted copy_to_user_safe |
-| `crates/akuma-exec/src/process/signal.rs` | exit_code=-9 (not 137); kill_process_with_signal() |
+| `crates/akuma-exec/src/process/signal.rs` | exit_code=-9 (not 137); kill_process_with_signal(); child channel notify in kill path |
 | `crates/akuma-exec/src/process/channel.rs` | is_interrupted() auto-clears via swap(false) |
 | `src/syscall/proc.rs` | sys_kill delivers signals properly; sys_exit/exit_group terminate thread + notify tgid channel; clone flag routing + bits-32+ guard; tgid-based thread group interrupt; wait4/waitid use schedule_blocking + add_poller (no busy spin) |
 | `src/syscall/sync.rs` | futex WAKE/WAIT on unmapped address: non-fatal returns |

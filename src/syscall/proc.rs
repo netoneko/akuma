@@ -1151,9 +1151,13 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         // On Linux, SIGKILL cannot be caught or ignored.  Hard-kill the
         // entire thread group immediately.
         if sig == 9 {
+            let tid = proc.thread_id;
+            let exited = proc.exited;
             drop(proc);
+            crate::tprint!(128, "[kill-dbg] SIGKILL pid={} tgid={} tid={:?} exited={}\n", pid, tgid, tid, exited);
             akuma_exec::process::kill_thread_group(pid, l0_phys);
-            akuma_exec::process::kill_process_with_signal(pid, 9).ok();
+            let kill_result = akuma_exec::process::kill_process_with_signal(pid, 9);
+            crate::tprint!(128, "[kill-dbg] SIGKILL pid={} kill_result={:?}\n", pid, kill_result);
             return 0;
         }
 

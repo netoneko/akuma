@@ -5017,22 +5017,22 @@ fn test_kill_process_cascades_to_children() -> bool {
     akuma_exec::process::register_process(child_pid, child_proc);
 
     let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
-    let parent_alive = akuma_exec::process::lookup_process(parent_pid).is_some();
-    let child_alive = akuma_exec::process::lookup_process(child_pid).is_some();
+    // After kill, processes should be zombies (still in table, but exited=true)
+    let parent_zombie = akuma_exec::process::lookup_process(parent_pid)
+        .map(|p| p.exited).unwrap_or(false);
+    let child_zombie = akuma_exec::process::lookup_process(child_pid)
+        .map(|p| p.exited).unwrap_or(false);
 
-    if parent_alive {
-        let _ = akuma_exec::process::unregister_process(parent_pid);
-    }
-    if child_alive {
-        let _ = akuma_exec::process::unregister_process(child_pid);
-    }
+    // Clean up zombies (simulates what wait4/on_thread_cleanup would do)
+    let _ = akuma_exec::process::unregister_process(parent_pid);
+    let _ = akuma_exec::process::unregister_process(child_pid);
     crate::pmm::free_page(parent_info);
     crate::pmm::free_page(child_info);
 
-    let pass = kill_ok && !parent_alive && !child_alive;
+    let pass = kill_ok && parent_zombie && child_zombie;
     if !pass {
-        crate::safe_print!(128, "  kill_ok={} parent_alive={} child_alive={}\n",
-            kill_ok, parent_alive, child_alive);
+        crate::safe_print!(128, "  kill_ok={} parent_zombie={} child_zombie={}\n",
+            kill_ok, parent_zombie, child_zombie);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

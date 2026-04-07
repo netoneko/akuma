@@ -4,7 +4,7 @@ use spinning_top::Spinlock;
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
 use crate::process::table;
 use crate::process::channel::{remove_channel, get_channel};
-use crate::process::children::{lookup_process, clear_lazy_regions};
+use crate::process::children::lookup_process;
 use crate::process::cleanup_process_fds;
 use crate::threading;
 
@@ -71,26 +71,27 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 
     // Clean up all open FDs for this process
     cleanup_process_fds(proc);
-    
-    // Mark process as killed by SIGKILL
-    proc.exited = true;
-    proc.exit_code = -9; // negative = killed by signal (SIGKILL)
-    proc.state = ProcessState::Zombie(-9);
-    
-    // Clear lazy region metadata before dropping the process.
-    // Without this, the LAZY_REGION_TABLE BTreeMap entry leaks.
-    clear_lazy_regions(pid);
 
-    // Unregister from process table and DROP the Box<Process>
-    let _dropped_process = crate::process::table::unregister_process(pid);
-    
-    // Remove and notify the process channel
+    // Mark process as zombie — do NOT unregister from the table.
+    // The parent's wait4 needs to find the zombie to collect exit status.
+    // The zombie is reaped by on_thread_cleanup when the thread slot is recycled,
+    // or by return_to_kernel if the thread reaches it.
+    // (Bug #24 + #31: eager unregister caused ECHILD in wait4)
+    proc.exited = true;
+    proc.exit_code = -9;
+    proc.state = ProcessState::Zombie(-9);
+    proc.thread_id = None; // prevent entry_point_trampoline from matching this zombie
+
+    // Notify the CHILD channel so the parent's wait4 unblocks
+    if let Some(ch) = crate::process::get_child_channel(pid) {
+        ch.set_exited(-9);
+    }
+
+    // Remove and notify the thread channel, terminate the thread
     if let Some(tid) = thread_id {
         if let Some(channel) = remove_channel(tid) {
             channel.set_exited(-9);
         }
-
-        // Mark the thread as terminated so scheduler stops scheduling it
         threading::mark_thread_terminated(tid);
     }
 
@@ -120,9 +121,14 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     proc.exited = true;
     proc.exit_code = exit_code;
     proc.state = ProcessState::Zombie(exit_code);
+    proc.thread_id = None;
 
-    clear_lazy_regions(pid);
-    let _dropped = crate::process::table::unregister_process(pid);
+    // Do NOT unregister — leave zombie for wait4 to reap.
+
+    // Notify the CHILD channel so the parent's wait4 unblocks
+    if let Some(ch) = crate::process::get_child_channel(pid) {
+        ch.set_exited(exit_code);
+    }
 
     if let Some(tid) = thread_id {
         if let Some(channel) = remove_channel(tid) {

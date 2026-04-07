@@ -532,27 +532,33 @@ pub fn get_stack_bounds() -> (usize, usize) {
 }
 
 
-/// List all running processes (lock-free scan).
+/// List all running processes.
+///
+/// Two-phase: collect PIDs with IRQs disabled (fast), then build
+/// ProcessInfo2 per PID outside IRQ-disabled context (allows heap alloc).
 pub fn list_processes() -> Vec<ProcessInfo2> {
-    let mut result = Vec::new();
-    crate::process::table::for_each_process(|proc| {
-        let state = match proc.state {
-            ProcessState::Ready => "ready",
-            ProcessState::Running => "running",
-            ProcessState::Blocked => "blocked",
-            ProcessState::Zombie(_) => "zombie",
-        };
-        result.push(ProcessInfo2 {
-            pid: proc.pid,
-            ppid: proc.parent_pid,
-            box_id: proc.box_id,
-            name: proc.name.clone(),
-            state,
-            current_syscall: proc.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
-            last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
-            args: proc.args.clone(),
-        });
-    });
+    let pids = crate::process::table::collect_pids(|_| true);
+    let mut result = Vec::with_capacity(pids.len());
+    for pid in pids {
+        if let Some(proc) = lookup_process(pid) {
+            let state = match proc.state {
+                ProcessState::Ready => "ready",
+                ProcessState::Running => "running",
+                ProcessState::Blocked => "blocked",
+                ProcessState::Zombie(_) => "zombie",
+            };
+            result.push(ProcessInfo2 {
+                pid,
+                ppid: proc.parent_pid,
+                box_id: proc.box_id,
+                name: proc.name.clone(),
+                state,
+                current_syscall: proc.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
+                last_syscall: proc.last_syscall.load(core::sync::atomic::Ordering::Relaxed),
+                args: proc.args.clone(),
+            });
+        }
+    }
     result
 }
 

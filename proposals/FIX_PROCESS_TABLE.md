@@ -264,17 +264,33 @@ Stage B was implemented but caused two deadlock classes:
 1. Writer starvation in the RwSpinlock (no writer priority)
 2. Per-process Spinlock vs data_ptr() shim mismatch during iteration
 
-Stage B was reverted in favor of Stage C (lock-free array). The RwSpinlock
-primitive was kept in `sync.rs` for future use but is no longer used by the
-process table. Stage D instrumentation (diag.rs, futex logging) was kept.
+Stage B was reverted in favor of Stage C (atomic array). Stage C itself
+went through three iterations:
+
+1. **Pure lock-free** (no IRQ protection): SIGSEGV at PC=0x20000000 from
+   use-after-free — preemption between atomic load and dereference let
+   `unregister_process` free the Process on another thread.
+
+2. **Full-scan IRQ protection** (`with_irqs_disabled` around entire scan):
+   Children stuck as "running" after SIGKILL — `Vec::push` heap allocation
+   inside IRQ-disabled callback deadlocked the allocator.
+
+3. **Per-slot IRQ protection + stack buffer** (current): `for_each_process`
+   and `find_process` run callbacks with IRQs disabled (MUST NOT allocate).
+   `collect_pids` scans into `[u32; 256]` stack buffer with IRQs disabled,
+   copies to Vec with IRQs enabled. Two-phase pattern for `list_processes`.
+
+The RwSpinlock primitive was kept in `sync.rs` for future use.
+Stage D instrumentation (diag.rs, futex logging) was kept.
 
 ## Implementation Order (as executed)
 
 1. **D1** — Fix `list_processes()` (immediate `ps` hang fix)
 2. **D2-D5** — Instrumentation (diag module, lock timing, borrow tracker, futex logging)
-3. **B1** — RwSpinlock primitive (kept)
+3. **B1** — RwSpinlock primitive with writer priority (kept in sync.rs)
 4. **B2-B5** — RwSpinlock + Arc<Spinlock<Process>> (caused deadlocks, reverted)
-5. **C** — Lock-free `[AtomicPtr<Process>; 256]` array (final, working)
+5. **C** — Atomic `[AtomicPtr<Process>; 256]` array with per-slot IRQ protection
+6. **Bug #31** — `kill_process_with_signal` missing child channel notify (wait4 hang)
 
 ## Verification
 
