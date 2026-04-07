@@ -48,7 +48,11 @@ fn log_slow_lock(caller: &str, elapsed_us: u64) {
 // ============================================================================
 
 /// Enable the borrow-aliasing detector for lookup_process().
-pub const BORROW_TRACKING_ENABLED: bool = true;
+/// WARNING: When enabled, every lookup_process call after the first for a given
+/// PID prints to serial (monotonic counter, never decremented). This floods
+/// serial output under heavy load (go build: 3000+ prints per process) and
+/// causes timing-related crashes. Only enable for targeted debugging sessions.
+pub const BORROW_TRACKING_ENABLED: bool = false;
 
 /// Per-PID outstanding borrow count. Index = PID value.
 const MAX_TRACKED_PIDS: usize = 256;

@@ -301,6 +301,8 @@ pub fn run_all_tests() {
     test_sigkill_goroutine_does_not_kill_leader();
     test_zombie_stays_for_wait4_reap();
     test_orphan_children_become_zombies();
+    test_borrow_tracker_disabled_no_serial_flood();
+    test_process_table_capacity();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -6394,5 +6396,43 @@ fn test_orphan_children_become_zombies() {
         crate::safe_print!(128,
             "[Test] orphan_children_become_zombies FAILED: p_z={} c_z={} p_in={} c_in={}\n",
             parent_zombie, child_zombie, parent_in_table, child_in_table);
+    }
+}
+
+/// Verify borrow tracker is disabled and doesn't flood serial output.
+/// When enabled, the monotonic counter triggers log_borrow_alias on every
+/// lookup_process call after the first, flooding serial under heavy load
+/// (go build: 3000+ prints per PID). This caused timing-related crashes.
+fn test_borrow_tracker_disabled_no_serial_flood() {
+    use akuma_exec::process::diag::BORROW_TRACKING_ENABLED;
+
+    if BORROW_TRACKING_ENABLED {
+        console::print("[Test] borrow_tracker_disabled_no_serial_flood FAILED (tracking is enabled!)\n");
+        console::print("       WARNING: go build will be unusably slow due to serial flood\n");
+    } else {
+        console::print("[Test] borrow_tracker_disabled_no_serial_flood PASSED\n");
+    }
+}
+
+/// Verify process table has enough capacity for go build workloads.
+/// go build spawns ~31 compile processes, each with goroutine threads.
+/// With zombies from killed processes, we need headroom.
+fn test_process_table_capacity() {
+    use akuma_exec::process::table::MAX_PROCESSES;
+
+    // go build worst case: 31 compiles × 5 goroutines = ~155 processes
+    // plus parent go process + goroutines = ~160 total
+    // plus zombies waiting to be reaped = ~200
+    // 256 should be sufficient
+    let sufficient = MAX_PROCESSES >= 256;
+    let count = akuma_exec::process::table::process_count();
+
+    if sufficient {
+        crate::safe_print!(128, "[Test] process_table_capacity PASSED (max={}, current={})\n",
+            MAX_PROCESSES, count);
+    } else {
+        crate::safe_print!(128,
+            "[Test] process_table_capacity FAILED: max={} < 256 needed for go build\n",
+            MAX_PROCESSES);
     }
 }
