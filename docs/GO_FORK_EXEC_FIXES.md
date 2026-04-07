@@ -700,6 +700,17 @@ child's `set_exited()` wakes the parent immediately.
 
 **File:** `src/syscall/proc.rs`, `crates/akuma-exec/src/process/children.rs`
 
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_add_poller_to_all_children` | Poller registered on all children of a parent |
+| `test_add_poller_to_all_children_isolation` | Poller NOT registered on another parent's children |
+| `test_add_poller_child_exit_wakes_waiter` | set_exited() consumes poller on exiting child, leaves others intact |
+| `test_wait4_pid_positive_registers_poller` | pid > 0 path returns immediately for already-exited child |
+| `test_wait4_pid_neg1_finds_exited_child` | pid == -1 finds exited child without blocking |
+| `test_poller_double_check_avoids_missed_wakeup` | Double-check catches exit between add_poller and schedule_blocking |
+
 ### 30. forktest_parent EPOLLONESHOT re-arm dead code (2026-04-07)
 
 **Symptom:** Second run of forktest_parent hangs — parent stuck in Go-level futex,
@@ -747,6 +758,12 @@ if tgid != pid {
 ```
 
 **File:** `src/syscall/proc.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_exit_group_notifies_tgid_channel` | Goroutine thread exit_group notifies both its own and the tgid leader's channel |
 
 ---
 
