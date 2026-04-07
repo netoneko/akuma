@@ -303,6 +303,7 @@ pub fn run_all_tests() {
     test_orphan_children_become_zombies();
     test_borrow_tracker_disabled_no_serial_flood();
     test_process_table_capacity();
+    test_wait4_reaps_zombie();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -6434,5 +6435,59 @@ fn test_process_table_capacity() {
         crate::safe_print!(128,
             "[Test] process_table_capacity FAILED: max={} < 256 needed for go build\n",
             MAX_PROCESSES);
+    }
+}
+
+/// Verify that the Linux process lifecycle is correct:
+/// fork → zombie → wait4 reaps zombie (removes from table).
+///
+/// This is the fundamental contract Go's runtime depends on:
+/// 1. kill(child, SIGKILL) → child becomes zombie (stays in table)
+/// 2. waitpid(child) → collects exit status, zombie removed from table
+/// 3. After waitpid, lookup_process(child) returns None
+///
+/// Without wait4 reaping, zombies accumulate and the 256-slot table fills up,
+/// causing go build to fail when spawning compile processes.
+fn test_wait4_reaps_zombie() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process,
+        register_child_channel};
+    use akuma_exec::process::channel::ProcessChannel;
+
+    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+    // Setup: parent + child + child channel
+    register_process(parent_pid, make_test_process(parent_pid));
+    let mut child = make_test_process(child_pid);
+    child.parent_pid = parent_pid;
+    register_process(child_pid, child);
+
+    let ch = alloc::sync::Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    // Step 1: kill → zombie (stays in table, channel notified)
+    let _ = akuma_exec::process::kill_process_with_signal(child_pid, 9);
+    let zombie_in_table = lookup_process(child_pid).is_some();
+    let channel_exited = ch.has_exited();
+
+    // Step 2: simulate wait4 reaping — this is what sys_wait4 now does
+    akuma_exec::process::clear_lazy_regions(child_pid);
+    let reaped = unregister_process(child_pid);
+    akuma_exec::process::remove_child_channel(child_pid);
+
+    // Step 3: after reaping, zombie is gone
+    let gone_after_reap = lookup_process(child_pid).is_none();
+    let reaped_ok = reaped.is_some();
+
+    // Clean up parent
+    let _ = unregister_process(parent_pid);
+
+    let pass = zombie_in_table && channel_exited && gone_after_reap && reaped_ok;
+    if pass {
+        console::print("[Test] wait4_reaps_zombie PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] wait4_reaps_zombie FAILED: zombie={} ch_exit={} gone={} reaped={}\n",
+            zombie_in_table, channel_exited, gone_after_reap, reaped_ok);
     }
 }

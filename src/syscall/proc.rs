@@ -695,6 +695,10 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                         let status = encode_wait_status(code);
                         let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
                     }
+                    // Reap the zombie: remove from process table + child channels.
+                    // On Linux, waitpid is the only way to reap a zombie.
+                    akuma_exec::process::clear_lazy_regions(p);
+                    let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::remove_child_channel(p);
                     return p as u64;
                 }
@@ -711,6 +715,8 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                         let status = encode_wait_status(code);
                         let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
                     }
+                    akuma_exec::process::clear_lazy_regions(p);
+                    let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::remove_child_channel(p);
                     return p as u64;
                 }
@@ -740,6 +746,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let status = encode_wait_status(code);
                     let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
                 }
+                // Reap the zombie
+                akuma_exec::process::clear_lazy_regions(child_pid);
+                let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::remove_child_channel(child_pid);
                 return child_pid as u64;
             }
@@ -760,6 +769,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let status = encode_wait_status(code);
                     let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
                 }
+                // Reap the zombie
+                akuma_exec::process::clear_lazy_regions(child_pid);
+                let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::remove_child_channel(child_pid);
                 return child_pid as u64;
             }
@@ -902,6 +914,9 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             };
         }
         if (options & WNOWAIT) == 0 {
+            // Reap the zombie (unless WNOWAIT says "don't consume")
+            akuma_exec::process::clear_lazy_regions(child_pid);
+            let _ = akuma_exec::process::unregister_process(child_pid);
             akuma_exec::process::remove_child_channel(child_pid);
         }
         0
@@ -1206,12 +1221,16 @@ pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
 
     if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
         if ch.has_exited() {
-            if status_ptr != 0 { 
+            if status_ptr != 0 {
                 let status = encode_wait_status(ch.exit_code());
                 if unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4).is_err() } {
                     return EFAULT;
                 }
             }
+            // Reap the zombie
+            akuma_exec::process::clear_lazy_regions(pid);
+            let _ = akuma_exec::process::unregister_process(pid);
+            akuma_exec::process::remove_child_channel(pid);
             return pid as u64;
         }
     }
