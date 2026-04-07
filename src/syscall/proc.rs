@@ -1163,15 +1163,13 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
             all_tids.push(tid);
         }
         {
-            let sibling_tids: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
-                let table = akuma_exec::process::table::PROCESS_TABLE.read();
-                table.iter()
-                    .filter(|(p, proc_arc)| {
-                        let proc = proc_arc.lock();
-                        **p != pid && proc.tgid == tgid
-                    })
-                    .filter_map(|(_, proc_arc)| proc_arc.lock().thread_id)
-                    .collect()
+            let mut sibling_tids = alloc::vec::Vec::new();
+            akuma_exec::process::table::for_each_process(|p| {
+                if p.pid != pid && p.tgid == tgid {
+                    if let Some(tid) = p.thread_id {
+                        sibling_tids.push(tid);
+                    }
+                }
             });
             all_tids.extend(sibling_tids);
         }

@@ -3811,9 +3811,8 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
 
     // Cleanup
     let _ = akuma_exec::process::unregister_process(child_pid);
-    let pp = akuma_exec::process::unregister_process(parent_pid);
-    if let Some(ref arc) = pp {
-        let mut p = arc.lock();
+    let mut pp = akuma_exec::process::unregister_process(parent_pid);
+    if let Some(ref mut p) = pp {
         for (_, frames) in p.mmap_regions.drain(..) {
             for f in frames { crate::pmm::free_page(f); }
         }
@@ -3905,9 +3904,8 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 
     // Cleanup
     let _ = akuma_exec::process::unregister_process(worker_pid);
-    let op = akuma_exec::process::unregister_process(owner_pid);
-    if let Some(ref arc) = op {
-        let mut p = arc.lock();
+    let mut op = akuma_exec::process::unregister_process(owner_pid);
+    if let Some(ref mut p) = op {
         for (_, frs) in p.mmap_regions.drain(..) {
             for f in frs { crate::pmm::free_page(f); }
         }

@@ -250,21 +250,31 @@ static PROCESS_SLOTS: [AtomicPtr<Spinlock<Process>>; MAX_PROCESSES] = ...;
 
 No epoch-based reclamation needed: unregister only runs after thread exit (no concurrent readers for dead process). Arc from Stage B provides safe reclamation if SMP added later.
 
-Migration from B to C is mechanical: only `table.rs` and `children.rs` change. The per-process `Arc<Spinlock<Process>>` and all 218+ call sites remain unchanged.
+Migration from B to C was mechanical: only `table.rs` and `children.rs` changed.
+All 218+ `lookup_process` call sites remained unchanged.
 
-**Decision deferred:** Whether PID = slot index (simplest, PIDs recycled 0..63) or keep sequential PIDs with a `PID_TO_SLOT` map.
+**Decision:** Sequential PIDs (NEXT_PID monotonic, never recycled) with linear
+scan for PID-to-slot lookup. 256 slots, ~2us worst-case scan on ARM64.
 
 ---
 
-## Implementation Order
+## What Actually Happened (2026-04-07)
+
+Stage B was implemented but caused two deadlock classes:
+1. Writer starvation in the RwSpinlock (no writer priority)
+2. Per-process Spinlock vs data_ptr() shim mismatch during iteration
+
+Stage B was reverted in favor of Stage C (lock-free array). The RwSpinlock
+primitive was kept in `sync.rs` for future use but is no longer used by the
+process table. Stage D instrumentation (diag.rs, futex logging) was kept.
+
+## Implementation Order (as executed)
 
 1. **D1** — Fix `list_processes()` (immediate `ps` hang fix)
 2. **D2-D5** — Instrumentation (diag module, lock timing, borrow tracker, futex logging)
-3. **B1** — RwSpinlock primitive
-4. **B2-B3** — Change table type + add shims (the big structural change)
-5. **B4-B5** — Update all direct `PROCESS_TABLE.lock()` sites
-6. **B6** — Update tests
-7. **B7** — Document lock ordering
+3. **B1** — RwSpinlock primitive (kept)
+4. **B2-B5** — RwSpinlock + Arc<Spinlock<Process>> (caused deadlocks, reverted)
+5. **C** — Lock-free `[AtomicPtr<Process>; 256]` array (final, working)
 
 ## Verification
 

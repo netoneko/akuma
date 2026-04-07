@@ -4,9 +4,9 @@ use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::fmt::Write;
 
-use crate::runtime::{runtime, with_irqs_disabled};
+use crate::runtime::runtime;
 use crate::process::types::Pid;
-use crate::process::table::PROCESS_TABLE;
+use crate::process::table;
 use crate::process::children::lookup_process;
 
 static PROCESS_SYSCALL_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -107,18 +107,11 @@ impl ProcessSyscallStats {
 
 pub fn dump_running_process_stats() {
     if !process_syscall_stats_enabled() { return; }
-    let pids: Vec<(Pid, String, u64)> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.read();
-        table.iter()
-            .filter(|(_, p_arc)| {
-                let p = p_arc.lock();
-                !p.exited && p.start_time_us > 0
-            })
-            .map(|(&pid, p_arc)| {
-                let p = p_arc.lock();
-                (pid, p.name.clone(), p.start_time_us)
-            })
-            .collect()
+    let mut pids: Vec<(Pid, String, u64)> = Vec::new();
+    table::for_each_process(|p| {
+        if !p.exited && p.start_time_us > 0 {
+            pids.push((p.pid, p.name.clone(), p.start_time_us));
+        }
     });
     let now = (runtime().uptime_us)();
     for (pid, name, start_us) in pids {

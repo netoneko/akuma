@@ -288,13 +288,15 @@ pub fn run_all_tests() {
     test_msgqueue_nowait_returns_immediately();
     test_msgqueue_waker_idempotent();
 
-    // Process table refactor (Stage D+B)
+    // Lock-free process table (Stage C)
     test_list_processes_does_not_hold_lock_during_clone();
     test_rwspinlock_table_concurrent_reads();
     test_process_table_register_get_unregister();
     test_lookup_process_shim_returns_valid_ref();
     test_borrow_tracker_increments();
     test_get_current_process_returns_arc();
+    test_lock_free_iteration();
+    test_slot_recycling();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -3040,16 +3042,8 @@ fn test_entry_point_trampoline_no_zombie_match() {
     register_process(child_pid, child_proc);
 
     // Replicate entry_point_trampoline's scan logic.
-    let mut found_pid: Option<u32> = None;
-    crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::table::PROCESS_TABLE.read();
-        for proc_arc in table.values() {
-            let proc = proc_arc.lock();
-            if proc.thread_id == Some(slot) {
-                found_pid = Some(proc.pid);
-                break;
-            }
-        }
+    let found_pid = akuma_exec::process::table::find_process(|p| {
+        if p.thread_id == Some(slot) { Some(p.pid) } else { None }
     });
 
     clear_lazy_regions(zombie_pid);
@@ -6042,66 +6036,55 @@ fn test_list_processes_does_not_hold_lock_during_clone() {
     }
 }
 
-/// Verify RwSpinlock allows concurrent reads on PROCESS_TABLE.
+/// Verify lock-free table allows concurrent lookups.
 fn test_rwspinlock_table_concurrent_reads() {
     use akuma_exec::process::{register_process, unregister_process};
-    use akuma_exec::process::table::PROCESS_TABLE;
 
     let pid1 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let pid2 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     register_process(pid1, make_test_process(pid1));
     register_process(pid2, make_test_process(pid2));
 
-    // Take two simultaneous read locks — should not deadlock
-    let ok = crate::irq::with_irqs_disabled(|| {
-        let r1 = PROCESS_TABLE.read();
-        let r2 = PROCESS_TABLE.read();
-        let has1 = r1.contains_key(&pid1);
-        let has2 = r2.contains_key(&pid2);
-        has1 && has2
-    });
+    // Lock-free lookups — both should succeed simultaneously
+    let has1 = akuma_exec::process::table::get_process_ptr(pid1).is_some();
+    let has2 = akuma_exec::process::table::get_process_ptr(pid2).is_some();
 
     let _ = unregister_process(pid1);
     let _ = unregister_process(pid2);
 
-    if ok {
-        console::print("[Test] rwspinlock_table_concurrent_reads PASSED\n");
+    if has1 && has2 {
+        console::print("[Test] lock_free_table_concurrent_reads PASSED\n");
     } else {
-        console::print("[Test] rwspinlock_table_concurrent_reads FAILED\n");
+        crate::safe_print!(128,
+            "[Test] lock_free_table_concurrent_reads FAILED: has1={} has2={}\n", has1, has2);
     }
 }
 
-/// Verify the register → get_process → unregister lifecycle with Arc<Spinlock<Process>>.
+/// Verify the register → lookup → unregister lifecycle with lock-free table.
 fn test_process_table_register_get_unregister() {
-    use akuma_exec::process::{register_process, unregister_process};
-    use akuma_exec::process::table::get_process;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let mut proc = make_test_process(pid);
-    proc.name = alloc::string::String::from("arc_test");
+    proc.name = alloc::string::String::from("lockfree_test");
     register_process(pid, proc);
 
-    // get_process returns Arc that can be locked
-    let arc = get_process(pid);
-    let name_ok = arc.as_ref().map(|a| a.lock().name == "arc_test").unwrap_or(false);
+    // lookup_process returns &mut Process via raw pointer (lock-free)
+    let name_ok = lookup_process(pid).map(|p| p.name == "lockfree_test").unwrap_or(false);
 
-    // Clone the Arc — original should still work after unregister removes table's copy
-    let arc_clone = arc.clone();
+    // Unregister returns Box<Process>
     let removed = unregister_process(pid);
     let removed_ok = removed.is_some();
 
     // Table no longer has it
-    let gone = get_process(pid).is_none();
+    let gone = lookup_process(pid).is_none();
 
-    // But our Arc clone still points to valid Process (kept alive by refcount)
-    let clone_ok = arc_clone.as_ref().map(|a| a.lock().name == "arc_test").unwrap_or(false);
-
-    if name_ok && removed_ok && gone && clone_ok {
+    if name_ok && removed_ok && gone {
         console::print("[Test] process_table_register_get_unregister PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] process_table_register_get_unregister FAILED: name={} removed={} gone={} clone={}\n",
-            name_ok, removed_ok, gone, clone_ok);
+            "[Test] process_table_register_get_unregister FAILED: name={} removed={} gone={}\n",
+            name_ok, removed_ok, gone);
     }
 }
 
@@ -6158,18 +6141,84 @@ fn test_borrow_tracker_increments() {
     console::print("[Test] borrow_tracker_increments PASSED\n");
 }
 
-/// Verify get_current_process returns a lockable Arc when called from a process context.
-/// Note: in kernel test context there is no user process, so this tests the None path.
+/// Verify current_process returns None in kernel context (no user process mapped).
 fn test_get_current_process_returns_arc() {
-    use akuma_exec::process::get_current_process;
+    use akuma_exec::process::current_process;
 
     // In kernel test context (no user process mapped), should return None
-    let result = get_current_process();
+    let result = current_process();
     let is_none = result.is_none();
 
     if is_none {
-        console::print("[Test] get_current_process_returns_arc PASSED (None in kernel ctx)\n");
+        console::print("[Test] current_process_none_in_kernel_ctx PASSED\n");
     } else {
-        console::print("[Test] get_current_process_returns_arc FAILED (expected None)\n");
+        console::print("[Test] current_process_none_in_kernel_ctx FAILED (expected None)\n");
+    }
+}
+
+/// Verify for_each_process and find_process iterate correctly.
+fn test_lock_free_iteration() {
+    use akuma_exec::process::{register_process, unregister_process};
+
+    let pid1 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let pid2 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let mut p1 = make_test_process(pid1);
+    p1.box_id = 42;
+    let mut p2 = make_test_process(pid2);
+    p2.box_id = 99;
+    register_process(pid1, p1);
+    register_process(pid2, p2);
+
+    // for_each_process should visit both
+    let mut count = 0u32;
+    akuma_exec::process::table::for_each_process(|p| {
+        if p.pid == pid1 || p.pid == pid2 { count += 1; }
+    });
+
+    // find_process should find pid2 by box_id
+    let found = akuma_exec::process::table::find_process(|p| {
+        if p.box_id == 99 { Some(p.pid) } else { None }
+    });
+
+    // collect_pids with box_id filter
+    let pids = akuma_exec::process::table::collect_pids(|p| p.box_id == 42);
+
+    let _ = unregister_process(pid1);
+    let _ = unregister_process(pid2);
+
+    let ok = count == 2 && found == Some(pid2) && pids.len() == 1 && pids[0] == pid1;
+    if ok {
+        console::print("[Test] lock_free_iteration PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] lock_free_iteration FAILED: count={} found={:?} pids_len={}\n",
+            count, found, pids.len());
+    }
+}
+
+/// Verify slot recycling: register, unregister, register again reuses slots.
+fn test_slot_recycling() {
+    use akuma_exec::process::{register_process, unregister_process};
+
+    let pid1 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid1, make_test_process(pid1));
+
+    let count_before = akuma_exec::process::table::process_count();
+    let _ = unregister_process(pid1);
+    let count_after = akuma_exec::process::table::process_count();
+
+    // Register again — should reuse the freed slot
+    let pid2 = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid2, make_test_process(pid2));
+    let count_reused = akuma_exec::process::table::process_count();
+    let _ = unregister_process(pid2);
+
+    let ok = count_before > count_after && count_reused == count_before;
+    if ok {
+        console::print("[Test] slot_recycling PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] slot_recycling FAILED: before={} after={} reused={}\n",
+            count_before, count_after, count_reused);
     }
 }

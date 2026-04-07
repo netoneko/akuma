@@ -2,11 +2,10 @@ use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
-use crate::process::table::PROCESS_TABLE;
+use crate::process::table;
 use crate::process::channel::{remove_channel, get_channel};
 use crate::process::children::{lookup_process, clear_lazy_regions};
 use crate::process::cleanup_process_fds;
-use crate::runtime::with_irqs_disabled;
 use crate::threading;
 
 /// Shared signal action table for CLONE_SIGHAND semantics.
@@ -42,19 +41,7 @@ impl SharedSignalTable {
 pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Kill direct children first so parent-kill semantics cascade and avoid
     // leaving orphaned workers running after the parent exits.
-    let child_pids: Vec<Pid> = with_irqs_disabled(|| {
-        let table = PROCESS_TABLE.read();
-        table
-            .iter()
-            .filter_map(|(&child_pid, p_arc)| {
-                if p_arc.lock().parent_pid == pid {
-                    Some(child_pid)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    });
+    let child_pids: Vec<Pid> = table::collect_pids(|p| p.parent_pid == pid);
     for child_pid in child_pids {
         if child_pid != pid {
             let _ = kill_process(child_pid);

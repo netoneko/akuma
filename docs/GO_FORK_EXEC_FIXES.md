@@ -829,19 +829,23 @@ pointer escape after releasing the lock, creating aliasing UB potential across
 - Added borrow-aliasing detector (`[BORROW-ALIAS]` warnings)
 - Added futex compliance logging (`[futex-dbg]` traces, const-gated)
 
-**Stage B** -- Structural refactor:
-- Implemented `RwSpinlock` via `lock_api::RawRwLock` (reader-writer spinlock)
-- Changed table to `RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>>`
-- Readers (syscall handlers) now proceed concurrently
-- Writers (fork, exit) take exclusive lock only for insert/remove
-- Added `get_process()` / `get_current_process()` as new safe API
-- Preserved `lookup_process()` / `current_process()` as backward-compatible shims
+**Stage B** (RwSpinlock + Arc -- reverted):
+Introduced `RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>>`. Caused two
+deadlock classes: writer starvation (no writer priority) and per-process
+Spinlock vs `data_ptr()` shim mismatch. Reverted in favor of Stage C.
+
+**Stage C** -- Lock-free array (current):
+- Replaced entire table with `[AtomicPtr<Process>; 256]` + `[AtomicU8; 256]`
+- Zero locks for reads: `lookup_process`, `list_processes` are pure atomic scans
+- CAS for writes: `register_process` claims slot via `compare_exchange`
+- Back to `Box<Process>` ownership (no Arc, no per-process Spinlock)
+- Matches the proven `THREAD_STATES` lock-free pattern from the thread pool
 
 ### Tests added
 
-- 9 host-level RwSpinlock tests (multiple readers, exclusion, state encoding)
-- 6 kernel-level tests (list_processes two-phase, concurrent reads, Arc
-  lifecycle, shim validity, borrow tracker, get_current_process)
+- 11 host-level RwSpinlock tests (kept for the sync primitive itself)
+- 8 kernel-level tests (lock-free iteration, slot recycling, register/unregister
+  lifecycle, concurrent lookups, borrow tracker, current_process in kernel ctx)
 
 ---
 
@@ -859,7 +863,7 @@ pointer escape after releasing the lock, creating aliasing UB potential across
 | `src/tests.rs` | tgid field in test Process structs |
 | `crates/akuma-exec/src/process/children.rs` | add_poller_to_all_children() for wait-any wakeup |
 | `userspace/forktest/parent/main.go` | Fixed EPOLLONESHOT re-arm dead code |
-| `crates/akuma-exec/src/sync.rs` | **NEW** RwSpinlock implementation (lock_api RawRwLock) |
+| `crates/akuma-exec/src/sync.rs` | **NEW** RwSpinlock implementation (lock_api RawRwLock, writer priority) |
 | `crates/akuma-exec/src/process/diag.rs` | **NEW** Lock timing, borrow tracker diagnostics |
-| `crates/akuma-exec/src/process/table.rs` | PROCESS_TABLE changed to RwSpinlock<BTreeMap<Pid, Arc<Spinlock<Process>>>> |
+| `crates/akuma-exec/src/process/table.rs` | Lock-free array: `[AtomicPtr<Process>; 256]` + `[AtomicU8; 256]` |
 | `src/config.rs` | Added FUTEX_DBG_ENABLED const |
