@@ -83,7 +83,7 @@ pub(crate) fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
 
 /// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
 /// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
-fn encode_wait_status(code: i32) -> u32 {
+pub(crate) fn encode_wait_status(code: i32) -> u32 {
     if code < 0 {
         let sig = (-code) as u32 & 0x7F;
         sig

@@ -1004,12 +1004,39 @@ waitpid() → parent collects exit status
 - kill (129): SIGKILL hard-kills, SIGTERM delivers to handler. Correct.
 - wstatus encoding: WIFEXITED (code<<8), WIFSIGNALED (sig&0x7F). Correct.
 
+### 36. Removed tgid group-kill from return_to_kernel (2026-04-08)
+
+**Symptom:** SIGSEGV at PC=0x20000000 — parent process destroyed while running.
+This was a regression from the process table refactor.
+
+**Root cause:** When a goroutine thread crashed (SIGSEGV), `return_to_kernel`
+killed the entire thread group including the leader. On Linux, a thread crash
+sends SIGSEGV to the process (exit_group), which coordinates shutdown through
+the signal mechanism. Akuma's approach (one thread crashes → immediately kill
+the leader) races with the leader still running — freeing page tables that
+the leader's TTBR0 points to.
+
+**Fix:** Removed the tgid group-kill block from `return_to_kernel` entirely.
+A goroutine crash now only affects that one goroutine. The leader and other
+goroutines continue running. Orphaned goroutine zombies are cleaned up by
+`on_thread_cleanup` or `kill_process` when the parent exits.
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
 ### Tests added
 
 - 11 host-level RwSpinlock tests (kept for the sync primitive itself)
-- 13 kernel-level tests (lock-free table, zombie lifecycle, wait4 reaping,
-  kill child channel notify, SIGKILL/SIGTERM tgid group-kill, orphan handling,
-  borrow tracker, process table capacity)
+- 13 kernel-level process table tests that exercise REAL kernel code:
+  - `goroutine_kill_does_not_kill_leader` — registers leader + goroutine, kills goroutine, verifies leader survives with intact data
+  - `kill_child_does_not_affect_parent` — kills child, verifies parent is completely unaffected
+  - `kill_thread_group_isolation` — verifies only siblings are killed, not the caller or unrelated processes
+  - `sigkill_cleanup_no_dangling_ptrs` — kills leader + goroutines, verifies list_processes doesn't crash
+  - `kill_thread_group_cleans_siblings` — verifies siblings are unregistered and table count decreases
+  - `tgid_leader_vs_member` — verifies tgid field correctness and group membership
+  - `wait4_reaps_zombie` — full fork→kill→wait4 lifecycle
+  - `kill_process_notifies_child_channel` — kill sets child channel exited + zombie stays
+  - `zombie_stays_for_wait4_reap` — zombie in table with correct state/exit_code
+  - Plus: lock-free iteration, slot recycling, table capacity, borrow tracker
 
 ---
 

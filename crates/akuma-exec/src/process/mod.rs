@@ -995,39 +995,30 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             }
         }
 
-        // Read tgid BEFORE unregister (unregister drops the Process).
-        let tgid = lookup_process(pid).map(|p| p.tgid);
+        // Read tgid BEFORE unregister (for future signal-based group exit).
+        let _tgid = lookup_process(pid).map(|p| p.tgid);
 
         clear_lazy_regions(pid);
         let _dropped_process = unregister_process(pid);
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
 
-        // If this was a goroutine thread (tgid != pid) that CRASHED with SIGSEGV/SIGBUS/etc,
-        // kill the entire thread group. But do NOT trigger for SIGKILL (-9) — when the
-        // parent sends SIGKILL, kill_process_with_signal handles the leader. If we also
-        // kill the leader here, we race with the leader still executing user code, freeing
-        // its page tables while it's running → SIGSEGV at PC=0x20000000 (bug #33).
+        // DO NOT kill the thread group leader from a goroutine thread's exit path.
         //
-        // Normal exits (code >= 0) must NOT kill the group either — the leader is still
-        // running. Go goroutine threads exit normally all the time (GC, probes).
-        if let Some(tgid) = tgid {
-            // Only for true crashes: SIGSEGV(-11), SIGBUS(-7), SIGABRT(-6), SIGFPE(-8), SIGILL(-4)
-            // Skip SIGKILL(-9) and SIGTERM(-15) — these are deliberate kills handled elsewhere.
-            let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
-            if tgid != pid && is_crash {
-                kill_thread_group(tgid, 0);
-                if let Some(leader) = lookup_process(tgid) {
-                    cleanup_process_fds(leader);
-                    leader.exited = true;
-                    leader.exit_code = exit_code;
-                    leader.state = ProcessState::Zombie(exit_code);
-                    leader.thread_id = None;
-                }
-                if let Some(ch) = get_child_channel(tgid) {
-                    ch.set_exited(exit_code);
-                }
-            }
-        }
+        // Previously this code killed the leader when a goroutine crashed (SIGSEGV etc).
+        // This caused SIGSEGV at PC=0x20000000 — the leader's address space was destroyed
+        // while its main thread was still running. The race is unfixable because:
+        // 1. The crashing goroutine's return_to_kernel runs on one thread
+        // 2. The leader's main thread is running user code on the same CPU (preemptive)
+        // 3. Killing the leader frees page tables that the main thread's TTBR0 points to
+        //
+        // On Linux, a thread crash sends SIGSEGV to the process (exit_group), which
+        // coordinates shutdown through the signal mechanism. Akuma should do the same
+        // (pending future work). For now, the crashed goroutine just exits individually.
+        // The leader and other goroutines continue running. If the leader itself crashes,
+        // it handles its own cleanup via its own return_to_kernel.
+        //
+        // Orphaned goroutine zombies are cleaned up by on_thread_cleanup when their
+        // thread slots are recycled, or by kill_process when the parent exits.
     } else {
         log::debug!("[Process] Thread {} exited ({})", tid, exit_code);
     }

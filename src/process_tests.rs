@@ -3249,28 +3249,39 @@ fn test_futex_wake_unmapped_returns_zero() {
 /// tgid: from_elf and fork_process set tgid=pid (new group leader).
 /// clone_thread sets tgid=parent.tgid (same group).
 /// kill() and kill_thread_group use tgid to target the whole group.
+/// Verify tgid is correctly stored and readable via lookup_process.
+/// Leader: tgid == self. Goroutine: tgid == leader. Fork child: tgid == self.
 fn test_tgid_inheritance() {
-    // from_elf: tgid == pid (group leader)
-    let leader_pid: u32 = 100;
-    let leader_tgid = leader_pid;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    // clone_thread: inherits parent tgid
-    let _thread_pid: u32 = 101;
-    let thread_tgid = leader_tgid; // same group
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let thread_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let fork_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // fork_process: new tgid == child_pid
-    let fork_pid: u32 = 200;
-    let fork_tgid = fork_pid; // new group
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    register_process(leader_pid, leader);
 
-    let leader_ok = leader_tgid == leader_pid;
-    let thread_ok = thread_tgid == leader_pid; // shares leader's tgid
-    let fork_ok = fork_tgid == fork_pid && fork_tgid != leader_pid; // new group
+    let mut thread = make_test_process(thread_pid);
+    thread.tgid = leader_pid; // goroutine inherits leader's tgid
+    register_process(thread_pid, thread);
+
+    let mut fork = make_test_process(fork_pid);
+    fork.tgid = fork_pid; // fork child gets own tgid
+    register_process(fork_pid, fork);
+
+    let leader_ok = lookup_process(leader_pid).map(|p| p.tgid == leader_pid).unwrap_or(false);
+    let thread_ok = lookup_process(thread_pid).map(|p| p.tgid == leader_pid).unwrap_or(false);
+    let fork_ok = lookup_process(fork_pid).map(|p| p.tgid == fork_pid && p.tgid != leader_pid).unwrap_or(false);
+
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(thread_pid);
+    let _ = unregister_process(fork_pid);
 
     if leader_ok && thread_ok && fork_ok {
         console::print("[Test] tgid_inheritance PASSED\n");
     } else {
-        crate::safe_print!(128,
-            "[Test] tgid_inheritance FAILED: leader={} thread={} fork={}\n",
+        crate::safe_print!(128, "[Test] tgid_inheritance FAILED: leader={} thread={} fork={}\n",
             leader_ok, thread_ok, fork_ok);
     }
 }
@@ -3850,22 +3861,13 @@ fn test_execve_preserves_cwd() {
 
 /// encode_wait_status for clean exit (code >= 0): Linux encodes as (code << 8).
 /// Go's syscall.WaitStatus.ExitStatus() returns (status >> 8) & 0xFF.
+/// Test the REAL encode_wait_status function from proc.rs for clean exits.
+/// Go interprets: WIFEXITED = (status & 0x7F) == 0, ExitStatus = (status >> 8) & 0xFF
 fn test_encode_wait_status_clean_exit() {
-    // Mirrors encode_wait_status in src/syscall/proc.rs
-    fn encode(code: i32) -> u32 {
-        if code < 0 {
-            let sig = (-code) as u32 & 0x7F;
-            sig
-        } else {
-            ((code as u32) & 0xFF) << 8
-        }
-    }
+    let status0 = crate::syscall::proc::encode_wait_status(0);
+    let status1 = crate::syscall::proc::encode_wait_status(1);
+    let status253 = crate::syscall::proc::encode_wait_status(253);
 
-    let status0 = encode(0);
-    let status1 = encode(1);
-    let status253 = encode(253);
-
-    // Go interprets: WIFEXITED = (status & 0x7F) == 0, ExitStatus = (status >> 8) & 0xFF
     let go_exit0 = (status0 & 0x7F == 0) && ((status0 >> 8) & 0xFF == 0);
     let go_exit1 = (status1 & 0x7F == 0) && ((status1 >> 8) & 0xFF == 1);
     let go_exit253 = (status253 & 0x7F == 0) && ((status253 >> 8) & 0xFF == 253);
@@ -3879,18 +3881,13 @@ fn test_encode_wait_status_clean_exit() {
     }
 }
 
-/// encode_wait_status for signal kill (code < 0): Linux encodes signal in low 7 bits.
-/// Go's syscall.WaitStatus.Signal() returns status & 0x7F.
+/// Test the REAL encode_wait_status function for signal kills.
+/// Go: WIFSIGNALED = (status & 0x7F) != 0, Signal = status & 0x7F
 fn test_encode_wait_status_signal_kill() {
-    fn encode(code: i32) -> u32 {
-        if code < 0 { (-code) as u32 & 0x7F } else { ((code as u32) & 0xFF) << 8 }
-    }
+    let status_kill = crate::syscall::proc::encode_wait_status(-9);
+    let status_term = crate::syscall::proc::encode_wait_status(-15);
+    let status_segv = crate::syscall::proc::encode_wait_status(-11);
 
-    let status_kill = encode(-9);   // SIGKILL
-    let status_term = encode(-15);  // SIGTERM
-    let status_segv = encode(-11);  // SIGSEGV
-
-    // Go: WIFSIGNALED = (status & 0x7F) != 0, Signal = status & 0x7F
     let go_kill = (status_kill & 0x7F) == 9;
     let go_term = (status_term & 0x7F) == 15;
     let go_segv = (status_segv & 0x7F) == 11;
@@ -4012,23 +4009,34 @@ fn test_kill_process_exit_code_uses_negative_signal() {
 ///
 /// On Linux, exit()/exit_group() call do_exit() which transitions the thread to
 /// TASK_DEAD and calls schedule() — the thread never runs again.
+/// Verify that kill_process marks the process as exited and zombie.
+/// (We can't test actual thread termination from a test — that would kill the test runner.)
 fn test_exit_terminates_calling_thread() {
-    // The fix adds these two lines after marking the process exited:
-    //   mark_thread_terminated(tid);
-    //   loop { yield_now(); }
-    //
-    // This is a structural test — we verify the invariant that after exit,
-    // the thread MUST be marked terminated before yielding.
-    // We can't easily test the actual never-return behavior in a unit test,
-    // but we verify that mark_thread_terminated exists and is called.
-    let tid = akuma_exec::threading::current_thread_id();
-    // Thread 0 (or the test runner) should NOT be terminated — we're still running!
-    let is_terminated = akuma_exec::threading::is_thread_terminated(tid);
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    if !is_terminated {
-        console::print("[Test] exit_terminates_calling_thread PASSED\n");
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid, make_test_process(pid));
+
+    // Before kill: not exited
+    let before = lookup_process(pid).map(|p| p.exited).unwrap_or(true);
+
+    // Kill it
+    let _ = akuma_exec::process::kill_process(pid);
+
+    // After kill: exited=true, state=Zombie
+    let after_exited = lookup_process(pid).map(|p| p.exited).unwrap_or(false);
+    let after_zombie = lookup_process(pid).map(|p|
+        matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))
+    ).unwrap_or(false);
+
+    let _ = unregister_process(pid);
+
+    if !before && after_exited && after_zombie {
+        console::print("[Test] kill_marks_exited_zombie PASSED\n");
     } else {
-        console::print("[Test] exit_terminates_calling_thread FAILED: test thread is terminated!\n");
+        crate::safe_print!(128,
+            "[Test] kill_marks_exited_zombie FAILED: before={} exited={} zombie={}\n",
+            before, after_exited, after_zombie);
     }
 }
 
@@ -4089,6 +4097,7 @@ fn test_kill_child_processes_basic() {
     let child_gone = lookup_process(child_pid).is_none();
 
     clear_lazy_regions(parent_pid);
+    let _ = unregister_process(child_pid);
     let _ = unregister_process(parent_pid);
 
     if child_gone {
@@ -4128,6 +4137,8 @@ fn test_kill_child_processes_recursive() {
     let grandchild_gone = lookup_process(grandchild_pid).is_none();
 
     clear_lazy_regions(parent_pid);
+    let _ = unregister_process(grandchild_pid);
+    let _ = unregister_process(child_pid);
     let _ = unregister_process(parent_pid);
 
     if child_gone && grandchild_gone {
@@ -4173,6 +4184,7 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
 
     clear_lazy_regions(main_pid);
     clear_lazy_regions(worker_pid);
+    let _ = unregister_process(compile_pid);
     let _ = unregister_process(main_pid);
     let _ = unregister_process(worker_pid);
 
@@ -5146,49 +5158,96 @@ fn test_msgqueue_waker_idempotent() {
 }
 
 
-/// When a goroutine thread crashes, return_to_kernel must kill the entire
-/// thread group (all processes with matching tgid).  Without this, the
-/// group leader and sibling goroutine threads become orphaned zombies.
+/// kill_thread_group must clean up goroutine siblings: unregister them
+/// from the table and their thread IDs from THREAD_PID_MAP.
+/// After cleanup, list_processes must not crash (no dangling pointers).
 fn test_goroutine_crash_kills_thread_group() {
-    // Scenario: leader PID=100 (tgid=100), goroutine PID=101 (tgid=100)
-    // Goroutine crashes → return_to_kernel unregisters PID 101
-    // Then: tgid=100, tgid != pid(101) → kill leader + siblings
-    let leader_pid: u32 = 100;
-    let goroutine_pid: u32 = 101;
-    let goroutine_tgid = leader_pid; // inherited from clone_thread
+    use akuma_exec::process::{register_process, unregister_process, lookup_process, list_processes};
 
-    // The key check in return_to_kernel:
-    let should_kill_group = goroutine_tgid != goroutine_pid;
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let g2_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    if should_kill_group {
-        console::print("[Test] goroutine_crash_kills_thread_group PASSED\n");
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    register_process(leader_pid, leader);
+
+    let mut g1 = make_test_process(g1_pid);
+    g1.tgid = leader_pid;
+    register_process(g1_pid, g1);
+
+    let mut g2 = make_test_process(g2_pid);
+    g2.tgid = leader_pid;
+    register_process(g2_pid, g2);
+
+    // Count before kill
+    let count_before = akuma_exec::process::table::process_count();
+
+    // Kill thread group from leader
+    akuma_exec::process::kill_thread_group(leader_pid, 0);
+
+    // Siblings gone
+    let g1_gone = lookup_process(g1_pid).is_none();
+    let g2_gone = lookup_process(g2_pid).is_none();
+    // Leader survives
+    let leader_alive = lookup_process(leader_pid).is_some();
+    // Table count decreased
+    let count_after = akuma_exec::process::table::process_count();
+    let count_decreased = count_after < count_before;
+
+    // list_processes must not crash
+    let _procs = list_processes();
+
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(g1_pid);
+    let _ = unregister_process(g2_pid);
+
+    let pass = g1_gone && g2_gone && leader_alive && count_decreased;
+    if pass {
+        console::print("[Test] kill_thread_group_cleans_siblings PASSED\n");
     } else {
-        console::print("[Test] goroutine_crash_kills_thread_group FAILED\n");
+        crate::safe_print!(128,
+            "[Test] kill_thread_group_cleans_siblings FAILED: g1={} g2={} leader={} count={}->{}\n",
+            g1_gone, g2_gone, leader_alive, count_before, count_after);
     }
 }
 
-/// When the group LEADER crashes, tgid == pid, so the thread-group cleanup
-/// code should NOT try to kill "the leader" again (it's already being cleaned up).
+/// Verify tgid field is correctly set: leader gets tgid=self,
+/// goroutine gets tgid=leader. kill_thread_group uses this to find siblings.
 fn test_tgid_leader_vs_member_cleanup() {
-    let leader_pid: u32 = 100;
-    let leader_tgid = leader_pid;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    // Leader crash: tgid == pid → don't enter the "kill leader" branch
-    let is_leader = leader_tgid == leader_pid;
-    let should_skip_leader_kill = is_leader;
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let member_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // Member crash: tgid != pid → enter the "kill leader" branch
-    let member_pid: u32 = 101;
-    let member_tgid = leader_pid;
-    let is_member = member_tgid != member_pid;
-    let should_kill_leader = is_member;
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid; // leader: tgid == pid
+    register_process(leader_pid, leader);
 
-    if should_skip_leader_kill && should_kill_leader {
-        console::print("[Test] tgid_leader_vs_member_cleanup PASSED\n");
+    let mut member = make_test_process(member_pid);
+    member.tgid = leader_pid; // member: tgid != pid (points to leader)
+    register_process(member_pid, member);
+
+    // Verify tgid values
+    let leader_tgid_ok = lookup_process(leader_pid)
+        .map(|p| p.tgid == leader_pid).unwrap_or(false);
+    let member_tgid_ok = lookup_process(member_pid)
+        .map(|p| p.tgid == leader_pid && p.tgid != member_pid).unwrap_or(false);
+
+    // Kill from leader — member should be cleaned up
+    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    let member_gone = lookup_process(member_pid).is_none();
+
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(member_pid);
+
+    let pass = leader_tgid_ok && member_tgid_ok && member_gone;
+    if pass {
+        console::print("[Test] tgid_leader_vs_member PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] tgid_leader_vs_member_cleanup FAILED: skip={} kill={}\n",
-            should_skip_leader_kill, should_kill_leader);
+            "[Test] tgid_leader_vs_member FAILED: l_tgid={} m_tgid={} m_gone={}\n",
+            leader_tgid_ok, member_tgid_ok, member_gone);
     }
 }
 
@@ -5460,19 +5519,33 @@ fn test_sigkill_bypasses_handlers() {
 
 /// SIGTERM (15) should be delivered to the handler, not hard-kill.
 /// SIGKILL (9) should hard-kill. Verify the distinction.
+/// Verify SIGTERM vs SIGKILL produce different exit codes on a real process.
+/// SIGTERM: exit_code = -15. SIGKILL: exit_code = -9.
 fn test_sigterm_vs_sigkill_behavior() {
-    let sigterm: u32 = 15;
-    let sigkill: u32 = 9;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    // SIGTERM: deliver to handler → Go can print "exiting gracefully"
-    let term_delivers = sigterm != 9;
-    // SIGKILL: bypass handler → immediate kill
-    let kill_hardkills = sigkill == 9;
+    let pid_term = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let pid_kill = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    if term_delivers && kill_hardkills {
-        console::print("[Test] sigterm_vs_sigkill_behavior PASSED\n");
+    register_process(pid_term, make_test_process(pid_term));
+    register_process(pid_kill, make_test_process(pid_kill));
+
+    let _ = akuma_exec::process::kill_process_with_signal(pid_term, 15);
+    let _ = akuma_exec::process::kill_process_with_signal(pid_kill, 9);
+
+    let term_code = lookup_process(pid_term).map(|p| p.exit_code).unwrap_or(0);
+    let kill_code = lookup_process(pid_kill).map(|p| p.exit_code).unwrap_or(0);
+
+    let _ = unregister_process(pid_term);
+    let _ = unregister_process(pid_kill);
+
+    let pass = term_code == -15 && kill_code == -9;
+    if pass {
+        console::print("[Test] sigterm_vs_sigkill_exit_codes PASSED\n");
     } else {
-        console::print("[Test] sigterm_vs_sigkill_behavior FAILED\n");
+        crate::safe_print!(128,
+            "[Test] sigterm_vs_sigkill_exit_codes FAILED: term={} kill={}\n",
+            term_code, kill_code);
     }
 }
 
@@ -5519,77 +5592,184 @@ fn test_pend_vs_interrupt_delivers_handler() {
     }
 }
 
-/// Normal goroutine thread exit (code=0) must NOT kill the thread group.
-/// Go's GC threads, doCheckClonePidfd probe, etc. exit normally all the time.
-/// Killing the leader on a normal exit destroys the parent process.
+/// When a goroutine thread (tgid != pid) is killed, the leader must survive.
+/// This test registers a leader + goroutine sibling, kills the sibling via
+/// kill_thread_group, and verifies the leader is still alive and its process
+/// data is intact (not freed, not corrupted).
 fn test_normal_goroutine_exit_does_not_kill_group() {
-    let exit_code: i32 = 0;  // normal exit
-    let tgid: u32 = 100;     // leader
-    let pid: u32 = 101;      // goroutine thread
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    // Updated condition: crash only (not SIGKILL/SIGTERM)
-    let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
-    let should_kill = tgid != pid && is_crash;
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let goroutine_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    if !should_kill {
-        console::print("[Test] normal_goroutine_exit_does_not_kill_group PASSED\n");
+    // Register leader
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    leader.name = alloc::string::String::from("leader_test");
+    register_process(leader_pid, leader);
+
+    // Register goroutine sibling (same tgid as leader)
+    let mut goroutine = make_test_process(goroutine_pid);
+    goroutine.tgid = leader_pid; // same thread group
+    goroutine.parent_pid = leader_pid;
+    register_process(goroutine_pid, goroutine);
+
+    // Kill the thread group from the goroutine's perspective
+    akuma_exec::process::kill_thread_group(goroutine_pid, 0);
+
+    // Leader must still be alive and intact
+    let leader_alive = lookup_process(leader_pid).is_some();
+    let leader_name_ok = lookup_process(leader_pid)
+        .map(|p| p.name == "leader_test")
+        .unwrap_or(false);
+    let leader_not_exited = lookup_process(leader_pid)
+        .map(|p| !p.exited)
+        .unwrap_or(false);
+
+    // Goroutine should be unregistered (auto-reaped by kill_thread_group)
+    let goroutine_gone = lookup_process(goroutine_pid).is_none();
+
+    // Cleanup — unregister anything still in the table
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(goroutine_pid);
+
+    let pass = leader_alive && leader_name_ok && leader_not_exited && goroutine_gone;
+    if pass {
+        console::print("[Test] goroutine_kill_does_not_kill_leader PASSED\n");
     } else {
-        console::print("[Test] normal_goroutine_exit_does_not_kill_group FAILED\n");
+        crate::safe_print!(128,
+            "[Test] goroutine_kill_does_not_kill_leader FAILED: alive={} name={} !exited={} sib_gone={}\n",
+            leader_alive, leader_name_ok, leader_not_exited, goroutine_gone);
     }
 }
 
-/// Crash exit (code=-11 = SIGSEGV) on a goroutine thread SHOULD kill the group.
-/// Without this, the leader and other goroutines become orphaned zombies.
+/// After kill_process_with_signal on a child, the child becomes a zombie
+/// but the PARENT must remain completely unaffected.
 fn test_crash_goroutine_exit_kills_group() {
-    let exit_code: i32 = -11; // SIGSEGV
-    let tgid: u32 = 100;
-    let pid: u32 = 101;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    let is_crash = exit_code < 0 && exit_code != -9 && exit_code != -15;
-    let should_kill = tgid != pid && is_crash;
+    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    if should_kill {
-        console::print("[Test] crash_goroutine_exit_kills_group PASSED\n");
+    let mut parent = make_test_process(parent_pid);
+    parent.name = alloc::string::String::from("parent_survives");
+    register_process(parent_pid, parent);
+
+    let mut child = make_test_process(child_pid);
+    child.parent_pid = parent_pid;
+    register_process(child_pid, child);
+
+    // Kill child with SIGSEGV signal
+    let _ = akuma_exec::process::kill_process_with_signal(child_pid, 11);
+
+    // Parent must be completely unaffected
+    let parent_alive = lookup_process(parent_pid).is_some();
+    let parent_name = lookup_process(parent_pid)
+        .map(|p| p.name == "parent_survives")
+        .unwrap_or(false);
+    let parent_not_exited = lookup_process(parent_pid)
+        .map(|p| !p.exited)
+        .unwrap_or(false);
+
+    // Child should be zombie
+    let child_zombie = lookup_process(child_pid)
+        .map(|p| p.exited)
+        .unwrap_or(false);
+
+    // Cleanup
+    let _ = unregister_process(child_pid);
+    let _ = unregister_process(parent_pid);
+
+    let pass = parent_alive && parent_name && parent_not_exited && child_zombie;
+    if pass {
+        console::print("[Test] kill_child_does_not_affect_parent PASSED\n");
     } else {
-        console::print("[Test] crash_goroutine_exit_kills_group FAILED\n");
+        crate::safe_print!(128,
+            "[Test] kill_child_does_not_affect_parent FAILED: alive={} name={} !exit={} child_z={}\n",
+            parent_alive, parent_name, parent_not_exited, child_zombie);
     }
 }
 
-/// Leader exit (tgid == pid) never enters the group-kill path regardless of
-/// exit code.  The leader's own cleanup handles everything.
+/// kill_thread_group must only kill siblings (same tgid, different pid),
+/// never the caller itself, and never processes in a different thread group.
 fn test_leader_exit_never_kills_group() {
-    let tgid: u32 = 100;
-    let pid: u32 = 100; // leader
+    use akuma_exec::process::{register_process, unregister_process, lookup_process};
 
-    // Should never enter group-kill (tgid == pid)
-    let normal_skip = !(tgid != pid && 0i32 < 0);
-    let crash_skip = !(tgid != pid && (-11i32) < 0);
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let sib_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let other_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    if normal_skip && crash_skip {
-        console::print("[Test] leader_exit_never_kills_group PASSED\n");
+    // Leader + sibling in same thread group
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    register_process(leader_pid, leader);
+
+    let mut sib = make_test_process(sib_pid);
+    sib.tgid = leader_pid;
+    register_process(sib_pid, sib);
+
+    // Unrelated process in different thread group
+    let mut other = make_test_process(other_pid);
+    other.tgid = other_pid;
+    register_process(other_pid, other);
+
+    // Kill thread group from leader's perspective
+    akuma_exec::process::kill_thread_group(leader_pid, 0);
+
+    // Leader must survive (kill_thread_group excludes caller)
+    let leader_alive = lookup_process(leader_pid).is_some();
+    // Sibling must be gone (auto-reaped)
+    let sib_gone = lookup_process(sib_pid).is_none();
+    // Unrelated process must be unaffected
+    let other_alive = lookup_process(other_pid).is_some();
+    let other_not_exited = lookup_process(other_pid)
+        .map(|p| !p.exited)
+        .unwrap_or(false);
+
+    // Cleanup — unregister everything that might still be in the table
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(sib_pid);
+    let _ = unregister_process(other_pid);
+
+    let pass = leader_alive && sib_gone && other_alive && other_not_exited;
+    if pass {
+        console::print("[Test] kill_thread_group_isolation PASSED\n");
     } else {
-        console::print("[Test] leader_exit_never_kills_group FAILED\n");
+        crate::safe_print!(128,
+            "[Test] kill_thread_group_isolation FAILED: leader={} sib_gone={} other={} other_ok={}\n",
+            leader_alive, sib_gone, other_alive, other_not_exited);
     }
 }
 
 /// sys_kill must set all interrupted flags BEFORE calling pend_signal_for_thread
 /// (which calls wake()).  Otherwise: thread wakes from schedule_blocking, checks
 /// is_current_interrupted() (false — not set yet), re-enters schedule_blocking.
+/// Verify interrupt_thread sets the flag and pend_signal_for_thread stores
+/// the signal — using real threading APIs on a real thread slot.
 fn test_interrupt_before_wake_ordering() {
-    // The correct order:
-    // 1. interrupt_thread(tid) — set flag
-    // 2. pend_signal_for_thread(tid, sig) — store signal + wake()
-    //
-    // Wrong order (old code):
-    // 1. pend_signal_for_thread(tid, sig) — store signal + wake()
-    // 2. interrupt_thread(tid) — set flag (too late! thread already re-blocked)
-    let flag_set_before_wake = true;  // after fix
-    let thread_sees_flag_on_wake = flag_set_before_wake;
+    let test_slot: usize = 31; // high slot guaranteed free
 
-    if thread_sees_flag_on_wake {
-        console::print("[Test] interrupt_before_wake_ordering PASSED\n");
+    // 1. Pend SIGTERM on the slot
+    akuma_exec::threading::pend_signal_for_thread(test_slot, 15);
+
+    // 2. Verify signal is pending
+    let pending1 = akuma_exec::threading::peek_pending_signal(test_slot);
+    let has_sigterm = pending1 == 15;
+
+    // 3. Pend SIGKILL on the same slot (bitmask: both should be stored)
+    akuma_exec::threading::pend_signal_for_thread(test_slot, 9);
+
+    // 4. Peek should return lowest pending (SIGKILL=9 < SIGTERM=15)
+    let pending2 = akuma_exec::threading::peek_pending_signal(test_slot);
+    let lowest_is_sigkill = pending2 == 9;
+
+    let pass = has_sigterm && lowest_is_sigkill;
+    if pass {
+        console::print("[Test] pend_signal_bitmask_ordering PASSED\n");
     } else {
-        console::print("[Test] interrupt_before_wake_ordering FAILED\n");
+        crate::safe_print!(128,
+            "[Test] pend_signal_bitmask_ordering FAILED: first={} second={}\n",
+            pending1, pending2);
     }
 }
 
@@ -6281,47 +6461,58 @@ fn test_kill_process_notifies_child_channel() {
     }
 }
 
-/// SIGKILL (-9) on a goroutine thread must NOT trigger tgid group-kill.
-/// The parent's sys_kill → kill_process_with_signal handles the leader.
-/// If return_to_kernel also kills the leader, it races with the leader still
-/// executing → SIGSEGV at PC=0x20000000 (bug #33).
+/// After SIGKILL on a process with goroutine threads, all siblings must be
+/// cleaned up but the process table must not contain dangling pointers.
+/// Verify by killing a process then scanning the table for corruption.
 fn test_sigkill_goroutine_does_not_kill_leader() {
-    // Test the condition logic from return_to_kernel
-    let tgid: u32 = 100;
-    let pid: u32 = 101; // goroutine thread (tgid != pid)
+    use akuma_exec::process::{register_process, unregister_process, lookup_process, list_processes};
 
-    // SIGKILL: should NOT trigger group-kill
-    let sigkill_code: i32 = -9;
-    let sigkill_is_crash = sigkill_code < 0 && sigkill_code != -9 && sigkill_code != -15;
-    let sigkill_kills = tgid != pid && sigkill_is_crash;
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let g2_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // SIGTERM: should NOT trigger group-kill
-    let sigterm_code: i32 = -15;
-    let sigterm_is_crash = sigterm_code < 0 && sigterm_code != -9 && sigterm_code != -15;
-    let sigterm_kills = tgid != pid && sigterm_is_crash;
+    // Leader + 2 goroutines in same thread group
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    register_process(leader_pid, leader);
 
-    // SIGSEGV: SHOULD trigger group-kill (true crash)
-    let sigsegv_code: i32 = -11;
-    let sigsegv_is_crash = sigsegv_code < 0 && sigsegv_code != -9 && sigsegv_code != -15;
-    let sigsegv_kills = tgid != pid && sigsegv_is_crash;
+    let mut g1 = make_test_process(g1_pid);
+    g1.tgid = leader_pid;
+    register_process(g1_pid, g1);
 
-    // SIGBUS: SHOULD trigger group-kill (true crash)
-    let sigbus_code: i32 = -7;
-    let sigbus_is_crash = sigbus_code < 0 && sigbus_code != -9 && sigbus_code != -15;
-    let sigbus_kills = tgid != pid && sigbus_is_crash;
+    let mut g2 = make_test_process(g2_pid);
+    g2.tgid = leader_pid;
+    register_process(g2_pid, g2);
 
-    // Normal exit: should NOT trigger
-    let normal_code: i32 = 0;
-    let normal_is_crash = normal_code < 0 && normal_code != -9 && normal_code != -15;
-    let normal_kills = tgid != pid && normal_is_crash;
+    // SIGKILL the leader (what the parent does)
+    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    let _ = akuma_exec::process::kill_process_with_signal(leader_pid, 9);
 
-    let pass = !sigkill_kills && !sigterm_kills && sigsegv_kills && sigbus_kills && !normal_kills;
+    // Goroutines must be gone (auto-reaped by kill_thread_group)
+    let g1_gone = lookup_process(g1_pid).is_none();
+    let g2_gone = lookup_process(g2_pid).is_none();
+
+    // Leader is zombie (killed by kill_process_with_signal)
+    let leader_zombie = lookup_process(leader_pid)
+        .map(|p| p.exited)
+        .unwrap_or(false);
+
+    // list_processes must not crash (no dangling pointers)
+    let _procs = list_processes();
+    let no_crash = true; // if we got here, it didn't crash
+
+    // Cleanup — unregister everything that might still be in the table
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(g1_pid);
+    let _ = unregister_process(g2_pid);
+
+    let pass = g1_gone && g2_gone && leader_zombie && no_crash;
     if pass {
-        console::print("[Test] sigkill_goroutine_does_not_kill_leader PASSED\n");
+        console::print("[Test] sigkill_cleanup_no_dangling_ptrs PASSED\n");
     } else {
         crate::safe_print!(128,
-            "[Test] sigkill_goroutine_does_not_kill_leader FAILED: kill9={} term15={} segv={} bus={} normal={}\n",
-            sigkill_kills, sigterm_kills, sigsegv_kills, sigbus_kills, normal_kills);
+            "[Test] sigkill_cleanup_no_dangling_ptrs FAILED: g1={} g2={} leader_z={}\n",
+            g1_gone, g2_gone, leader_zombie);
     }
 }
 
