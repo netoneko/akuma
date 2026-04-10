@@ -361,6 +361,10 @@ fn user_va_limit() -> u64 {
     0x0000_FFFF_FFFF_FFFFu64 // 48-bit user VA limit (standard Linux)
 }
 
+// #region agent log
+static VALIDATE_FAIL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// #endregion
+
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
     if ptr < 0x1000 { return false; }
@@ -378,12 +382,25 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 
     if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len) {
         if !ensure_user_pages_mapped(ptr as usize, len) {
+            // #region agent log
+            let count = VALIDATE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 5 {
+                let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                let tid = akuma_exec::threading::current_thread_id();
+                crate::safe_print!(192, "[VALIDERR] pid={} tid={} ptr=0x{:x} len={} ensure_failed\n",
+                    pid, tid, ptr, len);
+            }
+            // #endregion
             return false;
         }
     }
 
     true
 }
+
+// #region agent log
+static ENSURE_FAIL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// #endregion
 
 fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
     let page_start = start & !0xFFF;
@@ -437,9 +454,23 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                         for tf in table_frames { crate::pmm::free_page(tf); }
                     }
                 } else {
+                    // #region agent log
+                    let cnt = ENSURE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if cnt < 5 {
+                        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                        crate::safe_print!(128, "[ENSURE] pid={} va=0x{:x} FAIL: alloc_page_zeroed failed\n", pid, va);
+                    }
+                    // #endregion
                     return false;
                 }
             } else {
+                // #region agent log
+                let cnt = ENSURE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                if cnt < 5 {
+                    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                    crate::safe_print!(128, "[ENSURE] pid={} va=0x{:x} FAIL: lazy_region_lookup failed\n", pid, va);
+                }
+                // #endregion
                 return false;
             }
         }
