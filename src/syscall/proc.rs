@@ -32,15 +32,31 @@ pub(crate) fn vfork_complete(child_pid: u32) {
     // #region agent log
     crate::tprint!(96, "[FORK-DBG] vfork_complete child_pid={}\n", child_pid);
     // #endregion
+    // #region agent log
+    crate::safe_print!(64, "[vfork-dbg] about to lock VFORK_WAITERS\n");
+    // #endregion
     let parent_tid = crate::irq::with_irqs_disabled(|| {
-        VFORK_WAITERS.lock().remove(&child_pid)
+        // #region agent log
+        crate::safe_print!(64, "[vfork-dbg] IRQs disabled, locking\n");
+        // #endregion
+        let result = VFORK_WAITERS.lock().remove(&child_pid);
+        // #region agent log
+        crate::safe_print!(64, "[vfork-dbg] lock released, result={:?}\n", result);
+        // #endregion
+        result
     });
+    // #region agent log
+    crate::safe_print!(64, "[vfork-dbg] parent_tid={:?}\n", parent_tid);
+    // #endregion
     if let Some(tid) = parent_tid {
         // #region agent log
         crate::tprint!(96, "[FORK-DBG] vfork_complete waking parent tid={}\n", tid);
         // #endregion
         akuma_exec::threading::get_waker_for_thread(tid).wake();
     }
+    // #region agent log
+    crate::safe_print!(64, "[vfork-dbg] vfork_complete returning\n");
+    // #endregion
 }
 
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
@@ -275,11 +291,21 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         akuma_exec::process::kill_thread_group(pid, l0_phys);
         vfork_complete(pid);
 
+        // #region agent log
+        crate::tprint!(128, "[exit_group-dbg] after vfork_complete, checking proc_tid={:?} vs current tid\n", proc_tid);
+        // #endregion
+
         // Terminate the calling thread — exit_group() must never return to EL0.
         // Only do this if the calling thread IS the process's own thread;
         // kernel helpers must NOT be terminated.
         let tid = akuma_exec::threading::current_thread_id();
+        // #region agent log
+        crate::tprint!(128, "[exit_group-dbg] tid={} proc_tid={:?} match={}\n", tid, proc_tid, proc_tid == Some(tid));
+        // #endregion
         if proc_tid == Some(tid) {
+            // #region agent log
+            crate::tprint!(128, "[exit_group-dbg] setting io_ch exited and terminating\n");
+            // #endregion
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
@@ -289,7 +315,13 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             // when the thread slot is recycled, or by wait4.
             // Calling unregister_process here was causing the parent's
             // cmd.Wait() to hang because wait4 couldn't find the child.
+            // #region agent log
+            crate::tprint!(128, "[exit_group-dbg] calling mark_thread_terminated\n");
+            // #endregion
             akuma_exec::threading::mark_thread_terminated(tid);
+            // #region agent log
+            crate::tprint!(128, "[exit_group-dbg] entering yield loop\n");
+            // #endregion
             loop { akuma_exec::threading::yield_now(); }
         }
     }

@@ -463,9 +463,12 @@ impl Command for PsCommand {
         Box::pin(async move {
             use akuma_exec::process;
 
+            (akuma_exec::runtime::runtime().print_str)("[ps] enter\n");
             let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  CMDLINE\r\n").await;
+            (akuma_exec::runtime::runtime().print_str)("[ps] header done\n");
 
             let procs = process::list_processes();
+            (akuma_exec::runtime::runtime().print_str)("[ps] list done\n");
 
             if procs.is_empty() {
                 let _ = stdout.write(b"(no processes running)\r\n").await;

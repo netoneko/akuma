@@ -801,7 +801,8 @@ hard-killing would affect interactive session behavior and needs careful design.
 | Process table (ps, iteration) | WORKS (atomic array, no locks for reads) |
 | Child exit code after SIGTERM | BROKEN (code 130 instead of 0) |
 | Go build (compiler toolchain) | 30/31 packages compiled |
-| SSH stability after forktest | WORKS |
+| SSH stability after forktest | WORKS (kill/wait path fixed, tgid group-kill removed) |
+| ps after forktest | INVESTIGATING (hangs — debug prints added to narrow location) |
 
 ---
 
