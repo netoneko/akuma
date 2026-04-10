@@ -3667,7 +3667,7 @@ fn test_mmap_does_not_overlap_identity_map() -> bool {
         if let Some(a) = addr {
             // Verify address is completely outside the kernel reserved range
             let end = a + size;
-            if (a < 0xC000_0000 && end > 0x4000_0000) {
+            if a < 0xC000_0000 && end > 0x4000_0000 {
                 crate::safe_print!(128, "  FAIL: allocated 0x{:x}-0x{:x} overlaps kernel\n", a, end);
                 return false;
             }
