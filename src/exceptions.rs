@@ -2444,6 +2444,16 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
+                // Fatal signal in a thread should kill the entire process group.
+                // On Linux, unhandled SIGSEGV triggers exit_group for all threads.
+                // Without this, goroutine crashes leave Go runtime in a broken state.
+                let is_clone_thread = proc.address_space.is_shared();
+                if is_clone_thread {
+                    // This is a clone_thread (goroutine) - kill entire thread group
+                    crate::safe_print!(64, "[Fault] SIGSEGV in clone_thread, calling exit_group\n");
+                    crate::syscall::proc::sys_exit_group_pub(-11);
+                    // sys_exit_group_pub doesn't return
+                }
                 crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -11);
                 crate::syscall::proc::vfork_complete(proc.pid);
             }

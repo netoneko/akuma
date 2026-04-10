@@ -233,6 +233,16 @@ pub(super) fn sys_exit(code: i32) -> u64 {
     code as u64
 }
 
+/// Public wrapper for sys_exit_group, callable from exception handlers.
+/// Used when a fatal signal (SIGSEGV) in a clone_thread needs to kill
+/// the entire thread group.
+pub fn sys_exit_group_pub(code: i32) -> ! {
+    sys_exit_group(code);
+    // sys_exit_group should not return for the calling thread, but if it does
+    // (e.g., called from a kernel helper thread), fall through to return_to_kernel.
+    akuma_exec::process::return_to_kernel(code);
+}
+
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {

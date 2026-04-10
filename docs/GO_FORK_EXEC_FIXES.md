@@ -1243,3 +1243,50 @@ Two separate issues:
 |------|--------|
 | `src/process_tests.rs` | Changed fake thread IDs to >= 100; disabled msgqueue waker tests |
 | `crates/akuma-exec/src/process/table.rs` | Skip mark_thread_terminated for current thread |
+
+---
+
+## 2026-04-10: Fatal Signal in Clone Thread Triggers exit_group
+
+### Symptom
+
+Running `forktest_parent` from `/bin` would leave zombie processes and orphaned
+threads. The parent would hang after printing partial output. `ps` showed
+processes in "running" state that weren't actually running, and `kthreads`
+showed many orphaned user-process threads.
+
+Log showed goroutine threads crashing with SIGSEGV at invalid addresses like
+FAR=0x2 (NULL+offset dereference).
+
+### Root Cause
+
+When a Go goroutine thread crashed with SIGSEGV, Akuma called
+`return_to_kernel(-11)` which only exited that individual thread. The Go
+runtime was left in an inconsistent state - missing goroutines that it was
+waiting for. When SIGTERM arrived later, Go's graceful shutdown couldn't
+complete because the runtime was already broken.
+
+On Linux, an unhandled fatal signal (SIGSEGV, SIGBUS, etc.) in any thread
+triggers `exit_group` for the entire process.
+
+### Fix
+
+In `src/exceptions.rs`, when a fatal signal occurs in a `clone_thread` (detected
+via `address_space.is_shared()`), call `sys_exit_group_pub(-11)` instead of just
+`return_to_kernel(-11)`. This terminates all threads in the thread group.
+
+```rust
+let is_clone_thread = proc.address_space.is_shared();
+if is_clone_thread {
+    crate::syscall::proc::sys_exit_group_pub(-11);
+}
+```
+
+Also added `sys_exit_group_pub()` in `src/syscall/proc.rs` as a public wrapper.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/exceptions.rs` | Call exit_group for fatal signals in clone_threads |
+| `src/syscall/proc.rs` | Added sys_exit_group_pub() wrapper |
