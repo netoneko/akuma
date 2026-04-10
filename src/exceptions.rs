@@ -1411,9 +1411,6 @@ extern "C" fn rust_sync_el1_handler() {
     // actual data aborts — moving it earlier increases the window.
     // The debug dump noise for copy_to_user_safe faults is acceptable.
 
-    // #region agent log
-    crate::console::print("[FORK-DBG] EL1 SYNC EXCEPTION!\n");
-    // #endregion
     use core::fmt::Write;
     
     // Read ESR_EL1 to determine exception type
@@ -2437,13 +2434,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
-            // #region agent log
-            let tid = akuma_exec::threading::current_thread_id();
-            let ttbr0: u64;
-            unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
-            crate::safe_print!(192, "[DA-DBG] tid={} far=0x{:x} elr=0x{:x} ttbr0=0x{:x}\n",
-                tid, far, elr, ttbr0);
-            // #endregion
             if let Some(proc) = akuma_exec::process::current_process() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
                     .saturating_sub(proc.start_time_us);

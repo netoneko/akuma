@@ -541,3 +541,61 @@ fn write_at_file_size_appends_without_overwriting() {
     assert_eq!(result.len(), initial.len() + appended.len());
     assert_eq!(&result[initial.len()..], appended);
 }
+
+#[test]
+fn try_lock_state_succeeds_when_unlocked() {
+    let dev = load_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(dev, || 0).unwrap();
+    
+    // try_lock_state should succeed immediately when lock is not held
+    let guard = fs.try_lock_state(10);
+    assert!(guard.is_some(), "try_lock_state should succeed when lock is free");
+}
+
+#[test]
+fn try_lock_state_returns_none_when_locked() {
+    let dev = load_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(dev, || 0).unwrap();
+    
+    // Hold the lock
+    let _guard = fs.state.lock();
+    
+    // try_lock_state should fail quickly (1 retry only)
+    let result = fs.try_lock_state(1);
+    assert!(result.is_none(), "try_lock_state should return None when lock is held");
+}
+
+#[test]
+fn exists_returns_error_on_lock_contention() {
+    use std::sync::Arc;
+    use std::thread;
+    
+    let dev = load_fixture("test.ext2");
+    let fs = Arc::new(Ext2Filesystem::new(dev, || 0).unwrap());
+    
+    // Hold the state lock in a separate thread
+    let fs_clone = Arc::clone(&fs);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    
+    let handle = thread::spawn(move || {
+        let _guard = fs_clone.state.lock();
+        tx.send(()).unwrap(); // Signal that lock is held
+        done_rx.recv().unwrap(); // Wait for test to complete
+    });
+    
+    // Wait for lock to be held
+    rx.recv().unwrap();
+    
+    // exists() should eventually return false (via IoError -> not found path)
+    // because try_lock_state will fail after retries
+    let result = fs.exists("/test");
+    
+    // Signal thread to release lock
+    done_tx.send(()).unwrap();
+    handle.join().unwrap();
+    
+    // With the try_lock approach, exists returns false when lock can't be acquired
+    // (IoError is converted to not-found in lookup_path)
+    assert!(!result, "exists should return false when lock is contested");
+}

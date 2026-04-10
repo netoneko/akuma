@@ -463,17 +463,8 @@ impl Command for PsCommand {
         Box::pin(async move {
             use akuma_exec::process;
 
-            // #region agent log
-            crate::safe_print!(32, "[ps] start\n");
-            // #endregion
             let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  CMDLINE\r\n").await;
-            // #region agent log
-            crate::safe_print!(32, "[ps] calling list_processes\n");
-            // #endregion
             let procs = process::list_processes();
-            // #region agent log
-            crate::safe_print!(64, "[ps] got {} processes\n", procs.len());
-            // #endregion
 
             if procs.is_empty() {
                 let _ = stdout.write(b"(no processes running)\r\n").await;

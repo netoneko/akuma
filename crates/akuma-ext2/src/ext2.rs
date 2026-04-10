@@ -205,6 +205,19 @@ struct DirEntryRaw {
 // Ext2 Filesystem State
 // ============================================================================
 
+/// Internal filesystem state. Public for testing only.
+#[cfg(test)]
+pub struct Ext2State {
+    superblock: Superblock,
+    block_size: usize,
+    inodes_per_group: u32,
+    inode_size: u16,
+    block_group_count: u32,
+    blocks_per_group: u32,
+    first_data_block: u32,
+}
+
+#[cfg(not(test))]
 struct Ext2State {
     superblock: Superblock,
     block_size: usize,
@@ -223,6 +236,10 @@ struct Ext2State {
 pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     time_fn: fn() -> u64,
+    /// Internal state protected by spinlock. Public for testing only.
+    #[cfg(test)]
+    pub state: Spinlock<Ext2State>,
+    #[cfg(not(test))]
     state: Spinlock<Ext2State>,
     block_cache: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>>,
 }
@@ -282,6 +299,33 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     fn current_time(&self) -> u32 {
         ((self.time_fn)() / 1_000_000) as u32
+    }
+
+    /// Try to acquire the state lock with a retry limit.
+    /// Returns None if the lock cannot be acquired after max_retries attempts.
+    /// 
+    /// This prevents indefinite hangs when a process holding the lock is killed.
+    #[cfg(test)]
+    pub fn try_lock_state(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
+        self.try_lock_state_internal(max_retries)
+    }
+    
+    #[cfg(not(test))]
+    fn try_lock_state(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
+        self.try_lock_state_internal(max_retries)
+    }
+    
+    fn try_lock_state_internal(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
+        for _ in 0..max_retries {
+            if let Some(guard) = self.state.try_lock() {
+                return Some(guard);
+            }
+            // Small spin delay
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+        None
     }
 
     // ========================================================================
@@ -1097,7 +1141,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // ========================================================================
 
     fn lookup_path(&self, path: &str) -> Result<u32, FsError> {
-        let state = self.state.lock();
+        // Use try_lock with retry to detect potential deadlock from killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         self.lookup_path_internal(&state, path)
     }
 
