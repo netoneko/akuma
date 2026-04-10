@@ -74,8 +74,16 @@ pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
             // This prevents orphaned threads that stay READY forever after
             // their process is reaped. Without this, kthreads shows "user-process"
             // threads with no corresponding process, and switching to them hangs.
+            //
+            // IMPORTANT: Only mark terminated if this is NOT the current thread.
+            // Tests call unregister_process from the same thread to clean up,
+            // and marking ourselves terminated would cause Thread 0's cleanup
+            // to zero our context while we're still running.
             if let Some(tid) = unsafe { (*ptr).thread_id } {
-                crate::threading::mark_thread_terminated(tid);
+                let current_tid = crate::threading::current_thread_id();
+                if tid != current_tid {
+                    crate::threading::mark_thread_terminated(tid);
+                }
             }
             // Found it — swap to null and mark FREE
             let old = PROCESS_SLOTS[i].swap(core::ptr::null_mut(), Ordering::AcqRel);

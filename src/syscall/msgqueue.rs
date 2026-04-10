@@ -309,6 +309,7 @@ pub(crate) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags
 }
 
 /// Register a thread as interested in receiving from this queue (for epoll/poll).
+#[allow(dead_code)]
 pub(crate) fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -319,6 +320,7 @@ pub(crate) fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
 }
 
 /// Register a thread as interested in sending to this queue (for epoll/poll).
+#[allow(dead_code)]
 pub(crate) fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -357,6 +359,7 @@ pub(crate) fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
 // ============================================================================
 
 /// Test helper: return the number of recv pollers registered on a queue.
+#[allow(dead_code)]
 pub(crate) fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.recv_pollers.len())
@@ -364,6 +367,7 @@ pub(crate) fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
 }
 
 /// Test helper: return the number of send pollers registered on a queue.
+#[allow(dead_code)]
 pub(crate) fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.send_pollers.len())
@@ -371,6 +375,7 @@ pub(crate) fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
 }
 
 /// Test helper: check if a specific tid is registered as a recv poller.
+#[allow(dead_code)]
 pub(crate) fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(false, |q| q.recv_pollers.contains(&tid))
@@ -378,6 +383,7 @@ pub(crate) fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bo
 }
 
 /// Test helper: directly push a message into a queue (bypasses userspace pointer validation).
+#[allow(dead_code)]
 pub(crate) fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -400,6 +406,7 @@ pub(crate) fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[
 }
 
 /// Test helper: pop a message from a queue (bypasses userspace pointer validation).
+#[allow(dead_code)]
 pub(crate) fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -424,6 +431,7 @@ pub(crate) fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc
 }
 
 /// Test helper: return the number of messages in the queue.
+#[allow(dead_code)]
 pub(crate) fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.messages.len())
