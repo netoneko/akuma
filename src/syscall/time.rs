@@ -8,31 +8,8 @@ struct LocalTimespec {
     tv_nsec: u64,
 }
 
-// #region agent log
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtOrd};
-static CLOCK_DEBUG_ONCE: AtomicBool = AtomicBool::new(false);
-static CLOCK_EFAULT_COUNT: AtomicU32 = AtomicU32::new(0);
-// #endregion
-
 pub(super) fn sys_clock_gettime(clock_id: u32, tp_ptr: u64) -> u64 {
-    // #region agent log
-    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let tid = akuma_exec::threading::current_thread_id();
-    let ttbr0 = akuma_exec::mmu::get_current_ttbr0();
-    let is_mapped = akuma_exec::mmu::is_current_user_range_mapped(tp_ptr as usize, 16);
-    let lazy_info = akuma_exec::process::lazy_region_lookup(tp_ptr as usize);
-    // #endregion
-
-    if !validate_user_ptr(tp_ptr, 16) {
-        // #region agent log
-        let count = CLOCK_EFAULT_COUNT.fetch_add(1, AtOrd::Relaxed);
-        if count < 5 || !CLOCK_DEBUG_ONCE.swap(true, AtOrd::Relaxed) {
-            crate::safe_print!(256, "[CLKDBG] EFAULT pid={} tid={} ptr=0x{:x} ttbr0=0x{:x} mapped={} lazy={:?}\n",
-                pid, tid, tp_ptr, ttbr0, is_mapped, lazy_info.is_some());
-        }
-        // #endregion
-        return EFAULT;
-    }
+    if !validate_user_ptr(tp_ptr, 16) { return EFAULT; }
 
     let (sec, nsec) = match clock_id {
         0 => {
