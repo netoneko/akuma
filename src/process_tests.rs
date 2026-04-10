@@ -2527,6 +2527,9 @@ fn test_epoll_socket_waker() {
             sock.wake_all();
         });
 
+        // Mark terminated before yield loop to avoid thread leak
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
         loop { akuma_exec::threading::yield_now(); }
     }).expect("Failed to spawn waker thread");
 
@@ -2591,6 +2594,8 @@ fn test_epoll_poll_socket_readiness_no_deadlock() {
             POLL_ITERS.fetch_add(1, Ordering::SeqCst);
             akuma_exec::threading::yield_now();
         }
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
         loop { akuma_exec::threading::yield_now(); }
     }).expect("Failed to spawn poller thread");
 
@@ -2603,6 +2608,7 @@ fn test_epoll_poll_socket_readiness_no_deadlock() {
             akuma_exec::threading::yield_now();
         }
         akuma_exec::process::unregister_thread_pid(my_tid);
+        akuma_exec::threading::mark_thread_terminated(my_tid);
         loop { akuma_exec::threading::yield_now(); }
     }).expect("Failed to spawn checker thread");
 
@@ -2708,6 +2714,7 @@ fn test_epoll_multi_poller_pipe() {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         akuma_exec::process::unregister_thread_pid(my_tid);
+        akuma_exec::threading::mark_thread_terminated(my_tid);
         loop { akuma_exec::threading::yield_now(); }
     }).expect("thread 1 spawn failed");
 
@@ -2719,6 +2726,7 @@ fn test_epoll_multi_poller_pipe() {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         akuma_exec::process::unregister_thread_pid(my_tid);
+        akuma_exec::threading::mark_thread_terminated(my_tid);
         loop { akuma_exec::threading::yield_now(); }
     }).expect("thread 2 spawn failed");
 

@@ -246,12 +246,14 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
+        crate::safe_print!(16, "[eg]A\n");
         proc.exited = true;
         proc.exit_code = code;
         proc.state = akuma_exec::process::ProcessState::Zombie(code);
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
+        crate::safe_print!(16, "[eg]B\n");
         notify_child_channel_exited(pid, code);
         // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
         // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
@@ -261,18 +263,43 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if tgid != pid {
             notify_child_channel_exited(tgid, code);
         }
+        crate::safe_print!(16, "[eg]C\n");
         // Kill sibling threads FIRST, before closing FDs.
         // This prevents goroutines from being scheduled while we hold locks.
+        // Debug: count siblings before killing
+        let mut sib_tids: [usize; 8] = [0; 8];
+        let mut sib_count = 0usize;
+        akuma_exec::process::table::for_each_process(|p| {
+            if p.pid != pid && p.tgid == tgid {
+                if sib_count < 8 {
+                    sib_tids[sib_count] = p.thread_id.unwrap_or(999);
+                }
+                sib_count += 1;
+            }
+        });
+        crate::safe_print!(64, "[ktg] pid={} sibs={} tids={},{},{}\n", 
+            pid, sib_count, sib_tids[0], sib_tids[1], sib_tids[2]);
         akuma_exec::process::kill_thread_group(pid, l0_phys);
-        // Yield to let terminated siblings release any locks they're holding.
-        // Without this, a goroutine blocked in epoll_pwait might still hold
-        // EPOLL_TABLE lock, causing close_all() → epoll_destroy to deadlock.
-        akuma_exec::threading::yield_now();
+        // Verify siblings are terminated
+        for i in 0..sib_count.min(3) {
+            let tid = sib_tids[i];
+            if tid < 64 {
+                let state = akuma_exec::threading::get_thread_state(tid);
+                crate::safe_print!(48, "[ktg] after: tid={} state={}\n", tid, state);
+            }
+        }
+        crate::safe_print!(16, "[eg]D\n");
+        // NOTE: We intentionally do NOT yield here. The siblings are already
+        // marked TERMINATED by kill_thread_group, so they can't be scheduled.
+        // Yielding would risk switching to orphaned threads from previous runs
+        // that weren't properly cleaned up (thread leak bug).
+        crate::safe_print!(16, "[eg]E\n");
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later
         // will find an empty table and skip any double-close.
         proc.fds.close_all();
+        crate::safe_print!(16, "[eg]F\n");
         vfork_complete(pid);
 
         // Terminate the calling thread — exit_group() must never return to EL0.

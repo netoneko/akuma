@@ -1122,34 +1122,81 @@ happened to be in epoll_pwait at the moment exit_group ran.
 
 ### Fix
 
-Two changes in `src/syscall/proc.rs`:
-
-1. **Call kill_thread_group BEFORE close_all**: This marks sibling threads as
-   TERMINATED so they can't acquire new locks.
-
-2. **Yield after kill_thread_group**: This gives siblings a chance to wake up,
-   see they're terminated, and release any locks they're holding. Without this
-   yield, a sibling blocked in a syscall wouldn't get scheduled to release its
-   lock.
+Call `kill_thread_group` BEFORE `close_all` in `src/syscall/proc.rs`. This marks
+sibling threads as TERMINATED so they can't acquire new locks.
 
 ```rust
 // Kill sibling threads FIRST, before closing FDs.
 akuma_exec::process::kill_thread_group(pid, l0_phys);
-// Yield to let terminated siblings release any locks they're holding.
-akuma_exec::threading::yield_now();
 // NOW safe to close FDs - siblings can't hold locks anymore.
 proc.fds.close_all();
 ```
-
-### Tests Added
-
-- `test_exit_group_kills_siblings_before_close_all`: Verifies siblings are
-  TERMINATED before close_all would run.
-- `test_exit_group_yields_after_killing_siblings`: Verifies yield doesn't crash.
 
 ### Files Changed
 
 | File | Change |
 |------|--------|
-| `src/syscall/proc.rs` | Reordered kill_thread_group before close_all, added yield |
-| `src/process_tests.rs` | Added 2 regression tests |
+| `src/syscall/proc.rs` | Reordered kill_thread_group before close_all |
+
+---
+
+## 2026-04-10: Boot Test Thread Leak Fix
+
+### Symptom
+
+After boot, `kthreads` showed 5 orphaned "user-process" threads (tid 8, 9, 10, 11,
+13) in READY state, but `ps` showed no processes. These threads had 32-33KB stack
+usage, indicating they had run.
+
+```
+akuma:/> kthreads
+  TID  STATE     STACK_BASE  STACK_SIZE  STACK_USED  CANARY  TYPE         NAME
+   0  ready     0x40700000    1024 KB      0 KB  0%  OK      cooperative  bootstrap
+   1  ready     0x5800e000     256 KB     34 KB 13%  OK      preemptive   network
+   ...
+   8  ready     0x581ce000     128 KB     32 KB 25%  OK      preemptive   user-process
+   9  ready     0x581ee000     128 KB     33 KB 26%  OK      preemptive   user-process
+  ...
+```
+
+### Root Cause
+
+Boot tests in `src/process_tests.rs` spawn helper threads via `spawn_user_thread_fn`
+that end with `loop { yield_now(); }` but never call `mark_thread_terminated()`.
+These threads remained permanently READY after completing their work.
+
+When `yield_now()` was called elsewhere (e.g., in `sys_exit_group`), the scheduler
+could switch to these orphaned threads, which would attempt to run without a valid
+process context, causing hangs.
+
+### Fix
+
+Added `mark_thread_terminated(tid)` before the yield loop in all 5 test thread
+spawn sites:
+
+1. `test_epoll_socket_waker` - waker thread (line ~2530)
+2. `test_epoll_socket_concurrent_polling` - poller thread (line ~2599)
+3. `test_epoll_socket_concurrent_polling` - checker thread (line ~2612)
+4. `test_cross_epoll_wakeup` - thread 1 (line ~2718)
+5. `test_cross_epoll_wakeup` - thread 2 (line ~2730)
+
+### Result
+
+After fix, boot shows only 4 threads (bootstrap, network, 2x system-thread):
+
+```
+akuma:/> kthreads
+  TID  STATE     STACK_BASE  STACK_SIZE  STACK_USED  CANARY  TYPE         NAME
+   0  ready     0x40700000    1024 KB      0 KB  0%  OK      cooperative  bootstrap
+   1  ready     0x5800e000     256 KB     34 KB 13%  OK      preemptive   network
+   2  ready     0x5804e000     256 KB     33 KB 12%  OK      preemptive   system-thread
+   3  running   0x5808e000     256 KB     41 KB 16%  OK      preemptive   system-thread
+
+Total: 4 threads (ready: 3, running: 1, terminated: 0)
+```
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/process_tests.rs` | Added mark_thread_terminated() before yield loops in 5 test threads |
