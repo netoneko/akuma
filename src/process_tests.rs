@@ -1477,15 +1477,15 @@ fn test_signal_mask_nodefer_flag_skips() {
 // ── Signal frame layout constant regression tests ─────────────────────────
 
 /// Verify that the signal frame layout constants are self-consistent and match
-/// the Linux AArch64 ABI.
+/// the Linux AArch64 ABI (Go's defs_linux_arm64.go).
 ///
-/// Layout (from linux/arch/arm64/include/uapi/asm/sigcontext.h):
+/// Layout:
 ///   siginfo_t      128 bytes  at offset   0
-///   ucontext_t hdr 168 bytes  at offset 128  (uc_flags+uc_link+uc_stack+uc_sigmask+__unused)
-///   sigcontext     280 bytes  at offset 296  (fault_addr + regs[31] + sp + pc + pstate)
-///   FPSIMD record  528 bytes  at offset 576  (_aarch64_ctx(8)+fpsr(4)+fpcr(4)+vregs[32](512))
-///   null terminator  8 bytes  at offset 1104
-///   total size    1112 bytes
+///   ucontext_t hdr 176 bytes  at offset 128  (uc_flags+uc_link+uc_stack+uc_sigmask+_pad+_pad2)
+///   sigcontext     280 bytes  at offset 304  (fault_addr + regs[31] + sp + pc + pstate)
+///   FPSIMD record  528 bytes  at offset 584  (_aarch64_ctx(8)+fpsr(4)+fpcr(4)+vregs[32](512))
+///   null terminator  8 bytes  at offset 1112
+///   total size    1120 bytes
 ///
 /// The `uc_sigmask` field lives at ucontext+40 → frame offset 168 (128+40).
 fn test_sigframe_layout_constants() {
@@ -1502,20 +1502,20 @@ fn test_sigframe_layout_constants() {
         ok = false;
     }
 
-    // ucontext header: 168 bytes
-    if TEST_SIGFRAME_MCONTEXT != 128 + 168 {
+    // ucontext header: 176 bytes (Go's _pad + _pad2 for 16-byte alignment before sigcontext)
+    if TEST_SIGFRAME_MCONTEXT != 128 + 176 {
         crate::safe_print!(64, "[Test] sigframe: MCONTEXT offset wrong: {}\n", TEST_SIGFRAME_MCONTEXT);
         ok = false;
     }
 
     // sigcontext: 280 bytes
-    if TEST_SIGFRAME_FPSIMD != 128 + 168 + 280 {
+    if TEST_SIGFRAME_FPSIMD != 128 + 176 + 280 {
         crate::safe_print!(64, "[Test] sigframe: FPSIMD offset wrong: {}\n", TEST_SIGFRAME_FPSIMD);
         ok = false;
     }
 
     // FPSIMD(528) + null(8) = 536
-    if TEST_SIGFRAME_SIZE != 128 + 168 + 280 + 528 + 8 {
+    if TEST_SIGFRAME_SIZE != 128 + 176 + 280 + 528 + 8 {
         crate::safe_print!(64, "[Test] sigframe: SIZE wrong: {}\n", TEST_SIGFRAME_SIZE);
         ok = false;
     }

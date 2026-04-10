@@ -648,11 +648,19 @@ const SA_NODEFER: u64 = 0x40000000;
 // sigcontext (fault_address + regs[31] + sp + pc + pstate): 280 bytes
 // FPSIMD extension record: _aarch64_ctx(8) + fpsr(4) + fpcr(4) + vregs[32](512) = 528 bytes
 // Null terminator _aarch64_ctx{0,0}: 8 bytes
-const SIGFRAME_SIZE: usize = 128 + 168 + 280 + 528 + 8; // 1112 bytes
+// AArch64 rt_sigframe layout (matches Linux kernel):
+// siginfo_t:   128 bytes
+// ucontext_t:  176 bytes header (uc_flags, uc_link, uc_stack, uc_sigmask, _pad, _pad2)
+// sigcontext:  280 bytes (fault_address, regs[31], sp, pc, pstate, __reserved[8])
+// FPSIMD:      528 bytes (_aarch64_ctx header + fpsr + fpcr + vregs[32])
+// Null term:   8 bytes
+const SIGFRAME_SIZE: usize = 128 + 176 + 280 + 528 + 8; // 1120 bytes
 const SIGFRAME_SIGINFO: usize = 0;
 const SIGFRAME_UCONTEXT: usize = 128;
-const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168; // 296
-const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 576
+// uc_mcontext is at offset 176 within ucontext_t (not 168!)
+// Layout: uc_flags(8) + uc_link(8) + uc_stack(24) + uc_sigmask(8) + _pad(120) + _pad2(8) = 176
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 176; // 304
+const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 584
 const FPSIMD_MAGIC: u32 = 0x46508001;
 
 // Exposed for kernel layout tests.

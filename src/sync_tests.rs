@@ -778,9 +778,11 @@ fn test_rt_sigreturn_restores_registers() {
     // TEST hook if available, or just verify the frame layout constants.
     //
     // Verify the frame layout:
-    // MCONTEXT starts at SIGFRAME_UCONTEXT (128) + 168 = 296.
+    // MCONTEXT starts at SIGFRAME_UCONTEXT (128) + 176 = 304.
+    // The 176 offset includes: uc_flags(8) + uc_link(8) + uc_stack(24) + 
+    // uc_sigmask(8) + _pad(120) + _pad2(8) = 176 bytes.
     assert!(
-        TEST_SIGFRAME_MCONTEXT == 128 + 168,
+        TEST_SIGFRAME_MCONTEXT == 128 + 176,
         "MCONTEXT offset wrong: {}",
         TEST_SIGFRAME_MCONTEXT
     );
@@ -789,9 +791,9 @@ fn test_rt_sigreturn_restores_registers() {
         TEST_SIGFRAME_UCONTEXT + 40 == 168,
         "uc_sigmask offset wrong"
     );
-    // FPSIMD block starts at MCONTEXT + 280 = 576.
+    // FPSIMD block starts at MCONTEXT + 280 = 584.
     assert!(
-        TEST_SIGFRAME_FPSIMD == 576,
+        TEST_SIGFRAME_FPSIMD == 584,
         "FPSIMD offset wrong: {}",
         TEST_SIGFRAME_FPSIMD
     );

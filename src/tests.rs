@@ -8252,7 +8252,7 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
 /// uc_stack (stack_t) must be at ucontext+16 with fields:
 ///   +16: ss_sp (u64), +24: ss_flags (i32 + 4 pad), +32: ss_size (u64)
 /// uc_sigmask at ucontext+40.
-/// mcontext at ucontext+168.
+/// mcontext at ucontext+176 (after 120-byte _pad + 8-byte _pad2 for alignment).
 fn test_signal_frame_uc_stack_offsets() -> bool {
     use crate::exceptions::{
         TEST_SIGFRAME_UCONTEXT, TEST_SIGFRAME_MCONTEXT,
@@ -8260,15 +8260,16 @@ fn test_signal_frame_uc_stack_offsets() -> bool {
     };
     console::print("  signal_frame_uc_stack_offsets: ");
 
-    // ucontext layout:
-    //   +0:  uc_flags (u64)
-    //   +8:  uc_link  (u64)
-    //   +16: uc_stack.ss_sp    (u64)
-    //   +24: uc_stack.ss_flags (i32 + 4 pad)
-    //   +32: uc_stack.ss_size  (u64)
-    //   +40: uc_sigmask        (u64)
-    //   +48..+168: padding / __reserved
-    //   +168: uc_mcontext (sigcontext)
+    // ucontext layout (matches Go's defs_linux_arm64.go):
+    //   +0:   uc_flags (u64)
+    //   +8:   uc_link  (u64)
+    //   +16:  uc_stack.ss_sp    (u64)
+    //   +24:  uc_stack.ss_flags (i32 + 4 pad)
+    //   +32:  uc_stack.ss_size  (u64)
+    //   +40:  uc_sigmask        (u64)
+    //   +48:  _pad[(1024-64)/8] (120 bytes)
+    //   +168: _pad2[8]          (8 bytes for 16-byte alignment)
+    //   +176: uc_mcontext (sigcontext)
 
     let uc_stack_ss_sp = TEST_SIGFRAME_UCONTEXT + 16;
     let uc_stack_ss_flags = TEST_SIGFRAME_UCONTEXT + 24;
@@ -8282,10 +8283,11 @@ fn test_signal_frame_uc_stack_offsets() -> bool {
         return false;
     }
 
-    // mcontext should be at ucontext + 168 (per Linux AArch64 ABI)
-    if TEST_SIGFRAME_MCONTEXT != TEST_SIGFRAME_UCONTEXT + 168 {
-        crate::safe_print!(64, "FAIL: mcontext offset {} != ucontext+168 ({})\n",
-            TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_UCONTEXT + 168);
+    // mcontext should be at ucontext + 176 (per Linux AArch64 ABI)
+    // Go's ucontext has: _pad[(1024-64)/8]=120 bytes + _pad2[8]=8 bytes before uc_mcontext
+    if TEST_SIGFRAME_MCONTEXT != TEST_SIGFRAME_UCONTEXT + 176 {
+        crate::safe_print!(64, "FAIL: mcontext offset {} != ucontext+176 ({})\n",
+            TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_UCONTEXT + 176);
         return false;
     }
 

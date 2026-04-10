@@ -1363,6 +1363,66 @@ Three new tests in `crates/akuma-ext2/src/tests.rs`:
 
 ---
 
+## 2026-04-10: Signal Frame Layout Bug Fix (uc_mcontext offset)
+
+### Problem
+
+Go processes crashed with `SIGSEGV: segmentation violation PC=0x20000000`. The crash
+message showed `PC=0x20000000` which is actually a PSTATE value (C-flag = Carry set),
+not a code address. This indicated that Go was reading the wrong field from the signal
+frame - it was reading `pstate` where it expected `pc`.
+
+### Root Cause
+
+The kernel's `rt_sigframe` layout had `uc_mcontext` at the wrong offset within `ucontext_t`.
+
+Go's `defs_linux_arm64.go` defines:
+```go
+type ucontext struct {
+    uc_flags    uint64           // +0, 8 bytes
+    uc_link     *ucontext        // +8, 8 bytes
+    uc_stack    stackt           // +16, 24 bytes
+    uc_sigmask  uint64           // +40, 8 bytes
+    _pad        [(1024-64)/8]byte // +48, 120 bytes
+    _pad2       [8]byte          // +168, 8 bytes (16-byte alignment padding)
+    uc_mcontext sigcontext       // +176 <-- CORRECT OFFSET
+}
+```
+
+The kernel had:
+```rust
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168; // WRONG: 8 bytes too early
+```
+
+This 8-byte misalignment caused Go to read shifted values:
+- Go thought `pc` was at mcontext+264, but read from our mcontext+256 (our `sp`)
+- Go thought `sp` was at mcontext+256, but read from our mcontext+248 (our `x30`)
+- Go thought `pstate` was at mcontext+272, but read from our mcontext+264 (our `pc`)
+
+When Go printed `PC=0x20000000`, it was actually printing our `pstate` value (with the
+Carry flag set). The real PC was being printed as SP.
+
+### Fix
+
+Changed the signal frame layout constants:
+```rust
+// OLD (wrong):
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 168; // 296
+
+// NEW (correct):
+const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 176; // 304
+const SIGFRAME_SIZE: usize = 128 + 176 + 280 + 528 + 8;   // 1120 bytes (was 1112)
+```
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/exceptions.rs` | Fixed SIGFRAME_MCONTEXT offset (168 → 176), SIGFRAME_SIZE (1112 → 1120) |
+| `src/tests.rs` | Updated test_signal_frame_uc_stack_offsets to verify correct offset |
+
+---
+
 ## Current State (2026-04-10)
 
 | Operation | Status |
@@ -1370,16 +1430,36 @@ Three new tests in `crates/akuma-ext2/src/tests.rs`:
 | System stability | WORKS (no hangs) |
 | Process cleanup | WORKS (no zombies, no orphan threads) |
 | Fork+exec chain | WORKS |
-| forktest_parent combined_stress | WORKS (may crash internally but exits cleanly) |
-| Go runtime crashes (SIGSEGV at PC=0x20000000) | EXPECTED (stress test edge cases) |
+| forktest_parent combined_stress | Parent may crash under stress, children continue |
+| Go runtime crashes (SIGSEGV at PC=0x20000000) | FIXED (signal frame layout corrected) |
 | SSH after forktest | WORKS |
 | ps/kthreads after crash | WORKS (no longer hangs on ext2 lock) |
 
-The system is now stable. Go processes may still crash under stress (random goroutine
-crashes from edge cases in the Go runtime), but:
-1. The crashes are handled correctly (exit_group for clone_threads)
-2. All processes are cleaned up (no zombies)
-3. All threads are terminated (no orphans)
-4. The shell returns to prompt
-5. `ps` and `kthreads` show clean state
-6. ext2 lock contention no longer causes hangs
+### Verification
+
+After the signal frame fix, crashes now show **real PC values** instead of corrupted ones:
+
+**Before fix:**
+```
+SIGSEGV: segmentation violation
+PC=0x20000000 m=0 sigcode=1 addr=0x...  ← PC was actually PSTATE
+```
+
+**After fix:**
+```
+SIGSEGV: segmentation violation
+PC=0x13060 m=0 sigcode=1 addr=0x1e07a9000  ← PC is real code address
+```
+
+The `PC=0x13060` is a real instruction address in the forktest binary. The crash is now
+a legitimate memory access fault (SEGV_MAPERR at addr=0x1e07a9000), not a signal frame
+corruption issue.
+
+### Remaining Issues
+
+Go processes may still crash under heavy fork/exec stress due to:
+1. Memory pressure causing unmapped page access
+2. Race conditions in Go's runtime under fork stress
+3. Potential kernel mmap/munmap edge cases
+
+These are separate from the signal frame layout bug and require individual investigation.
