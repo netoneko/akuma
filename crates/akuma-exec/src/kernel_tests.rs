@@ -52,6 +52,7 @@ pub fn run_all_tests() {
     test_thread_pool_initialized();
     test_current_thread_id();
     test_stack_requirements();
+    test_mark_terminated_idempotent();
     print("--- akuma-exec Kernel Tests Done ---\n\n");
 }
 
@@ -112,4 +113,27 @@ fn test_stack_requirements() {
     assert_test!(summary.total_bytes > 0, "stack_requirements_nonzero");
     assert_test!(summary.system_thread_count > 0, "stack_has_system_threads");
     assert_test!(summary.user_thread_count > 0, "stack_has_user_threads");
+}
+
+/// Test that THREAD_STATES is correctly accessible for the two-phase
+/// kill_thread_group fix. The fix relies on mark_thread_terminated being
+/// idempotent and fast (no locks beyond the atomic state).
+fn test_mark_terminated_idempotent() {
+    use crate::threading::{mark_thread_terminated, get_thread_state, thread_state, cleanup_terminated_force};
+
+    // Use a high slot guaranteed to be FREE.
+    let slot: usize = 31;
+
+    // First mark: should transition to TERMINATED.
+    mark_thread_terminated(slot);
+    let s1 = get_thread_state(slot);
+    assert_test!(s1 == thread_state::TERMINATED, "mark_terminated_first_call");
+
+    // Second mark: should remain TERMINATED (idempotent).
+    mark_thread_terminated(slot);
+    let s2 = get_thread_state(slot);
+    assert_test!(s2 == thread_state::TERMINATED, "mark_terminated_idempotent");
+
+    // Cleanup.
+    cleanup_terminated_force();
 }

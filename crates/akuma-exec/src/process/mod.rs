@@ -644,6 +644,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
     let tgid = table::get_process_ptr(my_pid)
         .map(|ptr| unsafe { (*ptr).tgid })
         .unwrap_or(my_pid);
+
     let mut siblings: Vec<(Pid, Option<usize>)> = Vec::new();
     table::for_each_process(|p| {
         if p.pid != my_pid && p.tgid == tgid {
@@ -651,35 +652,24 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
         }
     });
 
-    {
-        let mut buf = [0u8; 128];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[ktg-dbg] pid={} tgid={} siblings={}\n", my_pid, tgid, siblings.len()));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    // PHASE 1: Mark ALL sibling threads as TERMINATED first.
+    // This prevents them from running and acquiring locks while we clean up.
+    // Without this, a sibling could be scheduled between our lock operations,
+    // try to acquire PROCESS_CHANNELS or other locks, and cause a deadlock
+    // when we later try to acquire the same lock.
+    for (_sib_pid, sib_tid) in &siblings {
+        if let Some(tid) = sib_tid {
+            crate::threading::mark_thread_terminated(*tid);
+        }
     }
 
-    for (i, (sib_pid, sib_tid)) in siblings.iter().enumerate() {
-        // #region agent log
-        {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[ktg-loop] sib {}/{} pid={}\n", i+1, siblings.len(), sib_pid));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-        }
-        // #endregion
+    // PHASE 2: Now safe to clean up resources - siblings can't run.
+    for (sib_pid, sib_tid) in &siblings {
         if let Some(proc) = lookup_process(*sib_pid) {
-            // #region agent log
-            (runtime().print_str)("[ktg-loop] cleanup_fds\n");
-            // #endregion
             cleanup_process_fds(proc);
         }
 
         if let Some(tid) = sib_tid {
-            // #region agent log
-            (runtime().print_str)("[ktg-loop] remove_channel\n");
-            // #endregion
             if let Some(channel) = remove_channel(*tid) {
                 channel.set_exited(-9);
             }
@@ -691,30 +681,15 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
         // the 256-slot table and causes ps/list_processes to hang.
         // DO NOT clear lazy regions here — they're keyed by the address-space
         // owner PID, and the owner is still alive.
-        // #region agent log
-        (runtime().print_str)("[ktg-loop] unreg\n");
-        // #endregion
         let _ = table::unregister_process(*sib_pid);
 
         if let Some(tid) = sib_tid {
-            // #region agent log
-            (runtime().print_str)("[ktg-loop] map_rm\n");
-            // #endregion
             with_irqs_disabled(|| {
                 THREAD_PID_MAP.lock().remove(tid);
             });
-            // #region agent log
-            (runtime().print_str)("[ktg-loop] term\n");
-            // #endregion
-            crate::threading::mark_thread_terminated(*tid);
-            // #region agent log
-            (runtime().print_str)("[ktg-loop] wake\n");
-            // #endregion
+            // Already marked terminated in phase 1
             crate::threading::get_waker_for_thread(*tid).wake();
         }
-        // #region agent log
-        (runtime().print_str)("[ktg-loop] done\n");
-        // #endregion
     }
 
     if !siblings.is_empty() {
@@ -1158,24 +1133,8 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 /// With shared fd tables (CLONE_FILES), only the last thread referencing the
 /// table performs actual cleanup. Other threads just drop their Arc reference.
 fn cleanup_process_fds(proc: &Process) {
-    let count = Arc::strong_count(&proc.fds);
-    // #region agent log
-    {
-        let mut buf = [0u8; 64];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[cleanup_fds] pid={} arc={}\n", proc.pid, count));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
-    }
-    // #endregion
-    if count == 1 {
-        // #region agent log
-        (runtime().print_str)("[cleanup_fds] close_all\n");
-        // #endregion
+    if Arc::strong_count(&proc.fds) == 1 {
         proc.fds.close_all();
-        // #region agent log
-        (runtime().print_str)("[cleanup_fds] done\n");
-        // #endregion
     }
 }
 

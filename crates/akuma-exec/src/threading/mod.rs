@@ -1638,6 +1638,12 @@ fn check_stack_canary(stack_base: usize) -> bool {
 
 static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
 static VOLUNTARY_SCHEDULE: AtomicBool = AtomicBool::new(false);
+static SGI_DEBUG_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Enable SGI debug for next yield (one-shot)
+pub fn set_sgi_debug(enable: bool) {
+    SGI_DEBUG_ONCE.store(enable, Ordering::SeqCst);
+}
 
 /// Initialize the thread pool
 pub fn init() {
@@ -1954,19 +1960,34 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
     
     let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
+    let debug = SGI_DEBUG_ONCE.swap(false, Ordering::SeqCst);
+    
+    if debug {
+        safe_print!(64, "[SGI-DBG] entry voluntary={}\n", voluntary);
+    }
     
     // Get scheduling decision
     let switch_info = {
+        if debug { (runtime().print_str)("[SGI-DBG] acquiring POOL\n"); }
         let mut pool = POOL.lock();
-        pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
+        if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
+        let result = pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
             let new_tpidr = pool.slots[new_idx].exception_stack_top;
             (old_idx, new_idx, new_tpidr)
-        })
+        });
+        if debug {
+            if result.is_some() {
+                (runtime().print_str)("[SGI-DBG] schedule_indices returned Some\n");
+            } else {
+                (runtime().print_str)("[SGI-DBG] schedule_indices returned None!\n");
+            }
+        }
+        result
     };
     
     if let Some((old_idx, new_idx, new_tpidr)) = switch_info {
-        if config().enable_sgi_debug_prints {
-            safe_print!(64, "[SGI-S] {} -> {}\n", old_idx, new_idx);
+        if debug || config().enable_sgi_debug_prints {
+            safe_print!(64, "[SGI-DBG] switching {} -> {}\n", old_idx, new_idx);
         }
         
         unsafe {

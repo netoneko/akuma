@@ -232,7 +232,6 @@ pub async fn execute_external_interactive(
         let raw_mode = channel.is_raw_mode();
 
         if let Some(data) = channel.try_read() {
-            crate::safe_print!(128, "[interactive_bridge] read {} bytes from channel\n", data.len());
             if raw_mode {
                 let _ = channel_stream.write_all(&data).await;
             } else {
@@ -249,14 +248,7 @@ pub async fn execute_external_interactive(
             let _ = channel_stream.flush().await;
         }
 
-        // #region agent log
-        let exited = channel.has_exited();
-        let terminated = akuma_exec::threading::is_thread_terminated(thread_id);
-        if exited || terminated {
-            crate::safe_print!(128, "[interactive_bridge] exit detected: exited={} terminated={} tid={}\n", exited, terminated, thread_id);
-        }
-        // #endregion
-        if exited || terminated {
+        if channel.has_exited() || akuma_exec::threading::is_thread_terminated(thread_id) {
             while let Some(data) = channel.try_read() {
                 if raw_mode {
                     let _ = channel_stream.write_all(&data).await;
@@ -273,9 +265,6 @@ pub async fn execute_external_interactive(
                 }
             }
             let _ = channel_stream.flush().await;
-            // #region agent log
-            crate::safe_print!(128, "[interactive_bridge] breaking from loop\n");
-            // #endregion
             break;
         }
 

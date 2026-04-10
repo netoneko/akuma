@@ -1041,6 +1041,43 @@ goroutines continue running. Orphaned goroutine zombies are cleaned up by
 
 ---
 
+### 37. kill_thread_group deadlock in PROCESS_CHANNELS (2026-04-10)
+
+**Symptom:** System hangs completely (no memory monitor, no SSH response) when
+`forktest_parent` exits after a failed child exec. The hang occurs in `sys_exit_group`
+after `kill_thread_group` but before the calling thread terminates.
+
+**Root cause:** `kill_thread_group` performed cleanup operations on sibling threads
+WITHOUT first marking them as TERMINATED. The cleanup sequence was:
+1. `cleanup_process_fds(proc)` — acquires fd table lock
+2. `remove_channel(*tid)` — acquires `PROCESS_CHANNELS` lock
+3. `unregister_process(*sib_pid)` — acquires process table lock
+4. `mark_thread_terminated(*tid)` — finally marks thread as stopped
+
+Between steps 1-3, the scheduler could preempt and run a sibling thread. That sibling,
+still RUNNING, would try to acquire `PROCESS_CHANNELS` (e.g., via `get_channel` in its
+own exit path), causing a spinlock deadlock because the main thread was holding the lock.
+
+The deadlock manifested when the parent's `sys_exit_group` tried to call `get_channel(tid)`
+for its OWN I/O channel — the lock was held by the `remove_channel` call that was
+interrupted mid-operation.
+
+**Fix:** Split `kill_thread_group` into two phases:
+1. **Phase 1:** Mark ALL sibling threads as TERMINATED immediately (no locks needed)
+2. **Phase 2:** Clean up resources safely (siblings can't run, no lock contention)
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+**Tests:**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_kill_thread_group_terminates_before_cleanup` | All siblings are TERMINATED before any cleanup runs |
+| `test_kill_thread_group_no_channel_lock_contention` | No deadlock when removing sibling channels then getting own channel |
+| `test_mark_terminated_idempotent` (crate-level) | mark_thread_terminated is idempotent and lock-free |
+
+---
+
 ## Files Changed
 
 | File | Changes |
@@ -1059,3 +1096,60 @@ goroutines continue running. Orphaned goroutine zombies are cleaned up by
 | `crates/akuma-exec/src/process/diag.rs` | **NEW** Lock timing, borrow tracker diagnostics |
 | `crates/akuma-exec/src/process/table.rs` | Lock-free array: `[AtomicPtr<Process>; 256]` + `[AtomicU8; 256]` |
 | `src/config.rs` | Added FUTEX_DBG_ENABLED const |
+
+---
+
+## 2026-04-10: exit_group Ordering Fix (close_all deadlock)
+
+### Symptom
+
+`forktest_parent --duration 10s --combined_stress` run from `/` (where child fails
+to execve) would intermittently hang on the 4th or 5th run. System would freeze
+completely - no SSH, no memory monitor.
+
+### Root Cause
+
+In `sys_exit_group`, the ordering was wrong:
+1. `close_all()` was called first, trying to close FDs (including epoll)
+2. `kill_thread_group()` was called later to terminate sibling goroutine threads
+
+The problem: A goroutine thread could be blocked in `epoll_pwait`, holding the
+`EPOLL_TABLE` lock. When the main thread called `close_all()` → `epoll_destroy()`,
+it would try to acquire `EPOLL_TABLE` - deadlock!
+
+This was intermittent because it depended on exact timing - whether a goroutine
+happened to be in epoll_pwait at the moment exit_group ran.
+
+### Fix
+
+Two changes in `src/syscall/proc.rs`:
+
+1. **Call kill_thread_group BEFORE close_all**: This marks sibling threads as
+   TERMINATED so they can't acquire new locks.
+
+2. **Yield after kill_thread_group**: This gives siblings a chance to wake up,
+   see they're terminated, and release any locks they're holding. Without this
+   yield, a sibling blocked in a syscall wouldn't get scheduled to release its
+   lock.
+
+```rust
+// Kill sibling threads FIRST, before closing FDs.
+akuma_exec::process::kill_thread_group(pid, l0_phys);
+// Yield to let terminated siblings release any locks they're holding.
+akuma_exec::threading::yield_now();
+// NOW safe to close FDs - siblings can't hold locks anymore.
+proc.fds.close_all();
+```
+
+### Tests Added
+
+- `test_exit_group_kills_siblings_before_close_all`: Verifies siblings are
+  TERMINATED before close_all would run.
+- `test_exit_group_yields_after_killing_siblings`: Verifies yield doesn't crash.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/syscall/proc.rs` | Reordered kill_thread_group before close_all, added yield |
+| `src/process_tests.rs` | Added 2 regression tests |

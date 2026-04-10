@@ -29,34 +29,12 @@ pub(crate) fn notify_child_channel_exited_pub(pid: u32, code: i32) {
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
 pub(crate) fn vfork_complete(child_pid: u32) {
-    // #region agent log
-    crate::tprint!(96, "[FORK-DBG] vfork_complete child_pid={}\n", child_pid);
-    // #endregion
-    // #region agent log
-    crate::safe_print!(64, "[vfork-dbg] about to lock VFORK_WAITERS\n");
-    // #endregion
     let parent_tid = crate::irq::with_irqs_disabled(|| {
-        // #region agent log
-        crate::safe_print!(64, "[vfork-dbg] IRQs disabled, locking\n");
-        // #endregion
-        let result = VFORK_WAITERS.lock().remove(&child_pid);
-        // #region agent log
-        crate::safe_print!(64, "[vfork-dbg] lock released, result={:?}\n", result);
-        // #endregion
-        result
+        VFORK_WAITERS.lock().remove(&child_pid)
     });
-    // #region agent log
-    crate::safe_print!(64, "[vfork-dbg] parent_tid={:?}\n", parent_tid);
-    // #endregion
     if let Some(tid) = parent_tid {
-        // #region agent log
-        crate::tprint!(96, "[FORK-DBG] vfork_complete waking parent tid={}\n", tid);
-        // #endregion
         akuma_exec::threading::get_waker_for_thread(tid).wake();
     }
-    // #region agent log
-    crate::safe_print!(64, "[vfork-dbg] vfork_complete returning\n");
-    // #endregion
 }
 
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
@@ -283,45 +261,30 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if tgid != pid {
             notify_child_channel_exited(tgid, code);
         }
+        // Kill sibling threads FIRST, before closing FDs.
+        // This prevents goroutines from being scheduled while we hold locks.
+        akuma_exec::process::kill_thread_group(pid, l0_phys);
+        // Yield to let terminated siblings release any locks they're holding.
+        // Without this, a goroutine blocked in epoll_pwait might still hold
+        // EPOLL_TABLE lock, causing close_all() → epoll_destroy to deadlock.
+        akuma_exec::threading::yield_now();
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later
         // will find an empty table and skip any double-close.
         proc.fds.close_all();
-        akuma_exec::process::kill_thread_group(pid, l0_phys);
         vfork_complete(pid);
-
-        // #region agent log
-        crate::tprint!(128, "[exit_group-dbg] after vfork_complete, checking proc_tid={:?} vs current tid\n", proc_tid);
-        // #endregion
 
         // Terminate the calling thread — exit_group() must never return to EL0.
         // Only do this if the calling thread IS the process's own thread;
         // kernel helpers must NOT be terminated.
         let tid = akuma_exec::threading::current_thread_id();
-        // #region agent log
-        crate::tprint!(128, "[exit_group-dbg] tid={} proc_tid={:?} match={}\n", tid, proc_tid, proc_tid == Some(tid));
-        // #endregion
         if proc_tid == Some(tid) {
-            // #region agent log
-            crate::tprint!(128, "[exit_group-dbg] setting io_ch exited and terminating\n");
-            // #endregion
             if let Some(io_ch) = akuma_exec::process::get_channel(tid) {
                 io_ch.set_exited(code);
             }
-            // Do NOT unregister_process here.  Leave the process as a zombie
-            // in PROCESS_TABLE so the parent's wait4 can find and collect the
-            // exit status.  The process will be reaped by on_thread_cleanup
-            // when the thread slot is recycled, or by wait4.
-            // Calling unregister_process here was causing the parent's
-            // cmd.Wait() to hang because wait4 couldn't find the child.
-            // #region agent log
-            crate::tprint!(128, "[exit_group-dbg] calling mark_thread_terminated\n");
-            // #endregion
             akuma_exec::threading::mark_thread_terminated(tid);
-            // #region agent log
-            crate::tprint!(128, "[exit_group-dbg] entering yield loop\n");
-            // #endregion
+            // Yield to trigger scheduler. Once terminated, we should never run again.
             loop { akuma_exec::threading::yield_now(); }
         }
     }
@@ -430,9 +393,6 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 // in the same address space, corrupting each other's state.
                 // Note: VFORK_WAITERS was already populated above, before fork_process.
                 if flags & CLONE_VFORK != 0 {
-                    // #region agent log
-                    crate::tprint!(128, "[FORK-DBG] VFORK blocking parent tid={} child={}\n", parent_tid, new_pid);
-                    // #endregion
                     // Loop to absorb spurious wakeups caused by signal delivery.
                     // pend_signal_for_thread() calls wake() which sets the sticky
                     // WOKEN_STATES flag, making schedule_blocking() return even though
@@ -445,9 +405,6 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                         });
                         if !still_pending { break; }
                     }
-                    // #region agent log
-                    crate::tprint!(128, "[FORK-DBG] VFORK parent tid={} RESUMED after child={}\n", parent_tid, new_pid);
-                    // #endregion
                 }
                 return new_pid as u64;
             },
@@ -565,9 +522,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
-    // #region agent log
-    crate::tprint!(128, "[FORK-DBG] do_execve ENTRY: {}\n", resolved_path);
-    // #endregion
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,
@@ -604,10 +558,6 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         }
     }
 
-    // #region agent log
-    crate::tprint!(128, "[FORK-DBG] do_execve: calling replace_image (data={})\n",
-        file_data.as_ref().map_or(0, |d| d.len()));
-    // #endregion
     let replace_result = if let Some(ref data) = file_data {
         proc.replace_image(data, &args, &env)
     } else {
@@ -620,10 +570,6 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         };
         proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
     };
-    // #region agent log
-    crate::tprint!(128, "[FORK-DBG] do_execve: replace_image returned {:?}\n",
-        replace_result.is_ok());
-    // #endregion
 
     if let Err(e) = replace_result {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
