@@ -1866,6 +1866,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             let thread_slot = akuma_exec::threading::current_thread_id();
                             let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                             if sig == 23 && alt_sp == 0 {
+                                crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, JIT retry)\n", thread_slot);
                                 akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                             } else {
                                 unsafe { (*frame).x0 = frame_ref.x0; }
@@ -1906,6 +1907,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let thread_slot = akuma_exec::threading::current_thread_id();
                         let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                         if sig == 23 && alt_sp == 0 {
+                            crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, sigreturn)\n", thread_slot);
                             akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                         } else {
                             unsafe { (*frame).x0 = saved_x0; }
@@ -1999,6 +2001,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                 if sig == 23 && alt_sp == 0 {
                     // Re-pend SIGURG for later - thread not ready yet
+                    crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, syscall return)\n", thread_slot);
                     akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                 } else {
                     // Store the syscall return value in x0 of the trap frame so that

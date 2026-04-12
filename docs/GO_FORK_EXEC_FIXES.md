@@ -1633,6 +1633,79 @@ fix extends that by also checking sigaltstack readiness before signal delivery.
 
 ---
 
+## 2026-04-12: Sigaltstack Inheritance in clone_thread (FIXED)
+
+### Problem
+
+Despite the sigaltstack check (`alt_sp == 0`) in the signal delivery paths, Go
+M-threads were still crashing with `SIGSEGV addr=0x2` and `pc=0x86768`. The crash
+was in `memclr_arm64.s` - Go was trying to clear memory at address ~0x2, indicating
+corrupted allocator state.
+
+### Root Cause
+
+When `clone(CLONE_VM | CLONE_THREAD)` created a new thread, the kernel was copying
+the parent thread's `sigaltstack` to the child:
+
+```rust
+// INCORRECT - this was in clone_thread():
+let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
+crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+```
+
+This caused the SIGURG guard (`alt_sp == 0`) to fail because the new thread had
+`alt_sp` set to the parent's sigaltstack address. The kernel thought the thread was
+ready for signal delivery, but:
+
+1. The Go runtime hadn't finished initializing the M-thread (`mstart1` incomplete)
+2. The parent's sigaltstack memory was shared due to `CLONE_VM`
+3. SIGURG delivery corrupted both parent and child state
+
+### Why Linux Doesn't Inherit Sigaltstack on CLONE_VM
+
+Linux explicitly does NOT inherit the alternate signal stack on `clone(CLONE_VM)`:
+- With `CLONE_VM`, parent and child share the same address space
+- If both used the same sigaltstack, concurrent signals would corrupt the stack
+- Each thread MUST set up its own sigaltstack after creation
+
+For `fork()` (without `CLONE_VM`), sigaltstack is inherited because the child gets
+a copy of the parent's address space, including the alternate stack memory.
+
+### Fix
+
+Removed the sigaltstack copy from `clone_thread()`:
+
+```rust
+// DO NOT copy sigaltstack from parent thread to child thread.
+// Each Go M-thread must set up its own sigaltstack during mstart1.
+// If we copy the parent's sigaltstack, the SIGURG guard (alt_sp == 0 check)
+// will think the child is ready for signal delivery, but it actually isn't -
+// Go's M-thread initialization hasn't completed and signal handlers would
+// corrupt the thread's state. Linux also doesn't inherit sigaltstack on clone.
+```
+
+Now new threads created via `clone(CLONE_VM | CLONE_THREAD)` start with `alt_sp = 0`,
+and the SIGURG guard correctly re-pends the signal until the thread calls `sigaltstack`.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `crates/akuma-exec/src/process/mod.rs` | Removed sigaltstack inheritance in `clone_thread()` |
+
+### Verification
+
+The SIGURG re-pend logging shows the guard now triggers correctly:
+```
+[SIGURG] re-pend tid=23 (alt_sp=0, syscall return)
+[SIGURG] re-pend tid=23 (alt_sp=0, syscall return)
+[SIGURG] re-pend tid=23 (alt_sp=0, syscall return)
+...
+(thread eventually calls sigaltstack, then SIGURG is delivered successfully)
+```
+
+---
+
 ## 2026-04-12: Ext2 Filesystem Orphaned Lock Recovery (FIXED)
 
 ### Problem

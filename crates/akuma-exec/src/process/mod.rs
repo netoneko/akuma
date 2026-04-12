@@ -1837,9 +1837,12 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
 
     new_proc.thread_id = Some(tid);
     
-    // Copy sigaltstack from parent thread to child thread
-    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
-    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+    // DO NOT copy sigaltstack from parent thread to child thread.
+    // Each Go M-thread must set up its own sigaltstack during mstart1.
+    // If we copy the parent's sigaltstack, the SIGURG guard (alt_sp == 0 check)
+    // will think the child is ready for signal delivery, but it actually isn't -
+    // Go's M-thread initialization hasn't completed and signal handlers would
+    // corrupt the thread's state. Linux also doesn't inherit sigaltstack on clone.
 
     crate::threading::update_thread_context(tid, &child_ctx);
 

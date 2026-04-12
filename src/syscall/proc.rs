@@ -1152,7 +1152,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         if sig == 9 {
             let tid = proc.thread_id;
             let exited = proc.exited;
-            drop(proc);
+            let _ = proc; // Release the borrow
             crate::tprint!(128, "[kill-dbg] SIGKILL pid={} tgid={} tid={:?} exited={}\n", pid, tgid, tid, exited);
             akuma_exec::process::kill_thread_group(pid, l0_phys);
             let kill_result = akuma_exec::process::kill_process_with_signal(pid, 9);

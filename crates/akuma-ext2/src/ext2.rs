@@ -28,6 +28,7 @@
     clippy::manual_repeat_n,
     clippy::missing_const_for_fn,
     clippy::no_effect_underscore_binding,
+    clippy::manual_is_multiple_of,
 )]
 
 use alloc::string::{String, ToString};
@@ -72,7 +73,7 @@ fn current_thread_id() -> usize {
 }
 
 fn is_thread_dead(tid: usize) -> bool {
-    unsafe { IS_THREAD_DEAD_FN.map_or(false, |f| f(tid)) }
+    unsafe { IS_THREAD_DEAD_FN.is_some_and(|f| f(tid)) }
 }
 
 // ============================================================================
@@ -270,20 +271,20 @@ struct Ext2WriteGuard<'a> {
     inner: spinning_top::lock_api::RwLockWriteGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
 }
 
-impl<'a> core::ops::Deref for Ext2WriteGuard<'a> {
+impl core::ops::Deref for Ext2WriteGuard<'_> {
     type Target = Ext2State;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<'a> core::ops::DerefMut for Ext2WriteGuard<'a> {
+impl core::ops::DerefMut for Ext2WriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl<'a> Drop for Ext2WriteGuard<'a> {
+impl Drop for Ext2WriteGuard<'_> {
     fn drop(&mut self) {
         // Clear ownership before the inner guard releases the lock
         EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);

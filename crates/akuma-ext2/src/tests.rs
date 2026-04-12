@@ -557,12 +557,12 @@ fn try_lock_state_returns_none_when_locked() {
     let dev = load_fixture("test.ext2");
     let fs = Ext2Filesystem::new(dev, || 0).unwrap();
     
-    // Hold the lock
-    let _guard = fs.state.lock();
+    // Hold the write lock (simulating a write operation)
+    let _guard = fs.state.write();
     
-    // try_lock_state should fail quickly (1 retry only)
+    // try_lock_state should fail quickly (1 retry only) when write lock is held
     let result = fs.try_lock_state(1);
-    assert!(result.is_none(), "try_lock_state should return None when lock is held");
+    assert!(result.is_none(), "try_lock_state should return None when write lock is held");
 }
 
 #[test]
@@ -579,8 +579,8 @@ fn exists_returns_error_on_lock_contention() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     
     let handle = thread::spawn(move || {
-        let _guard = fs_clone.state.lock();
-        tx.send(()).unwrap(); // Signal that lock is held
+        let _guard = fs_clone.state.write();
+        tx.send(()).unwrap(); // Signal that write lock is held
         done_rx.recv().unwrap(); // Wait for test to complete
     });
     
