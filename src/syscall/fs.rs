@@ -554,9 +554,9 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         });
                         n as u64
                     }
-                    Err(_) => {
+                    Err(e) => {
                         if total_written > 0 { return total_written as u64; }
-                        return !0u64;
+                        return fs_error_to_errno(e);
                     }
                 }
             }

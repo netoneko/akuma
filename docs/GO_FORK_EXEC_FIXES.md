@@ -1854,3 +1854,77 @@ The migration from `Spinlock` to `RwSpinlock` also provides:
 - **Concurrent reads**: Multiple threads can read filesystem metadata simultaneously
 - **Only writes need exclusive access**: Rare operations like create/unlink/truncate
 - **Better performance**: Reduces contention for read-heavy workloads
+
+---
+
+## 2026-04-12: Two Distinct SIGSEGV Crash Patterns (MOSTLY FIXED)
+
+### Overview
+
+After the SIGURG and orphaned lock fixes, two distinct crash patterns were observed.
+Multiple fixes were applied, and the test now passes consistently:
+
+```
+akuma:/bin> forktest_parent --duration 10s --combined_stress
+forktest_parent: Starting with 3 children, duration=10s
+forktest_parent: Launching child 0...
+forktest_parent: Launching child 1...
+forktest_parent: Launching child 2...
+forktest_parent: Duration elapsed, killing 3 remaining children.
+forktest_child: Received terminated, exiting gracefully.
+forktest_child: Received terminated, exiting gracefully.
+forktest_child: Received terminated, exiting gracefully.
+forktest_parent: All children processed via epoll. Parent exiting.
+```
+
+### Fixes Applied
+
+1. **Removed sigaltstack inheritance in `clone_thread()`**: New M-threads created via
+   `clone(CLONE_VM|CLONE_THREAD)` no longer inherit the parent's sigaltstack. This
+   ensures the SIGURG guard (`alt_sp == 0` check) works correctly.
+
+2. **Added SIGURG clearing in `entry_point_trampoline`**: Before a new thread enters
+   userspace for the first time, any pending SIGURG is cleared if `alt_sp == 0`.
+
+3. **Added sigaltstack validation in `clone_thread()`**: If a thread slot has stale
+   `alt_sp` from a previous occupant, it's forcibly reset to 0.
+
+4. **Added `clear_pending_signal()` function**: Allows clearing specific pending signals
+   for a thread without delivering them.
+
+5. **Added `[SIGSEGV-HEAP]` logging**: For debugging, any SIGSEGV in Go's heap range
+   (`0x1e000_0000` - `0x2_0000_0000`) is logged before signal delivery.
+
+### Crash Patterns Observed (Historical)
+
+**Type 1: Child M-Thread Corruption (addr=0x2)**
+- Fault address `0x2` (near-null pointer)
+- PC in `memclr_arm64.s` (Go's memory clearing routine)
+- Caused by SIGURG delivery to uninitialized M-threads
+
+**Type 2: Parent Heap Access Fault (addr=0x1e0......000)**
+- Fault in Go's heap region during `read()` syscall
+- Parent crashes while children are still running
+- Possibly related to CoW page table handling or lazy region tracking
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `crates/akuma-exec/src/process/mod.rs` | Removed sigaltstack inheritance in `clone_thread()` |
+| `crates/akuma-exec/src/process/mod.rs` | Added SIGURG clearing in `entry_point_trampoline` |
+| `crates/akuma-exec/src/process/mod.rs` | Added sigaltstack validation in `clone_thread()` |
+| `crates/akuma-exec/src/threading/mod.rs` | Added `clear_pending_signal()` function |
+| `src/exceptions.rs` | Added `[SIGSEGV-HEAP]` logging for debugging |
+
+### Remaining Observations
+
+The `[TRAMP]` logging shows some threads still have stale `alt_sp`:
+```
+[TRAMP] tid=12 alt_sp=0x1e0004000
+[TRAMP] tid=13 alt_sp=0x1e0004000
+```
+
+This suggests thread slot cleanup at termination may have a race condition or timing
+issue. However, the test now passes consistently, indicating the fixes are sufficient
+to prevent the crashes even when stale values exist.

@@ -2471,6 +2471,15 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             // Try delivering SIGSEGV to a registered userspace handler
+            // Log all SIGSEGV deliveries to understand crashes
+            {
+                let far_usize = far as usize;
+                if far_usize >= 0x1e000_0000 && far_usize < 0x2_0000_0000 {
+                    // Fault in Go heap range - always log for debugging
+                    crate::tprint!(128, "[SIGSEGV-HEAP] pid={} far={:#x} elr={:#x} iss={:#x}\n",
+                        pid, far, elr, iss);
+                }
+            }
             if try_deliver_signal(frame, 11, far, true) {
                 return 11; // signal number in x0 for the handler
             }

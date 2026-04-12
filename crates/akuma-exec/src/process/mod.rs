@@ -1843,6 +1843,14 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     // will think the child is ready for signal delivery, but it actually isn't -
     // Go's M-thread initialization hasn't completed and signal handlers would
     // corrupt the thread's state. Linux also doesn't inherit sigaltstack on clone.
+    
+    // Verify sigaltstack is clean (should be 0 from thread slot reuse cleanup)
+    let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
+    if alt_sp != 0 {
+        // If not clean, force-clear it
+        crate::threading::set_sigaltstack(tid, 0, 0, 2); // SS_DISABLE
+        log::warn!("[clone_thread] tid={} had stale alt_sp={:#x}, cleared", tid, alt_sp);
+    }
 
     crate::threading::update_thread_context(tid, &child_ctx);
 
@@ -1916,6 +1924,30 @@ pub extern "C" fn entry_point_trampoline() -> ! {
         }
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
+    }
+    
+    // SIGURG guard: Clear any pending SIGURG if sigaltstack isn't configured.
+    // Go's runtime sends SIGURG to newly created M-threads for goroutine preemption,
+    // but the thread hasn't finished mstart1 initialization yet (sigaltstack not set).
+    // Unlike syscall return paths, this is the first entry to userspace for a new
+    // thread, so we handle it here before calling run().
+    let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
+    {
+        let mut buf = [0u8; 96];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[TRAMP] tid={} alt_sp={:#x}\n", tid, alt_sp));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
+    if alt_sp == 0 {
+        // Thread's sigaltstack not configured - it's not ready for signal handling.
+        // Any SIGURG pended now would corrupt Go's M-thread state.
+        // Clear SIGURG (signal 23) if pending - it will be re-sent by Go later.
+        let pending = crate::threading::peek_pending_signal(tid);
+        if pending == 23 {
+            (runtime().print_str)("[TRAMP] clearing pending SIGURG\n");
+            crate::threading::clear_pending_signal(tid, 23);
+        }
     }
     
     unsafe {

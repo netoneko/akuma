@@ -2394,6 +2394,15 @@ pub fn peek_pending_signal(slot: usize) -> u32 {
     }
 }
 
+/// Clear a specific pending signal for a thread.
+/// Used to prevent SIGURG delivery to uninitialized Go M-threads.
+pub fn clear_pending_signal(slot: usize, sig: u32) {
+    if slot < MAX_THREADS && sig > 0 && sig <= 64 {
+        let bit = 1u64 << (sig - 1);
+        PENDING_SIGNALS[slot].fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
 /// Get the per-thread alternate signal stack (sp, size, flags).
 /// Returns (0, 0, SS_DISABLE=2) for an unset or out-of-range slot.
 pub fn get_sigaltstack(slot: usize) -> (u64, u64, i32) {
