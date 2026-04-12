@@ -1463,3 +1463,170 @@ Go processes may still crash under heavy fork/exec stress due to:
 3. Potential kernel mmap/munmap edge cases
 
 These are separate from the signal frame layout bug and require individual investigation.
+
+---
+
+## 2026-04-10: Lazy Region Lookup Miss Investigation (RESOLVED)
+
+### Problem
+
+After the signal frame fix, a new crash pattern emerged:
+```
+SIGSEGV: segmentation violation
+PC=0x13060 m=0 sigcode=1 addr=0x1e07a9000
+```
+
+The fault address `0x1e07a9000` is in Go's heap region (~7.4MB above the stack). This is a
+SEGV_MAPERR (unmapped page), not a permission fault.
+
+### Initial Hypothesis
+
+The crash may be caused by a lazy region lookup miss after fork:
+1. Go allocates memory via mmap → kernel creates lazy region in `LAZY_REGION_TABLE[parent_pid]`
+2. Fork happens → `clone_lazy_regions(parent_pid, child_pid)` copies entries to child
+3. Parent or child tries to access an unmapped page in the lazy region
+4. Translation fault occurs
+5. `lazy_region_lookup_for_pid(pid, va)` fails to find the region → SIGSEGV
+
+### Instrumentation Added
+
+Added `[DA-MISS]` and `[IA-MISS]` logging in `src/exceptions.rs` to capture:
+- PID of faulting process and parent PID
+- Fault VA
+- Number of lazy regions for both child and parent
+- Whether parent has the faulting VA in its lazy regions
+- Debug dump of all lazy regions
+
+### Resolution
+
+Further investigation (see 2026-04-12 entry below) revealed this crash pattern was actually
+caused by **SIGURG delivery to uninitialized threads**, not lazy region issues. The corrupted
+register state from premature signal delivery caused Go to access garbage memory addresses.
+
+The instrumentation was still useful for confirming that lazy regions were being cloned
+correctly (`parent_lr=13`, `lr_count=14` showed child had its regions plus one new one).
+
+### Files Changed for Instrumentation
+
+| File | Change |
+|------|--------|
+| `src/exceptions.rs` | Added `[DA-MISS]` and `[IA-MISS]` logging with parent PID lookup |
+| `crates/akuma-ext2/src/ext2.rs` | Changed all read operations to use `try_lock_state()` to prevent hangs |
+
+---
+
+## 2026-04-12: SIGURG Delivery to Uninitialized Go Threads (FIXED)
+
+### Problem
+
+Crash pattern observed during `forktest_child` mmap stress test:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x4f
+  ELR=0x40436b80, FAR=0x3ffc0, SPSR=0x80002345
+  Thread=24, TTBR0=0xd300005a015000, TTBR1=0x404b0000
+  WARNING: Kernel accessing user-space address!
+[EFAULT] nr=113 pid=120 args=[0x1e09ffff0, 0x3ffc0, 0x5b00000, 0x40000]
+[DA-MISS] pid=120 ppid=115 va=0x2 lr_count=14 parent_lr=13 parent_has_va=false
+```
+
+Go panics with:
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x2 pc=0x86768]
+```
+
+### Root Cause
+
+SIGURG (signal 23, Go's goroutine preemption signal) was delivered to a thread before
+it finished initializing its Go runtime state.
+
+**Timeline:**
+```
+clone() creates new thread
+    │
+    ▼
+Thread starts executing mstart1 (Go's M initialization)
+    │
+    ▼
+[SIGURG sent by another thread to preempt this one]
+    │
+    ▼
+Thread makes first syscall (e.g., clock_gettime during init)
+    │
+    ▼
+Kernel delivers pending SIGURG at syscall return
+    │
+    ▼
+Signal handler runs on wrong stack (sigaltstack not configured yet!)
+    │
+    ▼
+Memory/registers corrupted
+    │
+    ▼
+Next syscall has garbage arguments → EFAULT → crash
+```
+
+**Key insight:** Go threads call `sigaltstack()` during `mstart1` to set up their
+signal-handling stack. If SIGURG arrives before this call completes, Go's signal
+handler runs on the goroutine stack (wrong place) or accesses uninitialized M state,
+corrupting memory.
+
+### Evidence
+
+```
+[FORK-DBG] trampoline ENTRY tid=24          ← Thread starting
+[signal] tkill(tid=24, sig=23)              ← SIGURG sent immediately
+[EFAULT] nr=113 pid=120 args=[0x1e09ffff0, 0x3ffc0, ...]  ← Garbage args
+```
+
+The garbage `clock_id = 0x1e09ffff0` (looks like a heap address) and
+`tp_ptr = 0x3ffc0` (below Go's load address) indicate corrupted registers.
+
+### Fix
+
+Added a guard in all 3 signal delivery paths in `src/exceptions.rs`:
+
+```rust
+if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
+    
+    // SIGURG (23) requires sigaltstack to be configured
+    if sig == 23 && alt_sp == 0 {
+        // Thread hasn't called sigaltstack yet - not ready for signals
+        // Re-pend for later delivery
+        akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+    } else {
+        // Thread is ready, deliver normally
+        try_deliver_signal(frame, sig, 0, false);
+    }
+}
+```
+
+**Logic:** If `sigaltstack` hasn't been called (`alt_sp == 0`), the thread is still
+initializing. We re-pend SIGURG and deliver it later, after the thread has completed
+its `mstart1` initialization and called `sigaltstack()`.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/exceptions.rs` | Added sigaltstack check before SIGURG delivery in 3 places: IC flush path (~line 1864), rt_sigreturn path (~line 1904), and normal syscall return path (~line 1991) |
+| `src/syscall/mod.rs` | Added EINVAL to dangerous error code logging (helps diagnose similar issues) |
+
+### Why Only SIGURG?
+
+SIGURG (signal 23) is specifically used by Go for goroutine preemption:
+- Sent frequently by Go's scheduler
+- Async signal (can arrive at any time)
+- Most likely to hit uninitialized threads
+
+Other signals are either synchronous (triggered by the thread itself) or less frequent.
+
+### Related Issues
+
+This is similar to the documented issue in `docs/GOLANG_MISSING_SYSCALLS.md` where
+per-process `sigaltstack` caused corruption when multiple CLONE_VM threads shared
+the same `Process` struct. The fix there was per-thread sigaltstack arrays. This
+fix extends that by also checking sigaltstack readiness before signal delivery.

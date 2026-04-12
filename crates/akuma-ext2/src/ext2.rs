@@ -1182,7 +1182,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if name.is_empty() {
             return Err(FsError::InvalidPath);
         }
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let parent_path = if parent_path.is_empty() {
             "/"
         } else {
@@ -1201,7 +1203,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(0);
         }
 
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         let file_size = inode.size_lower as usize;
@@ -1288,7 +1292,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) != S_IFDIR {
@@ -1320,7 +1326,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1385,7 +1393,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
 
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1665,13 +1675,16 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         self.read_symlink_inode(&state, inode_num)
     }
 
     fn is_symlink(&self, path: &str) -> bool {
         if let Ok(inode_num) = self.lookup_path(path) {
-            let state = self.state.lock();
+            // Use try_lock to prevent hanging if lock is orphaned
+            let Some(state) = self.try_lock_state(100_000) else { return false };
             if let Ok(inode) = self.read_inode(&state, inode_num) {
                 return (inode.type_perms & 0xF000) == S_IFLNK;
             }
@@ -1715,7 +1728,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         let is_dir = (inode.type_perms & 0xF000) == S_IFDIR;
@@ -1778,7 +1793,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let mut inode = self.read_inode(&state, inode_num)?;
         
         // Only allow truncate on regular files
@@ -1803,7 +1820,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {
-        let state = self.state.lock();
+        // Use try_lock to prevent hanging if lock is orphaned by killed process
+        let state = self.try_lock_state(100_000)
+            .ok_or(FsError::IoError)?;
         let total_blocks = state.superblock.total_blocks;
         let unallocated_blocks = state.superblock.unallocated_blocks;
 

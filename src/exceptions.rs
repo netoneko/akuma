@@ -1862,9 +1862,16 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         // Block fault signals in this path by adding them to the effective mask.
                         let effective_mask = sig_mask | FAULT_SIGNALS;
                         if let Some(sig) = akuma_exec::threading::take_pending_signal(effective_mask) {
-                            unsafe { (*frame).x0 = frame_ref.x0; }
-                            if try_deliver_signal(frame, sig, 0, false) {
-                                return sig as u64;
+                            // For async signals like SIGURG, check if sigaltstack is ready
+                            let thread_slot = akuma_exec::threading::current_thread_id();
+                            let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
+                            if sig == 23 && alt_sp == 0 {
+                                akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+                            } else {
+                                unsafe { (*frame).x0 = frame_ref.x0; }
+                                if try_deliver_signal(frame, sig, 0, false) {
+                                    return sig as u64;
+                                }
                             }
                         }
                         return frame_ref.x0;
@@ -1895,9 +1902,16 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         0
                     };
                     if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
-                        unsafe { (*frame).x0 = saved_x0; }
-                        if try_deliver_signal(frame, sig, 0, false) {
-                            return sig as u64;
+                        // For async signals like SIGURG, check if sigaltstack is ready
+                        let thread_slot = akuma_exec::threading::current_thread_id();
+                        let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
+                        if sig == 23 && alt_sp == 0 {
+                            akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+                        } else {
+                            unsafe { (*frame).x0 = saved_x0; }
+                            if try_deliver_signal(frame, sig, 0, false) {
+                                return sig as u64;
+                            }
                         }
                     }
                     return saved_x0;
@@ -1978,12 +1992,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             };
 
             if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
-                // Store the syscall return value in x0 of the trap frame so that
-                // sigreturn restores it correctly (the signal handler's x0 = sig,
-                // and after sigreturn the caller sees x0 = syscall result).
-                unsafe { (*frame).x0 = ret; }
-                if try_deliver_signal(frame, sig, 0, false) {
-                    return sig as u64; // x0 = signal number for the handler
+                // For async signals like SIGURG (23), check if sigaltstack is configured.
+                // Go threads call sigaltstack during mstart1 - if not yet configured,
+                // the thread isn't ready to handle signals. Re-pend and deliver later.
+                let thread_slot = akuma_exec::threading::current_thread_id();
+                let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
+                if sig == 23 && alt_sp == 0 {
+                    // Re-pend SIGURG for later - thread not ready yet
+                    akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+                } else {
+                    // Store the syscall return value in x0 of the trap frame so that
+                    // sigreturn restores it correctly (the signal handler's x0 = sig,
+                    // and after sigreturn the caller sees x0 = syscall result).
+                    unsafe { (*frame).x0 = ret; }
+                    if try_deliver_signal(frame, sig, 0, false) {
+                        return sig as u64; // x0 = signal number for the handler
+                    }
                 }
                 // Delivery failed (no handler / bad stack); just return normally.
             }
@@ -2057,7 +2081,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                // #region agent log - debug lazy region miss
+                let lazy_found = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize);
+                if lazy_found.is_none() {
+                    let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
+                    // Also check the parent PID - maybe lazy regions weren't cloned
+                    let parent_pid = akuma_exec::process::lookup_process(pid)
+                        .map(|p| p.parent_pid)
+                        .unwrap_or(0);
+                    let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
+                    let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
+                    crate::safe_print!(256, "[DA-MISS] pid={} ppid={} va=0x{:x} lr_count={} parent_lr={} parent_has_va={}\n",
+                        pid, parent_pid, far_usize, lr_count, parent_lr_count, parent_has_va);
+                    akuma_exec::process::lazy_region_debug(far_usize);
+                }
+                // #endregion
+                if let Some((flags, source, region_start, region_size)) = lazy_found {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
                     } else if far_in_kernel_identity_user_range(far) {
@@ -2490,7 +2529,21 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if is_translation_fault {
-                if let Some((flags, source, region_start, region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                // #region debug lazy region miss
+                let lazy_found = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize);
+                if lazy_found.is_none() {
+                    let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
+                    let parent_pid = akuma_exec::process::lookup_process(pid)
+                        .map(|p| p.parent_pid)
+                        .unwrap_or(0);
+                    let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
+                    let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
+                    crate::safe_print!(256, "[IA-MISS] pid={} ppid={} va=0x{:x} lr_count={} parent_lr={} parent_has_va={}\n",
+                        pid, parent_pid, far_usize, lr_count, parent_lr_count, parent_has_va);
+                    akuma_exec::process::lazy_region_debug(far_usize);
+                }
+                // #endregion
+                if let Some((flags, source, region_start, region_size)) = lazy_found {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
                     } else if far_in_kernel_identity_user_range(far) {

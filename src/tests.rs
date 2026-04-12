@@ -83,6 +83,8 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_lazy_region_munmap_suffix, "lazy_region_munmap_suffix");
     run_test!(test_lazy_region_munmap_middle, "lazy_region_munmap_middle");
     run_test!(test_lazy_region_munmap_multi, "lazy_region_munmap_multi");
+    run_test!(test_lazy_region_clone, "lazy_region_clone");
+    run_test!(test_lazy_region_lookup_pid_isolation, "lazy_region_lookup_pid_isolation");
     run_test!(test_map_user_page_roundtrip, "map_user_page_roundtrip");
     run_test!(test_eager_mmap_pages_survive_subrange_munmap, "eager_mmap_subrange_munmap");
     run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
@@ -3295,6 +3297,95 @@ fn test_lazy_region_munmap_multi() -> bool {
     }
 
     akuma_exec::process::clear_lazy_regions(TEST_PID);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test clone_lazy_regions copies all regions from parent to child PID
+fn test_lazy_region_clone() -> bool {
+    console::print("\n[TEST] lazy_region: clone_lazy_regions\n");
+
+    const PARENT_PID: u32 = 0xDEAD;
+    const CHILD_PID: u32 = 0xBEEF;
+
+    akuma_exec::process::clear_lazy_regions(PARENT_PID);
+    akuma_exec::process::clear_lazy_regions(CHILD_PID);
+
+    // Create regions in parent
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x1000_0000, 0x100_0000, 0x3);
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x2000_0000, 0x200_0000, 0x1);
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x5000_0000, 0x50_0000, 0x7);
+
+    // Clone to child
+    akuma_exec::process::clone_lazy_regions(PARENT_PID, CHILD_PID);
+
+    // Verify child has all regions
+    let child_regions: Vec<(usize, usize, u64)> = crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
+        table.get(&CHILD_PID).map_or(Vec::new(), |r| {
+            r.values().map(|lr| (lr.start_va, lr.size, lr.flags)).collect()
+        })
+    });
+
+    let ok = child_regions.len() == 3
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x1000_0000 && sz == 0x100_0000 && f == 0x3)
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x2000_0000 && sz == 0x200_0000 && f == 0x1)
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x5000_0000 && sz == 0x50_0000 && f == 0x7);
+
+    // Verify parent still has its regions (clone should not remove them)
+    let parent_regions: Vec<(usize, usize)> = crate::irq::with_irqs_disabled(|| {
+        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
+        table.get(&PARENT_PID).map_or(Vec::new(), |r| {
+            r.values().map(|lr| (lr.start_va, lr.size)).collect()
+        })
+    });
+    let parent_ok = parent_regions.len() == 3;
+
+    if !ok || !parent_ok {
+        crate::safe_print!(192, "  child_regions={:?} parent_count={}\n",
+            child_regions, parent_regions.len());
+    }
+
+    akuma_exec::process::clear_lazy_regions(PARENT_PID);
+    akuma_exec::process::clear_lazy_regions(CHILD_PID);
+
+    let result = ok && parent_ok;
+    crate::safe_print!(64, "  Result: {}\n", if result { "PASS" } else { "FAIL" });
+    result
+}
+
+/// Test that lazy_region_lookup_for_pid finds regions only for the correct PID
+fn test_lazy_region_lookup_pid_isolation() -> bool {
+    console::print("\n[TEST] lazy_region: lookup PID isolation\n");
+
+    const PID_A: u32 = 0xAAAA;
+    const PID_B: u32 = 0xBBBB;
+
+    akuma_exec::process::clear_lazy_regions(PID_A);
+    akuma_exec::process::clear_lazy_regions(PID_B);
+
+    // Create region only in PID_A
+    akuma_exec::process::push_lazy_region(PID_A, 0x3000_0000, 0x100_0000, 0x3);
+
+    // Lookup should succeed for PID_A
+    let found_a = akuma_exec::process::lazy_region_lookup_for_pid(PID_A, 0x3000_5000).is_some();
+
+    // Lookup should fail for PID_B (region doesn't exist there)
+    let found_b = akuma_exec::process::lazy_region_lookup_for_pid(PID_B, 0x3000_5000).is_some();
+
+    // Lookup with PID 0 (invalid) should fail
+    let found_zero = akuma_exec::process::lazy_region_lookup_for_pid(0, 0x3000_5000).is_some();
+
+    let ok = found_a && !found_b && !found_zero;
+
+    if !ok {
+        crate::safe_print!(128, "  found_a={} found_b={} found_zero={}\n",
+            found_a, found_b, found_zero);
+    }
+
+    akuma_exec::process::clear_lazy_regions(PID_A);
+    akuma_exec::process::clear_lazy_regions(PID_B);
+
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
