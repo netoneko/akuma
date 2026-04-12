@@ -351,6 +351,10 @@ pub fn run_threading_tests() -> bool {
     // Parallel process tests (requires /bin/hello)
     run_test!(test_parallel_processes, "parallel_processes");
     run_test!(test_terminal_syscalls, "terminal_syscalls");
+    
+    // Orphaned lock recovery tests
+    run_test!(test_thread_terminated_detection, "thread_terminated_detection");
+    run_test!(test_ext2_orphaned_lock_recovery, "ext2_orphaned_lock_recovery");
 
     console::print("\n==================================\n");
     if all_pass {
@@ -9281,6 +9285,123 @@ pub fn test_block_on_real_waker() -> bool {
     crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
 
     let ok = result == Some(5) && poll_count == 5;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Orphaned ext2 RwSpinlock recovery.
+/// 
+/// Simulates the scenario where a thread holding the ext2 write lock is killed,
+/// and verifies that another thread can detect the orphan and recover.
+pub fn test_ext2_orphaned_lock_recovery() -> bool {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use spinning_top::RwSpinlock;
+    
+    console::print("\n[TEST] ext2 orphaned RwSpinlock recovery\n");
+    
+    // Simulate the ext2 lock ownership tracking
+    static TEST_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+    static TEST_LOCK: RwSpinlock<u32> = RwSpinlock::new(42);
+    
+    // Helper to check if "thread" is dead (simulated)
+    static DEAD_THREAD: AtomicUsize = AtomicUsize::new(0);
+    fn is_thread_dead(tid: usize) -> bool {
+        DEAD_THREAD.load(Ordering::Acquire) == tid && tid != 0
+    }
+    
+    // 1. Simulate thread 5 taking the write lock
+    let fake_owner_tid = 5usize;
+    console::print("  Step 1: Thread 5 takes write lock\n");
+    {
+        let guard = TEST_LOCK.try_write().expect("Should get write lock");
+        TEST_LOCK_OWNER.store(fake_owner_tid, Ordering::Release);
+        // Simulate crash: forget the guard (never drops, never unlocks)
+        core::mem::forget(guard);
+    }
+    crate::safe_print!(64, "    Lock owner: {} (simulating held by thread 5)\n", 
+        TEST_LOCK_OWNER.load(Ordering::Acquire));
+    
+    // 2. Verify the lock is indeed stuck
+    console::print("  Step 2: Verify lock is stuck (try_read fails)\n");
+    let can_read = TEST_LOCK.try_read().is_some();
+    if can_read {
+        console::print("    FAIL: Unexpectedly got read lock\n");
+        return false;
+    }
+    console::print("    OK: try_read() returned None (lock is stuck)\n");
+    
+    // 3. Mark thread 5 as dead
+    console::print("  Step 3: Mark thread 5 as dead\n");
+    DEAD_THREAD.store(fake_owner_tid, Ordering::Release);
+    
+    // 4. Simulate the orphan recovery logic (from ext2.rs try_read_state)
+    console::print("  Step 4: Attempt orphan recovery\n");
+    let owner = TEST_LOCK_OWNER.load(Ordering::Acquire);
+    if owner != 0 && is_thread_dead(owner) {
+        console::print("    Detected orphaned lock, force-unlocking\n");
+        unsafe { TEST_LOCK.force_unlock_write(); }
+        TEST_LOCK_OWNER.store(0, Ordering::Release);
+    } else {
+        console::print("    FAIL: Did not detect orphaned lock\n");
+        return false;
+    }
+    
+    // 5. Verify we can now acquire the lock
+    console::print("  Step 5: Verify lock is recoverable\n");
+    let can_read_now = TEST_LOCK.try_read().is_some();
+    if !can_read_now {
+        console::print("    FAIL: Still can't get read lock after recovery\n");
+        return false;
+    }
+    console::print("    OK: try_read() succeeded after recovery\n");
+    
+    // 6. Verify we can also write
+    let can_write = TEST_LOCK.try_write().is_some();
+    if !can_write {
+        console::print("    FAIL: Can't get write lock after recovery\n");
+        return false;
+    }
+    console::print("    OK: try_write() succeeded after recovery\n");
+    
+    console::print("  Result: PASS\n");
+    true
+}
+
+/// Test: is_thread_terminated returns true for TERMINATED and FREE states.
+pub fn test_thread_terminated_detection() -> bool {
+    use akuma_exec::threading::{is_thread_terminated, get_thread_state, set_thread_state, thread_state};
+    
+    console::print("\n[TEST] is_thread_terminated detects TERMINATED and FREE\n");
+    
+    // Use a high slot number that's unlikely to be in use
+    // We'll temporarily modify its state and restore it
+    let test_slot = 62usize; // Near end of thread array
+    let original_state = get_thread_state(test_slot);
+    
+    // Test 1: TERMINATED state should return true
+    set_thread_state(test_slot, thread_state::TERMINATED);
+    let terminated_detected = is_thread_terminated(test_slot);
+    crate::safe_print!(64, "  TERMINATED state: is_thread_terminated={} (expected true)\n", terminated_detected);
+    
+    // Test 2: FREE state should return true
+    set_thread_state(test_slot, thread_state::FREE);
+    let free_detected = is_thread_terminated(test_slot);
+    crate::safe_print!(64, "  FREE state: is_thread_terminated={} (expected true)\n", free_detected);
+    
+    // Test 3: RUNNING state should return false
+    set_thread_state(test_slot, thread_state::RUNNING);
+    let running_detected = is_thread_terminated(test_slot);
+    crate::safe_print!(64, "  RUNNING state: is_thread_terminated={} (expected false)\n", running_detected);
+    
+    // Test 4: READY state should return false  
+    set_thread_state(test_slot, thread_state::READY);
+    let ready_detected = is_thread_terminated(test_slot);
+    crate::safe_print!(64, "  READY state: is_thread_terminated={} (expected false)\n", ready_detected);
+    
+    // Restore original state
+    set_thread_state(test_slot, original_state);
+    
+    let ok = terminated_detected && free_detected && !running_detected && !ready_detected;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }

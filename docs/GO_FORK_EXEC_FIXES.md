@@ -2,7 +2,7 @@
 
 ## Date
 
-2026-04-02 to 2026-04-07
+2026-04-02 to 2026-04-12
 
 ---
 
@@ -1630,3 +1630,154 @@ This is similar to the documented issue in `docs/GOLANG_MISSING_SYSCALLS.md` whe
 per-process `sigaltstack` caused corruption when multiple CLONE_VM threads shared
 the same `Process` struct. The fix there was per-thread sigaltstack arrays. This
 fix extends that by also checking sigaltstack readiness before signal delivery.
+
+---
+
+## 2026-04-12: Ext2 Filesystem Orphaned Lock Recovery (FIXED)
+
+### Problem
+
+After `forktest_parent` killed its children with SIGKILL, subsequent shell commands
+(including `ps`, `ls`, or any command requiring filesystem access) would hang forever:
+
+```
+akuma:/bin> forktest_parent --duration 10s --combined_stress
+forktest_parent: All children processed via epoll. Parent exiting.
+akuma:/bin> ps
+[hangs indefinitely]
+```
+
+### Root Cause
+
+The ext2 filesystem uses a `RwSpinlock` (previously `Spinlock`) to protect its internal
+state. When a Go child process is killed via SIGKILL while holding the write lock
+(e.g., during `CreateTemp`, `WriteString`, or other file operations), the lock is
+never released.
+
+**Timeline:**
+```
+Child process calls CreateTemp()
+    │
+    ▼
+Ext2 write_state() acquires RwSpinlock
+    │
+    ▼
+[Parent sends SIGKILL - child is terminated immediately]
+    │
+    ▼
+Thread state → TERMINATED, then → FREE (after cleanup)
+    │
+    ▼
+RwSpinlock is STILL LOCKED (guard was never dropped)
+    │
+    ▼
+All subsequent filesystem operations block forever
+```
+
+### Fix
+
+Implemented orphaned lock detection and recovery in the ext2 filesystem:
+
+1. **Ownership Tracking**: Track which thread holds the write lock via `EXT2_WRITE_LOCK_OWNER`
+   atomic variable.
+
+2. **Thread Death Detection**: Added hook functions (`init_thread_hooks`) that let ext2
+   query the kernel's threading subsystem to check if a thread is dead.
+
+3. **Orphan Recovery**: During lock acquisition, periodically check if the lock owner
+   is dead (state is `TERMINATED` or `FREE`). If so, force-unlock and retry.
+
+4. **RwLock Migration**: Changed from `Spinlock` to `RwSpinlock` to allow concurrent
+   reads (most filesystem operations are reads).
+
+### Code Changes
+
+**`crates/akuma-ext2/src/ext2.rs`:**
+
+```rust
+/// Tracks which thread holds the ext2 write lock
+static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+/// Hook to check if a thread is dead
+static mut IS_THREAD_DEAD_FN: Option<fn(usize) -> bool> = None;
+
+fn try_read_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
+    for attempt in 0..max_retries {
+        if let Some(guard) = self.state.try_read() {
+            return Some(guard);
+        }
+        
+        // Check for orphaned write lock every 10k attempts
+        if attempt > 0 && attempt % 10_000 == 0 {
+            let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+            if owner != 0 && is_thread_dead(owner) {
+                // Owner is dead - force unlock
+                unsafe { self.state.force_unlock_write(); }
+                EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+            }
+        }
+        // ... spin delay
+    }
+    None
+}
+```
+
+**`crates/akuma-exec/src/threading/mod.rs`:**
+
+```rust
+/// Returns true if thread is dead (TERMINATED or FREE state)
+pub fn is_thread_terminated(thread_id: usize) -> bool {
+    let state = get_thread_state(thread_id);
+    state == thread_state::TERMINATED || state == thread_state::FREE
+}
+```
+
+**`src/fs.rs`:**
+
+```rust
+// Initialize hooks before mounting ext2
+unsafe {
+    akuma_ext2::init_thread_hooks(
+        || akuma_exec::threading::current_thread_id(),
+        |tid| akuma_exec::threading::is_thread_terminated(tid),
+    );
+}
+```
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `crates/akuma-ext2/src/ext2.rs` | Added ownership tracking, RwSpinlock migration, orphan detection |
+| `crates/akuma-ext2/src/lib.rs` | Export `init_thread_hooks` |
+| `crates/akuma-exec/src/threading/mod.rs` | `is_thread_terminated` checks both TERMINATED and FREE states |
+| `src/fs.rs` | Initialize ext2 thread hooks before mounting |
+| `src/tests.rs` | Added `test_ext2_orphaned_lock_recovery` and `test_thread_terminated_detection` |
+
+### Why Check Both TERMINATED and FREE?
+
+When a thread is killed:
+1. State immediately becomes `TERMINATED`
+2. After cleanup (cooldown period), state becomes `FREE`
+3. The slot may be reused by a new thread (`INITIALIZING` → `READY` → `RUNNING`)
+
+By checking for both `TERMINATED` and `FREE`, we catch orphaned locks regardless of
+how quickly cleanup happens.
+
+### Testing
+
+Two new kernel tests verify the fix:
+
+1. **`test_thread_terminated_detection`**: Verifies `is_thread_terminated()` returns
+   correct values for all thread states.
+
+2. **`test_ext2_orphaned_lock_recovery`**: Simulates a thread taking a write lock,
+   "crashing" (guard forgotten), being marked dead, and verifies another thread can
+   detect the orphan and recover the lock.
+
+### Benefits of RwSpinlock
+
+The migration from `Spinlock` to `RwSpinlock` also provides:
+- **Concurrent reads**: Multiple threads can read filesystem metadata simultaneously
+- **Only writes need exclusive access**: Rare operations like create/unlink/truncate
+- **Better performance**: Reduces contention for read-heavy workloads

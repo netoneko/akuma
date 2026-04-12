@@ -339,9 +339,13 @@ pub fn get_thread_state(idx: usize) -> u8 {
     }
 }
 
-/// Check if a thread is terminated (lock-free)
+/// Check if a thread is terminated or freed (lock-free).
+/// Returns true if the thread is dead (TERMINATED or FREE state).
+/// Used for orphaned lock detection - a thread holding a lock is considered
+/// dead if it's terminated or if its slot has been reclaimed.
 pub fn is_thread_terminated(thread_id: usize) -> bool {
-    get_thread_state(thread_id) == thread_state::TERMINATED
+    let state = get_thread_state(thread_id);
+    state == thread_state::TERMINATED || state == thread_state::FREE
 }
 
 /// Test helper: set a thread's state directly (lock-free).

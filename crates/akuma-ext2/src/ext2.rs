@@ -34,12 +34,46 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use spinning_top::Spinlock;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use spinning_top::{RwSpinlock, Spinlock};
 
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
 const BLOCK_CACHE_MAX: usize = 512;
+
+/// Tracks which thread (by slot ID) currently holds the ext2 state write lock.
+/// 0 means no write lock is held. Used to detect orphaned locks from killed processes.
+static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+/// Hook function to check if a thread is dead. Set by the kernel at runtime.
+static mut IS_THREAD_DEAD_FN: Option<fn(usize) -> bool> = None;
+
+/// Hook function to get the current thread ID. Set by the kernel at runtime.
+static mut CURRENT_THREAD_ID_FN: Option<fn() -> usize> = None;
+
+/// Initialize the thread hooks. Called once by the kernel.
+/// 
+/// # Safety
+/// Must only be called once during kernel initialization, before any filesystem operations.
+#[allow(dead_code)]
+pub unsafe fn init_thread_hooks(
+    current_thread_id: fn() -> usize,
+    is_thread_dead: fn(usize) -> bool,
+) {
+    unsafe {
+        CURRENT_THREAD_ID_FN = Some(current_thread_id);
+        IS_THREAD_DEAD_FN = Some(is_thread_dead);
+    }
+}
+
+fn current_thread_id() -> usize {
+    unsafe { CURRENT_THREAD_ID_FN.map_or(0, |f| f()) }
+}
+
+fn is_thread_dead(tid: usize) -> bool {
+    unsafe { IS_THREAD_DEAD_FN.map_or(false, |f| f(tid)) }
+}
 
 // ============================================================================
 // Constants
@@ -228,6 +262,34 @@ struct Ext2State {
     first_data_block: u32,
 }
 
+/// Type alias for read guard (no ownership tracking needed - reads are concurrent)
+type Ext2ReadGuard<'a> = spinning_top::lock_api::RwLockReadGuard<'a, spinning_top::RawRwSpinlock, Ext2State>;
+
+/// RAII guard for write access to `Ext2State` that clears lock ownership on drop.
+struct Ext2WriteGuard<'a> {
+    inner: spinning_top::lock_api::RwLockWriteGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
+}
+
+impl<'a> core::ops::Deref for Ext2WriteGuard<'a> {
+    type Target = Ext2State;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a> core::ops::DerefMut for Ext2WriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a> Drop for Ext2WriteGuard<'a> {
+    fn drop(&mut self) {
+        // Clear ownership before the inner guard releases the lock
+        EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+    }
+}
+
 // ============================================================================
 // Ext2 Filesystem Implementation
 // ============================================================================
@@ -236,11 +298,12 @@ struct Ext2State {
 pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     time_fn: fn() -> u64,
-    /// Internal state protected by spinlock. Public for testing only.
+    /// Internal state protected by RwSpinlock. Read operations can proceed concurrently.
+    /// Public for testing only.
     #[cfg(test)]
-    pub state: Spinlock<Ext2State>,
+    pub state: RwSpinlock<Ext2State>,
     #[cfg(not(test))]
-    state: Spinlock<Ext2State>,
+    state: RwSpinlock<Ext2State>,
     block_cache: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>>,
 }
 
@@ -292,7 +355,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(Self {
             dev,
             time_fn: utc_time_us,
-            state: Spinlock::new(state),
+            state: RwSpinlock::new(state),
             block_cache: Spinlock::new(alloc::collections::BTreeMap::new()),
         })
     }
@@ -301,31 +364,103 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         ((self.time_fn)() / 1_000_000) as u32
     }
 
-    /// Try to acquire the state lock with a retry limit.
+    /// Try to acquire a read lock with a retry limit.
     /// Returns None if the lock cannot be acquired after max_retries attempts.
     /// 
-    /// This prevents indefinite hangs when a process holding the lock is killed.
+    /// Read locks can be held concurrently by multiple threads.
+    /// If an orphaned write lock is detected, it will be force-unlocked.
     #[cfg(test)]
-    pub fn try_lock_state(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
-        self.try_lock_state_internal(max_retries)
+    pub fn try_lock_state(&self, max_retries: u32) -> Option<impl core::ops::Deref<Target = Ext2State> + '_> {
+        self.try_read_state(max_retries)
     }
     
     #[cfg(not(test))]
-    fn try_lock_state(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
-        self.try_lock_state_internal(max_retries)
+    fn try_lock_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
+        self.try_read_state(max_retries)
     }
     
-    fn try_lock_state_internal(&self, max_retries: u32) -> Option<spinning_top::lock_api::MutexGuard<'_, spinning_top::RawSpinlock, Ext2State>> {
-        for _ in 0..max_retries {
-            if let Some(guard) = self.state.try_lock() {
+    /// Try to acquire a read lock with a retry limit.
+    fn try_read_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
+        for attempt in 0..max_retries {
+            if let Some(guard) = self.state.try_read() {
                 return Some(guard);
             }
-            // Small spin delay
-            for _ in 0..1000 {
+            
+            // Check if there's an orphaned write lock blocking reads
+            if attempt > 0 && attempt % 10_000 == 0 {
+                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                if owner != 0 && is_thread_dead(owner) {
+                    // SAFETY: The owner thread is dead so it can't be using the lock.
+                    unsafe { self.state.force_unlock_write(); }
+                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    if let Some(guard) = self.state.try_read() {
+                        return Some(guard);
+                    }
+                }
+            }
+            
+            for _ in 0..100 {
                 core::hint::spin_loop();
             }
         }
         None
+    }
+    
+    /// Acquire a read lock, blocking until available.
+    /// Read locks can be held concurrently by multiple threads.
+    #[allow(dead_code)]
+    fn read_state(&self) -> Ext2ReadGuard<'_> {
+        let mut attempt = 0u32;
+        loop {
+            if let Some(guard) = self.state.try_read() {
+                return guard;
+            }
+            
+            attempt = attempt.wrapping_add(1);
+            
+            // Check for orphaned write lock periodically
+            if attempt % 10_000 == 0 {
+                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                if owner != 0 && is_thread_dead(owner) {
+                    unsafe { self.state.force_unlock_write(); }
+                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    continue;
+                }
+            }
+            
+            for _ in 0..100 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    
+    /// Acquire a write lock, blocking until available.
+    /// Tracks ownership for orphaned lock recovery.
+    fn write_state(&self) -> Ext2WriteGuard<'_> {
+        let current_tid = current_thread_id();
+        let mut attempt = 0u32;
+        loop {
+            if let Some(guard) = self.state.try_write() {
+                EXT2_WRITE_LOCK_OWNER.store(current_tid, Ordering::Release);
+                return Ext2WriteGuard { inner: guard };
+            }
+            
+            attempt = attempt.wrapping_add(1);
+            
+            // Check for orphaned write lock periodically
+            if attempt % 10_000 == 0 {
+                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                if owner != 0 && is_thread_dead(owner) {
+                    unsafe { self.state.force_unlock_write(); }
+                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    continue;
+                }
+            }
+            
+            for _ in 0..100 {
+                core::hint::spin_loop();
+            }
+        }
     }
 
     // ========================================================================
@@ -1343,7 +1478,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         match self.lookup_path(path) {
             Ok(inode_num) => {
                 // File exists - truncate and write
-                let mut state = self.state.lock();
+                let mut state = self.write_state();
                 let mut inode = self.read_inode(&state, inode_num)?;
 
                 if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1357,7 +1492,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             Err(FsError::NotFound) => {
                 // Create new file
                 let (parent_inode, name) = self.lookup_parent(path)?;
-                let mut state = self.state.lock();
+                let mut state = self.write_state();
 
                 // Allocate inode
                 let inode_num = self.allocate_inode(&mut state, false)?;
@@ -1448,7 +1583,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             Err(e) => return Err(e),
         };
 
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1507,7 +1642,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
 
         let (parent_inode_num, name) = self.lookup_parent(path)?;
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
 
         // Allocate inode
         let inode_num = self.allocate_inode(&mut state, true)?;
@@ -1585,7 +1720,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let inode_num = self.lookup_path(path)?;
         let (parent_inode, name) = self.lookup_parent(path)?;
 
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1626,7 +1761,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         let (parent_inode_num, name) = self.lookup_parent(path)?;
 
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) != S_IFDIR {
@@ -1669,7 +1804,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Err(FsError::AlreadyExists);
         }
         let (parent_inode, name) = self.lookup_parent(link_path)?;
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         self.create_symlink_internal(&mut state, parent_inode, &name, target)
     }
 
@@ -1697,7 +1832,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let (src_parent, src_name) = self.lookup_parent(old_path)?;
         let (dst_parent, dst_name) = self.lookup_parent(new_path)?;
 
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         let src_inode = self.read_inode(&state, src_inode_num)?;
         let ft = if (src_inode.type_perms & 0xF000) == S_IFDIR { FT_DIR } else { FT_REG_FILE };
 
@@ -1748,7 +1883,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
         let inode_num = self.lookup_path(path)?;
-        let state = self.state.lock();
+        let state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
         inode.type_perms = (inode.type_perms & 0xF000) | (mode as u16 & 0o7777);
         inode.modification_time = self.current_time();
@@ -1765,7 +1900,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
 
         let inode_num = self.lookup_path(path)?;
-        let mut state = self.state.lock();
+        let mut state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) != S_IFREG {

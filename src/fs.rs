@@ -71,6 +71,16 @@ pub fn init() -> Result<(), FsError> {
     // Initialize VFS subsystem
     vfs::init();
 
+    // Initialize ext2 thread hooks for orphaned lock recovery
+    // These hooks allow the filesystem to detect when a thread holding the lock has died
+    // and force-unlock to prevent permanent deadlock.
+    unsafe {
+        akuma_ext2::init_thread_hooks(
+            || akuma_exec::threading::current_thread_id(),
+            |tid| akuma_exec::threading::is_thread_terminated(tid),
+        );
+    }
+    
     // Mount ext2 filesystem at root
     let ext2_fs = vfs::ext2::mount()?;
     vfs::mount("/", ext2_fs)?;

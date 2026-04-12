@@ -8,7 +8,7 @@ extern crate alloc;
 
 mod ext2;
 
-pub use ext2::Ext2Filesystem;
+pub use ext2::{Ext2Filesystem, init_thread_hooks};
 
 /// Trait abstracting raw block device I/O.
 #[allow(clippy::result_unit_err)]
