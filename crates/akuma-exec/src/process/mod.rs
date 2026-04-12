@@ -1849,7 +1849,6 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     if alt_sp != 0 {
         // If not clean, force-clear it
         crate::threading::set_sigaltstack(tid, 0, 0, 2); // SS_DISABLE
-        log::warn!("[clone_thread] tid={} had stale alt_sp={:#x}, cleared", tid, alt_sp);
     }
 
     crate::threading::update_thread_context(tid, &child_ctx);

@@ -1,6 +1,6 @@
-//! Futex + Signal Syscall Tests
+//! Futex + Signal + Time Syscall Tests
 //!
-//! Tests for futex and signal-stack primitives.
+//! Tests for futex, signal-stack, and time-related primitives.
 //! Uses BYPASS_VALIDATION so kernel-stack addresses pass the user-pointer check.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -11,6 +11,8 @@ use crate::console;
 
 const NR_FUTEX: u64 = 98;
 const NR_SIGALTSTACK: u64 = 132;
+const NR_CLOCK_GETTIME: u64 = 113;
+const NR_CLOCK_GETRES: u64 = 114;
 //const NR_PIPE2: u64 = 59;
 //const NR_WRITE: u64 = 64;
 //const NR_CLOSE: u64 = 57;
@@ -29,6 +31,7 @@ const FUTEX_CMP_REQUEUE_PRIVATE: u64 = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 const EAGAIN: u64 = (-11i64) as u64;
 const ETIMEDOUT: u64 = (-110i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
+const EFAULT: u64 = (-14i64) as u64;
 //const EPIPE: u64 = (-32i64) as u64;
 //const EBADF: u64 = (-9i64) as u64;
 
@@ -113,6 +116,7 @@ fn test_futex_unaligned_addr() {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
@@ -1977,10 +1981,199 @@ fn test_futex_private_tgid_isolation() {
     console::print("  [PASS] test_futex_private_tgid_isolation\n");
 }
 
+// ============================================================================
+// clock_gettime / clock_getres Tests
+// ============================================================================
+
+// Uses existing Timespec struct defined above (line ~119)
+
+/// Linux clock IDs
+const CLOCK_REALTIME: u32 = 0;
+const CLOCK_MONOTONIC: u32 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
+const CLOCK_MONOTONIC_RAW: u32 = 4;
+const CLOCK_REALTIME_COARSE: u32 = 5;
+const CLOCK_MONOTONIC_COARSE: u32 = 6;
+const CLOCK_BOOTTIME: u32 = 7;
+
+fn test_clock_gettime_realtime() {
+    set_bypass(true);
+
+    let mut ts = Timespec::default();
+    let ret = crate::syscall::handle_syscall(
+        NR_CLOCK_GETTIME,
+        &[CLOCK_REALTIME as u64, &mut ts as *mut Timespec as u64, 0, 0, 0, 0],
+    );
+
+    set_bypass(false);
+
+    assert!(ret == 0, "clock_gettime(CLOCK_REALTIME) failed: ret={}", ret as i64);
+    assert!(ts.tv_sec >= 0, "tv_sec should be non-negative: {}", ts.tv_sec);
+    assert!(ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000,
+        "tv_nsec out of range [0, 1e9): {}", ts.tv_nsec);
+
+    console::print("  [PASS] test_clock_gettime_realtime\n");
+}
+
+fn test_clock_gettime_monotonic() {
+    set_bypass(true);
+
+    let mut ts1 = Timespec::default();
+    let ret1 = crate::syscall::handle_syscall(
+        NR_CLOCK_GETTIME,
+        &[CLOCK_MONOTONIC as u64, &mut ts1 as *mut Timespec as u64, 0, 0, 0, 0],
+    );
+
+    // Wait a bit
+    for _ in 0..1000 { core::hint::spin_loop(); }
+
+    let mut ts2 = Timespec::default();
+    let ret2 = crate::syscall::handle_syscall(
+        NR_CLOCK_GETTIME,
+        &[CLOCK_MONOTONIC as u64, &mut ts2 as *mut Timespec as u64, 0, 0, 0, 0],
+    );
+
+    set_bypass(false);
+
+    assert!(ret1 == 0, "clock_gettime(CLOCK_MONOTONIC) first call failed: ret={}", ret1 as i64);
+    assert!(ret2 == 0, "clock_gettime(CLOCK_MONOTONIC) second call failed: ret={}", ret2 as i64);
+
+    // Monotonic clock must not go backwards
+    let t1_ns = ts1.tv_sec * 1_000_000_000 + ts1.tv_nsec;
+    let t2_ns = ts2.tv_sec * 1_000_000_000 + ts2.tv_nsec;
+    assert!(t2_ns >= t1_ns, "CLOCK_MONOTONIC went backwards: {} -> {}", t1_ns, t2_ns);
+
+    console::print("  [PASS] test_clock_gettime_monotonic\n");
+}
+
+fn test_clock_gettime_all_clock_ids() {
+    set_bypass(true);
+
+    // Test all common clock IDs - they should all succeed (we map most to MONOTONIC)
+    let clock_ids = [
+        (CLOCK_REALTIME, "CLOCK_REALTIME"),
+        (CLOCK_MONOTONIC, "CLOCK_MONOTONIC"),
+        (CLOCK_PROCESS_CPUTIME_ID, "CLOCK_PROCESS_CPUTIME_ID"),
+        (CLOCK_THREAD_CPUTIME_ID, "CLOCK_THREAD_CPUTIME_ID"),
+        (CLOCK_MONOTONIC_RAW, "CLOCK_MONOTONIC_RAW"),
+        (CLOCK_REALTIME_COARSE, "CLOCK_REALTIME_COARSE"),
+        (CLOCK_MONOTONIC_COARSE, "CLOCK_MONOTONIC_COARSE"),
+        (CLOCK_BOOTTIME, "CLOCK_BOOTTIME"),
+    ];
+
+    for (clock_id, _name) in clock_ids {
+        let mut ts = Timespec::default();
+        let ret = crate::syscall::handle_syscall(
+            NR_CLOCK_GETTIME,
+            &[clock_id as u64, &mut ts as *mut Timespec as u64, 0, 0, 0, 0],
+        );
+        // We accept the call - even if we map to monotonic internally
+        assert!(ret == 0, "clock_gettime(clock_id={}) failed: ret={}", clock_id, ret as i64);
+        assert!(ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000,
+            "clock_gettime(clock_id={}) tv_nsec out of range: {}", clock_id, ts.tv_nsec);
+    }
+
+    set_bypass(false);
+    console::print("  [PASS] test_clock_gettime_all_clock_ids\n");
+}
+
+fn test_clock_gettime_efault_null_ptr() {
+    set_bypass(false); // Enable validation
+
+    let ret = crate::syscall::handle_syscall(
+        NR_CLOCK_GETTIME,
+        &[CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0], // NULL pointer
+    );
+
+    // Should return -EFAULT
+    assert!(ret == EFAULT, "clock_gettime(NULL) should return EFAULT, got {}", ret as i64);
+
+    console::print("  [PASS] test_clock_gettime_efault_null_ptr\n");
+}
+
+fn test_clock_gettime_efault_invalid_ptr() {
+    set_bypass(false); // Enable validation
+
+    // Use an address past the user VA limit (definitely unmapped)
+    let invalid_ptr = 0xFFFF_FFFF_0000_0000u64; // Way past user VA limit
+
+    let ret = crate::syscall::handle_syscall(
+        NR_CLOCK_GETTIME,
+        &[CLOCK_MONOTONIC as u64, invalid_ptr, 0, 0, 0, 0],
+    );
+
+    // Should return -EFAULT
+    assert!(ret == EFAULT, "clock_gettime(invalid_ptr) should return EFAULT, got {}", ret as i64);
+
+    console::print("  [PASS] test_clock_gettime_efault_invalid_ptr\n");
+}
+
+fn test_clock_getres_basic() {
+    set_bypass(true);
+
+    let mut res = Timespec::default();
+    let ret = crate::syscall::handle_syscall(
+        NR_CLOCK_GETRES,
+        &[CLOCK_MONOTONIC as u64, &mut res as *mut Timespec as u64, 0, 0, 0, 0],
+    );
+
+    set_bypass(false);
+
+    assert!(ret == 0, "clock_getres failed: ret={}", ret as i64);
+    // Resolution should be > 0 (we return 1ns)
+    let res_ns = res.tv_sec * 1_000_000_000 + res.tv_nsec;
+    assert!(res_ns > 0, "clock_getres should return positive resolution: {}", res_ns);
+
+    console::print("  [PASS] test_clock_getres_basic\n");
+}
+
+fn test_clock_getres_null_ptr() {
+    // Linux allows NULL res pointer (just checks if clock is supported)
+    let ret = crate::syscall::handle_syscall(
+        NR_CLOCK_GETRES,
+        &[CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0],
+    );
+
+    assert!(ret == 0, "clock_getres(NULL) should succeed, got {}", ret as i64);
+
+    console::print("  [PASS] test_clock_getres_null_ptr\n");
+}
+
+fn test_clock_gettime_struct_layout() {
+    // Verify struct timespec matches Linux ABI (16 bytes, tv_sec at offset 0, tv_nsec at offset 8)
+    assert!(core::mem::size_of::<Timespec>() == 16,
+        "struct timespec size mismatch: {} != 16", core::mem::size_of::<Timespec>());
+    assert!(core::mem::align_of::<Timespec>() == 8,
+        "struct timespec alignment mismatch: {} != 8", core::mem::align_of::<Timespec>());
+
+    // Verify field offsets
+    let ts = Timespec { tv_sec: 0x1234_5678_9ABC_DEF0u64 as i64, tv_nsec: 0xFEDC_BA98_7654_3210u64 as i64 };
+    let bytes = unsafe { core::slice::from_raw_parts(&ts as *const Timespec as *const u8, 16) };
+
+    // tv_sec at offset 0 (little-endian)
+    assert!(bytes[0] == 0xF0, "tv_sec byte 0 mismatch");
+    assert!(bytes[7] == 0x12, "tv_sec byte 7 mismatch");
+    // tv_nsec at offset 8
+    assert!(bytes[8] == 0x10, "tv_nsec byte 0 mismatch");
+    assert!(bytes[15] == 0xFE, "tv_nsec byte 7 mismatch");
+
+    console::print("  [PASS] test_clock_gettime_struct_layout\n");
+}
+
 pub fn run_all_tests() {
     console::print("
 --- Futex Sync Tests ---
 ");
+    // clock_gettime tests first (simple, fast)
+    test_clock_gettime_struct_layout();
+    test_clock_gettime_realtime();
+    test_clock_gettime_monotonic();
+    test_clock_gettime_all_clock_ids();
+    test_clock_gettime_efault_null_ptr();
+    test_clock_gettime_efault_invalid_ptr();
+    test_clock_getres_basic();
+    test_clock_getres_null_ptr();
     // Single-threaded correctness
     test_futex_eagain();
     test_futex_null_addr();

@@ -1857,74 +1857,121 @@ The migration from `Spinlock` to `RwSpinlock` also provides:
 
 ---
 
-## 2026-04-12: Two Distinct SIGSEGV Crash Patterns (MOSTLY FIXED)
+## 2026-04-12: Two Distinct SIGSEGV Crash Patterns (UNDER INVESTIGATION)
 
 ### Overview
 
-After the SIGURG and orphaned lock fixes, two distinct crash patterns were observed.
-Multiple fixes were applied, and the test now passes consistently:
+After extensive debugging, two distinct crash patterns remain in `forktest_parent --combined_stress`.
+Both manifest as `addr=0x2` crashes in Go's memory allocator.
+
+### Crash Pattern 1: Child Process (addr=0x2)
 
 ```
-akuma:/bin> forktest_parent --duration 10s --combined_stress
-forktest_parent: Starting with 3 children, duration=10s
-forktest_parent: Launching child 0...
-forktest_parent: Launching child 1...
-forktest_parent: Launching child 2...
-forktest_parent: Duration elapsed, killing 3 remaining children.
-forktest_child: Received terminated, exiting gracefully.
-forktest_child: Received terminated, exiting gracefully.
-forktest_child: Received terminated, exiting gracefully.
-forktest_parent: All children processed via epoll. Parent exiting.
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x2 pc=0x86768]
+runtime.memclrNoHeapPointers()
+  .../memclr_arm64.s:91 +0xb8
+runtime.mallocgcLarge(...)
+  .../malloc.go:1612 +0x1a8
+main.runMmapStress(...)
 ```
 
-### Fixes Applied
+**Analysis:**
+- Fault address `0x2` is a corrupted pointer value (NOT a valid address)
+- PC=0x86768 is in `memclrNoHeapPointers` (Go's memory zeroing routine)
+- `mallocgc` returned `0x2` instead of a valid heap pointer
+- `last_sc=!0u64` means no syscall was active - crash is purely in userspace
+- Kernel log: `[DA-DP] pid=X va=0x2 anon alloc failed, 0 free pages` can occur (OOM)
+- When not OOM: `[WILD-DA] pid=X FAR=0x2 ELR=0x86768`
 
-1. **Removed sigaltstack inheritance in `clone_thread()`**: New M-threads created via
-   `clone(CLONE_VM|CLONE_THREAD)` no longer inherit the parent's sigaltstack. This
-   ensures the SIGURG guard (`alt_sp == 0` check) works correctly.
+### Crash Pattern 2: Parent Process (addr=0x2)
 
-2. **Added SIGURG clearing in `entry_point_trampoline`**: Before a new thread enters
-   userspace for the first time, any pending SIGURG is cleared if `alt_sp == 0`.
+```
+SIGSEGV: segmentation violation
+PC=0x13060 m=0 sigcode=1 addr=0x2
+goroutine 1 gp=0x1e00021c0 m=0 mp=0x1edc40 [syscall]:
+syscall.Syscall(0x3f, 0x4, 0x1e0087718, 0x400)
+```
 
-3. **Added sigaltstack validation in `clone_thread()`**: If a thread slot has stale
-   `alt_sp` from a previous occupant, it's forcibly reset to 0.
+**Analysis:**
+- Same `addr=0x2` corrupted pointer
+- PC=0x13060 is in Go's syscall return path
+- Parent crashes while reading from pipe (fd=4) monitoring children
+- Happens after children crash, but sometimes independently
 
-4. **Added `clear_pending_signal()` function**: Allows clearing specific pending signals
-   for a thread without delivering them.
+### Root Cause Hypothesis
 
-5. **Added `[SIGSEGV-HEAP]` logging**: For debugging, any SIGSEGV in Go's heap range
-   (`0x1e000_0000` - `0x2_0000_0000`) is logged before signal delivery.
+Go's memory allocator internal data structures are being corrupted. The `0x2` value
+appears in both parent and child, suggesting a common mechanism:
 
-### Crash Patterns Observed (Historical)
+1. **CoW Page Table Corruption**: After `fork()`, parent and children share CoW pages.
+   If the page fault handler for CoW writes corrupts metadata, Go's heap structures
+   become invalid. Symptom: allocator's span/free-list pointers contain `0x2`.
 
-**Type 1: Child M-Thread Corruption (addr=0x2)**
-- Fault address `0x2` (near-null pointer)
-- PC in `memclr_arm64.s` (Go's memory clearing routine)
-- Caused by SIGURG delivery to uninitialized M-threads
+2. **Signal Handler Interference**: SIGURG (goroutine preemption) delivered during
+   `mallocgc` critical section could corrupt allocator state. However, Go's allocator
+   should be signal-safe since Go 1.14.
 
-**Type 2: Parent Heap Access Fault (addr=0x1e0......000)**
-- Fault in Go's heap region during `read()` syscall
-- Parent crashes while children are still running
-- Possibly related to CoW page table handling or lazy region tracking
+3. **Demand Paging Race**: Multiple M-threads fault on the same lazy region
+   simultaneously. If the fault handler has a race condition, the physical page
+   mapping could be incorrect, causing Go to read corrupted heap data.
+
+### Diagnostic Evidence
+
+From kernel logs:
+```
+[clone_thread] tid=16 alt_sp=0x0    # New threads have clean sigaltstack
+[clone_thread] tid=17 alt_sp=0x0
+...
+[TRAMP] tid=12 alt_sp=0x1e0004000   # Forked processes inherit sigaltstack (correct)
+[TRAMP] tid=13 alt_sp=0x1e0004000
+...
+[DA-MISS] pid=96 ppid=90 va=0x2     # Child faults at corrupted address
+[WILD-DA] pid=96 FAR=0x2 ELR=0x86768 last_sc=18446744073709551615
+```
+
+### Fixes Applied (Partial)
+
+1. **`clone_thread()` no longer inherits sigaltstack**: New M-threads start with
+   `alt_sp=0` so SIGURG guard works correctly.
+
+2. **SIGURG clearing in `entry_point_trampoline`**: Pending SIGURG cleared before
+   first userspace entry if `alt_sp=0`.
+
+3. **Sigaltstack validation**: Stale `alt_sp` from reused thread slots is reset.
+
+4. **`clear_pending_signal()` function**: Selective signal clearing without delivery.
+
+5. **`[SIGSEGV-HEAP]` logging**: Improved diagnostics for Go heap faults.
 
 ### Files Changed
 
 | File | Change |
 |------|--------|
-| `crates/akuma-exec/src/process/mod.rs` | Removed sigaltstack inheritance in `clone_thread()` |
-| `crates/akuma-exec/src/process/mod.rs` | Added SIGURG clearing in `entry_point_trampoline` |
-| `crates/akuma-exec/src/process/mod.rs` | Added sigaltstack validation in `clone_thread()` |
-| `crates/akuma-exec/src/threading/mod.rs` | Added `clear_pending_signal()` function |
-| `src/exceptions.rs` | Added `[SIGSEGV-HEAP]` logging for debugging |
+| `crates/akuma-exec/src/process/mod.rs` | sigaltstack handling in clone_thread |
+| `crates/akuma-exec/src/process/mod.rs` | SIGURG guard in entry_point_trampoline |
+| `crates/akuma-exec/src/threading/mod.rs` | `clear_pending_signal()` function |
+| `src/exceptions.rs` | `[SIGSEGV-HEAP]` and `[WILD-DA]` logging |
 
-### Remaining Observations
+### Next Steps
 
-The `[TRAMP]` logging shows some threads still have stale `alt_sp`:
+1. **Investigate CoW fault handler**: Check `handle_cow_fault()` for races when
+   multiple threads fault on the same page simultaneously.
+
+2. **Add heap corruption detection**: Log when Go's heap region receives page faults
+   that modify critical allocator metadata.
+
+3. **Test with GOMAXPROCS=1**: If crashes disappear with single M-thread, confirms
+   multi-threading race condition.
+
+4. **Audit demand paging**: Verify `LAZY_REGION_TABLE` operations are atomic and
+   don't corrupt Go's view of memory.
+
+### Memory Requirements
+
+The test requires sufficient RAM. With 256MB, OOM occurs:
 ```
-[TRAMP] tid=12 alt_sp=0x1e0004000
-[TRAMP] tid=13 alt_sp=0x1e0004000
+[DA-DP] pid=94 va=0x1e4ba6000 anon alloc failed, 0 free pages
 ```
 
-This suggests thread slot cleanup at termination may have a race condition or timing
-issue. However, the test now passes consistently, indicating the fixes are sufficient
-to prevent the crashes even when stale values exist.
+Run with `MEMORY=2048M cargo run --release` for reliable testing.
