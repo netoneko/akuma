@@ -1,6 +1,6 @@
 # Go Forktest Crash Analysis
 
-This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`** or **`-mmap_test`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address (see [Isolation matrix](#isolation-matrix-2026-04-14)).
+This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
 ## Current status (2026-04-14)
 
@@ -12,8 +12,9 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 |--------------|----------------|---------------|
 | `write /tmp/...: input/output error` | ext2 read path starved / `IoError` | ext2 history in `GO_FORK_EXEC_FIXES.md` |
 | `addr=0x2`, panic in `mallocgc` / `memclr` | Go heap sees bad pointer (kernel memory model) | This file, §Crash Pattern 1–2 |
+| SSH / shell **hang**, no new output | **Deadlock** or blocked ext2/pipe path | Often with **`-file_io`** or heavy `/tmp` I/O; [Isolation matrix](#isolation-matrix-2026-04-14) |
 
-**Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`** / **`-combined_stress`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
+**Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
 
 ## Isolation matrix (2026-04-14)
 
@@ -23,10 +24,10 @@ Shell: `export GOMAXPROCS=1` for all runs below. Command line: `forktest_parent 
 |------------|---------|
 | **(none)** — children run default main (no stress) | **Stable.** Parent sends SIGTERM at deadline; `Wait()` reports `signal: killed`; empty child stdout. |
 | **`-mmap_test`** | **Parent SIGSEGV** in `unix.Read` on pipe (**`main.go:199`**): `PC≈0x13060`, fault `addr≈0x1e39df000`, `syscall` read `fd=4`. Same shape as [Pattern 2](#crash-pattern-2-parent-process-heap-corruption). **Does not require** `-combined_stress` or multiple Go M-threads in the parent. |
-| **`-file_io`** | **Stable** in this session: children print `Received terminated, exiting gracefully.` before kill. |
+| **`-file_io`** | **Not a safe mode.** One short run showed children printing `Received terminated, exiting gracefully.` before kill, but **`-file_io` has also reproduced a full deadlock** (no forward progress in SSH / shell). That lines up with **concurrent temp-file writes** on ext2 and earlier **`ps`** / shell hangs under I/O stress—count **`file_io`** as a **deadlock risk**, not “stable”. |
 | **`-send_signal`** | **Stable** (benign race): `Failed to send SIGINT … process already finished` if the child exits before 500 ms; then deadline kill as usual. |
 
-**Conclusion:** The **mmap heap stress in children** (`runMmapStress`, large `make([]byte, …)`) is enough to trigger failure; **`GOMAXPROCS=1` does not rule out “multi-M in parent”** as the sole cause—it rules out **parent** multi-threading as required for the parent `read()` crash. The bug is likely **kernel-side** (pipe/read path, scheduling, or memory accounting) or **child-driven** kernel state that affects the parent’s syscall return.
+**Conclusion:** The **mmap heap stress in children** (`runMmapStress`, large `make([]byte, …)`) is enough to trigger the **parent `read()` SIGSEGV**; **`GOMAXPROCS=1` does not rule out “multi-M in parent”** as the sole cause—it rules out **parent** multi-threading as required for that crash. Separately, **`file_io`** stress can **deadlock** the system even when mmap does not SIGSEGV the parent—likely **filesystem / lock / scheduler** interaction, not only Go’s allocator.
 
 ## Test Command
 
@@ -287,13 +288,13 @@ grep -E "signal.*deliver|tkill.*sig=23" /tmp/akuma_output.txt
 
 ## Test Isolation Ideas
 
-1. **Single M-thread**: Run with `GOMAXPROCS=1` - if crashes disappear, confirms multi-threading issue
+1. **Single M-thread (`GOMAXPROCS=1`)**: **Tried (2026-04-14)** — parent still **SIGSEGV** in `read()` with **`-mmap_test`** only. This **does not** point to parent goroutine count alone; keep it for narrowing **child** threading vs allocator.
 
 2. **No forking**: Run child directly without fork - isolates fork/CoW from thread creation
 
 3. **Simple allocations**: Modify `runMmapStress` to use smaller allocations - checks if large allocations trigger the bug
 
-4. **Disable preemption**: Build Go binary with `GODEBUG=asyncpreemptoff=1` - eliminates SIGURG as a factor
+4. **Disable preemption**: `GODEBUG=asyncpreemptoff=1` - eliminates SIGURG as a factor (still worth testing; not yet logged as definitive)
 
 ## Summary
 
@@ -307,7 +308,9 @@ Both crash patterns show `addr=0x2` which indicates Go's heap allocator is retur
 
 A **delayed full kernel freeze** after the same kind of forktest run has been observed once (see [§Captured SSH log](#captured-ssh-log-2026-04-14) item 5); it is **not** yet tied to a specific kernel stack without serial/QEMU logs.
 
+**`-file_io`** is counted as a **deadlock** risk (SSH/shell hang), not only as a clean SIGTERM path—see [Isolation matrix](#isolation-matrix-2026-04-14).
+
 The most promising investigation paths are:
 1. Add locking/logging to CoW fault handler
 2. Verify `LAZY_REGION_TABLE` operations are atomic
-3. Test with `GOMAXPROCS=1` to confirm multi-threading involvement
+3. ~~Test with `GOMAXPROCS=1`~~ — **done:** parent `read()` crash still reproduces with `-mmap_test` at `GOMAXPROCS=1` ([Isolation matrix](#isolation-matrix-2026-04-14)); focus on **mmap/demand-paging** interaction and **pipe read** return path

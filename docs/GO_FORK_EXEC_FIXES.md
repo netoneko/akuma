@@ -1961,8 +1961,10 @@ From kernel logs:
 2. **Add heap corruption detection**: Log when Go's heap region receives page faults
    that modify critical allocator metadata.
 
-3. **Test with GOMAXPROCS=1**: If crashes disappear with single M-thread, confirms
-   multi-threading race condition.
+3. **~~Test with GOMAXPROCS=1~~** (2026-04-14): Parent **`read()` SIGSEGV** with
+   **`-mmap_test`** still reproduces at **`GOMAXPROCS=1`** — does **not** implicate
+   parent multi-threading alone. See [`GO_FORKTEST_DEBUG.md`](./GO_FORKTEST_DEBUG.md)
+   **§Isolation matrix**.
 
 4. **Audit demand paging**: Verify `LAZY_REGION_TABLE` operations are atomic and
    don't corrupt Go's view of memory.
@@ -1984,5 +1986,6 @@ to temp files. They do **not** resolve the separate **`addr=0x2`** / Go
 `mallocgc` / `memclrNoHeapPointers` crashes under `forktest_parent
 --combined_stress`. That problem is documented in
 [`GO_FORKTEST_DEBUG.md`](./GO_FORKTEST_DEBUG.md) and in **§2026-04-12** above;
-mitigations include `GOMAXPROCS=1`, `GODEBUG=asyncpreemptoff=1`, and sufficient
-`MEMORY=`.
+mitigations include `GODEBUG=asyncpreemptoff=1`, sufficient `MEMORY=`, and
+avoiding **`-mmap_test`** / **`-combined_stress`** (`GOMAXPROCS=1` alone is
+**not** sufficient; see **§Isolation matrix** in that doc).

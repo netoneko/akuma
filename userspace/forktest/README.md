@@ -109,19 +109,24 @@ causes the child to exit immediately.
 
 ## Known issues
 
-**Go heap SIGSEGV (`addr=0x2`, PC in the allocator):** With `-combined_stress`,
-each child runs mmap stress (`make([]byte, 100MB)`), file I/O, and goroutine
-stress at the same time. A **known, still-reproducing** failure is a panic such
-as `invalid memory address or nil pointer dereference` with **`addr=0x2`** and
-**`pc≈0x86768`** (often under `runtime.memclrNoHeapPointers` → `mallocgcLarge`).
-That points at **corrupted or bogus pointers in the Go allocator**, not a simple
-nil check in forktest source. Full analysis and kernel log patterns are in
-[`docs/GO_FORKTEST_DEBUG.md`](../../docs/GO_FORKTEST_DEBUG.md).
+**Go / kernel stress failures:** With **`-mmap_test`** or **`-combined_stress`**,
+children allocate large slices (`make([]byte, 100MB)` in mmap mode). With **`-file_io`**,
+children stress **`/tmp`** (ext2); that mode has caused **deadlocks** as well as normal
+I/O. A **known,
+still-reproducing** child failure is a panic with **`addr=0x2`** and **`pc≈0x86768`**
+(often under `memclrNoHeapPointers` → `mallocgcLarge`). Separately, the **parent**
+can **SIGSEGV** inside **`unix.Read`** on the epoll pipe (**`main.go:199`**)
+with a heap-range fault address — this has been observed with **`-mmap_test` alone**
+and with **`GOMAXPROCS=1`**, so it is **not** fixed by single-threading the parent.
+Details: [`docs/GO_FORKTEST_DEBUG.md`](../../docs/GO_FORKTEST_DEBUG.md) (**§Isolation matrix**).
 
 **Not the same as ext2 EIO:** Past **`input/output error`** writes to `/tmp`
 were tied to ext2 lock contention and are addressed in the kernel ext2 layer.
 The **`addr=0x2`** crash is tracked separately (CoW, lazy paging, thread groups).
 
-**Mitigations:** Give QEMU plenty of RAM (for example `MEMORY=2048M`), try
-`GOMAXPROCS=1` and/or `GODEBUG=asyncpreemptoff=1`, or avoid `-combined_stress`
-and run a single stress mode until the kernel/runtime issue is fixed.
+**Mitigations:** Plenty of RAM (`MEMORY=2048M`), try `GODEBUG=asyncpreemptoff=1`,
+or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1`**
+does **not** prevent the parent `read()` crash with **`-mmap_test`** (see doc above).
+Default runs (**no** child stress flags) are the safest smoke test. **`-file_io`**
+has reproduced **deadlocks** (SSH/shell hang) in addition to occasional clean runs—treat
+it as **high risk** on Akuma until the kernel I/O path is fully solid.
