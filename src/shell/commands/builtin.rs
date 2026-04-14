@@ -12,6 +12,7 @@ use core::pin::Pin;
 use embedded_io_async::Write;
 
 use crate::akuma::AKUMA_79;
+use crate::config;
 use akuma_net::stats as network;
 use crate::shell::{Command, ShellContext, ShellError, VecWriter};
 
@@ -463,8 +464,17 @@ impl Command for PsCommand {
         Box::pin(async move {
             use akuma_exec::process;
 
+            if config::SHELL_PS_DEBUG {
+                crate::tprint!(96, "[ps-builtin] before header write tid={}\n", akuma_exec::threading::current_thread_id());
+            }
             let _ = stdout.write(b"  PID  PPID  BOX  STATE      SYSCALL  CMDLINE\r\n").await;
+            if config::SHELL_PS_DEBUG {
+                crate::tprint!(96, "[ps-builtin] before list_processes\n");
+            }
             let procs = process::list_processes();
+            if config::SHELL_PS_DEBUG {
+                crate::tprint!(128, "[ps-builtin] after list_processes count={}\n", procs.len());
+            }
 
             if procs.is_empty() {
                 let _ = stdout.write(b"(no processes running)\r\n").await;

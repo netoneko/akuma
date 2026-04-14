@@ -566,36 +566,127 @@ fn try_lock_state_returns_none_when_locked() {
 }
 
 #[test]
-fn exists_returns_error_on_lock_contention() {
+fn exists_unblocks_after_raw_write_lock_released() {
     use std::sync::Arc;
     use std::thread;
-    
+
     let dev = load_fixture("test.ext2");
     let fs = Arc::new(Ext2Filesystem::new(dev, || 0).unwrap());
-    
-    // Hold the state lock in a separate thread
-    let fs_clone = Arc::clone(&fs);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    
-    let handle = thread::spawn(move || {
-        let _guard = fs_clone.state.write();
-        tx.send(()).unwrap(); // Signal that write lock is held
-        done_rx.recv().unwrap(); // Wait for test to complete
+
+    let fs_holder = Arc::clone(&fs);
+    let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let holder = thread::spawn(move || {
+        let _guard = fs_holder.state.write();
+        lock_held_tx.send(()).unwrap();
+        let _: () = release_rx.recv().unwrap();
     });
-    
-    // Wait for lock to be held
-    rx.recv().unwrap();
-    
-    // exists() should eventually return false (via IoError -> not found path)
-    // because try_lock_state will fail after retries
-    let result = fs.exists("/test");
-    
-    // Signal thread to release lock
-    done_tx.send(()).unwrap();
-    handle.join().unwrap();
-    
-    // With the try_lock approach, exists returns false when lock can't be acquired
-    // (IoError is converted to not-found in lookup_path)
-    assert!(!result, "exists should return false when lock is contested");
+
+    lock_held_rx.recv().unwrap();
+
+    let fs_check = Arc::clone(&fs);
+    let checker = thread::spawn(move || fs_check.exists("/lost+found"));
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let exists_result = checker.join().unwrap();
+
+    assert!(
+        exists_result,
+        "exists should succeed once the contended write lock is released"
+    );
+}
+
+#[test]
+fn concurrent_write_at_does_not_corrupt() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let fs = Arc::new(mount_empty());
+    fs.write_file("/testfile", b"").unwrap();
+
+    let num_threads = 4;
+    let writes_per_thread = 20;
+    let chunk_size = 64;
+
+    let mut handles = Vec::new();
+    for t in 0..num_threads {
+        let fs_clone = Arc::clone(&fs);
+        handles.push(thread::spawn(move || {
+            for i in 0..writes_per_thread {
+                let offset = (t * writes_per_thread + i) * chunk_size;
+                let data = vec![(t * 10 + i) as u8; chunk_size];
+                let result = fs_clone.write_at("/testfile", offset, &data);
+                assert!(result.is_ok(), "thread {} write {} failed: {:?}", t, i, result.err());
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    // Verify file is readable and has expected size
+    let content = fs.read_file("/testfile").unwrap();
+    let expected_size = num_threads * writes_per_thread * chunk_size;
+    assert!(
+        content.len() >= expected_size,
+        "file too small: {} < {}",
+        content.len(),
+        expected_size
+    );
+}
+
+#[test]
+fn concurrent_create_and_lookup() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let fs = Arc::new(mount_empty());
+    fs.create_dir("/tmp").unwrap();
+
+    let num_threads = 4;
+    let files_per_thread = 5;
+
+    let mut handles = Vec::new();
+    for t in 0..num_threads {
+        let fs_clone = Arc::clone(&fs);
+        handles.push(thread::spawn(move || {
+            for i in 0..files_per_thread {
+                let name = alloc::format!("/tmp/file_t{}_i{}", t, i);
+                let data = alloc::format!("thread={} file={}", t, i);
+                fs_clone.write_file(&name, data.as_bytes()).unwrap_or_else(|e| {
+                    panic!("thread {} failed to create {}: {:?}", t, name, e);
+                });
+
+                // Read back immediately
+                let content = fs_clone.read_file(&name).unwrap_or_else(|e| {
+                    panic!("thread {} failed to read back {}: {:?}", t, name, e);
+                });
+                assert_eq!(
+                    content,
+                    data.as_bytes(),
+                    "thread {} data mismatch for {}",
+                    t,
+                    name
+                );
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    // Verify all files still exist and are correct
+    for t in 0..num_threads {
+        for i in 0..files_per_thread {
+            let name = alloc::format!("/tmp/file_t{}_i{}", t, i);
+            let expected = alloc::format!("thread={} file={}", t, i);
+            assert!(fs.exists(&name), "file {} missing after concurrent creates", name);
+            let content = fs.read_file(&name).unwrap();
+            assert_eq!(content, expected.as_bytes(), "content mismatch for {}", name);
+        }
+    }
 }

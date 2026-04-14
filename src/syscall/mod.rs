@@ -335,6 +335,8 @@ const EAFNOSUPPORT: u64 = (-97i64) as u64;
 const EINPROGRESS: u64 = (-115i64) as u64;
 const ETIMEDOUT: u64 = (-110i64) as u64;
 const ENODEV: u64 = (-19i64) as u64;
+const EIO: u64 = (-5i64) as u64;
+const EMFILE: u64 = (-24i64) as u64;
 
 #[repr(C)]
 struct Timespec {

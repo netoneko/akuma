@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -56,6 +57,27 @@ func buildChildArgs() []string {
 	return args
 }
 
+// resolveForktestChild returns an absolute or stable path to forktest_child so exec works from any CWD
+// (e.g. Akuma shell at / vs /bin). Tries: next to this binary, then /bin/forktest_child, then ./forktest_child.
+func resolveForktestChild() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "./forktest_child"
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	candidate := filepath.Join(filepath.Dir(exe), "forktest_child")
+	if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+		return candidate
+	}
+	const akumaBin = "/bin/forktest_child"
+	if st, err := os.Stat(akumaBin); err == nil && !st.IsDir() {
+		return akumaBin
+	}
+	return "./forktest_child"
+}
+
 func main() {
 	flag.Parse()
 
@@ -83,6 +105,7 @@ func main() {
 	children := make([]*ChildInfo, numChildren)
 	childMap := make(map[int]*ChildInfo)
 	childArgs := buildChildArgs()
+	childPath := resolveForktestChild()
 
 	for i := 0; i < numChildren; i++ {
 		readPipe, writePipe, err := os.Pipe()
@@ -91,7 +114,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		cmd := exec.Command("./forktest_child", childArgs...)
+		cmd := exec.Command(childPath, childArgs...)
 		cmd.Env = append(os.Environ(), fmt.Sprintf("FORKTEST_CHILD_ID=%d", i))
 		cmd.Stdout = writePipe
 		cmd.Stderr = os.Stderr

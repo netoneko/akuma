@@ -7164,7 +7164,7 @@ fn test_map_user_page_already_mapped() -> bool {
     use akuma_exec::mmu::{UserAddressSpace, user_flags, map_user_page, is_current_user_page_mapped};
 
     // Create a test address space
-    let Some(mut addr_space) = UserAddressSpace::new() else {
+    let Some(addr_space) = UserAddressSpace::new() else {
         crate::safe_print!(64, "  SKIP: failed to allocate address space\n");
         return true;
     };

@@ -16,6 +16,8 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_child  ./child
 
 Copy both binaries to `/bin/` on the Akuma disk image.
 
+The parent resolves `forktest_child` next to its own executable (or falls back to `/bin/forktest_child`), so you do not need `cd /bin` for `exec` to succeed.
+
 ## Usage
 
 ```

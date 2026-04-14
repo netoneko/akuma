@@ -183,8 +183,8 @@ static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
 
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
-    page_table_frames: Vec<PhysFrame>,
-    user_frames: Vec<PhysFrame>,
+    page_table_frames: Spinlock<Vec<PhysFrame>>,
+    user_frames: Spinlock<Vec<PhysFrame>>,
     asid: u16,
     shared: bool,
 }
@@ -197,8 +197,8 @@ impl UserAddressSpace {
         let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
         let mut addr_space = Self {
             l0_frame,
-            page_table_frames: Vec::new(),
-            user_frames: Vec::new(),
+            page_table_frames: Spinlock::new(Vec::new()),
+            user_frames: Spinlock::new(Vec::new()),
             asid,
             shared: false,
         };
@@ -223,18 +223,18 @@ impl UserAddressSpace {
         });
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
-            page_table_frames: Vec::new(),
-            user_frames: Vec::new(),
+            page_table_frames: Spinlock::new(Vec::new()),
+            user_frames: Spinlock::new(Vec::new()),
             asid,
             shared: true,
         })
     }
 
-    fn add_kernel_mappings(&mut self) -> Result<(), &'static str> {
+    fn add_kernel_mappings(&self) -> Result<(), &'static str> {
         let rt = runtime();
         let l1_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L1 table")?;
         (rt.track_frame)(l1_frame, FrameSource::UserPageTable);
-        self.page_table_frames.push(l1_frame);
+        { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l1_frame); }
 
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
         unsafe {
@@ -245,7 +245,7 @@ impl UserAddressSpace {
         let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
         let l2_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate L2 table")?;
         (rt.track_frame)(l2_frame, FrameSource::UserPageTable);
-        self.page_table_frames.push(l2_frame);
+        { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l2_frame); }
 
         unsafe {
             let l2_entry = (l2_frame.addr as u64) | flags::VALID | flags::TABLE;
@@ -286,7 +286,7 @@ impl UserAddressSpace {
             for l1_idx in start_l1_idx..=end_l1_idx {
                 let l2_ram_frame = (rt.alloc_page_zeroed)().ok_or("Failed to allocate kernel RAM L2 table")?;
                 (rt.track_frame)(l2_ram_frame, FrameSource::UserPageTable);
-                self.page_table_frames.push(l2_ram_frame);
+                { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l2_ram_frame); }
 
                 unsafe {
                     let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
@@ -346,7 +346,7 @@ impl UserAddressSpace {
                 if entry & flags::TABLE == 0 {
                     let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
                     (rt.track_frame)(frame, FrameSource::UserPageTable);
-                    self.page_table_frames.push(frame);
+                    { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(frame); }
                     shatter_block_to_pages(frame.addr, entry);
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     table_ptr.add(idx).write_volatile(new_entry);
@@ -357,7 +357,7 @@ impl UserAddressSpace {
             } else {
                 let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for page table")?;
                 (rt.track_frame)(frame, FrameSource::UserPageTable);
-                self.page_table_frames.push(frame);
+                { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(frame); }
                 let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                 table_ptr.add(idx).write_volatile(new_entry);
                 Ok(frame)
@@ -377,7 +377,7 @@ impl UserAddressSpace {
         let rt = runtime();
         let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
         (rt.track_frame)(frame, FrameSource::ElfLoader);
-        self.user_frames.push(frame);
+        { let _irq = IrqGuard::new(); self.user_frames.lock().push(frame); }
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)
     }
@@ -416,10 +416,21 @@ impl UserAddressSpace {
         }
     }
 
-    pub fn track_user_frame(&mut self, frame: PhysFrame) { self.user_frames.push(frame); }
-    pub fn track_page_table_frame(&mut self, frame: PhysFrame) { self.page_table_frames.push(frame); }
-    pub fn remove_user_frame(&mut self, frame: PhysFrame) {
-        if let Some(idx) = self.user_frames.iter().position(|f| f.addr == frame.addr) { self.user_frames.swap_remove(idx); }
+    /// Thread-safe frame tracking — IRQs disabled to prevent preemption deadlock
+    /// (same pattern as PMM: if timer fires while holding lock, scheduler switches
+    /// to another thread which tries to lock → spins forever).
+    pub fn track_user_frame(&self, frame: PhysFrame) {
+        let _irq = IrqGuard::new();
+        self.user_frames.lock().push(frame);
+    }
+    pub fn track_page_table_frame(&self, frame: PhysFrame) {
+        let _irq = IrqGuard::new();
+        self.page_table_frames.lock().push(frame);
+    }
+    pub fn remove_user_frame(&self, frame: PhysFrame) {
+        let _irq = IrqGuard::new();
+        let mut frames = self.user_frames.lock();
+        if let Some(idx) = frames.iter().position(|f| f.addr == frame.addr) { frames.swap_remove(idx); }
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
@@ -664,8 +675,8 @@ impl Drop for UserAddressSpace {
                 // #region agent log
                 log::debug!("[FORK-DBG] AS owner L0=0x{:x} DEFERRING free (siblings alive)", l0_addr);
                 // #endregion
-                let user_frames = core::mem::take(&mut self.user_frames);
-                let pt_frames = core::mem::take(&mut self.page_table_frames);
+                let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
+                let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
                 let l0 = self.l0_frame;
                 with_irqs_disabled(|| {
                     let mut table = SHARED_L0_TABLE.lock();
@@ -678,8 +689,14 @@ impl Drop for UserAddressSpace {
             } else {
                 // No shared views (or all already dropped) — free immediately
                 let rt = runtime();
-                for frame in &self.user_frames { (rt.free_page)(*frame); }
-                for frame in &self.page_table_frames { (rt.free_page)(*frame); }
+                {
+                    let _irq = IrqGuard::new();
+                    for frame in &*self.user_frames.lock() { (rt.free_page)(*frame); }
+                }
+                {
+                    let _irq = IrqGuard::new();
+                    for frame in &*self.page_table_frames.lock() { (rt.free_page)(*frame); }
+                }
                 (rt.free_page)(self.l0_frame);
                 with_irqs_disabled(|| { SHARED_L0_TABLE.lock().remove(&l0_addr); });
             }

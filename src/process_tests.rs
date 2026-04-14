@@ -135,6 +135,8 @@ pub fn run_all_tests() {
 
     // kill_thread_group fixes (exit_group SIGSEGV fix)
     test_kill_thread_group_preserves_lazy_regions();
+    test_lazy_region_lookup_for_page_fault_clone();
+    test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
     test_schedule_blocking_respects_terminated();
 
@@ -2920,6 +2922,64 @@ fn test_kill_thread_group_preserves_lazy_regions() {
         crate::safe_print!(96,
             "[Test] kill_thread_group_preserves_lazy_regions FAILED: before={} after={}\n",
             before, after);
+    }
+}
+
+/// forktest / GO_FORKTEST_DEBUG: `lazy_region_lookup_for_page_fault` must find regions
+/// cloned to sibling PIDs (same as `lazy_region_lookup_for_pid` after `clone_lazy_regions`).
+fn test_lazy_region_lookup_for_page_fault_clone() {
+    use akuma_exec::process::{
+        lookup_process, register_process, unregister_process, push_lazy_region, clear_lazy_regions,
+        clone_lazy_regions, lazy_region_lookup_for_page_fault,
+    };
+    use akuma_exec::mmu::user_flags;
+
+    let owner_pid = 60_020u32;
+    let sibling_pid = 60_021u32;
+    let va = 0xC000_0000usize;
+    let size = 0x100_000usize;
+
+    let owner_proc = make_test_process(owner_pid);
+    register_process(owner_pid, owner_proc);
+
+    let mut sib_proc = make_test_process(sibling_pid);
+    sib_proc.tgid = owner_pid;
+    let l0 = lookup_process(owner_pid).expect("owner").address_space.l0_phys();
+    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(sibling_pid, sib_proc);
+
+    push_lazy_region(owner_pid, va, size, user_flags::RW);
+    clone_lazy_regions(owner_pid, sibling_pid);
+
+    let hit = lazy_region_lookup_for_page_fault(sibling_pid, va + 0x2000).is_some();
+
+    clear_lazy_regions(owner_pid);
+    clear_lazy_regions(sibling_pid);
+    let _ = unregister_process(owner_pid);
+    let _ = unregister_process(sibling_pid);
+
+    if hit {
+        console::print("[Test] lazy_region_lookup_for_page_fault_clone PASSED\n");
+    } else {
+        console::print("[Test] lazy_region_lookup_for_page_fault_clone FAILED\n");
+    }
+}
+
+/// Demand-paging serialization: per-page `fault_mutex` set must not leak entries (forktest stress).
+fn test_fault_mutex_insert_remove() {
+    let p = make_test_process(60_030);
+    let va = 0x5000usize;
+    {
+        let mut g = p.fault_mutex.lock();
+        g.insert(va);
+        assert!(g.contains(&va));
+    }
+    p.fault_mutex.lock().remove(&va);
+    let empty = p.fault_mutex.lock().is_empty();
+    if empty {
+        console::print("[Test] fault_mutex_insert_remove PASSED\n");
+    } else {
+        console::print("[Test] fault_mutex_insert_remove FAILED\n");
     }
 }
 

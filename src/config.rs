@@ -277,6 +277,9 @@ pub const TX_PACKET_BUFFER_SIZE: usize = 2048;
 pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
 pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
 
+/// Serial traces around the in-kernel `ps` builtin (`list_processes`) for diagnosing hangs.
+pub const SHELL_PS_DEBUG: bool = false;
+
 // Timer interval in microseconds
 pub const TIMER_INTERVAL_US: u64 = 10_000;
 

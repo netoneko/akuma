@@ -4,7 +4,7 @@ use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const EROFS: u64 = (-30i64) as u64;
 
-fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
+pub(crate) fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     use crate::vfs::FsError;
     match e {
         FsError::NotFound => ENOENT,
@@ -16,7 +16,10 @@ fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
         FsError::NoSpace => ENOSPC,
         FsError::ReadOnly => EROFS,
         FsError::InvalidPath => EINVAL,
-        _ => EPERM,
+        FsError::IoError => EIO,
+        FsError::Internal => EIO,
+        FsError::TooManyOpenFiles => EMFILE,
+        _ => EIO,
     }
 }
 
@@ -250,7 +253,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     n as u64
                 }
-                Err(_) => !0u64
+                Err(e) => fs_error_to_errno(e)
             }
         }
         akuma_exec::process::FileDescriptor::Socket(idx) => {
@@ -424,7 +427,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
                     }
                     n as u64
                 }
-                Err(_) => !0u64
+                Err(e) => fs_error_to_errno(e)
             }
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
@@ -459,7 +462,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             }
             match crate::fs::write_at(&f.path, offset as usize, &buf) {
                 Ok(n) => n as u64,
-                Err(_) => !0u64
+                Err(e) => fs_error_to_errno(e)
             }
         }
         akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,

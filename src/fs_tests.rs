@@ -55,6 +55,13 @@ pub fn run_all_tests() {
         failed += 1;
     }
 
+    // Test 6: fs_error_to_errno mapping
+    if test_fs_error_to_errno_mapping() {
+        passed += 1;
+    } else {
+        failed += 1;
+    }
+
     log(&format!(
         "\n[FS Tests] Complete: {} passed, {} failed\n",
         passed, failed
@@ -462,6 +469,69 @@ fn test_rename_operations() -> bool {
 
     log("  - PASSED\n");
     true
+}
+
+// ============================================================================
+// Test: fs_error_to_errno mapping
+// ============================================================================
+
+/// Verify every FsError variant maps to the correct Linux errno.
+/// Critically: only PermissionDenied should map to EPERM.
+fn test_fs_error_to_errno_mapping() -> bool {
+    use crate::vfs::FsError;
+
+    log("[FS Tests] Test: fs_error_to_errno_mapping\n");
+
+    // Linux errno values (negated, as u64)
+    let eperm: u64 = (-1i64) as u64;
+    let enoent: u64 = (-2i64) as u64;
+    let eio: u64 = (-5i64) as u64;
+    let eexist: u64 = (-17i64) as u64;
+    let enotdir: u64 = (-20i64) as u64;
+    let eisdir: u64 = (-21i64) as u64;
+    let einval: u64 = (-22i64) as u64;
+    let emfile: u64 = (-24i64) as u64;
+    let enospc: u64 = (-28i64) as u64;
+    let erofs: u64 = (-30i64) as u64;
+    let enotempty: u64 = (-39i64) as u64;
+
+    let cases: &[(FsError, u64, &str)] = &[
+        (FsError::NotFound, enoent, "NotFound -> ENOENT"),
+        (FsError::PermissionDenied, eperm, "PermissionDenied -> EPERM"),
+        (FsError::AlreadyExists, eexist, "AlreadyExists -> EEXIST"),
+        (FsError::NotADirectory, enotdir, "NotADirectory -> ENOTDIR"),
+        (FsError::NotAFile, eisdir, "NotAFile -> EISDIR"),
+        (FsError::DirectoryNotEmpty, enotempty, "DirectoryNotEmpty -> ENOTEMPTY"),
+        (FsError::NoSpace, enospc, "NoSpace -> ENOSPC"),
+        (FsError::ReadOnly, erofs, "ReadOnly -> EROFS"),
+        (FsError::InvalidPath, einval, "InvalidPath -> EINVAL"),
+        (FsError::IoError, eio, "IoError -> EIO"),
+        (FsError::Internal, eio, "Internal -> EIO"),
+        (FsError::TooManyOpenFiles, emfile, "TooManyOpenFiles -> EMFILE"),
+        // These should all fall through to EIO (not EPERM)
+        (FsError::BlockDeviceNotInitialized, eio, "BlockDeviceNotInitialized -> EIO"),
+        (FsError::NotInitialized, eio, "NotInitialized -> EIO"),
+        (FsError::InvalidHandle, eio, "InvalidHandle -> EIO"),
+        (FsError::Corrupt, eio, "Corrupt -> EIO"),
+        (FsError::EndOfFile, eio, "EndOfFile -> EIO"),
+        (FsError::NoFilesystem, eio, "NoFilesystem -> EIO"),
+        (FsError::NotSupported, eio, "NotSupported -> EIO"),
+    ];
+
+    let mut ok = true;
+    for (error, expected, label) in cases {
+        let actual = crate::syscall::fs::fs_error_to_errno(*error);
+        if actual != *expected {
+            log(&format!("  FAILED: {} — got {} expected {}\n", label, actual as i64, *expected as i64));
+            ok = false;
+        }
+    }
+
+    if ok {
+        log("  - All 19 FsError variants map to correct errno\n");
+        log("  - PASSED\n");
+    }
+    ok
 }
 
 // ============================================================================

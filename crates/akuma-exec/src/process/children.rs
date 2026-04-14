@@ -285,6 +285,28 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
     })
 }
 
+/// Thread group leader PID for page-fault / CoW paths: all `CLONE_VM` threads in a group must
+/// share one [`Process::fault_mutex`] and match [`LAZY_REGION_TABLE`] (see `clone_lazy_regions`,
+/// forktest / GO_FORKTEST_DEBUG). Prefer `current_process().tgid`, fall back to ProcessInfo PID.
+#[inline]
+pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
+    current_process().map(|p| p.tgid).or_else(read_current_pid)
+}
+
+/// Like [`lazy_region_lookup_for_pid`], but if `pid` misses, retries with the thread-group
+/// leader from [`address_space_owner_pid_for_fault`] when it differs (demand-paging / EL0 faults).
+pub fn lazy_region_lookup_for_page_fault(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
+    if let Some(r) = lazy_region_lookup_for_pid(pid, va) {
+        return Some(r);
+    }
+    if let Some(owner) = address_space_owner_pid_for_fault() {
+        if owner != pid {
+            return lazy_region_lookup_for_pid(owner, va);
+        }
+    }
+    None
+}
+
 /// Stack-local writer for visible kernel output without heap allocation.
 struct LazyDebugWriter<const N: usize> {
     buf: [u8; N],

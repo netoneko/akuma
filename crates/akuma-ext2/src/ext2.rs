@@ -374,13 +374,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     pub fn try_lock_state(&self, max_retries: u32) -> Option<impl core::ops::Deref<Target = Ext2State> + '_> {
         self.try_read_state(max_retries)
     }
-    
-    #[cfg(not(test))]
-    fn try_lock_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
-        self.try_read_state(max_retries)
-    }
-    
-    /// Try to acquire a read lock with a retry limit.
+
+    /// Try to acquire a read lock with a retry limit (used by unit tests only).
+    #[cfg(test)]
     fn try_read_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
         for attempt in 0..max_retries {
             if let Some(guard) = self.state.try_read() {
@@ -1277,9 +1273,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // ========================================================================
 
     fn lookup_path(&self, path: &str) -> Result<u32, FsError> {
-        // Use try_lock with retry to detect potential deadlock from killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        // Block for read lock. try_lock + IoError under concurrent writers caused
+        // spurious EIO on /tmp (forktest combined_stress): readers starved while
+        // another thread held write_state. Orphaned write locks are recovered in
+        // read_state / write_state loops.
+        let state = self.read_state();
         self.lookup_path_internal(&state, path)
     }
 
@@ -1313,21 +1311,23 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(current_inode)
     }
 
-    fn lookup_parent(&self, path: &str) -> Result<(u32, String), FsError> {
+    fn lookup_parent_internal(&self, state: &Ext2State, path: &str) -> Result<(u32, String), FsError> {
         let (parent_path, name) = split_path(path);
         if name.is_empty() {
             return Err(FsError::InvalidPath);
         }
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
         let parent_path = if parent_path.is_empty() {
             "/"
         } else {
             parent_path
         };
-        let parent_inode = self.lookup_path_internal(&state, parent_path)?;
+        let parent_inode = self.lookup_path_internal(state, parent_path)?;
         Ok((parent_inode, name.to_string()))
+    }
+
+    fn lookup_parent(&self, path: &str) -> Result<(u32, String), FsError> {
+        let state = self.read_state();
+        self.lookup_parent_internal(&state, path)
     }
 
     pub fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
@@ -1339,9 +1339,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(0);
         }
 
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
         let inode = self.read_inode(&state, inode_num)?;
 
         let file_size = inode.size_lower as usize;
@@ -1427,10 +1425,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) != S_IFDIR {
@@ -1461,10 +1457,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1528,10 +1522,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Ok(0);
         }
 
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1574,17 +1566,33 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Ok(0);
         }
 
-        let inode_num = match self.lookup_path(path) {
+        // One write lock for resolve + optional create + data write. Avoids
+        // lookup_path (read) failing with IoError while another thread holds write_state.
+        let mut state = self.write_state();
+
+        let inode_num = match self.lookup_path_internal(&state, path) {
             Ok(n) => n,
             Err(FsError::NotFound) => {
-                // Create the file first, then write into it
-                self.write_file(path, &[])?;
-                self.lookup_path(path)?
+                let (parent_inode, name) = self.lookup_parent_internal(&state, path)?;
+                let inode_num = self.allocate_inode(&mut state, false)?;
+                let now = self.current_time();
+                let mut inode = Inode {
+                    type_perms: DEFAULT_FILE_PERMS,
+                    uid: 0,
+                    size_lower: 0,
+                    access_time: now,
+                    creation_time: now,
+                    modification_time: now,
+                    hard_links: 1,
+                    ..Default::default()
+                };
+                self.write_inode_data(&mut state, inode_num, &mut inode, &[])?;
+                self.add_dir_entry(&mut state, parent_inode, &name, inode_num, FT_REG_FILE)?;
+                inode_num
             }
             Err(e) => return Err(e),
         };
 
-        let mut state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
 
         if (inode.type_perms & 0xF000) == S_IFDIR {
@@ -1810,17 +1818,14 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         self.read_symlink_inode(&state, inode_num)
     }
 
     fn is_symlink(&self, path: &str) -> bool {
-        if let Ok(inode_num) = self.lookup_path(path) {
-            // Use try_lock to prevent hanging if lock is orphaned
-            let Some(state) = self.try_lock_state(100_000) else { return false };
+        let state = self.read_state();
+        if let Ok(inode_num) = self.lookup_path_internal(&state, path) {
             if let Ok(inode) = self.read_inode(&state, inode_num) {
                 return (inode.type_perms & 0xF000) == S_IFLNK;
             }
@@ -1863,10 +1868,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
 
         let is_dir = (inode.type_perms & 0xF000) == S_IFDIR;
@@ -1928,10 +1931,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
-        let inode_num = self.lookup_path(path)?;
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
+        let inode_num = self.lookup_path_internal(&state, path)?;
         let mut inode = self.read_inode(&state, inode_num)?;
         
         // Only allow truncate on regular files
@@ -1956,9 +1957,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {
-        // Use try_lock to prevent hanging if lock is orphaned by killed process
-        let state = self.try_lock_state(100_000)
-            .ok_or(FsError::IoError)?;
+        let state = self.read_state();
         let total_blocks = state.superblock.total_blocks;
         let unallocated_blocks = state.superblock.unallocated_blocks;
 

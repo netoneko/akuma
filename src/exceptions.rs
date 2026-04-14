@@ -692,6 +692,7 @@ pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
 /// Prevents EL1 data aborts when kernel code writes to user memory (signal frame
 /// delivery, futex wake writes, etc.) that hits a CoW-demoted RO page.
 fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
+    let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
     let ttbr0: u64;
     #[cfg(target_os = "none")]
     unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
@@ -720,7 +721,7 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
         core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
     }
-    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
         let _ = owner.address_space.map_page(
             page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
         );
@@ -739,12 +740,13 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
 /// not yet mapped, allocates and maps a zeroed page. Returns true if the page
 /// is mapped after this call (either was already mapped, or was just demand-paged).
 fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
+    let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
     if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
         return true;
     }
     // Check if the page is in a lazy anonymous region
     if let Some((flags, source, _region_start, _region_size)) =
-        akuma_exec::process::lazy_region_lookup_for_pid(pid, page_va)
+        akuma_exec::process::lazy_region_lookup_for_page_fault(pid, page_va)
     {
         // Only demand-page anonymous regions here; file-backed pages handled by the fault path
         // PROT_NONE regions must NOT be demand-paged — access should SIGSEGV.
@@ -758,7 +760,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                     akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                 };
                 if installed {
-                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                         owner.address_space.track_user_frame(page_frame);
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
@@ -769,7 +771,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                     }
                 } else {
                     crate::pmm::free_page(page_frame);
-                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
                         }
@@ -796,6 +798,7 @@ const SIGRETURN_TRAMPOLINE_ADDR: usize = 0x2000;
 ///   movz x8, #139   ; SYS_rt_sigreturn
 ///   svc  #0
 fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
+    let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
     // movz x8, #139 = 0xD2801168 (LE: 68 11 80 D2)
     // svc  #0       = 0xD4000001 (LE: 01 00 00 D4)
     const TRAMPOLINE: [u8; 8] = [0x68, 0x11, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4];
@@ -814,7 +817,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         akuma_exec::mmu::map_user_page(SIGRETURN_TRAMPOLINE_ADDR, frame.addr, akuma_exec::mmu::user_flags::RX)
     };
 
-    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
         if installed {
             owner.address_space.track_user_frame(frame);
         } else {
@@ -2026,6 +2029,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
+            // (CLONE_VM worker threads have their own Process slot but empty mmap_regions).
+            let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
@@ -2038,6 +2044,31 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 // CoW write fault: write to a shared read-only page
                 if is_write {
                     let page_va = far_usize & !(0xFFF);
+
+                    // Serialize CoW fault handling per-page to prevent races
+                    // when multiple CLONE_VM threads fault on the same page.
+                    if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
+                        loop {
+                            {
+                                let mut faults = proc.fault_mutex.lock();
+                                if !faults.contains(&page_va) {
+                                    faults.insert(page_va);
+                                    break;
+                                }
+                            }
+                            akuma_exec::threading::yield_now();
+                        }
+                    }
+                    struct CowFaultGuard { pid: u32, page_va: usize }
+                    impl Drop for CowFaultGuard {
+                        fn drop(&mut self) {
+                            if let Some(proc) = akuma_exec::process::lookup_process(self.pid) {
+                                proc.fault_mutex.lock().remove(&self.page_va);
+                            }
+                        }
+                    }
+                    let _cow_fault_guard = CowFaultGuard { pid: as_owner, page_va };
+
                     let ttbr0: u64;
                     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
                     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
@@ -2054,7 +2085,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
                                     core::ptr::copy_nonoverlapping(src, dst, 0x1000);
                                 }
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     // Overwrite PTE: same VA, new PA, RW permissions
                                     let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                                     akuma_exec::mmu::flush_tlb_page(page_va);
@@ -2072,10 +2103,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
 
                 // Lazy region permission upgrade (e.g. demand-paged RO → RW after mprotect)
-                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize) {
                     if !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);
-                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                             let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                             return unsafe { (*frame).x0 };
                         }
@@ -2085,11 +2116,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             if is_translation_fault {
                 // #region agent log - debug lazy region miss
-                let lazy_found = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize);
+                let lazy_found = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize);
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     // Also check the parent PID - maybe lazy regions weren't cloned
-                    let parent_pid = akuma_exec::process::lookup_process(pid)
+                    let parent_pid = akuma_exec::process::lookup_process(as_owner)
                         .map(|p| p.parent_pid)
                         .unwrap_or(0);
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
@@ -2109,6 +2140,31 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             pid, far_usize);
                     } else {
                     let page_va = far_usize & !(0xFFF);
+
+                    // Serialize demand paging per-page to prevent races when
+                    // multiple CLONE_VM threads fault on the same page.
+                    if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
+                        loop {
+                            {
+                                let mut faults = proc.fault_mutex.lock();
+                                if !faults.contains(&page_va) {
+                                    faults.insert(page_va);
+                                    break;
+                                }
+                            }
+                            akuma_exec::threading::yield_now();
+                        }
+                    }
+                    struct DaFaultGuard { pid: u32, page_va: usize }
+                    impl Drop for DaFaultGuard {
+                        fn drop(&mut self) {
+                            if let Some(proc) = akuma_exec::process::lookup_process(self.pid) {
+                                proc.fault_mutex.lock().remove(&self.page_va);
+                            }
+                        }
+                    }
+                    let _da_fault_guard = DaFaultGuard { pid: as_owner, page_va };
+
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
                             if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
@@ -2202,7 +2258,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
                                 };
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.address_space.track_user_frame(pf);
                                         for tf in table_frames {
                                             owner.address_space.track_page_table_frame(tf);
@@ -2217,7 +2273,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     // Race: another CPU mapped this page between our check and
                                     // the atomic install. The page IS mapped now - don't SIGSEGV!
                                     crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         for tf in table_frames {
                                             owner.address_space.track_page_table_frame(tf);
                                         }
@@ -2255,7 +2311,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     owner.syscall_stats.inc_pagefault(pages_mapped);
                                 }
                             }
@@ -2303,7 +2359,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
                                 };
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.address_space.track_user_frame(pf);
                                         for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
                                     } else {
@@ -2312,7 +2368,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 } else {
                                     crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
                                     } else {
                                         for tf in table_frames { crate::pmm::free_page(tf); }
@@ -2332,7 +2388,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
                             if installed {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     owner.address_space.track_user_frame(page_frame);
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
@@ -2343,14 +2399,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 if crate::config::PROCESS_SYSCALL_STATS {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.syscall_stats.inc_pagefault(1);
                                     }
                                 }
                             } else {
                                 // Race: another CPU mapped this page. Free our frame and continue.
                                 crate::pmm::free_page(page_frame);
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
                                     }
@@ -2369,14 +2425,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     } // end else (not PROT_NONE)
                 } else {
                     // Fallback: check eager mmap regions — the PTE may have been lost.
-                    // Use lookup_process(pid) where pid = address-space owner (from
-                    // read_current_pid / process info page).  current_process() goes
+                    // Use lookup_process(as_owner): thread-group leader (tgid). current_process() goes
                     // through THREAD_PID_MAP and returns the *worker* thread's Process
                     // for CLONE_VM threads — that Process has empty mmap_regions because
                     // all mmaps were performed on the parent.
                     let page_va = far_usize & !0xFFF;
                     let mut recovered = false;
-                    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+                    if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
                         for (start, frames) in &proc.mmap_regions {
                             let region_end = *start + frames.len() * 4096;
                             if page_va >= *start && page_va < region_end {
@@ -2399,7 +2454,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         return unsafe { (*frame).x0 };
                     }
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
-                    if let Some(dbg_proc) = akuma_exec::process::lookup_process(pid) {
+                    if let Some(dbg_proc) = akuma_exec::process::lookup_process(as_owner) {
                         let n = dbg_proc.mmap_regions.len();
                         crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
                             pid, far_usize, n);
@@ -2521,6 +2576,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
 
             let fault_type = iss & 0x3C;
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;
@@ -2528,10 +2584,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             let far_usize = far as usize;
 
             if is_permission_fault {
-                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize) {
+                if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize) {
                     if !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);
-                        if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                        if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                             let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
                             owner.address_space.invalidate_icache_for_page_va(page_va);
                             return unsafe { (*frame).x0 };
@@ -2542,10 +2598,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
 
             if is_translation_fault {
                 // #region debug lazy region miss
-                let lazy_found = akuma_exec::process::lazy_region_lookup_for_pid(pid, far_usize);
+                let lazy_found = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize);
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
-                    let parent_pid = akuma_exec::process::lookup_process(pid)
+                    let parent_pid = akuma_exec::process::lookup_process(as_owner)
                         .map(|p| p.parent_pid)
                         .unwrap_or(0);
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
@@ -2569,7 +2625,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // Serialize page fault handling for this process.
                     // Insert page_va into fault_mutex so concurrent instruction faults
                     // on the same page yield until we are done mapping.
-                    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+                    if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
                         loop {
                             {
                                 let mut faults = proc.fault_mutex.lock();
@@ -2594,7 +2650,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                         }
                     }
-                    let _fault_guard = FaultGuard { pid, page_va };
+                    let _fault_guard = FaultGuard { pid: as_owner, page_va };
 
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
@@ -2683,7 +2739,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
                                 };
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.address_space.track_user_frame(pf);
                                         for tf in table_frames {
                                             owner.address_space.track_page_table_frame(tf);
@@ -2699,7 +2755,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     // the atomic install. The page IS mapped now - don't SIGSEGV!
                                     // We just need to free our unused page and track table frames.
                                     crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         for tf in table_frames {
                                             owner.address_space.track_page_table_frame(tf);
                                         }
@@ -2734,7 +2790,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         if any_mapped {
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     owner.syscall_stats.inc_pagefault(pages_mapped);
                                 }
                             }
@@ -2777,7 +2833,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
                                 };
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.address_space.track_user_frame(pf);
                                         for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
                                     } else {
@@ -2786,7 +2842,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 } else {
                                     crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
                                     } else {
                                         for tf in table_frames { crate::pmm::free_page(tf); }
@@ -2807,7 +2863,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
                             if installed {
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     owner.address_space.track_user_frame(page_frame);
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
@@ -2818,14 +2874,14 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 if crate::config::PROCESS_SYSCALL_STATS {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                         owner.syscall_stats.inc_pagefault(1);
                                     }
                                 }
                             } else {
                                 // Race: another CPU mapped this page. Free our frame and continue.
                                 crate::pmm::free_page(page_frame);
-                                if let Some(owner) = akuma_exec::process::lookup_process(pid) {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
                                     for tf in table_frames {
                                         owner.address_space.track_page_table_frame(tf);
                                     }
