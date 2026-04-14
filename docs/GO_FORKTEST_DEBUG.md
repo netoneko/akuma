@@ -1,6 +1,32 @@
 # Go Forktest Crash Analysis
 
-This document details two distinct crash patterns observed when running `forktest_parent --combined_stress` on Akuma OS. The crashes manifest as `addr=0x2` segmentation faults in Go's memory allocator.
+This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`** or **`-mmap_test`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address (see [Isolation matrix](#isolation-matrix-2026-04-14)).
+
+## Current status (2026-04-14)
+
+**These crashes still reproduce** (for example: `panic: invalid memory address or nil pointer dereference`, `addr=0x2`, `pc≈0x86768` in `memclrNoHeapPointers` / `mallocgcLarge` inside `runMmapStress`).
+
+This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** in the Go allocator, treat it as the **open heap / CoW / demand-paging** investigation described below.
+
+| What you see | Likely bucket | Where to read |
+|--------------|----------------|---------------|
+| `write /tmp/...: input/output error` | ext2 read path starved / `IoError` | ext2 history in `GO_FORK_EXEC_FIXES.md` |
+| `addr=0x2`, panic in `mallocgc` / `memclr` | Go heap sees bad pointer (kernel memory model) | This file, §Crash Pattern 1–2 |
+
+**Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`** / **`-combined_stress`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
+
+## Isolation matrix (2026-04-14)
+
+Shell: `export GOMAXPROCS=1` for all runs below. Command line: `forktest_parent --duration 10s` plus flags.
+
+| Child mode | Outcome |
+|------------|---------|
+| **(none)** — children run default main (no stress) | **Stable.** Parent sends SIGTERM at deadline; `Wait()` reports `signal: killed`; empty child stdout. |
+| **`-mmap_test`** | **Parent SIGSEGV** in `unix.Read` on pipe (**`main.go:199`**): `PC≈0x13060`, fault `addr≈0x1e39df000`, `syscall` read `fd=4`. Same shape as [Pattern 2](#crash-pattern-2-parent-process-heap-corruption). **Does not require** `-combined_stress` or multiple Go M-threads in the parent. |
+| **`-file_io`** | **Stable** in this session: children print `Received terminated, exiting gracefully.` before kill. |
+| **`-send_signal`** | **Stable** (benign race): `Failed to send SIGINT … process already finished` if the child exits before 500 ms; then deadline kill as usual. |
+
+**Conclusion:** The **mmap heap stress in children** (`runMmapStress`, large `make([]byte, …)`) is enough to trigger failure; **`GOMAXPROCS=1` does not rule out “multi-M in parent”** as the sole cause—it rules out **parent** multi-threading as required for the parent `read()` crash. The bug is likely **kernel-side** (pipe/read path, scheduling, or memory accounting) or **child-driven** kernel state that affects the parent’s syscall return.
 
 ## Test Command
 
@@ -62,10 +88,58 @@ syscall.Syscall(0x3f, 0x4, 0x1e0087718, 0x400)  // read() syscall
 
 ### Analysis
 
-- **Same `addr=0x2`**: Identical corrupted pointer pattern
-- **PC=0x13060**: In Go's syscall return trampoline
-- **Context**: Parent was reading from a pipe (fd=4) monitoring children
-- **Timing**: Often occurs after child crashes, but sometimes independently
+- **Fault address**: Older kernel captures reported **`FAR=0x2`** for the parent as well as the child. A **2026-04-14 SSH capture** (see below) shows the parent fault at **`addr=0x1e251f000`** (heap-range VA) while the child still shows **`addr=0x2`**. So the parent failure is **not always** the same bit pattern as the allocator bug in the child; it may be a **follow-on SIGSEGV** during `read()` (pipe drain), **kernel copy_to_user**, or a **distinct** runtime bug.
+- **PC≈0x13060**: In Go's syscall path (e.g. return trampoline around `read`)
+- **Context**: Parent was in **`unix.Read`** on the epoll-monitored pipe (**`fd=4`** in registers: `r0=4`, `r1=buf`, `r2=0x400`); corresponds to [`userspace/forktest/parent/main.go`](../../userspace/forktest/parent/main.go) pipe-read logic (line numbers shift with Go version; stack may show `main.go:176` in older builds vs current sources).
+- **Timing**: Often **after** a child process has already panicked with **`addr=0x2`** in `runMmapStress`, but not always independently observed.
+
+## Captured SSH log (2026-04-14)
+
+Full command: `forktest_parent --duration 10s --combined_stress` from `/bin` over SSH.
+
+**1. Child (`forktest_child`) — Pattern 1**
+
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x2 pc=0x86768]
+
+goroutine 10 [running]:
+main.runMmapStress(...{childID}...)
+    .../forktest/child/main.go:88 +0x228
+main.runCombinedStress.func1()
+    .../forktest/child/main.go:225 +0x50
+```
+
+Line 88 is the large `make([]byte, …)` allocation in `runMmapStress` (see [`userspace/forktest/child/main.go`](../../userspace/forktest/child/main.go)).
+
+**2. Parent (`forktest_parent`) — Pattern 2 (same session, second fault)**
+
+```
+SIGSEGV: segmentation violation
+PC=0x13060 m=0 sigcode=1 addr=0x1e251f000
+
+goroutine 1 gp=0x1e00021c0 m=0 mp=0x1edc40 [syscall]:
+syscall.Syscall(0x3f, 0x4, 0x1e0087718, 0x400)   // read(fd=4, buf, 1024)
+golang.org/x/sys/unix.Read(...)
+main.main()
+    .../forktest/parent/main.go:176 +0xd40
+```
+
+`0x3f` is **63** decimal = **`read`** on Linux arm64. The buffer pointer `0x1e0087718` is a normal-looking stack/local slot; the reported fault **`addr=0x1e251f000`** is in the **~0x1e0…** Go heap range (unlike **`0x2`** in the child). Register dump included `r0=0x4` (fd), consistent with draining the child's stdout pipe in the epoll loop.
+
+**3. `ps` after the crash**
+
+The first `ps` may list **many rows** with the same `/bin/forktest_child … -combined_stress` cmdline and odd **PPID chains** (e.g. threads under one child). That matches **goroutine / runtime threads** (`CLONE_VM`) each appearing as a schedulable entity in Akuma’s process listing. A **second** `ps` in the same session showed **no processes** — everything had exited after the faults.
+
+**4. Build paths in the traceback**
+
+Paths such as `/opt/homebrew/Cellar/go/1.25.5/...` are from the **host** used to build the `GOOS=linux GOARCH=arm64` binary; the panic still occurred on the **Akuma** target.
+
+**5. Delayed full kernel freeze (anecdotal, same session)**
+
+Sometime **after** the user-level panic/`SIGSEGV` sequence above, the **whole guest** appeared to **lock up** (e.g. SSH stopped responding). That was **not** in the same snippet as the forktest traceback, so it is **not** proven causal—only **temporally** related.
+
+If this repeats, capture **serial / QEMU log** from the freeze window and look for: a thread stuck **forever** in a spinlock (ext2, process table, lazy-region, or fault path), **interrupts masked** too long, or **memory corruption** from an earlier fault that only manifests when another subsystem runs. Until there is a trace, treat “freeze after forktest” as an open **follow-on** symptom tied to the same stress scenario, not a separately root-caused bug.
 
 ## The `0x2` Value
 
@@ -73,7 +147,7 @@ The value `0x2` is suspicious because:
 
 1. It's too small to be a valid heap pointer (Go heap starts at ~0x1e000_0000)
 2. It's not NULL (0x0) which would indicate a clear nil pointer
-3. It appears in both parent and child processes
+3. It appears in **child** processes in these traces; the **parent** sometimes faults at a **heap-like** address (e.g. `0x1e251f000`) instead — see [Captured SSH log](#captured-ssh-log-2026-04-14)
 4. It suggests corruption of Go's span/mheap data structures
 
 Possible sources of `0x2`:
@@ -223,11 +297,15 @@ grep -E "signal.*deliver|tkill.*sig=23" /tmp/akuma_output.txt
 
 ## Summary
 
+As of **2026-04-14**, both crash patterns below **still occur** on real runs; they are **not** fixed by filesystem-only changes.
+
 Both crash patterns show `addr=0x2` which indicates Go's heap allocator is returning corrupted pointers. The corruption likely originates from:
 
 1. A race condition in the kernel's handling of shared memory (CoW or demand paging)
 2. Incorrect address-space management for `CLONE_VM` thread groups
 3. Signal delivery timing issues during allocation
+
+A **delayed full kernel freeze** after the same kind of forktest run has been observed once (see [§Captured SSH log](#captured-ssh-log-2026-04-14) item 5); it is **not** yet tied to a specific kernel stack without serial/QEMU logs.
 
 The most promising investigation paths are:
 1. Add locking/logging to CoW fault handler

@@ -106,3 +106,22 @@ forktest_parent
 When `-duration` is set the child loops each stress test until the deadline
 is reached, then exits cleanly.  SIGTERM (sent by the parent on timeout) also
 causes the child to exit immediately.
+
+## Known issues
+
+**Go heap SIGSEGV (`addr=0x2`, PC in the allocator):** With `-combined_stress`,
+each child runs mmap stress (`make([]byte, 100MB)`), file I/O, and goroutine
+stress at the same time. A **known, still-reproducing** failure is a panic such
+as `invalid memory address or nil pointer dereference` with **`addr=0x2`** and
+**`pc≈0x86768`** (often under `runtime.memclrNoHeapPointers` → `mallocgcLarge`).
+That points at **corrupted or bogus pointers in the Go allocator**, not a simple
+nil check in forktest source. Full analysis and kernel log patterns are in
+[`docs/GO_FORKTEST_DEBUG.md`](../../docs/GO_FORKTEST_DEBUG.md).
+
+**Not the same as ext2 EIO:** Past **`input/output error`** writes to `/tmp`
+were tied to ext2 lock contention and are addressed in the kernel ext2 layer.
+The **`addr=0x2`** crash is tracked separately (CoW, lazy paging, thread groups).
+
+**Mitigations:** Give QEMU plenty of RAM (for example `MEMORY=2048M`), try
+`GOMAXPROCS=1` and/or `GODEBUG=asyncpreemptoff=1`, or avoid `-combined_stress`
+and run a single stress mode until the kernel/runtime issue is fixed.

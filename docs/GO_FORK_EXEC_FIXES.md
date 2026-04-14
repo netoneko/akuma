@@ -1975,3 +1975,14 @@ The test requires sufficient RAM. With 256MB, OOM occurs:
 ```
 
 Run with `MEMORY=2048M cargo run --release` for reliable testing.
+
+### Note (2026-04-14): ext2 EIO fixes vs `addr=0x2` heap crashes
+
+Changes to ext2 (blocking `read_state()`, single `write_state()` path for
+`write_at`, and related locking) address **spurious `EIO`** on concurrent writes
+to temp files. They do **not** resolve the separate **`addr=0x2`** / Go
+`mallocgc` / `memclrNoHeapPointers` crashes under `forktest_parent
+--combined_stress`. That problem is documented in
+[`GO_FORKTEST_DEBUG.md`](./GO_FORKTEST_DEBUG.md) and in **§2026-04-12** above;
+mitigations include `GOMAXPROCS=1`, `GODEBUG=asyncpreemptoff=1`, and sufficient
+`MEMORY=`.
