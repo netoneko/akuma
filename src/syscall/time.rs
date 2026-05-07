@@ -8,7 +8,18 @@ struct LocalTimespec {
     tv_nsec: u64,
 }
 
-pub(super) fn sys_clock_gettime(clock_id: u32, tp_ptr: u64) -> u64 {
+pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
+    // Linux clock_id is a small integer or a compact CPU-clock encoding
+    // (~(pid << 3) | CPUCLOCK_*).  Pointer-sized values in x0 (e.g. Go heap) are
+    // EINVAL on Linux.  Do not copy out a timespec to such an x0: serial crash5.log
+    // showed `clock_gettime_recover`-style writes immediately before WILD-DA at
+    // FAR=0x10 with memclr ELR (see docs/GO_FORKTEST_DEBUG.md).
+    const MAX_REASONABLE_CLOCK_ID: u64 = 0x1000_0000;
+    if clock_id_arg > MAX_REASONABLE_CLOCK_ID {
+        return EINVAL;
+    }
+    let clock_id = clock_id_arg as u32;
+
     if !validate_user_ptr(tp_ptr, 16) { return EFAULT; }
 
     let (sec, nsec) = match clock_id {

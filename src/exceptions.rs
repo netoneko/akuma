@@ -2115,7 +2115,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             if is_translation_fault {
-                // #region agent log - debug lazy region miss
                 let lazy_found = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize);
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
@@ -2129,7 +2128,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         pid, parent_pid, far_usize, lr_count, parent_lr_count, parent_has_va);
                     akuma_exec::process::lazy_region_debug(far_usize);
                 }
-                // #endregion
                 if let Some((flags, source, region_start, region_size)) = lazy_found {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
@@ -2419,7 +2417,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         } else {
                             let (_, _, free) = crate::pmm::stats();
                             crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
-                                pid, far_usize, free);
+                                    pid, far_usize, free);
                         }
                     }
                     } // end else (not PROT_NONE)
@@ -2484,6 +2482,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             1 => "EPERM", 2 => "ENOENT", 3 => "ESRCH", 4 => "EINTR",
                             9 => "EBADF", 11 => "EAGAIN", 12 => "ENOMEM", 13 => "EACCES",
                             14 => "EFAULT", 17 => "EEXIST", 19 => "ENODEV", 20 => "ENOTDIR",
+                            96 => "EPFNOSUPPORT",
                             21 => "EISDIR", 22 => "EINVAL", 28 => "ENOSPC", 38 => "ENOSYS",
                             95 => "ENOTSUP", 97 => "EAFNOSUPPORT", 110 => "ETIMEDOUT",
                             115 => "EINPROGRESS",

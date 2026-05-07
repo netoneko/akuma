@@ -630,7 +630,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCNTL => fs::sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
         nr::FACCESSAT => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
-        nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0] as u32, args[1]),
+        nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], args[1]),
         nr::FACCESSAT2 => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),

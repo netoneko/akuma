@@ -2,18 +2,20 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-04-14)
+## Current status (2026-05-07)
 
-**These crashes still reproduce** (for example: `panic: invalid memory address or nil pointer dereference`, `addr=0x2`, `pc≈0x86768` in `memclrNoHeapPointers` / `mallocgcLarge` inside `runMmapStress`).
+**Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
 
-This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** in the Go allocator, treat it as the **open heap / CoW / demand-paging** investigation described below.
+This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** / **`0x10`** in the Go allocator, treat it as the **heap + demand paging + signal / syscall-frame** investigation described below.
 
 | What you see | Likely bucket | Where to read |
 |--------------|----------------|---------------|
 | `write /tmp/...: input/output error` | ext2 read path starved / `IoError` | ext2 history in `GO_FORK_EXEC_FIXES.md` |
-| `addr=0x2`, panic in `mallocgc` / `memclr` | Go heap sees bad pointer (kernel memory model) | This file, §Crash Pattern 1–2 |
+| `addr=0x2`, `0x10`, `0x12`, panic in `mallocgc` / `memclr` | Bad pointer / span base in Go after kernel user-mode fault path | This file, §Crash Pattern 1–2, **`crash5.log`** |
+| **`unexpected fault address 0xfffffffffffffffa`** (`-6`), **`fatal error: fault`** | Prior **`clock_gettime` → EINVAL (-22)**; FAR **`-6`** = **`-22+16`** (errno misused as base + `sizeof(timespec)`) | **`crash4.log`** / § Serial captures |
 | **`unexpected fault address 0xffffffffffffffb0`**, `fatal error: fault` in `memclr` | Same **`pc≈0x86768`** family; often at **50–70 MiB** `-mmap_alloc_mb` | [Empirical threshold](#empirical-allocation-threshold-2026-04-14-session) |
-| SSH / shell **hang**, no new output | **Deadlock** or blocked ext2/pipe path | Often with **`-file_io`** or heavy `/tmp` I/O; [Isolation matrix](#isolation-matrix-2026-04-14) |
+| `[JIT] IC flush + replay … bogus nr=…` near fault | Stale / corrupted syscall dispatch state around SVC replay | [`src/exceptions.rs`](../src/exceptions.rs), `FIX_MEMORY_MAPPING.md`, `EPOLL_PERFORMANCE.md` |
+| SSH **disconnect** after commands finish | Often **client / router idle timeout**; confirm with serial still running | Not proven guest deadlock from **`crash5.log`** alone |
 
 **Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
 
@@ -161,10 +163,13 @@ Possible sources of `0x2`:
 
 ### clock_gettime Syscall
 
-The `[EFAULT] nr=113` log entry appearing before crashes was investigated. Analysis showed:
-- The args `[0x1e0a7aff0, 0x4fc0, ...]` indicate garbage register state, not a real syscall
-- `clock_gettime` implementation is Linux-compatible (verified with 8 kernel tests)
-- The EFAULT was from boot tests, not runtime crashes
+**Static tests:** `clock_gettime` / `clock_getres` behave plausibly Linux-compat in isolation (see tests below).
+
+**Runtime (2026-05-07):** Serial logs show **`nr=113`** with **pointer-sized “clock_id”** in **`x0`** and small garbage in **`x1`**, often **`tkill(…, SIGURG)`** (async preempt) nearby. That is **not** explained by the syscall implementation alone; it implicates **trap-frame / syscall-restart / signal** interaction. Returning **strict `EINVAL`** for oversized `clock_id` avoids EL1 `copy_to_user` on a bogus “second arg” pointer, but leaves **`-22` in `x0`**, which Go can still misuse (see **`crash4.log`**: FAR **`0xfffffffffffffffa`** = **`-22+16`**).
+
+**Rejected mitigation:** Treating oversized **`x0`** as the timespec pointer and writing 16 bytes (**“recover x0 as tp”**) was **abandoned**: **`crash5.log`** shows **`SIGURG`** → that path → **`[WILD-DA] FAR=0x`10` ELR=0x86768`** with **`x0=0x0`** at fault time (nil-adjacent **`memclr`**), i.e. no durable fix and possible heap clobber.
+
+The older note that some **`[EFAULT] nr=113`** lines come from **kernel self-tests at boot** remains true; **forktest** sessions additionally show **runtime** **`nr=113`** adjacent to allocator faults.
 
 Tests added:
 - `test_clock_gettime_struct_layout` - Verifies `struct timespec` matches Linux ABI
@@ -306,7 +311,7 @@ grep -E "signal.*deliver|tkill.*sig=23" /tmp/akuma_output.txt
 - **After a forktest repro over SSH**, search the log for demand paging and faults:
 
 ```bash
-rg '\[mmap\]|\[DA-MISS\]|\[DA-DP\]|\[WILD-DA\]|\[Fault\]|exit_group|forktest|mmap_alloc_mb' full.log
+rg '\[mmap\]|\[DA-MISS\]|\[DA-DP\]|\[WILD-DA\]|\[Fault\]|\[JIT\]|nr=113|exit_group|forktest|mmap_alloc_mb|clock_gettime' full.log
 ```
 
 Correlate **`pid=`** / **`ppid=`** in **`[DA-MISS]`** lines with **`[exit_group]`** PIDs to tie faults to parent vs child address spaces.
@@ -382,18 +387,31 @@ rg -n 'forktest|DA-MISS|WILD-DA|mmap_alloc_mb' full.log
 
 **Takeaway:** Serial proves the “bad address” is delivered to the fault handler as **`FAR`** on a **demand-paging / lazy miss** path (**`[DA-MISS]`** → **`no lazy region`** → **`[WILD-DA]`**), not only as a Go-side panic string. The PC **`0x86768`** matches userspace **`memclr`**. Next kernel step: determine **why `ELR`/`FAR` pair** ends up as **`0x2`** / **`-80` sign-extended** (bad **`mmap` return**, bad **`brk`**, or **corrupted register state** across syscall) while **`[DP]`** correctly reports **no** lazy mapping for that bogus VA.
 
-## Summary & Resolution (2026-05-07)
+## Summary & status (2026-05-07)
 
-**ROOT CAUSE FOUND & FIXED**: The `addr=0x2` / `0xffffffffffffffb0` (`-80`) panics in Go were caused by the kernel returning `EFAULT` (`-14`) to valid syscalls reading from or writing to the Go heap. Go's runtime incorrectly processed the `-14` pointer, offset it slightly (e.g. by 16 bytes yielding `0x2`, or negatively resulting in `-80`), and immediately panicked.
+### A. `EFAULT` / lazy-region owner (`tgid`) — fixed class
 
-**Why did syscalls return EFAULT?**
-During any syscall that reads/writes userspace memory, the kernel validates pointers via `validate_user_ptr()`, which uses `ensure_user_pages_mapped()` to proactively demand-page lazy regions before writing to them. `ensure_user_pages_mapped()` relied on `lazy_region_lookup(va)`.
+Many `addr=0x2`-style panics were consistent with the kernel returning **`EFAULT` (`-14`)** from syscalls that touched **lazy-mapped Go heap** while **`lazy_region_lookup` used `read_current_pid()`** instead of the **thread-group owner (`tgid`)**. Under **`CLONE_VM`**, lookup failed, demand paging was skipped, and **`copy_to_user` / validation** failed → **`EFAULT`** → Go mis-handled the negative value as an address (including **`FAR = -14 + 16`** patterns).
 
-However, `lazy_region_lookup(va)` internally used `read_current_pid()` instead of the Thread Group Leader PID (`tgid`). Because Go uses `CLONE_VM`, worker threads (goroutines) share memory but have independent PIDs. The `LAZY_REGION_TABLE` tracks lazy regions entirely under the `tgid` (address space owner). As a result, when a worker thread performed a syscall that touched a newly allocated (lazy) region of the Go heap, `lazy_region_lookup` failed to find the region, aborted the demand-paging, and the syscall returned `EFAULT`.
+**Fix (landed):** resolve the address-space owner for lazy regions and mmap metadata (`address_space_owner_pid_for_fault` / **`tgid`**) in **`lazy_region_lookup`**, **`sys_mmap`**, **`sys_mremap`**, **`sys_munmap`**, **`sys_mprotect`**, **`sys_madvise`**, etc., so worker threads don’t strand lazy regions or physical pages on the wrong `Process`.
 
-**Memory Leak / OOM Issue (Also Fixed):**
-In addition to `EFAULT` panics, subsequent runs of `forktest_parent` triggered kernel OOMs (`[DA-DP] ... anon alloc failed, 0 free pages`). This happened because worker threads performing eager mmaps (or demand-paging) were tracking physical frames (`user_frames`) and metadata (`mmap_regions`) in their *own* `Process` struct and independent `UserAddressSpace` structures rather than the shared thread group leader's. When `shared = true` (which is the case for `CLONE_VM` worker threads), the `UserAddressSpace::drop` method explicitly bypasses freeing its `user_frames`. As a result, any physical frames directly mapped by a worker thread leaked completely when that thread exited!
+### B. OOM / `user_frames` leak on `CLONE_VM` workers — fixed class
 
-**The Fix:**
-1. Modified `lazy_region_lookup(va)` to consistently use `address_space_owner_pid_for_fault()` instead of `read_current_pid()`. This ensures syscall validation on worker threads correctly traverses the Thread Group Leader's lazy regions.
-2. Updated memory syscalls (`sys_mmap`, `sys_mremap`, `sys_munmap`, `sys_mprotect`, `sys_madvise`) and virtual address allocators (`alloc_mmap`, `remove_mmap_region`) to always resolve the `owner_pid` (the `tgid`). This prevents worker threads from fragmenting the `mmap_regions` table and ensures all physical frames are tracked in the thread group leader's `UserAddressSpace`. When the thread group eventually exits, all memory is correctly freed, resolving the OOM issue.
+Heavy **`forktest`** also produced **`[DA-DP] … anon alloc failed, 0 free pages`** when **worker threads** mapped memory into per-thread `UserAddressSpace` slices that **skipped freeing `user_frames` on `drop` for `shared` address spaces**. Routing mappings through the owner **`tgid`** aligns teardown with Linux-like sharing semantics.
+
+### C. `clock_gettime` / SIGURG / syscall frame — **open**
+
+**`crash4.log` (serial):** After rejecting pointer-like **`x0`** with **`EINVAL`**, user-visible **`unexpected fault address 0xfffffffffffffffa`**: kernel register dump shows **`x0 = -22` (`EINVAL`)** and **`FAR = -6`** (**`-22 + sizeof(timespec)`** on AArch64), i.e. **errno in `x0` treated as a base pointer** inside Go’s runtime.
+
+**`crash5.log` (serial, `MEMORY=2048M`, `-mmap_alloc_mb=70`):**
+
+- First failing child sequence (**kernel with H4 recovery; reverted after this capture**): **`tkill(…, sig=23)`** (**`SIGURG`**) → NDJSON **`clock_gettime_recover_x0_as_tp`** (**hypothesis `H4`**, `x0≈0x1e…` heap) → **`[DA-MISS] va=0x10`**, **`[WILD-DA] pid=95 FAR=0x10 ELR=0x86768`**, fault **`pc` matches `memclr`**, register dump **`x0=0x0`**.
+- Second run (another child): **`[JIT] IC flush + replay #1 bogus nr=8053579784 ELR=0x86768`** then **`tkill(…, sig=23)`** → **`FAR=0x12`**, same **`ELR`**, **`exit_group` `code=2`**. No **`H4`** line required for that path.
+
+**Conclusion:** **`clock_gettime`-only heuristics do not resolve forktest**; **`recover x0 as tp` was removed** from [`src/syscall/time.rs`](../src/syscall/time.rs) after **`crash5`**. Remaining work aligns with **async preemption (`SIGURG`)**, **SVC / JIT IC flush replay**, and **signal return** correctness (see [`src/exceptions.rs`](../src/exceptions.rs), [`FIX_MEMORY_MAPPING.md`](FIX_MEMORY_MAPPING.md), [`EPOLL_PERFORMANCE.md`](EPOLL_PERFORMANCE.md)).
+
+### D. SSH “hang” / disconnect
+
+**`crash5.log`** ends with **`forktest_parent` / children `exit_group` `code=0`**. An SSH **“Connection closed”** afterward is **not** demonstrated as a guest deadlock from this capture alone—check **host timeouts** and **parallel serial tee**.
+
+**Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection.
