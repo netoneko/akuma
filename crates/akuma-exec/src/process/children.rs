@@ -293,18 +293,19 @@ pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
     current_process().map(|p| p.tgid).or_else(read_current_pid)
 }
 
-/// Like [`lazy_region_lookup_for_pid`], but if `pid` misses, retries with the thread-group
-/// leader from [`address_space_owner_pid_for_fault`] when it differs (demand-paging / EL0 faults).
+/// Like [`lazy_region_lookup_for_pid`], but resolves demand-paging metadata keyed by the
+/// thread-group id ([`Process::tgid`]) first — the same key as `sys_mmap` uses via `proc.tgid`
+/// — then falls back to `pid` (e.g. [`read_current_pid`] from EL0).
+///
+/// Ordering matters when `LAZY_REGION_TABLE` only has entries under the leader but the caller
+/// passes another thread id (clone snapshot keys, or stale ProcessInfo).
 pub fn lazy_region_lookup_for_page_fault(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    if let Some(r) = lazy_region_lookup_for_pid(pid, va) {
-        return Some(r);
-    }
     if let Some(owner) = address_space_owner_pid_for_fault() {
-        if owner != pid {
-            return lazy_region_lookup_for_pid(owner, va);
+        if let Some(r) = lazy_region_lookup_for_pid(owner, va) {
+            return Some(r);
         }
     }
-    None
+    lazy_region_lookup_for_pid(pid, va)
 }
 
 /// Stack-local writer for visible kernel output without heap allocation.

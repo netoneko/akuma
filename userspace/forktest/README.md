@@ -32,6 +32,7 @@ forktest_parent [flags]
 | `-duration D` | `0` | Total test duration (e.g. `30s`, `2m`). `0` = run until all children finish |
 | `-combined_stress` | `false` | Run all stress modes concurrently in each child |
 | `-mmap_test` | `false` | Enable mmap/munmap stress in children |
+| `-mmap_alloc_mb N` | `100` | MB per allocation in mmap mode (forwarded to children with `-mmap_test` / `-combined_stress`) |
 | `-file_io` | `false` | Enable O_APPEND file I/O test in children |
 | `-goroutine_stress` | `false` | Enable goroutine/channel stress in children |
 | `-send_signal` | `false` | Send SIGINT to child 0 after 500 ms |
@@ -44,6 +45,7 @@ forktest_parent [flags]
 |------|---------|-------------|
 | `-duration D` | `0` | How long to loop stress tests. `0` = run once |
 | `-mmap_test` | `false` | mmap/munmap stress |
+| `-mmap_alloc_mb N` | `100` | MB per `make([]byte, …)` in mmap stress (lower to bisect lazy region size) |
 | `-file_io` | `false` | O_APPEND file I/O |
 | `-goroutine_stress` | `false` | Goroutine/channel stress |
 | `-combined_stress` | `false` | All modes concurrently |
@@ -65,6 +67,11 @@ forktest_parent -duration=30s -combined_stress -num_children=5
 forktest_parent -duration=60s -mmap_test -num_children=2
 ```
 
+**Smaller heap allocations (bisect kernel lazy paging):**
+```
+forktest_parent -duration=30s -mmap_test -mmap_alloc_mb=4 -num_children=1
+```
+
 **Test SIGINT handling:**
 ```
 forktest_parent -send_signal -goroutine_stress
@@ -73,8 +80,21 @@ forktest_parent -send_signal -goroutine_stress
 ## Stress modes
 
 ### mmap/munmap (`-mmap_test`)
-Allocates 100 MB slices in a loop, triggering GC between each to exercise
-the Go heap's interaction with Akuma's lazy demand-paging mmap implementation.
+Allocates large slices (default **100 MB** each; override with **`-mmap_alloc_mb`**) in a loop,
+triggering GC between each to exercise the Go heap's interaction with Akuma's lazy
+demand-paging mmap implementation.
+
+Empirical note (see **`GO_FORKTEST_DEBUG.md`**, §Empirical allocation threshold): with
+**`GOMAXPROCS=1`**, **10 MB** allocations have been stable; **50 MB** is sometimes stable and
+sometimes crashes; **~70–100 MB** tends to fault in Go’s allocator (**`addr=0x2`** or
+**`0xffffffffffffffb0`**). Use **`-mmap_alloc_mb=10`** (or **50**) for smoke tests until the
+kernel issue is fixed.
+
+### QEMU serial capture (kernel debug)
+
+From the repo: **`./scripts/capture_serial_forktest_mmap.sh [logfile]`** tees serial output while
+running the VM; then grep for **`[mmap]`**, **`[DA-MISS]`**, etc. See
+[`docs/GO_FORKTEST_DEBUG.md`](../../docs/GO_FORKTEST_DEBUG.md) (**Appendix: mmap / demand-paging investigation**).
 
 ### O_APPEND file I/O (`-file_io`)
 Creates a temp file, writes 10 lines with `O_APPEND`, reads it back, and

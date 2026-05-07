@@ -20,6 +20,7 @@ const childReadBufSize = 1024
 var (
 	numChildrenFlag = flag.Int("num_children", 3, "Number of child processes to spawn")
 	mmapTestParent  = flag.Bool("mmap_test", false, "Enable mmap/munmap stress testing for children")
+	mmapAllocMB     = flag.Int("mmap_alloc_mb", 100, "Megabytes per child allocation when mmap_test or combined_stress (passed to forktest_child)")
 	fileIOParent    = flag.Bool("file_io", false, "Enable O_APPEND file I/O testing for children")
 	sendSignal      = flag.Bool("send_signal", false, "Send SIGINT to one child to test signal handling")
 	goroutineStress = flag.Bool("goroutine_stress", false, "Enable goroutine/channel stress testing for children")
@@ -43,9 +44,11 @@ func buildChildArgs() []string {
 	}
 	if *combinedStress {
 		args = append(args, "-combined_stress=true")
+		args = append(args, fmt.Sprintf("-mmap_alloc_mb=%d", *mmapAllocMB))
 	} else {
 		if *mmapTestParent {
 			args = append(args, "-mmap_test=true")
+			args = append(args, fmt.Sprintf("-mmap_alloc_mb=%d", *mmapAllocMB))
 		}
 		if *fileIOParent {
 			args = append(args, "-file_io=true")

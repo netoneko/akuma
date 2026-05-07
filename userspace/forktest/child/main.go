@@ -13,10 +13,11 @@ import (
 
 var (
 	mmapTestEnabled = flag.Bool("mmap_test", false, "Enable mmap/munmap stress testing")
-	fileIOEnabled   = flag.Bool("file_io", false, "Enable O_APPEND file I/O testing")
-	goroutineStress = flag.Bool("goroutine_stress", false, "Enable goroutine/channel/futex stress testing")
-	combinedStress  = flag.Bool("combined_stress", false, "Enable all stress modes concurrently")
-	durationFlag    = flag.Duration("duration", 0, "How long to run stress tests (e.g. 10s, 1m). 0 = run once")
+	mmapAllocMB       = flag.Int("mmap_alloc_mb", 100, "Megabytes per allocation in mmap_test (default 100; use 1–16 to narrow lazy-region size)")
+	fileIOEnabled     = flag.Bool("file_io", false, "Enable O_APPEND file I/O testing")
+	goroutineStress   = flag.Bool("goroutine_stress", false, "Enable goroutine/channel/futex stress testing")
+	combinedStress    = flag.Bool("combined_stress", false, "Enable all stress modes concurrently")
+	durationFlag      = flag.Duration("duration", 0, "How long to run stress tests (e.g. 10s, 1m). 0 = run once")
 )
 
 func main() {
@@ -75,8 +76,12 @@ func active(deadline time.Time) bool {
 }
 
 func runMmapStress(childID string, deadline time.Time) {
-	fmt.Printf("forktest_child %s: Starting mmap/munmap stress test...\n", childID)
-	const allocationSize = 100 * 1024 * 1024
+	mb := *mmapAllocMB
+	if mb < 1 {
+		mb = 1
+	}
+	allocationSize := mb * 1024 * 1024
+	fmt.Printf("forktest_child %s: Starting mmap/munmap stress test (%d MB per alloc)...\n", childID, mb)
 	const numAllocations = 5
 
 	iteration := 0

@@ -12,6 +12,7 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 |--------------|----------------|---------------|
 | `write /tmp/...: input/output error` | ext2 read path starved / `IoError` | ext2 history in `GO_FORK_EXEC_FIXES.md` |
 | `addr=0x2`, panic in `mallocgc` / `memclr` | Go heap sees bad pointer (kernel memory model) | This file, §Crash Pattern 1–2 |
+| **`unexpected fault address 0xffffffffffffffb0`**, `fatal error: fault` in `memclr` | Same **`pc≈0x86768`** family; often at **50–70 MiB** `-mmap_alloc_mb` | [Empirical threshold](#empirical-allocation-threshold-2026-04-14-session) |
 | SSH / shell **hang**, no new output | **Deadlock** or blocked ext2/pipe path | Often with **`-file_io`** or heavy `/tmp` I/O; [Isolation matrix](#isolation-matrix-2026-04-14) |
 
 **Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
@@ -292,9 +293,94 @@ grep -E "signal.*deliver|tkill.*sig=23" /tmp/akuma_output.txt
 
 2. **No forking**: Run child directly without fork - isolates fork/CoW from thread creation
 
-3. **Simple allocations**: Modify `runMmapStress` to use smaller allocations - checks if large allocations trigger the bug
+3. **Smaller allocations**: **`forktest_parent`** / **`forktest_child`** accept **`-mmap_alloc_mb=N`** (default **100**) to scale lazy region size without editing Go source (e.g. **`-mmap_alloc_mb=4`** with **`-num_children=1`**).
 
 4. **Disable preemption**: `GODEBUG=asyncpreemptoff=1` - eliminates SIGURG as a factor (still worth testing; not yet logged as definitive)
+
+## Appendix: mmap / demand-paging investigation (implementation notes)
+
+### Serial capture and grep
+
+- **Script:** [`scripts/capture_serial_forktest_mmap.sh`](../scripts/capture_serial_forktest_mmap.sh) — runs [`scripts/run.sh`](../scripts/run.sh) with **`tee`** to **`full.log`** (or the path you pass). Set **`MEMORY=2048M`** (default in script) as needed.
+- **Manual:** `MEMORY=2048M ./scripts/run.sh 2>&1 | tee full.log`
+- **After a forktest repro over SSH**, search the log for demand paging and faults:
+
+```bash
+rg '\[mmap\]|\[DA-MISS\]|\[DA-DP\]|\[WILD-DA\]|\[Fault\]|exit_group|forktest|mmap_alloc_mb' full.log
+```
+
+Correlate **`pid=`** / **`ppid=`** in **`[DA-MISS]`** lines with **`[exit_group]`** PIDs to tie faults to parent vs child address spaces.
+
+### Kernel audit: owner PID and lazy regions (read-path checklist)
+
+Code review (no behavioral change required for this appendix):
+
+| Mechanism | Location | Notes |
+|-----------|----------|--------|
+| Thread-group owner for faults | [`crates/akuma-exec/src/process/children.rs`](../crates/akuma-exec/src/process/children.rs) | **`address_space_owner_pid_for_fault()`** uses **`current_process().tgid`**. |
+| Lazy region lookup for faults | Same file | **`lazy_region_lookup_for_page_fault(pid, va)`** tries **`pid`**, then the owner PID if different — aligns **`LAZY_REGION_TABLE`** with **`CLONE_VM`**. |
+| EL0 demand paging / CoW | [`src/exceptions.rs`](../src/exceptions.rs) | **`as_owner`** from **`address_space_owner_pid_for_fault()`**; **`fault_mutex`** / **`DaFaultGuard`** on **`as_owner`**; **`lazy_region_lookup_for_page_fault(pid, far)`** for translation faults. |
+| **`sys_mmap` lazy policy** | [`src/syscall/mem.rs`](../src/syscall/mem.rs) | Large anonymous maps use **lazy** (`pages > 256`, **`MAP_NORESERVE`**, etc.). |
+
+Regression coverage includes [`src/process_tests.rs`](../src/process_tests.rs) (**`test_lazy_region_lookup_for_page_fault_clone`**, **`test_kill_thread_group_preserves_lazy_regions`**, etc.).
+
+### Branch: parent **`read()` SIGSEGV** vs child allocator
+
+If serial shows **no** suspicious **`[DA-MISS]`** / **`[WILD-DA]`** on children but the **parent** still faults in **`unix.Read`** (**[`userspace/forktest/parent/main.go`](../userspace/forktest/parent/main.go)** pipe drain), treat **pipe + syscall return** separately:
+
+| Layer | Files |
+|-------|--------|
+| **`read` syscall** | [`src/syscall/fs.rs`](../src/syscall/fs.rs) — **`sys_read`** |
+| **Pipe buffers** | [`src/syscall/pipe.rs`](../src/syscall/pipe.rs) — **`pipe_read`**, **`pipe_write`**, waiters |
+
+### `mmap_alloc_mb` flag
+
+- **Parent:** **`forktest_parent -mmap_alloc_mb=N`** (forwarded when **`-mmap_test`** or **`-combined_stress`**).
+- **Child:** **`forktest_child -mmap_alloc_mb=N`** (used by **`runMmapStress`**). Lower values reduce lazy region size and fault volume for bisection.
+
+### Empirical allocation threshold (2026-04-14 session)
+
+Conditions: **`export GOMAXPROCS=1`**, **`forktest_parent --duration 10s -mmap_test -mmap_alloc_mb=N`** (default **3 children**). Outcomes below are from **SSH transcripts**; for kernel-side correlation, capture **[`full.log`](../../full.log)** (or another serial path) and use the [grep patterns above](#serial-capture-and-grep).
+
+| `-mmap_alloc_mb` | Typical outcome |
+|------------------|-----------------|
+| **10** | **Stable** — children **`Received terminated, exiting gracefully`**, parent completes. Reproduced on repeated runs. |
+| **50** | **Mixed.** Often stable like 10 MB, but the **same** command also produced **`fatal error: fault`** / **`unexpected fault address 0xffffffffffffffb0`** in **`memclrNoHeapPointers`** → **`mallocgcLarge`** (request size **`0x3200000`** = 50 MiB). Treat as **non-deterministic** at this size. |
+| **70** | **Fails** — panics with **`addr=0x2`** or **`addr=0x12`**, and **`0xffffffffffffffb0`** in **`memclrNoHeapPointers`** (same **`pc≈0x86768`** family). |
+| **100** | **Fails** — **`addr=0x2`** at **`pc=0x86768`**, **`runMmapStress`** / goroutine 1 (duplicate panics when multiple children hit the bug). |
+
+**Interpretation:** Failures cluster **above ~50–70 MiB per slice** (not exact; **50 MiB can still pass or fail**). Guest **`free`** during the session still showed **~1.6 GB RAM free**, so these are **not** simple OOM from the shell’s view—favor **kernel demand-paging / lazy region / allocator visibility** bugs over “out of memory” until serial **`[DA-DP]`** / **`[DA-MISS]`** proves otherwise.
+
+**Fault address `0xffffffffffffffb0`:** Appears in Go’s **`fatal error: fault`** path while **`memclr`** runs on a large allocation. It is a distinct pattern from **`0x2`** but the **same code site** (`memclr_arm64.s` / **`mallocgcLarge`**). Log both when filing kernel issues.
+
+### `full.log` correlation (serial grep, 2026-04-14)
+
+Captured **[`full.log`](../../full.log)** (~48k lines) from the same session as the table above. Useful command:
+
+```bash
+rg -n 'forktest|DA-MISS|WILD-DA|mmap_alloc_mb' full.log
+```
+
+**Stable runs** ( **`exit_group` … `forktest_child` `code=0`** , parent `code=0` ):
+
+- **`mmap_alloc_mb=10`**: e.g. execve lines ~2147–2296; exits ~8348–8412.
+- **`mmap_alloc_mb=50`** (first batch): ~8587–8718 execve; ~14813–14874 clean exit.
+
+**Failing `mmap_alloc_mb=100`** (children **`exit_group` `code=2`**):
+
+- **`[DA-MISS] pid=137 … va=0x2`** (and pid **138** similarly) → **`[DP] no lazy region for FAR=0x2`** → **`[WILD-DA] pid=137 FAR=0x2 ELR=0x86768`** , **`last_sc=18446744073709551615`** (no syscall active).
+- Immediately **before** the first **`[DA-MISS]`** on pid **137**, the log shows **`[EFAULT] nr=113`** (**`clock_gettime`**) with odd args, an **EL1 sync** (**`EC=0x25`**) with **“Kernel accessing user-space address”**, and **`WARNING: … stale TTBR0`**. That lines up with the older “garbage **`clock_gettime`**” note in [Verified Non-Issues](#clock_gettime-syscall) but here it is **adjacent to** the **`FAR=0x2`** wild fault—worth treating as **noise vs cause** only after more runs.
+
+**Failing `mmap_alloc_mb=70`**:
+
+- **`FAR=0x12`** and **`FAR=0xffffffffffffffb0`** on different PIDs; **`[WILD-DA]`** still reports **`ELR=0x86768`**.
+- For **`FAR=0xffffffffffffffb0`**, the kernel prints **`*** FAR=0xffffffffffffffb0 is -80 (???) - syscall error used as pointer! ***`** (signed **`FAR == -80`**). Register dumps show **`x0`** values like **`0xffffffffffffffa0`** (another errno-like pattern). Demand-paging path still logs **`[DP] no lazy region for FAR=…`** before **`[WILD-DA]`**.
+
+**Second `mmap_alloc_mb=50`** run (one child faults):
+
+- Same **`FAR=0xffffffffffffffb0`** / **`ELR=0x86768`** chain for pid **205** (~43914–43932).
+
+**Takeaway:** Serial proves the “bad address” is delivered to the fault handler as **`FAR`** on a **demand-paging / lazy miss** path (**`[DA-MISS]`** → **`no lazy region`** → **`[WILD-DA]`**), not only as a Go-side panic string. The PC **`0x86768`** matches userspace **`memclr`**. Next kernel step: determine **why `ELR`/`FAR` pair** ends up as **`0x2`** / **`-80` sign-extended** (bad **`mmap` return**, bad **`brk`**, or **corrupted register state** across syscall) while **`[DP]`** correctly reports **no** lazy mapping for that bogus VA.
 
 ## Summary
 

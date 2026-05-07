@@ -51,8 +51,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
         if is_fixed {
-            let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
-            let _ = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, pages * 4096);
+            let _ = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, pages * 4096);
             for i in 0..pages {
                 let va = addr + i * 4096;
                 let _ = proc.address_space.unmap_page(va);
@@ -91,8 +90,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     );
 
     if use_lazy {
-        let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
-        let count = akuma_exec::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+        let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
         crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
             proc.pid, len, prot, flags, mmap_addr, count);
         return mmap_addr as u64;
@@ -111,8 +109,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         None => {
             if map_populate {
                 // MAP_POPULATE is advisory — fall back to lazy rather than failing the call.
-                let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
-                let count = akuma_exec::process::push_lazy_region(as_pid, mmap_addr, pages * 4096, page_flags);
+                let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
                 crate::tprint!(128, "[mmap] MAP_POPULATE OOM, lazy fallback: pid={} pages={} ({} regions)\n",
                     proc.pid, pages, count);
                 return mmap_addr as u64;
@@ -193,8 +190,9 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
 
     if flags & MREMAP_MAYMOVE == 0 {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let lazy_key = akuma_exec::process::lookup_process(owner_pid).map(|p| p.tgid).unwrap_or(owner_pid);
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
-            || akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, old_addr).is_some()
+            || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
             || akuma_exec::process::lookup_process(owner_pid)
                 .map(|p| p.mmap_regions.iter().any(|(start, frames)| {
                     old_addr >= *start && old_addr < *start + frames.len() * 4096
@@ -255,7 +253,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         }
 
         if !found_eager {
-            let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(owner_pid, old_addr, old_pages * 4096);
+            let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, old_addr, old_pages * 4096);
             for &(freed_start, freed_pages) in &lazy_results {
                 for i in 0..freed_pages {
                     if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
@@ -299,7 +297,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             while va < end {
                 if !akuma_exec::mmu::is_current_user_page_mapped(va) {
                     if let Some((flags, _, _, _)) =
-                        akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, va)
+                        akuma_exec::process::lazy_region_lookup_for_pid(proc.tgid, va)
                     {
                         prefault.push((va, flags));
                     }
@@ -376,7 +374,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let adding_exec = prot & 0x4 != 0;
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
-        akuma_exec::process::update_lazy_region_flags(owner_pid, addr, pages * 4096, new_flags);
+        akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
         // Update all page table entries with no_flush, then issue a single
         // TLB range flush. Previously each update_page_flags call issued its
@@ -461,8 +459,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         return 0;
     }
 
-    let as_pid = akuma_exec::process::read_current_pid().unwrap_or(proc.pid);
-    let results = akuma_exec::process::munmap_lazy_regions_in_range(as_pid, addr, unmap_len);
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, unmap_len);
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
             let mut had_physical = false;

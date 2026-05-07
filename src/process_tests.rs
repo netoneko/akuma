@@ -136,6 +136,7 @@ pub fn run_all_tests() {
     // kill_thread_group fixes (exit_group SIGSEGV fix)
     test_kill_thread_group_preserves_lazy_regions();
     test_lazy_region_lookup_for_page_fault_clone();
+    test_lazy_region_lookup_resolves_tgid_for_demand_paging();
     test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
     test_schedule_blocking_respects_terminated();
@@ -2962,6 +2963,53 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
         console::print("[Test] lazy_region_lookup_for_page_fault_clone PASSED\n");
     } else {
         console::print("[Test] lazy_region_lookup_for_page_fault_clone FAILED\n");
+    }
+}
+
+/// `LAZY_REGION_TABLE` is keyed by TGID (see `sys_mmap` / `proc.tgid`). Demand paging must
+/// resolve lazy metadata via the thread-group leader even when the fault path passes a
+/// worker PID or an unrelated id, as long as [`current_process`] maps to a CLONE_VM sibling.
+fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        push_lazy_region, clear_lazy_regions, lazy_region_lookup_for_page_fault,
+        register_thread_pid, unregister_thread_pid,
+    };
+    use akuma_exec::mmu::user_flags;
+
+    let leader = 60_050u32;
+    let worker = 60_051u32;
+    let va = 0xD100_0000usize;
+    let size = 0x20_000usize;
+
+    let leader_proc = make_test_process(leader);
+    register_process(leader, leader_proc);
+
+    let mut worker_proc = make_test_process(worker);
+    worker_proc.tgid = leader;
+    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    worker_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(worker, worker_proc);
+
+    push_lazy_region(leader, va, size, user_flags::RW);
+
+    register_thread_pid(0, worker);
+
+    let hit_worker = lazy_region_lookup_for_page_fault(worker, va + 0x3000).is_some();
+    let hit_any = lazy_region_lookup_for_page_fault(12_345, va + 0x3000).is_some();
+
+    unregister_thread_pid(0);
+    clear_lazy_regions(leader);
+    clear_lazy_regions(worker);
+    let _ = unregister_process(leader);
+    let _ = unregister_process(worker);
+
+    if hit_worker && hit_any {
+        console::print("[Test] lazy_region_lookup_resolves_tgid_for_demand_paging PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] lazy_region_lookup_resolves_tgid_for_demand_paging FAILED: worker={} any={}\n",
+            hit_worker, hit_any);
     }
 }
 
