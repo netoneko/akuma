@@ -137,6 +137,7 @@ pub fn run_all_tests() {
     test_kill_thread_group_preserves_lazy_regions();
     test_lazy_region_lookup_for_page_fault_clone();
     test_lazy_region_lookup_resolves_tgid_for_demand_paging();
+    test_lazy_region_lookup_resolves_tgid();
     test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
     test_schedule_blocking_respects_terminated();
@@ -7224,6 +7225,52 @@ fn test_mark_terminated_ignores_large_ids() {
 }
 
 /// Test: Boot tests using fake thread IDs don't affect real system threads
+fn test_lazy_region_lookup_resolves_tgid() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        push_lazy_region, lazy_region_lookup, clear_lazy_regions,
+        register_thread_pid, unregister_thread_pid,
+    };
+    use akuma_exec::mmu::user_flags;
+
+    let leader = 60_060u32;
+    let worker = 60_061u32;
+    let va = 0x2000_0000usize;
+    let size = 0x1000usize;
+
+    // Leader has the regions
+    let proc = make_test_process(leader);
+    register_process(leader, proc);
+    push_lazy_region(leader, va, size, user_flags::RW);
+
+    // Worker belongs to leader's thread group (CLONE_VM)
+    let mut wproc = make_test_process(worker);
+    wproc.tgid = leader;
+    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(worker, wproc);
+
+    // Switch to worker context using thread PID map
+    register_thread_pid(0, worker);
+
+    // This lookup (used by ensure_user_pages_mapped in syscalls) must resolve
+    // to the leader's lazy regions, otherwise EFAULT happens.
+    let hit = lazy_region_lookup(va).is_some();
+
+    // Clean up
+    unregister_thread_pid(0);
+    clear_lazy_regions(leader);
+    let _ = unregister_process(leader);
+    let _ = unregister_process(worker);
+
+    if hit {
+        console::print("[Test] lazy_region_lookup_resolves_tgid PASSEDn");
+    } else {
+        console::print("[Test] lazy_region_lookup_resolves_tgid FAILED (worker thread missed leader's lazy region)n");
+    }
+}
+
+
 fn test_fake_thread_ids_safe() {
     use akuma_exec::threading::{get_thread_state, thread_state};
     

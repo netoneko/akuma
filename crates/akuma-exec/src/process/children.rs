@@ -247,7 +247,7 @@ pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
 /// Returns `(flags, source, region_start, region_size)` if found.
 /// The source is cloned so the caller can release the table lock before performing I/O.
 pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    let pid = read_current_pid()?;
+    let pid = address_space_owner_pid_for_fault()?;
     with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(regions) = table.get(&pid) {

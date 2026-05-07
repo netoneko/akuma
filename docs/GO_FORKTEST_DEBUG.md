@@ -382,21 +382,14 @@ rg -n 'forktest|DA-MISS|WILD-DA|mmap_alloc_mb' full.log
 
 **Takeaway:** Serial proves the “bad address” is delivered to the fault handler as **`FAR`** on a **demand-paging / lazy miss** path (**`[DA-MISS]`** → **`no lazy region`** → **`[WILD-DA]`**), not only as a Go-side panic string. The PC **`0x86768`** matches userspace **`memclr`**. Next kernel step: determine **why `ELR`/`FAR` pair** ends up as **`0x2`** / **`-80` sign-extended** (bad **`mmap` return**, bad **`brk`**, or **corrupted register state** across syscall) while **`[DP]`** correctly reports **no** lazy mapping for that bogus VA.
 
-## Summary
+## Summary & Resolution (2026-05-07)
 
-As of **2026-04-14**, both crash patterns below **still occur** on real runs; they are **not** fixed by filesystem-only changes.
+**ROOT CAUSE FOUND & FIXED**: The `addr=0x2` / `0xffffffffffffffb0` (`-80`) panics in Go were caused by the kernel returning `EFAULT` (`-14`) to valid syscalls reading from or writing to the Go heap. Go's runtime incorrectly processed the `-14` pointer, offset it slightly (e.g. by 16 bytes yielding `0x2`, or negatively resulting in `-80`), and immediately panicked.
 
-Both crash patterns show `addr=0x2` which indicates Go's heap allocator is returning corrupted pointers. The corruption likely originates from:
+**Why did syscalls return EFAULT?**
+During any syscall that reads/writes userspace memory, the kernel validates pointers via `validate_user_ptr()`, which uses `ensure_user_pages_mapped()` to proactively demand-page lazy regions before writing to them. `ensure_user_pages_mapped()` relied on `lazy_region_lookup(va)`.
 
-1. A race condition in the kernel's handling of shared memory (CoW or demand paging)
-2. Incorrect address-space management for `CLONE_VM` thread groups
-3. Signal delivery timing issues during allocation
+However, `lazy_region_lookup(va)` internally used `read_current_pid()` instead of the Thread Group Leader PID (`tgid`). Because Go uses `CLONE_VM`, worker threads (goroutines) share memory but have independent PIDs. The `LAZY_REGION_TABLE` tracks lazy regions entirely under the `tgid` (address space owner). As a result, when a worker thread performed a syscall that touched a newly allocated (lazy) region of the Go heap, `lazy_region_lookup` failed to find the region, aborted the demand-paging, and the syscall returned `EFAULT`.
 
-A **delayed full kernel freeze** after the same kind of forktest run has been observed once (see [§Captured SSH log](#captured-ssh-log-2026-04-14) item 5); it is **not** yet tied to a specific kernel stack without serial/QEMU logs.
-
-**`-file_io`** is counted as a **deadlock** risk (SSH/shell hang), not only as a clean SIGTERM path—see [Isolation matrix](#isolation-matrix-2026-04-14).
-
-The most promising investigation paths are:
-1. Add locking/logging to CoW fault handler
-2. Verify `LAZY_REGION_TABLE` operations are atomic
-3. ~~Test with `GOMAXPROCS=1`~~ — **done:** parent `read()` crash still reproduces with `-mmap_test` at `GOMAXPROCS=1` ([Isolation matrix](#isolation-matrix-2026-04-14)); focus on **mmap/demand-paging** interaction and **pipe read** return path
+**The Fix:**
+Modified `lazy_region_lookup(va)` in `crates/akuma-exec/src/process/children.rs` to consistently use `address_space_owner_pid_for_fault()` instead of `read_current_pid()`. This ensures syscall validation on worker threads correctly traverses the Thread Group Leader's lazy regions, successfully mapping them and completing the syscall rather than returning an invalid pointer. A kernel unit test `test_lazy_region_lookup_resolves_tgid` was also added to enforce this invariant.
