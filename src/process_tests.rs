@@ -138,6 +138,8 @@ pub fn run_all_tests() {
     test_lazy_region_lookup_for_page_fault_clone();
     test_lazy_region_lookup_resolves_tgid_for_demand_paging();
     test_lazy_region_lookup_resolves_tgid();
+    test_alloc_mmap_resolves_tgid();
+    test_alloc_mmap_resolves_tgid();
     test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
     test_schedule_blocking_respects_terminated();
@@ -7225,6 +7227,47 @@ fn test_mark_terminated_ignores_large_ids() {
 }
 
 /// Test: Boot tests using fake thread IDs don't affect real system threads
+fn test_alloc_mmap_resolves_tgid() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process,
+        alloc_mmap, register_thread_pid, unregister_thread_pid,
+    };
+
+    let leader = 60_070u32;
+    let worker = 60_071u32;
+
+    let proc = make_test_process(leader);
+    register_process(leader, proc);
+
+    let mut wproc = make_test_process(worker);
+    wproc.tgid = leader;
+    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(worker, wproc);
+
+    let leader_next_before = lookup_process(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let worker_next_before = lookup_process(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+
+    register_thread_pid(0, worker);
+
+    let size = 0x1000;
+    let addr = alloc_mmap(size);
+
+    let leader_next_after = lookup_process(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let worker_next_after = lookup_process(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+
+    unregister_thread_pid(0);
+    let _ = unregister_process(leader);
+    let _ = unregister_process(worker);
+
+    if addr != 0 && leader_next_after > leader_next_before && worker_next_after == worker_next_before {
+        console::print("[Test] test_alloc_mmap_resolves_tgid PASSEDn");
+    } else {
+        console::print("[Test] test_alloc_mmap_resolves_tgid FAILEDn");
+    }
+}
+
+
 fn test_lazy_region_lookup_resolves_tgid() {
     use akuma_exec::process::{
         register_process, unregister_process, lookup_process,

@@ -1,7 +1,8 @@
 use super::*;
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
@@ -27,7 +28,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let map_populate = flags & MAP_POPULATE != 0;
 
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,
@@ -189,7 +191,8 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     }
 
     if flags & MREMAP_MAYMOVE == 0 {
-        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
         let lazy_key = akuma_exec::process::lookup_process(owner_pid).map(|p| p.tgid).unwrap_or(owner_pid);
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
             || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
@@ -201,7 +204,8 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         return if is_mapped { ENOMEM } else { EFAULT };
     }
 
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     let new_addr = match akuma_exec::process::lookup_process(owner_pid)
         .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
         Some(a) => a,
@@ -283,7 +287,8 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         MADV_WILLNEED => {
             // Pre-fault pages in lazy regions that aren't yet mapped.
             // This is advisory; OOM during pre-faulting is silently ignored.
-            let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
                 Some(p) => p,
                 None => return 0,
@@ -328,7 +333,8 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             0
         }
         MADV_DONTNEED => {
-            let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
                 Some(p) => p,
                 None => return 0,
@@ -372,7 +378,8 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let pages = (len + 4095) / 4096;
     let new_flags = akuma_exec::mmu::user_flags::from_prot(prot);
     let adding_exec = prot & 0x4 != 0;
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
@@ -415,7 +422,8 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 }
 
 pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return !0u64,

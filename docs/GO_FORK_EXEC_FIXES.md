@@ -15,6 +15,8 @@ all receiving SIGTERM gracefully, and the parent returning to the shell prompt.
 Also fixed `go build` (the Go compiler toolchain) which successfully compiled 30/31
 packages before hitting a timeout on the large `unicode/tables.go` file.
 
+*Update 2026-05-07:* Addressed remaining `EFAULT` kernel panic regressions and memory leaks (OOM) during Go heap scaling in `forktest`. Handled by correctly binding lazy regions and mmaps to the Thread Group Leader's (`tgid`) address space instead of the `CLONE_VM` worker thread's PID (see `GO_FORKTEST_DEBUG.md` for details).
+
 ---
 
 ## Bugs Fixed (in order)

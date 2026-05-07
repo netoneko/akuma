@@ -203,7 +203,7 @@ pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>
 /// Returns the address or 0 on failure
 pub fn alloc_mmap(size: usize) -> usize {
     // Use address-space owner so CLONE_VM threads share allocation state.
-    let pid = read_current_pid().unwrap_or(0);
+    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     let proc = match lookup_process(pid) {
         Some(p) => p,
         None => {
@@ -228,7 +228,7 @@ pub fn alloc_mmap(size: usize) -> usize {
 /// Called by sys_mmap after allocating frames.
 /// The frames Vec should contain all physical frames for this region.
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
-    let pid = read_current_pid().unwrap_or(0);
+    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     if let Some(proc) = lookup_process(pid) {
         proc.mmap_regions.push((start_va, frames));
     }
@@ -237,7 +237,7 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
 /// Record a lazy mmap region — VA reserved, no physical pages.
 /// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
 pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
-    let pid = read_current_pid().unwrap_or(0);
+    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     if let Some(proc) = lookup_process(pid) {
         proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
     }
@@ -334,7 +334,7 @@ impl<const N: usize> core::fmt::Write for LazyDebugWriter<N> {
 }
 
 pub fn lazy_region_debug(va: usize) {
-    let pid = read_current_pid().unwrap_or(0);
+    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     with_irqs_disabled(|| {
         use core::fmt::Write;
         let table = LAZY_REGION_TABLE.lock();
@@ -551,7 +551,7 @@ pub fn is_in_lazy_region(va: usize) -> bool {
 
 /// Remove and return mmap region starting at the given VA
 pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
-    let pid = read_current_pid().unwrap_or(0);
+    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     let proc = lookup_process(pid)?;
     
     // Find the region
