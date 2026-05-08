@@ -232,6 +232,31 @@ pub const PROC_SYSVIPC_ENABLED: bool = true;
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
+/// Extended diagnostics for syscalls that return EFAULT/ENOSYS/EINVAL.
+///
+/// When enabled, the dangerous-errno log line in `handle_syscall` includes
+/// the calling thread id, ELR_EL1 of the SVC, and all six argument registers.
+/// For `mmap` (nr=222) failures, also decodes the flag bitmask and prints a
+/// short reason hint (`len==0`, `fixed+unaligned`, `kernel_va`, or `other`).
+///
+/// Default `true` while the forktest mmap-stress investigation is active
+/// (see docs/GO_FORKTEST_DEBUG.md §E). Set to `false` to revert to the
+/// compact one-line format.
+pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
+
+/// Log **`read()`** on **pipe reader FDs** (`PipeRead`): pid, tid, fd, pipe id, user
+/// buffer pointer and count on each syscall, plus **`validate_user_ptr`** /
+/// **`copy_to_user`** failures. Uses **`tprint`** timestamps so serial correlates with
+/// **`[signal]`** / mmap lines (`GO_FORKTEST_DEBUG.md`, parent Pattern 2).
+///
+/// Can be very chatty during **`forktest_parent` + epoll**; set **`false`** once done,
+/// or pair with a shorter **`--duration`**.
+pub const SYSCALL_DEBUG_PIPE_READ: bool = true;
+
+/// Log one **`[pipe-read]`** line every **N** matching syscalls (1 = every call).
+/// Ignored when **`SYSCALL_DEBUG_PIPE_READ`** is **`false`**.
+pub const SYSCALL_DEBUG_PIPE_READ_SAMPLE: u64 = 1;
+
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
 pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;

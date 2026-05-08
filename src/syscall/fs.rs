@@ -69,9 +69,49 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 }
 
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
-    if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
-    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
+    if !validate_user_ptr(buf_ptr, count) {
+        if crate::config::SYSCALL_DEBUG_PIPE_READ {
+            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+            crate::tprint!(
+                192,
+                "[pipe-read] EFAULT validate ptr pid={} fd={} buf={:#x} cnt={}\n",
+                pid,
+                fd_num,
+                buf_ptr,
+                count,
+            );
+        }
+        return EFAULT;
+    }
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => {
+            if crate::config::SYSCALL_DEBUG_PIPE_READ {
+                crate::tprint!(
+                    128,
+                    "[pipe-read] EBADF no current_process fd={} buf={:#x}\n",
+                    fd_num,
+                    buf_ptr,
+                );
+            }
+            return EBADF;
+        }
+    };
+    let fd = match proc.get_fd(fd_num as u32) {
+        Some(e) => e,
+        None => {
+            if crate::config::SYSCALL_DEBUG_PIPE_READ {
+                crate::tprint!(
+                    160,
+                    "[pipe-read] EBADF bad fd pid={} fd={} buf={:#x}\n",
+                    proc.pid,
+                    fd_num,
+                    buf_ptr,
+                );
+            }
+            return EBADF;
+        }
+    };
     
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
@@ -334,10 +374,40 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             let mut temp = alloc::vec![0u8; count];
+            if crate::config::SYSCALL_DEBUG_PIPE_READ {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static PIPE_READ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+                let sample = crate::config::SYSCALL_DEBUG_PIPE_READ_SAMPLE.max(1);
+                let seq = PIPE_READ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+                if seq % sample == 0 {
+                    let tid = akuma_exec::threading::current_thread_id();
+                    crate::tprint!(
+                        224,
+                        "[pipe-read] enter pid={} tid={} fd={} pipe={} buf={:#x} cnt={}\n",
+                        proc.pid,
+                        tid,
+                        fd_num,
+                        pipe_id,
+                        buf_ptr,
+                        count,
+                    );
+                }
+            }
             loop {
                 let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
                 if n > 0 {
                     if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        if crate::config::SYSCALL_DEBUG_PIPE_READ {
+                            crate::tprint!(
+                                224,
+                                "[pipe-read] EFAULT copy_to_user pid={} fd={} pipe={} buf={:#x} copy_len={}\n",
+                                proc.pid,
+                                fd_num,
+                                pipe_id,
+                                buf_ptr,
+                                n,
+                            );
+                        }
                         return EFAULT;
                     }
                     return n as u64;

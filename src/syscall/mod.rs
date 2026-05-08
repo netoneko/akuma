@@ -35,6 +35,11 @@ pub(crate) use sync::futex_do_wake;
 pub use mem::membarrier_cmd;
 pub(crate) use fs::sys_close_range;
 
+// Re-export the mmap alignment-EINVAL helper + the flag bits used by kernel
+// tests. `mod mem` is private; these wrappers keep the module boundary intact.
+pub(crate) use mem::mmap_fixed_addr_unaligned_einval;
+pub(crate) use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
+
 pub(crate) fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
 }
@@ -823,11 +828,87 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if result == EFAULT || result == ENOSYS || result == EINVAL {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let err_name = if result == EFAULT { "EFAULT" } else if result == ENOSYS { "ENOSYS" } else { "EINVAL" };
-        crate::safe_print!(128,
-            "[{}] nr={} pid={} args=[{:#x}, {:#x}, {:#x}, {:#x}]\n",
-            err_name, syscall_num, owner_pid, args[0], args[1], args[2], args[3]);
+
+        if crate::config::SYSCALL_ERRNO_DIAG_EXTRA {
+            let tid = akuma_exec::threading::current_thread_id();
+            let elr = akuma_exec::threading::current_trap_frame_elr();
+            crate::safe_print!(192,
+                "[{}] nr={} pid={} tid={} ELR={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]\n",
+                err_name, syscall_num, owner_pid, tid,
+                ElrFmt(elr),
+                args[0], args[1], args[2], args[3], args[4], args[5]);
+
+            // mmap-specific decode: the §E investigation (docs/GO_FORKTEST_DEBUG.md)
+            // hinges on knowing whether MAP_FIXED is set, whether `len` is zero, and
+            // whether the address would overlap the kernel identity map.
+            if syscall_num == nr::MMAP && result == EINVAL {
+                let addr = args[0] as usize;
+                let len = args[1] as usize;
+                let prot = args[2] as u32;
+                let flags = args[3] as u32;
+                let reason = if len == 0 {
+                    "len==0"
+                } else if mem::mmap_fixed_addr_unaligned_einval(addr, flags) {
+                    "fixed+unaligned"
+                } else if (flags & mem::MAP_FIXED) != 0
+                    && addr != 0
+                    && mem::mmap_fixed_overlaps_kernel_va(addr, len)
+                {
+                    "kernel_va"
+                } else {
+                    "other"
+                };
+                crate::safe_print!(192,
+                    "  [mmap-einval] reason={} addr={:#x} len={:#x} prot={:#x} flags={:#x}({})\n",
+                    reason, addr, len, prot, flags, MmapFlagsFmt(flags));
+            }
+        } else {
+            crate::safe_print!(128,
+                "[{}] nr={} pid={} args=[{:#x}, {:#x}, {:#x}, {:#x}]\n",
+                err_name, syscall_num, owner_pid, args[0], args[1], args[2], args[3]);
+        }
     }
 
     CURRENT_SYSCALL_NR.store(!0u64, Ordering::Relaxed);
     result
+}
+
+/// `Display` shim for an optional ELR value: prints `0x…` or `?`.
+struct ElrFmt(Option<u64>);
+impl core::fmt::Display for ElrFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{:#x}", v),
+            None => f.write_str("?"),
+        }
+    }
+}
+
+/// `Display` shim for an mmap `flags` bitmask: prints a compact decode like
+/// `FIXED|PRIVATE|ANON`. Empty mask renders as `0`.
+struct MmapFlagsFmt(u32);
+impl core::fmt::Display for MmapFlagsFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let flags = self.0;
+        let entries: [(u32, &'static str); 8] = [
+            (mem::MAP_SHARED, "SHARED"),
+            (mem::MAP_PRIVATE, "PRIVATE"),
+            (mem::MAP_FIXED, "FIXED"),
+            (mem::MAP_ANONYMOUS, "ANON"),
+            (mem::MAP_NORESERVE, "NORESERVE"),
+            (mem::MAP_POPULATE, "POPULATE"),
+            (mem::MAP_STACK, "STACK"),
+            (mem::MAP_FIXED_NOREPLACE, "FIXED_NOREPLACE"),
+        ];
+        let mut first = true;
+        for (bit, name) in entries.iter() {
+            if flags & *bit != 0 {
+                if !first { f.write_str("|")?; }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        if first { f.write_str("0")?; }
+        Ok(())
+    }
 }

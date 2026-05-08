@@ -1,5 +1,47 @@
 use super::*;
 
+// ── Linux mmap flag constants ────────────────────────────────────────────────
+//
+// Lifted from `sys_mmap` to module scope so the same bits are used by both
+// `sys_mmap` and the diagnostic helpers below. Values match Linux AArch64.
+
+pub(crate) const MAP_SHARED: u32 = 0x01;
+pub(crate) const MAP_PRIVATE: u32 = 0x02;
+pub(crate) const MAP_FIXED: u32 = 0x10;
+pub(crate) const MAP_ANONYMOUS: u32 = 0x20;
+pub(crate) const MAP_NORESERVE: u32 = 0x4000;
+pub(crate) const MAP_POPULATE: u32 = 0x8000;
+pub(crate) const MAP_STACK: u32 = 0x20000; // hint-only on Linux; ignored here
+pub(crate) const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+
+pub(crate) const PROT_NONE: u32 = 0;
+
+/// Returns `true` if a MAP_FIXED / MAP_FIXED_NOREPLACE call with the given
+/// `addr` and `flags` would be rejected with `EINVAL` for **page misalignment**.
+///
+/// Mirrors the alignment guard in `sys_mmap`. Pure function over the syscall
+/// inputs so kernel tests can assert that errno-shaped argument values
+/// (e.g. crash14: `addr = 0xffffffffffffffea`) genuinely map to EINVAL when
+/// MAP_FIXED is set, and *do not* trip this branch when it is not.
+pub(crate) fn mmap_fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool {
+    let is_fixed = (flags & MAP_FIXED) != 0;
+    let is_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    (is_fixed || is_fixed_noreplace) && addr != 0 && (addr & 0xFFF) != 0
+}
+
+/// Returns `true` if a MAP_FIXED mapping would overlap the kernel
+/// identity-map VA range (and thus be rejected with `EINVAL`).
+///
+/// Same predicate as the in-line guard in `sys_mmap`; kept here so the
+/// diagnostic logger can derive a one-token reason hint without re-walking
+/// the syscall body.
+pub(crate) fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
+    use akuma_exec::process::types::ProcessMemory;
+    let pages = (len + 4095) / 4096;
+    let map_end = addr.saturating_add(pages * 4096);
+    addr < ProcessMemory::KERNEL_VA_END && map_end > ProcessMemory::KERNEL_VA_START
+}
+
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
@@ -13,20 +55,19 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     let pages = (len + 4095) / 4096;
     let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
 
-    const MAP_ANONYMOUS: u32 = 0x20;
-    const MAP_FIXED: u32 = 0x10;
-    const MAP_NORESERVE: u32 = 0x4000;
-    const MAP_FIXED_NOREPLACE: u32 = 0x100000;
-    const MAP_POPULATE: u32 = 0x8000;
-    const MAP_STACK: u32 = 0x20000;   // hint-only on Linux; ignored here
-    const MAP_SHARED: u32 = 0x01;
-    const PROT_NONE: u32 = 0;
-    let _ = MAP_STACK; // silence unused-variable lint
+    let _ = MAP_STACK; // silence unused-import lint; flag accepted but ignored
 
     let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let map_populate = flags & MAP_POPULATE != 0;
+
+    // Like `len == 0`, an unaligned MAP_FIXED / MAP_FIXED_NOREPLACE address is
+    // EINVAL before any process lookup. Otherwise `handle_syscall` from kernel
+    // tests (no current user task) returns ESRCH instead of EINVAL.
+    if mmap_fixed_addr_unaligned_einval(addr, flags) {
+        return EINVAL;
+    }
 
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
@@ -36,21 +77,14 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     };
 
     let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
-        if addr & 0xFFF != 0 { return EINVAL; }
         // Reject MAP_FIXED mappings that overlap the kernel identity-map range.
         // The Go runtime uses MAP_FIXED to commit its heap arenas; without this
         // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
         // kernel's physical-RAM identity map and causing silent memory corruption.
-        {
-            use akuma_exec::process::types::ProcessMemory;
-            let map_end = addr.saturating_add(pages * 4096);
-            if addr < ProcessMemory::KERNEL_VA_END
-                && map_end > ProcessMemory::KERNEL_VA_START
-            {
-                crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
-                    proc.pid, addr, pages * 4096);
-                return EINVAL;
-            }
+        if mmap_fixed_overlaps_kernel_va(addr, pages * 4096) {
+            crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
+                proc.pid, addr, pages * 4096);
+            return EINVAL;
         }
         if is_fixed {
             let _ = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, pages * 4096);

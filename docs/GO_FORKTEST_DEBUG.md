@@ -8,6 +8,8 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 **2026-05-08:** Pure-C **`mmap_stress`** ([`userspace/forktest/c_stress/`](../userspace/forktest/c_stress/)) can run cleanly **standalone**, but **`forktest_parent --use_c_child`** still kills the **Go parent** in **Pattern 2** (`read` / epoll pipe). Serial **`crash14.log`** shows **`mmap`** (**`nr=222`**) from a C child with **`x0 = −22`** (errno-shaped **before** kernel handling)—see [§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08) below. That points to **syscall-entry / trap-frame corruption**, not Go’s allocator alone.
 
+**Kernel instrumentation (2026-05-08):** When **`[EINVAL]` / `[EFAULT]` / `[ENOSYS]`** fire, serial can include **`tid=`**, **`ELR=`**, full **`x0`–`x5`**, and for **`nr=222`** a follow-on **`[mmap-einval]`** line with **`reason=`** and decoded **`flags=`**—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08). Toggle via **`SYSCALL_ERRNO_DIAG_EXTRA`** in [`src/config.rs`](../src/config.rs). Regression tests: **`mmap_fixed_addr_unaligned_einval_helper`**, **`mmap_einval_through_handle_syscall`** in [`src/tests.rs`](../src/tests.rs).
+
 This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** / **`0x10`** in the Go allocator, treat it as the **heap + demand paging + signal / syscall-frame** investigation described below.
 
 | What you see | Likely bucket | Where to read |
@@ -17,7 +19,7 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 | **`unexpected fault address 0xfffffffffffffffa`** (`-6`), **`fatal error: fault`** | Prior **`clock_gettime` → EINVAL (-22)**; FAR **`-6`** = **`-22+16`** (errno misused as base + `sizeof(timespec)`) | **`crash4.log`** / § Serial captures |
 | **`unexpected fault address 0xffffffffffffffb0`**, `fatal error: fault` in `memclr` | Same **`pc≈0x86768`** family; often at **50–70 MiB** `-mmap_alloc_mb` | [Empirical threshold](#empirical-allocation-threshold-2026-04-14-session) |
 | `[JIT] IC flush + replay … bogus nr=…` near fault | Stale / corrupted syscall dispatch state around SVC replay | [`src/exceptions.rs`](../src/exceptions.rs), `FIX_MEMORY_MAPPING.md`, `EPOLL_PERFORMANCE.md` |
-| **`[EINVAL] nr=222`** (`mmap`), **`args[0]`** = **`0xffffffffffffffea`** (−22) | Same **errno-as-GPR** family as xattr/`clock_gettime`; **`mmap` addr** must never be an errno word | **`crash14.log`**, §E; [`src/syscall/mod.rs`](../src/syscall/mod.rs) `nr::MMAP` |
+| **`[EINVAL] nr=222`** (`mmap`), **`args[0]`** = **`0xffffffffffffffea`** (−22) | Same **errno-as-GPR** family as xattr/`clock_gettime`; extended lines show **`reason=`** (`len==0`, **`fixed+unaligned`**, **`kernel_va`**, **`other`**)—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08) | **`crash14.log`**, §E; [`src/syscall/mod.rs`](../src/syscall/mod.rs); **`mmap_fixed_addr_unaligned_einval`** in [`src/syscall/mem.rs`](../src/syscall/mem.rs) |
 | SSH **disconnect** after commands finish | Often **client / router idle timeout**; confirm with serial still running | Not proven guest deadlock from **`crash5.log`** alone |
 
 **Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
@@ -318,7 +320,32 @@ grep -E "signal.*deliver|tkill.*sig=23" /tmp/akuma_output.txt
 rg '\[mmap\]|\[DA-MISS\]|\[DA-DP\]|\[WILD-DA\]|\[Fault\]|\[JIT\]|nr=113|exit_group|forktest|mmap_alloc_mb|clock_gettime' full.log
 ```
 
+For **`[EINVAL]`** / **`mmap`** correlation after the 2026-05-08 logging change, also search:
+
+```bash
+rg '\[EINVAL\]|\[EFAULT\]|\[ENOSYS\]|\[mmap-einval\]|mmap_fixed_addr|nr=222|tid=' full.log
+```
+
 Correlate **`pid=`** / **`ppid=`** in **`[DA-MISS]`** lines with **`[exit_group]`** PIDs to tie faults to parent vs child address spaces.
+
+### Serial errno diagnostics (2026-05-08)
+
+When a syscall returns **`EFAULT`**, **`ENOSYS`**, or **`EINVAL`**, the kernel may print an extended line (gated by **`SYSCALL_ERRNO_DIAG_EXTRA`** in [`src/config.rs`](../src/config.rs); default **`true`**, set **`false`** for the legacy short format).
+
+**First line** (all dangerous errnos): **`[EINVAL]`** / **`[EFAULT]`** / **`[ENOSYS]`** with **`nr=<n> pid=<p> tid=<t> ELR=<pc-or-?> args=[x0…x5]`** — six AArch64 argument registers at SVC entry, plus the userspace program counter of the system call when the live trap frame is available (**`ELR=?`** if not). Thread id comes from the scheduler slot (**`current_thread_id`**).
+
+**Second line** (only **`nr=222`** **`mmap`** returning **`EINVAL`**): **`[mmap-einval] reason=<token> addr=… len=… prot=… flags=0x…(FLAG|FLAG|…)`**. The **`reason`** token is derived from the syscall inputs using the same predicates as [`sys_mmap`](../src/syscall/mem.rs) (via **`mmap_fixed_addr_unaligned_einval`** and **`mmap_fixed_overlaps_kernel_va`**):
+
+| **`reason=`** | Meaning |
+|---------------|---------|
+| **`len==0`** | **`x1`** was zero — **`EINVAL`** before address interpretation. |
+| **`fixed+unaligned`** | **`MAP_FIXED`** or **`MAP_FIXED_NOREPLACE`** set and **`addr`** not page-aligned — **errno-shaped `addr`** (e.g. **`0xffffffffffffffea`**) produces **`EINVAL`** here without implying **`NULL` was corrupted** if **`MAP_FIXED`** is actually set in **`flags`**. |
+| **`kernel_va`** | Fixed mapping would overlap the kernel identity-map VA window. |
+| **`other`** | No token matched — inspect **`sys_mmap`** body for that combination of **`prot` / flags / fd**. |
+
+**Reading crash14:** If **`flags`** decodes to normal musl anonymous mmap (**`PRIVATE|ANON`**, no **`FIXED`**) but **`x0`** still looks errno-shaped and **`reason=other`** (or **`EINVAL`** for an unexpected branch), that supports **GPR corruption** rather than the fixed-alignment path alone. If **`FIXED`** appears in the decode and **`reason=fixed+unaligned`**, the kernel is behaving consistently with **unaligned fixed `addr`** even though user source passed **`NULL`** — then prioritize **trap-frame / wrong-register** auditing.
+
+**Trap ELR source:** [`current_trap_frame_elr()`](../crates/akuma-exec/src/threading/mod.rs) reads the pointer saved by **`set_current_trap_frame`** in the EL0 sync handler ([`src/exceptions.rs`](../src/exceptions.rs)).
 
 ### Kernel audit: owner PID and lazy regions (read-path checklist)
 
@@ -432,10 +459,12 @@ Heavy **`forktest`** also produced **`[DA-DP] … anon alloc failed, 0 free page
 
    - **`forktest_parent`** exits **`exit_group … code=2`** shortly after **`[signal] deliver sig=11`** with **`fault_pc=0x13060`** (**SIGSEGV** on the parent thread draining pipes — matches userspace **`read`** trampoline).
 
-   - **Immediately before** that, kernel prints **`[EINVAL] nr=222 pid=<child>`** with **`args=[0xffffffffffffffea, …]`**. **`nr::MMAP` is 222** in [`src/syscall/mod.rs`](../src/syscall/mod.rs). **`0xffffffffffffffea`** is **`−22` (`EINVAL`)** in **`x0`** — the **first argument to `mmap`** (address hint). The C source only ever passes **`NULL`**; this implies **GPR corruption at syscall entry** (or a logging/TID mix-up—either way, investigate trap path).
+   - **Immediately before** that, kernel prints **`[EINVAL] nr=222 pid=<child>`** with **`args=[0xffffffffffffffea, …]`**. **`nr::MMAP` is 222** in [`src/syscall/mod.rs`](../src/syscall/mod.rs). **`0xffffffffffffffea`** is **`−22` (`EINVAL`)** in **`x0`** — the **first argument to `mmap`** (address hint). The C source only ever passes **`NULL`**; this implies **GPR corruption at syscall entry** (or a logging/TID mix-up—either way, investigate trap path). With **extended errno logging** enabled, compare **`tid`** / **`ELR`** on that line to the faulting thread; read **`[mmap-einval] reason=`** and the **`flags=(…)`** decode—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08).
 
    - **After** the parent dies, **`mmap_stress`** children often **`exit_group code=0`** — they can **outlive** the parent until **`SIGTERM`** / duration; **child `code=0` does not prove** the parent **`read`** path is safe.
 
 **Interpretation:** Parallel **mmap storm + parent pipe I/O** correlates with **errno-shaped words appearing in syscall argument registers** — seen on **`crash13`** (**xattr / `clock_gettime`**) and now on **`mmap`** in **`crash14`**. That strengthens the hypothesis that **kernel-side syscall / trap-frame / `clone` / `rt_sigreturn` plumbing** must be audited—not only Go’s **`mallocgc`**.
+
+**Regression coverage:** In-kernel tests **`mmap_fixed_addr_unaligned_einval_helper`** and **`mmap_einval_through_handle_syscall`** ([`src/tests.rs`](../src/tests.rs)) pin the **`MAP_FIXED` + unaligned `addr` → EINVAL** path and the **`len==0`** path so **`mmap_fixed_addr_unaligned_einval`** in [`src/syscall/mem.rs`](../src/syscall/mem.rs) cannot drift from **`sys_mmap`** without CI catching it.
 
 **Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection; reduce contention with **`--num_children=1`** when isolating parent vs child behavior.

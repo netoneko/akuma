@@ -211,6 +211,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_lazy_fault_kernel_va_guard,  "lazy_fault_kernel_va_guard");
     run_test!(test_fork_mmap_skips_kernel_va,   "fork_mmap_skips_kernel_va");
 
+    // Regression: forktest §E `[EINVAL] nr=222` (docs/GO_FORKTEST_DEBUG.md).
+    // Pin the alignment-EINVAL helper so the mmap diagnostic decode and
+    // sys_mmap guard cannot drift apart. crash14 shape: addr=-22, FIXED set.
+    run_test!(test_mmap_fixed_addr_unaligned_einval_helper, "mmap_fixed_addr_unaligned_einval_helper");
+    run_test!(test_mmap_einval_through_handle_syscall,      "mmap_einval_through_handle_syscall");
+
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
     // run_test!(test_lifo_pattern, "lifo_pattern");
@@ -7959,6 +7965,86 @@ fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
     crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
 
     let pass = write_ok && read_ok;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: forktest §E `[EINVAL] nr=222` with errno-shaped `addr`.
+///
+/// `crash14` (docs/GO_FORKTEST_DEBUG.md) shows `mmap` syscalls where `x0` is
+/// `0xffffffffffffffea` (-22 = EINVAL). The kernel's `sys_mmap` already rejects
+/// such calls — but only when `MAP_FIXED` (or `MAP_FIXED_NOREPLACE`) is set.
+/// This test pins the alignment-EINVAL helper so future refactors cannot
+/// silently break the diagnostic decode path or the `sys_mmap` guard.
+fn test_mmap_fixed_addr_unaligned_einval_helper() -> bool {
+    console::print("\n[TEST] mmap_fixed_addr_unaligned_einval helper (crash14 shapes)\n");
+    use crate::syscall::{
+        mmap_fixed_addr_unaligned_einval, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
+        MAP_PRIVATE,
+    };
+
+    // crash14 hint shape: addr looks like an errno (-22), various flag bitmasks.
+    let crash14_addr = 0xffffffffffffffea_usize;
+    let aligned_fixed = 0x4000_0000_usize;
+    let normal_anon_flags = MAP_ANONYMOUS | MAP_PRIVATE;       // musl mmap(NULL, ...) usual flags
+    let fixed_anon_flags = MAP_FIXED | normal_anon_flags;
+    let fnr_anon_flags = MAP_FIXED_NOREPLACE | normal_anon_flags;
+
+    // (label, addr, flags, expected_einval)
+    let cases: &[(&str, usize, u32, bool)] = &[
+        ("crash14 + FIXED",        crash14_addr,  fixed_anon_flags,   true),
+        ("crash14 + FIXED_NOREP",  crash14_addr,  fnr_anon_flags,     true),
+        ("crash14 no FIXED",       crash14_addr,  normal_anon_flags,  false),
+        ("aligned + FIXED",        aligned_fixed, fixed_anon_flags,   false),
+        ("addr=0 + FIXED",         0,             fixed_anon_flags,   false),
+        ("aligned no FIXED",       aligned_fixed, normal_anon_flags,  false),
+    ];
+
+    let mut pass = true;
+    for &(label, addr, flags, expected) in cases {
+        let got = mmap_fixed_addr_unaligned_einval(addr, flags);
+        if got != expected {
+            crate::safe_print!(192,
+                "  FAIL ({}): addr={:#x} flags={:#x} expected={} got={}\n",
+                label, addr, flags, expected, got);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: forktest §E `[EINVAL] nr=222` end-to-end through `handle_syscall`.
+///
+/// Walks the same matrix through the public `handle_syscall(nr=222, …)` entry
+/// point so we also catch breakage in `sys_mmap`'s call into the helper, not
+/// just the helper itself. Uses the `len==0` and `MAP_FIXED + unaligned addr`
+/// EINVAL branches that don't require a live process address space.
+fn test_mmap_einval_through_handle_syscall() -> bool {
+    console::print("\n[TEST] handle_syscall mmap EINVAL paths (len==0 / fixed+unaligned)\n");
+    use crate::syscall::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
+    const NR_MMAP: u64 = 222;
+    const EINVAL: u64 = (-22i64) as u64;
+
+    // mmap(addr=0, len=0, prot=0, flags=0, fd=-1, off=0) → EINVAL (len check).
+    let len_zero = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
+    let len_zero_ok = len_zero == EINVAL;
+
+    // mmap(addr=0xffffffffffffffea, len=0x1000, MAP_FIXED|ANON|PRIVATE) → EINVAL
+    // (fixed+unaligned). Mirrors crash14: addr is a negative errno-shaped word.
+    let fixed_flags = (MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE) as u64;
+    let fixed_unaligned = crate::syscall::handle_syscall(
+        NR_MMAP,
+        &[0xffffffffffffffea_u64, 0x1000, 0x3, fixed_flags, !0u64, 0],
+    );
+    let fixed_unaligned_ok = fixed_unaligned == EINVAL;
+
+    let pass = len_zero_ok && fixed_unaligned_ok;
+    if !pass {
+        crate::safe_print!(192,
+            "  FAIL: len_zero={:#x} fixed_unaligned={:#x} (expected {:#x})\n",
+            len_zero, fixed_unaligned, EINVAL);
+    }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

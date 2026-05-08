@@ -2714,6 +2714,24 @@ pub fn clear_current_trap_frame() {
     }
 }
 
+/// Read `ELR_EL1` from the live trap frame of the current thread, if available.
+///
+/// Returns `None` outside an EL0 sync exception window (when no trap frame has
+/// been registered via `set_current_trap_frame`). Used by syscall errno
+/// diagnostics to attach the user PC of the faulting SVC.
+pub fn current_trap_frame_elr() -> Option<u64> {
+    let tid = current_thread_id();
+    if tid >= MAX_THREADS {
+        return None;
+    }
+    let frame_ptr = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
+    if frame_ptr == 0 {
+        return None;
+    }
+    let frame = unsafe { &*(frame_ptr as *const UserTrapFrame) };
+    Some(frame.elr_el1)
+}
+
 /// Get the saved user context for a thread.
 /// Used by fork() to duplicate the parent's state.
 /// Reads from the live trap frame on the stack when available (captures all registers).
