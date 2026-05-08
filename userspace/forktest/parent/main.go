@@ -26,6 +26,7 @@ var (
 	goroutineStress = flag.Bool("goroutine_stress", false, "Enable goroutine/channel stress testing for children")
 	combinedStress  = flag.Bool("combined_stress", false, "Enable all stress modes concurrently for children")
 	durationFlag    = flag.Duration("duration", 0, "Total test duration (e.g. 30s, 1m). 0 = run until all children finish")
+	useCChild       = flag.Bool("use_c_child", false, "Spawn /bin/mmap_stress (pure C, musl static) instead of forktest_child (Go) — for kernel-vs-runtime disambiguation")
 )
 
 type ChildInfo struct {
@@ -60,25 +61,31 @@ func buildChildArgs() []string {
 	return args
 }
 
-// resolveForktestChild returns an absolute or stable path to forktest_child so exec works from any CWD
-// (e.g. Akuma shell at / vs /bin). Tries: next to this binary, then /bin/forktest_child, then ./forktest_child.
-func resolveForktestChild() string {
+// resolveChildBinary returns an absolute or stable path to the child binary
+// so exec works from any CWD (e.g. Akuma shell at / vs /bin).  When
+// `--use_c_child` is set we look for /bin/mmap_stress; otherwise we look for
+// forktest_child next to this binary, then /bin/forktest_child.
+func resolveChildBinary() string {
+	name := "forktest_child"
+	if *useCChild {
+		name = "mmap_stress"
+	}
 	exe, err := os.Executable()
 	if err != nil {
-		return "./forktest_child"
+		return "./" + name
 	}
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
-	candidate := filepath.Join(filepath.Dir(exe), "forktest_child")
+	candidate := filepath.Join(filepath.Dir(exe), name)
 	if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
 		return candidate
 	}
-	const akumaBin = "/bin/forktest_child"
+	akumaBin := "/bin/" + name
 	if st, err := os.Stat(akumaBin); err == nil && !st.IsDir() {
 		return akumaBin
 	}
-	return "./forktest_child"
+	return "./" + name
 }
 
 func main() {
@@ -108,7 +115,7 @@ func main() {
 	children := make([]*ChildInfo, numChildren)
 	childMap := make(map[int]*ChildInfo)
 	childArgs := buildChildArgs()
-	childPath := resolveForktestChild()
+	childPath := resolveChildBinary()
 
 	for i := 0; i < numChildren; i++ {
 		readPipe, writePipe, err := os.Pipe()

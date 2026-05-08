@@ -151,6 +151,17 @@ if [ "$WITH_FORKTEST" = true ]; then
     cp forktest/forktest_child ../bootstrap/bin/
     cp forktest/forktest_parent ../bootstrap/bin/
     echo "forktest binaries copied to bootstrap/bin/"
+
+    # C-only mmap stress control: pure musl static binary, no Go runtime.
+    # Used to disambiguate kernel-vs-runtime crashes (see
+    # docs/GO_FORKTEST_DEBUG.md and the forktest_parent --use_c_child flag).
+    echo "Building forktest mmap_stress (C control)..."
+    (
+        cd forktest/c_stress
+        aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mmap_stress mmap_stress.c
+    )
+    cp forktest/c_stress/mmap_stress ../bootstrap/bin/
+    echo "mmap_stress (C) copied to bootstrap/bin/"
 fi
 
 echo "Build process completed."

@@ -14,9 +14,25 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_parent ./parent
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_child  ./child
 ```
 
-Copy both binaries to `/bin/` on the Akuma disk image.
+Copy both binaries to `/bin/` on the Akuma disk image (or use **`pkg install`** — see below).
 
 The parent resolves `forktest_child` next to its own executable (or falls back to `/bin/forktest_child`), so you do not need `cd /bin` for `exec` to succeed.
+
+### Installing via `pkg install` (SSH)
+
+From the host, serve packages so QEMU can reach them at `10.0.2.2:8000` ([`docs/PACKAGES.md`](../../docs/PACKAGES.md)):
+
+```bash
+cd bootstrap && python3 -m http.server 8000
+```
+
+In SSH: `pkg install forktest_parent forktest_child` (if those names are served under `bootstrap/bin/`), or copy updated binaries the same way.
+
+For the **C control binary** `mmap_stress` (kernel-vs-Go disambiguation), build or copy it to `bootstrap/bin/mmap_stress`, keep the server running, then:
+
+```text
+pkg install mmap_stress
+```
 
 ## Usage
 
@@ -36,6 +52,7 @@ forktest_parent [flags]
 | `-file_io` | `false` | Enable O_APPEND file I/O test in children |
 | `-goroutine_stress` | `false` | Enable goroutine/channel stress in children |
 | `-send_signal` | `false` | Send SIGINT to child 0 after 500 ms |
+| `-use_c_child` | `false` | Exec **`/bin/mmap_stress`** (pure C, static musl) instead of **`forktest_child`** — bisect kernel vs Go runtime |
 
 `-duration` is forwarded to each child so all processes share the same deadline.
 
@@ -71,6 +88,12 @@ forktest_parent -duration=60s -mmap_test -num_children=2
 ```
 forktest_parent -duration=30s -mmap_test -mmap_alloc_mb=4 -num_children=1
 ```
+
+**C-only mmap stress (after `pkg install mmap_stress`):**
+```
+forktest_parent --use_c_child -duration=10s --mmap_test=true --mmap_alloc_mb=70
+```
+See [`c_stress/README.md`](c_stress/README.md).
 
 **Test SIGINT handling:**
 ```

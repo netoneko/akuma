@@ -1,2 +1,3 @@
 forktest_child
 forktest_parent
+c_stress/mmap_stress

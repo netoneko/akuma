@@ -2,9 +2,11 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-05-07)
+## Current status (2026-05-07, updated 2026-05-08)
 
 **Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
+
+**2026-05-08:** Pure-C **`mmap_stress`** ([`userspace/forktest/c_stress/`](../userspace/forktest/c_stress/)) can run cleanly **standalone**, but **`forktest_parent --use_c_child`** still kills the **Go parent** in **Pattern 2** (`read` / epoll pipe). Serial **`crash14.log`** shows **`mmap`** (**`nr=222`**) from a C child with **`x0 = −22`** (errno-shaped **before** kernel handling)—see [§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08) below. That points to **syscall-entry / trap-frame corruption**, not Go’s allocator alone.
 
 This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** / **`0x10`** in the Go allocator, treat it as the **heap + demand paging + signal / syscall-frame** investigation described below.
 
@@ -15,6 +17,7 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 | **`unexpected fault address 0xfffffffffffffffa`** (`-6`), **`fatal error: fault`** | Prior **`clock_gettime` → EINVAL (-22)**; FAR **`-6`** = **`-22+16`** (errno misused as base + `sizeof(timespec)`) | **`crash4.log`** / § Serial captures |
 | **`unexpected fault address 0xffffffffffffffb0`**, `fatal error: fault` in `memclr` | Same **`pc≈0x86768`** family; often at **50–70 MiB** `-mmap_alloc_mb` | [Empirical threshold](#empirical-allocation-threshold-2026-04-14-session) |
 | `[JIT] IC flush + replay … bogus nr=…` near fault | Stale / corrupted syscall dispatch state around SVC replay | [`src/exceptions.rs`](../src/exceptions.rs), `FIX_MEMORY_MAPPING.md`, `EPOLL_PERFORMANCE.md` |
+| **`[EINVAL] nr=222`** (`mmap`), **`args[0]`** = **`0xffffffffffffffea`** (−22) | Same **errno-as-GPR** family as xattr/`clock_gettime`; **`mmap` addr** must never be an errno word | **`crash14.log`**, §E; [`src/syscall/mod.rs`](../src/syscall/mod.rs) `nr::MMAP` |
 | SSH **disconnect** after commands finish | Often **client / router idle timeout**; confirm with serial still running | Not proven guest deadlock from **`crash5.log`** alone |
 
 **Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
@@ -27,10 +30,11 @@ Shell: `export GOMAXPROCS=1` for all runs below. Command line: `forktest_parent 
 |------------|---------|
 | **(none)** — children run default main (no stress) | **Stable.** Parent sends SIGTERM at deadline; `Wait()` reports `signal: killed`; empty child stdout. |
 | **`-mmap_test`** | **Parent SIGSEGV** in `unix.Read` on pipe (**`main.go:199`**): `PC≈0x13060`, fault `addr≈0x1e39df000`, `syscall` read `fd=4`. Same shape as [Pattern 2](#crash-pattern-2-parent-process-heap-corruption). **Does not require** `-combined_stress` or multiple Go M-threads in the parent. |
+| **`--use_c_child`** + **`-mmap_test`** | Same **parent** failure as above (Go parent + epoll **`read`**); children run **`/bin/mmap_stress`** instead of Go. **C children can still `exit_group code=0`** after the parent dies — not proof the parent path is sound. **`crash14.log`**: **`nr=222`** (`mmap`) with errno-shaped **`x0`** from a child. See §E. |
 | **`-file_io`** | **Not a safe mode.** One short run showed children printing `Received terminated, exiting gracefully.` before kill, but **`-file_io` has also reproduced a full deadlock** (no forward progress in SSH / shell). That lines up with **concurrent temp-file writes** on ext2 and earlier **`ps`** / shell hangs under I/O stress—count **`file_io`** as a **deadlock risk**, not “stable”. |
 | **`-send_signal`** | **Stable** (benign race): `Failed to send SIGINT … process already finished` if the child exits before 500 ms; then deadline kill as usual. |
 
-**Conclusion:** The **mmap heap stress in children** (`runMmapStress`, large `make([]byte, …)`) is enough to trigger the **parent `read()` SIGSEGV**; **`GOMAXPROCS=1` does not rule out “multi-M in parent”** as the sole cause—it rules out **parent** multi-threading as required for that crash. Separately, **`file_io`** stress can **deadlock** the system even when mmap does not SIGSEGV the parent—likely **filesystem / lock / scheduler** interaction, not only Go’s allocator.
+**Conclusion:** The **mmap heap stress in children** (`runMmapStress`, large `make([]byte, …)`, or pure-C **`mmap_stress`**) is enough to trigger the **parent `read()` SIGSEGV**; **`GOMAXPROCS=1` does not rule out “multi-M in parent”** as the sole cause—it rules out **parent** multi-threading as required for that crash. Replacing Go children with **C `mmap_stress`** does **not** eliminate the parent crash (§E). Separately, **`file_io`** stress can **deadlock** the system even when mmap does not SIGSEGV the parent—likely **filesystem / lock / scheduler** interaction, not only Go’s allocator.
 
 ## Test Command
 
@@ -414,4 +418,24 @@ Heavy **`forktest`** also produced **`[DA-DP] … anon alloc failed, 0 free page
 
 **`crash5.log`** ends with **`forktest_parent` / children `exit_group` `code=0`**. An SSH **“Connection closed”** afterward is **not** demonstrated as a guest deadlock from this capture alone—check **host timeouts** and **parallel serial tee**.
 
-**Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection.
+### E. Pure-C `mmap_stress` + `crash14` serial (2026-05-08)
+
+**Motivation:** Swap **`forktest_child`** (Go) for **`/bin/mmap_stress`** (static musl: **`mmap` → `memset` → `munmap`**, see [`userspace/forktest/c_stress/README.md`](../userspace/forktest/c_stress/README.md)) via **`forktest_parent --use_c_child`**, to see whether crashes are **only** Go’s heap/runtime.
+
+**Results:**
+
+1. **`mmap_stress` alone** (no parent farm): can finish many iterations and **`exit_group code=0`** — the **anonymous mmap demand-paging path is not unconditionally broken** for a single process.
+
+2. **`forktest_parent --use_c_child --duration 10s --mmap_test=true --mmap_alloc_mb=70`:** the **parent still crashes** in **[Pattern 2](#crash-pattern-2-parent-process-heap-corruption)** — **`unix.Read`** on the epoll pipe (**`PC≈0x13060`**), fault address in the **heap VA range** (e.g. **`0x13d96000`**). Only children were swapped to C; **parent remains Go + epoll + pipe `read`**.
+
+3. **`crash14.log`** (serial, same style of run):
+
+   - **`forktest_parent`** exits **`exit_group … code=2`** shortly after **`[signal] deliver sig=11`** with **`fault_pc=0x13060`** (**SIGSEGV** on the parent thread draining pipes — matches userspace **`read`** trampoline).
+
+   - **Immediately before** that, kernel prints **`[EINVAL] nr=222 pid=<child>`** with **`args=[0xffffffffffffffea, …]`**. **`nr::MMAP` is 222** in [`src/syscall/mod.rs`](../src/syscall/mod.rs). **`0xffffffffffffffea`** is **`−22` (`EINVAL`)** in **`x0`** — the **first argument to `mmap`** (address hint). The C source only ever passes **`NULL`**; this implies **GPR corruption at syscall entry** (or a logging/TID mix-up—either way, investigate trap path).
+
+   - **After** the parent dies, **`mmap_stress`** children often **`exit_group code=0`** — they can **outlive** the parent until **`SIGTERM`** / duration; **child `code=0` does not prove** the parent **`read`** path is safe.
+
+**Interpretation:** Parallel **mmap storm + parent pipe I/O** correlates with **errno-shaped words appearing in syscall argument registers** — seen on **`crash13`** (**xattr / `clock_gettime`**) and now on **`mmap`** in **`crash14`**. That strengthens the hypothesis that **kernel-side syscall / trap-frame / `clone` / `rt_sigreturn` plumbing** must be audited—not only Go’s **`mallocgc`**.
+
+**Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection; reduce contention with **`--num_children=1`** when isolating parent vs child behavior.
