@@ -1,4 +1,5 @@
 forktest_child
 forktest_parent
+pattern2_minimal.bin
 c_stress/mmap_stress
 c_stress/pattern2_parent

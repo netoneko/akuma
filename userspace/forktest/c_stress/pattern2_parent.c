@@ -3,8 +3,10 @@
  * (docs/GO_FORKTEST_DEBUG.md): epoll + EPOLLONESHOT, pipe read, epoll_ctl MOD re-arm,
  * children exec /bin/mmap_stress. Mirrors forktest_parent shape without Go.
  *
- * Usage (Akuma): pkg install pattern2_parent mmap_stress
+ * Usage (Akuma): pkg install pattern2_parent mmap_stress [forktest_child]
  *   /bin/pattern2_parent -num_children=1 -duration=10s -mmap_alloc_mb=70
+ * C parent + Go child (quadrant vs Go parent + C child — GO_FORKTEST_DEBUG.md):
+ *   /bin/pattern2_parent -child=forktest …   # exec /bin/forktest_child -mmap_test=true …
  */
 
 #include <errno.h>
@@ -56,14 +58,34 @@ typedef struct {
     int done;
 } ChildSlot;
 
+static int parse_kv_child_mode(const char *arg, int *use_forktest_child) {
+    const char *keys[] = { "-child=", "--child=", NULL };
+    for (int k = 0; keys[k]; k++) {
+        size_t len = strlen(keys[k]);
+        if (strncmp(arg, keys[k], len) != 0) continue;
+        const char *val = arg + len;
+        if (strcmp(val, "forktest") == 0) {
+            *use_forktest_child = 1;
+            return 1;
+        }
+        if (strcmp(val, "mmap_stress") == 0 || strcmp(val, "c") == 0) {
+            *use_forktest_child = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int num_children = 3;
     long duration_s = 10;
     int mmap_mb = 70;
+    int use_forktest_child = 0;
 
     for (int i = 1; i < argc; i++) {
         int v;
-        if (parse_kv_int(argv[i], "-num_children", &v) || parse_kv_int(argv[i], "--num_children", &v)) {
+        if (parse_kv_child_mode(argv[i], &use_forktest_child)) {
+        } else if (parse_kv_int(argv[i], "-num_children", &v) || parse_kv_int(argv[i], "--num_children", &v)) {
             if (v >= 1) num_children = v;
         } else if (parse_kv_int(argv[i], "-mmap_alloc_mb", &v) ||
                    parse_kv_int(argv[i], "--mmap_alloc_mb", &v)) {
@@ -111,10 +133,17 @@ int main(int argc, char **argv) {
             char arg_mb[64];
             char arg_dur[64];
             snprintf(arg_mb, sizeof(arg_mb), "-mmap_alloc_mb=%d", mmap_mb);
-            snprintf(arg_dur, sizeof(arg_dur), "-duration=%ld", duration_s);
-            char *av[] = { "/bin/mmap_stress", arg_dur, arg_mb, NULL };
-            execv("/bin/mmap_stress", av);
-            perror("execv /bin/mmap_stress");
+            snprintf(arg_dur, sizeof(arg_dur), "-duration=%lds", (long)duration_s);
+            if (use_forktest_child) {
+                char mt[] = "-mmap_test=true";
+                char *av[] = { "/bin/forktest_child", mt, arg_mb, arg_dur, NULL };
+                execv("/bin/forktest_child", av);
+                perror("execv /bin/forktest_child");
+            } else {
+                char *av[] = { "/bin/mmap_stress", arg_dur, arg_mb, NULL };
+                execv("/bin/mmap_stress", av);
+                perror("execv /bin/mmap_stress");
+            }
             _exit(127);
         }
         close(pipefd[1]);
@@ -133,8 +162,10 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "pattern2_parent: %d x mmap_stress duration=%lds mb=%d (C parent control)\n",
-            num_children, duration_s, mmap_mb);
+            "pattern2_parent: %d x %s duration=%lds mb=%d (C parent)\n",
+            num_children,
+            use_forktest_child ? "forktest_child(Go)" : "mmap_stress(C)",
+            duration_s, mmap_mb);
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);

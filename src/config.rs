@@ -271,6 +271,12 @@ pub const DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN: u64 = 0x10000;
 /// Inclusive maximum user **`ELR_EL1`** for **`[sigsegv-syscall]`**.
 pub const DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX: u64 = 0x20000;
 
+/// When **`true`**, log **`[pattern2-stub]`** / **`[pattern2-sigreturn]`** only when user **`ELR`**
+/// is inside **`DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_*`** (shared Go syscall trampoline window).
+/// Chatty if many **`SIGURG`**s hit the stub — enable only while correlating signal delivery vs
+/// **`rt_sigreturn`** (`docs/GO_FORKTEST_DEBUG.md` Phase D).
+pub const DEBUG_PATTERN2_TRAP_TRACE: bool = false;
+
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
 pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;

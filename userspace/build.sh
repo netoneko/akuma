@@ -147,9 +147,12 @@ if [ "$WITH_FORKTEST" = true ]; then
         cd forktest
         GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_child ./child
         GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o forktest_parent ./parent
+        # Output must not equal the package dir name (./pattern2_minimal is a directory).
+        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o pattern2_minimal.bin ./pattern2_minimal
     )
     cp forktest/forktest_child ../bootstrap/bin/
     cp forktest/forktest_parent ../bootstrap/bin/
+    cp forktest/pattern2_minimal.bin ../bootstrap/bin/pattern2_minimal
     echo "forktest binaries copied to bootstrap/bin/"
 
     # C-only mmap stress control: pure musl static binary, no Go runtime.

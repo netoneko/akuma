@@ -699,22 +699,29 @@ fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
     }
 }
 
-/// Log syscall number (**`x8`**) when SIGSEGV hits the configured syscall-stub VA window.
-fn maybe_print_sigsegv_syscall_diag(elr: u64, frame: &UserTrapFrame) {
+#[inline]
+fn syscall_stub_elr_in_diag_window(elr: u64) -> bool {
+    let min = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN;
+    let max = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX;
+    elr >= min && elr <= max
+}
+
+/// Log syscall number (**`x8`**), **FAR**, **pid/tid** when SIGSEGV hits the configured syscall-stub VA window.
+fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
     if !crate::config::DEBUG_SIGSEGV_SYSCALL_STUB {
         return;
     }
-    let min = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN;
-    let max = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX;
-    if elr < min || elr > max {
+    if !syscall_stub_elr_in_diag_window(elr) {
         return;
     }
     let nr = frame.x8;
     let hint = syscall_nr_pattern2_hint(nr);
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let tid = akuma_exec::threading::current_thread_id();
     crate::tprint!(
-        288,
-        "[sigsegv-syscall] ELR={:#x} x8={} ({}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}\n",
-        elr, nr, hint, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5,
+        384,
+        "[sigsegv-syscall] pid={} tid={} FAR={:#x} ELR={:#x} x8={} ({}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}\n",
+        pid, tid, far, elr, nr, hint, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5,
     );
 }
 
@@ -952,6 +959,20 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     crate::tprint!(256,
         "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
         signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
+
+    if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(frame_ref.elr_el1) {
+        crate::tprint!(
+            192,
+            "[pattern2-stub] deliver sig={} pid={} slot={} fault_pc={:#x} x8={:#x} ({}) sp={:#x}\n",
+            signal,
+            pid,
+            thread_slot,
+            frame_ref.elr_el1,
+            frame_ref.x8,
+            syscall_nr_pattern2_hint(frame_ref.x8),
+            user_sp,
+        );
+    }
 
     // If the handler requires SA_ONSTACK but no sigaltstack is configured for
     // this thread yet (e.g. SIGURG arrives before Go M calls sigaltstack during
@@ -1230,6 +1251,21 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         crate::tprint!(256,
             "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
             (*frame).sp_el0, (*frame).elr_el1, (*frame).spsr_el1, sigframe_sp);
+
+        if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window((*frame).elr_el1) {
+            let rp = akuma_exec::process::read_current_pid().unwrap_or(0);
+            let slot = akuma_exec::threading::current_thread_id();
+            crate::tprint!(
+                224,
+                "[pattern2-sigreturn] pid={} slot={} restored_pc={:#x} x8={:#x} ({}) sigframe_sp={:#x}\n",
+                rp,
+                slot,
+                (*frame).elr_el1,
+                (*frame).x8,
+                syscall_nr_pattern2_hint((*frame).x8),
+                sigframe_sp,
+            );
+        }
 
         // Restore signal mask from uc_sigmask (ucontext+40)
         let uc_sigmask_ptr = (sigframe_sp + SIGFRAME_UCONTEXT + 40) as *const u64;
@@ -2584,7 +2620,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
             {
                 let fr = unsafe { &*frame };
-                maybe_print_sigsegv_syscall_diag(elr, fr);
+                maybe_print_sigsegv_syscall_diag(elr, far, fr);
             }
             if try_deliver_signal(frame, 11, far, true) {
                 return 11; // signal number in x0 for the handler
@@ -2965,7 +3001,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Try delivering SIGSEGV to a registered userspace handler
             {
                 let fr = unsafe { &*frame };
-                maybe_print_sigsegv_syscall_diag(fr.elr_el1, fr);
+                maybe_print_sigsegv_syscall_diag(fr.elr_el1, far, fr);
             }
             if try_deliver_signal(frame, 11, far, true) {
                 return 11;
