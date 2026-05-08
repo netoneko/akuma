@@ -2,13 +2,17 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-05-07, updated 2026-05-08)
+## Current status (2026-05-07, updated 2026-05-08 — interim conclusions below)
 
 **Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
 
 **2026-05-08:** Pure-C **`mmap_stress`** ([`userspace/forktest/c_stress/`](../userspace/forktest/c_stress/)) can run cleanly **standalone**, but **`forktest_parent --use_c_child`** still kills the **Go parent** in **Pattern 2** (`read` / epoll pipe). Serial **`crash14.log`** shows **`mmap`** (**`nr=222`**) from a C child with **`x0 = −22`** (errno-shaped **before** kernel handling)—see [§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08) below. That points to **syscall-entry / trap-frame corruption**, not Go’s allocator alone.
 
 **Kernel instrumentation (2026-05-08):** When **`[EINVAL]` / `[EFAULT]` / `[ENOSYS]`** fire, serial can include **`tid=`**, **`ELR=`**, full **`x0`–`x5`**, and for **`nr=222`** a follow-on **`[mmap-einval]`** line with **`reason=`** and decoded **`flags=`**—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08). Toggle via **`SYSCALL_ERRNO_DIAG_EXTRA`** in [`src/config.rs`](../src/config.rs). Regression tests: **`mmap_fixed_addr_unaligned_einval_helper`**, **`mmap_einval_through_handle_syscall`** in [`src/tests.rs`](../src/tests.rs).
+
+**Pipe `read` tracing (2026-05-08):** With **`SYSCALL_DEBUG_PIPE_READ`** (and optional **`SYSCALL_DEBUG_PIPE_READ_SAMPLE`**) in [`src/config.rs`](../src/config.rs), serial emits **`[pipe-read] enter`** / **`EFAULT`** lines from [`src/syscall/fs.rs`](../src/syscall/fs.rs) for **`PipeRead`** FDs—correlate with **`fault_pc≈0x13060`** via **`tprint`** timestamps. [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh) greps **`[pipe-read]`** alongside mmap / fault markers.
+
+Synthesis of evidence so far: [§ Interim conclusions](#interim-conclusions-2026-05-08). **Continuing work:** [§ Agent handoff](#agent-handoff-2026-05-08).
 
 This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** / **`0x10`** in the Go allocator, treat it as the **heap + demand paging + signal / syscall-frame** investigation described below.
 
@@ -22,7 +26,41 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 | **`[EINVAL] nr=222`** (`mmap`), **`args[0]`** = **`0xffffffffffffffea`** (−22) | Same **errno-as-GPR** family as xattr/`clock_gettime`; extended lines show **`reason=`** (`len==0`, **`fixed+unaligned`**, **`kernel_va`**, **`other`**)—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08) | **`crash14.log`**, §E; [`src/syscall/mod.rs`](../src/syscall/mod.rs); **`mmap_fixed_addr_unaligned_einval`** in [`src/syscall/mem.rs`](../src/syscall/mem.rs) |
 | SSH **disconnect** after commands finish | Often **client / router idle timeout**; confirm with serial still running | Not proven guest deadlock from **`crash5.log`** alone |
 
-**Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)).
+**Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)). **`asyncpreemptoff=1` alone does not reliably prevent Pattern 2**—see [§ Interim conclusions](#interim-conclusions-2026-05-08).
+
+## Interim conclusions (2026-05-08)
+
+These are **working hypotheses** from serial + SSH captures (**`crash16.log`**, **`crash14`**, same-session repros), not a closed root cause.
+
+### 1. `GODEBUG=asyncpreemptoff=1` is necessary context, not a fix
+
+In one session, **`forktest_parent --use_c_child …`** completed cleanly (**deadline SIGTERM**, children graceful, parent exited **0**), then a **second run** in the **same shell** (**`GODEBUG` still set**) **SIGSEGV**’d again (**`PC≈0x13060`**, **`read`** on a pipe FD). So **async goroutine preemption via `SIGURG` is not the only prerequisite** for Pattern 2; disabling it **reduces** urgency-signal traffic but **does not prove** the bug away. This aligns with the older finding that **`GOMAXPROCS=1` does not save the parent**.
+
+### 2. Parent SIGSEGV: fault address vs `read` buffer
+
+User registers at crash often show **`read(fd, buf, 0x400)`** with **`buf ≈ 0x1e0087708`**, while Go reports **`addr`** / **`fault`** around **`0x129a1000`**, **`0x1343f000`**, **`0x13d96000`**—**not** inside **`[buf, buf+0x400)`**. That **does not match** a naïve story “kernel **`copy_to_user`** faulted on the first byte of the pipe-read buffer.” It fits better **wrong effective address for some access while `PC` is still in the syscall/read trampoline** (e.g. **corrupted GPRs**) or **fault metadata** that does not map one-to-one to the **`copy_to_user`** range—still consistent with **syscall-entry / return / signal-frame** bugs rather than only “pipe implementation wrong.”
+
+### 3. `SIGURG` at the same PC as `SIGSEGV` (serial **`crash16`**)
+
+**`crash16.log`** shows **`SIGURG` (`sig=23`)** delivered to the parent thread with **`fault_pc=0x13060`** **before** the fatal **`SIGSEGV` (`sig=11`)** at the **same `fault_pc`**. That strengthened suspicion of **signal + syscall interaction**, but **§1** shows **`asyncpreemptoff`** does **not** eliminate the crash—so treat **`SIGURG`** as **correlated**, not **sufficiently causal** by itself.
+
+### 4. Children: `mmap` **`[EINVAL]`** lines and **`[mmap-einval]`**
+
+Extended logging shows **`nr=222`** with **`x1=0`** (**`len==0`**), **`x0`** sometimes a **prior mmap base** (e.g. **`0x10420000`**) or errno-shaped (**`0xffffffffffffffea`**), and **`prot` / `flags`** fields that are **not plausible Linux `mmap` arguments**. **`reason=len==0`** is accurate for the **`EINVAL`** return path; the **`flags=(FIXED|…)`** **decode can be meaningless** when **`x2`/`x3` are garbage**—do not read **`FIXED`** from the string alone. This supports **GPR corruption or reordering at SVC** under mmap load, independent of Go in the child.
+
+### 5. Kernel implementation notes (landed in tree)
+
+- **`sys_mmap`:** **`MAP_FIXED` / `MAP_FIXED_NOREPLACE`** **unaligned `addr` → `EINVAL`** is evaluated **before** **`lookup_process`** so **`handle_syscall`** from kernel-only tests and early rejects match **`EINVAL`**, not **`ESRCH`** (memory-test **`mmap_einval_through_handle_syscall`**).
+- **Diagnostics:** **`SYSCALL_ERRNO_DIAG_EXTRA`**, **`SYSCALL_DEBUG_PIPE_READ`**, [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh).
+
+### 6. Next narrowing steps
+
+| Step | Purpose |
+|------|---------|
+| Serial **`grep`** **`[pipe-read]`** + **`fault_pc=0x13060`** + **`sig=11`** | See last **`buf=`** before crash; check for **`EFAULT copy_to_user`** vs fault without EFAULT. |
+| **`--num_children=1`** | Reduce cross-process contention; if parent stabilizes, suspect **scheduler / concurrent mmap / FD** pressure. |
+| Fresh process **vs** second run in same shell | Check for **accumulated kernel or libc state** (informal; serial **`pid=`** / **`pipe=`** ids still help). |
+| **`[pipe-read]`** + **`[EINVAL] nr=222`** ordering | If syscall-arg garbage **clusters before** parent **`sig=11`**, prioritize **global trap / per-thread syscall state** audits over pipe-only fixes. |
 
 ## Isolation matrix (2026-04-14)
 
@@ -347,6 +385,8 @@ When a syscall returns **`EFAULT`**, **`ENOSYS`**, or **`EINVAL`**, the kernel m
 
 **Trap ELR source:** [`current_trap_frame_elr()`](../crates/akuma-exec/src/threading/mod.rs) reads the pointer saved by **`set_current_trap_frame`** in the EL0 sync handler ([`src/exceptions.rs`](../src/exceptions.rs)).
 
+**Pipe `read` (Pattern 2 parent):** unrelated tag **`[pipe-read]`** — gated by **`SYSCALL_DEBUG_PIPE_READ`** in [`src/config.rs`](../src/config.rs); see [§ Interim conclusions](#interim-conclusions-2026-05-08) for how **`buf=`** vs Go **`fault`** compares.
+
 ### Kernel audit: owner PID and lazy regions (read-path checklist)
 
 Code review (no behavioral change required for this appendix):
@@ -468,3 +508,61 @@ Heavy **`forktest`** also produced **`[DA-DP] … anon alloc failed, 0 free page
 **Regression coverage:** In-kernel tests **`mmap_fixed_addr_unaligned_einval_helper`** and **`mmap_einval_through_handle_syscall`** ([`src/tests.rs`](../src/tests.rs)) pin the **`MAP_FIXED` + unaligned `addr` → EINVAL** path and the **`len==0`** path so **`mmap_fixed_addr_unaligned_einval`** in [`src/syscall/mem.rs`](../src/syscall/mem.rs) cannot drift from **`sys_mmap`** without CI catching it.
 
 **Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection; reduce contention with **`--num_children=1`** when isolating parent vs child behavior.
+
+## Agent handoff (2026-05-08)
+
+Use this section to pick up **`forktest_parent`** + **`--use_c_child`** + **`-mmap_test`** investigation without re-reading the whole thread. **Root cause is not closed.**
+
+### Scope
+
+- **Parent:** Go binary **`forktest_parent`** ([`userspace/forktest/parent/main.go`](../userspace/forktest/parent/main.go)) — **epoll loop**, **`read`** on pipe FDs, **`EpollCtl`** `EPOLL_CTL_MOD` re-arm ([`main.go`](../userspace/forktest/parent/main.go) ~238–245).
+- **Children:** **`/bin/mmap_stress`** (pure C, musl) — heavy **`mmap` / memset / munmap** ([`userspace/forktest/c_stress/`](../userspace/forktest/c_stress/)).
+- **Failure:** intermittent **Pattern 2**-style death: **`SIGSEGV`**, userspace reports **`PC≈0x13060`**, fault addresses in **`~0x13……`** / **`~0x129……`** range (not obviously the pipe **`read`** buffer pointer **`~0x1e008……`**).
+
+### Established conclusions (do not re-litigate without new evidence)
+
+1. **`PC=0x13060` is not specific to `read`.** In static **`forktest_parent`**, it is the shared **AArch64 syscall trampoline** (`internal/runtime/syscall/asm_linux_arm64.s` → **`Syscall6`**). Crashes have been attributed in Go stacks to **`unix.Read`**, **`unix.EpollCtl`**, etc.—**the same `PC`** appears for **different syscalls**. **Inferring “pipe read bug only” from `PC` is wrong.**
+
+2. **`crash17.log` (serial + same-session SSH)** — two **`forktest_parent` runs in one boot log:
+   - **Run A (`pid=90`, ~`T22`):** Last **`[pipe-read] enter`** with **`fd=4`**, **`buf=0x1e0087708`**, **`cnt=1024`**; **immediately after**, **`tkill(tid=8, sig=23)`** (`SIGURG`); then **`deliver sig=11`**, **`fault_pc=0x13060`**. No **`[pipe-read] EFAULT`** (validate or **`copy_to_user`**) before death.
+   - **Run B (`pid=97`, ~`T92`):** Dense **`[pipe-read] enter`** storm; **no** adjacent **`tkill(sig=23)`** line before **`sig=11`** in the captured window; **same** **`fault_pc=0x13060`**, **`slot=8`**. SSH traceback for run B showed **`EpollCtl`** at **`main.go:243`** (re-arm), not **`Read`**—consistent with **§1**.
+
+3. **Fault address vs buffer.** Go **`fault` / `addr`** (e.g. **`0x1343f000`**, **`0x13a53000`**) has **not** been shown to lie in **`[buf, buf+count)`** for the **`read`** shown in registers (**`buf≈0x1e0087708`**, **`count=0x400`**). Do **not** assume a trivial **`copy_to_user`**-to-pipe-buffer failure without kernel **`FAR`** / **`copy_to_user`** path proof.
+
+4. **`GODEBUG=asyncpreemptoff=1`** — In at least one session, **first** forktest run **succeeded**, **second** run in the **same shell** still **crashed**. **`asyncpreemptoff`** is **not** a reliable fix. Treat **`SIGURG`** as **sometimes correlated** (see run A), **not** always present (run B) and **not** proven sole cause.
+
+5. **Children / `mmap`:** Serial **`[EINVAL] nr=222`** with **`x1=0`**, errno-shaped or mmap-base-shaped **`x0`**, garbage **`prot`/`flags`** → **`reason=len==0`** is real; **decoded `flags=(FIXED|…)` text may be meaningless** when registers are garbage. Supports **SVC entry / GPR corruption** under load, **not** “musl called `mmap` wrong” in source.
+
+### Already in tree (landed before next agent)
+
+| Item | Location |
+|------|----------|
+| Extended errno lines (`tid`, `ELR`, full args; **`[mmap-einval]`**) | [`src/syscall/mod.rs`](../src/syscall/mod.rs), **`SYSCALL_ERRNO_DIAG_EXTRA`** in [`src/config.rs`](../src/config.rs) |
+| **`[pipe-read]`** tracing | [`src/syscall/fs.rs`](../src/syscall/fs.rs), **`SYSCALL_DEBUG_PIPE_READ`**, **`SYSCALL_DEBUG_PIPE_READ_SAMPLE`** in [`src/config.rs`](../src/config.rs) |
+| **`mmap`** unaligned fixed **`EINVAL`** before **`lookup_process`** | [`src/syscall/mem.rs`](../src/syscall/mem.rs) |
+| Regression tests | [`src/tests.rs`](../src/tests.rs): **`mmap_fixed_addr_unaligned_einval_helper`**, **`mmap_einval_through_handle_syscall`** |
+| **`current_trap_frame_elr()`** | [`crates/akuma-exec/src/threading/mod.rs`](../crates/akuma-exec/src/threading/mod.rs) |
+| Log grep helper | [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh) |
+
+### Open hypotheses (priority order)
+
+1. **Trap frame / syscall return / `rt_sigreturn`** loses or swaps GPRs across **nested signals** (`SIGURG`, **`SIGSEGV`**) or across **scheduler / syscall** boundaries.
+2. **`copy_from_user`** / **`copy_to_user`** interaction with **lazy mappings** or **wrong ASID / TTBR / owner PID** for **`CLONE_VM`**-adjacent bugs — less ruled out than once thought after **`tgid`** fixes, still worth verifying on **parent** path.
+3. **Epoll + pipe** interaction bugs — **secondary** until **`x8`** (syscall nr) at fault is proven; **`read`** and **`epoll_ctl`** share **`PC`**.
+
+### Recommended next steps (for the next agent)
+
+1. **Log syscall number at fault:** On **`SIGSEGV`** delivery or EL0 fault when **`ELR≈0x13060`**, print **`x8`** and a short name (**`63`**=`read`, **`21`**=`epoll_ctl` on Linux aarch64—verify constants in-tree). Removes ambiguity between **`read`** vs **`EpollCtl`**.
+2. **If `x8=21`:** Audit **[`sys_epoll_ctl`](../src/syscall/poll.rs)** (`copy_from_user` for **`epoll_event`**, **`validate_user_ptr`**).
+3. **If `x8=63`:** Trace **[`sys_read`](../src/syscall/fs.rs)** **`PipeRead`** path end-to-end; confirm whether **`copy_to_user`** can return **`EFAULT`** without logging (already logs when **`SYSCALL_DEBUG_PIPE_READ`** on).
+4. **A/B:** **`GODEBUG=asyncpreemptoff=1`** vs off — tabulate **`tkill(sig=23)`** vs crash.
+5. **Load bisection:** **`--num_children=1`**, **`-mmap_alloc_mb=10`** vs **70**.
+6. **Control experiment:** minimal **C parent** (pipes + **`epoll_pwait`** + **`read`** + **`epoll_ctl`**) + same **`mmap_stress`** children — if stable, shift focus to **Go runtime**; if not, **kernel**.
+
+### Key kernel files
+
+[`src/exceptions.rs`](../src/exceptions.rs) (`rust_sync_el0_handler`, **`try_deliver_signal`**, **`do_rt_sigreturn`**) · [`src/syscall/fs.rs`](../src/syscall/fs.rs) · [`src/syscall/poll.rs`](../src/syscall/poll.rs) · [`src/syscall/pipe.rs`](../src/syscall/pipe.rs) · [`src/syscall/mod.rs`](../src/syscall/mod.rs)
+
+### Reference captures
+
+**`crash16.log`**, **`crash17.log`** (repo or local paths as provided by the user), **`crash14`** / **`crash5`** discussed above—grep patterns in [Serial capture and grep](#serial-capture-and-grep) and **`analyze_kernel_log.sh`**.
