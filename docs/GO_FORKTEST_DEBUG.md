@@ -4,6 +4,8 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 ## Current status (2026-05-07, updated 2026-05-08 — interim conclusions below)
 
+**Quadrant experiments (`crash21.log`, 2026-05-08):** Serial capture across **Go/C parent × Go/C child** combinations — see [§ Quadrant matrix + crash21](#quadrant-matrix--crash21log-2026-05-08). **`pattern2_parent -child=forktest`** drives **`forktest_child`** from a **C** epoll parent; **one** Go child tends to complete cleanly; **two** Go children reliably stress **`forktest_child`** (**`memclr` / errno-shaped FAR**) while **`pattern2_parent` stays `exit_group code=0`**.
+
 **Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
 
 **2026-05-08 (session `crash19.log`):** One serial capture ties together **SSH + kernel**: with **`GODEBUG=asyncpreemptoff=1`**, the Go parent dies in **`EpollCtl`** (**syscall nr `0x15` = `epoll_ctl`**); with **`GODEBUG` unset**, stacks show **`unix.Read`** (**`0x3f` = `read`**). **`pattern2_parent`** ([`userspace/forktest/c_stress/pattern2_parent.c`](../userspace/forktest/c_stress/pattern2_parent.c)) — minimal **C** parent with the same epoll/pipe/**`mmap_stress`** shape — **`exit_group code=0`** for **1** and **3** children @ **70 MiB**, while **`forktest_parent`** in the same log exits **`code=2`** four times with **`deliver sig=11`**, **`fault_pc=0x13060`**. That **isolates the crash to the Go parent path** (runtime / signal / trampoline interaction), not “epoll or pipe broken for every userspace caller.” Full tables: [§ crash19.log](#crash19log--pattern2_parent-session-2026-05-08).
@@ -110,6 +112,42 @@ Approximate **`[pipe-read] enter`** counts: **`forktest_parent`** pid **109** **
 3. **Shrink the repro in Go:** Minimal static binary: **epoll + pipe `read` + `epoll_ctl` MOD** only (no **`forktest_parent`** extras) to bisect runtime surface area.
 4. **Keep child `mmap` `[EINVAL]` on the parallel track:** Still audit **SVC / GPR** under load ([§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08)), but treat it as **orthogonal noise** until it correlates with parent death in time/pid order.
 5. **Scripts:** [`scripts/forktest_pattern2_bisect.sh`](../scripts/forktest_pattern2_bisect.sh) for bisection commands; rebuild **`pattern2_parent`** via **`userspace/build.sh --with-forktest`**.
+
+## Quadrant matrix + crash21.log (2026-05-08)
+
+Single boot, serial **`crash21.log`** (~32k lines): mixed **`forktest_parent`**, **`pattern2_parent`** (C parent + **`mmap_stress`** or **`forktest_child`** via **`-child=forktest`**), and **`exit_group`** outcomes. Mine with [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh) / [`scripts/correlate_forktest_mmap_sig11.sh`](../scripts/correlate_forktest_mmap_sig11.sh).
+
+### Parent × child stress (four quadrants)
+
+| Quadrant | Parent | Children | Serial assessment (`crash21.log`) |
+|----------|--------|----------|---------------------------|
+| **Q1** | Go **`forktest_parent`** | C **`mmap_stress`** (`--use_c_child`) | **Mixed:** **`forktest_parent`** **`exit_group code=2`** (e.g. pid **90**, **111**) and **`code=0`** (e.g. **97**, **104**). **`mmap_stress`** exits logged **`code=0`**. Matches **Pattern 2** in the **Go parent** — intermittent. |
+| **Q2** | C **`pattern2_parent`** | C **`mmap_stress`** (default) | **Stable:** **`pattern2_parent`** **`code=0`**; **`mmap_stress`** **`code=0`** (several 3-child runs @ **70 MiB**). Baseline: epoll/pipe + mmap storm **without Go**. |
+| **Q3** | C **`pattern2_parent`** | Go **`forktest_child`** (**`-child=forktest`**) | **Parent always `code=0`.** **`forktest_child`** sometimes **`code=2`** under multi-child + **70 MiB** (failed **`runMmapStress`** / **`memclr`**); **`code=0`** on other runs. Failure is **child-side**, not C epoll. **One** Go child often completes; **two** children reliably reproduce **`forktest_child`** faults in interactive testing — aligns with **`exit_group`** **`forktest_child`** **`code=2`** while parent **`pattern2_parent`** still **`code=0`**. |
+| **Q4** | Go **`forktest_parent`** | Go **`forktest_child`** (default) | **Not clearly separated** in this serial file (no distinct **`execve(forktest_parent)`** + **`forktest_child`** window vs Q1 — prioritize a dedicated capture with **`tee`**). Required to compare **Pattern 2 parent** vs **child malloc** in one controlled session. |
+
+### Kernel sequence (Q3 / errno-shaped FAR)
+
+On a failing **`forktest_child`** (e.g. **pid 172**), serial shows **`[EINVAL] nr=113`** (**`clock_gettime`**) with **implausible `args=`** and **`ELR≈0x86768`** (**`memclr`**), then **`[DA-MISS]`** / **`[WILD-DA]`** with **`FAR=0xfffffffffffffffa`** (**signed −6**), **`x0=0xffffffffffffffea`** (**−22 `EINVAL`** sign-extended) — same **errno-as-pointer / timespec** family as [crash4 / table](#what-you-see) (**`unexpected fault address 0xfffffffffffffffa`**). **`pattern2_parent`** continues (**`[pipe-read]`** on parent **pid 171**) — the crash is **not** the C parent’s syscall trampoline.
+
+### Practical commands (Q3)
+
+```bash
+# C parent, one Go child (often clean @ 70 MiB / 10 s)
+/bin/pattern2_parent -child=forktest -num_children=1 -duration=10s -mmap_alloc_mb=70
+
+# C parent, two Go children (stress — child faults common)
+/bin/pattern2_parent -child=forktest -num_children=2 -duration=10s -mmap_alloc_mb=70
+```
+
+Rebuild **`pattern2_parent`** / disk after changing [`pattern2_parent.c`](../userspace/forktest/c_stress/pattern2_parent.c): **`userspace/build.sh --with-forktest`**.
+
+### Next steps (from this matrix)
+
+1. **Capture Q4** explicitly: **`forktest_parent`** without **`--use_c_child`**, same **`-mmap_test`** / **`-mmap_alloc_mb`**, **`tee`** serial — compare **`[sigsegv-syscall]`** / parent **`sig=11`** vs child **`WILD-DA`** ordering.
+2. **Q3 bisection:** **`pattern2_parent -child=forktest -num_children=2`** with **`-mmap_alloc_mb=10`** vs **70** to locate a pressure threshold.
+3. **Q3 control:** **`pattern2_parent`** (default **`mmap_stress`**) **`-num_children=2`** @ **70 MiB** — if stable, isolates **Go runtime + syscalls** vs raw mmap traffic.
+4. **Kernel audit:** **`nr=113`** path + trap-frame **`args=`** when **`ELR`** points at **allocator** PC — [`src/syscall/mod.rs`](../src/syscall/mod.rs), [`src/exceptions.rs`](../src/exceptions.rs).
 
 ## Isolation matrix (2026-04-14)
 
