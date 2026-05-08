@@ -1878,6 +1878,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                             }
                         }
+                        // handle_syscall was not invoked; do not clear CURRENT_SYSCALL_NR /
+                        // proc.current_syscall here — those are global/per-process and another
+                        // thread may be inside handle_syscall (crash7 WILD-DA last_sc=!0 is OK).
                         return frame_ref.x0;
                     }
                     crate::safe_print!(128, "[JIT] giving up after {} retries, nr={}\n",
