@@ -177,6 +177,10 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
     }
 }
 
+/// Forktest Pattern 2: Go reports crashes at **`PC≈0x13060`** for both **`read`** and **`epoll_ctl`**
+/// (shared syscall trampoline). **`[sigsegv-syscall]`** serial (`src/exceptions.rs`) keys off **`x8`**.
+/// This path validates **`event_ptr`** and uses **`copy_from_user_safe`** for the 16-byte
+/// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
 pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,

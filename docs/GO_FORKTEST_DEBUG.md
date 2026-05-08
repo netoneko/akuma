@@ -6,6 +6,8 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 **Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
 
+**2026-05-08 (session `crash19.log`):** One serial capture ties together **SSH + kernel**: with **`GODEBUG=asyncpreemptoff=1`**, the Go parent dies in **`EpollCtl`** (**syscall nr `0x15` = `epoll_ctl`**); with **`GODEBUG` unset**, stacks show **`unix.Read`** (**`0x3f` = `read`**). **`pattern2_parent`** ([`userspace/forktest/c_stress/pattern2_parent.c`](../userspace/forktest/c_stress/pattern2_parent.c)) — minimal **C** parent with the same epoll/pipe/**`mmap_stress`** shape — **`exit_group code=0`** for **1** and **3** children @ **70 MiB**, while **`forktest_parent`** in the same log exits **`code=2`** four times with **`deliver sig=11`**, **`fault_pc=0x13060`**. That **isolates the crash to the Go parent path** (runtime / signal / trampoline interaction), not “epoll or pipe broken for every userspace caller.” Full tables: [§ crash19.log](#crash19log--pattern2_parent-session-2026-05-08).
+
 **2026-05-08:** Pure-C **`mmap_stress`** ([`userspace/forktest/c_stress/`](../userspace/forktest/c_stress/)) can run cleanly **standalone**, but **`forktest_parent --use_c_child`** still kills the **Go parent** in **Pattern 2** (`read` / epoll pipe). Serial **`crash14.log`** shows **`mmap`** (**`nr=222`**) from a C child with **`x0 = −22`** (errno-shaped **before** kernel handling)—see [§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08) below. That points to **syscall-entry / trap-frame corruption**, not Go’s allocator alone.
 
 **Kernel instrumentation (2026-05-08):** When **`[EINVAL]` / `[EFAULT]` / `[ENOSYS]`** fire, serial can include **`tid=`**, **`ELR=`**, full **`x0`–`x5`**, and for **`nr=222`** a follow-on **`[mmap-einval]`** line with **`reason=`** and decoded **`flags=`**—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08). Toggle via **`SYSCALL_ERRNO_DIAG_EXTRA`** in [`src/config.rs`](../src/config.rs). Regression tests: **`mmap_fixed_addr_unaligned_einval_helper`**, **`mmap_einval_through_handle_syscall`** in [`src/tests.rs`](../src/tests.rs).
@@ -24,6 +26,7 @@ This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input
 | **`unexpected fault address 0xffffffffffffffb0`**, `fatal error: fault` in `memclr` | Same **`pc≈0x86768`** family; often at **50–70 MiB** `-mmap_alloc_mb` | [Empirical threshold](#empirical-allocation-threshold-2026-04-14-session) |
 | `[JIT] IC flush + replay … bogus nr=…` near fault | Stale / corrupted syscall dispatch state around SVC replay | [`src/exceptions.rs`](../src/exceptions.rs), `FIX_MEMORY_MAPPING.md`, `EPOLL_PERFORMANCE.md` |
 | **`[EINVAL] nr=222`** (`mmap`), **`args[0]`** = **`0xffffffffffffffea`** (−22) | Same **errno-as-GPR** family as xattr/`clock_gettime`; extended lines show **`reason=`** (`len==0`, **`fixed+unaligned`**, **`kernel_va`**, **`other`**)—see [Serial errno diagnostics](#serial-errno-diagnostics-2026-05-08) | **`crash14.log`**, §E; [`src/syscall/mod.rs`](../src/syscall/mod.rs); **`mmap_fixed_addr_unaligned_einval`** in [`src/syscall/mem.rs`](../src/syscall/mem.rs) |
+| **`pattern2_parent`** exits **0**, **`forktest_parent`** exits **2** (same **`mmap_stress`** stress) | C parent control completes; Go parent still Pattern 2 — focus **Go runtime + signals**, not pipe/epoll alone | [crash19 session](#crash19log--pattern2_parent-session-2026-05-08), [`pattern2_parent.c`](../userspace/forktest/c_stress/pattern2_parent.c) |
 | SSH **disconnect** after commands finish | Often **client / router idle timeout**; confirm with serial still running | Not proven guest deadlock from **`crash5.log`** alone |
 
 **Mitigations while debugging:** ample RAM (`MEMORY=2048M` or higher), `GODEBUG=asyncpreemptoff=1`, or avoid **`-mmap_test`**, **`-combined_stress`**, and **`-file_io`** until fixed. **`GOMAXPROCS=1` does not prevent** the **parent** `read()` SIGSEGV when **`-mmap_test`** is enabled ([Isolation matrix](#isolation-matrix-2026-04-14)). **`asyncpreemptoff=1` alone does not reliably prevent Pattern 2**—see [§ Interim conclusions](#interim-conclusions-2026-05-08).
@@ -61,6 +64,52 @@ Extended logging shows **`nr=222`** with **`x1=0`** (**`len==0`**), **`x0`** som
 | **`--num_children=1`** | Reduce cross-process contention; if parent stabilizes, suspect **scheduler / concurrent mmap / FD** pressure. |
 | Fresh process **vs** second run in same shell | Check for **accumulated kernel or libc state** (informal; serial **`pid=`** / **`pipe=`** ids still help). |
 | **`[pipe-read]`** + **`[EINVAL] nr=222`** ordering | If syscall-arg garbage **clusters before** parent **`sig=11`**, prioritize **global trap / per-thread syscall state** audits over pipe-only fixes. |
+
+## crash19.log + pattern2_parent session (2026-05-08)
+
+Single boot, serial **`crash19.log`** (~7853 lines) + SSH transcript: **`forktest_parent --use_c_child`** (**`-mmap_test`**, **70 MiB**) and **`pattern2_parent`** (**same child stress**). Grep volume for the bundled regex ([`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh)): **~1588** matching lines.
+
+### SSH: syscall number (`x8`) vs `GODEBUG`
+
+Go prints the syscall number as the **first** argument to **`Syscall` / `Syscall6`**.
+
+| `GODEBUG` | First arg (hex) | nr | Userspace stack |
+|-----------|-------------------|-----|-----------------|
+| **`asyncpreemptoff=1`** | **`0x15`** | **21** (`epoll_ctl`) | **`EpollCtl`** `main.go:243` |
+| **unset** | **`0x3f`** | **63** (`read`) | **`unix.Read`** `main.go:209` |
+
+So **`PC≈0x13060`** stays the **shared trampoline**; **`asyncpreemptoff`** changes **which syscall is live** when the fault surfaces—not proof of two unrelated bugs.
+
+### Kernel / serial outcomes
+
+| Binary | **`exit_group`** | Code |
+|--------|------------------|------|
+| **`forktest_parent`** | **4×** (pid **90, 97, 102, 109**) | **`2`** |
+| **`pattern2_parent`** | **2×** (pid **116, 118**) | **`0`** |
+
+**`deliver sig=11`** with **`fault_pc=0x13060`**: **4** lines (**`T22`**, **`T49`**, **`T84`**, **`T111`**) — all **`forktest_parent`** pids. **None** in the **`pattern2_parent`** windows (**~`T396–407`**, **`~T433–444`**).
+
+### `[pipe-read]` churn
+
+Approximate **`[pipe-read] enter`** counts: **`forktest_parent`** pid **109** **~1263** vs **`pattern2_parent`** pid **116** **~36** / pid **118** **~23**. Buffer pointers: Go **`buf≈0x1e0087708`**; musl **`buf≈0x201ffffa00`**. No **`[pipe-read] EFAULT`** on runtime pids immediately before **`sig=11`** in this capture.
+
+### Children **`mmap` `[EINVAL]`**
+
+**`[EINVAL] nr=222`** with **`x1=0`**, **`reason=len==0`**, garbage **`prot`/`flags`** decode appears for **`mmap_stress`** during **both** Go-parent and C-parent runs — **does not** predict parent **`sig=11`**.
+
+### What did *not* show up in **`crash19.log`**
+
+- **`[DA-MISS]` / `[WILD-DA]` / `[WILD-IA]`**: **no** lines with those tags (this failure mode is **not** exposing as logged demand-page wild faults here).
+- **`[JIT]` bogus nr`**: **none**.
+- **`[sigsegv-syscall]`**: **none** (instrumentation may be absent in the kernel binary used for this capture).
+
+### Proposed next steps (after this session)
+
+1. **Confirm `x8` on serial:** Run a kernel build that prints **`[sigsegv-syscall]`** ([`src/config.rs`](../src/config.rs) **`DEBUG_SIGSEGV_SYSCALL_STUB`**) and verify it matches SSH (**21** vs **63**) on crash.
+2. **Prioritize Go + trap path:** With **`pattern2_parent`** stable, focus on **`SIGURG`** delivery / **`rt_sigreturn`** / nested signals while **`ELR≈0x13060`**, and on **why** Go’s heap-range **`fault`** addresses appear during syscalls (**[`src/exceptions.rs`](../src/exceptions.rs)**, Go signal handler **`0x86ee0`**).
+3. **Shrink the repro in Go:** Minimal static binary: **epoll + pipe `read` + `epoll_ctl` MOD** only (no **`forktest_parent`** extras) to bisect runtime surface area.
+4. **Keep child `mmap` `[EINVAL]` on the parallel track:** Still audit **SVC / GPR** under load ([§E](#e-pure-c-mmap_stress--crash14-serial-2026-05-08)), but treat it as **orthogonal noise** until it correlates with parent death in time/pid order.
+5. **Scripts:** [`scripts/forktest_pattern2_bisect.sh`](../scripts/forktest_pattern2_bisect.sh) for bisection commands; rebuild **`pattern2_parent`** via **`userspace/build.sh --with-forktest`**.
 
 ## Isolation matrix (2026-04-14)
 
@@ -552,12 +601,15 @@ Use this section to pick up **`forktest_parent`** + **`--use_c_child`** + **`-mm
 
 ### Recommended next steps (for the next agent)
 
-1. **Log syscall number at fault:** On **`SIGSEGV`** delivery or EL0 fault when **`ELR≈0x13060`**, print **`x8`** and a short name (**`63`**=`read`, **`21`**=`epoll_ctl` on Linux aarch64—verify constants in-tree). Removes ambiguity between **`read`** vs **`EpollCtl`**.
+1. ~~**Log syscall number at fault:**~~ **Done in-tree** (`[sigsegv-syscall]`, [`src/exceptions.rs`](../src/exceptions.rs); **`DEBUG_SIGSEGV_SYSCALL_STUB`** in [`src/config.rs`](../src/config.rs)). **Also observable from SSH:** first arg to **`Syscall6`** / **`Syscall`** (**`crash19`** session: **`asyncpreemptoff`** → **`epoll_ctl`** (**`0x15`**); default → **`read`** (**`0x3f`**)).
 2. **If `x8=21`:** Audit **[`sys_epoll_ctl`](../src/syscall/poll.rs)** (`copy_from_user` for **`epoll_event`**, **`validate_user_ptr`**).
 3. **If `x8=63`:** Trace **[`sys_read`](../src/syscall/fs.rs)** **`PipeRead`** path end-to-end; confirm whether **`copy_to_user`** can return **`EFAULT`** without logging (already logs when **`SYSCALL_DEBUG_PIPE_READ`** on).
-4. **A/B:** **`GODEBUG=asyncpreemptoff=1`** vs off — tabulate **`tkill(sig=23)`** vs crash.
-5. **Load bisection:** **`--num_children=1`**, **`-mmap_alloc_mb=10`** vs **70**.
-6. **Control experiment:** minimal **C parent** (pipes + **`epoll_pwait`** + **`read`** + **`epoll_ctl`**) + same **`mmap_stress`** children — if stable, shift focus to **Go runtime**; if not, **kernel**.
+4. ~~**A/B:** **`GODEBUG=asyncpreemptoff=1`** vs off~~ — **done** in **`crash19`** SSH + serial (**`SIGURG`** / **`sig=23`** clustering before last **`forktest_parent`** death **`T108–111`**).
+5. ~~**Load bisection:** **`--num_children=1`**, **`-mmap_alloc_mb=10`** vs **70**.~~ Partially covered in session (multiple **`forktest_parent`** runs); keep for flaky repros.
+6. ~~**Control experiment:** minimal **C parent**~~ — **`pattern2_parent`** ([`userspace/forktest/c_stress/pattern2_parent.c`](../userspace/forktest/c_stress/pattern2_parent.c)) **stable** @ **1** and **3** children in **`crash19`** → **shift focus to Go parent runtime + kernel signal/trap interaction**, not pipe/epoll correctness alone.
+7. **Next:** Confirm **`[sigsegv-syscall]`** on serial; minimal **Go** repro (epoll loop only); deep dive **`try_deliver_signal`** / **`do_rt_sigreturn`** when **`SIGURG`** overlaps trampoline (**[`src/exceptions.rs`](../src/exceptions.rs)**); optional audit **TTBR / ASID** for parent thread vs **`mmap_stress`** children under pressure.
+
+See [crash19.log + pattern2_parent session](#crash19log--pattern2_parent-session-2026-05-08) for evidence tables.
 
 ### Key kernel files
 
@@ -565,4 +617,4 @@ Use this section to pick up **`forktest_parent`** + **`--use_c_child`** + **`-mm
 
 ### Reference captures
 
-**`crash16.log`**, **`crash17.log`** (repo or local paths as provided by the user), **`crash14`** / **`crash5`** discussed above—grep patterns in [Serial capture and grep](#serial-capture-and-grep) and **`analyze_kernel_log.sh`**.
+**`crash16.log`**, **`crash17.log`**, **`crash19.log`** (SSH + **`pattern2_parent`** control + **`x8`** evidence), **`crash14`** / **`crash5`** — grep patterns in [Serial capture and grep](#serial-capture-and-grep) and **`analyze_kernel_log.sh`**.

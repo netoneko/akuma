@@ -257,6 +257,20 @@ pub const SYSCALL_DEBUG_PIPE_READ: bool = true;
 /// Ignored when **`SYSCALL_DEBUG_PIPE_READ`** is **`false`**.
 pub const SYSCALL_DEBUG_PIPE_READ_SAMPLE: u64 = 1;
 
+/// When **`true`**, a fatal SIGSEGV whose **`ELR_EL1`** falls in the inclusive range
+/// **`DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN`..=`DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX`**
+/// logs **`[sigsegv-syscall]`** with **`x8`** (syscall number) and **`x0`–`x5`** — disambiguates
+/// **`read`** vs **`epoll_ctl`** vs other syscalls when Go reports **`PC≈0x13060`** (shared syscall
+/// trampoline). See **`docs/GO_FORKTEST_DEBUG.md`** (Pattern 2, Agent handoff).
+pub const DEBUG_SIGSEGV_SYSCALL_STUB: bool = true;
+
+/// Inclusive minimum user **`ELR_EL1`** for **`[sigsegv-syscall]`** (static **`forktest_parent`**
+/// trampoline ~**`0x13060`**; widen if your binary's text mapping differs).
+pub const DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN: u64 = 0x10000;
+
+/// Inclusive maximum user **`ELR_EL1`** for **`[sigsegv-syscall]`**.
+pub const DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX: u64 = 0x20000;
+
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
 pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;

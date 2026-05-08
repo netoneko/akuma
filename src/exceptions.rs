@@ -681,6 +681,43 @@ pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
         && a < akuma_exec::process::types::ProcessMemory::KERNEL_VA_END
 }
 
+/// Human-readable syscall hint for forktest Pattern 2 serial (`GO_FORKTEST_DEBUG.md`).
+fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
+    use crate::syscall::nr;
+    match nr {
+        x if x == nr::READ => "read",
+        x if x == nr::EPOLL_CTL => "epoll_ctl",
+        x if x == nr::EPOLL_PWAIT => "epoll_pwait",
+        x if x == nr::EPOLL_CREATE1 => "epoll_create1",
+        x if x == nr::WRITE => "write",
+        x if x == nr::MMAP => "mmap",
+        x if x == nr::CLOSE => "close",
+        x if x == nr::FCNTL => "fcntl",
+        x if x == nr::IOCTL => "ioctl",
+        x if x == nr::CLOCK_GETTIME => "clock_gettime",
+        _ => "?",
+    }
+}
+
+/// Log syscall number (**`x8`**) when SIGSEGV hits the configured syscall-stub VA window.
+fn maybe_print_sigsegv_syscall_diag(elr: u64, frame: &UserTrapFrame) {
+    if !crate::config::DEBUG_SIGSEGV_SYSCALL_STUB {
+        return;
+    }
+    let min = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN;
+    let max = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX;
+    if elr < min || elr > max {
+        return;
+    }
+    let nr = frame.x8;
+    let hint = syscall_nr_pattern2_hint(nr);
+    crate::tprint!(
+        288,
+        "[sigsegv-syscall] ELR={:#x} x8={} ({}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}\n",
+        elr, nr, hint, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5,
+    );
+}
+
 /// Pre-resolve a CoW write barrier: if the page at `page_va` in the current
 /// TTBR0 address space is a CoW-demoted RO page (cow_ref_get > 0), allocate a
 /// private copy, remap it RW, and update frame tracking.
@@ -1117,6 +1154,12 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 }
 /// Restore saved context from a signal frame on the user stack (rt_sigreturn).
 /// Returns the saved x0 value, or None if the frame is invalid.
+///
+/// **Forktest Pattern 2:** full GPR restore including **`x8`** — if anything in the
+/// sigframe path is wrong, the next SVC can see bogus syscall numbers or arguments
+/// (see `docs/GO_FORKTEST_DEBUG.md`, Agent handoff). Pending **`SIGURG`** delivery
+/// immediately after sigreturn is handled in the **`syscall_num == 139`** branch in
+/// `rust_sync_el0_handler`.
 fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     let frame_ref = unsafe { &*frame };
     let sigframe_sp = frame_ref.sp_el0 as usize;
@@ -1831,6 +1874,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         let prev_is_svc = prev_instr
                             .map(|instr| (instr & 0xFFE0001F) == 0xD4000001)
                             .unwrap_or(false);
+                        // FIX_MEMORY_MAPPING.md / EPOLL_PERFORMANCE.md: stale icache can make the
+                        // CPU decode the wrong SVC immediate; replay preserves ELR unless prev was SVC.
                         crate::safe_print!(128,
                             "[JIT] IC flush + replay #{} bogus nr={} ELR={:#x} prev={}\n",
                             count + 1, syscall_num, elr,
@@ -2537,6 +2582,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         pid, far, elr, iss);
                 }
             }
+            {
+                let fr = unsafe { &*frame };
+                maybe_print_sigsegv_syscall_diag(elr, fr);
+            }
             if try_deliver_signal(frame, 11, far, true) {
                 return 11; // signal number in x0 for the handler
             }
@@ -2914,6 +2963,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             }
 
             // Try delivering SIGSEGV to a registered userspace handler
+            {
+                let fr = unsafe { &*frame };
+                maybe_print_sigsegv_syscall_diag(fr.elr_el1, fr);
+            }
             if try_deliver_signal(frame, 11, far, true) {
                 return 11;
             }

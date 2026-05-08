@@ -372,6 +372,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 EBADF
             }
         }
+        // PipeRead: forktest_parent drains child stdout; correlate **`[pipe-read]`** / EFAULT with
+        // **`[sigsegv-syscall] x8=63`** (`read`) — **`GO_FORKTEST_DEBUG.md`** Pattern 2.
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             let mut temp = alloc::vec![0u8; count];
             if crate::config::SYSCALL_DEBUG_PIPE_READ {

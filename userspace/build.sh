@@ -159,9 +159,11 @@ if [ "$WITH_FORKTEST" = true ]; then
     (
         cd forktest/c_stress
         aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mmap_stress mmap_stress.c
+        aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pattern2_parent pattern2_parent.c
     )
     cp forktest/c_stress/mmap_stress ../bootstrap/bin/
-    echo "mmap_stress (C) copied to bootstrap/bin/"
+    cp forktest/c_stress/pattern2_parent ../bootstrap/bin/
+    echo "mmap_stress + pattern2_parent (C) copied to bootstrap/bin/"
 fi
 
 echo "Build process completed."
