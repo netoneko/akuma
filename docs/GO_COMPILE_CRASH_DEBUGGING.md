@@ -1,6 +1,6 @@
 # Go `compile` crash — handoff theory (errno-shaped faults)
 
-This note summarizes evidence from **`crash9.log`**, userspace stack traces, and the kernel syscall stub for **extended-attribute** syscalls. It is intended for another agent to turn into a fix plan and tests.
+This note summarizes evidence from **`crash9.log`** (`go tool compile`), **`crash12.log`** (`forktest` / mmap stress vs `GODEBUG=asyncpreemptoff`), userspace stack traces, and the xattr syscall stub. It is intended for another agent to turn into a fix plan and tests.
 
 ## Symptoms (userspace)
 
@@ -32,39 +32,47 @@ So the last logged syscall return before the fault is **errno-shaped (−96)**, 
 
 On **Linux aarch64**, **`nr == 5`** in the **asm-generic** numbering used by glibc/musl callers maps to the **setxattr** family (extended attributes). Akuma routes **`syscall_num` 5–16** through one stub (see below).
 
-## Kernel code path (actionable)
+## Kernel code path (xattr — fixed in tree)
 
-In [`src/syscall/mod.rs`](../src/syscall/mod.rs), extended-attribute syscalls are handled as:
+Extended-attribute syscalls **5–16** historically used **`(!95i64) as u64`**, which encodes **−96** (`0xffffffa0`), not **−95** (`0xffffffa9`). That **exactly matched** **`crash9.log`** syscall returns and **`x0`** at the **`compile`** fault site.
 
-```779:785:src/syscall/mod.rs
-        // Extended attributes syscalls (5-16) - return ENOTSUP (not supported on this fs)
+**Resolution:** the stub now uses **`neg_errno(95)`**:
+
+```779:786:src/syscall/mod.rs
+        // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
+        // AArch64. Must be encoded as `x0 = -95` (0xffffffa9), never `!95`
+        // which is `-96` (0xffffffa0 = EPFNOSUPPORT) and breaks musl/Go callers.
         5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 => {
-            // setxattr, lsetxattr, fsetxattr, getxattr, ...
-            const ENOTSUP: u64 = (!95i64) as u64; // Operation not supported
-            ENOTSUP
-        },
+            // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
+            // listxattr, llistxattr, flistxattr, removexattr, lremovexattr, fremovexattr
+            neg_errno(95)
+        }
 ```
 
-**Problem:** **`(!95i64) as u64` is not `-(95)`**. Bitwise **`!`** on **`95`** yields **−96** in two’s complement, so this stub returns **−96** (**`0xffffffa0`**), **not** **−95** (**`0xffffffa9`**, Linux **`EOPNOTSUPP`** / commonly used for “operation not supported on socket” — and the intended **`ENOTSUP`**-class value should use [`neg_errno(95)`](../src/syscall/mod.rs) per project convention).
+**Hypothesis (for `crash9`):** Musl/Go interpret **`errno`** from **`x0`**. Wrong encoding breaks libc invariants and can surface later as **`bytes.Buffer`** faults with errno-shaped addresses.
 
-This **exactly matches** the logged return **`0xffffffffffffffa0`** and **`x0`** at the fault site.
+Regression coverage: **`test_syscall_errno_compliance`** in [`src/process_tests.rs`](../src/process_tests.rs) asserts **`setxattr` / `lsetxattr` / `fremovexattr`** return **−95**, not **−96**.
 
-**Hypothesis (primary):** Musl/Go treat **`setxattr`** failure by checking **`errno`**. Returning the **wrong negative errno** (off-by-one in the encoded value) can violate libc invariants and surface as **corrupted Go heap/slice metadata**, later faulting in **`bytes.Buffer`** with addresses that look like small negative integers.
+## Forktest / mmap stress vs async preempt (`crash12.log`)
 
-**Secondary:** **`FAR = −64`** may still be a **downstream** artifact (bad pointer arithmetic / slice header) rather than a second distinct kernel bug; prove or disprove with a fixed **`neg_errno(95)`** (or the correct Linux errno for “xattr not supported” on this ABI) and re-run **`go build`**.
+Serial was split at each **`[exit_group] … forktest_parent`** boundary. Two early slices used **`GODEBUG=asyncpreemptoff=1`**; the **last** slice used **default Go** (no `GODEBUG`, async preempt on).
+
+| Condition | Role in log | `[EINVAL] nr=113` (`clock_gettime`) | `sig=23` (SIGURG) | `[JIT] IC flush` | `WILD-DA` |
+|-----------|-------------|-------------------------------------|-------------------|------------------|-----------|
+| **`asyncpreemptoff=1`** | Earlier runs (forktest parents **90**, **112**) | **0** | **0** | **4** | **6** |
+| **Default preempt** | Last run (parent **134**) | **2** | **25** | **2** | **8** |
+
+**Conclusion:** The **`compile`** / xattr failure was a **deterministic errno-encoding bug** in the stub (above). **`forktest` + mmap stress** is a **different** path but **correlates with async preempt** on Akuma: **`asyncpreemptoff=1`** removes **`nr=113`** and SIGURG bursts in those slices; **default preempt** reproduces **`clock_gettime` EINVAL**, SIGURG spam, and more **`WILD-DA`**. Use **`GODEBUG=asyncpreemptoff=1`** as an **isolation knob** while debugging signal/syscall interaction; see **[GO_FORKTEST_DEBUG.md](GO_FORKTEST_DEBUG.md)**.
 
 ## Relationship to other “errno as pointer” bugs
 
 This ties into the same family as **[GO_FORKTEST_DEBUG.md](GO_FORKTEST_DEBUG.md)** (**`WILD-DA`**, **`clock_gettime` / EINVAL**, small negative FARs) and **[SYSCALL_ERRNO_COMPLIANCE_CHANGES.md](SYSCALL_ERRNO_COMPLIANCE_CHANGES.md)** — syscall returns must be **bit-accurate** vs Linux so userspace never mistakes **`-(errno)`** for a pointer or length.
 
-Forktest / **`SIGURG`** / **JIT IC flush** tracks (**Bucket A** in earlier triage) may still matter for **other** crashes; this **`compile`** failure has a **clean, log-aligned** kernel stub bug independent of preemption.
+## Suggested follow-ups
 
-## Suggested work for the next agent
-
-1. **Fix** the xattr stub to use **`neg_errno(95)`** (or the errno number you confirm matches Linux “operation not supported” for xattr on musl — verify against **`errno(3)`** / **`musl` `bits/errno.h`**), **never** **`(!errno)`**.
-2. Add a **kernel regression test** (see existing **`test_syscall_errno_compliance`** in [`src/process_tests.rs`](../src/process_tests.rs)): **`setxattr`** (nr **5**) returns **`-(95)`** bit pattern, **not** **`0xffffffa0`** unless errno **96** is intentionally required (it should not be here).
-3. Re-run **`go build .`** on a minimal module and confirm **`crash9.log`** no longer shows **`WILD-DA`** at **`0xffffffc0`** for **`compile`** after **`nr=5`**.
-4. Optional: grep the tree for **`(!`** `i64)` **`as u64`** errno tricks and replace with **`neg_errno`**.
+1. Re-run **`go build .`** on a minimal module and confirm serial no longer shows **`compile`** faulting after **`nr=5`** with **`0xffffffa0`** (**`crash9`** scenario).
+2. Optional: grep the tree for **`(!`** `i64)` **`as u64`** errno tricks and replace with **`neg_errno`**.
+3. For **`forktest`** / preempt-on failures, trace **`clock_gettime`** **`EINVAL`** and SIGURG paths per **`GO_FORKTEST_DEBUG.md`** (kernel + runtime).
 
 ## Follow-ups (tooling / UX — not kernel)
 
@@ -75,5 +83,6 @@ Forktest / **`SIGURG`** / **JIT IC flush** tracks (**Bucket A** in earlier triag
 ## References
 
 - [`src/syscall/mod.rs`](../src/syscall/mod.rs) — `handle_syscall`, **`neg_errno`**, xattr stub **`5 | … | 16`**
+- [`docs/GO_FORKTEST_DEBUG.md`](GO_FORKTEST_DEBUG.md) — errno-as-pointer, **`clock_gettime`**, SIGURG / preempt
 - [`docs/GOLANG_MISSING_SYSCALLS.md`](GOLANG_MISSING_SYSCALLS.md) — broader Go-on-Akuma syscall history
 - [`docs/SYSCALL_ERRNO_COMPLIANCE_CHANGES.md`](SYSCALL_ERRNO_COMPLIANCE_CHANGES.md) — **`neg_errno`** motivation

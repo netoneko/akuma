@@ -7414,11 +7414,11 @@ fn test_io_setup_and_destroy() -> bool {
         return false;
     }
 
-    // io_destroy with unknown context must return EINVAL
+    // io_destroy with unknown context must return 0 (idempotent; EINVAL breaks Go — crash10.log)
     let r = crate::syscall::handle_syscall(1, &[0xdeadbeef, 0, 0, 0, 0, 0]);
-    crate::safe_print!(64, "  io_destroy(0xdeadbeef) = {:#x} (expect EINVAL={:#x})\n", r, EINVAL);
-    if r != EINVAL {
-        console::print("  FAIL: io_destroy(bad_ctx) did not return EINVAL\n");
+    crate::safe_print!(64, "  io_destroy(0xdeadbeef) = {:#x} (expect 0)\n", r);
+    if r != 0 {
+        console::print("  FAIL: io_destroy(bad_ctx) did not return 0\n");
         return false;
     }
 
@@ -8549,11 +8549,20 @@ fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
             return false;
         }
 
+        // io_destroy
+        let r = crate::syscall::handle_syscall(1, &[ctx, 0, 0, 0, 0, 0]);
+        if r != 0 {
+            crate::safe_print!(128,
+                "  FAIL: io_destroy(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
         // Extra safety: verify none of them ever return ENOSYS
         let r2 = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
         let r3 = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
         let r4 = crate::syscall::handle_syscall(4, &[ctx, 0, 8, 0, 0, 0]);
-        if r2 == ENOSYS || r3 == ENOSYS || r4 == ENOSYS {
+        let r5 = crate::syscall::handle_syscall(1, &[ctx, 0, 0, 0, 0, 0]);
+        if r2 == ENOSYS || r3 == ENOSYS || r4 == ENOSYS || r5 == ENOSYS {
             crate::safe_print!(128,
                 "  FAIL: AIO stub returned ENOSYS for ctx={:#x}\n", ctx);
             return false;
@@ -8569,20 +8578,11 @@ fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
 fn test_aio_stubs_valid_ctx_returns_zero() -> bool {
     console::print("\n[TEST] AIO stubs with valid ctx return 0\n");
 
-    const EINVAL: u64 = (-22i64) as u64;
     const EFAULT: u64 = (-14i64) as u64;
 
-    // We need a writable slot to receive the ctx_idp from io_setup.
-    // Use a stack-allocated u64 and pass its kernel VA as ctx_idp.
-    // Note: validate_user_ptr checks for userspace VA range. In kernel tests
-    // the stack is kernel VA, so io_setup will return EFAULT for the ctx_idp.
-    // We verify the stub returns EINVAL (not ENOSYS) for an unregistered ctx.
-    //
-    // The only way to get a valid registered ctx in a kernel test is to use
-    // a userspace-mapped page. Since we can't guarantee that in a unit test,
-    // we instead verify the consistent behavior: io_getevents with unregistered
-    // ctx returns EINVAL (not ENOSYS, not 0).  The full lifecycle (io_setup →
-    // io_getevents → io_destroy) is tested in userspace integration tests.
+    // Kernel-test stacks are kernel VA; io_setup(null ctx_idp) → EFAULT.
+    // io_destroy without io_setup (unknown ctx) → 0 — must not return EINVAL
+    // or Go may fault (crash10.log / aio.rs).
 
     // Verify io_setup with null ctx_idp returns EFAULT (not ENOSYS)
     let r = crate::syscall::handle_syscall(0, &[8, 0, 0, 0, 0, 0]);
@@ -8592,11 +8592,11 @@ fn test_aio_stubs_valid_ctx_returns_zero() -> bool {
         return false;
     }
 
-    // io_destroy with ctx=0 must return EINVAL (not ENOSYS)
+    // io_destroy(ctx=0) with no setup: unknown ctx → 0 (same policy as other AIO stubs)
     let r = crate::syscall::handle_syscall(1, &[0, 0, 0, 0, 0, 0]);
-    crate::safe_print!(96, "  io_destroy(ctx=0) = {:#x} (expect EINVAL={:#x})\n", r, EINVAL);
-    if r != EINVAL {
-        crate::safe_print!(96, "  FAIL: expected EINVAL, got {:#x}\n", r);
+    crate::safe_print!(96, "  io_destroy(ctx=0) = {:#x} (expect 0)\n", r);
+    if r != 0 {
+        crate::safe_print!(96, "  FAIL: expected 0, got {:#x}\n", r);
         return false;
     }
 
