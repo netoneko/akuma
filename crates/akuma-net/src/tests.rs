@@ -304,17 +304,25 @@ mod errno_tests {
     /// These must be exact to maintain ABI compatibility with musl/glibc.
     #[test]
     fn errno_values_match_linux() {
+        assert_eq!(libc_errno::EPERM, 1);
         assert_eq!(libc_errno::ENOENT, 2);
+        assert_eq!(libc_errno::ESRCH, 3);
         assert_eq!(libc_errno::EINTR, 4);
         assert_eq!(libc_errno::EIO, 5);
+        assert_eq!(libc_errno::ENOEXEC, 8);
         assert_eq!(libc_errno::EBADF, 9);
         assert_eq!(libc_errno::ECHILD, 10);
         assert_eq!(libc_errno::EAGAIN, 11);
         assert_eq!(libc_errno::ENOMEM, 12);
+        assert_eq!(libc_errno::EACCES, 13);
+        assert_eq!(libc_errno::EFAULT, 14);
+        assert_eq!(libc_errno::EEXIST, 17);
         assert_eq!(libc_errno::EINVAL, 22);
+        assert_eq!(libc_errno::EMFILE, 24);
         assert_eq!(libc_errno::EPIPE, 32);
         assert_eq!(libc_errno::ERANGE, 34);
         assert_eq!(libc_errno::EDESTADDRREQ, 89);
+        assert_eq!(libc_errno::EADDRINUSE, 98);
         assert_eq!(libc_errno::ENETDOWN, 100);
         assert_eq!(libc_errno::ECONNABORTED, 103);
         assert_eq!(libc_errno::ENOTCONN, 107);

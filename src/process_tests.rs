@@ -53,6 +53,9 @@ pub fn run_all_tests() {
     // Test tgkill (syscall 131) is wired — does not return ENOSYS
     test_tgkill_not_enosys();
 
+    // Linux-compliance: failing syscalls return specific errnos (not -EPERM)
+    test_syscall_errno_compliance();
+
     // Test SysV message queue syscalls (186-189)
     test_msgqueue_create_destroy();
     test_msgqueue_send_recv();
@@ -1235,6 +1238,50 @@ fn test_tgkill_not_enosys() {
         console::print("[Test] tgkill not-ENOSYS PASSED\n");
     } else {
         console::print("[Test] tgkill not-ENOSYS FAILED: returned ENOSYS\n");
+    }
+}
+
+/// Regression: verify failing syscalls no longer collapse to `-EPERC` (`!0u64`).
+///
+/// Several call sites used to return `!0u64` for any failure; on Linux that
+/// decodes as `-1 = -EPERM`, hiding the real reason. Spot-check three paths
+/// that were rewritten to specific errnos:
+///   - `mmap(_, 0, …)` → EINVAL
+///   - `bind(bad_fd, …)` → EBADF
+///   - `setpgid(non_existent_pid, …)` → ESRCH
+fn test_syscall_errno_compliance() {
+    const NR_MMAP: u64 = 222;
+    const NR_BIND: u64 = 200;
+    const NR_SETPGID: u64 = 154;
+    const EPERM: u64 = (-1i64) as u64;
+    const ESRCH: u64 = (-3i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const EFAULT: u64 = (-14i64) as u64;
+    const EINVAL: u64 = (-22i64) as u64;
+
+    // mmap(addr=0, len=0, ...) must return -EINVAL, not -EPERM.
+    let mmap_ret = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
+    let mmap_ok = mmap_ret == EINVAL;
+
+    // bind on an out-of-range fd: EBADF (or EFAULT for the null sockaddr ptr,
+    // which is checked first); never EPERM.
+    let bind_ret = crate::syscall::handle_syscall(NR_BIND, &[9999, 0, 16, 0, 0, 0]);
+    let bind_ok = bind_ret == EBADF || bind_ret == EFAULT;
+
+    // setpgid against a definitely-nonexistent pid: ESRCH, not ENOENT/EPERM.
+    let sp_ret = crate::syscall::handle_syscall(NR_SETPGID, &[0xFFFF_FFFE, 0, 0, 0, 0, 0]);
+    let sp_ok = sp_ret == ESRCH;
+
+    let no_eperm = mmap_ret != EPERM && bind_ret != EPERM && sp_ret != EPERM;
+
+    if mmap_ok && bind_ok && sp_ok && no_eperm {
+        console::print("[Test] syscall_errno_compliance PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={}\n",
+            mmap_ret as i64, bind_ret as i64, sp_ret as i64,
+        );
     }
 }
 

@@ -95,7 +95,7 @@ pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {
 
 pub(super) fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
     let target_pid = if pid == 0 {
-        match akuma_exec::process::read_current_pid() { Some(p) => p, None => return !0u64 }
+        match akuma_exec::process::read_current_pid() { Some(p) => p, None => return ESRCH }
     } else {
         pid
     };
@@ -109,21 +109,20 @@ pub(super) fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
         proc.pgid = target_pgid;
         0
     } else {
-        ENOENT
+        // Linux: setpgid(2) returns ESRCH for a pid that is not a child of the
+        // caller or the caller itself (no such process). ENOENT here was wrong
+        // — userspace expects "no such process".
+        ESRCH
     }
 }
 
 pub(super) fn sys_getpgid(pid: u32) -> u64 {
     let target_pid = if pid == 0 {
-        match akuma_exec::process::read_current_pid() { 
-            Some(p) => p, 
-            None => {
-                let tid = akuma_exec::threading::current_thread_id();
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] getpgid(0) kernel fallback: returning TID {}\n", tid);
-                }
-                return tid as u64;
-            }
+        match akuma_exec::process::read_current_pid() {
+            Some(p) => p,
+            // Caller has no registered process; matches Linux behavior of
+            // returning ESRCH for an unknown pid rather than a bogus TID/PGID.
+            None => return ESRCH,
         }
     } else {
         pid
@@ -136,9 +135,9 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
         proc.pgid as u64
     } else {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] getpgid({}) not found: returning TID fallback {}\n", target_pid, target_pid);
+            crate::safe_print!(128, "[syscall] getpgid({}) not found: ESRCH\n", target_pid);
         }
-        target_pid as u64
+        ESRCH
     }
 }
 
@@ -147,7 +146,10 @@ pub(super) fn sys_setsid() -> u64 {
         proc.pgid = proc.pid;
         proc.pid as u64
     } else {
-        !0u64
+        // Per setsid(2): EPERM if the calling process is already a process
+        // group leader. Here the caller has no current process at all, so
+        // ESRCH is the most accurate Linux-compatible code.
+        ESRCH
     }
 }
 
@@ -350,7 +352,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     if flags & CLONE_VFORK != 0 || flags & 0xFF == 0x11 {
         let parent_proc = match akuma_exec::process::current_process() {
             Some(p) => p,
-            None => return !0u64,
+            None => return ESRCH,
         };
 
         let child_pid = akuma_exec::process::allocate_pid();
@@ -422,7 +424,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                     });
                 }
                 crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
-                return !0u64;
+                return ENOMEM;
             }
         }
     }
@@ -531,9 +533,9 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,
-        Err(_) => {
+        Err(e) => {
             crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
-            return ENOENT;
+            return super::fs::fs_error_to_errno(e);
         }
     };
 
@@ -545,7 +547,7 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
 
     let proc = match akuma_exec::process::current_process() {
         Some(p) => p,
-        None => return !0u64,
+        None => return ESRCH,
     };
 
     let closed_fds = proc.close_cloexec_fds();
@@ -569,9 +571,9 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
     } else {
         let file_size = match crate::vfs::file_size(&resolved_path) {
             Ok(sz) => sz as usize,
-            Err(_) => {
+            Err(e) => {
                 crate::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
-                return ENOENT;
+                return super::fs::fs_error_to_errno(e);
             }
         };
         proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
@@ -579,7 +581,10 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
 
     if let Err(e) = replace_result {
         crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
-        return ENOENT;
+        // `replace_image` returns a stringly-typed error from the ELF loader;
+        // a "Failed to load ELF: ..." message means the binary is malformed
+        // (missing PT_LOAD, bad magic, etc.) — Linux returns ENOEXEC for that.
+        return if e.contains("Failed to load ELF") { ENOEXEC } else { ENOMEM };
     }
 
     proc.name = resolved_path.clone();
@@ -963,14 +968,16 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
 }
 
 pub(super) fn sys_getpid() -> u64 {
-    akuma_exec::process::read_current_pid().map_or(!0u64, |pid| pid as u64)
+    // Linux's getpid(2) cannot fail; we return ESRCH only as a defensive
+    // sentinel for kernel paths where no current PID has been registered.
+    akuma_exec::process::read_current_pid().map_or(ESRCH, |pid| pid as u64)
 }
 
 pub(super) fn sys_getppid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         proc.parent_pid as u64
     } else {
-        !0u64
+        ESRCH
     }
 }
 
@@ -990,7 +997,7 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
                 return EFAULT;
             }
         } else {
-            return !0u64;
+            return EIO;
         }
         remaining -= chunk;
         current_ptr += chunk as u64;
@@ -1071,7 +1078,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
             return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
-    !0u64
+    ENOMEM
 }
 
 pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
@@ -1080,7 +1087,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
         Err(e) => return e,
     };
 
-    if options_ptr == 0 { return !0u64; }
+    if options_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
 
     let mut o = SpawnOptions { cwd_ptr: 0, cwd_len: 0, root_dir_ptr: 0, root_dir_len: 0, args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: 0 };
@@ -1126,12 +1133,14 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
             return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
         }
     }
-    !0u64
+    ENOMEM
 }
 
 pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if pid == 0 { return 0; }
-    if pid <= 1 { return !0u64; }
+    // Linux: kill(pid <= 0, ...) targets a process group; we don't support
+    // those semantics, so return EPERM for "operation not permitted".
+    if pid <= 1 { return EPERM; }
 
     // sig=0 is a "does the process exist?" probe — don't actually send anything.
     if sig == 0 {

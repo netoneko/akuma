@@ -8,7 +8,9 @@ pub(crate) fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     use crate::vfs::FsError;
     match e {
         FsError::NotFound => ENOENT,
-        FsError::PermissionDenied => EPERM,
+        // Linux uses EACCES for filesystem permission errors on open/access/etc.;
+        // EPERM is reserved for capability-style "operation not permitted".
+        FsError::PermissionDenied => EACCES,
         FsError::AlreadyExists => EEXIST,
         FsError::NotADirectory => ENOTDIR,
         FsError::NotAFile => EISDIR,
@@ -384,7 +386,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 count as u64
             } else {
-                !0u64
+                EIO
             }
         }
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
@@ -400,7 +402,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             } else { EINVAL }
         }
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
-        _ => !0u64
+        // Catch-all for fd types that don't support read(2) — Linux returns EBADF.
+        _ => EBADF
     }
 }
 
@@ -439,7 +442,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
                 }
                 count as u64
             } else {
-                !0u64
+                EIO
             }
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
@@ -612,7 +615,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => this_chunk as u64,
-            _ => !0u64
+            _ => EBADF
         };
         
         // If write failed or returned error code (large positive u64)
@@ -848,7 +851,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             }
             return fd as u64;
         }
-        return !0u64;
+        return ESRCH;
     }
 
     if path == "/dev/urandom" || path == "/dev/random" {
@@ -862,7 +865,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             }
             return fd as u64;
         }
-        return !0u64;
+        return ESRCH;
     }
 
     let path = if path == "/proc/self/exe" {
@@ -918,7 +921,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
         fd as u64
-    } else { !0u64 }
+    } else { ESRCH }
 }
 
 pub(crate) fn sys_close(fd: u32) -> u64 {
@@ -949,8 +952,8 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
             }
             proc.clear_nonblock(fd);
             0
-        } else { !0u64 }
-    } else { !0u64 }
+        } else { EBADF }
+    } else { ESRCH }
 }
 
 pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
@@ -1000,7 +1003,9 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
         }
         let mut new_pos = 0i64;
         let mut success = false;
+        let mut bad_fd = true;
         proc.update_fd(fd, |entry| {
+            bad_fd = false;
             if let akuma_exec::process::FileDescriptor::File(f) = entry {
                 let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
                 new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
@@ -1011,14 +1016,14 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                 }
             }
         });
-        if success { new_pos as u64 } else { !0u64 }
-    } else { !0u64 }
+        if success { new_pos as u64 } else if bad_fd { EBADF } else { EINVAL }
+    } else { ESRCH }
 }
 
 pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     let stat_size = core::mem::size_of::<Stat>();
     if !validate_user_ptr(stat_ptr, stat_size) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
     
     let mut stat = Stat::default();
     let res = match proc.get_fd(fd) {
@@ -1029,7 +1034,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
                 0
-            } else { !0u64 }
+            } else { ENOENT }
         }
         Some(akuma_exec::process::FileDescriptor::DevNull) => {
             stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
@@ -1051,7 +1056,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
-        _ => !0u64,
+        _ => EBADF,
     };
     
     if res == 0 {
@@ -1076,20 +1081,20 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
              if let Some(proc) = akuma_exec::process::current_process() {
                  proc.cwd.clone()
              } else {
-                 return !0u64;
+                 return ESRCH;
              }
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path.clone()
                  } else {
-                     return !0u64;
+                     return EBADF;
                  }
              } else {
-                 return !0u64;
+                 return ESRCH;
              }
         } else {
-            return !0u64;
+            return EBADF;
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
@@ -1415,20 +1420,20 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
              if let Some(proc) = akuma_exec::process::current_process() {
                  proc.cwd.clone()
              } else {
-                 return !0u64;
+                 return ESRCH;
              }
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path.clone()
                  } else {
-                     return !0u64;
+                     return EBADF;
                  }
              } else {
-                 return !0u64;
+                 return ESRCH;
              }
         } else {
-            return !0u64;
+            return EBADF;
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
@@ -1633,7 +1638,10 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
     let oldpath = resolve_path_at(olddirfd, &raw_old);
     let newpath = resolve_path_at(newdirfd, &raw_new);
     crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
-    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
+    match crate::fs::rename(&oldpath, &newpath) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
 }
 
 const RENAME_NOREPLACE: u32 = 1;
@@ -1665,7 +1673,10 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(256, "[syscall] renameat2: {} -> {} flags=0x{:x}\n", oldpath, newpath, flags);
     }
-    if crate::fs::rename(&oldpath, &newpath).is_ok() { 0 } else { !0u64 }
+    match crate::fs::rename(&oldpath, &newpath) {
+        Ok(()) => 0,
+        Err(e) => fs_error_to_errno(e),
+    }
 }
 
 pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
@@ -1692,10 +1703,13 @@ pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpa
     let newpath = match copy_from_user_str(newpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
     let src = resolve_path_at(_olddirfd, &oldpath);
     let dst = resolve_path_at(_newdirfd, &newpath);
-    if let Ok(data) = crate::fs::read_file(&src) {
-        if crate::fs::write_file(&dst, &data).is_ok() { return 0; }
+    match crate::fs::read_file(&src) {
+        Ok(data) => match crate::fs::write_file(&dst, &data) {
+            Ok(()) => 0,
+            Err(e) => fs_error_to_errno(e),
+        },
+        Err(e) => fs_error_to_errno(e),
     }
-    !0u64
 }
 
 pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u64 {
@@ -1744,10 +1758,10 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
 
 pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(ptr, size) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
     let f = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => f,
-        _ => return !0u64,
+        _ => return EBADF,
     };
 
     let entries = if let Some(ref cached) = f.dir_cache {
@@ -1755,7 +1769,7 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     } else {
         let dir_entries = match crate::fs::list_dir(&f.path) {
             Ok(e) => e,
-            Err(_) => return !0u64,
+            Err(e) => return fs_error_to_errno(e),
         };
         let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dir_entries
             .iter()
@@ -1810,7 +1824,7 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_fchdir(fd: u32) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
     let entry = match proc.get_fd(fd) {
         Some(e) => e,
         None => return EBADF,
@@ -1850,5 +1864,5 @@ pub(super) fn sys_chdir(ptr: u64) -> u64 {
         }
         return ENOENT;
     }
-    !0u64
+    ESRCH
 }

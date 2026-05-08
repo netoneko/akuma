@@ -316,27 +316,43 @@ pub struct ThreadCpuStat {
     pub name: [u8; 16],
 }
 
-const EINTR: u64 = (-4i64) as u64;
+// Linux-compatible negated errno values. The AArch64 syscall ABI returns
+// `-errno` in x0 on failure; userspace decodes via `if ((long)ret < 0) errno = -(int)ret`.
+const EPERM: u64 = (-1i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
 const ESRCH: u64 = (-3i64) as u64;
-const EFAULT: u64 = (-14i64) as u64;
-const EINVAL: u64 = (-22i64) as u64;
+const EINTR: u64 = (-4i64) as u64;
+const EIO: u64 = (-5i64) as u64;
+const ENOEXEC: u64 = (-8i64) as u64;
 const EBADF: u64 = (-9i64) as u64;
-const ENOSYS: u64 = (-38i64) as u64;
-const EPERM: u64 = (-1i64) as u64;
-const ENOTDIR: u64 = (-20i64) as u64;
-const EISDIR: u64 = (-21i64) as u64;
-const ENOTEMPTY: u64 = (-39i64) as u64;
-const EEXIST: u64 = (-17i64) as u64;
-const ENOSPC: u64 = (-28i64) as u64;
 const EAGAIN: u64 = (-11i64) as u64;
 const ENOMEM: u64 = (-12i64) as u64;
-const EAFNOSUPPORT: u64 = (-97i64) as u64;
-const EINPROGRESS: u64 = (-115i64) as u64;
-const ETIMEDOUT: u64 = (-110i64) as u64;
+const EACCES: u64 = (-13i64) as u64;
+const EFAULT: u64 = (-14i64) as u64;
+const EEXIST: u64 = (-17i64) as u64;
 const ENODEV: u64 = (-19i64) as u64;
-const EIO: u64 = (-5i64) as u64;
+const ENOTDIR: u64 = (-20i64) as u64;
+const EISDIR: u64 = (-21i64) as u64;
+const EINVAL: u64 = (-22i64) as u64;
 const EMFILE: u64 = (-24i64) as u64;
+const ENOSPC: u64 = (-28i64) as u64;
+const ENOSYS: u64 = (-38i64) as u64;
+const ENOTEMPTY: u64 = (-39i64) as u64;
+const EAFNOSUPPORT: u64 = (-97i64) as u64;
+// Reserved for future socket_bind / socket_listen paths that distinguish a
+// duplicate-bind failure from a generic EINVAL. Kept here so call sites can
+// adopt the symbolic name without re-deriving the negated value each time.
+#[allow(dead_code)]
+const EADDRINUSE: u64 = (-98i64) as u64;
+const ETIMEDOUT: u64 = (-110i64) as u64;
+const EINPROGRESS: u64 = (-115i64) as u64;
+
+/// Encode a positive `libc` errno value as the negated form expected on
+/// the AArch64 syscall ABI return register (`x0 = -errno`).
+#[inline]
+pub(crate) fn neg_errno(e: i32) -> u64 {
+    (-(e as i64)) as u64
+}
 
 #[repr(C)]
 struct Timespec {

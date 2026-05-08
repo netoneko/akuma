@@ -22,12 +22,14 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
             crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
             return fd as u64;
         }
+        // Process gone between alloc_socket and current_process.
+        return ESRCH;
     }
-    !0u64
+    EMFILE
 }
 
 pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
-    if len < 16 { return !0u64; }
+    if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
     let copy_len = len.min(core::mem::size_of::<SockAddrIn>());
@@ -36,72 +38,85 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     crate::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
-    if let Some(idx) = get_socket_from_fd(fd) {
-        match socket::socket_bind(idx, addr) {
-            Ok(()) => return 0,
-            Err(e) => {
-                crate::safe_print!(64, "[syscall] bind failed: {}\n", e);
-                return !0u64;
-            }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+    match socket::socket_bind(idx, addr) {
+        Ok(()) => 0,
+        Err(e) => {
+            crate::safe_print!(64, "[syscall] bind failed: {}\n", e);
+            neg_errno(e)
         }
     }
-    !0u64
 }
 
 pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
-    if let Some(idx) = get_socket_from_fd(fd) { if socket::socket_listen(idx, backlog as usize).is_ok() { return 0; } }
-    !0u64
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+    match socket::socket_listen(idx, backlog as usize) {
+        Ok(()) => 0,
+        Err(e) => neg_errno(e),
+    }
 }
 
 pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
-    if let Some(idx) = get_socket_from_fd(fd) {
-        let nonblock = fd_is_nonblock(fd);
-        match socket::socket_accept(idx, nonblock) {
-            Ok((new_idx, addr)) => {
-                if let Some(proc) = akuma_exec::process::current_process() {
-                    if addr_ptr != 0 { 
-                        let sa = SockAddrIn::from_addr(&addr);
-                        let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
-                    }
-                    return proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64;
-                }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+    let nonblock = fd_is_nonblock(fd);
+    match socket::socket_accept(idx, nonblock) {
+        Ok((new_idx, addr)) => {
+            let proc = match akuma_exec::process::current_process() {
+                Some(p) => p,
+                None => return ESRCH,
+            };
+            if addr_ptr != 0 {
+                let sa = SockAddrIn::from_addr(&addr);
+                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
             }
-            Err(e) => return (-e as i64) as u64,
+            proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64
         }
+        Err(e) => neg_errno(e),
     }
-    !0u64
 }
 
 pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
-    if let Some(idx) = get_socket_from_fd(fd) {
-        let nonblock = fd_is_nonblock(fd);
-        match socket::socket_accept(idx, nonblock) {
-            Ok((new_idx, addr)) => {
-                if let Some(proc) = akuma_exec::process::current_process() {
-                    if addr_ptr != 0 {
-                        let sa = SockAddrIn::from_addr(&addr);
-                        let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
-                    }
-                    let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
-                    const SOCK_CLOEXEC: u32 = 0x80000;
-                    const SOCK_NONBLOCK: u32 = 0x800;
-                    if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
-                    if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
-                    return new_fd as u64;
-                }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+    let nonblock = fd_is_nonblock(fd);
+    match socket::socket_accept(idx, nonblock) {
+        Ok((new_idx, addr)) => {
+            let proc = match akuma_exec::process::current_process() {
+                Some(p) => p,
+                None => return ESRCH,
+            };
+            if addr_ptr != 0 {
+                let sa = SockAddrIn::from_addr(&addr);
+                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
             }
-            Err(e) => return (-e as i64) as u64,
+            let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
+            const SOCK_CLOEXEC: u32 = 0x80000;
+            const SOCK_NONBLOCK: u32 = 0x800;
+            if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
+            if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
+            new_fd as u64
         }
+        Err(e) => neg_errno(e),
     }
-    !0u64
 }
 
 pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
-    if len < 16 { return !0u64; }
+    if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
     let copy_len = len.min(core::mem::size_of::<SockAddrIn>());
@@ -110,32 +125,33 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
-    if let Some(idx) = get_socket_from_fd(fd) {
-        let nonblock = fd_is_nonblock(fd);
-        match socket::socket_connect(idx, addr, nonblock) {
-            Ok(()) => {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
-                return 0;
-            }
-            Err(e) if e == libc_errno::EINPROGRESS => {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
-                return EINPROGRESS;
-            }
-            Err(e) => {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
-                return (-e as i64) as u64;
-            }
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return EBADF,
+    };
+    let nonblock = fd_is_nonblock(fd);
+    match socket::socket_connect(idx, addr, nonblock) {
+        Ok(()) => {
+            crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
+            0
+        }
+        Err(e) if e == libc_errno::EINPROGRESS => {
+            crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
+            EINPROGRESS
+        }
+        Err(e) => {
+            crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
+            neg_errno(e)
         }
     }
-    !0u64
 }
 
 pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
-    if addr_ptr == 0 || len_ptr == 0 { return (-libc_errno::EINVAL as i64) as u64; }
+    if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
     let port = socket::with_socket(idx, |s| s.bind_port.unwrap_or(0)).unwrap_or(0);
     let local_ip = akuma_net::smoltcp_net::get_local_ip();
@@ -158,11 +174,11 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 }
 
 pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
-    if addr_ptr == 0 || len_ptr == 0 { return (-libc_errno::EINVAL as i64) as u64; }
+    if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
 
     let remote = socket::with_socket(idx, |sock| {
@@ -204,7 +220,7 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
             }
             0
         }
-        None => (-libc_errno::ENOTCONN as i64) as u64,
+        None => neg_errno(libc_errno::ENOTCONN),
     }
 }
 
@@ -219,7 +235,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
 
     if socket::is_udp_socket(idx) {
@@ -241,7 +257,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         } else {
             match socket::udp_default_peer(idx) {
                 Some(peer) => peer,
-                None => return (-libc_errno::EINVAL as i64) as u64,
+                None => return neg_errno(libc_errno::EDESTADDRREQ),
             }
         };
         match socket::socket_send_udp(idx, buf, dest) {
@@ -255,13 +271,13 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
                     crate::tprint!(64, "[DNS] query send error: {}\n", e);
                 }
-                (-e as i64) as u64
+                neg_errno(e)
             }
         }
     } else {
         match socket::socket_send(idx, buf, fd_is_nonblock(fd)) {
             Ok(n) => n as u64,
-            Err(e) => (-e as i64) as u64,
+            Err(e) => neg_errno(e),
         }
     }
 }
@@ -271,7 +287,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     let mut kernel_buf = alloc::vec![0u8; len.min(64 * 1024)];
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
     let nonblock = fd_is_nonblock(fd);
 
@@ -305,7 +321,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
                     crate::tprint!(64, "[UDP] recvfrom error: {}\n", e);
                 }
-                (-e as i64) as u64
+                neg_errno(e)
             }
         }
     } else {
@@ -330,7 +346,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 if e == libc_errno::EAGAIN {
                     super::poll::epoll_on_fd_drained(fd);
                 }
-                (-e as i64) as u64
+                neg_errno(e)
             }
         }
     }
@@ -516,7 +532,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
 
     if socket::is_udp_socket(idx) {
@@ -528,12 +544,12 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         } else {
             match socket::udp_default_peer(idx) {
                 Some(peer) => peer,
-                None => return (-libc_errno::EINVAL as i64) as u64,
+                None => return neg_errno(libc_errno::EDESTADDRREQ),
             }
         };
         match socket::socket_send_udp(idx, &kernel_buf, dest) {
             Ok(n) => n as u64,
-            Err(e) => (-e as i64) as u64,
+            Err(e) => neg_errno(e),
         }
     } else {
         let result = socket::socket_send(idx, &kernel_buf, fd_is_nonblock(fd));
@@ -545,7 +561,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         }
         match result {
             Ok(n) => n as u64,
-            Err(e) => (-e as i64) as u64,
+            Err(e) => neg_errno(e),
         }
     }
 }
@@ -572,7 +588,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return EBADF,
     };
     let nonblock = fd_is_nonblock(fd);
 
@@ -607,7 +623,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
                     crate::tprint!(64, "[UDP] recvmsg error: {}\n", e);
                 }
-                (-e as i64) as u64
+                neg_errno(e)
             }
         }
     } else {
@@ -634,7 +650,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 if e == libc_errno::EAGAIN {
                     super::poll::epoll_on_fd_drained(fd);
                 }
-                (-e as i64) as u64
+                neg_errno(e)
             }
         }
     }
@@ -768,6 +784,9 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
             }
             0
         }
-        Err(_) => !0u64,
+        // Custom Akuma syscall: report DNS resolution failure as ENOENT
+        // (matches how getaddrinfo's EAI_NONAME maps to ENOENT-flavored errors
+        // and is much more useful to userspace than a generic -EPERM).
+        Err(_) => ENOENT,
     }
 }

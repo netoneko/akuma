@@ -790,21 +790,29 @@ pub fn list_sockets() -> Vec<SocketStat> {
 // ============================================================================
 
 pub mod libc_errno {
+    pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
+    pub const ESRCH: i32 = 3;
     pub const EINTR: i32 = 4;
     pub const EIO: i32 = 5;
+    pub const ENOEXEC: i32 = 8;
     pub const EBADF: i32 = 9;
     pub const ECHILD: i32 = 10;
     pub const EAGAIN: i32 = 11;
     pub const ENOMEM: i32 = 12;
+    pub const EACCES: i32 = 13;
+    pub const EFAULT: i32 = 14;
+    pub const EEXIST: i32 = 17;
     pub const EINVAL: i32 = 22;
+    pub const EMFILE: i32 = 24;
     pub const EPIPE: i32 = 32;
     pub const ERANGE: i32 = 34;
+    pub const EDESTADDRREQ: i32 = 89;
+    pub const EADDRINUSE: i32 = 98;
     pub const ENETDOWN: i32 = 100;
     pub const ECONNABORTED: i32 = 103;
-    pub const ETIMEDOUT: i32 = 110;
-    pub const EDESTADDRREQ: i32 = 89;
-    pub const EINPROGRESS: i32 = 115;
     pub const ENOTCONN: i32 = 107;
+    pub const ETIMEDOUT: i32 = 110;
     pub const ECONNREFUSED: i32 = 111;
+    pub const EINPROGRESS: i32 = 115;
 }

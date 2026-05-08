@@ -36,12 +36,14 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
 pub(super) fn sys_kill_box(box_id: u64) -> u64 {
     crate::vfs::remove_box_namespace(box_id);
 
-    if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { !0u64 }
+    // kill_box only fails when the box id is unknown.
+    if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { ESRCH }
 }
 
 pub(super) fn sys_reattach(pid: u32) -> u64 {
 
-    if akuma_exec::process::reattach_process(pid).is_ok() { 0 } else { !0u64 }
+    // reattach_process only fails when the target pid does not exist.
+    if akuma_exec::process::reattach_process(pid).is_ok() { 0 } else { ESRCH }
 
 }
 

@@ -20,7 +20,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return !0u64 };
+    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
 
     match cmd {
         FIONBIO => {

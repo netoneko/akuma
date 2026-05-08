@@ -9,7 +9,7 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
 }
 
 pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
-    if len == 0 { return !0u64; }
+    if len == 0 { return EINVAL; }
     let pages = (len + 4095) / 4096;
     let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
 
@@ -32,11 +32,11 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
-        None => return !0u64,
+        None => return ESRCH,
     };
 
     let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
-        if addr & 0xFFF != 0 { return !0u64; }
+        if addr & 0xFFF != 0 { return EINVAL; }
         // Reject MAP_FIXED mappings that overlap the kernel identity-map range.
         // The Go runtime uses MAP_FIXED to commit its heap arenas; without this
         // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
@@ -68,7 +68,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                     proc.pid, pages * 4096,
                     proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
                     proc.memory.mmap_limit);
-                return !0u64;
+                return ENOMEM;
             }
         }
     };
@@ -120,7 +120,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM (batch alloc)\n",
                     proc.pid, len);
             }
-            return !0u64;
+            return ENOMEM;
         }
     };
     let mut frames = alloc::vec::Vec::with_capacity(pages);
@@ -426,7 +426,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
-        None => return !0u64,
+        None => return ESRCH,
     };
 
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
