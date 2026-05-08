@@ -838,7 +838,9 @@ async fn handle_exec(
 ) {
     crate::console::print("[SSH-EXEC] Got exec request!\n");
     let mut exec_ctx = crate::shell::new_shell_context();
-    crate::safe_print!(64,
+    // Large enough that the trailing `\n` is not lost to StackWriter truncation
+    // (safe_print!(64, …) merged this line with stdout / [exit_group] on serial).
+    crate::safe_print!(512,
         "[SSH-EXEC] Command: {:?}\n",
         core::str::from_utf8(cmd_bytes)
     );

@@ -66,6 +66,12 @@ Forktest / **`SIGURG`** / **JIT IC flush** tracks (**Bucket A** in earlier triag
 3. Re-run **`go build .`** on a minimal module and confirm **`crash9.log`** no longer shows **`WILD-DA`** at **`0xffffffc0`** for **`compile`** after **`nr=5`**.
 4. Optional: grep the tree for **`(!`** `i64)` **`as u64`** errno tricks and replace with **`neg_errno`**.
 
+## Follow-ups (tooling / UX — not kernel)
+
+- **`neko` (editor):** Does not track or apply **current working directory** the way a normal shell session does — easy to edit or save the **wrong file** when paths are relative or duplicated across dirs. **Bug fix:** teach `neko` cwd semantics (or make cwd explicit in the UI).
+- **Pipes:** Shell pipelines **do not carry cwd** per stage — only the starting process’s cwd applies unless each stage does its own `cd`. Misleading when debugging “file exists” vs “command failed.” **Bug fix:** document in tooling; optionally wrappers that set cwd per pipeline segment.
+- **In-kernel shell (`akuma-shell`):** **`;`** and **`&&`** between commands **are** parsed ([`parse_command_chain`](../../crates/akuma-shell/src/parse.rs)). A lone **`&`** (background job) is **not** implemented — do not rely on it. For **non-interactive SSH one-liners**, prefer **`env KEY=val cmd …`** so vars apply without `export …; …`, or **`go build -o /tmp/hello/hello /tmp/hello`** (package path) to avoid **`cd`** / chaining quirks entirely.
+
 ## References
 
 - [`src/syscall/mod.rs`](../src/syscall/mod.rs) — `handle_syscall`, **`neg_errno`**, xattr stub **`5 | … | 16`**

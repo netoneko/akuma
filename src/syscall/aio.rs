@@ -180,6 +180,10 @@ pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _
 }
 
 /// io_destroy(ctx: aio_context_t) -> i64
+///
+/// Linux returns EINVAL for unknown ctx; negative errno breaks Go (`compile`)
+/// (errno-as-pointer WILD-DA — crash10.log: `[EINVAL] nr=1` then FAR=-6).
+/// Same policy as `sys_io_submit`: return 0 for unknown ctx (idempotent).
 pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
     let removed =
         crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().remove(&ctx));
@@ -192,6 +196,9 @@ pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
             crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
             0
         }
-        None => EINVAL,
+        None => {
+            crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
+            0
+        }
     }
 }

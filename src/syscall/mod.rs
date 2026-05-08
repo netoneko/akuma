@@ -776,12 +776,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         2 => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
         3 => aio::sys_io_cancel(args[0], args[1], args[2]),
         4 => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
-        // Extended attributes syscalls (5-16) - return ENOTSUP (not supported on this fs)
+        // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
+        // AArch64. Must be encoded as `x0 = -95` (0xffffffa9), never `!95`
+        // which is `-96` (0xffffffa0 = EPFNOSUPPORT) and breaks musl/Go callers.
         5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
             // listxattr, llistxattr, flistxattr, removexattr, lremovexattr, fremovexattr
-            const ENOTSUP: u64 = (!95i64) as u64; // Operation not supported
-            ENOTSUP
+            neg_errno(95)
         }
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
             crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,

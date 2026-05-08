@@ -1249,15 +1249,23 @@ fn test_tgkill_not_enosys() {
 ///   - `mmap(_, 0, …)` → EINVAL
 ///   - `bind(bad_fd, …)` → EBADF
 ///   - `setpgid(non_existent_pid, …)` → ESRCH
+///   - xattr stubs (nr 5, 6, 16) → EOPNOTSUPP (-95), never -96 (the old
+///     `(!95i64) as u64` bug that surfaced as Go `compile` SIGSEGV at
+///     errno-shaped FARs; see docs/GO_COMPILE_CRASH_DEBUGGING.md).
 fn test_syscall_errno_compliance() {
     const NR_MMAP: u64 = 222;
     const NR_BIND: u64 = 200;
     const NR_SETPGID: u64 = 154;
+    const NR_SETXATTR: u64 = 5;
+    const NR_LSETXATTR: u64 = 6;
+    const NR_FREMOVEXATTR: u64 = 16;
     const EPERM: u64 = (-1i64) as u64;
     const ESRCH: u64 = (-3i64) as u64;
     const EBADF: u64 = (-9i64) as u64;
     const EFAULT: u64 = (-14i64) as u64;
     const EINVAL: u64 = (-22i64) as u64;
+    const EOPNOTSUPP: u64 = (-95i64) as u64;
+    const EPFNOSUPPORT: u64 = (-96i64) as u64;
 
     // mmap(addr=0, len=0, ...) must return -EINVAL, not -EPERM.
     let mmap_ret = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
@@ -1272,15 +1280,27 @@ fn test_syscall_errno_compliance() {
     let sp_ret = crate::syscall::handle_syscall(NR_SETPGID, &[0xFFFF_FFFE, 0, 0, 0, 0, 0]);
     let sp_ok = sp_ret == ESRCH;
 
+    // xattr stubs must return -EOPNOTSUPP (-95 = 0xffffffa9) bit-exact.
+    // The previous `(!95i64) as u64` returned -96 (EPFNOSUPPORT) which
+    // corrupted Go's heap and caused `go tool compile` SIGSEGV at
+    // FAR=0xffffffffffffffc0 (see docs/GO_COMPILE_CRASH_DEBUGGING.md).
+    let xa_set = crate::syscall::handle_syscall(NR_SETXATTR, &[0, 0, 0, 0, 0, 0]);
+    let xa_lset = crate::syscall::handle_syscall(NR_LSETXATTR, &[0, 0, 0, 0, 0, 0]);
+    let xa_frm = crate::syscall::handle_syscall(NR_FREMOVEXATTR, &[0, 0, 0, 0, 0, 0]);
+    let xa_ok = xa_set == EOPNOTSUPP && xa_lset == EOPNOTSUPP && xa_frm == EOPNOTSUPP;
+    let xa_no_off_by_one =
+        xa_set != EPFNOSUPPORT && xa_lset != EPFNOSUPPORT && xa_frm != EPFNOSUPPORT;
+
     let no_eperm = mmap_ret != EPERM && bind_ret != EPERM && sp_ret != EPERM;
 
-    if mmap_ok && bind_ok && sp_ok && no_eperm {
+    if mmap_ok && bind_ok && sp_ok && no_eperm && xa_ok && xa_no_off_by_one {
         console::print("[Test] syscall_errno_compliance PASSED\n");
     } else {
         crate::safe_print!(
-            96,
-            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={}\n",
+            160,
+            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={} setxattr={} lsetxattr={} fremovexattr={}\n",
             mmap_ret as i64, bind_ret as i64, sp_ret as i64,
+            xa_set as i64, xa_lset as i64, xa_frm as i64,
         );
     }
 }
