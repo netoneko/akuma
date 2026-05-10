@@ -2,7 +2,34 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-05-07, updated 2026-05-08 — interim conclusions below)
+## Current status (2026-05-10 — DC ZVA misrouting fix)
+
+**Root cause confirmed (`crash31.log`, 2026-05-10):** The child crash at `pc=0x86840` (Go's `memclrNoHeapPointers` DC ZVA loop) is caused by **QEMU TCG misrouting `DC ZVA` from EL0 as `EC=0x15` (SVC) instead of `EC=0x18` (system instruction trap)**, with ELR pointing at the DC ZVA instruction itself. Because x8 happened to be 113 (`clock_gettime`) from a prior `nanotime` call, Akuma's SVC handler dispatched to `sys_clock_gettime` with the DC ZVA target address as `clock_id` → **EINVAL**. `frame.x0` was overwritten with EINVAL at line 2096 before SIGURG delivery; the signal frame saved `{pc=0x86840, x0=EINVAL}`; `sigreturn` restored `x0=EINVAL` to the goroutine; DC ZVA with `x0=0xffffffffffffffea` → `[WILD-DA]`.
+
+**Two fixes landed (`src/exceptions.rs`, 2026-05-10):**
+
+1. **EC=0x15 QEMU misrouting detector** (primary fix): Before `handle_syscall`, check whether the instruction at ELR is a DC ZVA (`0xD50B74XX`) and the instruction at ELR-4 is *not* an SVC. If both hold, this is a QEMU misrouting — emulate the DC ZVA via `emulate_dc_zva`, advance ELR by 4, and return the goroutine's original x0 unchanged (never corrupted by a syscall return value).
+
+2. **EC=0x18 DC ZVA emulation** (`emulate_dc_zva`, secondary): Even when EC=0x18 fires for DC ZVA, the old handler silently skipped it (ELR+4, no zeroing). `emulate_dc_zva` now reads `DCZID_EL0.BS`, computes the aligned block size (typically 64 bytes), and zeros the block via `copy_to_user_safe`.
+
+3. **`SCTLR_EL1.DZE=1` fix** (`src/boot.rs`, earlier session): Sets bit 14 so DC ZVA from EL0 is not trapped by the CPU. Despite this, QEMU TCG still generates EC=0x15 (confirmed by `crash31.log`), making fix #1 the critical path.
+
+**Boot test:** `[Test] dc_zva_emulation PASSED` — verifies EL1-side DC ZVA zeroes a block and `DCZID_EL0.BS` is a valid power-of-two (`src/process_tests.rs`).
+
+**Crash chain (`crash31.log` lines 3054–3079):**
+```
+[clock-diag] large clock_id=0x1e059e000 tp=0x21fc0 ELR=0x86840   ← QEMU EC=0x15 misroute
+[EINVAL] nr=113 pid=94 tid=17 ELR=0x86840                          ← clock_gettime returns EINVAL
+[signal] deliver sig=23 fault_pc=0x86840                           ← SIGURG saves x0=EINVAL, pc=0x86840
+[sigreturn] pc=0x86840                                             ← goroutine resumes x0=EINVAL
+[WILD-DA] pid=94 FAR=0xffffffffffffffea ELR=0x86840                ← dc zva x0=EINVAL → fault
+```
+
+**What remains:** Parent-side crash at `fault_pc=0x13060` (pipe `read` / SIGSEGV-HEAP) is a separate pattern — see §Interim conclusions and §Pattern 2 below.
+
+---
+
+## Prior status (2026-05-07, updated 2026-05-08 — interim conclusions below)
 
 **Quadrant experiments (`crash21.log`, **`crash23.log`**, 2026-05-08):** Serial captures across **Go/C parent × Go/C child** combinations — see [§ Quadrant matrix + crash21](#quadrant-matrix--crash21log-2026-05-08) and [§ crash23.log quadrant timeline](#crash23log-quadrant-timeline-2026-05-08). **`pattern2_parent -child=forktest`** drives **`forktest_child`** from a **C** epoll parent; **one** Go child tends to complete cleanly; **two** Go children reliably stress **`forktest_child`** (**`memclr` / errno-shaped FAR**) while **`pattern2_parent` stays `exit_group code=0`**. **`crash23.log`** adds a **dedicated Q4** window (Go parent + Go children): **both** child **`WILD-DA` / `nr=113`** and parent **`sig=11` @ `0x13060`** / **`SIGSEGV-HEAP`** in one session.
 

@@ -1990,6 +1990,49 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            // QEMU-DC-ZVA-MISROUTING: QEMU TCG sometimes generates EC=0x15 (SVC)
+            // instead of EC=0x18 (system instruction trap) for DC ZVA from EL0,
+            // with ELR pointing at the DC ZVA instruction itself rather than SVC+4.
+            // Detection: instruction AT ELR is DC ZVA (0xD50B74XX) AND instruction
+            // at ELR-4 is NOT an SVC.  If both hold, emulate the DC ZVA, advance
+            // ELR by 4, and return the goroutine's original x0 unchanged so that
+            // x0 (the zero-target address) is never overwritten with a syscall
+            // return value — which would crash the goroutine when it resumes DC ZVA.
+            {
+                let elr = frame_ref.elr_el1;
+                let elr_instr = {
+                    let mut buf = [0u8; 4];
+                    unsafe {
+                        akuma_exec::mmu::user_access::copy_from_user_safe(
+                            buf.as_mut_ptr(), elr as *const u8, 4)
+                        .ok()
+                    }.map(|_| u32::from_le_bytes(buf))
+                };
+                if elr_instr.map(|i| (i & !0x1F) == 0xD50B7420).unwrap_or(false) {
+                    let prev_instr = elr.checked_sub(4).and_then(|prev| {
+                        let mut buf = [0u8; 4];
+                        unsafe {
+                            akuma_exec::mmu::user_access::copy_from_user_safe(
+                                buf.as_mut_ptr(), prev as *const u8, 4)
+                            .ok()
+                        }.map(|_| u32::from_le_bytes(buf))
+                    });
+                    let prev_is_svc = prev_instr
+                        .map(|i| (i & 0xFFE0001F) == 0xD4000001)
+                        .unwrap_or(false);
+                    if !prev_is_svc {
+                        // Misrouted DC ZVA: decode Xt register and emulate.
+                        let xt = (elr_instr.unwrap_or(0) & 0x1F) as usize;
+                        let dc_addr = if xt < 31 {
+                            unsafe { core::ptr::read_volatile((frame as *const u64).add(xt)) }
+                        } else { 0 };
+                        emulate_dc_zva(dc_addr);
+                        unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
+
             // rt_sigreturn (NR 139): restore saved context from signal frame
             if syscall_num == 139 {
                 if let Some(saved_x0) = do_rt_sigreturn(frame) {
