@@ -4,19 +4,10 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 ## Current status (2026-05-10 — DC ZVA misrouting fix)
 
-**Root cause confirmed (`crash31.log`, 2026-05-10):** The child crash at `pc=0x86840` (Go's `memclrNoHeapPointers` DC ZVA loop) is caused by **QEMU TCG misrouting `DC ZVA` from EL0 as `EC=0x15` (SVC) instead of `EC=0x18` (system instruction trap)**, with ELR pointing at the DC ZVA instruction itself. Because x8 happened to be 113 (`clock_gettime`) from a prior `nanotime` call, Akuma's SVC handler dispatched to `sys_clock_gettime` with the DC ZVA target address as `clock_id` → **EINVAL**. `frame.x0` was overwritten with EINVAL at line 2096 before SIGURG delivery; the signal frame saved `{pc=0x86840, x0=EINVAL}`; `sigreturn` restored `x0=EINVAL` to the goroutine; DC ZVA with `x0=0xffffffffffffffea` → `[WILD-DA]`.
+### Root cause: QEMU TCG DC ZVA misrouting
 
-**Two fixes landed (`src/exceptions.rs`, 2026-05-10):**
+`crash31.log` (lines 3054–3079) reveals the complete crash chain for the child at `pc=0x86840`:
 
-1. **EC=0x15 QEMU misrouting detector** (primary fix): Before `handle_syscall`, check whether the instruction at ELR is a DC ZVA (`0xD50B74XX`) and the instruction at ELR-4 is *not* an SVC. If both hold, this is a QEMU misrouting — emulate the DC ZVA via `emulate_dc_zva`, advance ELR by 4, and return the goroutine's original x0 unchanged (never corrupted by a syscall return value).
-
-2. **EC=0x18 DC ZVA emulation** (`emulate_dc_zva`, secondary): Even when EC=0x18 fires for DC ZVA, the old handler silently skipped it (ELR+4, no zeroing). `emulate_dc_zva` now reads `DCZID_EL0.BS`, computes the aligned block size (typically 64 bytes), and zeros the block via `copy_to_user_safe`.
-
-3. **`SCTLR_EL1.DZE=1` fix** (`src/boot.rs`, earlier session): Sets bit 14 so DC ZVA from EL0 is not trapped by the CPU. Despite this, QEMU TCG still generates EC=0x15 (confirmed by `crash31.log`), making fix #1 the critical path.
-
-**Boot test:** `[Test] dc_zva_emulation PASSED` — verifies EL1-side DC ZVA zeroes a block and `DCZID_EL0.BS` is a valid power-of-two (`src/process_tests.rs`).
-
-**Crash chain (`crash31.log` lines 3054–3079):**
 ```
 [clock-diag] large clock_id=0x1e059e000 tp=0x21fc0 ELR=0x86840   ← QEMU EC=0x15 misroute
 [EINVAL] nr=113 pid=94 tid=17 ELR=0x86840                          ← clock_gettime returns EINVAL
@@ -25,7 +16,51 @@ This document details crash patterns seen when running `forktest_parent` with **
 [WILD-DA] pid=94 FAR=0xffffffffffffffea ELR=0x86840                ← dc zva x0=EINVAL → fault
 ```
 
-**What remains:** Parent-side crash at `fault_pc=0x13060` (pipe `read` / SIGSEGV-HEAP) is a separate pattern — see §Interim conclusions and §Pattern 2 below.
+**What QEMU is doing wrong:** `forktest_child` disassembles as:
+
+```
+0x8683c: sub  x1, x1, x5    // loop: remaining -= block_size
+0x86840: dc   zva, x0        // zero cache line at x0  ← DC ZVA here
+0x86844: add  x0, x0, x5    // x0 += block_size
+0x86848: subs x1, x1, x5
+0x8684c: b.hs 0x86840        // loop
+```
+
+QEMU TCG generates **EC=0x15 (SVC)** for the `dc zva, x0` at 0x86840, with ELR pointing at the DC ZVA instruction itself (not at the non-existent SVC+4). For real SVCs, ELR = SVC + 4; here ELR = the DC ZVA address, and the instruction at ELR-4 is `sub x1, x1, x5` — not an SVC.
+
+**Why x8=113:** x8 holds the syscall number for `svc #0`. Go's `nanotime1` sets `mov x8, #0x71 (113)` then calls `svc #0`; after that SVC returns, x8=113 is still in the register file (the kernel saves/restores all GPRs across a syscall). The Go runtime does not clear x8 between nanotime and the subsequent `mallocgcLarge → memclrNoHeapPointers` call chain. When QEMU misroutes DC ZVA as EC=0x15, Akuma's SVC dispatcher reads x8=113 and calls `sys_clock_gettime` with x0 = the DC ZVA target address (a heap pointer ~`0x1e0…`) as the `clock_id`.
+
+**Why EINVAL:** `sys_clock_gettime` has a guard — `clock_id > 0x10000000` → EINVAL — intended to catch heap pointers accidentally passed as clock IDs. This fires here, returning EINVAL (0xffffffffffffffea).
+
+**Why the goroutine dies:** After `handle_syscall` returns EINVAL, line 2096 in `exceptions.rs` does `(*frame).x0 = ret` (stores EINVAL into the trap frame's x0 field). SIGURG (goroutine preemption) is pending and gets delivered at this exact syscall return boundary: `try_deliver_signal` builds a signal frame on the goroutine's altstack, saving `{pc = frame.elr_el1 = 0x86840, x0 = EINVAL}`. The Go signal handler (`handler=0x87160`) runs, then returns via `rt_sigreturn`. `do_rt_sigreturn` restores the saved `{x0=EINVAL, pc=0x86840}` to the goroutine. The goroutine resumes at 0x86840 — the DC ZVA instruction — but now x0=0xffffffffffffffea. `SCTLR_EL1.DZE=1` allows DC ZVA to execute without trapping (EC=0x18 no longer fires), so the CPU attempts to zero the cache line at 0xffffffffffffffea → translation fault → `[WILD-DA]`.
+
+### Fixes (`src/exceptions.rs`, 2026-05-10)
+
+**Fix 1 — EC=0x15 QEMU misrouting detector (primary):**
+
+Inserted in `rust_sync_el0_handler` before `handle_syscall` (after the JIT-retry block, before rt_sigreturn). On every EC=0x15 entry:
+
+1. Read 4 bytes at ELR — check if it is a DC ZVA instruction: `(instr & !0x1F) == 0xD50B7420`. The low 5 bits are the Xt register number; all other bits are fixed for any `dc zva, Xn`.
+2. If yes, read 4 bytes at ELR-4 — check if it is **not** an SVC: `(instr & 0xFFE0001F) != 0xD4000001`. This distinguishes the QEMU misrouting (ELR points at DC ZVA; ELR-4 is a non-SVC instruction) from the legitimate case where a real SVC is immediately followed by DC ZVA (`svc #0; dc zva, x0`), which would have an SVC at ELR-4 and should be handled normally.
+3. If both hold: decode Xt from `instr & 0x1F`, read `frame[Xt]` to get the zero-target address, call `emulate_dc_zva(addr)`, set `frame.elr_el1 = elr + 4` (advance past the DC ZVA), return `frame.x0` (original goroutine x0, unmodified). The assembly stub stores the return value into x0 on ERET, so the goroutine resumes at DC_ZVA+4 with x0 = the original heap address, as if the instruction had executed normally.
+
+This means `handle_syscall` is never called, `frame.x0` is never overwritten with a syscall return value, and there is nothing bad for SIGURG to save in a signal frame.
+
+**Fix 2 — EC=0x18 DC ZVA emulation via `emulate_dc_zva` (secondary):**
+
+Added `pub(crate) fn emulate_dc_zva(addr: u64)` (`src/exceptions.rs` ~line 687). Reads `DCZID_EL0`: if bit 4 (DZP) is set, DC ZVA is prohibited — return silently. Otherwise, `block_size = (4 << BS).min(2048)` (QEMU uses BS=4 → 64 bytes), aligns `addr` to the block boundary, and zeroes `block_size` bytes via `copy_to_user_safe`. Also wired into the EC=0x18 handler's `CRm==4` branch so that if QEMU does generate EC=0x18 (e.g. with DZE=0), the handler actually zeroes memory instead of silently skipping.
+
+**Fix 3 — `SCTLR_EL1.DZE=1` (`src/boot.rs`, prior session):**
+
+Sets bit 14 in SCTLR_EL1 at boot so that DC ZVA from EL0 is architecturally permitted without a trap. Confirmed effective: after this fix, invalid DC ZVA addresses generate EC=0x25 (data abort) rather than EC=0x18 (system trap), which is correct CPU behavior. QEMU TCG nonetheless continues generating EC=0x15 for DC ZVA, so Fix 1 is still required.
+
+### Kernel boot test
+
+`test_dc_zva_emulation` in `src/process_tests.rs`: reads `DCZID_EL0.BS`, checks block size is a power-of-two ≥ 4, allocates a heap buffer, fills it with 0xAA, issues `dc zva` from EL1 (no trap needed in EL1 regardless of DZE), and verifies the block is zeroed. Boot log shows `[Test] dc_zva_emulation PASSED`.
+
+### What remains
+
+Parent-side crash at `fault_pc=0x13060` (SIGSEGV in pipe `read` / `runtime.read`) is a separate pattern unrelated to DC ZVA — see §Interim conclusions and §Pattern 2 below.
 
 ---
 
