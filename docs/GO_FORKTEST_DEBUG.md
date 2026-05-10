@@ -113,13 +113,14 @@ The fault chain:
 
 Before the DC ZVA fix, the child was crashing within seconds (crash31.log shows the child dying at ~T1). Thread=17 ran very little child-side code before the child died, so the window for the demand-paging race was tiny. With the DC ZVA fix, `forktest_child` runs for the full 30s duration with heavy mmap stress (70 MiB, `-mmap_test`), greatly expanding the window during which Thread=17 is executing child goroutines under the parent's process_info_page PID.
 
-### Fix direction
+### Fix applied (2026-05-10)
 
-The fix must ensure `read_current_pid()` (via the process_info_page) returns the correct PID for the currently-running address space:
+**`address_space_owner_pid_for_fault()` — TTBR0-derived lookup**
+(`crates/akuma-exec/src/process/children.rs`)
 
-- **When `execve` assigns a new child to a kernel thread**, update that thread's process_info_page mapping to point at the child's PID. Currently, the thread's `process_info_phys` pointer is set at fork time and is not updated on exec of a child that reuses the same thread slot.
-- **In the demand-paging fault handler**, use TTBR0-derived address-space owner lookup rather than `read_current_pid()` to identify which process's lazy regions to consult. The address-space owner PID is already used for `CLONE_VM` threads; the same mechanism should apply when Thread N runs a newly-exec'd child.
-- **Alternative**: store the address-space owner PID in the kernel thread state (not in the user-visible process_info_page) and update it on every TTBR0 switch.
+Added `owner_pid_for_l0_phys(l0_phys)` which scans the process table for the non-shared process (thread-group leader) whose address space L0 frame matches the given physical address.  Updated `address_space_owner_pid_for_fault()` to call this first, using the current TTBR0_EL1 (which unambiguously identifies the running address space) before falling back to `THREAD_PID_MAP → tgid` and `read_current_pid()`.
+
+**Why this fixes the crash**: TTBR0_EL1 is always correct for the currently-running address space. Any staleness in `THREAD_PID_MAP` (e.g. a kernel thread slot reused for a different process before the old entry was cleaned up, or a goroutine that was assigned tgid=100 by a misdirected `clone_thread` call) does not affect the TTBR0 path. The demand-pager now finds the correct owner PID even if the process_info_page or thread map disagrees.
 
 ---
 

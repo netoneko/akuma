@@ -6,7 +6,7 @@ use spinning_top::Spinlock;
 use crate::process::Process;
 use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, ProcessInfo2, ProcessState};
 use crate::process::channel::{ProcessChannel, get_channel};
-use crate::process::table::{LAZY_REGION_TABLE, THREAD_PID_MAP};
+use crate::process::table::{LAZY_REGION_TABLE, THREAD_PID_MAP, find_process};
 use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
 use akuma_terminal as terminal;
 
@@ -285,11 +285,40 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
     })
 }
 
+/// Find the PID of the non-shared process whose address space's L0 page-table frame
+/// matches `l0_phys`. CLONE_THREAD goroutines share an address space (is_shared==true),
+/// so this returns the thread-group leader (the owner of the real page tables).
+fn owner_pid_for_l0_phys(l0_phys: usize) -> Option<Pid> {
+    find_process(|p| {
+        if !p.address_space.is_shared() && p.address_space.l0_phys() == l0_phys {
+            Some(p.pid)
+        } else {
+            None
+        }
+    })
+}
+
 /// Thread group leader PID for page-fault / CoW paths: all `CLONE_VM` threads in a group must
 /// share one [`Process::fault_mutex`] and match [`LAZY_REGION_TABLE`] (see `clone_lazy_regions`,
-/// forktest / GO_FORKTEST_DEBUG). Prefer `current_process().tgid`, fall back to ProcessInfo PID.
-#[inline]
+/// forktest / GO_FORKTEST_DEBUG).
+///
+/// Uses TTBR0-derived lookup as the primary mechanism: the current TTBR0_EL1 unambiguously
+/// identifies the running address space regardless of THREAD_PID_MAP state.  Stale
+/// THREAD_PID_MAP entries (e.g. when a kernel thread slot is reused for a different process)
+/// would otherwise cause the demand-pager to look up lazy regions under the wrong PID,
+/// triggering an EL1 copy-path fault and delivering a spurious SIGSEGV to the wrong process.
 pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
+    // TTBR0 identifies the running address space with certainty.  Find the non-shared
+    // process (i.e. the thread-group leader) that owns this L0 frame.
+    let ttbr0 = crate::mmu::get_current_ttbr0() as usize;
+    let boot_ttbr0 = crate::mmu::get_boot_ttbr0() as usize;
+    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    if l0_phys != 0 && l0_phys != boot_ttbr0 {
+        if let Some(pid) = owner_pid_for_l0_phys(l0_phys) {
+            return Some(pid);
+        }
+    }
+    // Fallback: THREAD_PID_MAP tgid, then ProcessInfo page.
     current_process().map(|p| p.tgid).or_else(read_current_pid)
 }
 
