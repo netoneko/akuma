@@ -16,6 +16,26 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     // FAR=0x10 with memclr ELR (see docs/GO_FORKTEST_DEBUG.md).
     const MAX_REASONABLE_CLOCK_ID: u64 = 0x1000_0000;
     if clock_id_arg > MAX_REASONABLE_CLOCK_ID {
+        // Diagnostic: read instruction bytes at ELR and ELR-4 to identify the caller
+        if let Some(elr) = akuma_exec::threading::current_trap_frame_elr() {
+            let mut instr_before = [0u8; 4];
+            let mut instr_at = [0u8; 4];
+            let ok_before = elr >= 4 && unsafe {
+                akuma_exec::mmu::user_access::copy_from_user_safe(
+                    instr_before.as_mut_ptr(), (elr - 4) as *const u8, 4).is_ok()
+            };
+            let ok_at = unsafe {
+                akuma_exec::mmu::user_access::copy_from_user_safe(
+                    instr_at.as_mut_ptr(), elr as *const u8, 4).is_ok()
+            };
+            let before_word = u32::from_le_bytes(instr_before);
+            let at_word = u32::from_le_bytes(instr_at);
+            crate::safe_print!(192,
+                "[clock-diag] large clock_id={:#x} tp={:#x} ELR={:#x}\n  instr[ELR-4]={:#010x}({}) instr[ELR]={:#010x}({})\n",
+                clock_id_arg, tp_ptr, elr,
+                before_word, if ok_before { "ok" } else { "err" },
+                at_word, if ok_at { "ok" } else { "err" });
+        }
         return EINVAL;
     }
     let clock_id = clock_id_arg as u32;

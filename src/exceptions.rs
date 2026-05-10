@@ -681,6 +681,25 @@ pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
         && a < akuma_exec::process::types::ProcessMemory::KERNEL_VA_END
 }
 
+/// Emulate `DC ZVA` for EL0 when QEMU TCG still traps it despite SCTLR_EL1.DZE=1.
+/// Zeros the naturally-aligned block that contains `addr`, using the block size
+/// from DCZID_EL0.BS (4 << BS bytes, typically 64).
+pub(crate) fn emulate_dc_zva(addr: u64) {
+    let dczid: u64;
+    unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid); }
+    // Bit 4 (DZP) set means DC ZVA is prohibited; skip silently.
+    if dczid & (1 << 4) != 0 { return; }
+    let bs = (dczid & 0xF) as u32;
+    // block_size = 4 << BS; cap at 2048 to bound the stack frame.
+    let block_size = (4usize << bs).min(2048);
+    let aligned_addr = addr & !(block_size as u64 - 1);
+    let zeros = [0u8; 2048];
+    let _ = unsafe {
+        akuma_exec::mmu::user_access::copy_to_user_safe(
+            aligned_addr as *mut u8, zeros.as_ptr(), block_size)
+    };
+}
+
 /// Human-readable syscall hint for forktest Pattern 2 serial (`GO_FORKTEST_DEBUG.md`).
 fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
     use crate::syscall::nr;
@@ -3063,10 +3082,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // Cache maintenance instruction (DC or IC).
                     // DC CVAU: op1=3, crm=11, op2=1
                     // IC IVAU: op1=3, crm=5, op2=1
+                    // DC ZVA:  op1=3, crm=4,  op2=1
                     if op1 == 3 && crm == 11 && op2 == 1 {
                         unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr); }
                     } else if op1 == 3 && crm == 5 && op2 == 1 {
                         unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr); }
+                    } else if op1 == 3 && crm == 4 && op2 == 1 {
+                        emulate_dc_zva(addr);
                     }
                 }
             }

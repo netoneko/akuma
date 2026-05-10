@@ -579,7 +579,65 @@ cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2) -p akuma -- sig
 
 ---
 
+---
+
+## Fixes applied (2026-05-10)
+
+Four of the six planned fixes were implemented in `src/exceptions.rs`. All compile clean (`cargo check` zero errors); 332 host-target unit tests pass; kernel fully boots to SSH under TCG; no new in-kernel test failures.
+
+### Fix 1 — FPSIMD vreg copy alignment (F5.2)
+
+**Sites:** `try_deliver_signal` (frame build) and `do_rt_sigreturn` (frame restore).
+
+The vreg destination is at `new_sp + SIGFRAME_FPSIMD + 16 = new_sp + 600`; `600 % 16 == 8` so the buffer is only 8-byte aligned. The old `u128` pointer-cast loop could lower to `ldp q` / `stp q`, which require 16-byte alignment on AArch64 (alignment fault on hardware, silent misread on QEMU TCG).
+
+**Fix:** replaced the 32-iteration `u128` loop with `core::ptr::copy_nonoverlapping::<u8>(src, dst, 32 * 16)` at both sites.
+
+### Fix 3 — SA_RESTART reads stale ESR (F1.3)
+
+**Site:** `try_deliver_signal` signature and all five call sites.
+
+The old code read `ESR_EL1` via inline `mrs` inside `try_deliver_signal`, which runs after potential scheduler yields. After a context switch `ESR_EL1` reflects the last exception on this CPU, not the signal-entry exception. The check could skip SA_RESTART for a real interrupted syscall, or trigger it on a non-SVC fault path.
+
+**Fix:** added `entry_esr: u64` parameter; all five call sites pass the `esr` captured at the very top of `rust_sync_el0_handler`. Inner `mrs esr_el1` removed.
+
+### Fix 6 — SPSR sanitisation destroys NZCV (F2.1)
+
+**Site:** `do_rt_sigreturn` corrupted-SPSR branch.
+
+Old code wrote `(*frame).spsr_el1 = 0`, clearing NZCV and DAIF along with the bad mode bits. Go's signal handler reads/writes condition flags in pstate for goroutine stack-scan decisions; zeroing them causes the preempted goroutine to resume with incorrect flags.
+
+**Fix:** `(*frame).spsr_el1 = restored_spsr & !0x1F` — only M[4:0] cleared; NZCV, DAIF, and all other flag bits preserved.
+
+### Fix 5 — sa_mask never applied at delivery (F1.1)
+
+**Site:** `try_deliver_signal`, after the SA_NODEFER block.
+
+`sys_rt_sigaction` stored `sa_mask` in `SignalAction.mask` correctly, but delivery never ORed it into `proc.signal_mask`. Signals listed in `sa_mask` remained unmasked during handler execution — a POSIX violation.
+
+**Fix:** added `proc.signal_mask |= action.mask & !((1u64 << 8) | (1u64 << 18));` (SIGKILL/SIGSTOP excluded as required).
+
+### Deferred
+
+- **Fix 2** (SP alignment/bounds in `do_rt_sigreturn`) — needs tuning to not reject non-altstack delivery.
+- **Fix 4** (signal delivery at `irq_el0_handler` return) — requires assembly changes and re-entrancy analysis; will be done behind a `config` toggle.
+
+### Boot verification
+
+| Check | Result |
+|---|---|
+| `cargo check` | 0 errors, 1 pre-existing warning |
+| Host-target unit tests | 332 passed, 0 failed |
+| TCG boot — elftest | PASSED (exit 42) |
+| TCG boot — signal tests | All `[PASS]` unchanged from baseline |
+| TCG boot — SSH server | Listening on port 2222 |
+| New in-kernel failures | None |
+| HVF `(isv)` assertion | Pre-existing QEMU HVF bug, unrelated |
+
+---
+
 ## Document history
 
 - **2026-05-10:** Initial write-up after analysis of `crash27.log` and user-reported Pattern 2 stacks; supports rollback of narrow `SIGURG` stub deferral and shift to signal-path audit.
 - **2026-05-10:** Code audit and fix plan added (findings F1.1–F5.2, fixes 1–6, eight new kernel tests).
+- **2026-05-10:** Fixes 1, 3, 5, 6 implemented in `src/exceptions.rs`; boot verified; fixes 2 and 4 deferred.
