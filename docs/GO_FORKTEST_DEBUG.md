@@ -64,6 +64,65 @@ Parent-side crash at `fault_pc=0x13060` (SIGSEGV in pipe `read` / `runtime.read`
 
 ---
 
+## Pattern 2 root cause analysis (crash32.log, 2026-05-10)
+
+`crash32.log` provides clean evidence of the parent crash in a run where the DC ZVA child crash was already fixed. The child (`forktest_child` pid=97) exits `code=0` at T60.43 after 30.27s; the parent (`forktest_parent` pid=100) crashes at T178.70 after only 1.57s. The DC ZVA fix eliminated the child crash but exposed the parent crash in isolation.
+
+### crash32.log crash sequence (T178.55–T178.70)
+
+```
+[T178.55] [pipe-read] enter pid=100 tid=8 fd=4 pipe=34 buf=0x1e0087708 cnt=1024
+[T178.56] [epoll]    ev[0] data=0x4 IN
+[signal] tkill(tid=17, sig=23)
+[T178.58] [signal] deliver sig=23 slot=17 handler=0x87160 fault_pc=0x87064
+[T178.58] [sigreturn] restoring: sp=0x1e0083c90 pc=0x87064 pstate=0x80000000
+[T178.59] [SIGSEGV-HEAP] pid=100 far=0x1e0a47000 elr=0x402b38a0 iss=0x47
+[T178.59] [signal] deliver sig=11 slot=8 handler=0x86ee0 fault_pc=0x13060
+[Exception] Sync from EL1: EC=0x25, ISS=0x47
+  ELR=0x40435e28, FAR=0x1e0a47000, SPSR=0x80002345
+  Thread=17, TTBR0=0xcc00005958a000, TTBR1=0x404b6000
+  SP=0x583048d0, SP_EL0=0x1e0066c30
+  Instruction at ELR: 0x38001403   (strb w3, [x0], #1)
+[T178.70] [exit_group] pid=100 name=/bin/forktest_parent code=2 after 1.57s
+```
+
+Key observation: the `[SIGSEGV-HEAP]` log and the `[Exception] Sync from EL1` log are produced by the same page fault — but they fire under different contexts. `[SIGSEGV-HEAP]` reports `pid=100` (parent) because that is what `read_current_pid()` returns; the EL1 exception dump shows `Thread=17, TTBR0=0xcc00005958a000`. These are inconsistent.
+
+### Root cause: process_info_page PID mismatch
+
+Thread=17 is running the child's goroutine (`SP_EL0=0x1e0066c30` is in the child's goroutine stack range; the TTBR0 is the child's page table root) but `read_current_pid()` returns 100 (the parent's PID). This happens because `process_info_page` — the per-thread page that holds the PID readable from EL0 — is **not updated** when a newly-exec'd child is assigned to a kernel thread that previously ran the parent's goroutines.
+
+The fault chain:
+
+1. **Thread=17 triggers a demand-paging fault** on child VA `0x1e0a47000` — a lazily-mapped heap page in the child's address space.
+2. **The kernel's demand-paging handler** reads `read_current_pid()` → 100 (parent). It looks up the parent's lazy region table (keyed by PID 100) for VA `0x1e0a47000`.
+3. **That VA does not exist in the parent's lazy regions** — it's a child VA. The lookup fails.
+4. **The kernel copy path** (`strb w3, [x0], #1` at EL1 ELR=0x40435e28) faults when trying to write to the unmapped page, generating a **Sync from EL1 exception** (EC=0x25 = data abort from EL1).
+5. **The EL1 fault handler** sees this as an unexpected kernel address fault, delivers `SIGSEGV` to `pid=100` (still using the stale `read_current_pid()`), with `fault_pc=0x13060` (the `read` SVC+4 — the parent goroutine's suspended resume point).
+6. **The parent goroutine** receives SIGSEGV at `pc=0x13060` (return from `read` syscall) with `addr=0x1e0a47000` (the child's unmapped heap page) — a heap-range address that makes Go panic.
+
+### Evidence details
+
+- `TTBR0=0xcc00005958a000`: This is the child's (pid=104, exec'd at T177.42) page table. It is **not** the parent's page table. Thread=17 was assigned to the child after `execve`.
+- `SP_EL0=0x1e0066c30`: This is in the `~0x1e006...` range — the child's goroutine stack (child stacks span `0x1e006...`–`0x1e008...`). The parent's main goroutine has `user_sp≈0x1e0087xxx` throughout the log.
+- `[SIGSEGV-HEAP] pid=100 far=0x1e0a47000 elr=0x402b38a0`: The SIGSEGV is attributed to pid=100 because the PID lookup is stale. `elr=0x402b38a0` is inside the kernel (`0x402b…`) — this is a kernel VA fault, not a user-land fault, confirming the EL1 copy path faulted.
+- `[signal] deliver sig=11 slot=8 handler=0x86ee0 fault_pc=0x13060`: The signal is delivered at slot=8 (the parent's main goroutine thread). `fault_pc=0x13060` is the `read` syscall return trampoline — the parent goroutine is waiting blocked in `unix.Read` on the epoll pipe and gets a spurious SIGSEGV from the child's demand-paging failure.
+- Earlier in the log (T29.55, T177.42): the child (`forktest_child`) was exec'd twice (`pid=94` and `pid=104`). Thread=17 evidences fault at `TTBR0=0xc1000059568000` (pid=94's tables) at T29 (lines 3006, 3278) and at `TTBR0=0xcc00005958a000` (pid=104's tables) at T178 — same pattern, same thread, two different children, same stale-PID failure mode.
+
+### Why this is hard to hit without the DC ZVA fix
+
+Before the DC ZVA fix, the child was crashing within seconds (crash31.log shows the child dying at ~T1). Thread=17 ran very little child-side code before the child died, so the window for the demand-paging race was tiny. With the DC ZVA fix, `forktest_child` runs for the full 30s duration with heavy mmap stress (70 MiB, `-mmap_test`), greatly expanding the window during which Thread=17 is executing child goroutines under the parent's process_info_page PID.
+
+### Fix direction
+
+The fix must ensure `read_current_pid()` (via the process_info_page) returns the correct PID for the currently-running address space:
+
+- **When `execve` assigns a new child to a kernel thread**, update that thread's process_info_page mapping to point at the child's PID. Currently, the thread's `process_info_phys` pointer is set at fork time and is not updated on exec of a child that reuses the same thread slot.
+- **In the demand-paging fault handler**, use TTBR0-derived address-space owner lookup rather than `read_current_pid()` to identify which process's lazy regions to consult. The address-space owner PID is already used for `CLONE_VM` threads; the same mechanism should apply when Thread N runs a newly-exec'd child.
+- **Alternative**: store the address-space owner PID in the kernel thread state (not in the user-visible process_info_page) and update it on every TTBR0 switch.
+
+---
+
 ## Prior status (2026-05-07, updated 2026-05-08 — interim conclusions below)
 
 **Quadrant experiments (`crash21.log`, **`crash23.log`**, 2026-05-08):** Serial captures across **Go/C parent × Go/C child** combinations — see [§ Quadrant matrix + crash21](#quadrant-matrix--crash21log-2026-05-08) and [§ crash23.log quadrant timeline](#crash23log-quadrant-timeline-2026-05-08). **`pattern2_parent -child=forktest`** drives **`forktest_child`** from a **C** epoll parent; **one** Go child tends to complete cleanly; **two** Go children reliably stress **`forktest_child`** (**`memclr` / errno-shaped FAR**) while **`pattern2_parent` stays `exit_group code=0`**. **`crash23.log`** adds a **dedicated Q4** window (Go parent + Go children): **both** child **`WILD-DA` / `nr=113`** and parent **`sig=11` @ `0x13060`** / **`SIGSEGV-HEAP`** in one session.
