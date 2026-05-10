@@ -4,7 +4,7 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 ## Current status (2026-05-07, updated 2026-05-08 — interim conclusions below)
 
-**Quadrant experiments (`crash21.log`, 2026-05-08):** Serial capture across **Go/C parent × Go/C child** combinations — see [§ Quadrant matrix + crash21](#quadrant-matrix--crash21log-2026-05-08). **`pattern2_parent -child=forktest`** drives **`forktest_child`** from a **C** epoll parent; **one** Go child tends to complete cleanly; **two** Go children reliably stress **`forktest_child`** (**`memclr` / errno-shaped FAR**) while **`pattern2_parent` stays `exit_group code=0`**.
+**Quadrant experiments (`crash21.log`, **`crash23.log`**, 2026-05-08):** Serial captures across **Go/C parent × Go/C child** combinations — see [§ Quadrant matrix + crash21](#quadrant-matrix--crash21log-2026-05-08) and [§ crash23.log quadrant timeline](#crash23log-quadrant-timeline-2026-05-08). **`pattern2_parent -child=forktest`** drives **`forktest_child`** from a **C** epoll parent; **one** Go child tends to complete cleanly; **two** Go children reliably stress **`forktest_child`** (**`memclr` / errno-shaped FAR**) while **`pattern2_parent` stays `exit_group code=0`**. **`crash23.log`** adds a **dedicated Q4** window (Go parent + Go children): **both** child **`WILD-DA` / `nr=113`** and parent **`sig=11` @ `0x13060`** / **`SIGSEGV-HEAP`** in one session.
 
 **Forktest mmap stress still reproduces intermittent allocator crashes** (`pc≈0x86768`, `runMmapStress` / `memclr`), with fault addresses varying over time (`0x2`, **`0x10`** / **`0x12`** (low canonical VAs), negative “errno-like” FARs, etc.). A **lazy-region / `tgid` owner fix** (2026-05-07) addresses a real **`EFAULT` / wrong-owner** class of bugs but **does not close** the **SIGURG + syscall / JIT replay** failure mode seen in serial evidence (see **`crash5.log`** below).
 
@@ -16,7 +16,7 @@ This document details crash patterns seen when running `forktest_parent` with **
 
 **Pipe `read` tracing (2026-05-08):** With **`SYSCALL_DEBUG_PIPE_READ`** (and optional **`SYSCALL_DEBUG_PIPE_READ_SAMPLE`**) in [`src/config.rs`](../src/config.rs), serial emits **`[pipe-read] enter`** / **`EFAULT`** lines from [`src/syscall/fs.rs`](../src/syscall/fs.rs) for **`PipeRead`** FDs—correlate with **`fault_pc≈0x13060`** via **`tprint`** timestamps. [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh) greps **`[pipe-read]`** alongside mmap / fault markers.
 
-Synthesis of evidence so far: [§ Interim conclusions](#interim-conclusions-2026-05-08). **Continuing work:** [§ Agent handoff](#agent-handoff-2026-05-08).
+Synthesis of evidence so far: [§ Interim conclusions](#interim-conclusions-2026-05-08). **Continuing work:** [§ Agent handoff](#agent-handoff-2026-05-08) (includes **`crash23.log`** findings).
 
 This failure mode is **orthogonal** to ext2 fixes that removed spurious **`input/output error`** on `/tmp` under load (blocking `read_state()` and a single `write_state()` for `write_at` in [`crates/akuma-ext2/src/ext2.rs`](../crates/akuma-ext2/src/ext2.rs)). If you see **EIO** on temp files, that was filesystem contention; if you see **`addr=0x2`** / **`0x10`** in the Go allocator, treat it as the **heap + demand paging + signal / syscall-frame** investigation described below.
 
@@ -124,7 +124,7 @@ Single boot, serial **`crash21.log`** (~32k lines): mixed **`forktest_parent`**,
 | **Q1** | Go **`forktest_parent`** | C **`mmap_stress`** (`--use_c_child`) | **Mixed:** **`forktest_parent`** **`exit_group code=2`** (e.g. pid **90**, **111**) and **`code=0`** (e.g. **97**, **104**). **`mmap_stress`** exits logged **`code=0`**. Matches **Pattern 2** in the **Go parent** — intermittent. |
 | **Q2** | C **`pattern2_parent`** | C **`mmap_stress`** (default) | **Stable:** **`pattern2_parent`** **`code=0`**; **`mmap_stress`** **`code=0`** (several 3-child runs @ **70 MiB**). Baseline: epoll/pipe + mmap storm **without Go**. |
 | **Q3** | C **`pattern2_parent`** | Go **`forktest_child`** (**`-child=forktest`**) | **Parent always `code=0`.** **`forktest_child`** sometimes **`code=2`** under multi-child + **70 MiB** (failed **`runMmapStress`** / **`memclr`**); **`code=0`** on other runs. Failure is **child-side**, not C epoll. **One** Go child often completes; **two** children reliably reproduce **`forktest_child`** faults in interactive testing — aligns with **`exit_group`** **`forktest_child`** **`code=2`** while parent **`pattern2_parent`** still **`code=0`**. |
-| **Q4** | Go **`forktest_parent`** | Go **`forktest_child`** (default) | **Not clearly separated** in this serial file (no distinct **`execve(forktest_parent)`** + **`forktest_child`** window vs Q1 — prioritize a dedicated capture with **`tee`**). Required to compare **Pattern 2 parent** vs **child malloc** in one controlled session. |
+| **Q4** | Go **`forktest_parent`** | Go **`forktest_child`** (default) | **`crash23.log`** (~**T224–T226**): explicit **`forktest_parent`** + **`forktest_child`** window — parent **`sig=11`**, **`fault_pc=0x13060`**, **`[SIGSEGV-HEAP]`** on parent **`far≈0x1e4372000`**; children **`[EINVAL] nr=113`** @ **`ELR≈0x86768`** → **`[WILD-DA] FAR=0xfffffffa`**. **`crash21.log`** alone did not isolate Q4 cleanly; use **`crash23`** as the serial baseline for **Go+Go**. |
 
 ### Kernel sequence (Q3 / errno-shaped FAR)
 
@@ -148,6 +148,44 @@ Rebuild **`pattern2_parent`** / disk after changing [`pattern2_parent.c`](../use
 2. **Q3 bisection:** **`pattern2_parent -child=forktest -num_children=2`** with **`-mmap_alloc_mb=10`** vs **70** to locate a pressure threshold.
 3. **Q3 control:** **`pattern2_parent`** (default **`mmap_stress`**) **`-num_children=2`** @ **70 MiB** — if stable, isolates **Go runtime + syscalls** vs raw mmap traffic.
 4. **Kernel audit:** **`nr=113`** path + trap-frame **`args=`** when **`ELR`** points at **allocator** PC — [`src/syscall/mod.rs`](../src/syscall/mod.rs), [`src/exceptions.rs`](../src/exceptions.rs).
+
+## crash23.log quadrant timeline (2026-05-08)
+
+Serial **`crash23.log`** (~7185 lines): one QEMU boot with SSH traffic + mixed quadrant runs. Mine with [`scripts/analyze_kernel_log.sh`](../scripts/analyze_kernel_log.sh) (**`[WILD-DA]`**, **`[EINVAL] nr=113`**, **`deliver sig=11`**, **`exit_group`**).
+
+### Boot noise (ignore for forktest RCA)
+
+- **`[Test] exit_group_kills_siblings_before_close_all FAILED`** during kernel self-tests — **orthogonal** to mmap/forktest; track as a separate CI/kernel bug.
+
+### Q1 — Go parent + C **`mmap_stress`** (~**T39**)
+
+- **`forktest_parent` pid 90** (`/bin/forktest_parent`): **`tkill(tid=8, sig=23)`** then **`deliver sig=11`**, **`fault_pc=0x13060`**, **`slot=8`**; nested **`sig=23`** at **`fault_pc=0x80800`** after **`sigreturn`**.
+- **`[exit_group] pid=90 … forktest_parent code=2`** after **~0.63 s**. No adjacent **`[pipe-read] EFAULT`** — same shape as **`crash19`**: parent dies **without** a logged pipe **`copy_to_user`** failure.
+- Children **94–96** continue **`mmap_stress`**; **`[EINVAL] nr=222`** (**`len==0`**, garbage decode) appears **after** the parent is already gone — **parallel child noise**, not causal ordering.
+
+### Q2 — C **`pattern2_parent`** + C **`mmap_stress`** (~**T85–T95**)
+
+- **`pattern2_parent` pid 97** **`exit_group code=0`**; **`mmap_stress`** pids **98–100** **`code=0`**. **`buf≈0x201ffffa00`** on **`[pipe-read]`** (musl stack) vs Go **`~0x1e0087708`**.
+
+### Q3 — C **`pattern2_parent`** + Go **`forktest_child`**
+
+- **One child (~T127–T138):** **`forktest_child` pid 108 `code=0`**, **`pattern2_parent` pid 101 `code=0`** — clean.
+- **Two children (~T155–T156):** **`forktest_child` pid 110**: **`[EINVAL] nr=113`** (**`clock_gettime`**) with **`ELR≈0x86768`** and implausible **`args=`** → **`[DA-MISS] va=0xfffffffffffffffa`** → **`[WILD-DA]`** (**`FAR=-6`**, **`x0=-22`**). **`forktest_child` exits `code=2`**; **`pattern2_parent` pid 109 `code=0`**. Strong kernel-visible proof of the **child-only** errno / **`memclr`** lane while the **C parent stays healthy**.
+
+### Q4 — Go **`forktest_parent`** + Go **`forktest_child`** (~**T224–T226**)
+
+- **`SIGURG`** bursts (**`tkill`**) on parent thread **tid 8** with **`fault_pc=0x13060`**; **`sigreturn`** restores **`pc=0x13060`** (syscall trampoline under preempt signals).
+- **`forktest_child`** pids **127 / 128**: repeat **`[EINVAL] nr=113` @ `ELR≈0x86768`** → **`[WILD-DA]`** (**`FAR=0xfffffffa`**).
+- **`forktest_parent` pid 123**: **`[SIGSEGV-HEAP] far=0x1e4372000 elr=0x402b30a0`** then **`deliver sig=11`**, **`fault_pc=0x13060`** — **two PCs** in sequence (**runtime / heap-tagged fault** vs **stub-line `sig=11`**); treat both as parent-side evidence, not a single ELR.
+- **`forktest_parent` `exit_group code=2`**; some **`forktest_child`** instances **`code=2`**, others **`code=0`** depending on timing.
+
+### Instrumentation gap in this capture
+
+- **No `[sigsegv-syscall]`** lines — either **`DEBUG_SIGSEGV_SYSCALL_STUB`** was off or ELR at the diagnostic site did not match the stub window. **Use serial **`deliver sig=11` … `fault_pc=0x13060`**** as the anchor for the parent crash in this log.
+
+### Relation to **`crash21.log`**
+
+- **`crash21`** established the quadrant matrix and Q3 **`nr=113` → `WILD-DA`** sequence; **`crash23`** **narrows Q4** (Go+Go) and records **Q1/Q2/Q3** in one shorter file with **timestamps** (**`T39`**, **`T95`**, **`T138`**, **`T226`**) for ordering **`SIGURG`** vs child faults.
 
 ## Isolation matrix (2026-04-14)
 
@@ -596,9 +634,17 @@ Heavy **`forktest`** also produced **`[DA-DP] … anon alloc failed, 0 free page
 
 **Mitigations while debugging:** `GODEBUG=asyncpreemptoff=1`, ample RAM, smaller `-mmap_alloc_mb` for bisection; reduce contention with **`--num_children=1`** when isolating parent vs child behavior.
 
-## Agent handoff (2026-05-08)
+## Agent handoff (2026-05-08, updated with crash23)
 
 Use this section to pick up **`forktest_parent`** + **`--use_c_child`** + **`-mmap_test`** investigation without re-reading the whole thread. **Root cause is not closed.**
+
+### Handoff notes from **`crash23.log`**
+
+- **Q4 is now serial-documented:** Go parent (**pid 123**) + Go children in **one boot** — **`SIGURG`/`tkill`** overlapping **`fault_pc=0x13060`**, **`[SIGSEGV-HEAP]`** (**`elr=0x402b30a0`**) immediately before **`deliver sig=11`** (**`fault_pc=0x13060`**), plus **`forktest_child`** **`nr=113` → `WILD-DA`** (**pids 127/128**). Confirms **messy Q4** from interactive SSH is reproducible on serial with **PID/timestamp order**.
+- **Q3 two-child** block (**~T155**): **`pattern2_parent` `code=0`** while **`forktest_child` pid 110** fails — **best short kernel trace** for **`EINVAL nr=113`** + **`ELR≈memclr`** without Go parent in the loop.
+- **Q1** (~**T39**): **`forktest_parent` pid 90** dies **`code=2`** at **`fault_pc=0x13060`**; **`mmap_stress`** survives — parent failure **does not require** child **`WILD-DA`** first.
+- **Still missing on this kernel binary:** **`[sigsegv-syscall]`** — next agent should verify **`DEBUG_SIGSEGV_SYSCALL_STUB`** at build time when correlating **`x8`** with **`fault_pc=0x13060`**.
+- **Ignore boot **`exit_group_kills_siblings`** test failure** when grep-mining **`crash23`** for forktest (listed in [§ crash23.log quadrant timeline](#crash23log-quadrant-timeline-2026-05-08)).
 
 ### Scope
 
@@ -639,7 +685,7 @@ Use this section to pick up **`forktest_parent`** + **`--use_c_child`** + **`-mm
 
 ### Recommended next steps (for the next agent)
 
-1. ~~**Log syscall number at fault:**~~ **Done in-tree** (`[sigsegv-syscall]`, [`src/exceptions.rs`](../src/exceptions.rs); **`DEBUG_SIGSEGV_SYSCALL_STUB`** in [`src/config.rs`](../src/config.rs)). **Also observable from SSH:** first arg to **`Syscall6`** / **`Syscall`** (**`crash19`** session: **`asyncpreemptoff`** → **`epoll_ctl`** (**`0x15`**); default → **`read`** (**`0x3f`**)).
+1. ~~**Log syscall number at fault:**~~ **Done in-tree** (`[sigsegv-syscall]`, [`src/exceptions.rs`](../src/exceptions.rs); **`DEBUG_SIGSEGV_SYSCALL_STUB`** in [`src/config.rs`](../src/config.rs)). **`crash23.log`** had **no** **`[sigsegv-syscall]`** lines — **confirm toggles + rebuild** before relying on serial for **`x8`**. **Also observable from SSH:** first arg to **`Syscall6`** / **`Syscall`** (**`crash19`** session: **`asyncpreemptoff`** → **`epoll_ctl`** (**`0x15`**); default → **`read`** (**`0x3f`**)).
 2. **If `x8=21`:** Audit **[`sys_epoll_ctl`](../src/syscall/poll.rs)** (`copy_from_user` for **`epoll_event`**, **`validate_user_ptr`**).
 3. **If `x8=63`:** Trace **[`sys_read`](../src/syscall/fs.rs)** **`PipeRead`** path end-to-end; confirm whether **`copy_to_user`** can return **`EFAULT`** without logging (already logs when **`SYSCALL_DEBUG_PIPE_READ`** on).
 4. ~~**A/B:** **`GODEBUG=asyncpreemptoff=1`** vs off~~ — **done** in **`crash19`** SSH + serial (**`SIGURG`** / **`sig=23`** clustering before last **`forktest_parent`** death **`T108–111`**).
@@ -655,4 +701,4 @@ See [crash19.log + pattern2_parent session](#crash19log--pattern2_parent-session
 
 ### Reference captures
 
-**`crash16.log`**, **`crash17.log`**, **`crash19.log`** (SSH + **`pattern2_parent`** control + **`x8`** evidence), **`crash14`** / **`crash5`** — grep patterns in [Serial capture and grep](#serial-capture-and-grep) and **`analyze_kernel_log.sh`**.
+**`crash16.log`**, **`crash17.log`**, **`crash19.log`** (SSH + **`pattern2_parent`** control + **`x8`** evidence), **`crash21.log`** (full quadrant matrix), **`crash23.log`** (**Q1–Q4** ordering + **Q4 Go+Go**), **`crash14`** / **`crash5`** — grep patterns in [Serial capture and grep](#serial-capture-and-grep) and **`analyze_kernel_log.sh`**.
