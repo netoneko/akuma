@@ -882,7 +882,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
-fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool) -> bool {
+fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process(pid) {
         Some(p) => p,
@@ -909,12 +909,13 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // we want the syscall to be re-executed after the handler returns.
     // In Linux, this is often done via ERESTARTSYS. Here we do it manually
     // by backing up ELR to the SVC instruction.
+    //
+    // entry_esr is the ESR captured at the very top of rust_sync_el0_handler,
+    // before any context switch could overwrite ESR_EL1 on the live register.
     const SA_RESTART: u64 = 0x10000000;
     if action.flags & SA_RESTART != 0 {
         // Only if we were in a syscall (EC_SVC_LOWER)
-        let esr: u64;
-        unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr); }
-        if (esr >> 26) == 0x15 { // EC_SVC_LOWER
+        if (entry_esr >> 26) == 0x15 { // EC_SVC_LOWER
             // Only restart the syscall if it was actually interrupted.
             // SA_RESTART must NOT apply to successful syscalls — backing up ELR
             // for a completed FUTEX_WAKE (ret=1) causes it to re-execute with
@@ -1128,13 +1129,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         let fpcr_val = core::ptr::read((frame as *const u8).add(816) as *const u32);
         core::ptr::write(fp.add(8) as *mut u32, fpsr_val);
         core::ptr::write(fp.add(12) as *mut u32, fpcr_val);
-        // vregs[0..31]: 16 bytes each
+        // vregs[0..31]: 16 bytes each.  Use byte copy to avoid ldp q / stp q
+        // which requires 16-byte alignment; vregs_dst is only 8-byte aligned here
+        // (new_sp + SIGFRAME_FPSIMD + 16 = new_sp + 600, and 600 % 16 == 8).
         let vregs_dst = fp.add(16);
-        for i in 0..32usize {
-            let src = kernel_neon.add(i * 16) as *const u128;
-            let dst = vregs_dst.add(i * 16) as *mut u128;
-            core::ptr::write(dst, core::ptr::read(src));
-        }
+        core::ptr::copy_nonoverlapping(kernel_neon, vregs_dst, 32 * 16);
         // Null terminator _aarch64_ctx{0,0}
         let null_term = fp.add(528);
         core::ptr::write(null_term as *mut u64, 0u64);
@@ -1161,13 +1160,15 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         }
     }
 
-    // Block the delivered signal during handler execution unless SA_NODEFER is set.
-    // This prevents recursive delivery of the same signal.
+    // Block the delivered signal and the sa_mask signals during handler execution.
     if action.flags & SA_NODEFER == 0 && signal >= 1 && signal <= 64 {
         if signal != 9 && signal != 19 { // SIGKILL/SIGSTOP cannot be masked
             proc.signal_mask |= 1u64 << (signal - 1);
         }
     }
+    // Also apply the additional mask from sigaction(2): sa_mask is the set of signals
+    // blocked while this handler runs.  SIGKILL (bit 8) and SIGSTOP (bit 18) are immune.
+    proc.signal_mask |= action.mask & !((1u64 << 8) | (1u64 << 18));
 
     crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
         signal, handler_addr, restorer);
@@ -1243,7 +1244,9 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
             crate::tprint!(128,
                 "[sigreturn] WARNING: corrupted SPSR={:#x} (mode bits={:#x}), forcing EL0t\n",
                 restored_spsr, restored_spsr & 0x1F);
-            (*frame).spsr_el1 = 0; // Clean EL0t, all flags cleared
+            // Clear only the M[4:0] mode bits; preserve NZCV, DAIF, and other flags
+            // so that Go's signal-handler modifications to pstate (e.g. NZCV) survive.
+            (*frame).spsr_el1 = restored_spsr & !0x1F;
         } else {
             (*frame).spsr_el1 = restored_spsr;
         }
@@ -1286,11 +1289,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
             core::ptr::write((frame as *mut u8).add(816) as *mut u64, fpcr_val);
             let vregs_src = fp.add(16);
             let kernel_neon = (frame as *mut u8).add(304);
-            for i in 0..32usize {
-                let src = vregs_src.add(i * 16) as *const u128;
-                let dst = kernel_neon.add(i * 16) as *mut u128;
-                core::ptr::write(dst, core::ptr::read(src));
-            }
+            core::ptr::copy_nonoverlapping(vregs_src, kernel_neon, 32 * 16);
         }
 
         let saved_x0 = (*frame).x0;
@@ -1954,7 +1953,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                             } else {
                                 unsafe { (*frame).x0 = frame_ref.x0; }
-                                if try_deliver_signal(frame, sig, 0, false) {
+                                if try_deliver_signal(frame, sig, 0, false, esr) {
                                     return sig as u64;
                                 }
                             }
@@ -1998,7 +1997,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                         } else {
                             unsafe { (*frame).x0 = saved_x0; }
-                            if try_deliver_signal(frame, sig, 0, false) {
+                            if try_deliver_signal(frame, sig, 0, false, esr) {
                                 return sig as u64;
                             }
                         }
@@ -2095,7 +2094,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // sigreturn restores it correctly (the signal handler's x0 = sig,
                     // and after sigreturn the caller sees x0 = syscall result).
                     unsafe { (*frame).x0 = ret; }
-                    if try_deliver_signal(frame, sig, 0, false) {
+                    if try_deliver_signal(frame, sig, 0, false, esr) {
                         return sig as u64; // x0 = signal number for the handler
                     }
                 }
@@ -2622,7 +2621,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let fr = unsafe { &*frame };
                 maybe_print_sigsegv_syscall_diag(elr, far, fr);
             }
-            if try_deliver_signal(frame, 11, far, true) {
+            if try_deliver_signal(frame, 11, far, true, esr) {
                 return 11; // signal number in x0 for the handler
             }
 
@@ -3003,7 +3002,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 let fr = unsafe { &*frame };
                 maybe_print_sigsegv_syscall_diag(fr.elr_el1, far, fr);
             }
-            if try_deliver_signal(frame, 11, far, true) {
+            if try_deliver_signal(frame, 11, far, true, esr) {
                 return 11;
             }
 
