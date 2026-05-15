@@ -2,7 +2,65 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-05-10 — DC ZVA misrouting fix)
+## Current status (2026-05-15 — forktest matrix clear; crush has new Pattern 4)
+
+### Open work: Pattern 4 — QEMU EC=0x15 misrouting for `stp xzr, xzr` in Go 1.26 GreenTeaGC (`crush`, crash36.log)
+
+Same root-cause class as Pattern 1 (QEMU generates EC=0x15 instead of EC=0x25 for a non-SVC instruction), but for a **different instruction** in a **different binary**. The DC ZVA fix does not catch it.
+
+**Binary:** `/bin/crush` — a Go 1.26.1 binary with GreenTeaGC (`toolchain@v0.0.1-go1.26.1`), CGo-enabled, statically linked via `aarch64-linux-musl-gcc`. Source: `userspace/crush/crush/` (Go), built by `userspace/crush/build.rs` (Rust build script).
+
+**Crash sequence (crash36.log lines 61569–61589, T157.84):**
+
+```
+[TRAMP] tid=15 alt_sp=0x0
+[EFAULT] nr=48 pid=142 tid=15 ELR=0x432e40 args=[0x1e1c4df80, 0x12, 0x1, 0x4d, ...]
+[DA-MISS] pid=142 ppid=0 va=0xfffffffffffffff2 lr_count=31
+[WILD-DA] *** FAR=0xfffffffffffffff2 is -14 (EFAULT) - syscall error used as pointer! ***
+[WILD-DA] pid=142 FAR=0xfffffffffffffff2 ELR=0x432e40 last_sc=18446744073709551615
+```
+
+User-visible panic:
+```
+[signal SIGSEGV: segmentation violation code=0x1 addr=0xfffffffffffffff2 pc=0x432e40]
+runtime.(*spanInlineMarkBits).init  mgcmark_greenteagc.go:139 +0x20 pc=0x432e40
+runtime.(*mspan).moveInlineMarks    mgcmark_greenteagc.go:215
+runtime.(*sweepLocked).sweep        mgcsweep.go:656
+runtime.bgsweep
+```
+
+**Disassembly of crush at 0x432e40** (`bootstrap/bin/crush`, ET_EXEC non-PIE):
+
+```
+432e38: cbz  x0, 0x432e70
+432e3c: tbz  w2, #0x0, 0x432e60     ← NOT an SVC
+432e40: stp  xzr, xzr, [x0]         ← misrouted instruction (0xa9007c1f)
+432e44: stp  xzr, xzr, [x0, #0x10]
+432e48: stp  xzr, xzr, [x0, #0x20]
+...
+432e5c: stp  xzr, xzr, [x0, #0x70]  ← 8× 16-byte zero-stores = 128-byte zero block
+```
+
+**Why QEMU misroutes it:** `spanInlineMarkBits.init` zeroes a 128-byte inline mark bitmap using 8× `stp xzr, xzr`. When x0 (the bitmap base) is in a PROT_NONE lazy region (Go's `sysReserve` arena, not yet committed by `sysMap`), QEMU generates EC=0x15 instead of EC=0x25. ELR is set to the `stp` instruction itself (same QEMU behaviour as DC ZVA: ELR = faulting instruction, not +4).
+
+**Why the DC ZVA fix misses it:** The check at `src/exceptions.rs` line 2011 is `(instr & 0xFFFFFFE0) == 0xD50B7420` — DC ZVA only. `stp xzr, xzr, [x0]` encodes as `0xa9007c1f`, which doesn't match.
+
+**Consequence:** `handle_syscall` is called with x8=48 (`faccessat`, leftover from a prior syscall). `faccessat` validates x1=0x12 as the path pointer → EFAULT. x0 is overwritten to `0xfffffffffffffff2`. Goroutine resumes at ELR=0x432e40, executes `stp xzr, xzr, [0xfffffffffffffff2]` → translation fault → `[DA-MISS]` → SIGSEGV.
+
+**Fix needed (`src/exceptions.rs`, EC=0x15 handler):**
+
+Broaden the misrouting detector to also match `stp xzr, xzr, [Xn]`:
+
+- Pattern: `(instr & 0xFFFFFC1F) == 0xa9007c1f` — matches `stp xzr, xzr, [Xn, #0]` for any base register Xn (bits[9:5] = Rn, cleared by mask).
+- Action: decode Xn from `(instr >> 5) & 0x1F`, read `frame[Xn]` to get the store target address, demand-page it (call the existing lazy-region mapper or `emulate_dc_zva`-style zeroing), advance `frame.elr_el1 = elr + 4`, return `frame.x0` unchanged.
+- The `stp` stores zeros to [Xn] and [Xn+8]. Both bytes of the pair land in the same page if Xn is 16-byte aligned (guaranteed by Go's span allocator). Zeroing 16 bytes at the target is sufficient (or just ensure the page is mapped and let the instruction re-execute — but re-execution requires NOT advancing ELR and looping, which is fragile; emulating is cleaner).
+- Also consider the offset variants (`stp xzr, xzr, [Xn, #N]`): same upper bits with non-zero imm7. A broader mask `(instr & 0xFFC07C1F) == 0xa9007c1f` would catch all signed-offset `stp xzr, xzr` variants regardless of offset.
+
+**Remaining question:** confirm whether QEMU also misroutes the seven subsequent `stp xzr, xzr, [x0, #N]` stores (0x432e44–0x432e5c). If each one triggers EC=0x15, all eight need to be handled or the whole 128-byte zero block needs to be emulated at once (read the loop bounds and zero the full range).
+
+**`-file_io` mode:** not yet tested. Historically caused ext2 deadlocks unrelated to the demand-paging/EC=0x15 bugs. Safe to run; capture serial log if it freezes.
+
+---
 
 ### Root cause: QEMU TCG DC ZVA misrouting
 
@@ -121,6 +179,60 @@ Before the DC ZVA fix, the child was crashing within seconds (crash31.log shows 
 Added `owner_pid_for_l0_phys(l0_phys)` which scans the process table for the non-shared process (thread-group leader) whose address space L0 frame matches the given physical address.  Updated `address_space_owner_pid_for_fault()` to call this first, using the current TTBR0_EL1 (which unambiguously identifies the running address space) before falling back to `THREAD_PID_MAP → tgid` and `read_current_pid()`.
 
 **Why this fixes the crash**: TTBR0_EL1 is always correct for the currently-running address space. Any staleness in `THREAD_PID_MAP` (e.g. a kernel thread slot reused for a different process before the old entry was cleaned up, or a goroutine that was assigned tgid=100 by a misdirected `clone_thread` call) does not affect the TTBR0 path. The demand-pager now finds the correct owner PID even if the process_info_page or thread map disagrees.
+
+---
+
+## Pattern 3 root cause analysis (crash34.log, 2026-05-15)
+
+`crash34.log` showed `forktest_parent` (pid=128) crashing with:
+
+```
+[DA-NONE] pid=128 as_owner=128 far=0x1e2be9000 region=0x1e0400000+0x7c00000 flags=0x60000000000080
+[signal] deliver sig=11 slot=8 handler=0x86ee0 fault_pc=0x13060
+```
+
+### Root cause: PROT_NONE lazy region accessed without prior sysMap
+
+Go's memory manager reserves heap arenas with `sysReserve` → `mmap(hint, n, PROT_NONE, MAP_ANON)`, then commits subranges with `sysMap` → `mmap(v, n, PROT_RW, MAP_FIXED)` before first use. Both calls produce lazy regions (> 256 pages, so `use_lazy = true`).
+
+`forktest_parent`'s Go runtime called `sysReserve` for `0x1e0400000+0x7c00000` (128 MB, PROT_NONE lazy entry) but never called `sysMap` for the subrange containing `0x1e2be9000`. The parent's heap workload is lighter than `forktest_child`'s, so its heap never grew into the fourth 72 MB subrange that the children commit during their own initialization.
+
+When the parent eventually wrote to `0x1e2be9000` (a heap data write — ISS WnR=1, translation fault DFSC=0x07), the demand-pager found the PROT_NONE lazy region entry and previously fell through to SIGSEGV via the `[DA-NONE]` path.
+
+**Why guard pages are unaffected:** Stack guard pages are plain unmapped VAs (no PTE, no lazy-region entry). On access they fault with `lazy_region_lookup = None` and fall through to SIGSEGV regardless of this change.
+
+### Fix (`src/exceptions.rs`, 2026-05-15)
+
+Changed the `[DA-NONE]` path in the translation-fault demand-pager to auto-commit anonymous PROT_NONE lazy regions on first access, mapping with `RW_NO_EXEC` instead of SIGSEGVing. Only the OOM path still falls through to SIGSEGV.
+
+```rust
+if akuma_exec::mmu::user_flags::is_none(flags) {
+    // Auto-commit anonymous PROT_NONE reservation on first access (Go sysReserve pattern).
+    let page_va = far_usize & !(0xFFF);
+    if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+        // ... map RW_NO_EXEC, track frames, return success
+        return unsafe { (*frame).x0 };
+    }
+    // OOM: fall through to SIGSEGV
+}
+```
+
+### Verification (crash35.log + crash36.log, 2026-05-15)
+
+**crash35.log:** Three `forktest_parent -mmap_test -mmap_alloc_mb=70 -duration=30s -num_children=2` runs show no `[DA-NONE]` lines. All completed runs exited `code=0` (pid=112 at T116, pid=127 at T160, pid=143 confirmed clean).
+
+**crash36.log:** Three `forktest_parent --combined_stress --mmap_alloc_mb=100 --duration=30s --num_children=2` runs all exited `code=0` (pid=90 at T47, pid=108 at T85, pid=125 at T121). All children `code=0`. No `[DA-NONE]`, `[SIGSEGV]`, or `[WILD-DA]` lines for forktest anywhere in the log. Combined stress with 100 MB mmap is fully passing.
+
+**crash36.log also contains the first `crush` crash** (pid=142/149, T157–T158): Pattern 4 QEMU EC=0x15 misrouting on `stp xzr, xzr, [x0]` in Go 1.26 GreenTeaGC — see §Pattern 4 at top of this document.
+
+**Forktest matrix status:**
+
+| Test | Status |
+|------|--------|
+| `-mmap_test -mmap_alloc_mb=70 -duration=30s -num_children=2` | ✅ 3 clean runs (crash35.log) |
+| `--combined_stress --mmap_alloc_mb=100 -duration=30s --num_children=2` | ✅ 3 clean runs (crash36.log) |
+| `-file_io` | ❓ not yet tested; ext2 deadlock risk |
+| `crush` binary | ❌ Pattern 4 open — see §Pattern 4 |
 
 ---
 

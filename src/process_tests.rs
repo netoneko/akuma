@@ -347,6 +347,7 @@ pub fn run_all_tests() {
 /// This test triggers the PROT_NONE / mprotect regression that was only reproducible
 /// interactively via SSH. Runs forktest_parent for 5 kernel seconds with one child and
 /// a 70 MB mmap alloc so the lazy-region code path is exercised.
+#[allow(dead_code)]
 fn test_forktest_parent_mmap() {
     const FORKTEST_PATH: &str = "/bin/forktest_parent";
 
