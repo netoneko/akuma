@@ -2275,9 +2275,42 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
                 if let Some((flags, source, region_start, region_size)) = lazy_found {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
-                        crate::tprint!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} region=0x{:x}+0x{:x} flags={:#x}\n",
-                            pid, as_owner, far_usize, region_start, region_size, flags);
-                        // PROT_NONE: don't demand-page, fall through to SIGSEGV
+                        // Auto-commit anonymous PROT_NONE reservation on first access.
+                        // Go's sysReserve calls mmap(PROT_NONE) then sysMap calls
+                        // mmap(PROT_RW, MAP_FIXED) to commit subranges. When the parent
+                        // process accesses a reserved-but-uncommitted page we demand-page
+                        // it as RW rather than SIGSEGVing. Guard pages are NOT lazy-region
+                        // entries so this path is only reached for genuine reservations.
+                        let page_va = far_usize & !(0xFFF);
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                            let (table_frames, installed) = unsafe {
+                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+                            };
+                            if installed {
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                    owner.address_space.track_user_frame(page_frame);
+                                    for tf in table_frames {
+                                        owner.address_space.track_page_table_frame(tf);
+                                    }
+                                } else {
+                                    crate::pmm::free_page(page_frame);
+                                    for tf in table_frames { crate::pmm::free_page(tf); }
+                                }
+                                crate::syscall::syscall_counters::inc_pagefault(1);
+                            } else {
+                                // Race: another CPU already mapped this page.
+                                crate::pmm::free_page(page_frame);
+                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
+                                } else {
+                                    for tf in table_frames { crate::pmm::free_page(tf); }
+                                }
+                            }
+                            return unsafe { (*frame).x0 };
+                        }
+                        // OOM: fall through to SIGSEGV
+                        crate::tprint!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} OOM\n",
+                            pid, as_owner, far_usize);
                     } else if far_in_kernel_identity_user_range(far) {
                         // Fault VA is in the kernel identity-map range — demand-paging here
                         // would corrupt kernel memory.  Fall through to SIGSEGV.
