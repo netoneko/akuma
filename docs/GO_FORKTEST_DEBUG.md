@@ -129,6 +129,9 @@ Each of the 8 subsequent `stp xzr, xzr, [x0, #N]` stores triggers its own EC=0x1
 In-kernel unit tests (`src/process_tests.rs`):
 - `test_stp_xzr_misroute_decode` — validates the decoder against 7 encodings and 5 non-matching instructions.
 - `test_stp_xzr_emulation` — verifies the 16-byte zeroing lands at the correct offset in a kernel heap buffer.
+- `test_stp_xzr_ec15_handler_fires` — runs `stp_test_c` as a subprocess and asserts that `QEMU_STP_XZR_EC15_COUNT` (a hit counter in the EC=0x15 STP handler, `src/syscall/mod.rs`) incremented. This is the only test that proves QEMU actually generated EC=0x15 (rather than EC=0x25 being handled by the Pattern 3 demand-pager) and that the new handler fired.
+
+**Note:** the first two unit tests and the initial `stp_test_*` binaries were insufficient on their own — they passed even before the fix because a `mmap(PROT_NONE)` + `stp xzr, xzr` sequence can be handled entirely by the EC=0x25 path (Pattern 3 auto-commit) if QEMU happens not to misroute that particular run. The counter + subprocess test closes this gap.
 
 ---
 

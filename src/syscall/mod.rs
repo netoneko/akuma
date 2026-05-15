@@ -76,6 +76,9 @@ pub mod syscall_counters {
     static PAGEFAULT_PAGES: AtomicU64 = AtomicU64::new(0);
     static OTHER_LAST_NR: AtomicU64 = AtomicU64::new(0);
     static OTHER_COUNT: AtomicU64 = AtomicU64::new(0);
+    // QEMU TCG EC=0x15 misrouting emulation hit counters
+    static QEMU_DC_ZVA_EC15_COUNT: AtomicU64 = AtomicU64::new(0);
+    static QEMU_STP_XZR_EC15_COUNT: AtomicU64 = AtomicU64::new(0);
 
     pub fn inc_mmap(pages: usize) { MMAP_COUNT.fetch_add(1, Ordering::Relaxed); MMAP_PAGES.fetch_add(pages as u64, Ordering::Relaxed); }
     pub fn inc_munmap() { MUNMAP_COUNT.fetch_add(1, Ordering::Relaxed); }
@@ -101,6 +104,9 @@ pub mod syscall_counters {
     pub fn inc_other(nr: u64) { OTHER_COUNT.fetch_add(1, Ordering::Relaxed); OTHER_LAST_NR.store(nr, Ordering::Relaxed); }
     pub fn inc_total() { TOTAL_COUNT.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_pagefault(pages_mapped: u64) { PAGEFAULT_COUNT.fetch_add(1, Ordering::Relaxed); PAGEFAULT_PAGES.fetch_add(pages_mapped, Ordering::Relaxed); }
+    pub fn inc_qemu_dc_zva_ec15() { QEMU_DC_ZVA_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_qemu_stp_xzr_ec15() { QEMU_STP_XZR_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
+    pub fn get_qemu_stp_xzr_ec15() -> u64 { QEMU_STP_XZR_EC15_COUNT.load(Ordering::Relaxed) }
 
     pub fn dump() {
         let total = TOTAL_COUNT.load(Ordering::Relaxed);

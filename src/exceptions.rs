@@ -2054,6 +2054,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             unsafe { core::ptr::read_volatile((frame as *const u64).add(xt)) }
                         } else { 0 };
                         emulate_dc_zva(dc_addr);
+                        crate::syscall::syscall_counters::inc_qemu_dc_zva_ec15();
                         unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
                         return unsafe { (*frame).x0 };
                     }
@@ -2120,6 +2121,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                         }
                         emulate_stp_xzr_xzr(store_va);
+                        crate::syscall::syscall_counters::inc_qemu_stp_xzr_ec15();
                         unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
                         return unsafe { (*frame).x0 };
                     }

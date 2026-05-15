@@ -98,6 +98,9 @@ pub fn run_all_tests() {
     // EC=0x15 STP XZR misrouting decode + emulation (Pattern 4 / crush fix)
     test_stp_xzr_misroute_decode();
     test_stp_xzr_emulation();
+    // Integration test: verify QEMU actually generates EC=0x15 for stp xzr,xzr
+    // on PROT_NONE pages and that the kernel handler fires (not just EC=0x25).
+    test_stp_xzr_ec15_handler_fires();
 
     // Test pipe write/read round-trip (catches use-after-close silent data loss)
     test_pipe_write_read_roundtrip();
@@ -1898,6 +1901,43 @@ fn test_stp_xzr_emulation() {
         console::print("[Test] stp_xzr_emulation PASSED\n");
     } else {
         crate::safe_print!(128, "[Test] stp_xzr_emulation FAILED: pre={} mid={} post={}\n", pre, mid, post);
+    }
+}
+
+/// Integration test: run `stp_test_c` and assert that the EC=0x15 STP emulation
+/// counter incremented — proving QEMU actually generated EC=0x15 (not EC=0x25)
+/// for `stp xzr, xzr` on a PROT_NONE page, and that our handler fired.
+///
+/// Without this check, `test_stp_xzr_emulation` passing is inconclusive: the
+/// instruction could have been handled by the EC=0x25 demand-pager (Pattern 3)
+/// without the EC=0x15 path ever being reached.
+fn test_stp_xzr_ec15_handler_fires() {
+    const STP_TEST_PATH: &str = "/bin/stp_test_c";
+
+    if fs::read_file(STP_TEST_PATH).is_err() {
+        crate::safe_print!(96, "[Test] stp_xzr_ec15_handler_fires SKIPPED: {} not found\n", STP_TEST_PATH);
+        return;
+    }
+
+    let before = crate::syscall::syscall_counters::get_qemu_stp_xzr_ec15();
+
+    match process::exec_with_io(STP_TEST_PATH, None, None) {
+        Ok((exit_code, _)) => {
+            let after = crate::syscall::syscall_counters::get_qemu_stp_xzr_ec15();
+            let hits = after - before;
+            if exit_code != 0 {
+                crate::safe_print!(96, "[Test] stp_xzr_ec15_handler_fires FAILED: stp_test_c exited {}\n", exit_code);
+                return;
+            }
+            if hits == 0 {
+                console::print("[Test] stp_xzr_ec15_handler_fires FAILED: EC=0x15 STP handler never fired (QEMU may be generating EC=0x25 instead — fix not exercised)\n");
+            } else {
+                crate::safe_print!(96, "[Test] stp_xzr_ec15_handler_fires PASSED: {} EC=0x15 STP hits\n", hits);
+            }
+        }
+        Err(e) => {
+            crate::safe_print!(64, "[Test] stp_xzr_ec15_handler_fires FAILED: exec error {}\n", e);
+        }
     }
 }
 
