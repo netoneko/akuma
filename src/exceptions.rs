@@ -2275,6 +2275,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                 }
                 if let Some((flags, source, region_start, region_size)) = lazy_found {
                     if akuma_exec::mmu::user_flags::is_none(flags) {
+                        crate::tprint!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} region=0x{:x}+0x{:x} flags={:#x}\n",
+                            pid, as_owner, far_usize, region_start, region_size, flags);
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
                     } else if far_in_kernel_identity_user_range(far) {
                         // Fault VA is in the kernel identity-map range — demand-paging here

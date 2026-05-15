@@ -336,7 +336,68 @@ pub fn run_all_tests() {
     test_mark_terminated_ignores_large_ids();
     test_fake_thread_ids_safe();
 
+    // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
+    test_forktest_parent_mmap();
+
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// Run forktest_parent with mmap_test enabled to catch SIGSEGV on lazy-region demand paging.
+///
+/// This test triggers the PROT_NONE / mprotect regression that was only reproducible
+/// interactively via SSH. Runs forktest_parent for 5 kernel seconds with one child and
+/// a 70 MB mmap alloc so the lazy-region code path is exercised.
+fn test_forktest_parent_mmap() {
+    const FORKTEST_PATH: &str = "/bin/forktest_parent";
+
+    if crate::fs::read_file(FORKTEST_PATH).is_err() {
+        crate::safe_print!(96, "[Test] {} not found, skipping forktest mmap test\n", FORKTEST_PATH);
+        return;
+    }
+
+    crate::safe_print!(128, "[Test] Running forktest_parent mmap test (5s)...\n");
+
+    let args = [
+        "/bin/forktest_parent",
+        "--num_children=1",
+        "--mmap_test=true",
+        "--mmap_alloc_mb=70",
+        "--duration=5s",
+    ];
+
+    let (tid, ch, pid) = match process::spawn_process_with_channel(FORKTEST_PATH, Some(&args), None) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::safe_print!(64, "[Test] forktest_parent spawn failed: {}\n", e);
+            return;
+        }
+    };
+    ch.close_stdin();
+
+    crate::safe_print!(128, "[Test] forktest_parent started pid={} tid={}\n", pid, tid);
+
+    // Wait up to 60 kernel seconds; forktest is scheduled for 5s but needs startup time.
+    let deadline = crate::timer::uptime_us() + 60_000_000;
+    loop {
+        if ch.has_exited() || akuma_exec::threading::is_thread_terminated(tid) {
+            break;
+        }
+        if crate::timer::uptime_us() >= deadline {
+            crate::safe_print!(64, "[Test] forktest_parent TIMEOUT (60s), killing\n");
+            let _ = akuma_exec::process::kill_process(pid);
+            break;
+        }
+        akuma_exec::threading::yield_now();
+    }
+
+    let exit_code = ch.exit_code();
+    if exit_code == 0 {
+        console::print("[Test] forktest_parent mmap: PASSED\n");
+    } else {
+        crate::safe_print!(64, "[Test] forktest_parent mmap: FAILED exit_code={}\n", exit_code);
+    }
+
+    akuma_exec::threading::cleanup_terminated();
 }
 
 /// Helper to create a minimal Process for testing logic without loading a real ELF.

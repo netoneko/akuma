@@ -414,6 +414,8 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
+        current_pid, owner_pid, addr, pages * 4096, prot);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
@@ -451,6 +453,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         }
         0
     } else {
+        crate::tprint!(128, "[mprotect] EINVAL: owner={} not found\n", owner_pid);
         EINVAL
     }
 }
