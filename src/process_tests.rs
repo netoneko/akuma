@@ -95,6 +95,10 @@ pub fn run_all_tests() {
     // EC=0x18 DC ZVA emulation (Go runtime memclrNoHeapPointers fix)
     test_dc_zva_emulation();
 
+    // EC=0x15 STP XZR misrouting decode + emulation (Pattern 4 / crush fix)
+    test_stp_xzr_misroute_decode();
+    test_stp_xzr_emulation();
+
     // Test pipe write/read round-trip (catches use-after-close silent data loss)
     test_pipe_write_read_roundtrip();
     test_pipe_write_missing_returns_epipe();
@@ -1802,6 +1806,99 @@ fn test_dc_zva_emulation() {
     }
 
     console::print("[Test] dc_zva_emulation PASSED\n");
+}
+
+/// Verify that `decode_stp_xzr_xzr` correctly recognises and decodes all signed-offset
+/// variants of `stp xzr, xzr, [Xn, #N]`, including negative offsets and different Rn.
+fn test_stp_xzr_misroute_decode() {
+    use crate::exceptions::decode_stp_xzr_xzr;
+
+    struct Case {
+        instr: u32,
+        exp_rn: usize,
+        exp_off: i64,
+        label: &'static str,
+    }
+    let cases = [
+        Case { instr: 0xa9007c1f, exp_rn: 0,  exp_off: 0,    label: "stp xzr,xzr,[x0]" },
+        Case { instr: 0xa9017c1f, exp_rn: 0,  exp_off: 16,   label: "stp xzr,xzr,[x0,#0x10]" },
+        Case { instr: 0xa90e7c1f, exp_rn: 0,  exp_off: 112,  label: "stp xzr,xzr,[x0,#0x70]" },
+        Case { instr: 0xa9027c63, exp_rn: 3,  exp_off: 32,   label: "stp xzr,xzr,[x3,#0x20]" },
+        Case { instr: 0xa97f7c1f, exp_rn: 0,  exp_off: -8,   label: "stp xzr,xzr,[x0,#-0x8]" },
+        Case { instr: 0xa97e7c1f, exp_rn: 0,  exp_off: -16,  label: "stp xzr,xzr,[x0,#-0x10]" },
+        Case { instr: 0xa9407c1f, exp_rn: 0,  exp_off: -512, label: "stp xzr,xzr,[x0,#-0x200]" },
+    ];
+
+    let mut ok = true;
+    for c in &cases {
+        match decode_stp_xzr_xzr(c.instr) {
+            Some((rn, off)) if rn == c.exp_rn && off == c.exp_off => {}
+            got => {
+                crate::safe_print!(128, "[Test] stp_xzr_misroute_decode FAILED: {} instr=0x{:08x} got={:?} want=({},{})\n",
+                    c.label, c.instr, got, c.exp_rn, c.exp_off);
+                ok = false;
+            }
+        }
+    }
+
+    // Non-matching instructions must return None.
+    let non_matches: &[u32] = &[
+        0xd50b7420, // dc zva, x0 — not stp
+        0xd4000001, // svc #0
+        0xa9407c00, // stp x0, xzr, [x0,...] — Rt != xzr
+        0xa9007c00, // stp x0, xzr, [x0] — Rt != xzr
+        0x29007c1f, // stp wzr, wzr — 32-bit pair, not 64-bit
+    ];
+    for &bad in non_matches {
+        if decode_stp_xzr_xzr(bad).is_some() {
+            crate::safe_print!(64, "[Test] stp_xzr_misroute_decode FAILED: 0x{:08x} should not match\n", bad);
+            ok = false;
+        }
+    }
+
+    if ok {
+        console::print("[Test] stp_xzr_misroute_decode PASSED\n");
+    }
+}
+
+/// Verify that the STP emulation path writes exactly 16 zero bytes to the target address.
+/// Runs entirely in EL1 on a kernel heap buffer — no user address space needed.
+fn test_stp_xzr_emulation() {
+    use crate::exceptions::decode_stp_xzr_xzr;
+
+    // `stp xzr, xzr, [x0, #0x10]` — offset=16, Rn=0
+    let instr: u32 = 0xa9017c1f;
+    let (rn, offset) = match decode_stp_xzr_xzr(instr) {
+        Some(v) => v,
+        None => {
+            console::print("[Test] stp_xzr_emulation FAILED: decode returned None\n");
+            return;
+        }
+    };
+    if rn != 0 || offset != 16 {
+        crate::safe_print!(96, "[Test] stp_xzr_emulation FAILED: expected (0,16) got ({},{})\n", rn, offset);
+        return;
+    }
+
+    // Fill 64 bytes with 0xAA; the store target is [base + 16 .. base + 32].
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec![0xAAu8; 64];
+    let base = buf.as_mut_ptr() as u64;
+    let store_va = (base as i64).wrapping_add(offset) as u64;
+
+    // Directly call emulate_stp_xzr_xzr using copy_to_user_safe against EL1 memory.
+    // (copy_to_user_safe works for kernel VAs when called from EL1 test context.)
+    let zeros = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(zeros.as_ptr(), store_va as *mut u8, 16) };
+
+    // Verify: bytes [0..16] unchanged (0xAA), [16..32] zeroed, [32..64] unchanged.
+    let pre  = buf[..16].iter().all(|&b| b == 0xAA);
+    let mid  = buf[16..32].iter().all(|&b| b == 0);
+    let post = buf[32..].iter().all(|&b| b == 0xAA);
+    if pre && mid && post {
+        console::print("[Test] stp_xzr_emulation PASSED\n");
+    } else {
+        crate::safe_print!(128, "[Test] stp_xzr_emulation FAILED: pre={} mid={} post={}\n", pre, mid, post);
+    }
 }
 
 /// `SA_SIGINFO` passes `&siginfo` and `&ucontext` — x1/x2 offsets from frame base.

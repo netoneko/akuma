@@ -29,7 +29,8 @@ members = [
     "xbps",
     "apk-tools",
     "llama.cpp",
-    "crush"
+    "crush",
+    "stp_test"
 ]
 
 [profile.dev]

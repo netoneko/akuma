@@ -700,6 +700,33 @@ pub(crate) fn emulate_dc_zva(addr: u64) {
     };
 }
 
+/// Emulate `stp xzr, xzr, [Xn, #imm7*8]` for EL0 when QEMU TCG misroutes it as EC=0x15.
+/// Writes 16 zero bytes to `addr`.
+fn emulate_stp_xzr_xzr(addr: u64) {
+    let zeros = [0u8; 16];
+    let _ = unsafe {
+        akuma_exec::mmu::user_access::copy_to_user_safe(
+            addr as *mut u8, zeros.as_ptr(), 16)
+    };
+}
+
+/// Decode `stp xzr, xzr, [Xn, #imm7*8]` signed-offset form.
+/// Returns `(Rn_index, byte_offset)` or `None` if not this instruction form.
+///
+/// Encoding: opc=10 (64-bit), L=0 (store), V=0 (GPR), signed-offset class.
+/// Mask 0xFFC07C1F clears imm7 [21:15] and Rn [9:5]; the constant 0xA9007C1F
+/// matches Rt=11111 (xzr) and Rt2=11111 (xzr) with all other fixed bits set.
+pub(crate) fn decode_stp_xzr_xzr(instr: u32) -> Option<(usize, i64)> {
+    if (instr & 0xFFC0_7C1F) != 0xA900_7C1F {
+        return None;
+    }
+    let rn = ((instr >> 5) & 0x1F) as usize;
+    let imm7_raw = ((instr >> 15) & 0x7F) as i32;
+    // Sign-extend 7-bit field to i32 via arithmetic shift.
+    let imm7 = (imm7_raw << 25) >> 25;
+    Some((rn, (imm7 as i64) * 8))
+}
+
 /// Human-readable syscall hint for forktest Pattern 2 serial (`GO_FORKTEST_DEBUG.md`).
 fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
     use crate::syscall::nr;
@@ -2027,6 +2054,72 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             unsafe { core::ptr::read_volatile((frame as *const u64).add(xt)) }
                         } else { 0 };
                         emulate_dc_zva(dc_addr);
+                        unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
+                        return unsafe { (*frame).x0 };
+                    }
+                }
+            }
+
+            // QEMU-STP-XZR-MISROUTING: QEMU TCG sometimes generates EC=0x15 (SVC)
+            // instead of EC=0x25 (data abort) for `stp xzr, xzr, [Xn, #N]` when Xn
+            // points into a PROT_NONE lazy region (Go's sysReserve arena). Same class
+            // as the DC ZVA misrouting above but for a different instruction.
+            // Pattern 4 in GO_FORKTEST_DEBUG.md (crush, crash36.log).
+            {
+                let elr = frame_ref.elr_el1;
+                let elr_instr = {
+                    let mut buf = [0u8; 4];
+                    unsafe {
+                        akuma_exec::mmu::user_access::copy_from_user_safe(
+                            buf.as_mut_ptr(), elr as *const u8, 4)
+                        .ok()
+                    }.map(|_| u32::from_le_bytes(buf))
+                };
+                if let Some((rn, offset)) = elr_instr.and_then(decode_stp_xzr_xzr) {
+                    let prev_instr = elr.checked_sub(4).and_then(|prev| {
+                        let mut buf = [0u8; 4];
+                        unsafe {
+                            akuma_exec::mmu::user_access::copy_from_user_safe(
+                                buf.as_mut_ptr(), prev as *const u8, 4)
+                            .ok()
+                        }.map(|_| u32::from_le_bytes(buf))
+                    });
+                    let prev_is_svc = prev_instr
+                        .map(|i| (i & 0xFFE0001F) == 0xD4000001)
+                        .unwrap_or(false);
+                    if !prev_is_svc {
+                        let base = if rn < 31 {
+                            unsafe { core::ptr::read_volatile((frame as *const u64).add(rn)) }
+                        } else { 0 };
+                        let store_va = (base as i64).wrapping_add(offset) as u64;
+                        let page_va = (store_va as usize) & !0xFFF;
+                        // Demand-page if target is in a PROT_NONE lazy region.
+                        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+                        let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
+                        if akuma_exec::process::lazy_region_lookup_for_page_fault(pid, store_va as usize).is_some() {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                                let (tfs, installed) = unsafe {
+                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+                                };
+                                if installed {
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                        owner.address_space.track_user_frame(pf);
+                                        for tf in tfs { owner.address_space.track_page_table_frame(tf); }
+                                    } else {
+                                        crate::pmm::free_page(pf);
+                                        for tf in tfs { crate::pmm::free_page(tf); }
+                                    }
+                                } else {
+                                    crate::pmm::free_page(pf);
+                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                        for tf in tfs { owner.address_space.track_page_table_frame(tf); }
+                                    } else {
+                                        for tf in tfs { crate::pmm::free_page(tf); }
+                                    }
+                                }
+                            }
+                        }
+                        emulate_stp_xzr_xzr(store_va);
                         unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
                         return unsafe { (*frame).x0 };
                     }

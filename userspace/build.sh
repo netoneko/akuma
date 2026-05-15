@@ -38,6 +38,7 @@ MEMBERS=(
     "apk-tools"
     "llama-cpp"
     "crush"
+    "stp_test"
     )
 
 

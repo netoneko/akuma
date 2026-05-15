@@ -2,11 +2,11 @@
 
 This document details crash patterns seen when running `forktest_parent` with **stress flags** (especially **`-combined_stress`**, **`-mmap_test`**, or **`-file_io`**) on Akuma OS. The **child** often shows `addr=0x2` in Go's allocator; the **parent** can fault in **`read()`** on the epoll pipe with a **heap-range** fault address; **`-file_io`** can also contribute to **deadlocks** (guest or SSH) via temp-file traffic on ext2 (see [Isolation matrix](#isolation-matrix-2026-04-14)).
 
-## Current status (2026-05-15 — forktest matrix clear; crush has new Pattern 4)
+## Current status (2026-05-15 — all patterns fixed; full matrix green)
 
-### Open work: Pattern 4 — QEMU EC=0x15 misrouting for `stp xzr, xzr` in Go 1.26 GreenTeaGC (`crush`, crash36.log)
+### Fixed: Pattern 4 — QEMU EC=0x15 misrouting for `stp xzr, xzr` in Go 1.26 GreenTeaGC (`crush`)
 
-Same root-cause class as Pattern 1 (QEMU generates EC=0x15 instead of EC=0x25 for a non-SVC instruction), but for a **different instruction** in a **different binary**. The DC ZVA fix does not catch it.
+Same root-cause class as Pattern 1 (QEMU generates EC=0x15 instead of EC=0x25 for a non-SVC instruction), but for a **different instruction** in a **different binary**. The DC ZVA fix did not catch it.
 
 **Binary:** `/bin/crush` — a Go 1.26.1 binary with GreenTeaGC (`toolchain@v0.0.1-go1.26.1`), CGo-enabled, statically linked via `aarch64-linux-musl-gcc`. Source: `userspace/crush/crush/` (Go), built by `userspace/crush/build.rs` (Rust build script).
 
@@ -43,22 +43,40 @@ runtime.bgsweep
 
 **Why QEMU misroutes it:** `spanInlineMarkBits.init` zeroes a 128-byte inline mark bitmap using 8× `stp xzr, xzr`. When x0 (the bitmap base) is in a PROT_NONE lazy region (Go's `sysReserve` arena, not yet committed by `sysMap`), QEMU generates EC=0x15 instead of EC=0x25. ELR is set to the `stp` instruction itself (same QEMU behaviour as DC ZVA: ELR = faulting instruction, not +4).
 
-**Why the DC ZVA fix misses it:** The check at `src/exceptions.rs` line 2011 is `(instr & 0xFFFFFFE0) == 0xD50B7420` — DC ZVA only. `stp xzr, xzr, [x0]` encodes as `0xa9007c1f`, which doesn't match.
+**Why the DC ZVA fix missed it:** The check at `src/exceptions.rs` was `(instr & 0xFFFFFFE0) == 0xD50B7420` — DC ZVA only. `stp xzr, xzr, [x0]` encodes as `0xa9007c1f`, which doesn't match.
 
-**Consequence:** `handle_syscall` is called with x8=48 (`faccessat`, leftover from a prior syscall). `faccessat` validates x1=0x12 as the path pointer → EFAULT. x0 is overwritten to `0xfffffffffffffff2`. Goroutine resumes at ELR=0x432e40, executes `stp xzr, xzr, [0xfffffffffffffff2]` → translation fault → `[DA-MISS]` → SIGSEGV.
+**Consequence (pre-fix):** `handle_syscall` was called with x8=48 (`faccessat`, leftover from a prior syscall). `faccessat` validated x1=0x12 as the path pointer → EFAULT. x0 was overwritten to `0xfffffffffffffff2`. Goroutine resumed at ELR=0x432e40, executed `stp xzr, xzr, [0xfffffffffffffff2]` → translation fault → `[DA-MISS]` → SIGSEGV.
 
-**Fix needed (`src/exceptions.rs`, EC=0x15 handler):**
+### Fix (`src/exceptions.rs`, 2026-05-15)
 
-Broaden the misrouting detector to also match `stp xzr, xzr, [Xn]`:
+Added `decode_stp_xzr_xzr` and `emulate_stp_xzr_xzr` helpers, plus a second misrouting detector block in the `EC_SVC64` handler immediately after the DC ZVA block.
 
-- Pattern: `(instr & 0xFFFFFC1F) == 0xa9007c1f` — matches `stp xzr, xzr, [Xn, #0]` for any base register Xn (bits[9:5] = Rn, cleared by mask).
-- Action: decode Xn from `(instr >> 5) & 0x1F`, read `frame[Xn]` to get the store target address, demand-page it (call the existing lazy-region mapper or `emulate_dc_zva`-style zeroing), advance `frame.elr_el1 = elr + 4`, return `frame.x0` unchanged.
-- The `stp` stores zeros to [Xn] and [Xn+8]. Both bytes of the pair land in the same page if Xn is 16-byte aligned (guaranteed by Go's span allocator). Zeroing 16 bytes at the target is sufficient (or just ensure the page is mapped and let the instruction re-execute — but re-execution requires NOT advancing ELR and looping, which is fragile; emulating is cleaner).
-- Also consider the offset variants (`stp xzr, xzr, [Xn, #N]`): same upper bits with non-zero imm7. A broader mask `(instr & 0xFFC07C1F) == 0xa9007c1f` would catch all signed-offset `stp xzr, xzr` variants regardless of offset.
+**Decoder:** mask `(instr & 0xFFC0_7C1F) == 0xA900_7C1F` matches all signed-offset `stp xzr, xzr, [Xn, #N]` variants (clears imm7 bits [21:15] and Rn bits [9:5]; checks Rt=xzr and Rt2=xzr). Rn and byte offset are extracted as:
 
-**Remaining question:** confirm whether QEMU also misroutes the seven subsequent `stp xzr, xzr, [x0, #N]` stores (0x432e44–0x432e5c). If each one triggers EC=0x15, all eight need to be handled or the whole 128-byte zero block needs to be emulated at once (read the loop bounds and zero the full range).
+```rust
+let rn = ((instr >> 5) & 0x1F) as usize;
+let imm7 = ((instr >> 15) & 0x7F) as i32;
+let imm7 = (imm7 << 25) >> 25; // sign-extend 7-bit
+let offset = (imm7 as i64) * 8;
+```
 
-**`-file_io` mode:** not yet tested. Historically caused ext2 deadlocks unrelated to the demand-paging/EC=0x15 bugs. Safe to run; capture serial log if it freezes.
+**Emulation sequence:**
+1. Read instruction at ELR; check it matches `decode_stp_xzr_xzr`.
+2. Read ELR-4; confirm it is not an actual SVC (`(i & 0xFFE0001F) == 0xD4000001`).
+3. Compute `store_va = frame[Rn] + offset`.
+4. If `store_va` is in a PROT_NONE lazy region, demand-page it as RW_NO_EXEC (same logic as the Pattern 3 DA-NONE handler).
+5. Write 16 zero bytes to `store_va` via `copy_to_user_safe`.
+6. Advance `frame.elr_el1 += 4`; return `frame.x0` unchanged (preserves caller's x0 across the fake syscall).
+
+Each of the 8 subsequent `stp xzr, xzr, [x0, #N]` stores triggers its own EC=0x15 trap and is handled independently — the page is already mapped after the first one, so steps 1–4 become a fast path on the remaining seven.
+
+### Verification (2026-05-15)
+
+`stp_test_go` and `stp_test_c` binaries (`userspace/stp_test/`) exercise three offset variants each against freshly `mmap(PROT_NONE)`-mapped regions; the C binary additionally tests the exact `#0x70` offset from the crush crash. Both binaries print `ALL PASSED` and exit 0 on the patched kernel.
+
+In-kernel unit tests (`src/process_tests.rs`):
+- `test_stp_xzr_misroute_decode` — validates the decoder against 7 encodings and 5 non-matching instructions.
+- `test_stp_xzr_emulation` — verifies the 16-byte zeroing lands at the correct offset in a kernel heap buffer.
 
 ---
 
@@ -232,7 +250,7 @@ if akuma_exec::mmu::user_flags::is_none(flags) {
 | `-mmap_test -mmap_alloc_mb=70 -duration=30s -num_children=2` | ✅ 3 clean runs (crash35.log) |
 | `--combined_stress --mmap_alloc_mb=100 -duration=30s --num_children=2` | ✅ 3 clean runs (crash36.log) |
 | `-file_io` | ❓ not yet tested; ext2 deadlock risk |
-| `crush` binary | ❌ Pattern 4 open — see §Pattern 4 |
+| `crush` binary (`stp_test_go`, `stp_test_c`) | ✅ Pattern 4 fixed (2026-05-15) |
 
 ---
 
