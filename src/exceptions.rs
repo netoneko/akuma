@@ -1644,7 +1644,7 @@ extern "C" fn rust_sync_el1_handler() {
                 proc.exited = true;
                 proc.exit_code = -14; // EFAULT
                 proc.state = akuma_exec::process::ProcessState::Zombie(-14);
-                akuma_exec::process::kill_thread_group(pid, l0_phys);
+                akuma_exec::process::kill_thread_group(pid, l0_phys, -14);
                 crate::syscall::proc::notify_child_channel_exited_pub(pid, -14);
                 crate::syscall::proc::vfork_complete(pid);
             }

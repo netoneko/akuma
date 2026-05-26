@@ -275,7 +275,9 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         }
         // Kill sibling threads FIRST, before closing FDs.
         // This prevents goroutines from being scheduled while we hold locks.
-        akuma_exec::process::kill_thread_group(pid, l0_phys);
+        // Pass the real exit_group code so the leader's channel (read by the
+        // shell) reports the actual code, not a hardcoded -9.
+        akuma_exec::process::kill_thread_group(pid, l0_phys, code);
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later
@@ -1163,7 +1165,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
             let exited = proc.exited;
             let _ = proc; // Release the borrow
             crate::tprint!(128, "[kill-dbg] SIGKILL pid={} tgid={} tid={:?} exited={}\n", pid, tgid, tid, exited);
-            akuma_exec::process::kill_thread_group(pid, l0_phys);
+            akuma_exec::process::kill_thread_group(pid, l0_phys, -9);
             let kill_result = akuma_exec::process::kill_process_with_signal(pid, 9);
             crate::tprint!(128, "[kill-dbg] SIGKILL pid={} kill_result={:?}\n", pid, kill_result);
             return 0;

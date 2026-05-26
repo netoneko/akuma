@@ -243,3 +243,256 @@ procfs stdout
 3. ~~**fake_thread_ids_safe**~~ — DONE (2026-05-26, test-assumption fix; see Cluster 4). System threads spawn after the test suite, so FREE slots are expected, not corruption.
 4. ~~**STP decoder**~~ — `stp_xzr_misroute_decode` DONE (2026-05-26, test-only fix; the decoder was correct, the test words were malformed). `stp_xzr_ec15_handler_fires` remains: real EC 0x25-vs-0x15 runtime issue, separate from the decoder.
 5. **FS errno / procfs** — clean up after the above.
+
+---
+
+# Confirmed crush bug & fix: `exit_group(0)` reported as `-9` (2026-05-26)
+
+**Symptom (interactive):**
+```
+akuma:/tmp> crush
+[exit code: -9]
+```
+crush ran, the LLM responded, then on exit the shell reported `-9` (killed by
+signal 9) even though no SIGKILL was ever sent (grep of the boot log shows zero
+`sig=9` / SIGKILL events) and a thread reached `[exit_group] code=0`.
+
+**Root cause:** `kill_thread_group` stamped a **hardcoded `-9`** on every sibling
+channel (`channel.set_exited(-9)`). When a Go **goroutine** calls `exit_group(0)`,
+the thread-group **leader** is one of the "siblings" torn down — and the leader's
+I/O channel is exactly the `Arc<ProcessChannel>` the interactive shell reads for
+the exit status (`src/shell/mod.rs:294` → `channel.exit_code()`). So a clean
+`exit_group(0)` was overwritten to `-9` before the shell read it. (`set_exited`
+is last-writer-wins; `kill_thread_group` had no `has_exited()` guard, unlike
+`teardown_forked_process_thread_group`.)
+
+**Fix:** `kill_thread_group(my_pid, l0_phys, exit_code)` now takes the group's
+real exit code and applies it only when the channel hasn't already recorded one
+(`if !channel.has_exited()`). Callers pass the right code: exit_group → `code`,
+SIGKILL → `-9`, EC=0x25 fault → `-14`, fork-subtree teardown → `137`,
+return_to_kernel(_from_fault) → `exit_code`.
+
+**Status: FIXED, confirmed on trim8.log.** `test_kill_thread_group_preserves_exit_code`
+PASSES (goroutine `exit_group(0)` leaves the leader's channel reporting `0`, not
+`-9`). The existing `test_kill_thread_group_sets_child_channel_exited` was updated
+to assert the caller's code propagates (now passes `137`, asserts `137`) instead
+of the old hardcoded `-9`. The cross-thread coordination guard
+`test_blocked_sibling_woken_by_cross_thread_signal` also passes.
+
+This explains the *exit status*. It does NOT by itself explain the runtime
+slow-down below — that's a separate, still-open problem.
+
+**Note (test infra):** the `parallel_processes` threading test was made robust in
+the same pass — it required *both* the `ps` and `kthreads` liveness checks, but
+`ps` spawns a slow busybox subprocess that races short-lived `/bin/hello`, so it
+now accepts *either* (`ps_done || kthreads_done`). Unrelated to the kill path; it
+was halting the boot test suite before `process_tests` could run.
+
+---
+
+# Crush goroutine-coordination stall — working theories (2026-05-26)
+
+This is the *real* live bug behind the whole "signal hell" investigation: `crush`
+(a multi-goroutine Go LLM client) cannot coordinate its goroutines to receive a
+response from the LLM — it makes progress for a while then effectively stalls.
+None of the unit-test clusters above reproduce it; they were broken test
+harnesses. This section collects the evidence and ranked theories so the next
+session can start from the right place.
+
+## What's already ruled OUT
+
+- **Pending-signal bitmask / mask semantics** (Cluster 2) — primitives were
+  always correct; only the tests were wrong.
+- **Cross-thread wake/interrupt mechanism** — the new guard test
+  `test_blocked_sibling_woken_by_cross_thread_signal` PASSES: a signal delivered
+  from another thread via the `sys_kill` sequence (interrupt → pend → wake)
+  correctly sets the channel interrupted flag, pends the signal, and flips the
+  target WAITING→READY. So the *primitive* layer of goroutine preemption works.
+- **Futex key inconsistency across CLONE_VM threads** — futexes are keyed
+  `(read_current_pid(), uaddr)`; CLONE_VM threads share `PROCESS_INFO_ADDR`, so
+  all threads in the group resolve the same namespace. (One caveat survives as
+  Theory 1.)
+
+## Evidence — `crush` (PID 102) PSTATS, trim3.log
+
+```
+t=10.89s  5359 syscalls  in_kernel=38476ms   futex=226(21798ms)  nanosleep=320(8874ms)   epoll_pwait=347(4900ms)
+t=40.89s 16728 syscalls  in_kernel=146000ms  epoll_pwait=1891(53517ms)  futex=291(50041ms)  nanosleep=1092(37432ms)
+t=70.91s 25341 syscalls  in_kernel=272199ms  epoll_pwait=3508(120602ms) futex=315(79749ms)  nanosleep=1897(66775ms)
+```
+
+Shape of the data:
+- **futex call count is nearly flat (226→291→315) while futex wait time balloons
+  (21.8s→50s→79.7s).** A few waiters are parked for very long and never woken —
+  classic lost-wakeup signature.
+- **nanosleep grows steadily (320→1092→1897 calls).** Go's runtime falls back to
+  timed sleeps when event wakeups don't arrive — a *symptom* of a missed wakeup,
+  not a root cause.
+- **epoll_pwait time grows large** but `read` keeps trickling (255→312→328), so
+  the netpoller isn't fully dead — readiness is delivered sometimes.
+- `in_kernel` (272s) >> wall (71s) is just per-thread summed blocking time, not
+  itself a bug.
+
+## Ranked theories
+
+**Theory 1 — lost futex wakeup via the `tgid = 0` fallback (LEAD).**
+`futex_key_tgid` is `read_current_pid().unwrap_or(0)` (`src/syscall/sync.rs:17`).
+If `read_current_pid()` ever returns `None` for one side of a wait/wake pair
+(e.g. TTBR0 momentarily on boot tables, or an edge in the info-page read), that
+operation silently keys `(0, uaddr)` and misses the real `(leader_pid, uaddr)`
+queue — the waiter is never woken. Flat futex-call / ballooning futex-wait fits
+this exactly.
+*Probe:* log `(key_tgid, uaddr)` on every FUTEX_WAIT enqueue and FUTEX_WAKE; look
+for a WAKE that finds an empty queue while a WAIT sits under a different key.
+Assert `read_current_pid()` is never `None` on the futex path (treat None as a
+hard error, not `0`).
+
+**Theory 2 — epoll readiness edge lost / not re-armed.**
+crush's netpoller blocks in `epoll_pwait` for the socket carrying the LLM
+response. If a readiness edge isn't latched (or a level-triggered fd isn't
+re-reported after a partial read), the goroutine that should read the response
+never wakes. Reads do still trickle, so this is partial, not total.
+*Probe:* instrument `epoll_pwait` return path — how many events, which fds, and
+whether a known-readable socket failed to be reported.
+
+**Theory 3 — woken thread not promptly dispatched (SGI/scheduler latency).**
+`wake()` sets WAITING→READY and fires `trigger_sgi(0)`, but the guard test only
+proved the *state transition*, not that the scheduler actually re-dispatches the
+slot quickly. If dispatch lags (preemption disabled in a long critical section,
+or the round-robin skips the slot), wakeups arrive late and goroutines back off
+into nanosleep.
+*Probe:* measure latency from `wake()` to the target thread actually running.
+
+**Theory 4 — orphaned lock held by a terminated goroutine.**
+If a goroutine thread terminated while holding a kernel lock (futex bucket,
+EPOLL_TABLE), peers block forever. `is_thread_terminated()` orphan detection
+exists but may not cover every lock.
+*Probe:* on long futex/epoll blocks, check whether the lock's last holder is a
+TERMINATED/FREE tid.
+
+Theories 1 and 2 best fit the PSTATS; start there.
+
+---
+
+# Runtime degradation, scheduling & epoll (2026-05-26, trim6.log)
+
+This section drills into *why* crush slows to a crawl after the LLM starts
+issuing tool calls. It is the in-depth companion to Theories 2 and 3 above. The
+short version: **epoll readiness latency is coupled to the round-robin scheduler
+quantum, and Go's runtime reacts to slow wakeups by spinning, which adds more
+runnable threads, which lengthens the quantum cycle — a positive-feedback
+degradation loop.**
+
+## The two relevant constants (both 10 ms)
+
+- `TIMER_INTERVAL_US = 10_000` (`src/config.rs:329`) — preemptive round-robin
+  tick. With N runnable threads, a given thread is revisited roughly every
+  `N × 10 ms`.
+- `BLOCKING_POLL_INTERVAL_US = 10_000` (`src/syscall/poll.rs:34`) — the per-loop
+  cap on how long `epoll_pwait` blocks before re-polling, even when an
+  event-driven waker is registered.
+
+## How `epoll_pwait` actually waits (`src/syscall/poll.rs:394`)
+
+It is a **hybrid poll/wake loop**, not purely event-driven:
+
+1. `smoltcp_net::poll()` — drive the network stack (RX/TX) *inline*.
+2. Snapshot the interest list, check each fd's readiness, registering the
+   thread's waker for event-driven wakeup.
+3. If any fd is ready → return. If `timeout==0` → return. If timed out → return.
+4. Otherwise `schedule_blocking(min(deadline, now + 10ms))` and loop.
+
+Each loop is one `iters`. So `epoll_pwait` re-polls **at least every 10 ms** even
+when nothing is ready, and the network stack is only advanced while an
+epoll-waiting thread is actually running.
+
+## Evidence from trim6 — the smoking gun
+
+Tail of the log, crush PID 131, the network epoll instance (`epfd=9`,
+`timeout_ms=-1` = infinite):
+```
+[epoll] pwait ret pid=131 epfd=9 timeout_ms=-1 nready=1 iters=107 dur_us=4136760 ...
+[epoll] pwait ret pid=131 epfd=9 timeout_ms=-1 nready=1 iters=58  dur_us=2287872 ...
+```
+- `iters=107` over `dur_us=4_136_760` ⇒ **~38 ms per iteration**, despite the
+  10 ms cap. The blocked thread is NOT re-dispatched at its 10 ms deadline — it
+  waits ~3–4 scheduler quanta. That means ~3–4 other threads sit ahead of it in
+  the round-robin each cycle.
+- One ready network event therefore took **~4 seconds** to be delivered to the
+  goroutine that wanted it. That is the coordination stall, concretely.
+
+Meanwhile `epfd=4` (Go's timer/netpoll instance, short timeouts,
+`interest_fds=0`) just spins through `timeout_expired` returns — Go using epoll
+as a timer because real wakeups are slow.
+
+## PSTATS shape (crush PID 122, 36 s → 156 s)
+
+```
+t=36.67s   futex=440(50673ms)   epoll_pwait=1577(48243ms)   nanosleep=905(29393ms)
+t=156.74s  futex=1012(179229ms) epoll_pwait=7008(186008ms)  nanosleep=3755(139114ms)
+           sched_yield=202(6123ms)   clock_gettime=79105(345ms)
+```
+- **`clock_gettime=79105`** in one 30 s window and **`sched_yield` climbing
+  27→202** are the classic Go-runtime *busy-spin* signature: `findrunnable` /
+  `sysmon` loop on the clock and `osyield` when they can't find work or park
+  cleanly.
+- **futex wait time balloons (50 s → 179 s) while call count stays modest** —
+  goroutines parked on futexes (channel ops, netpoller note) woken late, via the
+  10 ms timed fallback rather than a prompt direct wake.
+- All of these spinning threads are themselves **RUNNABLE**, so they *increase*
+  N in the `N × 10 ms` revisit cost.
+
+## The degradation feedback loop
+
+```
+slow epoll/futex wakeup (≥10ms, often ~38ms under load)
+        │
+        ▼
+Go runtime compensates by spinning  ── clock_gettime, sched_yield, 10ms timed futex/nanosleep
+        │
+        ▼
+more RUNNABLE threads in the fixed-slot round-robin
+        │
+        ▼
+longer time to revisit any one thread  (N × 10ms grows)
+        │
+        └────────────► even slower wakeups  (loop tightens)
+```
+This is why crush is fine for the first few LLM turns (few goroutines, small N)
+and degrades once tool-calling fans out into more concurrent goroutines /
+subprocess plumbing (larger N).
+
+## Why tool-calling specifically triggers it
+
+Tool calls fan out concurrency: crush forks+execs subprocesses (`git`, `find`,
+`cat`, `jq` — seen in trim6) *and* spins up goroutines to pump their pipes and to
+issue follow-up network requests. Each adds runnable threads and more
+epoll/pipe fds, pushing N up and tipping the loop above into the visible stall.
+
+## Suggested fixes / probes (in priority order)
+
+1. **Make network-fd epoll truly event-driven.** The waker is already
+   registered (`epoll_check_fd_readiness(.., Some(&waker))`); the 10 ms re-poll
+   cap should be unnecessary for fds that support wakers. If a socket-ready event
+   reliably calls the waker, raise/remove the cap for waker-backed fds so the
+   thread sleeps until the real event (deadline only as a backstop). Measure
+   wake→dispatch latency first.
+2. **Decouple network RX from epoll-thread scheduling.** `smoltcp_net::poll()`
+   only runs while an epoll thread runs; under load that starves RX. Drive the
+   net poll from the timer IRQ / a dedicated thread so packets are processed
+   even when epoll threads are behind.
+3. **Prioritise woken threads.** A thread transitioning WAITING→READY via a real
+   event should be dispatched ahead of threads that are merely spin-yielding, so
+   wakeup latency doesn't scale with N. (Ties to Theory 3.)
+4. **Instrument wake→run latency** for one thread to confirm the ~38 ms/iter
+   reading and quantify the loop.
+
+## Tests to add (next session)
+
+- **epoll wake latency**: register a waker-backed fd, make it ready from another
+  thread, assert `epoll_pwait` returns in ≪ one full `N × 10 ms` cycle (catches
+  the "polled, not event-driven" regression).
+- **scheduler revisit under load**: with K spin-yielding threads runnable, assert
+  a WAITING→READY thread is dispatched within a bounded number of quanta.
+- **net RX independence**: assert inbound data is processed without an
+  epoll-waiting thread actively running (once fix #2 lands).
