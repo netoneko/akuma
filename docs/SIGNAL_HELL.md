@@ -4,35 +4,69 @@ Captured from a boot run. All failures below need to be fixed before acceptance 
 
 ---
 
-## 1. Thread-group kill / exit_group (6 failures)
+## 1. Thread-group kill / exit_group (6 failures) — FIXED 2026-05-26
 
-These all point to threads in a group not observing kill/exit signals sent to the group leader or via `exit_group`.
+**Status: RESOLVED.** All 6 now PASS (confirmed on a real boot, trim4.log). The
+original framing ("threads in a group not observing kill/exit signals") was
+WRONG — the production kill/exit_group path is sound. These were all broken
+*test harness* code, in two distinct flavours.
 
 ```
-kill_thread_group_terminates_before_cleanup
-  s1=0 s2=0 s3=0 — expected TERMINATED=3
-  Sibling threads are not being terminated when the group is killed.
-
-exit_group_kills_siblings_before_close_all
-  s1=0 s2=0 leader=0
-  exit_group is not propagating termination to siblings before fd cleanup.
-
-kill_thread_group_clears_thread_id
-  sib_exists=false sib_state=0 leader_tid=Some(Some(128))
-  Leader TID not cleared after group kill; sibling state incorrect.
-
-zombie_process_unregistered_after_return_to_kernel
-  reg=true exited=false dropped=true gone=true
-  Process stays registered (reg=true) even after returning to kernel; exit flag not set.
-
-sys_kill_sets_interrupted_flag
-  not interrupted
-  Sending a signal to a sleeping thread via sys_kill does not set the interrupted flag.
-
-goroutine_kill_does_not_kill_leader
-  alive=false name=false !exited=false sib_gone=false
-  Killing a goroutine-style thread kills the leader when it should not; or leader state is wrong.
+kill_thread_group_terminates_before_cleanup   s1=0 s2=0 s3=0 — expected TERMINATED=3
+exit_group_kills_siblings_before_close_all     s1=0 s2=0 leader=0
+kill_thread_group_clears_thread_id             sib_exists=false sib_state=0 leader_tid=Some(Some(128))
+zombie_process_unregistered_after_return_to_kernel  reg=true exited=false dropped=true gone=true
+sys_kill_sets_interrupted_flag                 not interrupted
+goroutine_kill_does_not_kill_leader            alive=false name=false !exited=false sib_gone=false
 ```
+
+### Cause A — fake TIDs the state array cannot represent (3 tests)
+
+`terminates_before_cleanup`, `exit_group_kills_siblings`, `clears_thread_id`
+assigned sibling `thread_id = 128/129/130` and asserted
+`get_thread_state(tid) == TERMINATED`. `THREAD_STATES` is a fixed 64-slot array;
+`mark_thread_terminated(idx)` / `get_thread_state(idx)` both early-return for
+`idx >= MAX_THREADS (64)`, so the slot can never be observed. Commit `8624aab`
+bumped these from `28/29/30` (valid slots, passing) to `128/129/130` to stop
+clobbering real threads (the `fake_thread_ids_safe` concern) — correct intent,
+but it made the assertions impossible.
+
+**Fix:** new test-only helper `claim_test_thread_slots(n)` /
+`release_test_thread_slot(idx)` in `crates/akuma-exec/src/threading/mod.rs`
+atomically claims genuinely-FREE slots (parked INITIALIZING, never dispatched by
+the scheduler or `spawn_*`). The 3 tests now use claimed slots — observable AND
+collision-free.
+
+### Cause B — tests asserting behavior the code never had (3 tests)
+
+- `sys_kill_sets_interrupted_flag`: `interrupt_thread(tid)` sets the flag on
+  `get_channel(tid)`, but the boot test thread has no channel registered, so it
+  was a silent no-op. Fix: register a temporary channel for the current thread.
+  (Also fixed a `!0u64`→`0u64` cleanup-mask bug, same class as Cluster 2.)
+- `zombie_process_unregistered_after_return_to_kernel`: expected
+  `kill_thread_group(sibling)` to mark a bystander `exited` — it never does that.
+  Real `sys_exit_group` marks the *caller* Zombie, then `kill_thread_group` reaps
+  the *other* members. Rewritten to model that.
+- `goroutine_kill_does_not_kill_leader`: called `kill_thread_group` (the
+  exit_group/crash group-kill primitive) but asserted the leader survives.
+  `kill_thread_group` correctly tears the whole group down. Real
+  `return_to_kernel` only calls it when the exiting thread OWNS the address space
+  (`!is_shared` — the leader); a goroutine's normal exit (shared) must not.
+  Rewritten to model the `is_shared` gate.
+
+### New regression test (crush goroutine-coordination guard)
+
+`test_blocked_sibling_woken_by_cross_thread_signal` was added to replicate the
+crush stall (goroutines failing to coordinate an LLM response): a *different*
+thread delivers SIGURG via the exact `sys_kill` sequence (interrupt → pend →
+wake) to a blocked sibling, asserting all three coordination effects — channel
+interrupted (EINTR), signal pending, and WAITING→READY.
+
+**Result: it PASSES** (trim4.log). So the cross-thread wake/interrupt mechanism
+is intact in isolation — crush's stall is NOT in this layer. The test now stands
+as a regression guard and rules this path out; the crush hang must be elsewhere
+(candidates: SGI/scheduler re-dispatch, epoll_pwait re-arm, or a lock held by a
+terminated thread). Separate investigation.
 
 ---
 
@@ -187,7 +221,7 @@ procfs stdout
 ## Suggested attack order
 
 1. ~~**Pending signal bitmask**~~ — DONE (2026-05-26, test-only fix; see Cluster 2). The "underlies most of the kill tests" premise was false; the primitives were never broken.
-2. **Thread-group kill / exit_group** — independent bug, does NOT self-resolve (still failing in trim2.log after the signal fix). Needs its own investigation.
+2. ~~**Thread-group kill / exit_group**~~ — DONE (2026-05-26, test-harness fixes; see Cluster 1). All 6 pass in trim4.log. New guard test `blocked_sibling_woken_by_cross_thread_signal` added and passing — rules out the cross-thread wake path as the crush stall.
 3. **fake_thread_ids_safe** — TID namespace overlap, isolated fix.
 4. ~~**STP decoder**~~ — `stp_xzr_misroute_decode` DONE (2026-05-26, test-only fix; the decoder was correct, the test words were malformed). `stp_xzr_ec15_handler_fires` remains: real EC 0x25-vs-0x15 runtime issue, separate from the decoder.
 5. **FS errno / procfs** — clean up after the above.
