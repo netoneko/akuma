@@ -6515,11 +6515,12 @@ fn test_pending_signal_bitmask_multiple() {
     akuma_exec::threading::pend_signal_for_thread(tid, 23);
     // Both should be visible — peek returns lowest
     let first = akuma_exec::threading::peek_pending_signal(tid);
-    // Take the first (15), second (23) should still be pending
-    let taken = akuma_exec::threading::take_pending_signal(!0u64);
+    // Take the first (15), second (23) should still be pending.
+    // mask=0 blocks nothing; a set bit blocks that signal.
+    let taken = akuma_exec::threading::take_pending_signal(0u64);
     let second = akuma_exec::threading::peek_pending_signal(tid);
     // Cleanup
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if first == 15 && taken == Some(15) && second == 23 {
         console::print("[Test] pending_signal_bitmask_multiple PASSED\n");
@@ -6537,10 +6538,10 @@ fn test_pending_signal_take_clears_one() {
     akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
     akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG
 
-    let t1 = akuma_exec::threading::take_pending_signal(!0u64); // takes 2 (lowest)
-    let t2 = akuma_exec::threading::take_pending_signal(!0u64); // takes 15
-    let t3 = akuma_exec::threading::take_pending_signal(!0u64); // takes 23
-    let t4 = akuma_exec::threading::take_pending_signal(!0u64); // none left
+    let t1 = akuma_exec::threading::take_pending_signal(0u64); // takes 2 (lowest)
+    let t2 = akuma_exec::threading::take_pending_signal(0u64); // takes 15
+    let t3 = akuma_exec::threading::take_pending_signal(0u64); // takes 23
+    let t4 = akuma_exec::threading::take_pending_signal(0u64); // none left
 
     if t1 == Some(2) && t2 == Some(15) && t3 == Some(23) && t4.is_none() {
         console::print("[Test] pending_signal_take_clears_one PASSED\n");
@@ -6563,7 +6564,7 @@ fn test_pending_signal_mask_blocks() {
 
     // Should skip 15 (masked) and take 23 (unmasked)
     // Cleanup
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if taken == Some(23) {
         console::print("[Test] pending_signal_mask_blocks PASSED\n");
@@ -6595,9 +6596,9 @@ fn test_pend_signal_or_semantics() {
     akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG — must NOT overwrite 15
 
     let has_15 = akuma_exec::threading::peek_pending_signal(tid) == 15; // lowest pending
-    let taken_15 = akuma_exec::threading::take_pending_signal(!0u64);
+    let taken_15 = akuma_exec::threading::take_pending_signal(0u64);
     let has_23 = akuma_exec::threading::peek_pending_signal(tid) == 23;
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if has_15 && taken_15 == Some(15) && has_23 {
         console::print("[Test] pend_signal_or_semantics PASSED\n");
