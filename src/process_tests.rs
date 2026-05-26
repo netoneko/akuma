@@ -7758,17 +7758,42 @@ fn test_lazy_region_lookup_resolves_tgid() {
 
 fn test_fake_thread_ids_safe() {
     use akuma_exec::threading::{get_thread_state, thread_state};
-    
-    // System threads 0-3 should all be in valid states (READY or RUNNING)
+
+    // Guard that the fake-TID test harness (the kill_thread_group tests, which
+    // run before this one) never clobbered a reserved system-thread slot.
+    //
+    // NOTE: the service threads (SSH/HTTP) are spawned AFTER this test suite, so
+    // at this point slots 1.. are normally FREE — that is expected, NOT
+    // corruption. The earlier version of this test demanded READY/RUNNING and so
+    // could never pass before the services existed. What actually signals
+    // corruption is a reserved slot left TERMINATED or stuck INITIALIZING by a
+    // stray fake-TID write. Slot 0 is the idle thread and must always be live.
     let mut all_valid = true;
-    for i in 0..4 {
+
+    let s0 = get_thread_state(0);
+    if s0 != thread_state::READY && s0 != thread_state::RUNNING {
+        all_valid = false;
+        crate::safe_print!(64, "[Test] fake_thread_ids_safe: idle thread 0 has state {}\n", s0);
+    }
+
+    for i in 1..4 {
         let state = get_thread_state(i);
-        if state != thread_state::READY && state != thread_state::RUNNING {
+        // FREE (unspawned) or any live state is fine; TERMINATED / INITIALIZING
+        // in a reserved slot means a test corrupted it.
+        let ok = matches!(
+            state,
+            thread_state::FREE
+                | thread_state::READY
+                | thread_state::RUNNING
+                | thread_state::WAITING
+        );
+        if !ok {
             all_valid = false;
-            crate::safe_print!(64, "[Test] fake_thread_ids_safe: thread {} has state {}\n", i, state);
+            crate::safe_print!(64,
+                "[Test] fake_thread_ids_safe: reserved thread {} corrupted, state {}\n", i, state);
         }
     }
-    
+
     if all_valid {
         console::print("[Test] fake_thread_ids_safe PASSED\n");
     } else {

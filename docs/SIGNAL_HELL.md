@@ -192,13 +192,31 @@ stp_xzr_ec15_handler_fires
 
 ---
 
-## 4. Thread safety
+## 4. Thread safety — `fake_thread_ids_safe` FIXED 2026-05-26
+
+**Status: RESOLVED.** Passes in trim5.log. Again a test-assumption bug, not real
+corruption.
 
 ```
-fake_thread_ids_safe FAILED: system threads corrupted
-  Assigning fake TIDs to user threads is corrupting the system thread table.
-  Likely an index bounds issue or the TID namespace for user vs system threads overlaps.
+fake_thread_ids_safe FAILED: system threads corrupted   (slots 1,2,3 had state 0 = FREE)
 ```
+
+The test demanded slots 0-3 be READY/RUNNING, assuming live system threads
+occupy slots 1-3. But `process_tests::run_all_tests()` runs at `main.rs:619`,
+while the SSH/HTTP service threads aren't spawned until `main.rs:651`/`810` —
+*after* the test suite. So at test time slots 1-3 are legitimately FREE. The
+test never passed (added in `5920862`).
+
+**Fix:** rewrote the assertion to guard what actually matters — that the
+fake-TID test harness (the kill_thread_group tests, which run earlier) never
+clobbered a reserved system slot:
+- slot 0 (idle thread) must be READY/RUNNING (always live),
+- slots 1-3 must be FREE (unspawned, normal) or a live state; TERMINATED /
+  INITIALIZING in a reserved slot would flag corruption.
+
+Structurally reinforced by the Cluster 1 fix: `claim_test_thread_slots` only
+claims FREE slots in `reserved_threads..MAX_THREADS` (8..64), so the test harness
+can never touch system slots 0-7.
 
 ---
 
@@ -222,6 +240,6 @@ procfs stdout
 
 1. ~~**Pending signal bitmask**~~ — DONE (2026-05-26, test-only fix; see Cluster 2). The "underlies most of the kill tests" premise was false; the primitives were never broken.
 2. ~~**Thread-group kill / exit_group**~~ — DONE (2026-05-26, test-harness fixes; see Cluster 1). All 6 pass in trim4.log. New guard test `blocked_sibling_woken_by_cross_thread_signal` added and passing — rules out the cross-thread wake path as the crush stall.
-3. **fake_thread_ids_safe** — TID namespace overlap, isolated fix.
+3. ~~**fake_thread_ids_safe**~~ — DONE (2026-05-26, test-assumption fix; see Cluster 4). System threads spawn after the test suite, so FREE slots are expected, not corruption.
 4. ~~**STP decoder**~~ — `stp_xzr_misroute_decode` DONE (2026-05-26, test-only fix; the decoder was correct, the test words were malformed). `stp_xzr_ec15_handler_fires` remains: real EC 0x25-vs-0x15 runtime issue, separate from the decoder.
 5. **FS errno / procfs** — clean up after the above.
