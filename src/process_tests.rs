@@ -1825,11 +1825,11 @@ fn test_stp_xzr_misroute_decode() {
     let cases = [
         Case { instr: 0xa9007c1f, exp_rn: 0,  exp_off: 0,    label: "stp xzr,xzr,[x0]" },
         Case { instr: 0xa9017c1f, exp_rn: 0,  exp_off: 16,   label: "stp xzr,xzr,[x0,#0x10]" },
-        Case { instr: 0xa90e7c1f, exp_rn: 0,  exp_off: 112,  label: "stp xzr,xzr,[x0,#0x70]" },
-        Case { instr: 0xa9027c63, exp_rn: 3,  exp_off: 32,   label: "stp xzr,xzr,[x3,#0x20]" },
-        Case { instr: 0xa97f7c1f, exp_rn: 0,  exp_off: -8,   label: "stp xzr,xzr,[x0,#-0x8]" },
-        Case { instr: 0xa97e7c1f, exp_rn: 0,  exp_off: -16,  label: "stp xzr,xzr,[x0,#-0x10]" },
-        Case { instr: 0xa9407c1f, exp_rn: 0,  exp_off: -512, label: "stp xzr,xzr,[x0,#-0x200]" },
+        Case { instr: 0xa9077c1f, exp_rn: 0,  exp_off: 112,  label: "stp xzr,xzr,[x0,#0x70]" },
+        Case { instr: 0xa9027c7f, exp_rn: 3,  exp_off: 32,   label: "stp xzr,xzr,[x3,#0x20]" },
+        Case { instr: 0xa93ffc1f, exp_rn: 0,  exp_off: -8,   label: "stp xzr,xzr,[x0,#-0x8]" },
+        Case { instr: 0xa93f7c1f, exp_rn: 0,  exp_off: -16,  label: "stp xzr,xzr,[x0,#-0x10]" },
+        Case { instr: 0xa9207c1f, exp_rn: 0,  exp_off: -512, label: "stp xzr,xzr,[x0,#-0x200]" },
     ];
 
     let mut ok = true;

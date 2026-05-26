@@ -107,26 +107,53 @@ as an independent bug.
 
 ---
 
-## 3. STP instruction decoder (5 + 1 failures)
+## 3. STP instruction decoder — `stp_xzr_misroute_decode` FIXED 2026-05-26
 
-The `stp xzr, xzr, [rN, #imm]` misroute decoder is computing wrong offsets or returning None for valid encodings.
+**Status of `stp_xzr_misroute_decode`: RESOLVED** (test-only fix). The original
+framing below ("decoder computing wrong offsets / rejecting valid encodings")
+was WRONG. `decode_stp_xzr_xzr` in `src/exceptions.rs:719` is correct per the
+ARM64 STP signed-offset encoding (imm7 in bits[21:15], Rt in bits[4:0], proper
+sign-extension). This was a **test bug**: 5 of the 7 hand-assembled instruction
+words in `src/process_tests.rs` did not encode the instruction their label
+claimed. The 2 well-formed cases (`[x0]`, `[x0,#0x10]`) always passed, which
+already proved the decoder logic.
 
 ```
-stp_xzr_misroute_decode
+stp_xzr_misroute_decode (original failure log)
   stp xzr,xzr,[x0,#0x70]  instr=0xa90e7c1f  got=Some((0,224))  want=(0,112)
   stp xzr,xzr,[x3,#0x20]  instr=0xa9027c63  got=None           want=(3,32)
   stp xzr,xzr,[x0,#-0x8]  instr=0xa97f7c1f  got=None           want=(0,-8)
   stp xzr,xzr,[x0,#-0x10] instr=0xa97e7c1f  got=None           want=(0,-16)
   stp xzr,xzr,[x0,#-0x200] instr=0xa9407c1f got=None           want=(0,-512)
+```
 
-  First case: offset doubled (224 = 0x70 * 2) — shift applied twice or scale factor wrong.
-  Remaining: negative offsets and some positive offsets return None — sign extension or
-  range check rejecting valid signed immediates.
+What each malformed word actually was, and the corrected constant:
 
+| label          | old (wrong) word | defect in the word                  | corrected word |
+|----------------|------------------|-------------------------------------|----------------|
+| `[x0,#0x70]`   | `0xa90e7c1f`     | imm7=28 (→224), should be 14         | `0xa9077c1f`   |
+| `[x3,#0x20]`   | `0xa9027c63`     | Rt=x3 in bits[4:0], should be xzr    | `0xa9027c7f`   |
+| `[x0,#-0x8]`   | `0xa97f7c1f`     | imm7 placed in bits[22:16] not [21:15] | `0xa93ffc1f` |
+| `[x0,#-0x10]`  | `0xa97e7c1f`     | same bit-position error              | `0xa93f7c1f`   |
+| `[x0,#-0x200]` | `0xa9407c1f`     | same bit-position error              | `0xa9207c1f`   |
+
+The "offset doubled (224 = 0x70*2)" symptom was a coincidence of the wrong word,
+not a scale bug; the decoder never doubles anything. Fixed by replacing the 5
+constants in `src/process_tests.rs`. `cargo check` clean.
+
+### `stp_xzr_ec15_handler_fires` — STILL FAILING (separate, real issue)
+
+NOT a decoder bug and NOT fixed. This is a runtime/QEMU concern: QEMU's TCG is
+generating EC=0x25 (data abort) for `stp xzr,xzr` on a PROT_NONE page instead of
+EC=0x15, so the EC=0x15 emulation path is never exercised. The handler may be
+registered under the wrong EC, or the instruction is simply handled by the
+EC=0x25 demand-pager before the EC=0x15 path is reached. Needs its own
+investigation — left untouched.
+
+```
 stp_xzr_ec15_handler_fires
   EC=0x15 STP handler never fired.
   QEMU is generating EC=0x25 for this instruction class instead of EC=0x15.
-  The handler is either registered under the wrong EC or the dispatch table has the wrong key.
 ```
 
 ---
@@ -162,5 +189,5 @@ procfs stdout
 1. ~~**Pending signal bitmask**~~ — DONE (2026-05-26, test-only fix; see Cluster 2). The "underlies most of the kill tests" premise was false; the primitives were never broken.
 2. **Thread-group kill / exit_group** — independent bug, does NOT self-resolve (still failing in trim2.log after the signal fix). Needs its own investigation.
 3. **fake_thread_ids_safe** — TID namespace overlap, isolated fix.
-4. **STP decoder** — arithmetic bug (offset doubled + sign-extension rejecting negative imm7) plus EC 0x25-vs-0x15 dispatch; isolated from signal work.
+4. ~~**STP decoder**~~ — `stp_xzr_misroute_decode` DONE (2026-05-26, test-only fix; the decoder was correct, the test words were malformed). `stp_xzr_ec15_handler_fires` remains: real EC 0x25-vs-0x15 runtime issue, separate from the decoder.
 5. **FS errno / procfs** — clean up after the above.
