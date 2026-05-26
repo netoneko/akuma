@@ -496,3 +496,81 @@ epoll/pipe fds, pushing N up and tipping the loop above into the visible stall.
   a WAITING→READY thread is dispatched within a bounded number of quanta.
 - **net RX independence**: assert inbound data is processed without an
   epoll-waiting thread actively running (once fix #2 lands).
+
+---
+
+# RESOLVED — crush goroutine stall was debug-log UART contention (2026-05-27)
+
+**Status: SOLVED for now** (trim9.log). The crush goroutine-coordination stall
+documented above was caused by **high-volume debug logging holding IRQs disabled
+across synchronous UART writes**, not by a flaw in the futex/epoll/scheduler
+primitives themselves. Disabling two hot-path debug flags broke the degradation
+loop and crush now runs to completion.
+
+## Root cause
+
+`console::print()` (`src/console.rs:69`) wraps its entire byte-by-byte UART write
+loop in `irq::with_irqs_disabled(...)`. The IRQ guard itself is correct (saves and
+restores DAIF, `src/irq.rs:16-41`), but every log line means IRQs are masked for
+the full duration of writing that line to the PL011 data register. Two aggravating
+factors:
+
+1. The UART write does a blind `write_volatile` per byte with **no TXFF (transmit
+   FIFO full) check** (`src/console.rs:31-36`; `TXFF` is defined but
+   `#[allow(dead_code)]`).
+2. Serial is `-serial mon:stdio` (`scripts/run.sh:33`), so output goes to the host
+   terminal and QEMU's stdio chardev can apply host-side backpressure on the vCPU
+   thread *inside* that MMIO store.
+
+Two chatty flags were **on by default** and fire in exactly crush's hot path, both
+routed through `tprint!` → `print()` → IRQs-disabled UART:
+
+- `SYSCALL_DEBUG_NET_ENABLED` (`src/config.rs:282`) — one line per `epoll_pwait`
+  return (`src/syscall/poll.rs:100`). crush's netpoller hammers epoll.
+- `SYSCALL_DEBUG_PIPE_READ` with `SAMPLE=1` (`src/config.rs:254-258`) — a line on
+  **every** pipe read (`src/syscall/fs.rs:73+`). Tool-calling forks subprocesses
+  (`git`, `jq`, `cat`) and pumps their pipes.
+
+The ARM generic timer IRQ is level-triggered, so masking doesn't *lose* ticks — but
+it *delays* them, and delays VirtIO-net RX servicing too. Under tool-call fan-out
+the log volume ramps exactly when concurrency rises, delaying every goroutine
+wakeup. This is the concrete driver of the §6 "≈38 ms per epoll iteration despite a
+10 ms cap" and the positive-feedback degradation loop.
+
+(Note: `PROC_SYSCALL_LOG_ENABLED`, `src/config.rs:221`, is **not** a UART offender —
+it's an in-memory ring buffer via `log::record`, `src/syscall/mod.rs:826`. It only
+adds a `uptime_us()` per syscall.)
+
+## Fix applied
+
+Set both hot-path flags to `false` (`src/config.rs:254,282`). Reversible, one line
+each.
+
+## Confirmation (trim9.log)
+
+- **crush completes its turn and the box goes idle.** Bad runs (trim3/trim6) showed
+  *multiple* PSTATS windows of relentless degradation out to 70–156 s. trim9 shows a
+  single PSTATS at 39.66 s, then crush finishes and the system is fully idle through
+  209 s (`[Thread0] loop` steady, heap flat ~12.2 MB, `[TMR]` regular).
+- **Goroutine coordination is healthy.** SIGURG (sig 23) is delivered to the altstack
+  handler and `rt_sigreturn`'d back-to-back ~50 ms apart (`trim9.log:4470-4477`); the
+  bad runs took ~4 s on that wakeup path.
+- **No feedback loop.** Thread count stayed bounded at 4–7/64, not fanning out into a
+  runnable-thread pileup. Throughput rose to 547 syscalls/s vs ~409/s in trim3.
+- Interactive: crush crashed a couple of times due to a **corrupted crush DB**
+  (unrelated to scheduling); after removing the DB it ran smoothly as expected.
+
+## Structural follow-up (not yet done)
+
+These flags are *diagnostic*; the IRQ-masked-UART coupling is structural, so the
+logging is unusable under load even when wanted. The real fix is to make `print()`
+not hold IRQs across a synchronous UART loop:
+
+- **Preferred — TX ring buffer + UART TX interrupt.** Writer briefly masks IRQs, pushes
+  bytes into a software ring (bounded, tiny critical section), unmasks. The PL011 TX
+  IRQ (fires as the FIFO drains / TXFF clears) feeds the hardware from the ring in the
+  background. Nobody spins; IRQs are off only for the buffer push, not the device drain.
+- **Minimum — honor TXFF, but only with IRQs *enabled*.** Spinning on `TXFF` fixes
+  correctness (no dropped bytes on real HW) but NOT latency, and spinning **with IRQs
+  masked would reinforce the original bug** — so it must not go in the current
+  IRQs-disabled `print()` path as-is.
