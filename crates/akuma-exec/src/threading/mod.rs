@@ -355,6 +355,41 @@ pub fn set_thread_state(idx: usize, state: u8) {
     }
 }
 
+/// Test-only: atomically claim up to `n` genuinely-FREE user thread slots so a
+/// test can use them as sibling thread IDs without corrupting real threads.
+///
+/// Hardcoding fake TIDs is unsafe two ways: low TIDs (< reserved_threads) collide
+/// with live system threads, and TIDs >= MAX_THREADS are silently ignored by
+/// `mark_thread_terminated` / `get_thread_state` (so the slot's state can never be
+/// observed). Claimed slots are parked in INITIALIZING — never dispatched by the
+/// scheduler and never handed out by `spawn_*` (which only takes FREE). Release
+/// each slot with `release_test_thread_slot` when the test finishes.
+pub fn claim_test_thread_slots(n: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for i in config().reserved_threads..MAX_THREADS {
+        if out.len() == n { break; }
+        if THREAD_STATES[i]
+            .compare_exchange(
+                thread_state::FREE,
+                thread_state::INITIALIZING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Test-only: return a slot claimed by `claim_test_thread_slots` to the FREE pool.
+pub fn release_test_thread_slot(idx: usize) {
+    if idx < MAX_THREADS {
+        THREAD_STATES[idx].store(thread_state::FREE, Ordering::SeqCst);
+    }
+}
+
 /// Test helper: get the sticky woken flag for a thread.
 pub fn get_woken_state(idx: usize) -> bool {
     if idx < MAX_THREADS {

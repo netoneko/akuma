@@ -33,7 +33,7 @@ unused_variables = "deny"
 
 [package]
 name = "akuma"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 [[bin]]

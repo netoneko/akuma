@@ -2718,8 +2718,14 @@ fn test_parallel_processes() -> bool {
     // The ps/kthreads checks are best-effort: they can only succeed while at
     // least one process is still running.  If both processes finished before
     // the checks had a chance to run, don't penalise.
+    //
+    // Require EITHER check, not both: `kthreads` runs in-kernel and is fast,
+    // while `ps` spawns a busybox subprocess and is much slower, so for a
+    // short-lived `/bin/hello` `ps` frequently queries only after the process
+    // has already exited. Both observations prove the same thing — the two
+    // processes were concurrently alive and listable — so one suffices.
     let checks_ok = if checks_attempted {
-        ps_done && kthreads_done
+        ps_done || kthreads_done
     } else {
         true
     };

@@ -224,6 +224,8 @@ pub fn run_all_tests() {
     test_signal_wake_sets_woken_state();
     // sys_kill must set interrupted flag so nanosleep returns EINTR
     test_sys_kill_sets_interrupted_flag();
+    // cross-thread signal must wake a blocked sibling (Go goroutine preemption)
+    test_blocked_sibling_woken_by_cross_thread_signal();
     test_nanosleep_returns_eintr_on_interrupt();
     // futex WAKE on unmapped address must return 0, not EFAULT
     test_futex_wake_unmapped_returns_zero();
@@ -256,6 +258,8 @@ pub fn run_all_tests() {
     test_pend_vs_interrupt_delivers_handler();
     // return_to_kernel: normal exit must NOT kill thread group
     test_normal_goroutine_exit_does_not_kill_group();
+    // kill_thread_group must report the real exit code, not a hardcoded -9
+    test_kill_thread_group_preserves_exit_code();
     test_crash_goroutine_exit_kills_group();
     test_leader_exit_never_kills_group();
     // sys_kill must set interrupted BEFORE wake to avoid race
@@ -762,7 +766,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
     register_process(sib_pid, sib_proc);
 
     // Call kill_thread_group (as if main_pid called exit_group)
-    kill_thread_group(main_pid, l0_phys);
+    kill_thread_group(main_pid, l0_phys, 0);
 
     // Verify sibling still exists in table but is marked Zombie
     let (exists, is_zombie) = crate::irq::with_irqs_disabled(|| {
@@ -821,7 +825,7 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
     register_thread_pid(sib_tid, sib_pid);
 
     // Call kill_thread_group
-    kill_thread_group(main_pid, l0_phys);
+    kill_thread_group(main_pid, l0_phys, 0);
 
     // Impersonate the sibling thread and try a syscall
     // We can't easily change current_thread_id(), but we can register the
@@ -1825,11 +1829,11 @@ fn test_stp_xzr_misroute_decode() {
     let cases = [
         Case { instr: 0xa9007c1f, exp_rn: 0,  exp_off: 0,    label: "stp xzr,xzr,[x0]" },
         Case { instr: 0xa9017c1f, exp_rn: 0,  exp_off: 16,   label: "stp xzr,xzr,[x0,#0x10]" },
-        Case { instr: 0xa90e7c1f, exp_rn: 0,  exp_off: 112,  label: "stp xzr,xzr,[x0,#0x70]" },
-        Case { instr: 0xa9027c63, exp_rn: 3,  exp_off: 32,   label: "stp xzr,xzr,[x3,#0x20]" },
-        Case { instr: 0xa97f7c1f, exp_rn: 0,  exp_off: -8,   label: "stp xzr,xzr,[x0,#-0x8]" },
-        Case { instr: 0xa97e7c1f, exp_rn: 0,  exp_off: -16,  label: "stp xzr,xzr,[x0,#-0x10]" },
-        Case { instr: 0xa9407c1f, exp_rn: 0,  exp_off: -512, label: "stp xzr,xzr,[x0,#-0x200]" },
+        Case { instr: 0xa9077c1f, exp_rn: 0,  exp_off: 112,  label: "stp xzr,xzr,[x0,#0x70]" },
+        Case { instr: 0xa9027c7f, exp_rn: 3,  exp_off: 32,   label: "stp xzr,xzr,[x3,#0x20]" },
+        Case { instr: 0xa93ffc1f, exp_rn: 0,  exp_off: -8,   label: "stp xzr,xzr,[x0,#-0x8]" },
+        Case { instr: 0xa93f7c1f, exp_rn: 0,  exp_off: -16,  label: "stp xzr,xzr,[x0,#-0x10]" },
+        Case { instr: 0xa9207c1f, exp_rn: 0,  exp_off: -512, label: "stp xzr,xzr,[x0,#-0x200]" },
     ];
 
     let mut ok = true;
@@ -3222,7 +3226,7 @@ fn test_kill_thread_group_preserves_lazy_regions() {
     let before = lazy_region_lookup_for_pid(owner_pid, va + 0x1000).is_some();
 
     // kill_thread_group called from the sibling (exit_group scenario).
-    kill_thread_group(sibling_pid, l0_phys);
+    kill_thread_group(sibling_pid, l0_phys, 0);
 
     let after = lazy_region_lookup_for_pid(owner_pid, va + 0x1000).is_some();
 
@@ -3370,7 +3374,7 @@ fn test_kill_thread_group_marks_siblings_zombie() {
     register_process(sibling_pid, sib_proc);
 
     // Leader calls kill_thread_group - should unregister sibling
-    kill_thread_group(leader_pid, l0_phys);
+    kill_thread_group(leader_pid, l0_phys, 0);
 
     // Sibling should be unregistered (auto-reaped)
     let sibling_exists = lookup_process(sibling_pid).is_some();
@@ -3450,11 +3454,17 @@ fn test_kill_thread_group_terminates_before_cleanup() {
     let sib2_pid = 65_002u32;
     let sib3_pid = 65_003u32;
 
-    // Use high thread slots to avoid interference with real threads.
-    // Use fake thread IDs >= MAX_THREADS (64) so mark_thread_terminated ignores them
-    let sib1_tid = 128usize;
-    let sib2_tid = 129usize;
-    let sib3_tid = 130usize;
+    // Claim real FREE thread slots so mark_thread_terminated actually records
+    // state we can observe, without clobbering live system/user threads.
+    let claimed = akuma_exec::threading::claim_test_thread_slots(3);
+    if claimed.len() != 3 {
+        for s in &claimed { akuma_exec::threading::release_test_thread_slot(*s); }
+        console::print("[Test] kill_thread_group_terminates_before_cleanup SKIPPED: no free slots\n");
+        return;
+    }
+    let sib1_tid = claimed[0];
+    let sib2_tid = claimed[1];
+    let sib3_tid = claimed[2];
 
     // Create owner process.
     let owner_proc = make_test_process(owner_pid);
@@ -3482,7 +3492,7 @@ fn test_kill_thread_group_terminates_before_cleanup() {
 
     // Before kill: threads should be FREE (test slots, never spawned).
     // The fix sets them to TERMINATED in phase 1 before cleanup.
-    kill_thread_group(owner_pid, l0_phys);
+    kill_thread_group(owner_pid, l0_phys, 0);
 
     // After kill: all sibling threads should be TERMINATED.
     let s1 = get_thread_state(sib1_tid);
@@ -3559,7 +3569,7 @@ fn test_kill_thread_group_no_channel_lock_contention() {
 
     // This is the sequence that used to deadlock:
     // kill_thread_group removes sibling channels, then we get our own channel.
-    kill_thread_group(owner_pid, l0_phys);
+    kill_thread_group(owner_pid, l0_phys, 0);
 
     // If we got here without hanging, the fix works.
     // Verify we can still get the owner's channel (wasn't removed by mistake).
@@ -3596,10 +3606,16 @@ fn test_exit_group_kills_siblings_before_close_all() {
     let leader_pid = 67_000u32;
     let sib1_pid = 67_001u32;
     let sib2_pid = 67_002u32;
-    // Use fake thread IDs >= MAX_THREADS (64) so mark_thread_terminated ignores them
-    let leader_tid = 126usize;
-    let sib1_tid = 127usize;
-    let sib2_tid = 128usize;
+    // Claim real FREE thread slots (see claim_test_thread_slots).
+    let claimed = akuma_exec::threading::claim_test_thread_slots(3);
+    if claimed.len() != 3 {
+        for s in &claimed { akuma_exec::threading::release_test_thread_slot(*s); }
+        console::print("[Test] exit_group_kills_siblings_before_close_all SKIPPED: no free slots\n");
+        return;
+    }
+    let leader_tid = claimed[0];
+    let sib1_tid = claimed[1];
+    let sib2_tid = claimed[2];
 
     // Create leader process
     let mut leader_proc = make_test_process(leader_pid);
@@ -3621,7 +3637,7 @@ fn test_exit_group_kills_siblings_before_close_all() {
     register_process(sib2_pid, sib2_proc);
 
     // Simulate exit_group ordering: kill_thread_group runs FIRST
-    kill_thread_group(leader_pid, l0_phys);
+    kill_thread_group(leader_pid, l0_phys, 0);
 
     // After kill_thread_group, both siblings must be TERMINATED
     let s1 = get_thread_state(sib1_tid);
@@ -3633,6 +3649,8 @@ fn test_exit_group_kills_siblings_before_close_all() {
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
     cleanup_terminated_force();
+    // Leader slot was never terminated, so cleanup won't recycle it — free it.
+    akuma_exec::threading::release_test_thread_slot(leader_tid);
 
     let siblings_terminated = s1 == thread_state::TERMINATED && s2 == thread_state::TERMINATED;
     // Leader state could be anything (we didn't set it), just verify siblings are terminated
@@ -3679,9 +3697,15 @@ fn test_kill_thread_group_clears_thread_id() {
 
     let leader_pid = 62_000u32;
     let sibling_pid = 62_001u32;
-    // Use fake thread IDs >= MAX_THREADS (64) so mark_thread_terminated ignores them
-    let leader_tid = 128usize;
-    let sibling_tid = 129usize;
+    // Claim real FREE thread slots (see claim_test_thread_slots).
+    let claimed = akuma_exec::threading::claim_test_thread_slots(2);
+    if claimed.len() != 2 {
+        for s in &claimed { akuma_exec::threading::release_test_thread_slot(*s); }
+        console::print("[Test] kill_thread_group_clears_thread_id SKIPPED: no free slots\n");
+        return;
+    }
+    let leader_tid = claimed[0];
+    let sibling_tid = claimed[1];
 
     let mut leader_proc = make_test_process(leader_pid);
     leader_proc.thread_id = Some(leader_tid);
@@ -3695,7 +3719,7 @@ fn test_kill_thread_group_clears_thread_id() {
     register_process(sibling_pid, sib_proc);
 
     // Leader calls kill_thread_group
-    kill_thread_group(leader_pid, l0_phys);
+    kill_thread_group(leader_pid, l0_phys, 0);
 
     // Sibling should be unregistered and its thread marked TERMINATED
     let sibling_exists = lookup_process(sibling_pid).is_some();
@@ -3706,9 +3730,11 @@ fn test_kill_thread_group_clears_thread_id() {
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
     cleanup_terminated_force();
+    // Leader slot was never terminated, so cleanup won't recycle it — free it.
+    akuma_exec::threading::release_test_thread_slot(leader_tid);
 
     // Sibling unregistered, its thread TERMINATED, leader unchanged
-    let passed = !sibling_exists 
+    let passed = !sibling_exists
         && sibling_thread_state == thread_state::TERMINATED
         && leader_tid_after == Some(Some(leader_tid));
 
@@ -3768,53 +3794,62 @@ fn test_entry_point_trampoline_no_zombie_match() {
     }
 }
 
-/// Verify that the `return_to_kernel` path for already-terminated threads
-/// captures the PID and can unregister the process, preventing a leak.
+/// Verify the real exit_group → return_to_kernel sequence leaves the *caller*
+/// as a registered zombie (for wait4) while its siblings are torn down, and that
+/// the caller can subsequently be unregistered without leaking.
 ///
-/// We can't call `return_to_kernel` directly (it never returns), but we can
-/// verify the precondition: `current_process()` succeeds for a process that
-/// was killed by `kill_thread_group` (marked zombie but still registered).
-/// This is what the fix relies on — the already_terminated path now calls
-/// `current_process()` instead of unconditionally setting `pid = None`.
+/// Mirrors `sys_exit_group` (src/syscall/proc.rs): the calling thread marks
+/// ITSELF exited+Zombie, then `kill_thread_group` unregisters the *other* group
+/// members. The earlier version of this test wrongly expected
+/// `kill_thread_group` to mark a bystander process exited — it never does that;
+/// it only sets exited/Zombie on the explicit caller path.
 fn test_zombie_process_unregistered_after_return_to_kernel() {
     use akuma_exec::process::{
         register_process, unregister_process, lookup_process,
-        kill_thread_group, clear_lazy_regions,
+        kill_thread_group, clear_lazy_regions, ProcessState,
     };
 
-    let owner_pid = 64_000u32;
-    let sibling_pid = 64_001u32;
+    let caller_pid = 64_000u32;   // the thread calling exit_group
+    let sibling_pid = 64_001u32;  // another thread in the same group
 
-    let owner_proc = make_test_process(owner_pid);
-    let l0_phys = owner_proc.address_space.l0_phys();
-    register_process(owner_pid, owner_proc);
+    let caller_proc = make_test_process(caller_pid); // tgid defaults to caller_pid
+    let l0_phys = caller_proc.address_space.l0_phys();
+    register_process(caller_pid, caller_proc);
 
     let mut sib_proc = make_test_process(sibling_pid);
+    sib_proc.tgid = caller_pid; // same thread group as the caller
     sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
     register_process(sibling_pid, sib_proc);
 
-    // Simulate exit_group from sibling.
-    kill_thread_group(sibling_pid, l0_phys);
+    // exit_group: the caller marks itself exited+Zombie (as sys_exit_group does)
+    // BEFORE tearing down the group, then kills the siblings.
+    if let Some(caller) = lookup_process(caller_pid) {
+        caller.exited = true;
+        caller.exit_code = 0;
+        caller.state = ProcessState::Zombie(0);
+    }
+    kill_thread_group(caller_pid, l0_phys, 0);
 
-    // After kill_thread_group, the owner is zombie but still registered.
-    let still_registered = lookup_process(owner_pid).is_some();
-    let is_exited = lookup_process(owner_pid).map(|p| p.exited).unwrap_or(false);
+    // The caller remains a registered zombie; the sibling is auto-reaped.
+    let still_registered = lookup_process(caller_pid).is_some();
+    let is_exited = lookup_process(caller_pid).map(|p| p.exited).unwrap_or(false);
+    let sibling_gone = lookup_process(sibling_pid).is_none();
 
-    // Simulate what the fixed return_to_kernel does: unregister the zombie.
-    clear_lazy_regions(owner_pid);
-    let dropped = unregister_process(owner_pid);
-    let gone_after = lookup_process(owner_pid).is_none();
+    // return_to_kernel then unregisters the zombie caller.
+    clear_lazy_regions(caller_pid);
+    let dropped = unregister_process(caller_pid);
+    let gone_after = lookup_process(caller_pid).is_none();
 
-    // Clean up sibling too.
+    // Defensive cleanup if the sibling somehow survived.
     clear_lazy_regions(sibling_pid);
     let _ = unregister_process(sibling_pid);
 
-    if still_registered && is_exited && dropped.is_some() && gone_after {
+    if still_registered && is_exited && sibling_gone && dropped.is_some() && gone_after {
         console::print("[Test] zombie_process_unregistered_after_return_to_kernel PASSED\n");
     } else {
-        crate::safe_print!(128,
-            "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} dropped={} gone={}\n",
-            still_registered, is_exited, dropped.is_some(), gone_after);
+        crate::safe_print!(160,
+            "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} sib_gone={} dropped={} gone={}\n",
+            still_registered, is_exited, sibling_gone, dropped.is_some(), gone_after);
     }
 }
 
@@ -3883,7 +3918,18 @@ fn test_signal_wake_sets_woken_state() {
 /// sys_kill must set the channel interrupted flag so blocking syscalls return EINTR.
 /// Without this, nanosleep/futex re-block after wake() and the signal is never delivered.
 fn test_sys_kill_sets_interrupted_flag() {
+    use alloc::sync::Arc;
     let tid = akuma_exec::threading::current_thread_id();
+
+    // interrupt_thread sets the flag on the channel registered for `tid`.
+    // The boot test thread has no channel, so register a temporary one (and
+    // restore any pre-existing channel afterwards) — otherwise interrupt_thread
+    // is a silent no-op and the test can never observe the flag.
+    let prior = akuma_exec::process::channel::get_channel(tid);
+    if prior.is_none() {
+        akuma_exec::process::channel::register_channel(
+            tid, Arc::new(akuma_exec::process::ProcessChannel::new()));
+    }
 
     // Simulate what sys_kill does: pend signal + interrupt channel
     akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
@@ -3892,17 +3938,88 @@ fn test_sys_kill_sets_interrupted_flag() {
     // is_current_interrupted should now be true
     let interrupted = akuma_exec::process::is_current_interrupted();
 
-    // Clean up
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
-    // Clear interrupted flag by getting the channel and resetting
+    // Clean up. mask=0 blocks nothing, so the pended signal is actually drained.
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
     if let Some(ch) = akuma_exec::process::current_channel() {
         ch.clear_interrupted();
+    }
+    if prior.is_none() {
+        let _ = akuma_exec::process::channel::remove_channel(tid);
     }
 
     if interrupted {
         console::print("[Test] sys_kill_sets_interrupted_flag PASSED\n");
     } else {
         console::print("[Test] sys_kill_sets_interrupted_flag FAILED: not interrupted\n");
+    }
+}
+
+/// Replicates the cross-thread coordination Go's runtime depends on to preempt a
+/// goroutine blocked in a syscall (epoll_pwait / futex / nanosleep): a *different*
+/// thread delivers a signal via the exact `sys_kill` sequence (interrupt → pend →
+/// wake). For the blocked sibling to make progress, all three effects must land:
+///   1. its channel is interrupted    → the blocking syscall returns EINTR
+///   2. the signal is pending         → the handler runs on syscall return
+///   3. it is woken: WAITING → READY  → the scheduler re-dispatches it
+///
+/// This is the chain that stalled in crush: blocked goroutines never woke to
+/// service the preemption signal, so the thread group couldn't coordinate a
+/// response from the LLM. A break in any link reproduces that hang.
+fn test_blocked_sibling_woken_by_cross_thread_signal() {
+    use alloc::sync::Arc;
+    use akuma_exec::threading::{
+        thread_state, get_thread_state, peek_pending_signal, get_woken_state,
+        set_woken_state, set_thread_state, clear_pending_signal,
+        claim_test_thread_slots, release_test_thread_slot,
+    };
+
+    const SIGURG: u32 = 23; // Go's async-preemption signal
+
+    let slots = claim_test_thread_slots(1);
+    if slots.len() != 1 {
+        for s in &slots { release_test_thread_slot(*s); }
+        console::print("[Test] blocked_sibling_woken_by_cross_thread_signal SKIPPED: no free slots\n");
+        return;
+    }
+    let sib_tid = slots[0];
+    akuma_exec::process::channel::register_channel(
+        sib_tid, Arc::new(akuma_exec::process::ProcessChannel::new()));
+
+    // wake() flips WAITING→READY and fires a reschedule SGI. This claimed slot has
+    // no real context, so run the delivery+check with IRQs off and restore the
+    // slot before they return — the deferred SGI then finds it non-dispatchable.
+    let (interrupted, pending_ok, woken_flag, now_ready) = crate::irq::with_irqs_disabled(|| {
+        set_woken_state(sib_tid, false);
+        set_thread_state(sib_tid, thread_state::WAITING);
+
+        // Deliver from this (other) thread, exactly as sys_kill does.
+        akuma_exec::process::interrupt_thread(sib_tid);
+        akuma_exec::threading::pend_signal_for_thread(sib_tid, SIGURG);
+
+        let interrupted = akuma_exec::process::channel::get_channel(sib_tid)
+            .map(|c| c.is_interrupted())
+            .unwrap_or(false);
+        let pending_ok = peek_pending_signal(sib_tid) == SIGURG;
+        let woken_flag = get_woken_state(sib_tid);
+        let now_ready = get_thread_state(sib_tid) == thread_state::READY;
+
+        // Park the slot non-dispatchable before IRQs (and the SGI) come back.
+        set_thread_state(sib_tid, thread_state::FREE);
+        set_woken_state(sib_tid, false);
+        (interrupted, pending_ok, woken_flag, now_ready)
+    });
+
+    // Cleanup outside the critical section.
+    clear_pending_signal(sib_tid, SIGURG);
+    let _ = akuma_exec::process::channel::remove_channel(sib_tid);
+    release_test_thread_slot(sib_tid);
+
+    if interrupted && pending_ok && woken_flag && now_ready {
+        console::print("[Test] blocked_sibling_woken_by_cross_thread_signal PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] blocked_sibling_woken_by_cross_thread_signal FAILED: interrupted={} pending={} woken={} ready={}\n",
+            interrupted, pending_ok, woken_flag, now_ready);
     }
 }
 
@@ -5504,10 +5621,13 @@ fn test_kill_thread_group_sets_child_channel_exited() {
     // Before kill: sibling's channel should not be exited
     let sib_before = sib_ch.has_exited();
 
-    // Leader calls kill_thread_group → kills sibling
-    kill_thread_group(leader_pid, l0_phys);
+    // Leader calls kill_thread_group with the group's exit code → kills sibling.
+    // The sibling's channel must reflect the code the caller passed (here 137),
+    // not a hardcoded value — this is what lets a clean exit_group(0) report 0
+    // instead of -9 on the leader's channel.
+    kill_thread_group(leader_pid, l0_phys, 137);
 
-    // After kill: sibling's channel should be set exited (code -9)
+    // After kill: sibling's channel should be set exited with the passed code.
     let sib_after = sib_ch.has_exited();
     let sib_code = sib_ch.exit_code();
 
@@ -5518,7 +5638,7 @@ fn test_kill_thread_group_sets_child_channel_exited() {
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
 
-    if !sib_before && sib_after && sib_code == -9 && !sib_exists {
+    if !sib_before && sib_after && sib_code == 137 && !sib_exists {
         console::print("[Test] kill_thread_group_sets_child_channel_exited PASSED\n");
     } else {
         crate::safe_print!(128,
@@ -5580,7 +5700,7 @@ fn test_epoll_pidfd_with_kill_thread_group() {
     let before = epoll_check_fd_readiness(pidfd_fd, EPOLLIN, None);
 
     // Leader calls kill_thread_group → kills sibling
-    kill_thread_group(leader_pid, l0_phys);
+    kill_thread_group(leader_pid, l0_phys, 0);
 
     // Manually set the child channel as exited (kill_thread_group only sets PROCESS_CHANNEL)
     // In real usage, sys_exit_group handles the child channel via reparent_to_init_and_wake_parent
@@ -5912,7 +6032,7 @@ fn test_goroutine_crash_kills_thread_group() {
     let count_before = akuma_exec::process::table::process_count();
 
     // Kill thread group from leader
-    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
 
     // Siblings gone
     let g1_gone = lookup_process(g1_pid).is_none();
@@ -5963,7 +6083,7 @@ fn test_tgid_leader_vs_member_cleanup() {
         .map(|p| p.tgid == leader_pid && p.tgid != member_pid).unwrap_or(false);
 
     // Kill from leader — member should be cleaned up
-    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
     let member_gone = lookup_process(member_pid).is_none();
 
     let _ = unregister_process(leader_pid);
@@ -6320,32 +6440,48 @@ fn test_pend_vs_interrupt_delivers_handler() {
     }
 }
 
-/// When a goroutine thread (tgid != pid) is killed, the leader must survive.
-/// This test registers a leader + goroutine sibling, kills the sibling via
-/// kill_thread_group, and verifies the leader is still alive and its process
-/// data is intact (not freed, not corrupted).
+/// When a goroutine thread (CLONE_VM, shared address space) exits NORMALLY, the
+/// leader and the rest of the group must survive.
+///
+/// This models the real `return_to_kernel` decision: it only tears down the
+/// thread group when the exiting thread OWNS the address space (`!is_shared` —
+/// the leader). A goroutine shares the address space (`is_shared`), so its
+/// normal exit must NOT call `kill_thread_group`. The earlier version of this
+/// test called `kill_thread_group(goroutine_pid)` unconditionally, which is the
+/// exit_group/crash primitive — it correctly tears the leader down, so the test
+/// was asserting the opposite of what the function does.
 fn test_normal_goroutine_exit_does_not_kill_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process, kill_thread_group};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let goroutine_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // Register leader
+    // Leader owns its address space (is_shared == false).
     let mut leader = make_test_process(leader_pid);
     leader.tgid = leader_pid;
     leader.name = alloc::string::String::from("leader_test");
+    let leader_l0 = leader.address_space.l0_phys();
     register_process(leader_pid, leader);
 
-    // Register goroutine sibling (same tgid as leader)
+    // Goroutine shares the leader's address space (is_shared == true).
     let mut goroutine = make_test_process(goroutine_pid);
     goroutine.tgid = leader_pid; // same thread group
     goroutine.parent_pid = leader_pid;
+    goroutine.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(leader_l0).unwrap();
     register_process(goroutine_pid, goroutine);
 
-    // Kill the thread group from the goroutine's perspective
-    akuma_exec::process::kill_thread_group(goroutine_pid, 0);
+    // Replicate return_to_kernel's gate for the goroutine's normal exit: only an
+    // address-space OWNER tears down the group. A shared goroutine must not.
+    let (l0_phys, is_shared) = lookup_process(goroutine_pid)
+        .map(|p| (p.address_space.l0_phys(), p.address_space.is_shared()))
+        .unwrap_or((0, true));
+    if !is_shared && l0_phys != 0 {
+        kill_thread_group(goroutine_pid, l0_phys, 0);
+    }
+    // The goroutine's own thread is then unregistered (single-thread teardown).
+    let _ = unregister_process(goroutine_pid);
 
-    // Leader must still be alive and intact
+    // Leader must still be alive and intact.
     let leader_alive = lookup_process(leader_pid).is_some();
     let leader_name_ok = lookup_process(leader_pid)
         .map(|p| p.name == "leader_test")
@@ -6353,8 +6489,6 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     let leader_not_exited = lookup_process(leader_pid)
         .map(|p| !p.exited)
         .unwrap_or(false);
-
-    // Goroutine should be unregistered (auto-reaped by kill_thread_group)
     let goroutine_gone = lookup_process(goroutine_pid).is_none();
 
     // Cleanup — unregister anything still in the table
@@ -6368,6 +6502,77 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
         crate::safe_print!(128,
             "[Test] goroutine_kill_does_not_kill_leader FAILED: alive={} name={} !exited={} sib_gone={}\n",
             leader_alive, leader_name_ok, leader_not_exited, goroutine_gone);
+    }
+}
+
+/// `kill_thread_group` must stamp the GROUP's real exit code onto each sibling's
+/// I/O channel — not a hardcoded -9 — and must never clobber a channel that
+/// already recorded a real code.
+///
+/// Regression: when a Go goroutine calls `exit_group(0)`, the thread-group
+/// leader is one of the "siblings" torn down, and the leader's I/O channel is
+/// exactly the Arc the interactive shell reads for the exit status. A hardcoded
+/// `set_exited(-9)` made a clean `exit_group(0)` surface in the shell as
+/// `[exit code: -9]` (137 / "killed by signal 9"). Observed with `crush`.
+fn test_kill_thread_group_preserves_exit_code() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        register_process, unregister_process, kill_thread_group, clear_lazy_regions,
+        ProcessChannel,
+    };
+    use akuma_exec::process::channel::{register_channel, remove_channel};
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot, cleanup_terminated_force,
+    };
+
+    let claimed = claim_test_thread_slots(2);
+    if claimed.len() != 2 {
+        for s in &claimed { release_test_thread_slot(*s); }
+        console::print("[Test] kill_thread_group_preserves_exit_code SKIPPED: no free slots\n");
+        return;
+    }
+    let leader_tid = claimed[0];
+    let goroutine_tid = claimed[1];
+    let leader_pid = 68_000u32;
+    let goroutine_pid = 68_001u32;
+
+    // Leader owns the address space; its I/O channel is what the shell reads.
+    let mut leader = make_test_process(leader_pid);
+    leader.thread_id = Some(leader_tid);
+    let l0 = leader.address_space.l0_phys();
+    register_process(leader_pid, leader);
+    let leader_ch = Arc::new(ProcessChannel::new());
+    register_channel(leader_tid, leader_ch.clone());
+
+    // Goroutine sibling: same tgid, shared address space.
+    let mut g = make_test_process(goroutine_pid);
+    g.tgid = leader_pid;
+    g.thread_id = Some(goroutine_tid);
+    g.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    register_process(goroutine_pid, g);
+
+    // Goroutine calls exit_group(0): the leader is torn down as a "sibling".
+    // Its channel must report 0 — the regression stamped -9 here.
+    kill_thread_group(goroutine_pid, l0, 0);
+
+    let exited = leader_ch.has_exited();
+    let code = leader_ch.exit_code();
+
+    // Cleanup.
+    let _ = remove_channel(leader_tid);
+    clear_lazy_regions(leader_pid);
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(goroutine_pid);
+    cleanup_terminated_force();
+    release_test_thread_slot(leader_tid);
+    release_test_thread_slot(goroutine_tid);
+
+    if exited && code == 0 {
+        console::print("[Test] kill_thread_group_preserves_exit_code PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] kill_thread_group_preserves_exit_code FAILED: exited={} code={} (want 0; regression stamps -9)\n",
+            exited, code);
     }
 }
 
@@ -6442,7 +6647,7 @@ fn test_leader_exit_never_kills_group() {
     register_process(other_pid, other);
 
     // Kill thread group from leader's perspective
-    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
 
     // Leader must survive (kill_thread_group excludes caller)
     let leader_alive = lookup_process(leader_pid).is_some();
@@ -6515,11 +6720,12 @@ fn test_pending_signal_bitmask_multiple() {
     akuma_exec::threading::pend_signal_for_thread(tid, 23);
     // Both should be visible — peek returns lowest
     let first = akuma_exec::threading::peek_pending_signal(tid);
-    // Take the first (15), second (23) should still be pending
-    let taken = akuma_exec::threading::take_pending_signal(!0u64);
+    // Take the first (15), second (23) should still be pending.
+    // mask=0 blocks nothing; a set bit blocks that signal.
+    let taken = akuma_exec::threading::take_pending_signal(0u64);
     let second = akuma_exec::threading::peek_pending_signal(tid);
     // Cleanup
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if first == 15 && taken == Some(15) && second == 23 {
         console::print("[Test] pending_signal_bitmask_multiple PASSED\n");
@@ -6537,10 +6743,10 @@ fn test_pending_signal_take_clears_one() {
     akuma_exec::threading::pend_signal_for_thread(tid, 15); // SIGTERM
     akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG
 
-    let t1 = akuma_exec::threading::take_pending_signal(!0u64); // takes 2 (lowest)
-    let t2 = akuma_exec::threading::take_pending_signal(!0u64); // takes 15
-    let t3 = akuma_exec::threading::take_pending_signal(!0u64); // takes 23
-    let t4 = akuma_exec::threading::take_pending_signal(!0u64); // none left
+    let t1 = akuma_exec::threading::take_pending_signal(0u64); // takes 2 (lowest)
+    let t2 = akuma_exec::threading::take_pending_signal(0u64); // takes 15
+    let t3 = akuma_exec::threading::take_pending_signal(0u64); // takes 23
+    let t4 = akuma_exec::threading::take_pending_signal(0u64); // none left
 
     if t1 == Some(2) && t2 == Some(15) && t3 == Some(23) && t4.is_none() {
         console::print("[Test] pending_signal_take_clears_one PASSED\n");
@@ -6563,7 +6769,7 @@ fn test_pending_signal_mask_blocks() {
 
     // Should skip 15 (masked) and take 23 (unmasked)
     // Cleanup
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if taken == Some(23) {
         console::print("[Test] pending_signal_mask_blocks PASSED\n");
@@ -6595,9 +6801,9 @@ fn test_pend_signal_or_semantics() {
     akuma_exec::threading::pend_signal_for_thread(tid, 23); // SIGURG — must NOT overwrite 15
 
     let has_15 = akuma_exec::threading::peek_pending_signal(tid) == 15; // lowest pending
-    let taken_15 = akuma_exec::threading::take_pending_signal(!0u64);
+    let taken_15 = akuma_exec::threading::take_pending_signal(0u64);
     let has_23 = akuma_exec::threading::peek_pending_signal(tid) == 23;
-    let _ = akuma_exec::threading::take_pending_signal(!0u64);
+    let _ = akuma_exec::threading::take_pending_signal(0u64);
 
     if has_15 && taken_15 == Some(15) && has_23 {
         console::print("[Test] pend_signal_or_semantics PASSED\n");
@@ -7213,7 +7419,7 @@ fn test_sigkill_goroutine_does_not_kill_leader() {
     register_process(g2_pid, g2);
 
     // SIGKILL the leader (what the parent does)
-    akuma_exec::process::kill_thread_group(leader_pid, 0);
+    akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
     let _ = akuma_exec::process::kill_process_with_signal(leader_pid, 9);
 
     // Goroutines must be gone (auto-reaped by kill_thread_group)
@@ -7501,7 +7707,7 @@ fn test_kill_thread_group_two_phase() {
     register_process(sibling_pid, sibling);
     
     // Kill thread group
-    kill_thread_group(leader_pid, l0_phys);
+    kill_thread_group(leader_pid, l0_phys, 0);
     
     // Sibling should be unregistered (kill_thread_group removes it)
     let sibling_gone = akuma_exec::process::lookup_process(sibling_pid).is_none();
@@ -7628,17 +7834,42 @@ fn test_lazy_region_lookup_resolves_tgid() {
 
 fn test_fake_thread_ids_safe() {
     use akuma_exec::threading::{get_thread_state, thread_state};
-    
-    // System threads 0-3 should all be in valid states (READY or RUNNING)
+
+    // Guard that the fake-TID test harness (the kill_thread_group tests, which
+    // run before this one) never clobbered a reserved system-thread slot.
+    //
+    // NOTE: the service threads (SSH/HTTP) are spawned AFTER this test suite, so
+    // at this point slots 1.. are normally FREE — that is expected, NOT
+    // corruption. The earlier version of this test demanded READY/RUNNING and so
+    // could never pass before the services existed. What actually signals
+    // corruption is a reserved slot left TERMINATED or stuck INITIALIZING by a
+    // stray fake-TID write. Slot 0 is the idle thread and must always be live.
     let mut all_valid = true;
-    for i in 0..4 {
+
+    let s0 = get_thread_state(0);
+    if s0 != thread_state::READY && s0 != thread_state::RUNNING {
+        all_valid = false;
+        crate::safe_print!(64, "[Test] fake_thread_ids_safe: idle thread 0 has state {}\n", s0);
+    }
+
+    for i in 1..4 {
         let state = get_thread_state(i);
-        if state != thread_state::READY && state != thread_state::RUNNING {
+        // FREE (unspawned) or any live state is fine; TERMINATED / INITIALIZING
+        // in a reserved slot means a test corrupted it.
+        let ok = matches!(
+            state,
+            thread_state::FREE
+                | thread_state::READY
+                | thread_state::RUNNING
+                | thread_state::WAITING
+        );
+        if !ok {
             all_valid = false;
-            crate::safe_print!(64, "[Test] fake_thread_ids_safe: thread {} has state {}\n", i, state);
+            crate::safe_print!(64,
+                "[Test] fake_thread_ids_safe: reserved thread {} corrupted, state {}\n", i, state);
         }
     }
-    
+
     if all_valid {
         console::print("[Test] fake_thread_ids_safe PASSED\n");
     } else {

@@ -639,7 +639,7 @@ pub extern "C" fn check_process_exit() -> bool {
 /// Kill all threads in the same thread group (matching tgid).
 /// Used by exit_group and when the address-space owner exits to prevent
 /// sibling threads from running with freed page tables.
-pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
+pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // Find tgid for the calling process
     let tgid = table::get_process_ptr(my_pid)
         .map(|ptr| unsafe { (*ptr).tgid })
@@ -671,7 +671,15 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize) {
 
         if let Some(tid) = sib_tid {
             if let Some(channel) = remove_channel(*tid) {
-                channel.set_exited(-9);
+                // Use the GROUP's real exit code, not a hardcoded -9. When a
+                // goroutine calls exit_group(0), the leader is one of these
+                // "siblings" and its channel is the one the shell reads — a
+                // hardcoded -9 here made a clean exit report as "killed by
+                // signal 9" (-9). Never clobber a channel that already recorded
+                // a real code (matches teardown_forked_process_thread_group).
+                if !channel.has_exited() {
+                    channel.set_exited(exit_code);
+                }
             }
         }
 
@@ -742,7 +750,7 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
     }
     members.sort_by_key(|(_, _, shared)| if *shared { 0 } else { 1 });
 
-    kill_thread_group(child_pid, l0_phys);
+    kill_thread_group(child_pid, l0_phys, 137);
 
     for (pid, tid, _) in &members {
         if let Some(proc) = lookup_process(*pid) {
@@ -984,7 +992,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
         // all page tables; siblings still using them would cause EL1 faults.
         if !is_shared && l0_phys != 0 {
-            kill_thread_group(pid, l0_phys);
+            kill_thread_group(pid, l0_phys, exit_code);
         }
 
         let (start_us, proc_name) = lookup_process(pid)
@@ -1104,7 +1112,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
         }
 
         if !is_shared && l0_phys != 0 {
-            kill_thread_group(pid, l0_phys);
+            kill_thread_group(pid, l0_phys, exit_code);
         }
 
         let start_us = lookup_process(pid)

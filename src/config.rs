@@ -251,7 +251,7 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
 ///
 /// Can be very chatty during **`forktest_parent` + epoll**; set **`false`** once done,
 /// or pair with a shorter **`--duration`**.
-pub const SYSCALL_DEBUG_PIPE_READ: bool = true;
+pub const SYSCALL_DEBUG_PIPE_READ: bool = false;
 
 /// Log one **`[pipe-read]`** line every **N** matching syscalls (1 = every call).
 /// Ignored when **`SYSCALL_DEBUG_PIPE_READ`** is **`false`**.
@@ -279,7 +279,7 @@ pub const DEBUG_PATTERN2_TRAP_TRACE: bool = false;
 
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
-pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;
+pub const SYSCALL_DEBUG_NET_ENABLED: bool = false;
 
 /// Log every Nth `epoll_pwait` with **timeout=0** and **nready=0** (hot spin). Others are suppressed
 /// to avoid serial floods; increase for quieter traces, decrease (e.g. 512) while debugging.
