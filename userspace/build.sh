@@ -34,8 +34,6 @@ MEMBERS=(
     "sbase"
     "sshd"
     "dash"
-    "xbps"
-    "apk-tools"
     "llama-cpp"
     "crush"
     "stp_test"
@@ -62,28 +60,6 @@ for member in "${MEMBERS[@]}"; do
             echo "Copied $LIBTCC1_ARCHIVE to ../bootstrap/archives/libtcc1.tar"
         else
             echo "Warning: libtcc1 archive not found at $LIBTCC1_ARCHIVE"
-        fi
-    fi
-    # Special handling for xbps to copy its package archive
-    if [ "$member" == "xbps" ]; then
-        XBPS_ARCHIVE="xbps/dist/xbps.tar"
-        if [ -f "$XBPS_ARCHIVE" ]; then
-            mkdir -p ../bootstrap/archives/
-            cp "$XBPS_ARCHIVE" ../bootstrap/archives/xbps.tar
-            echo "Copied $XBPS_ARCHIVE to ../bootstrap/archives/xbps.tar"
-        else
-            echo "Warning: xbps archive not found at $XBPS_ARCHIVE"
-        fi
-    fi
-    # Special handling for apk-tools to copy its archive
-    if [ "$member" == "apk-tools" ]; then
-        APK_ARCHIVE="apk-tools/dist/apk-tools.tar"
-        if [ -f "$APK_ARCHIVE" ]; then
-            mkdir -p ../bootstrap/archives/
-            cp "$APK_ARCHIVE" ../bootstrap/archives/apk-tools.tar
-            echo "Copied $APK_ARCHIVE to ../bootstrap/archives/apk-tools.tar"
-        else
-            echo "Warning: apk-tools archive not found at $APK_ARCHIVE"
         fi
     fi
 done

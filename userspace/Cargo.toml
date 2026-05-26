@@ -26,8 +26,6 @@ members = [
     "sshd",
     "dash",
     "sbase",
-    "xbps",
-    "apk-tools",
     "llama.cpp",
     "crush",
     "stp_test"
