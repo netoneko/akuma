@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libakuma",
     "libakuma-tls",
+    "apk-tools",
     "box",
     "cat",
     "doom",
