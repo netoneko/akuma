@@ -2,11 +2,20 @@
 set -e
 
 WITH_FORKTEST=false
+APK_ONLY=false
 for arg in "$@"; do
     case "$arg" in
         --with-forktest) WITH_FORKTEST=true ;;
+        --apk-only) APK_ONLY=true ;;
     esac
 done
+
+if [ "$APK_ONLY" = true ]; then
+    echo "Building apk-tools only..."
+    cargo build --release -p apk-tools
+    echo "apk-tools bootstrap assets ready."
+    exit 0
+fi
 
 # List of members to build (excluding those known to fail with std issues)
 MEMBERS=(
