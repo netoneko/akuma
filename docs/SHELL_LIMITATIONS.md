@@ -54,7 +54,6 @@ $ echo meow > /home/meow.txt
 The following userspace programs do not respect the current working directory:
 
 - **quickjs** - JavaScript file paths are resolved from root
-- **sqld** - Database file paths are resolved from root
 
 These programs need to be updated to use the CWD passed by the kernel.
 
