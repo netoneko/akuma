@@ -18,7 +18,6 @@ exec qemu-system-aarch64 \
   -machine virt \
   -cpu max \
   -m "$MEMORY" \
-  -L qemu-roms \
   -serial mon:stdio \
   -display none \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080,hostfwd=tcp::44-:44,hostfwd=tcp::4444-:4444 \

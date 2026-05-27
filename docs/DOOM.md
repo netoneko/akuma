@@ -1,5 +1,7 @@
 # DOOM on Akuma
 
+> **Note:** DOOM support has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`). This document is kept for historical reference.
+
 A `no_std` port of DOOM running as a userspace ELF binary on the Akuma bare-metal ARM64 kernel.
 
 ## Overview

@@ -1,6 +1,6 @@
 # Akuma OS
 
-**A bare-metal AArch64 operating system written in Rust — preemptive kernel, Linux-compatible syscalls, SSH server, containers, package managers, a C compiler, a JS runtime, a Git client, DOOM, and an AI coding assistant**
+**A bare-metal AArch64 operating system written in Rust — preemptive kernel, Linux-compatible syscalls, SSH server, containers, package managers, a C compiler, a JS runtime, a Git client, and an AI coding assistant**
 
 ```
                                              %#%:                +
@@ -108,7 +108,6 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | **SQLite server (sqld)** | TCP-based SQLite daemon for executing SQL queries over the network |
 | **AI assistant (meow)** | LLM chat client connecting to Ollama — streaming responses, filesystem and network tool calling |
 | **Package managers** | Built-in `pkg install`, plus `xbps` (Void Linux) and `apk` (Alpine Linux) for real package repositories |
-| **DOOM** | Playable DOOM — renders to framebuffer and as ANSI art over SSH |
 
 ### Terminal
 
@@ -173,7 +172,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 ┌──────────────────────────────────────────────────────────────────┐
 │                          Userspace                               │
 │  ┌──────┐ ┌─────┐ ┌─────┐ ┌───────┐ ┌─────┐ ┌──────┐ ┌──────┐  │
-│  │ dash │ │ tcc │ │ bun │ │scratch│ │ doom│ │ meow │ │ sbase│  │
+│  │ dash │ │ tcc │ │ bun │ │scratch│ │ meow │ │ sbase│         │
 │  └──────┘ └─────┘ └─────┘ └───────┘ └─────┘ └──────┘ └──────┘  │
 │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────────┐  │
 │  │ herd │ │ box  │ │ sqld │ │ httpd│ │ xbps │ │ apk          │  │
