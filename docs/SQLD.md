@@ -1,5 +1,7 @@
 # sqld - SQLite Daemon for Akuma
 
+> **Note:** sqld has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`). This document is kept for historical reference.
+
 `sqld` is a userspace SQLite server that provides a TCP interface for executing SQL queries.
 
 ## Quick Start

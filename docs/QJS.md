@@ -213,6 +213,10 @@ The compiled `qjs` binary is approximately 700KB:
 - C library stubs (~40KB)
 - Rust runtime and libakuma (~60KB)
 
+## Comparison with sqld (removed)
+
+> **Note:** sqld has been removed (see `docs/TRIMMING_FAT_PART_2.md`). This comparison is kept for historical context.
+
 ## Comparison with sqld
 
 | Aspect | sqld | qjs |

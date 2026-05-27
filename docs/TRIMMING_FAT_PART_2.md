@@ -30,3 +30,26 @@ Continued removal of components that add build complexity and maintenance burden
 - `scripts/run.sh`
 - `scripts/cargo_runner.sh`
 - `.claude/settings.local.json` (allowlist entries)
+
+## Removed: sqld
+
+**What:** `userspace/sqld/` — a TCP-based SQLite daemon exposing a network interface for executing SQL queries against a local SQLite database.
+
+**Why removed:** Application-level service with no tie to core OS functionality. Adding a full SQLite amalgamation and custom network protocol is significant build weight for a feature that isn't part of the OS itself.
+
+**Files removed:**
+- `userspace/sqld/` (entire directory)
+- `"sqld"` entry from `userspace/Cargo.toml`
+- `"sqld"` from both MEMBERS and BINARIES arrays in `userspace/build.sh`
+- sqld row from `README.md` capabilities table and architecture diagram
+
+**Files updated:**
+- `docs/SQLD.md` — kept for historical reference, marked as removed
+- `docs/C_STUBS.md` — noted that sqld stubs no longer exist
+- `docs/QJS.md` — noted sqld removal in the comparison section
+
+## Removed: xbps
+
+**What:** `xbps` — the Void Linux package manager, used to install packages from Void Linux repositories.
+
+**Why removed:** Maintaining two package managers (xbps and apk) was redundant; apk (Alpine Linux) covers the same use case with a smaller footprint.

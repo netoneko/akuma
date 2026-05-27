@@ -105,7 +105,6 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 |---|---|
 | **Process supervisor (herd)** | Manages background services with auto-restart, logging, config files in `/etc/herd/` |
 | **Container manager (box)** | `box open/close/stop/ps/inspect` for managing isolated containers |
-| **SQLite server (sqld)** | TCP-based SQLite daemon for executing SQL queries over the network |
 | **AI assistant (meow)** | LLM chat client connecting to Ollama — streaming responses, filesystem and network tool calling |
 | **Package managers** | Built-in `pkg install`, plus `xbps` (Void Linux) and `apk` (Alpine Linux) for real package repositories |
 
@@ -175,7 +174,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 │  │ dash │ │ tcc │ │ bun │ │scratch│ │ meow │ │ sbase│         │
 │  └──────┘ └─────┘ └─────┘ └───────┘ └─────┘ └──────┘ └──────┘  │
 │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────────┐  │
-│  │ herd │ │ box  │ │ sqld │ │ httpd│ │ xbps │ │ apk          │  │
+│  │ herd │ │ box  │ │ httpd│ │ xbps │ │ apk  │                  │
 │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
 │  Syscall Interface (Linux AArch64 ABI, ~140 syscalls)            │

@@ -1,5 +1,7 @@
 # C Library Stubs - Future Refactoring
 
+> **Note:** sqld has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`). The sqld stubs described below no longer exist; only qjs stubs remain.
+
 ## Current State
 
 Both `sqld` and `qjs` maintain their own C library stub implementations:
