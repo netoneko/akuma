@@ -1,38 +1,79 @@
-# Trim the Fat — Part 1: Removing xbps and apk-tools
+# Trim the Fat — Part 1
 
 ## Summary
 
-Removed the two bundled package managers (`userspace/xbps/` and `userspace/apk-tools/`) as the first step in the infrastructure optimization described in [`proposals/TRIM_SOME_FAT.md`](../proposals/TRIM_SOME_FAT.md).
+Removed `userspace/xbps/` and restructured `userspace/apk-tools/` as the first
+step in the infrastructure optimization described in
+[`proposals/TRIM_SOME_FAT.md`](../proposals/TRIM_SOME_FAT.md).
 
-## What Was Removed
+The acceptance criterion — `apk add busybox` running to completion inside the
+VM — has been verified and passes.
+
+## What Was Done
+
+### Removed
 
 | Component | Reason |
 |-----------|--------|
-| `userspace/xbps/` | Void Linux package manager — redundant, complex vendor tree, replaced by the Alpine/busybox model |
-| `userspace/apk-tools/` | Pre-bundled Alpine apk binary — no longer baked in; bootstrapped on demand from Alpine CDN at runtime |
-| `bootstrap/archives/xbps.tar` | Generated artifact from xbps build; deleted alongside the source |
-| `bootstrap/archives/apk-tools.tar` | Generated artifact from apk-tools build; deleted alongside the source |
+| `userspace/xbps/` | Void Linux package manager — redundant, complex vendor tree, superseded by the Alpine/apk model |
+| `bootstrap/archives/xbps.tar` | Generated artifact; deleted with the source |
 
-## What Replaced Them
+### Changed
 
-The OS no longer ships a package manager as a pre-installed binary. Instead:
+| Component | Change |
+|-----------|--------|
+| `userspace/apk-tools/` | Restored and updated (3.0.5 → 3.0.6). No longer deleted — used via `--apk-only` to stage bootstrap assets without a full userspace build |
+| `userspace/build.sh` | Added `--apk-only` flag: builds only `apk-tools`, exits early |
+| `src/shell/commands/net.rs` (curl) | Added `-o <file>` output flag |
+| `src/process_tests.rs` | Tests that require binaries now skip with a warning when `FAIL_TESTS_IF_TEST_BINARY_MISSING = false` instead of panicking |
 
-1. The built-in kernel `curl` command (HTTP/HTTPS GET, `src/shell/commands/net.rs`) is used to download `apk.static` from Alpine CDN at first boot or on demand.
-2. `apk.static` is a statically-linked Alpine binary that needs no dynamic libraries and can bootstrap a full Alpine root from scratch.
-3. `busybox` is then installed via `apk add busybox`, providing the full Unix utility suite.
+### Added
 
-This matches the model described in `proposals/TRIM_SOME_FAT.md`: success is defined by the stability of the syscalls required by `apk` and `busybox`, not by bundling every tool.
+| Component | Purpose |
+|-----------|---------|
+| `bootstrap/etc/apk/` | Alpine signing keys, repo URLs, arch — pre-staged by `apk-tools` build.rs |
+| `bootstrap/etc/resolv.conf` | DNS config for the VM |
+| `bootstrap/etc/sshd/authorized_keys` | SSH public key (provisioned manually, see acceptance doc) |
+| `acceptance/01_verify_apk_bootstrap.md` | Step-by-step acceptance procedure for fresh-image bootstrap |
 
-## How to Verify
+## Bootstrap Model
 
-Follow the steps in [`acceptance/01_verify_apk_bootstrap.md`](../acceptance/01_verify_apk_bootstrap.md) against a live Akuma QEMU instance.
+`apk` and its signing keys are staged into `bootstrap/` at build time (not
+downloaded at runtime). Fresh-image setup:
 
-## Syscall Requirements
+```
+userspace/build.sh --apk-only   # download apk binary + keys + CA certs → bootstrap/
+scripts/create_disk.sh          # create blank ext2 disk.img
+scripts/populate_disk.sh        # copy bootstrap/ into disk.img via Docker
+cargo run --release             # boot the VM
+ssh -p 2222 root@localhost "apk add busybox"
+```
 
-For `apk` and `busybox` to work, the kernel must correctly implement the syscalls documented in `docs/APK_MISSING_SYSCALLS.md`. That file remains the reference for any syscall gaps discovered during bootstrap.
+## Acceptance
 
-## Next Steps (Part 2)
+```
+akuma:/> apk add busybox
+(1/2) Installing musl (1.2.5-r23)
+(2/2) Installing busybox (1.37.0-r30)
+  Executing busybox-1.37.0-r30.post-install
+Executing busybox-1.37.0-r30.trigger
+OK: 1612 KiB in 2 packages
+akuma:/> busybox sh
+sh: can't access tty; job control turned off
+~ # exit
+```
 
-Per the proposal, the next candidates for removal are:
-- `sbase/` utilities that duplicate busybox functionality (low risk)
-- `userspace/top/` (replace with `busybox top`)
+Full procedure: [`acceptance/01_verify_apk_bootstrap.md`](../acceptance/01_verify_apk_bootstrap.md)
+
+## What Can Now Be Eliminated (Part 2)
+
+With busybox available via `apk add`, these in-tree components become redundant:
+
+- **`userspace/sbase/`** — Unix utilities (ls, cat, echo, …) duplicated by busybox
+- **`userspace/top/`** — replaced by `busybox top`
+- **`userspace/cat/`** — replaced by `busybox cat`
+- **`userspace/echo2/`** — replaced by `busybox echo`
+- **`bootstrap/bin/sbase`** symlink farm and related disk space
+
+Syscall requirements for `apk` and `busybox` are tracked in
+`docs/APK_MISSING_SYSCALLS.md`.
