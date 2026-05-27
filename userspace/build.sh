@@ -39,7 +39,6 @@ MEMBERS=(
     "musl"
     "tcc"
     "tar"
-    "sbase"
     "sshd"
     "dash"
     "llama-cpp"

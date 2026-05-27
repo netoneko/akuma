@@ -25,7 +25,6 @@ members = [
     "tar",
     "sshd",
     "dash",
-    "sbase",
     "llama.cpp",
     "crush",
     "stp_test"
