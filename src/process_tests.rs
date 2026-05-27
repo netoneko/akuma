@@ -2558,10 +2558,20 @@ fn test_pipe_eof_after_data_flush() {
 fn test_child_stdout_blocking_read() {
     use akuma_exec::process::spawn_process_with_channel_ext;
 
-    // Use /bin/hello as it's available in the test environment and designed for streaming
     let path = "/bin/hello";
+
+    if fs::read_file(path).is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, "[Test] {} not found - FAIL\n", path);
+            panic!("Required test binary not found");
+        } else {
+            crate::safe_print!(96, "[Test] {} not found, skipping child_stdout_blocking_read test\n", path);
+            return;
+        }
+    }
+
     let args = ["/bin/hello", "1", "100"];
-    
+
     let (_tid, ch, _pid) = spawn_process_with_channel_ext(
         path,
         Some(&args),
