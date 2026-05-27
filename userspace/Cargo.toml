@@ -5,7 +5,6 @@ members = [
     "libakuma-tls",
     "apk-tools",
     "box",
-    "cat",
     "doom",
     "echo2",
     "elftest",
