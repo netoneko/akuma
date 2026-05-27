@@ -280,7 +280,7 @@ impl Command for HelpCommand {
                 .await;
             let _ = stdout.write(b"\r\nNetwork commands:\r\n").await;
             let _ = stdout
-                .write(b"  curl <url>            - HTTP GET request\r\n")
+                .write(b"  curl [-L] [-o <file>] <url> - HTTP GET request\r\n")
                 .await;
             let _ = stdout
                 .write(b"  nslookup <host>       - DNS lookup with timing\r\n")

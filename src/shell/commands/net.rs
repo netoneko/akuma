@@ -65,7 +65,7 @@ pub struct CurlCommand;
 impl Command for CurlCommand {
     fn name(&self) -> &'static str { "curl" }
     fn description(&self) -> &'static str { "HTTP/HTTPS GET request" }
-    fn usage(&self) -> &'static str { "curl [-k] [-L] [-v] <url>" }
+    fn usage(&self) -> &'static str { "curl [-k] [-L] [-v] [-o <file>] <url>" }
 
     fn execute<'a>(
         &'a self,
@@ -77,20 +77,25 @@ impl Command for CurlCommand {
         Box::pin(async move {
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
             if args_str.is_empty() {
-                let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] <url>\r\n").await;
+                let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] [-o <file>] <url>\r\n").await;
                 return Ok(());
             }
 
             let mut insecure = false;
             let mut follow_redirects = false;
             let mut verbose = false;
+            let mut output_file: Option<&str> = None;
             let mut url_str = None;
 
-            for token in args_str.split_whitespace() {
+            let mut tokens = args_str.split_whitespace();
+            while let Some(token) = tokens.next() {
                 match token {
                     "-k" | "--insecure" => insecure = true,
                     "-L" | "--location" => follow_redirects = true,
                     "-v" | "--verbose" => verbose = true,
+                    "-o" | "--output" => {
+                        output_file = tokens.next();
+                    }
                     "-Lv" | "-vL" => { follow_redirects = true; verbose = true; }
                     "-Lk" | "-kL" => { follow_redirects = true; insecure = true; }
                     "-kv" | "-vk" => { insecure = true; verbose = true; }
@@ -105,7 +110,7 @@ impl Command for CurlCommand {
             let raw_url = match url_str {
                 Some(u) => u,
                 None => {
-                    let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] <url>\r\n").await;
+                    let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] [-o <file>] <url>\r\n").await;
                     return Ok(());
                 }
             };
@@ -150,9 +155,24 @@ impl Command for CurlCommand {
                             }
                         }
 
-                        let _ = stdout.write(&resp.body).await;
-                        if !resp.body.ends_with(b"\n") {
-                            let _ = stdout.write(b"\r\n").await;
+                        if let Some(path) = output_file {
+                            match async_fs::write_file(path, &resp.body).await {
+                                Ok(_) => {
+                                    if verbose {
+                                        let msg = format!("* Saved {} bytes to {}\r\n", resp.body.len(), path);
+                                        let _ = stdout.write(msg.as_bytes()).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    let msg = format!("Error: failed to write {}: {}\r\n", path, e);
+                                    let _ = stdout.write(msg.as_bytes()).await;
+                                }
+                            }
+                        } else {
+                            let _ = stdout.write(&resp.body).await;
+                            if !resp.body.ends_with(b"\n") {
+                                let _ = stdout.write(b"\r\n").await;
+                            }
                         }
                     }
                     Err(e) => {
