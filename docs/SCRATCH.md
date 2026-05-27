@@ -1,5 +1,7 @@
 # Scratch - Minimal Git Client for Akuma OS
 
+> **Note:** scratch has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`). Git is now available via `apk add git`. This document is kept for historical reference.
+
 Scratch is a minimal, `no_std` compatible Git client designed to run in the Akuma OS userspace. It implements the Git Smart HTTP protocol to clone repositories from GitHub and other Git servers.
 
 ## Quick Start Workflow

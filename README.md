@@ -96,7 +96,7 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |
-| **Git client (scratch)** | Clone, fetch, pull, push, commit, branch, tag, status — Git Smart HTTP protocol over HTTPS |
+| **Git client** | `git` from Alpine apk — full Git support via `apk add git` |
 | **Vi editor (neatvi)** | Vi-like text editor, compilable on-target with TCC |
 
 ### Services & Applications
@@ -171,7 +171,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 ┌──────────────────────────────────────────────────────────────────┐
 │                          Userspace                               │
 │  ┌──────┐ ┌─────┐ ┌─────┐ ┌───────┐ ┌─────┐ ┌──────┐ ┌──────┐  │
-│  │ dash │ │ tcc │ │ bun │ │scratch│ │ meow │ │ sbase│         │
+│  │ dash │ │ tcc │ │ bun │ │ meow │ │ sbase│                   │
 │  └──────┘ └─────┘ └─────┘ └───────┘ └─────┘ └──────┘ └──────┘  │
 │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────────┐  │
 │  │ herd │ │ box  │ │ httpd│ │ xbps │ │ apk  │                  │

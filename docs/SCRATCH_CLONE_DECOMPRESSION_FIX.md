@@ -1,5 +1,7 @@
 # scratch clone: zlib decompression fix
 
+> **Note:** scratch has been removed (see `docs/TRIMMING_FAT_PART_2.md`). This document is kept for historical reference.
+
 ## Symptom
 
 `scratch clone` fails during checkout with "zlib decompression failed":

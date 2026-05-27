@@ -103,7 +103,7 @@ The kernel is `no_std`. Always:
 | JS engine | `userspace/quickjs/` | QuickJS |
 | C compiler | `userspace/tcc/` | TCC + musl (static linking) |
 | Dynamic linker | `src/elf_loader.rs` | PT_INTERP + ld-musl-aarch64.so.1 at 0x3000_0000 |
-| Git | `userspace/scratch/` | Git clone; needs 256+ KB stack (zlib) |
+| Git | `apk add git` | Git via Alpine apk |
 | AI assistant | `userspace/meow/` | meow coding assistant |
 | Shell | `src/shell/` + `userspace/paws/` + `userspace/dash/` | In-kernel shell + POSIX dash |
 | VFS | `src/vfs/` | ext2, memfs, procfs |

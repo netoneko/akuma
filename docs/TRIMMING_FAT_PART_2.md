@@ -53,3 +53,22 @@ Continued removal of components that add build complexity and maintenance burden
 **What:** `xbps` — the Void Linux package manager, used to install packages from Void Linux repositories.
 
 **Why removed:** Maintaining two package managers (xbps and apk) was redundant; apk (Alpine Linux) covers the same use case with a smaller footprint.
+
+## Removed: scratch
+
+**What:** `userspace/scratch/` — a custom `no_std` Git client implementing Git Smart HTTP protocol (clone, fetch, pull, push, commit, branch, tag, status).
+
+**Why removed:** With Alpine apk available, `git` can be installed via `apk add git`, providing a full standard Git implementation without maintaining a bespoke no_std client. The custom implementation also required a 256+ KB stack for zlib decompression and had ongoing compatibility issues.
+
+**Replacement:** `apk add git-core`
+
+**Files removed:**
+- `userspace/scratch/` (entire directory)
+- `"scratch"` from `userspace/Cargo.toml` and both arrays in `userspace/build.sh`
+- scratch row from `README.md` and architecture diagram; updated `CLAUDE.md` table
+
+**Files updated:**
+- `userspace/meow/src/tools/git.rs` — all `scratch <cmd>` calls replaced with `git <cmd>`
+- `userspace/meow/src/config.rs` — removed "via scratch" from Git tools section header
+- `docs/SCRATCH.md` — kept for historical reference, marked as removed
+- `docs/SCRATCH_CLONE_DECOMPRESSION_FIX.md` — kept for historical reference, marked as removed

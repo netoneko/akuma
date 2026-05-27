@@ -12,7 +12,6 @@ members = [
     "httpd",
     "meow",
     "quickjs",
-    "scratch",
     "stackstress",
     "stdcheck",
     "termtest",
