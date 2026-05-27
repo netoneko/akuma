@@ -25,24 +25,7 @@ This matches the model described in `proposals/TRIM_SOME_FAT.md`: success is def
 
 ## How to Verify
 
-Run the verification script against a live Akuma QEMU instance:
-
-```bash
-# Start QEMU first
-cargo run --release
-# or: ./scripts/run.sh
-
-# Then in another terminal:
-./scripts/acceptance/01_verify_apk_bootstrap.sh
-```
-
-The script:
-1. Downloads `apk-tools-static` from Alpine CDN using the built-in `curl`
-2. Extracts `apk.static` and initializes an Alpine root at `/tmp/apkroot`
-3. Runs `apk add busybox` and validates busybox works (`ls`, `echo`, `uname`)
-4. Installs a second package (`file`) to confirm the package database is healthy
-
-Expected output: all steps print `[PASS]` and the final step shows `ELF 64-bit LSB executable, ARM aarch64`.
+Follow the steps in [`acceptance/01_verify_apk_bootstrap.md`](../acceptance/01_verify_apk_bootstrap.md) against a live Akuma QEMU instance.
 
 ## Syscall Requirements
 
