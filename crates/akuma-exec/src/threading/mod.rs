@@ -1983,8 +1983,40 @@ pub fn sgi_scheduler_handler(irq: u32) {
     }
 }
 
+/// Counter of yield_now() calls observed with IRQs masked (DAIF.I=1).
+/// SGIs are gated by DAIF.I, so a yield issued under an IrqGuard (or any
+/// IRQ-disabling spinlock) is a silent no-op — the caller will busy-spin
+/// instead of yielding, and on this single-core kernel that wedges the
+/// timer interrupt too. See docs/STABILITY_URGENT_ISSUES.md issue #1.
+pub static YIELD_WITH_IRQS_MASKED: AtomicU64 = AtomicU64::new(0);
+static YIELD_MASKED_WARNED: AtomicU32 = AtomicU32::new(0);
+const YIELD_MASKED_WARN_LIMIT: u32 = 8;
+
 /// Yield to another thread
+#[inline(never)]
 pub fn yield_now() {
+    #[cfg(target_os = "none")]
+    {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+        }
+        // DAIF.I is bit 7. If set, the SGI we are about to trigger will not
+        // be delivered to this core until IRQs are re-enabled — yield_now
+        // becomes a no-op and the caller spins.
+        if (daif & 0x80) != 0 {
+            YIELD_WITH_IRQS_MASKED.fetch_add(1, Ordering::Relaxed);
+            let warns = YIELD_MASKED_WARNED.fetch_add(1, Ordering::Relaxed);
+            if warns < YIELD_MASKED_WARN_LIMIT {
+                let lr: u64;
+                unsafe {
+                    core::arch::asm!("mov {}, x30", out(reg) lr, options(nomem, nostack));
+                }
+                let tid = get_current_thread_register();
+                safe_print!(96, "[SCHED] WARNING: yield_now with IRQs masked tid={} lr={:#x}\n", tid, lr);
+            }
+        }
+    }
     VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
     (runtime().trigger_sgi)(0);
 }
