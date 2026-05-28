@@ -32,7 +32,6 @@ certificates into `bootstrap/`.
 
 ```bash
 MEMORY=2048 cargo run --release 2>&1 > 01_verify_apk_bootstrap_acceptance.log
-# or: ./scripts/run.sh
 ```
 
 Grep the log until SSH server line appears, then connect.

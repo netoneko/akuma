@@ -28,7 +28,6 @@ cd userspace && ./build.sh --apk-only && cd ..
 
 ```bash
 cargo run --release
-# or: ./scripts/run.sh
 ```
 
 Wait until SSH is accepting connections on `localhost:2222`.

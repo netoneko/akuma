@@ -282,6 +282,97 @@ in-kernel tests pin the foundational invariant in place, and
 `scripts/daif_analyze.sh` makes regression checks across saved runs
 mechanical.
 
+### 2026-05-28 verification runs
+
+Moved from `logs/daif/INDEX.md`. Every boot during the DAIF / IRQ-mask
+stability work is captured below. Analyze any run with
+`./scripts/daif_analyze.sh logs/daif/<run-dir>`.
+
+| Run | Label | TMR | Thread0 | SCHED | DAIF/5 | Verdict |
+|-----|-------|-----|---------|-------|--------|---------|
+| 20260528-180007 | 01a-baseline-idle (80s) | 12 | 18 | 0 | 0 (pre-tests) | OK |
+| 20260528-180202 | 01b-ssh-trigger (single SSH @30s) | 17 | 26 | 0 | 0 (pre-tests) | OK |
+| 20260528-183801 | 01c-ssh-stress (5x rapid SSH) | 26 | 45 | 0 | 0 (pre-tests) | OK |
+| 20260528-191601 | 02-daif-tests (verify tests) | 12 | 20 | 0\* | 5/5 | OK |
+| 20260528-195143 | 03-boot-1 (45s smoke) | 7 | 10 | 0 | 5/5 | OK |
+| 20260528-195229 | 03-boot-2 | 6 | 10 | 0 | 5/5 | OK |
+| 20260528-195315 | 03-boot-3 | 7 | 10 | 0 | 5/5 | OK |
+| 20260528-195401 | 03-boot-4 | 7 | 10 | 0 | 5/5 | OK |
+| 20260528-195447 | 03-boot-5 | 7 | 12 | 0 | 5/5 | OK |
+| 20260528-195544 | 04-idle-10min (caffeinate -i only) | 13 | 19 | 0 | 5/5 | host-sleep confound |
+| 20260528-200717 | 04b-idle-150s (probe 100s mark) | 21 | 28 | 0 | 5/5 | OK |
+| 20260528-201006 | 04c-idle-10min-dis (full caffeinate) | 83 | 125 | 0 | 5/5 | OK |
+
+\*sched=0 after excluding the deliberate test-induced warning in
+`test_yield_now_detects_masked_yield`.
+
+Operational notes:
+
+- The 04-idle-10min run silently stalled at kernel uptime ~98s, ~500s
+  before the script's SIGTERM. It was originally attributed to a macOS
+  host-sleep confound, but **that explanation no longer holds**: the
+  Claude Code harness kept the other runs (including 04b/04c) flowing
+  on the same host without trouble, and the new 1.log reproducer
+  (below) shows the same abrupt-stop shape after 31s — host sleep is
+  ruled out. 04-idle-10min should be re-classified as a suspected
+  kernel hang.
+- The DAIF instrumentation in
+  `crates/akuma-exec/src/threading/mod.rs`
+  (`YIELD_WITH_IRQS_MASKED`) never triggered outside the deliberate
+  test in any of the runs above — so whatever the bug is, it is not
+  reached by the current `yield_now()` masked-IRQ probe.
+
+### 2026-05-28 22:49 — new idle reproducer (`logs/daif/1.log`)
+
+A subsequent run silently stalled at kernel uptime **~31.7s** while
+fully idle (no SSH attempts, no client traffic). QEMU PID 59574 was
+still alive at 98% CPU when discovered, confirming the VM is running
+but the kernel scheduler / heartbeat threads are wedged. This matches
+the *shape* of the original issue #1 symptom (all heartbeats silenced
+together while QEMU keeps spinning), minus the SSH trigger:
+
+- Last lines: `[TMR] t=2500 T=0 f=0`, `[Thread0] loop=500000`,
+  `[Mem] Uptime 31742293`.
+- No `[SCHED] WARNING: yield_now with IRQs masked` outside the
+  expected deliberate test warning at boot.
+- No `[Heartbeat]` after the single `Loop 708293` line at the very
+  end of the visible run.
+- No SSH connect attempts in the log — host sleep, SSH, and the
+  authorized-keys path are all ruled out as triggers for this one.
+
+This run was NOT started with `-s`/`-gdb`, so the still-alive QEMU
+cannot be attached to. Reproduction with the gdbstub enabled is the
+next step (see the GDB attach playbook below).
+
+## GDB attach playbook
+
+Repro on a fresh boot with `-s` (gdbstub on `localhost:1234`); when the
+hang fires, attach `aarch64-elf-gdb` and inspect PC / LR / DAIF / SP on
+each CPU.
+
+1. Boot the kernel with the QEMU gdbstub exposed on :1234 (do NOT use
+   `GDB_WAIT` — we want the kernel to boot normally and only attach
+   after the stall):
+   ```bash
+   GDB=1 cargo run --release 2>&1 \
+     | tee logs/daif/gdb-repro-$(date +%Y%m%d-%H%M%S).log
+   ```
+2. In another terminal, when heartbeats stop:
+   ```bash
+   aarch64-elf-gdb target/aarch64-unknown-none/release/akuma \
+     -ex 'target remote :1234' \
+     -ex 'info threads' \
+     -ex 'thread apply all bt' \
+     -ex 'p/x $pc' -ex 'p/x $lr' -ex 'p/x $sp' \
+     -ex 'p/x $daif' -ex 'p/x $spsr_el1' -ex 'p/x $elr_el1'
+   ```
+3. Capture the per-CPU PC; cross-reference against
+   `crates/akuma-exec/src/threading/mod.rs` and `src/exceptions.rs`.
+   A PC parked inside a spinlock acquire or `wfi` with DAIF.I set
+   would confirm the IRQ-masked / lost-IPI hypothesis.
+4. Save the gdb transcript next to the matching kernel log under
+   `logs/daif/`.
+
 ## Priority Order
 
 | # | Issue | Severity | Effort |

@@ -249,7 +249,7 @@ GDB is **highly recommended** for debugging the FAR=0x5 corruption:
 
 1. **Start QEMU with GDB server:**
    ```bash
-   ./scripts/run_with_gdb.sh
+   GDB_WAIT=1 cargo run --release
    ```
 
 2. **Connect GDB and set hardware watchpoint:**

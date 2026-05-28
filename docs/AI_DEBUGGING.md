@@ -13,12 +13,14 @@ For low-level kernel debugging, you can run QEMU with a GDB server that waits fo
 ### Start QEMU with GDB Server
 
 ```bash
-./scripts/run_with_gdb.sh
+GDB_WAIT=1 cargo run --release   # gdbstub on :1234, CPU halted until gdb attaches
+# or, to attach mid-run without halting at reset:
+GDB=1 cargo run --release        # gdbstub on :1234, kernel runs normally
 ```
 
-This launches QEMU with:
-- `-s` - Opens GDB server on port 1234
-- `-S` - Freezes CPU at startup (waits for GDB to connect)
+These env vars are read by `scripts/cargo_runner.sh`:
+- `GDB=1` adds `-s` (gdbstub on port 1234)
+- `GDB_WAIT=1` adds `-s -S` (also freezes CPU until GDB connects)
 
 ### Connect with GDB
 
@@ -110,7 +112,8 @@ ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 "pkg
 | Start package server | `cd userspace && python3 -m http.server 8000` |
 | Run userspace process | `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 <package>` |
 | Install package | `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no user@localhost -p 2222 "pkg install <package>"` |
-| Run with GDB | `./scripts/run_with_gdb.sh` |
+| Run with GDB (halt at boot) | `GDB_WAIT=1 cargo run --release` |
+| Run with GDB (attach later) | `GDB=1 cargo run --release` |
 | Connect GDB (Linux) | `gdb-multiarch -ex 'target remote :1234' target/aarch64-unknown-none/release/akuma` |
 | Connect GDB (macOS) | `lldb -o 'gdb-remote 1234' target/aarch64-unknown-none/release/akuma` |
 

@@ -23,8 +23,10 @@ Akuma is a bare-metal Rust operating system targeting AArch64 (QEMU virt machine
 
 ```bash
 cargo build --release          # Build kernel
-cargo run --release            # Build and run in QEMU
-scripts/run.sh                 # Convenience wrapper
+cargo run --release            # Build and run in QEMU (via scripts/cargo_runner.sh)
+GDB=1 cargo run --release      # Same, plus QEMU gdbstub on :1234
+GDB_WAIT=1 cargo run --release # gdbstub on :1234, CPU halted until gdb attaches
+MEMORY=512M cargo run --release  # Override RAM (default 256M)
 scripts/create_disk.sh         # (Re)create ext2 disk image
 scripts/populate_disk.sh       # Populate disk with userspace binaries
 userspace/build.sh             # Build all userspace binaries

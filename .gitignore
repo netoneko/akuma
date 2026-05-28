@@ -1,5 +1,8 @@
 .cursor
 .vscode
+.crush
+.opencode
+.claude
 target
 *.img
 .DS_Store
@@ -7,4 +10,3 @@ authorized_keys
 bootstrap/bin
 bootstrap/
 *.log
-.opencode

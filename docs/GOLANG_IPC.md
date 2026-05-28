@@ -401,8 +401,8 @@ an **`execve`** line if you wait longer (slow disk vs true hang).
 **`ssh -p 2222 …` never connects** even though the VM is still running.  Do **not** rely on SSH
 for post-mortem in that case.  Prefer:
 
-- **Serial console** — QEMU is typically started with **`-serial mon:stdio`** (`scripts/run.sh`,
-  `scripts/run_on_kvm.sh`), so kernel **`dmesg`-style** output and **`SYSCALL_DEBUG_INFO`** traces
+- **Serial console** — QEMU is started with **`-serial mon:stdio`** by `scripts/cargo_runner.sh`,
+  so kernel **`dmesg`-style** output and **`SYSCALL_DEBUG_INFO`** traces
   go to the **same terminal** as QEMU.  Redirect that stream to **`full.log`** (`tee`, or run QEMU
   under `script`) so you still have a trace when SSH is dead.
 - **Reproduce with logging on from boot** — enable whatever serial logging you need *before* the

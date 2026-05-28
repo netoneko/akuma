@@ -168,7 +168,7 @@ Each process gets its own TTBR0 page tables. These include:
 - **Memory layout**: `src/main.rs` (kernel_main function)
 - **Linker script**: `linker.ld` (kernel load address 0x40200000)
 - **Page tables**: `src/boot.rs` and `src/mmu.rs`
-- **Boot scripts**: `scripts/cargo_runner.sh` and `scripts/run.sh`
+- **Boot script**: `scripts/cargo_runner.sh` (invoked by `cargo run`)
 
 ## DTB Detection
 

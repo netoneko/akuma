@@ -70,7 +70,7 @@ Set RAM size via the `MEMORY` environment variable:
 
 ```bash
 MEMORY=1024M cargo run --release   # 1 GB RAM
-MEMORY=512M scripts/run.sh         # 512 MB RAM
+MEMORY=512M cargo run --release    # 512 MB RAM
 cargo run --release                # default: 256 MB
 ```
 
@@ -100,6 +100,5 @@ cargo run --release
 
 - `src/boot.rs` — ARM64 Image header and early boot assembly
 - `src/main.rs` — `detect_memory()` and `scan_for_dtb()` functions
-- `scripts/cargo_runner.sh` — ELF to flat binary conversion
-- `scripts/run.sh` — Alternative run script with HVF acceleration
+- `scripts/cargo_runner.sh` — ELF to flat binary conversion and QEMU launch (supports `GDB`/`GDB_WAIT`/`MEMORY`)
 - `linker.ld` — Kernel linked at 0x40200000
