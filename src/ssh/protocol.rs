@@ -46,15 +46,54 @@ const SSH_INTERACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(10);
 // Shared Host Key (for all sessions)
 // ============================================================================
 
+const HOST_KEY_PATH: &str = "/etc/sshd/host_key";
+
 pub fn init_host_key() {
-    let guard = keys::get_host_key();
-    if guard.is_none() {
-        let mut rng = SimpleRng::new();
-        let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
-        rng.fill_bytes(&mut key_bytes);
-        let key = SigningKey::from_bytes(&key_bytes);
-        keys::set_host_key(key);
-        log("[SSH] Temporary host key initialized (will load from fs on first connection)\n");
+    if keys::get_host_key().is_some() {
+        return;
+    }
+
+    // Try to load a persisted host key from disk so the host fingerprint
+    // is stable across reboots — otherwise every boot triggers
+    // `Host key verification failed` on the client side.
+    match crate::fs::read_file(HOST_KEY_PATH) {
+        Ok(bytes) if bytes.len() == SECRET_KEY_LENGTH => {
+            let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
+            key_bytes.copy_from_slice(&bytes);
+            keys::set_host_key(SigningKey::from_bytes(&key_bytes));
+            log("[SSH] Host key loaded from /etc/sshd/host_key\n");
+            return;
+        }
+        Ok(bytes) => {
+            safe_print!(
+                128,
+                "[SSH] WARNING: {} has wrong length ({} != {}), regenerating\n",
+                HOST_KEY_PATH,
+                bytes.len(),
+                SECRET_KEY_LENGTH
+            );
+        }
+        Err(_) => {
+            // File missing or unreadable — fall through to generation.
+        }
+    }
+
+    let mut rng = SimpleRng::new();
+    let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
+    rng.fill_bytes(&mut key_bytes);
+    let key = SigningKey::from_bytes(&key_bytes);
+    keys::set_host_key(key);
+
+    // Best-effort persistence: log failures but don't abort, the kernel
+    // still works with an ephemeral key (just nags the client).
+    match crate::fs::write_file(HOST_KEY_PATH, &key_bytes) {
+        Ok(()) => log("[SSH] Generated and persisted new host key to /etc/sshd/host_key\n"),
+        Err(e) => safe_print!(
+            128,
+            "[SSH] WARNING: generated host key but failed to persist to {}: {}\n",
+            HOST_KEY_PATH,
+            e
+        ),
     }
 }
 
@@ -76,6 +115,11 @@ pub struct SshChannelStream<'a> {
     session: &'a mut SshSession,
     pub current_process_pid: Option<Pid>,
     pub current_process_channel: Option<Arc<akuma_exec::process::ProcessChannel>>,
+    /// Count of non-data SSH packets (window-adjust, ignore, debug, etc.)
+    /// handled since the last data packet was delivered to the caller.
+    /// Reset whenever `read_until_channel_data` returns with data.
+    /// Used by the `[SSH-ECHO]` instrumentation to attribute jitter.
+    non_data_packets_since_data: u32,
 }
 
 impl<'a> SshChannelStream<'a> {
@@ -85,6 +129,7 @@ impl<'a> SshChannelStream<'a> {
             session,
             current_process_pid: None,
             current_process_channel: None,
+            non_data_packets_since_data: 0,
         }
     }
 
@@ -119,8 +164,15 @@ impl<'a> SshChannelStream<'a> {
                         match packet {
                             Some((msg_type, payload)) => {
                                 match self.handle_channel_message(msg_type, &payload).await {
-                                    Ok(true) => return Ok(()),
-                                    Ok(false) => {}
+                                    Ok(true) => {
+                                        // Data delivered; reset attribution counter.
+                                        self.non_data_packets_since_data = 0;
+                                        return Ok(());
+                                    }
+                                    Ok(false) => {
+                                        self.non_data_packets_since_data =
+                                            self.non_data_packets_since_data.saturating_add(1);
+                                    }
                                     Err(e) => return Err(e),
                                 }
                             }
@@ -509,8 +561,8 @@ async fn run_shell_session(
                     let gap = read_time - last_read_time_us;
                     if gap < 2_000_000 {
                         safe_print!(256,
-                            "[SSH-ECHO] read gap={}us, {} bytes\n",
-                            gap, n
+                            "[SSH-ECHO] read gap={}us, {} bytes, non_data_pkts={}\n",
+                            gap, n, channel_stream.non_data_packets_since_data
                         );
                     }
                 }
@@ -881,9 +933,30 @@ pub async fn handle_connection(mut stream: TcpStream) {
     // Reject new connections under memory pressure
     if crate::allocator::is_memory_low() {
         log("[SSH] Rejecting connection: kernel memory low\n");
+        super::server::note_handshake_fail();
         return;
     }
 
+    let final_state = handle_connection_inner(&mut stream).await;
+    classify_session_exit(final_state);
+    log("[SSH] Connection ended\n");
+}
+
+pub(crate) fn classify_session_exit(state: akuma_ssh::session::SshState) {
+    use akuma_ssh::session::SshState::*;
+    match state {
+        AwaitingVersion | AwaitingKexInit | AwaitingKexEcdhInit
+        | AwaitingNewKeys | AwaitingServiceRequest => {
+            super::server::note_handshake_fail();
+        }
+        AwaitingUserAuth => {
+            super::server::note_auth_fail();
+        }
+        Authenticated | Disconnected => {}
+    }
+}
+
+async fn handle_connection_inner(stream: &mut TcpStream) -> akuma_ssh::session::SshState {
     log("[SSH] New SSH connection\n");
 
     let config = super::config::get_config();
@@ -892,9 +965,9 @@ pub async fn handle_connection(mut stream: TcpStream) {
     let mut session = SshSession::new(config, host_key, rng);
     let auth = KernelAuthProvider;
 
-    if akuma_ssh::transport::send_raw(&mut stream, SSH_VERSION).await.is_err() {
+    if akuma_ssh::transport::send_raw(stream, SSH_VERSION).await.is_err() {
         log("[SSH] Failed to send version\n");
-        return;
+        return session.state;
     }
 
     let mut buf = [0u8; 512];
@@ -958,32 +1031,32 @@ pub async fn handle_connection(mut stream: TcpStream) {
                     match packet {
                         Some((msg_type, payload)) => {
                             match akuma_ssh::message::handle_message(
-                                &mut stream, msg_type, &payload, &mut session, &auth,
+                                stream, msg_type, &payload, &mut session, &auth,
                             ).await {
                                 Ok(MessageResult::Continue) => {}
                                 Ok(MessageResult::StartShell) => {
-                                    if run_shell_session(&mut stream, &mut session).await.is_err() {
+                                    if run_shell_session(stream, &mut session).await.is_err() {
                                         log("[SSH] Shell session error\n");
                                     }
                                     if session.channel_open {
                                         let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                                         write_u32(&mut close, session.client_channel);
                                         let _ =
-                                            akuma_ssh::transport::send_packet(&mut stream, &close, &mut session).await;
+                                            akuma_ssh::transport::send_packet(stream, &close, &mut session).await;
                                         session.channel_open = false;
                                     }
                                     session.state = SshState::Disconnected;
-                                    return;
+                                    return session.state;
                                 }
                                 Ok(MessageResult::ExecCommand(cmd)) => {
-                                    handle_exec(&mut stream, &mut session, &cmd).await;
+                                    handle_exec(stream, &mut session, &cmd).await;
                                 }
                                 Ok(MessageResult::Disconnect) => {
-                                    return;
+                                    return session.state;
                                 }
                                 Err(_) => {
                                     log("[SSH] Error handling message\n");
-                                    return;
+                                    return session.state;
                                 }
                             }
                         }
@@ -994,7 +1067,7 @@ pub async fn handle_connection(mut stream: TcpStream) {
         }
     }
 
-    log("[SSH] Connection ended\n");
+    session.state
 }
 
 fn log(msg: &str) {

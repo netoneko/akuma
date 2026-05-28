@@ -36,6 +36,7 @@ mod shell;
 mod shell_tests;
 mod sync_tests;
 mod ssh;
+mod ssh_tests;
 mod syscall;
 mod tests;
 mod timer;
@@ -808,6 +809,7 @@ fn run_async_main() -> ! {
 
     if !config::DISABLE_ALL_TESTS {
         process_tests::run_network_tests();
+        ssh_tests::run_all_tests();
     }
 
     // Initialize SSH host key
@@ -1021,6 +1023,36 @@ async fn memory_monitor() -> ! {
             uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
             threads_used, threads_max, threads_running, threads_ready
         );
+        console::print(buf.as_str());
+
+        let ssh = ssh::server::stats();
+        buf.clear();
+        if ssh.alive {
+            // Stall watchdog: if the accept loop hasn't ticked SERVER_TICK_US
+            // for >5s while reporting alive, that's a soft hang in the SSH
+            // server. We don't auto-respawn (the dead thread still owns the
+            // listener socket; a parallel respawn would collide on port
+            // SSH_PORT) but a loud log makes the failure mode visible to the
+            // operator and to the Python harness in scripts/ssh_harness.py.
+            const SSH_STALL_THRESHOLD_US: u64 = 5_000_000;
+            let stall_us = uptime_us.saturating_sub(ssh.last_tick_us);
+            let stall_marker = if stall_us > SSH_STALL_THRESHOLD_US {
+                " STALLED"
+            } else {
+                ""
+            };
+            let _ = write!(
+                buf,
+                "[SSH]{} listening | active={} open={} close={} hs_fail={} auth_fail={} panic={} stall_us={}\n",
+                stall_marker, ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked, stall_us
+            );
+        } else {
+            let _ = write!(
+                buf,
+                "[SSH] no listener | active={} open={} close={} hs_fail={} auth_fail={} panic={}\n",
+                ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked
+            );
+        }
         console::print(buf.as_str());
 
         // Report every 10 seconds (or period from config)

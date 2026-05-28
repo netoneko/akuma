@@ -1,5 +1,26 @@
 # SSH Multi-Session Threading Bug
 
+> **STATUS (2026-05-29): superseded.** This document was written against an
+> embassy-net networking stack with `unsafe impl Send for SendableTcpStream`
+> and no internal embassy synchronization. The kernel no longer uses
+> embassy at all — `src/main.rs:20-22` commented out the embassy modules;
+> all networking is raw smoltcp behind the global
+> `NETWORK: Spinlock<Option<NetworkState>>` in
+> `crates/akuma-net/src/smoltcp_net.rs:102`. Every socket op already
+> serializes through NETWORK, so the race described below — concurrent
+> writes from N session threads against unsynchronized embassy state — is
+> structurally impossible under current code.
+>
+> Solution 1 (global write lock) is effectively already implemented by
+> NETWORK. Solution 2 (message queue) and Solution 3 (async-only) were
+> framed against an embassy threat model that no longer applies.
+>
+> The current threading-related SSH risks and the 2026-05-29 audit live
+> in `STABILITY_URGENT_ISSUES.md` issue #2. Retaining this file for
+> historical context only.
+
+---
+
 This document describes a threading bug that causes crashes when multiple SSH sessions are active concurrently.
 
 ## Symptoms

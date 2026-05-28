@@ -111,7 +111,96 @@ In `crates/akuma-exec/src/runtime.rs`:
 
 ## 2. SSH Jitter and Connection Resilience
 
-### Symptom
+### 2026-05-29 audit and instrumentation pass
+
+A full audit across three axes — jitter sources, session lifecycle, and
+deadlock surface — landed on 2026-05-29. Summary of findings and follow-up
+status:
+
+**Two stale assumptions corrected.** All earlier docs describing SSH
+threading were written against an embassy-net + cooperative-executor
+model. The current code is raw smoltcp behind a single global
+`NETWORK: Spinlock` (`crates/akuma-net/src/smoltcp_net.rs:102`) on a
+preemptive 32-thread pool with 10ms round-robin ticks. There is no
+embassy and no cooperative executor — every "async" path is a per-thread
+`block_on` that parks the kernel thread on `Poll::Pending`. As a
+consequence: `SSH_THREADING_BUG.md`'s embassy-race premise is no longer
+reachable (NETWORK serializes every socket op already), and `SSH_STAGGERING.md`'s
+`yield_now` vs `schedule_blocking` constraint should be read as a
+preemptive-thread invariant, not a cooperative-task one.
+
+**Lifecycle bugs found and fixed during instrumentation:**
+
+1. **SessionGuard never dropping** (`src/ssh/server.rs::run_session`).
+   The original `run_session` ended in `loop { yield_now() }` (`-> !`).
+   When refactoring socket-close into an RAII guard, leaving the guard
+   at function scope meant Drop never ran. Fixed by scoping the guard
+   in an inner block so its Drop fires before the terminal loop.
+   `ACTIVE_SESSIONS` would otherwise leak by one slot per session.
+
+2. **Discarded `spawn_system_thread_fn` result.** Accept loop
+   incremented `ACTIVE_SESSIONS` before spawning the session thread,
+   then ignored the spawn's `Result`. A failed spawn (thread pool
+   exhaustion, allocator pressure) would never run the guard, leaking
+   the counter permanently. Fixed by rolling back the counter +
+   `socket_close` on spawn failure.
+
+These are real fixes, not theoretical. Both were caught via the new
+Python harness `scripts/ssh_harness.py parallel` flooding the accept
+loop with concurrent KEX-only sessions.
+
+**Open follow-up (surfaced by instrumentation, NOT YET fixed):** under
+sustained connect-storm (16k+ accept attempts in 15s, far past
+MAX_CONNECTIONS=4), the accept loop itself stops ticking
+`SERVER_TICK_US`. The supervisor in `src/main.rs` flags this as
+`[SSH] STALLED listening` once `stall_us > 5_000_000`. Session counters
+remain perfectly balanced (`open == close`, `active == 0`) — this is
+NOT a session leak, it's something inside the accept loop's
+listener-recreation cycle (`src/ssh/server.rs:80-87`). Reproducer:
+```
+./venv/bin/python scripts/ssh_harness.py parallel --count 4 --duration 15
+# wait 10s, then:
+grep '\[SSH\]' logs/<run>.log | tail
+# expect: [SSH] STALLED listening | ... stall_us=12947081
+```
+The supervisor only LOGS the stall today; an auto-respawn would collide
+on `SSH_PORT` because the dead accept thread still owns the listener
+socket. Concrete next investigation: attach lldb when STALLED fires
+and inspect the SSH server thread's PC + LR (see "GDB attach playbook"
+below). Likely candidates are (a) `with_network()` blocked behind a
+NETWORK holder, (b) `smoltcp_net::poll()` stuck, or (c) the
+listener-handle becoming invalid after smoltcp's `pending_removal`
+sweep frees it.
+
+**Jitter framing was overstated.** The audit's J1 ("multi-await chain
+in `read_until_channel_data` costs 10–30ms × N") and J2 ("async
+dispatch for sync ops") were both based on assumptions that didn't
+survive re-reading the code: the inner loop in `protocol.rs:117-137`
+already drains every complete SSH packet from one TCP buffer before
+re-awaiting, and `handle_channel_message` is async-by-signature but
+synchronous-in-practice for control packets (only `GLOBAL_REQUEST`
+with `want_reply` calls `.await`). The non-data-packet counter from
+A4 will quantify any remaining jitter at runtime; the harness `echo`
+subcommand is the right way to measure it once authenticated sessions
+are available.
+
+**Net delta from this pass:**
+
+- A1–A4: lifecycle counters (`SSH_SESSIONS_OPENED/CLOSED/HANDSHAKE_FAIL/AUTH_FAIL/PANICKED`),
+  loud `authorized_keys` missing warning, non-data packet counter, `[SSH]` heartbeat line.
+- B (T1–T4): kernel-side tests in `src/ssh_tests.rs` covering the
+  `yield_now` invariant (D2), counter balance, session-exit classification,
+  and `SERVER_ALIVE` wiring. All four pass on every boot.
+- C1: panic-safe SessionGuard (also fixed the never-dropping bug, see above).
+- C2: persistent host key (`/etc/sshd/host_key`). Verified across two
+  reboots — fingerprint `c215bdf2…6e55` stable.
+- C3: skipped — the audit's premise didn't hold.
+- C4: stall watchdog. Detects the open accept-loop stall described above.
+- D: Python harness `scripts/ssh_harness.py` (connect, soak, parallel,
+  auth-probe, burst, echo). KEX-only path because the disk has no
+  `authorized_keys` provisioned; auth-probe verifies rejection paths.
+
+### Original symptom description (kept for context)
 
 Interactive SSH sessions exhibit 800ms–1.8s input stagger, especially when
 multiple threads are scheduled. Even after the `SSH_STAGGERING.md` and

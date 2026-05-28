@@ -4,12 +4,16 @@
 //! provides async host-key persistence (filesystem I/O).
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
 
 pub use akuma_ssh_crypto::keys::parse_public_key_ssh;
 
 use crate::async_fs;
+
+/// One-shot guard so the missing-authorized_keys warning fires exactly once.
+static MISSING_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Constants
@@ -41,6 +45,13 @@ pub async fn load_authorized_keys() -> Vec<VerifyingKey> {
     let mut keys = Vec::new();
 
     if !async_fs::exists(AUTHORIZED_KEYS_PATH).await {
+        if !MISSING_WARNING_LOGGED.swap(true, Ordering::AcqRel) {
+            safe_print!(
+                256,
+                "[SSH Auth] WARNING: {} missing — all pubkey auth will be denied\n",
+                AUTHORIZED_KEYS_PATH
+            );
+        }
         return keys;
     }
 

@@ -1,5 +1,18 @@
 # SSH Staggering: Root Cause & Options
 
+> **Reframed (2026-05-29):** Earlier passes described the
+> `yield_now()`-vs-`schedule_blocking()` constraint as a cooperative-executor
+> requirement. The kernel does NOT have a cooperative executor — `src/ssh/server.rs::block_on`
+> drives a future on a preemptive kernel thread, parking the thread on
+> `Poll::Pending`. The constraint still applies but for a different reason:
+> `schedule_blocking()` flips the thread to `WAITING`, which on `wake()`
+> triggers an SGI for an immediate context switch. If the SGI fires while
+> the network thread holds NETWORK (inside `iface.poll()`), we
+> context-switch into the SSH thread which tries to re-acquire NETWORK,
+> producing a single-CPU spinlock deadlock. The
+> `test_block_on_uses_yield_now` test in `src/ssh_tests.rs` is the
+> regression guard.
+
 ## Symptom
 
 Typed characters appear in bursts during SSH sessions rather than immediately. The `[SSH-ECHO]` instrumentation in `full.log` confirms this: keystroke read gaps are normally 50–300µs (matching typing speed), but stagger events produce gaps of **800ms–1.83s**.
