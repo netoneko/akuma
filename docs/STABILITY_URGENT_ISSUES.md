@@ -85,6 +85,12 @@ In `crates/akuma-exec/src/runtime.rs`:
   any contended boot would deadlock here; post-fix this completes
   uniformly and DAIF is restored cleanly. Runs every boot as part of
   the DAIF test suite.
+- **Verification corpus — `logs/daif/hunt-20260528-234542/`** — 8
+  parallel instances, 32 min wall / ~4h 19m cumulative kernel uptime,
+  zero `[HANG?]` events. Prior repros hit at 31s (`logs/daif/1.log`)
+  and 217s (instance 7 of `logs/daif/hunt-20260528-232632/`); the
+  verification run is ~9× past the worst prior repro on 8× the
+  surface area.
 
 ### Earlier observations (now subsumed)
 
