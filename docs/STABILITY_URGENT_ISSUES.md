@@ -1,7 +1,19 @@
 # Stability Urgent Issues
 
-Collected from the `01_verify_apk_bootstrap` acceptance run (2026-05-28) and
-cross-referenced with existing SSH and threading docs.
+Originally collected from the `01_verify_apk_bootstrap` acceptance run
+(2026-05-28). The original report bundled two unrelated things under
+"issue #1":
+
+1. A kernel hang that silenced every heartbeat at once. SSH stopped
+   responding during that hang, but only because *everything* stopped.
+2. Pre-existing SSH usability problems (sluggish responses, missing
+   `authorized_keys` log, no persisted host key, etc.) that were
+   visible in the same log because the operator was trying to SSH in
+   when the hang hit.
+
+They are now split. Issue #1 below is the kernel hang only; SSH
+usability and lifecycle items live under issue #2 and in the SSH
+Deferred Follow-ups section.
 
 ---
 
@@ -74,94 +86,20 @@ In `crates/akuma-exec/src/runtime.rs`:
   uniformly and DAIF is restored cleanly. Runs every boot as part of
   the DAIF test suite.
 
-### Original "SSH Connection Triggers Kernel Deadlock" notes (kept for history)
+### Earlier observations (now subsumed)
 
-### Symptom
-
-The kernel hard-hangs approximately 30 seconds after the first SSH connection
-attempt. Evidence from `01_verify_apk_bootstrap_acceptance.log`:
-
-- Regular heartbeats (`[TMR]` every 500ms, `[Thread0] loop=N` every ~3s) run
-  cleanly up to **Uptime 102s** (log line 1669).
-- After `[TMR] t=8000` at Uptime 99s, the expected `[TMR] t=8500` and
-  `[Thread0] loop=1600000` **never appear** — Thread 0 itself stops executing.
-- QEMU continues running at 98% CPU for 16+ minutes after the last log line,
-  confirming the VM is alive but the kernel scheduler is deadlocked.
-- Timing: VM started at 15:42:15, first SSH attempt at ~15:43:27, last log line
-  at ~15:43:57 — approximately 30s after connection attempts began.
-
-Prior to the hang, every SSH attempt returned
-`kex_exchange_identification: read: Connection reset by peer`.
-
-### Root Causes
-
-**a) SSH connection triggers NETWORK spinlock deadlock**
-
-`SSH_STAGGERING.md` documents a known single-core spinlock deadlock path that
-may not be fully closed:
-
-> If the waker fires during `iface.poll()` while the NETWORK spinlock is held
-> by the network thread, the SGI context-switches to the SSH thread, which then
-> tries to acquire NETWORK in its `future.poll()` → spinlock deadlock.
-
-Thread 0 holds NETWORK during `iface.poll()`. An incoming connection wakes the
-SSH thread via SGI. The SSH thread spins on NETWORK. Thread 0 never runs again.
-The fix in `SSH_STAGGERING.md` (use `yield_now()` instead of
-`schedule_blocking()`) may be incomplete or has been regressed — the hang
-pattern is a textbook instance of this same deadlock.
-
-**b) `authorized_keys` absent on disk → silent auth rejection (pre-hang)**
-
-`load_authorized_keys()` (`src/ssh/keys.rs:40`) silently returns an empty `Vec`
-when `/etc/sshd/authorized_keys` does not exist on the disk image:
-
-```rust
-if !async_fs::exists(AUTHORIZED_KEYS_PATH).await {
-    return keys;   // no error, no log
-}
-```
-
-If `populate_disk.sh` didn't write the file, or wrote it to the wrong path, auth
-silently fails and the connection is dropped. There is no log line distinguishing
-"zero keys loaded because file missing" from "zero keys loaded because file is
-empty".
-
-**b) Host key is never persisted or reloaded**
-
-`init_host_key()` (`src/ssh/protocol.rs:49`) generates a random temporary key and
-logs `"will load from fs on first connection"` — but that loading never happens.
-There is no code path that reads a persistent host key from the filesystem. Every
-boot generates a fresh key, which:
-- Causes `Host key verification failed` for any client that cached the previous key.
-- Makes it impossible to confirm identity across reboots.
-
-### Fix Process
-
-1. **Audit and re-confirm the `yield_now()` fix** in `src/ssh/server.rs` and
-   `src/ssh/protocol.rs`: verify no code path in the SSH accept or session
-   loop calls `schedule_blocking()` while NETWORK could be held. Add a debug
-   assert or lock-order check. Reproduce with `RUST_LOG=trace` or added
-   spinlock contention instrumentation.
-
-2. **Add a NETWORK lock timeout / deadlock detector**: if NETWORK is held for
-   more than N ms (e.g., 50ms), print a backtrace-equivalent (ELR, thread ID)
-   and forcibly release, to convert a silent hang into a visible error.
-
-3. **Make missing `authorized_keys` a loud error**: log
-   `[SSH Auth] WARNING: no authorized_keys found — all pubkey auth will be denied`
-   when the file is absent. This turns a silent hang into an obvious log line.
-
-2. **Implement host key persistence**: on first connection, attempt to load
-   `/etc/sshd/host_key` from disk; if absent, generate and write it. Replace the
-   misleading log message with actual load-or-generate logic.
-
-3. **Add a `populate_disk.sh` smoke-check**: after populating, `debugfs -R "ls
-   /etc/sshd"` the disk image and fail loudly if `authorized_keys` is missing.
-
-4. **Add a diagnostic SSH connection self-test to kernel boot** (optional):
-   log `[SSH Auth] authorized_keys loaded: N keys` (or `0 keys — connections will
-   be rejected`) during server startup so the problem is visible before any client
-   connects.
+- The original acceptance-log symptom (heartbeats stop together at
+  uptime ~102s, QEMU still alive at 98% CPU) — same root cause as the
+  217s lldb-confirmed hang above.
+- The 22:49 idle reproducer at uptime ~31.7s in `logs/daif/1.log` —
+  same root cause.
+- The 04-idle-10min run that stalled at uptime ~98s and was earlier
+  attributed to macOS host sleep — re-attributed to the same kernel
+  bug; host sleep does not match other runs on the same host.
+- `Connection reset by peer` errors on SSH attempts shortly before
+  the hang fired in the original acceptance run were a symptom of
+  the hang having already eaten the network thread, not a separate
+  cause.
 
 ---
 
@@ -321,35 +259,24 @@ attempting a connection.
 
 ### Status of the 2026-05-28 investigation
 
-The headline symptom (hard kernel hang ~30s after the first SSH attempt
-with both heartbeats silenced together) **did not reproduce** under the
-2026-05-28 acceptance ladder:
+The DAIF / IRQ-mask work and the runs in the table below were the first
+attempt at issue #1 and did *not* find the actual root cause — the
+hang did not reproduce reliably enough on a single-instance boot to be
+caught while a debugger was attached. The defensive work still landed
+and is still useful:
 
-- 5 sequential boot smoke tests: all clean (`logs/daif/2026*-03-boot-*`)
-- 80s baseline idle: clean
-- 180s 5x rapid SSH burst: clean (all 5 connections succeeded)
-- 600s idle endurance (with `caffeinate -dis`): clean — kernel uptime
-  advanced 1:1 with wall time, QEMU CPU pinned at 100%
-- In-kernel DAIF tests (`src/daif_tests.rs`): 5/5 passing on every boot
-- `YIELD_WITH_IRQS_MASKED` counter (instrumentation in
-  `crates/akuma-exec/src/threading/mod.rs`): never triggered in
-  production code paths
+- `IrqGuard` semantics tests pin the foundational invariant in place
+  (5 tests under `src/daif_tests.rs`).
+- The `YIELD_WITH_IRQS_MASKED` counter is in place and ready to fire
+  if an IRQ-masked-yield bug ever does occur.
+- `scripts/daif_analyze.sh` makes mechanical regression checks across
+  saved runs.
 
-One earlier 600s attempt using only `caffeinate -i` stopped emitting
-output at kernel uptime ~98s and resumed at SIGTERM time, with QEMU CPU
-unobserved during the gap — strongly consistent with a macOS *system*
-sleep (the `-i` flag only inhibits idle sleep, not display- or
-system-initiated sleep). The original acceptance log this section is
-based on also covered a long real-time window during which a host sleep
-event would look identical to a kernel hang from the log alone. There
-is now reason to suspect at least part of the originally reported
-symptom was the same host-sleep confounder.
-
-The defensive work landed regardless: the instrumentation will fire
-loudly if the IRQ-masked-yield class of bug ever does occur, the
-in-kernel tests pin the foundational invariant in place, and
-`scripts/daif_analyze.sh` makes regression checks across saved runs
-mechanical.
+The actual root cause (RUNTIME spinlock acquired from an IRQ handler)
+was found later that day by running 8 boots in parallel via
+`scripts/run_multiple.sh` with the log-stall watchdog and the QEMU
+gdbstub already wired up on every instance — see the top of this
+issue for the lldb evidence and the landed fix.
 
 ### 2026-05-28 verification runs
 
