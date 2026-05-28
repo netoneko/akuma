@@ -83,21 +83,52 @@ def _try_password_auth(client: paramiko.SSHClient, host: str, port: int,
                        user: str, timeout: float) -> None:
     """
     Authenticate with the project's conventional credentials. Akuma's SSH
-    server accepts pubkey if /etc/sshd/authorized_keys exists, falling back
-    to a permissive password path in most test builds. We try password
-    first because the harness doesn't ship a key.
+    server currently only accepts pubkey auth (see `src/ssh/keys.rs`); we
+    try a key path first, then fall back to password for older test builds.
+
+    Key precedence: ``AKUMA_SSH_KEY`` env var → ``~/.ssh/id_ed25519`` →
+    ``~/.ssh/id_rsa``. The bootstrap disk ships
+    `bootstrap/etc/sshd/authorized_keys` so the host's id_ed25519 is the
+    expected match.
     """
-    client.connect(
-        hostname=host,
-        port=port,
-        username=user,
-        password=os.environ.get("AKUMA_SSH_PASSWORD", ""),
-        allow_agent=False,
-        look_for_keys=False,
-        timeout=timeout,
-        auth_timeout=timeout,
-        banner_timeout=timeout,
-    )
+    key_candidates = []
+    env_key = os.environ.get("AKUMA_SSH_KEY")
+    if env_key:
+        key_candidates.append(env_key)
+    home = os.path.expanduser("~")
+    key_candidates.extend([
+        os.path.join(home, ".ssh", "id_ed25519"),
+        os.path.join(home, ".ssh", "id_rsa"),
+    ])
+    key_filename = next((p for p in key_candidates if os.path.isfile(p)), None)
+
+    try:
+        client.connect(
+            hostname=host,
+            port=port,
+            username=user,
+            key_filename=key_filename,
+            password=os.environ.get("AKUMA_SSH_PASSWORD", ""),
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=timeout,
+            auth_timeout=timeout,
+            banner_timeout=timeout,
+        )
+    except paramiko.ssh_exception.BadAuthenticationType:
+        # Server doesn't accept our methods — retry without the password so
+        # paramiko fails with a useful error rather than mis-classifying it.
+        client.connect(
+            hostname=host,
+            port=port,
+            username=user,
+            key_filename=key_filename,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=timeout,
+            auth_timeout=timeout,
+            banner_timeout=timeout,
+        )
 
 
 def _kex_once(host: str, port: int, timeout: float) -> ConnectResult:

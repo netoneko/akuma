@@ -532,13 +532,46 @@ need to install a separate toolchain.
 | 1d | Host key not persisted | 2026-05-29 (`/etc/sshd/host_key`; fingerprint stable across reboots) |
 | 2-stall | Accept loop terminally exits on socket-pool exhaustion under storm | 2026-05-29 (`recreate_listener_with_retry`) |
 | 2a | Accept loop / session-thread isolation | 2026-05-29 (per-session `spawn_system_thread_fn` + panic-safe SessionGuard) |
+| 2b | Multi-await batch reads (jitter) | 2026-05-29 — measured: idle p95=27.7ms, under-storm p95=53.9ms (vs original 800–1800ms claim). Framing was overstated; no fix warranted. |
+| 2c | Concurrent session write lock | 2026-05-29 — measured: 280 rounds of concurrent writes, 0 corruption. NETWORK serialization sufficient; no fix warranted. |
 | 4 | SSH status in heartbeat | 2026-05-29 (`[SSH] listening | active=… open=… …`) |
+
+### 2026-05-29 Phase-3 empirical measurement (2b and 2c)
+
+Both bullets had been carried as "needs empirical check before fixing"
+since the 2026-05-29 audit. Measured against a fresh boot using
+`ssh_harness.py echo` and a 2-/4-session concurrent `cat`-echo test:
+
+**2b — multi-await batch read jitter.** Original symptom claimed
+"800ms–1.8s input stagger." Measured per-byte echo latency
+(`ssh_harness.py echo --count N --size 32`):
+
+| Scenario | p50 | p95 | p99 | max | outliers>100ms |
+|---|---|---|---|---|---|
+| Idle, n=100 | 2.5ms | 27.7ms | 38.8ms | 38.9ms | 0 |
+| Under 1-worker storm, n=200 | 3.8ms | 53.9ms | 56.7ms | 73.9ms | 0 |
+
+Storm load doubles p95 from ~28ms to ~54ms — visible but well under the
+original 800ms+ symptom and the plan's ≤50ms p50 acceptance bar.
+**Conclusion: no batch-read fix warranted. Closed.**
+
+**2c — concurrent session write lock.** Two and four-way concurrent
+`exec cat` sessions each pushed a tag-distinctive 128–256B payload many
+rounds and checked for foreign tags in the echoed bytes:
+
+| Scenario | corrupt | lost |
+|---|---|---|
+| 2 sessions × 40 rounds × 128B | 0/80 | 0/80 |
+| 4 sessions × 100 rounds × 256B (2 connected, 2 lost handshake) | 0/200 | 0/200 |
+
+280 rounds of concurrent write traffic, zero interleaving observed.
+NETWORK lock serialization already prevents byte-level interleaving.
+**Conclusion: no per-session write mutex warranted. Closed.**
 
 ### Open
 
 | # | Issue | Severity | Effort | Notes |
 |---|-------|----------|--------|-------|
 | 1a | SSH path → NETWORK spinlock deadlock (watch item) | high | medium | No repro since holder tracking landed; absence of evidence, not evidence of absence. |
-| 2b | Multi-await batch reads (jitter) | medium | medium | Audit said framing was overstated; measure via `ssh_harness.py echo` under load before any fix. |
-| 2c | Concurrent session write lock | medium | low | Likely a no-op (NETWORK already serializes); needs empirical check. |
+| 5 | Session counter drift on concurrent-connect handshake race | medium | low | Surfaced 2026-05-29 during 2c testing: 4 concurrent connects produced `active=4 open=6 close=2` (only 2 sessions actually succeeded). Likely a missed counter rollback path during handshake failure. |
 | 3 | Wrong username + `ssh` blocked in crush | low (tooling, not kernel) | low | Playbook + crush config change. Not kernel work. |
