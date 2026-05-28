@@ -12,6 +12,8 @@ Bare-metal Rust OS for AArch64 (QEMU virt). In-kernel SSH, networking, ext2 VFS,
 - `bootstrap/` — Alpine apk bootstrap assets
 - `acceptance/` — Acceptance test playbooks
 
+Never glob or list the repo root — it has 1000+ files. Always use a specific subdirectory path.
+
 ## Build & Run
 
 ```bash
