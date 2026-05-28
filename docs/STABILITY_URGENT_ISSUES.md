@@ -522,16 +522,23 @@ need to install a separate toolchain.
 
 ## Priority Order
 
-| # | Issue | Severity | Effort |
-|---|-------|----------|--------|
-| 1 | ~~Idle kernel deadlock — RUNTIME spinlock self-deadlock from IRQ handler~~ — **FIXED 2026-05-28** | resolved | resolved |
-| 1a | SSH connection → NETWORK spinlock deadlock (kept as separate watch item) | high | medium |
-| 1b | NETWORK lock timeout / deadlock detector | resolved (partial — holder tracking landed 2026-05-29) | resolved |
-| 1c | `authorized_keys` missing → silent reject | high | low |
-| 1d | Host key not persisted | medium | medium |
-| 2-stall | ~~Accept loop terminally exits on socket-pool exhaustion under storm~~ — **FIXED 2026-05-29** (`recreate_listener_with_retry`) | resolved | resolved |
-| 3 | Wrong username + `ssh` blocked in crush | **blocker** (acceptance) | low |
-| 2a | Accept loop / session restart isolation | high | medium |
-| 2b | Multi-await batch reads (jitter) | medium | medium |
-| 2c | Concurrent session write lock | medium | low |
-| 4 | SSH status in heartbeat | low | low |
+### Resolved
+
+| # | Issue | Resolved |
+|---|-------|----------|
+| 1 | Idle kernel deadlock — RUNTIME spinlock self-deadlock from IRQ handler | 2026-05-28 (`OnceCopy` in `akuma_exec::runtime`) |
+| 1b | NETWORK lock timeout / deadlock detector | 2026-05-29, partial — holder tracking + `[SSH] STALL DETAIL` line; no auto-respawn detector |
+| 1c | `authorized_keys` missing → silent reject | 2026-05-29 (loud warning at first call) |
+| 1d | Host key not persisted | 2026-05-29 (`/etc/sshd/host_key`; fingerprint stable across reboots) |
+| 2-stall | Accept loop terminally exits on socket-pool exhaustion under storm | 2026-05-29 (`recreate_listener_with_retry`) |
+| 2a | Accept loop / session-thread isolation | 2026-05-29 (per-session `spawn_system_thread_fn` + panic-safe SessionGuard) |
+| 4 | SSH status in heartbeat | 2026-05-29 (`[SSH] listening | active=… open=… …`) |
+
+### Open
+
+| # | Issue | Severity | Effort | Notes |
+|---|-------|----------|--------|-------|
+| 1a | SSH path → NETWORK spinlock deadlock (watch item) | high | medium | No repro since holder tracking landed; absence of evidence, not evidence of absence. |
+| 2b | Multi-await batch reads (jitter) | medium | medium | Audit said framing was overstated; measure via `ssh_harness.py echo` under load before any fix. |
+| 2c | Concurrent session write lock | medium | low | Likely a no-op (NETWORK already serializes); needs empirical check. |
+| 3 | Wrong username + `ssh` blocked in crush | low (tooling, not kernel) | low | Playbook + crush config change. Not kernel work. |
