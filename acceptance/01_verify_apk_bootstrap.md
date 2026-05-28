@@ -31,11 +31,19 @@ certificates into `bootstrap/`.
 ### 4. Start the VM
 
 ```bash
-cargo run --release
+MEMORY=2048 cargo run --release 2>&1 > 01_verify_apk_bootstrap_acceptance.log
 # or: ./scripts/run.sh
 ```
 
+Grep the log until SSH server line appears, then connect.
+
 Wait until SSH is accepting connections on `localhost:2222`.
+
+If you have issues starting up, make sure to kill qemu instances that might be hogging the port:
+
+```bash
+pkill -9 qemu-system-aarch64
+```
 
 ## Steps (in VM)
 
