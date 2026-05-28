@@ -1,0 +1,16 @@
+log: logs/daif/20260528-201006-04c-idle-10min-dis/boot.log
+tmr_count: 83
+thread0_count: 125
+heartbeat_count: 19
+sched_warnings_total: 1
+sched_warnings_post_tests: 0
+negative_signals: 0
+daif_test_passes: 5
+last_tmr: [TMR] t=41000 T=0 f=0
+last_thread0: [Thread0] loop=12200000 | run=1 rdy=2 wait=0 term=0 init=0 free=61
+
+--- SCHED warnings (if any) ---
+74:[SCHED] WARNING: yield_now with IRQs masked tid=0 lr=0x40331178
+
+--- negative signals (if any) ---
+(none)

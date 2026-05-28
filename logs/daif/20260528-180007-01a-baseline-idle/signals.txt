@@ -1,0 +1,16 @@
+log: logs/daif/20260528-180007-01a-baseline-idle/boot.log
+tmr_count: 12
+thread0_count: 18
+heartbeat_count: 2
+sched_warnings_total: 0
+sched_warnings_post_tests: 0
+negative_signals: 0
+daif_test_passes: 0
+last_tmr: [TMR] t=5500 T=1 f=0
+last_thread0: [Thread0] loop=1400000 | run=1 rdy=2 wait=0 term=0 init=0 free=61
+
+--- SCHED warnings (if any) ---
+(none)
+
+--- negative signals (if any) ---
+(none)

@@ -191,6 +191,97 @@ whether SSH is actually serviceable.
 
 ---
 
+## SSH Lifecycle & Visibility (Deferred Follow-ups)
+
+These items came out of the 2026-05-28 investigation into issue #1.
+They are real gaps but did NOT need to be fixed to close the immediate
+stability work — the DAIF instrumentation and tests landed as the
+load-bearing change. They remain useful follow-ups whenever SSH gets
+attention next.
+
+### a) Per-session thread recycling needs an explicit accounting check
+
+`src/ssh/server.rs:66` spawns a per-session thread via
+`spawn_system_thread_fn(run_session)` and immediately recreates the
+listener socket. On close, the session thread calls `socket_close()` and
+`mark_current_terminated()` (`src/ssh/server.rs:150-154`). Whether the
+thread slot is actually returned to the global pool fast enough to
+survive a burst of failed handshakes is unverified — add explicit
+`SSH_SESSIONS_OPENED` / `SSH_SESSIONS_CLOSED` counters and assert
+`opened - closed <= MAX_CONCURRENT` in the SSH heartbeat.
+
+### b) smoltcp socket reaping verification
+
+Closed sockets are queued in `pending_removal` in `smoltcp_net.rs` and
+swept inside `poll()` (around lines 544-562). A second SSH connection
+right after the first closes appears to work, but there is no test that
+proves the socket handle is freshly allocated rather than the same
+handle reused before the prior close fully drained. Add an assertion or
+counter.
+
+### c) Loud "no authorized_keys" log
+
+`src/ssh/keys.rs:40` silently returns an empty `Vec` when
+`/etc/sshd/authorized_keys` is missing. Add a one-shot
+`[SSH Auth] WARNING: authorized_keys missing — all pubkey auth will be
+denied` at the first call site so the failure is visible in the log
+instead of presenting as a generic auth reject.
+
+### d) Persistent host key
+
+`src/ssh/protocol.rs:49` generates a fresh ephemeral host key each boot
+and logs `"will load from fs on first connection"` — but no load-or-
+generate code path actually exists. Replace with: on first connection,
+attempt to read `/etc/sshd/host_key`; if absent, generate and persist.
+Today every boot triggers `Host key verification failed` on the client.
+
+### e) Accept-loop / session-thread isolation
+
+The accept loop and the session handler currently share the same
+thread. If a session panics or stalls, the listener dies with it for the
+lifetime of the VM. Decouple: accept-only on one thread, sessions on
+spawned children; have Thread 0 watchdog the listener and respawn if it
+ever exits.
+
+### f) SSH status in the heartbeat
+
+Issue #4 in this document — add `[SSH] listening (N active)` (or
+`no listener`) once per heartbeat tick so a future observer can tell
+"idle but serviceable" from "looks idle but SSH is dead" without
+attempting a connection.
+
+### Status of the 2026-05-28 investigation
+
+The headline symptom (hard kernel hang ~30s after the first SSH attempt
+with both heartbeats silenced together) **did not reproduce** under the
+2026-05-28 acceptance ladder:
+
+- 5 sequential boot smoke tests: all clean (`logs/daif/2026*-03-boot-*`)
+- 80s baseline idle: clean
+- 180s 5x rapid SSH burst: clean (all 5 connections succeeded)
+- 600s idle endurance (with `caffeinate -dis`): clean — kernel uptime
+  advanced 1:1 with wall time, QEMU CPU pinned at 100%
+- In-kernel DAIF tests (`src/daif_tests.rs`): 5/5 passing on every boot
+- `YIELD_WITH_IRQS_MASKED` counter (instrumentation in
+  `crates/akuma-exec/src/threading/mod.rs`): never triggered in
+  production code paths
+
+One earlier 600s attempt using only `caffeinate -i` stopped emitting
+output at kernel uptime ~98s and resumed at SIGTERM time, with QEMU CPU
+unobserved during the gap — strongly consistent with a macOS *system*
+sleep (the `-i` flag only inhibits idle sleep, not display- or
+system-initiated sleep). The original acceptance log this section is
+based on also covered a long real-time window during which a host sleep
+event would look identical to a kernel hang from the log alone. There
+is now reason to suspect at least part of the originally reported
+symptom was the same host-sleep confounder.
+
+The defensive work landed regardless: the instrumentation will fire
+loudly if the IRQ-masked-yield class of bug ever does occur, the
+in-kernel tests pin the foundational invariant in place, and
+`scripts/daif_analyze.sh` makes regression checks across saved runs
+mechanical.
+
 ## Priority Order
 
 | # | Issue | Severity | Effort |
