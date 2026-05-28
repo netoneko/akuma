@@ -15,6 +15,7 @@ mod boot;
 mod config;
 #[macro_use]
 mod console;
+mod daif_tests;
 mod editor;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
@@ -548,6 +549,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
+    // Run DAIF / IRQ-mask tests first — these verify the foundational
+    // invariants that every later subsystem relies on. See
+    // docs/STABILITY_URGENT_ISSUES.md issue #1.
+    if !config::DISABLE_ALL_TESTS {
+        daif_tests::run_all_tests();
+    }
+
     // Run memory tests (no filesystem dependency)
     if !config::DISABLE_ALL_TESTS {
         if !tests::run_memory_tests() {
