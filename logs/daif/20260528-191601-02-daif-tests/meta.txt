@@ -1,2 +1,0 @@
-5a9223ee0f39cf1e83e4342079681ced332bf21f
-label: 02-daif-tests (verify in-kernel DAIF tests pass)
