@@ -10,3 +10,4 @@ authorized_keys
 bootstrap/bin
 bootstrap/
 *.log
+tmp
