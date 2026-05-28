@@ -4,7 +4,7 @@
 //! Runs on a dedicated system thread.
 
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp;
 use akuma_net::smoltcp_net::{self, SocketHandle, with_network};
@@ -34,6 +34,43 @@ static SERVER_ALIVE: AtomicBool = AtomicBool::new(false);
 /// Uptime (us) at the last accept-loop iteration; used by the supervisor in main.rs.
 static SERVER_TICK_US: AtomicU64 = AtomicU64::new(0);
 
+/// Last step the accept loop reached, for the supervisor's stall report.
+/// 0=idle, 1=tick, 2=pre-with_network, 3=post-with_network, 4=spawn,
+/// 5=create_listener, 6=poll, 7=yield. If the supervisor sees STALLED with
+/// step stuck at 2, candidate (a) (NETWORK contention) is the cause; at 6,
+/// candidate (b) (poll() stuck); at 5, candidate (c) (listener handle bad).
+pub(crate) static SERVER_STEP: AtomicU8 = AtomicU8::new(0);
+
+/// True if the current `listen_handle` in the accept loop is still a valid
+/// smoltcp socket. Cleared if the GC ever frees it out from under us.
+static LISTENER_HANDLE_VALID: AtomicBool = AtomicBool::new(false);
+
+pub mod step {
+    #[allow(dead_code)]
+    pub const IDLE: u8 = 0;
+    pub const TICK: u8 = 1;
+    pub const PRE_WITH_NETWORK: u8 = 2;
+    pub const POST_WITH_NETWORK: u8 = 3;
+    pub const SPAWN: u8 = 4;
+    pub const CREATE_LISTENER: u8 = 5;
+    pub const POLL: u8 = 6;
+    pub const YIELD: u8 = 7;
+
+    #[must_use]
+    pub fn name(v: u8) -> &'static str {
+        match v {
+            TICK => "tick",
+            PRE_WITH_NETWORK => "pre_with_network",
+            POST_WITH_NETWORK => "post_with_network",
+            SPAWN => "spawn",
+            CREATE_LISTENER => "create_listener",
+            POLL => "poll",
+            YIELD => "yield",
+            _ => "idle",
+        }
+    }
+}
+
 /// Snapshot of SSH server counters for the heartbeat in src/main.rs.
 #[derive(Copy, Clone)]
 pub struct SshStats {
@@ -45,6 +82,10 @@ pub struct SshStats {
     pub auth_fail: u64,
     pub panicked: u64,
     pub last_tick_us: u64,
+    /// Last accept-loop step the server reached. See `server::step::*`.
+    pub last_step: u8,
+    /// Whether the current `listen_handle` is still a valid smoltcp socket.
+    pub listener_valid: bool,
 }
 
 pub fn stats() -> SshStats {
@@ -57,6 +98,8 @@ pub fn stats() -> SshStats {
         auth_fail: AUTH_FAIL.load(Ordering::Relaxed),
         panicked: PANICKED.load(Ordering::Relaxed),
         last_tick_us: SERVER_TICK_US.load(Ordering::Relaxed),
+        last_step: SERVER_STEP.load(Ordering::Relaxed),
+        listener_valid: LISTENER_HANDLE_VALID.load(Ordering::Relaxed),
     }
 }
 
@@ -107,21 +150,31 @@ pub fn run() -> ! {
             loop { akuma_exec::threading::yield_now(); }
         }
     };
+    LISTENER_HANDLE_VALID.store(true, Ordering::Relaxed);
 
     log("[SSH Server] Listening...\n");
     SERVER_ALIVE.store(true, Ordering::Release);
 
     loop {
+        SERVER_STEP.store(step::TICK, Ordering::Relaxed);
         SERVER_TICK_US.store((akuma_exec::runtime::runtime().uptime_us)(), Ordering::Relaxed);
 
         // Poll for new connection
+        SERVER_STEP.store(step::PRE_WITH_NETWORK, Ordering::Relaxed);
         let mut established = false;
-        with_network(|net| {
+        let lookup = with_network(|net| {
             let socket = net.sockets.get_mut::<tcp::Socket>(listen_handle);
             if socket.state() == tcp::State::Established {
                 established = true;
             }
         });
+        // `with_network` returns `None` only if NETWORK isn't initialized,
+        // which is unreachable here — but if smoltcp ever frees our handle
+        // out from under us (candidate (c) in STABILITY_URGENT_ISSUES.md),
+        // `sockets.get_mut` would have panicked above. Stamp the flag on
+        // success.
+        LISTENER_HANDLE_VALID.store(lookup.is_some(), Ordering::Relaxed);
+        SERVER_STEP.store(step::POST_WITH_NETWORK, Ordering::Relaxed);
 
         if established {
             let active = ACTIVE_SESSIONS.load(Ordering::Acquire);
@@ -138,6 +191,7 @@ pub fn run() -> ! {
                 // socket. Without this rollback, every failed spawn leaks
                 // a slot in ACTIVE_SESSIONS forever. Discovered via harness
                 // `parallel` run, 2026-05-29.
+                SERVER_STEP.store(step::SPAWN, Ordering::Relaxed);
                 if let Err(_e) = akuma_exec::threading::spawn_system_thread_fn(move || {
                     run_session(session_handle);
                 }) {
@@ -147,32 +201,64 @@ pub fn run() -> ! {
                     SESSIONS_CLOSED.fetch_add(1, Ordering::Relaxed);
                 }
 
-                // Create a NEW listening socket for the server loop
-                match create_listener() {
-                    Some(h) => listen_handle = h,
-                    None => {
-                        log("[SSH Server] Failed to recreate listener\n");
-                        break;
-                    }
-                }
+                // Create a NEW listening socket for the server loop. If the
+                // socket pool is exhausted (e.g. pending_removal hasn't
+                // drained yet under connect-storm), retry with backoff
+                // rather than breaking out of the accept loop — pending_removal
+                // is GC'd inside poll() and clears within SOCKET_GC_TIMEOUT_US
+                // (30s) of the last close. Phase-2 fix for the stall observed
+                // in logs/stall-20260529-021802.log: previously `None => break`
+                // would terminate the accept loop permanently with
+                // SERVER_ALIVE still set. See docs/STABILITY_URGENT_ISSUES.md.
+                SERVER_STEP.store(step::CREATE_LISTENER, Ordering::Relaxed);
+                LISTENER_HANDLE_VALID.store(false, Ordering::Relaxed);
+                listen_handle = recreate_listener_with_retry();
+                LISTENER_HANDLE_VALID.store(true, Ordering::Relaxed);
             } else {
                 log("[SSH Server] Too many connections, rejecting\n");
+                SERVER_STEP.store(step::CREATE_LISTENER, Ordering::Relaxed);
+                LISTENER_HANDLE_VALID.store(false, Ordering::Relaxed);
                 smoltcp_net::socket_close(listen_handle);
-                
-                // Recreate listener
-                match create_listener() {
-                    Some(h) => listen_handle = h,
-                    None => break,
-                }
+                listen_handle = recreate_listener_with_retry();
+                LISTENER_HANDLE_VALID.store(true, Ordering::Relaxed);
             }
         }
 
+        SERVER_STEP.store(step::POLL, Ordering::Relaxed);
+        smoltcp_net::poll();
+        SERVER_STEP.store(step::YIELD, Ordering::Relaxed);
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Recreate the listener, retrying forever if the socket pool is exhausted.
+/// Each attempt drives one `poll()` (so the GC sweep can drain
+/// `pending_removal`) and yields. Logs a warning every 100 attempts so a
+/// pathological case is still visible in the heartbeat.
+fn recreate_listener_with_retry() -> SocketHandle {
+    let mut attempts: u32 = 0;
+    loop {
+        if let Some(h) = create_listener() {
+            if attempts > 0 {
+                log(&format!(
+                    "[SSH Server] Recovered listener after {} attempts\n",
+                    attempts
+                ));
+            }
+            return h;
+        }
+        attempts = attempts.saturating_add(1);
+        if attempts % 100 == 0 {
+            log(&format!(
+                "[SSH Server] Listener creation still failing after {} attempts (socket pool exhausted; waiting for pending_removal GC)\n",
+                attempts
+            ));
+        }
+        // Drive poll() to advance the GC sweep, then yield so other threads
+        // (including session threads closing their sockets) can run.
         smoltcp_net::poll();
         akuma_exec::threading::yield_now();
     }
-    
-    log("[SSH Server] Server loop exited abnormally\n");
-    loop { akuma_exec::threading::yield_now(); }
 }
 
 fn create_listener() -> Option<SocketHandle> {

@@ -6,7 +6,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage, PollResult};
@@ -100,6 +100,102 @@ pub struct NetworkState {
 
 /// Global network stack protected by a Spinlock.
 static NETWORK: Spinlock<Option<NetworkState>> = Spinlock::new(None);
+
+// ============================================================================
+// NETWORK lock holder tracking (instrumentation for the SSH stall watchdog
+// in src/main.rs::memory_monitor). All four atomics describe the *current*
+// NETWORK lock holder; they are stamped on acquire and cleared on release.
+// Reads are best-effort (no acquire ordering vs the spinlock itself); a
+// stall report is allowed to see a torn snapshot — the supervisor flags
+// long holds, not exact values.
+// ============================================================================
+
+/// Thread id of the current NETWORK holder, or `NETWORK_HOLDER_NONE` when
+/// the lock is free. We use `u32::MAX` as the sentinel because thread 0 is
+/// a real holder (kernel main).
+pub const NETWORK_HOLDER_NONE: u32 = u32::MAX;
+static NETWORK_HOLDER: AtomicU32 = AtomicU32::new(NETWORK_HOLDER_NONE);
+/// Uptime (us) when the current holder acquired the lock. Stale if
+/// `NETWORK_HOLDER == NETWORK_HOLDER_NONE`.
+static NETWORK_LOCKED_AT_US: AtomicU64 = AtomicU64::new(0);
+/// Last call site that acquired the lock. See [`NetSite`] for the enum.
+static NETWORK_LAST_SITE: AtomicU8 = AtomicU8::new(NetSite::None as u8);
+
+/// Tag for the last call site that acquired NETWORK. Kept in a u8 atomic so
+/// the supervisor can snapshot it cheaply.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum NetSite {
+    None = 0,
+    Poll = 1,
+    WithNetwork = 2,
+    SocketClose = 3,
+    UdpSocketClose = 4,
+}
+
+impl NetSite {
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Poll,
+            2 => Self::WithNetwork,
+            3 => Self::SocketClose,
+            4 => Self::UdpSocketClose,
+            _ => Self::None,
+        }
+    }
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Poll => "poll",
+            Self::WithNetwork => "with_network",
+            Self::SocketClose => "socket_close",
+            Self::UdpSocketClose => "udp_socket_close",
+        }
+    }
+}
+
+/// Cumulative `poll()` entries (incremented before `iface.poll()`).
+static POLL_ENTERED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative `poll()` exits (incremented after `pending_removal` sweep).
+static POLL_EXITED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the NETWORK lock holder, for use by the SSH stall watchdog.
+///
+/// Tuple: (`holder_tid`, `locked_at_us`, site, `poll_entered`, `poll_exited`).
+/// `holder_tid == NETWORK_HOLDER_NONE` means the lock is currently free.
+#[must_use]
+pub fn network_holder_snapshot() -> (u32, u64, NetSite, u64, u64) {
+    (
+        NETWORK_HOLDER.load(Ordering::Relaxed),
+        NETWORK_LOCKED_AT_US.load(Ordering::Relaxed),
+        NetSite::from_u8(NETWORK_LAST_SITE.load(Ordering::Relaxed)),
+        POLL_ENTERED.load(Ordering::Relaxed),
+        POLL_EXITED.load(Ordering::Relaxed),
+    )
+}
+
+/// Record that the current thread has just acquired NETWORK at `site`. Must
+/// be paired with a matching `mark_release` before the lock guard is
+/// dropped.
+///
+/// We expose these helpers so callers outside this module (kernel tests in
+/// host mode) can exercise the holder tracking without a real spinlock.
+fn mark_acquire(site: NetSite) {
+    // Best-effort: skip stamping if the runtime isn't registered yet
+    // (host tests, very early boot). The site is the cheap part to set;
+    // holder/locked_at need the runtime callbacks.
+    if let Some(rt) = crate::runtime::try_runtime() {
+        NETWORK_HOLDER.store((rt.current_thread_id)(), Ordering::Relaxed);
+        NETWORK_LOCKED_AT_US.store((rt.uptime_us)(), Ordering::Relaxed);
+    }
+    NETWORK_LAST_SITE.store(site as u8, Ordering::Relaxed);
+}
+
+fn mark_release() {
+    NETWORK_HOLDER.store(NETWORK_HOLDER_NONE, Ordering::Relaxed);
+}
 
 /// Static storage for sockets (required by smoltcp)
 static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorage::EMPTY; MAX_SOCKETS];
@@ -485,8 +581,11 @@ pub fn init(mmio_addrs: &[usize], enable_dhcp: bool) -> Result<(), &'static str>
 
 #[allow(clippy::cast_possible_wrap)]
 pub fn poll() -> bool {
+    POLL_ENTERED.fetch_add(1, Ordering::Relaxed);
     let socket_state_changed = {
-        if let Some(net) = NETWORK.lock().as_mut() {
+        let mut guard = NETWORK.lock();
+        mark_acquire(NetSite::Poll);
+        let result = if let Some(net) = guard.as_mut() {
             let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
             
             let p1 = net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
@@ -569,7 +668,11 @@ pub fn poll() -> bool {
             }
         } else {
             false
-        }
+        };
+        mark_release();
+        drop(guard);
+        POLL_EXITED.fetch_add(1, Ordering::Relaxed);
+        result
     };
     // NETWORK lock is released here — safe to acquire SOCKET_TABLE.
     // Acquiring SOCKET_TABLE while holding NETWORK causes AB-BA deadlock
@@ -591,7 +694,11 @@ where
     F: FnOnce(&mut NetworkState) -> R,
 {
     let mut guard = NETWORK.lock();
-    guard.as_mut().map(f)
+    mark_acquire(NetSite::WithNetwork);
+    let result = guard.as_mut().map(f);
+    mark_release();
+    drop(guard);
+    result
 }
 
 // ============================================================================

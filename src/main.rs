@@ -787,6 +787,7 @@ fn run_async_main() -> ! {
             current_box_id: || process::current_process().map(|p| p.box_id).unwrap_or(0),
             is_current_interrupted: process::is_current_interrupted,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
+            current_thread_id: || threading::current_thread_id() as u32,
         },
         &mmio_addrs,
         config::ENABLE_DHCP,
@@ -1046,6 +1047,37 @@ async fn memory_monitor() -> ! {
                 "[SSH]{} listening | active={} open={} close={} hs_fail={} auth_fail={} panic={} stall_us={}\n",
                 stall_marker, ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked, stall_us
             );
+            // Phase-1 instrumentation: when STALLED, dump the accept-loop
+            // step + NETWORK lock holder snapshot so the log alone tells us
+            // which of (a) NETWORK contention, (b) poll() stuck, (c) listener
+            // handle freed is responsible. See docs/STABILITY_URGENT_ISSUES.md.
+            if stall_us > SSH_STALL_THRESHOLD_US {
+                let (holder, locked_at, site, polls_in, polls_out) =
+                    akuma_net::smoltcp_net::network_holder_snapshot();
+                let net_held_us = if holder == akuma_net::smoltcp_net::NETWORK_HOLDER_NONE {
+                    0
+                } else {
+                    uptime_us.saturating_sub(locked_at)
+                };
+                let holder_str = if holder == akuma_net::smoltcp_net::NETWORK_HOLDER_NONE {
+                    -1_i64
+                } else {
+                    i64::from(holder)
+                };
+                let _ = write!(
+                    buf,
+                    "[SSH] STALL DETAIL | step={}({}) listener_valid={} net_holder={} net_site={} net_held_us={} poll_in={} poll_out={} poll_gap={}\n",
+                    ssh.last_step,
+                    ssh::server::step::name(ssh.last_step),
+                    ssh.listener_valid,
+                    holder_str,
+                    site.as_str(),
+                    net_held_us,
+                    polls_in,
+                    polls_out,
+                    polls_in.saturating_sub(polls_out),
+                );
+            }
         } else {
             let _ = write!(
                 buf,

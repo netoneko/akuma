@@ -111,6 +111,42 @@ mod stats_tests {
 }
 
 #[cfg(test)]
+mod net_holder_tests {
+    use crate::smoltcp_net::{network_holder_snapshot, NetSite, NETWORK_HOLDER_NONE};
+
+    #[test]
+    fn netsite_round_trips() {
+        for v in 0u8..=5 {
+            let site = NetSite::from_u8(v);
+            // Re-encoding NetSite::None for unknown values is intentional.
+            let expect_v = if v > 4 { 0 } else { v };
+            assert_eq!(site as u8, expect_v, "round-trip mismatch for {v}");
+        }
+    }
+
+    #[test]
+    fn netsite_strings_are_stable() {
+        assert_eq!(NetSite::None.as_str(), "none");
+        assert_eq!(NetSite::Poll.as_str(), "poll");
+        assert_eq!(NetSite::WithNetwork.as_str(), "with_network");
+        assert_eq!(NetSite::SocketClose.as_str(), "socket_close");
+        assert_eq!(NetSite::UdpSocketClose.as_str(), "udp_socket_close");
+    }
+
+    #[test]
+    fn snapshot_reports_idle_before_any_acquire() {
+        // No runtime is registered in the host test harness, so this only
+        // verifies the static atomics' initial values. The kernel side
+        // exercises real acquire/release via ssh_tests::test_poll_entered_exited_balanced.
+        let (holder, _locked_at, site, polls_in, polls_out) = network_holder_snapshot();
+        assert_eq!(holder, NETWORK_HOLDER_NONE);
+        assert_eq!(site, NetSite::None);
+        assert_eq!(polls_in, 0);
+        assert_eq!(polls_out, 0);
+    }
+}
+
+#[cfg(test)]
 mod tls_tests {
     use crate::tls::TlsOptions;
 

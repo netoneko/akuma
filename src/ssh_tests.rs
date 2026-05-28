@@ -18,9 +18,10 @@
 //!   wiring).
 
 use akuma_ssh::session::SshState;
+use core::sync::atomic::Ordering;
 
 use crate::console;
-use crate::ssh::server::{self, stats, test_note_session_close, test_note_session_open};
+use crate::ssh::server::{self, stats, test_note_session_close, test_note_session_open, SERVER_STEP, step};
 
 /// T1: static guard on the SSH `block_on` body. If anyone re-introduces
 /// `schedule_blocking()` inside it we abort the test run instead of waiting
@@ -163,12 +164,102 @@ fn test_stats_alive_flag_before_server_start() {
     console::print("  [PASS] test_stats_alive_flag_before_server_start\n");
 }
 
+/// T5: `SERVER_STEP` defaults to `IDLE` before the accept loop runs and is
+/// represented by `step::name()` with stable strings. Locks the contract
+/// between the accept loop and the supervisor's `STALL DETAIL` line.
+fn test_server_step_defaults_and_names() {
+    let s = stats();
+    assert_eq!(
+        s.last_step, step::IDLE,
+        "SERVER_STEP must be IDLE before run() is entered (got {})",
+        s.last_step,
+    );
+
+    // Stable name strings — the supervisor logs these in `STALL DETAIL`.
+    assert_eq!(step::name(step::IDLE), "idle");
+    assert_eq!(step::name(step::TICK), "tick");
+    assert_eq!(step::name(step::PRE_WITH_NETWORK), "pre_with_network");
+    assert_eq!(step::name(step::POST_WITH_NETWORK), "post_with_network");
+    assert_eq!(step::name(step::SPAWN), "spawn");
+    assert_eq!(step::name(step::CREATE_LISTENER), "create_listener");
+    assert_eq!(step::name(step::POLL), "poll");
+    assert_eq!(step::name(step::YIELD), "yield");
+    assert_eq!(step::name(255), "idle", "unknown step values fall back to idle");
+
+    console::print("  [PASS] test_server_step_defaults_and_names\n");
+}
+
+/// T6: a write to `SERVER_STEP` round-trips through `stats()` so the
+/// supervisor reads the value the accept loop last stamped.
+fn test_server_step_round_trips_through_stats() {
+    let before = SERVER_STEP.load(Ordering::Relaxed);
+    SERVER_STEP.store(step::POLL, Ordering::Relaxed);
+    let s = stats();
+    assert_eq!(s.last_step, step::POLL, "stats() must reflect SERVER_STEP");
+    // Restore so the heartbeat after tests doesn't show a misleading step.
+    SERVER_STEP.store(before, Ordering::Relaxed);
+
+    console::print("  [PASS] test_server_step_round_trips_through_stats\n");
+}
+
+/// T7: `network_holder_snapshot()` from akuma-net reports NONE when no
+/// `with_network` / `poll` is active, and the supervisor's "free" check
+/// uses the public `NETWORK_HOLDER_NONE` sentinel. Pins the contract.
+fn test_network_holder_snapshot_idle() {
+    use akuma_net::smoltcp_net::{network_holder_snapshot, NetSite, NETWORK_HOLDER_NONE};
+
+    let (holder, _locked_at, _site, _polls_in, _polls_out) = network_holder_snapshot();
+    // The boot path may have left a stale `locked_at`/`site` from the last
+    // acquisition, so we only assert the holder is currently free. Tests
+    // run between heartbeats and the `with_network` body is short.
+    assert_eq!(
+        holder, NETWORK_HOLDER_NONE,
+        "NETWORK should be unlocked between calls; got holder={holder}"
+    );
+
+    // `NetSite::as_str` strings are stable contract with the supervisor.
+    assert_eq!(NetSite::None.as_str(), "none");
+    assert_eq!(NetSite::Poll.as_str(), "poll");
+    assert_eq!(NetSite::WithNetwork.as_str(), "with_network");
+    assert_eq!(NetSite::SocketClose.as_str(), "socket_close");
+    assert_eq!(NetSite::UdpSocketClose.as_str(), "udp_socket_close");
+    assert_eq!(NetSite::from_u8(99), NetSite::None);
+
+    console::print("  [PASS] test_network_holder_snapshot_idle\n");
+}
+
+/// T8: `poll()` increments both POLL_ENTERED and POLL_EXITED in lockstep
+/// during normal operation. If they diverge during a stall, candidate (b)
+/// is implicated. Drive a few polls and assert the deltas match.
+fn test_poll_entered_exited_balanced() {
+    use akuma_net::smoltcp_net::{network_holder_snapshot, poll};
+
+    let (_, _, _, in0, out0) = network_holder_snapshot();
+    for _ in 0..4 {
+        poll();
+    }
+    let (_, _, _, in1, out1) = network_holder_snapshot();
+    assert_eq!(
+        in1 - in0,
+        out1 - out0,
+        "POLL_ENTERED/EXITED must move in lockstep across normal polls (in: {} → {}, out: {} → {})",
+        in0, in1, out0, out1,
+    );
+    assert!(in1 >= in0 + 4, "expected at least 4 polls (in0={in0} in1={in1})");
+
+    console::print("  [PASS] test_poll_entered_exited_balanced\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- SSH Tests ---\n");
     test_block_on_uses_yield_now();
     test_stats_alive_flag_before_server_start();
     test_session_counters_balance();
     test_classify_session_exit_mapping();
+    test_server_step_defaults_and_names();
+    test_server_step_round_trips_through_stats();
+    test_network_holder_snapshot_idle();
+    test_poll_entered_exited_balanced();
     console::print("--- SSH tests complete ---\n");
 
     // Reset transient counters so the heartbeat in production isn't confused

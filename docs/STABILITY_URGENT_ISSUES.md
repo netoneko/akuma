@@ -149,14 +149,31 @@ These are real fixes, not theoretical. Both were caught via the new
 Python harness `scripts/ssh_harness.py parallel` flooding the accept
 loop with concurrent KEX-only sessions.
 
-**Open follow-up (surfaced by instrumentation, NOT YET fixed):** under
+**Connect-storm stall — ROOT-CAUSED AND FIXED 2026-05-29 (Phase 2).** Under
 sustained connect-storm (16k+ accept attempts in 15s, far past
-MAX_CONNECTIONS=4), the accept loop itself stops ticking
-`SERVER_TICK_US`. The supervisor in `src/main.rs` flags this as
-`[SSH] STALLED listening` once `stall_us > 5_000_000`. Session counters
-remain perfectly balanced (`open == close`, `active == 0`) — this is
-NOT a session leak, it's something inside the accept loop's
-listener-recreation cycle (`src/ssh/server.rs:80-87`). Reproducer:
+MAX_CONNECTIONS=4), the accept loop stopped ticking `SERVER_TICK_US`.
+Session counters remained perfectly balanced (`open == close`,
+`active == 0`) — NOT a session leak. The Phase-1 STALL DETAIL line
+identified the failure as `step=create_listener listener_valid=false
+net_holder=-1 poll_in==poll_out` and the log carried `[SSH Server]
+Failed to recreate listener` + `Server loop exited abnormally`. Diagnosis:
+`create_listener()` returned `None` because `socket_create()` hit the
+`MAX_SOCKETS=256` ceiling — `pending_removal` (30s
+`SOCKET_GC_TIMEOUT_US`) couldn't drain fast enough under the storm. The
+accept loop's `None => break` then terminated the loop permanently while
+`SERVER_ALIVE` stayed `true`, so the supervisor misreported it as
+"listening."
+
+Fix: `src/ssh/server.rs::recreate_listener_with_retry()` replaces the
+hard break with a retry loop that drives `poll()` (advancing the GC
+sweep) and `yield_now()` on every failed attempt; logs progress every
+100 attempts. Verified by re-running
+`./scripts/ssh_stall_repro.sh logs/<run>.log`: same 15s storm now handles
+1138 sessions (vs 561 before lockup) and produces 42 `[SSH Server]
+Recovered listener after N attempts` entries — including one through
+~30k retry attempts at peak storm. `stall_us` returns to <100 µs once
+the storm ends; a follow-up `ssh_harness.py connect` completes in
+5.4 ms. Reproducer:
 ```
 ./venv/bin/python scripts/ssh_harness.py parallel --count 4 --duration 15
 # wait 10s, then:
@@ -165,12 +182,40 @@ grep '\[SSH\]' logs/<run>.log | tail
 ```
 The supervisor only LOGS the stall today; an auto-respawn would collide
 on `SSH_PORT` because the dead accept thread still owns the listener
-socket. Concrete next investigation: attach lldb when STALLED fires
-and inspect the SSH server thread's PC + LR (see "GDB attach playbook"
-below). Likely candidates are (a) `with_network()` blocked behind a
+socket. Likely candidates are (a) `with_network()` blocked behind a
 NETWORK holder, (b) `smoltcp_net::poll()` stuck, or (c) the
 listener-handle becoming invalid after smoltcp's `pending_removal`
 sweep frees it.
+
+**2026-05-29 Phase-1 instrumentation (in-tree).** Rather than only
+attaching lldb when STALLED fires, the accept loop and NETWORK lock now
+stamp atomics that the supervisor reads inline:
+
+- `src/ssh/server.rs::SERVER_STEP` — last loop step the accept thread
+  reached (`tick`/`pre_with_network`/`post_with_network`/`spawn`/
+  `create_listener`/`poll`/`yield`). If the supervisor sees STALLED with
+  step stuck at `pre_with_network`, candidate (a) is implicated; at
+  `poll`, candidate (b); at `create_listener` with `listener_valid=false`,
+  candidate (c).
+- `src/ssh/server.rs::LISTENER_HANDLE_VALID` — flips to false the moment
+  smoltcp's GC frees our handle.
+- `crates/akuma-net/src/smoltcp_net.rs::network_holder_snapshot()` —
+  returns `(holder_tid, locked_at_us, NetSite, poll_entered, poll_exited)`.
+  `poll_entered > poll_exited` during a stall is direct evidence of (b).
+- New supervisor line `[SSH] STALL DETAIL | step=… listener_valid=…
+  net_holder=… net_site=… net_held_us=… poll_in=… poll_out=…
+  poll_gap=…` prints right after `[SSH] STALLED listening` when the
+  watchdog trips. No debugger needed for the first-line diagnosis.
+
+Reproducer:
+```
+./scripts/ssh_stall_repro.sh <kernel-log-path>
+# runs ssh_harness.py parallel --count 4 --duration 15 then tails [SSH]/[NET]
+# expect: [SSH] STALLED listening | …  +  [SSH] STALL DETAIL step=…
+```
+
+Manual lldb attach playbook below remains valid for cases where the
+in-kernel snapshot is ambiguous.
 
 **Jitter framing was overstated.** The audit's J1 ("multi-await chain
 in `read_until_channel_data` costs 10–30ms × N") and J2 ("async
@@ -481,9 +526,10 @@ need to install a separate toolchain.
 |---|-------|----------|--------|
 | 1 | ~~Idle kernel deadlock — RUNTIME spinlock self-deadlock from IRQ handler~~ — **FIXED 2026-05-28** | resolved | resolved |
 | 1a | SSH connection → NETWORK spinlock deadlock (kept as separate watch item) | high | medium |
-| 1b | NETWORK lock timeout / deadlock detector | high | low |
+| 1b | NETWORK lock timeout / deadlock detector | resolved (partial — holder tracking landed 2026-05-29) | resolved |
 | 1c | `authorized_keys` missing → silent reject | high | low |
 | 1d | Host key not persisted | medium | medium |
+| 2-stall | ~~Accept loop terminally exits on socket-pool exhaustion under storm~~ — **FIXED 2026-05-29** (`recreate_listener_with_retry`) | resolved | resolved |
 | 3 | Wrong username + `ssh` blocked in crush | **blocker** (acceptance) | low |
 | 2a | Accept loop / session restart isolation | high | medium |
 | 2b | Multi-await batch reads (jitter) | medium | medium |
