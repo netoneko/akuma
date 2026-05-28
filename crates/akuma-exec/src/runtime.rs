@@ -1,6 +1,52 @@
 #![allow(clippy::missing_safety_doc)]
 
-use spinning_top::Spinlock;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Single-shot, lock-free cell for `Copy` types.
+///
+/// Set once at init, then read freely from any context (including IRQ
+/// handlers). No spinlock — readers must never block on writers, because
+/// reading `RUNTIME`/`CONFIG` from inside an IRQ that interrupted code
+/// holding the same lock would self-deadlock on a single CPU.
+struct OnceCopy<T: Copy> {
+    initialized: AtomicBool,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+unsafe impl<T: Copy + Send + Sync> Sync for OnceCopy<T> {}
+
+impl<T: Copy> OnceCopy<T> {
+    const fn new() -> Self {
+        Self {
+            initialized: AtomicBool::new(false),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    /// Write the value. Must be called exactly once before any `get()`.
+    /// Second call is silently ignored — callers shouldn't rely on that.
+    fn set(&self, v: T) {
+        if self.initialized.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: we are the only writer (single-shot at boot); readers
+        // observe the value only after the Release store below.
+        unsafe { (*self.value.get()).write(v) };
+        self.initialized.store(true, Ordering::Release);
+    }
+
+    fn get(&self) -> Option<T> {
+        if self.initialized.load(Ordering::Acquire) {
+            // SAFETY: initialized=true means the value was fully written
+            // before the Release store; T: Copy lets us read a copy.
+            Some(unsafe { (*self.value.get()).assume_init_read() })
+        } else {
+            None
+        }
+    }
+}
 
 /// Physical page frame (mirrors kernel pmm::PhysFrame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,28 +177,34 @@ pub struct ExecConfig {
     pub cow_fork_enabled: bool,
 }
 
-static RUNTIME: Spinlock<Option<ExecRuntime>> = Spinlock::new(None);
-static CONFIG: Spinlock<Option<ExecConfig>> = Spinlock::new(None);
+// Lock-free single-shot cells: must be safe to read from IRQ context.
+// A spinlock here causes a self-deadlock if any IRQ handler (e.g. the
+// preemption watchdog) reads while EL1 code is mid-critical-section.
+static RUNTIME: OnceCopy<ExecRuntime> = OnceCopy::new();
+static CONFIG: OnceCopy<ExecConfig> = OnceCopy::new();
 
-/// Register the kernel runtime callbacks. Must be called before using the crate.
+/// Register the kernel runtime callbacks. Must be called exactly once,
+/// before any other crate function (including from IRQ handlers).
 pub fn register(rt: ExecRuntime, cfg: ExecConfig) {
-    *RUNTIME.lock() = Some(rt);
-    *CONFIG.lock() = Some(cfg);
+    RUNTIME.set(rt);
+    CONFIG.set(cfg);
 }
 
 /// Access the registered runtime. Panics if not yet registered.
+/// Safe to call from IRQ context — never blocks.
 #[must_use]
 pub fn runtime() -> ExecRuntime {
     RUNTIME
-        .lock()
+        .get()
         .expect("akuma-exec: ExecRuntime not registered — call akuma_exec::init() first")
 }
 
 /// Access the registered config. Panics if not yet registered.
+/// Safe to call from IRQ context — never blocks.
 #[must_use]
 pub fn config() -> ExecConfig {
     CONFIG
-        .lock()
+        .get()
         .expect("akuma-exec: ExecConfig not registered — call akuma_exec::init() first")
 }
 
@@ -198,5 +250,73 @@ impl Drop for IrqGuard {
         unsafe {
             core::arch::asm!("msr daif, {}", in(reg) self.saved_daif, options(nomem, nostack));
         }
+    }
+}
+
+#[cfg(test)]
+mod once_copy_tests {
+    use super::OnceCopy;
+
+    #[test]
+    fn get_returns_none_before_set() {
+        let cell: OnceCopy<u32> = OnceCopy::new();
+        assert!(cell.get().is_none());
+    }
+
+    #[test]
+    fn get_returns_value_after_set() {
+        let cell: OnceCopy<u32> = OnceCopy::new();
+        cell.set(0xc0ffee);
+        assert_eq!(cell.get(), Some(0xc0ffee));
+    }
+
+    #[test]
+    fn second_set_is_ignored() {
+        let cell: OnceCopy<u32> = OnceCopy::new();
+        cell.set(1);
+        cell.set(2);
+        assert_eq!(cell.get(), Some(1));
+    }
+
+    #[test]
+    fn many_reads_return_same_value() {
+        let cell: OnceCopy<u64> = OnceCopy::new();
+        cell.set(0xdead_beef_cafe_babe);
+        for _ in 0..10_000 {
+            assert_eq!(cell.get(), Some(0xdead_beef_cafe_babe));
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_after_set_never_block() {
+        // Lock-free contract: many threads reading concurrently must each
+        // observe the value with no spinning, no panics. If anyone ever
+        // reintroduced a Spinlock-on-read, this would still pass (no
+        // contention), but combined with the "called from IRQ" kernel
+        // test it nails down the invariant.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let cell: Arc<OnceCopy<u32>> = Arc::new(OnceCopy::new());
+        cell.set(42);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let cell = Arc::clone(&cell);
+            let hits = Arc::clone(&hits);
+            handles.push(thread::spawn(move || {
+                for _ in 0..10_000 {
+                    if cell.get() == Some(42) {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 8 * 10_000);
     }
 }

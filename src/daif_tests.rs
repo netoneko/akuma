@@ -14,7 +14,7 @@
 
 use core::sync::atomic::Ordering;
 
-use akuma_exec::runtime::{with_irqs_disabled, IrqGuard};
+use akuma_exec::runtime::{config, runtime, with_irqs_disabled, IrqGuard};
 use akuma_exec::threading::{yield_now, YIELD_WITH_IRQS_MASKED};
 
 use crate::console;
@@ -135,6 +135,64 @@ fn test_yield_now_clean_path_does_not_warn() {
     console::print("  [PASS] test_yield_now_clean_path_does_not_warn\n");
 }
 
+fn test_runtime_is_lock_free_under_masked_irqs() {
+    // Regression test for the hang found at uptime ~217s on instance 7
+    // of the 2026-05-28 parallel hunt (see docs/STABILITY_URGENT_ISSUES.md
+    // issue #1). Root cause: `akuma_exec::runtime::RUNTIME` and `CONFIG`
+    // were `Spinlock<Option<T>>`. The timer IRQ handler called
+    // `runtime().uptime_us()` from `check_preemption_watchdog`; if EL1
+    // code held the same lock when the IRQ fired, the IRQ-side acquire
+    // self-deadlocked on this single-CPU kernel.
+    //
+    // After the fix (lock-free `OnceCopy<T>`), `runtime()` / `config()`
+    // must be valid IRQ-context calls. We can't synthesise an
+    // EL1-held-the-lock-then-IRQ scenario from a kernel thread, but we
+    // can drive thousands of calls under DAIF.I=1 — pre-fix this would
+    // already deadlock the first time any other thread held the lock;
+    // post-fix it is uniformly fast and DAIF is restored cleanly.
+
+    let saved_yield_count = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
+
+    with_irqs_disabled(|| {
+        let during = read_daif();
+        assert!(
+            during & DAIF_I_BIT != 0,
+            "precondition: IRQs masked inside the closure (daif={:#x})",
+            during
+        );
+
+        // 10k iterations of the exact call shape the watchdog uses.
+        // If the underlying storage ever regresses to a Spinlock and any
+        // other thread holds it, this loop hangs the test boot —
+        // converting a silent-stall regression into a loud failure.
+        for _ in 0..10_000 {
+            let rt = runtime();
+            // Touch a field so the compiler can't elide the load.
+            let _ = (rt.uptime_us)();
+            let cfg = config();
+            // Touch a config field for the same reason.
+            assert!(cfg.max_threads > 0, "config().max_threads must be > 0");
+        }
+    });
+
+    let after = read_daif();
+    assert!(
+        after & DAIF_I_BIT == 0,
+        "DAIF.I must be cleared after with_irqs_disabled (daif={:#x})",
+        after
+    );
+
+    // Sanity: this path must not yield (we never call yield_now), so the
+    // masked-yield counter is untouched.
+    assert_eq!(
+        YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed),
+        saved_yield_count,
+        "runtime()/config() reads must not yield"
+    );
+
+    console::print("  [PASS] test_runtime_is_lock_free_under_masked_irqs\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- DAIF / IRQ-mask Tests ---\n");
     test_irq_guard_masks_and_restores();
@@ -142,5 +200,6 @@ pub fn run_all_tests() {
     test_with_irqs_disabled_matches_guard();
     test_yield_now_clean_path_does_not_warn();
     test_yield_now_detects_masked_yield();
+    test_runtime_is_lock_free_under_masked_irqs();
     console::print("--- DAIF tests complete ---\n");
 }

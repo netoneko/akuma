@@ -5,7 +5,76 @@ cross-referenced with existing SSH and threading docs.
 
 ---
 
-## 1. SSH Connection Attempt Triggers Kernel Deadlock (Critical)
+## 1. Idle kernel deadlock — `RUNTIME` spinlock self-deadlock from IRQ handler (FIXED 2026-05-28)
+
+### Root cause (confirmed via lldb attach)
+
+Originally reported as "SSH connection triggers kernel deadlock"; SSH
+turned out to be incidental. The real bug reproduces idle and is now
+identified.
+
+`akuma_exec::runtime::RUNTIME` (and `CONFIG`) were stored as
+`spinning_top::Spinlock<Option<T>>` in
+`crates/akuma-exec/src/runtime.rs`. The timer IRQ handler dispatches
+into `check_preemption_watchdog()`
+(`crates/akuma-exec/src/threading/mod.rs:640`), which calls
+`runtime().uptime_us()` — i.e. acquires the `RUNTIME` spinlock from
+IRQ context.
+
+If any EL1 code held `RUNTIME` (which the watchdog also reads on every
+timer tick) when the timer IRQ fired, the IRQ handler re-acquired the
+same lock on the same CPU and span forever. Single-CPU kernel, no
+other core to release. Both heartbeats stop together because the timer
+IRQ itself is wedged.
+
+### How it was caught
+
+`scripts/run_multiple.sh` (8-way parallel boot with the hang
+watchdog) flagged instance 7 at uptime 217s in
+`logs/daif/hunt-20260528-232632/7.log`. Attached with `lldb -b
+gdb-remote 1241`:
+
+- **PC**: `akuma_exec::threading::check_preemption_watchdog+268`
+- **Disassembly at PC**: LL/SC spinlock-acquire loop
+  (`ldaxrb`/`stxrb`) on the byte at `0x404c0da0`
+- **Backtrace**: `irq_handler → rust_irq_handler_with_sp →
+  kernel_main::{closure#11} → check_preemption_watchdog` interrupting
+  `run_async_main+2228`
+- **`nm`** on the kernel ELF located
+  `_RNvNtCs..._10akuma_exec7runtime7RUNTIME` exactly at
+  `0x404c0da0` — identifying the lock byte
+
+### Fix (landed)
+
+In `crates/akuma-exec/src/runtime.rs`:
+
+- Introduced `OnceCopy<T: Copy>` — a single-shot, lock-free cell
+  backed by `AtomicBool` (Release-on-`set`, Acquire-on-`get`) + an
+  `UnsafeCell<MaybeUninit<T>>`.
+- Replaced `static RUNTIME: Spinlock<Option<ExecRuntime>>` and
+  `static CONFIG: Spinlock<Option<ExecConfig>>` with
+  `OnceCopy<ExecRuntime>` / `OnceCopy<ExecConfig>`.
+- `register()`, `runtime()`, `config()` keep identical public
+  signatures. `ExecRuntime` and `ExecConfig` were already
+  `#[derive(Clone, Copy)]` and registered exactly once at boot, so the
+  swap is semantically equivalent on the happy path — but reads are
+  now lock-free and safe to call from IRQ context.
+
+### Tests
+
+- **Host (5 tests) — `runtime::once_copy_tests` in
+  `crates/akuma-exec/src/runtime.rs`** — verifies single-shot
+  semantics, get-before-set returns `None`, second `set` is ignored,
+  many-reads stability, and 8-thread concurrent reader stress
+  (10 000 iterations each).
+- **Kernel — `test_runtime_is_lock_free_under_masked_irqs` in
+  `src/daif_tests.rs`** — drives 10 000 paired `runtime()` /
+  `config()` reads inside `with_irqs_disabled` (DAIF.I=1). Pre-fix,
+  any contended boot would deadlock here; post-fix this completes
+  uniformly and DAIF is restored cleanly. Runs every boot as part of
+  the DAIF test suite.
+
+### Original "SSH Connection Triggers Kernel Deadlock" notes (kept for history)
 
 ### Symptom
 
@@ -341,43 +410,55 @@ together while QEMU keeps spinning), minus the SSH trigger:
   authorized-keys path are all ruled out as triggers for this one.
 
 This run was NOT started with `-s`/`-gdb`, so the still-alive QEMU
-cannot be attached to. Reproduction with the gdbstub enabled is the
-next step (see the GDB attach playbook below).
+could not be attached to. A re-hunt with `scripts/run_multiple.sh`
+(8-way parallel, `GDB=1` on every instance) caught the same hang on
+instance 7 at uptime 217s and produced the lldb evidence used to
+identify the `RUNTIME` spinlock root cause — see the new top of issue
+#1.
 
 ## GDB attach playbook
 
-Repro on a fresh boot with `-s` (gdbstub on `localhost:1234`); when the
-hang fires, attach `aarch64-elf-gdb` and inspect PC / LR / DAIF / SP on
-each CPU.
+Repro on a fresh boot with `GDB=1` (gdbstub on `localhost:1234+i`);
+when the hang fires, attach lldb (or `aarch64-elf-gdb`) and inspect
+PC / LR / DAIF / SP / disassembly. Apple's system `lldb` speaks the
+gdb-remote protocol and works directly against the QEMU stub — no
+need to install a separate toolchain.
 
-1. Boot the kernel with the QEMU gdbstub exposed on :1234 (do NOT use
-   `GDB_WAIT` — we want the kernel to boot normally and only attach
-   after the stall):
+1. Run the parallel hang hunt — it boots N kernels with `GDB=1`
+   already wired, prints `[HANG?]` (with the exact attach command)
+   the moment a log stops growing:
    ```bash
-   GDB=1 cargo run --release 2>&1 \
-     | tee logs/daif/gdb-repro-$(date +%Y%m%d-%H%M%S).log
+   scripts/run_multiple.sh 8     # 8-way; Ctrl-C to stop
    ```
-2. In another terminal, when heartbeats stop:
+   For single-instance hunts, `GDB=1 cargo run --release` exposes
+   the stub on :1234.
+2. When `[HANG?]` fires (or heartbeats stop), attach lldb in batch
+   mode and dump the wedged state:
    ```bash
-   aarch64-elf-gdb target/aarch64-unknown-none/release/akuma \
-     -ex 'target remote :1234' \
-     -ex 'info threads' \
-     -ex 'thread apply all bt' \
-     -ex 'p/x $pc' -ex 'p/x $lr' -ex 'p/x $sp' \
-     -ex 'p/x $daif' -ex 'p/x $spsr_el1' -ex 'p/x $elr_el1'
+   ELF=target/aarch64-unknown-none/release/akuma
+   PORT=$((1234 + INSTANCE))   # instance index from the [HANG?] line
+   lldb -b \
+     -o "target create --no-dependents $ELF" \
+     -o "gdb-remote $PORT" \
+     -o "thread list" \
+     -o "register read pc lr sp cpsr" \
+     -o "thread backtrace all" \
+     -o "disassemble --pc --count 8" \
+     -o "detach"
    ```
-3. Capture the per-CPU PC; cross-reference against
-   `crates/akuma-exec/src/threading/mod.rs` and `src/exceptions.rs`.
-   A PC parked inside a spinlock acquire or `wfi` with DAIF.I set
-   would confirm the IRQ-masked / lost-IPI hypothesis.
-4. Save the gdb transcript next to the matching kernel log under
+3. Decode the PC. If the disassembly shows `ldaxrb`/`stxrb` it's a
+   spinlock acquire; map the address (e.g. `[x21, #0xda0]` →
+   `x21 + 0xda0`) back to a symbol with
+   `nm $ELF | grep -i <name>` or by sorting nm output by address.
+4. Save the lldb transcript next to the matching kernel log under
    `logs/daif/`.
 
 ## Priority Order
 
 | # | Issue | Severity | Effort |
 |---|-------|----------|--------|
-| 1a | SSH connection → NETWORK spinlock deadlock | **critical** | medium |
+| 1 | ~~Idle kernel deadlock — RUNTIME spinlock self-deadlock from IRQ handler~~ — **FIXED 2026-05-28** | resolved | resolved |
+| 1a | SSH connection → NETWORK spinlock deadlock (kept as separate watch item) | high | medium |
 | 1b | NETWORK lock timeout / deadlock detector | high | low |
 | 1c | `authorized_keys` missing → silent reject | high | low |
 | 1d | Host key not persisted | medium | medium |
