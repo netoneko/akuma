@@ -36,7 +36,10 @@ import subprocess
 subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-p", "2222", "root@localhost", "<cmd>"])
 ```
 
-To wait for the VM to be ready, tail the log file and watch for `SSH Server] Listening` — do not wait on the cargo/QEMU process itself.
+To wait for VM boot, poll the log file — NEVER call `job_output` with `wait: true` on the QEMU process (it runs forever):
+```bash
+until grep -q "SSH Server\] Listening" 01_verify_apk_bootstrap_acceptance.log 2>/dev/null; do sleep 2; done
+```
 
 ## Testing
 
