@@ -133,6 +133,14 @@ impl<'a> SshChannelStream<'a> {
         }
     }
 
+    /// Whether the SSH client has signaled CHANNEL_EOF or CHANNEL_CLOSE.
+    /// Used by `execute_external_interactive` to break out of its
+    /// process-pump loop when the peer is gone (issue #5 in
+    /// `docs/STABILITY_URGENT_ISSUES.md`).
+    pub fn channel_eof(&self) -> bool {
+        self.session.channel_eof
+    }
+
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
         let mut buf = [0u8; 512];
 
@@ -1050,6 +1058,23 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> akuma_ssh::session::
                                 }
                                 Ok(MessageResult::ExecCommand(cmd)) => {
                                     handle_exec(stream, &mut session, &cmd).await;
+                                    // Mirror the StartShell exit path: send
+                                    // CHANNEL_CLOSE and disconnect. Without this
+                                    // the session sits in the outer loop waiting
+                                    // for SSH_IDLE_TIMEOUT (300s) — even after
+                                    // the client closes — keeping a session
+                                    // slot reserved. Issue #5 in
+                                    // docs/STABILITY_URGENT_ISSUES.md, surfaced
+                                    // 2026-05-29 by 4-way concurrent exec test.
+                                    if session.channel_open {
+                                        let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
+                                        write_u32(&mut close, session.client_channel);
+                                        let _ =
+                                            akuma_ssh::transport::send_packet(stream, &close, &mut session).await;
+                                        session.channel_open = false;
+                                    }
+                                    session.state = SshState::Disconnected;
+                                    return session.state;
                                 }
                                 Ok(MessageResult::Disconnect) => {
                                     return session.state;

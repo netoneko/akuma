@@ -534,6 +534,7 @@ need to install a separate toolchain.
 | 2a | Accept loop / session-thread isolation | 2026-05-29 (per-session `spawn_system_thread_fn` + panic-safe SessionGuard) |
 | 2b | Multi-await batch reads (jitter) | 2026-05-29 — measured: idle p95=27.7ms, under-storm p95=53.9ms (vs original 800–1800ms claim). Framing was overstated; no fix warranted. |
 | 2c | Concurrent session write lock | 2026-05-29 — measured: 280 rounds of concurrent writes, 0 corruption. NETWORK serialization sufficient; no fix warranted. |
+| 5 | Session counter drift on concurrent-connect handshake race | 2026-05-29 — root cause was `execute_external_interactive` (`src/shell/mod.rs`) ignoring `channel_eof` and spinning forever after the SSH client closed. Fixed: check `channel_eof()` at the loop top and break + interrupt the process. Plus belt-and-suspenders: `handle_exec` now sends `CHANNEL_CLOSE` + disconnects mirroring the StartShell path. After fix: 3 × 4-way concurrent `exec cat` runs leave `active=0 open=16 close=16`. |
 | 4 | SSH status in heartbeat | 2026-05-29 (`[SSH] listening | active=… open=… …`) |
 
 ### 2026-05-29 Phase-3 empirical measurement (2b and 2c)
@@ -573,5 +574,4 @@ NETWORK lock serialization already prevents byte-level interleaving.
 | # | Issue | Severity | Effort | Notes |
 |---|-------|----------|--------|-------|
 | 1a | SSH path → NETWORK spinlock deadlock (watch item) | high | medium | No repro since holder tracking landed; absence of evidence, not evidence of absence. |
-| 5 | Session counter drift on concurrent-connect handshake race | medium | low | Surfaced 2026-05-29 during 2c testing: 4 concurrent connects produced `active=4 open=6 close=2` (only 2 sessions actually succeeded). Likely a missed counter rollback path during handshake failure. |
 | 3 | Wrong username + `ssh` blocked in crush | low (tooling, not kernel) | low | Playbook + crush config change. Not kernel work. |

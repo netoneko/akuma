@@ -229,6 +229,16 @@ pub async fn execute_external_interactive(
             break;
         }
 
+        // The SSH client closed/EOF'd the channel. Interrupt the process so
+        // it exits and don't keep spinning waiting for stdin that will never
+        // come. Without this, `exec cat` over SSH hangs the session for the
+        // full SSH_IDLE_TIMEOUT (300s) after the client disconnects — see
+        // issue #5 in docs/STABILITY_URGENT_ISSUES.md.
+        if channel_stream.channel_eof() {
+            channel.set_interrupted();
+            break;
+        }
+
         let raw_mode = channel.is_raw_mode();
 
         if let Some(data) = channel.try_read() {
