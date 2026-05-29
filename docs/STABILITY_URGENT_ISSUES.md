@@ -524,6 +524,8 @@ need to install a separate toolchain.
 
 ## 6. SSH Exec: External Binaries Use Buffered Path, Output Lost to Client
 
+**RESOLVED 2026-05-29.**
+
 ### Symptom
 
 When a programmatic SSH `exec` request runs an external binary (one not
@@ -541,19 +543,14 @@ buffered flush).
 
 Observed in acceptance run `02_git_clone` (2026-05-29): `git --version`,
 `tcc`, `ls /usr/lib`, `which`, and other external binaries all hit this
-path. Only a small set of commands reach the streaming path: built-in
-shell commands and binaries explicitly whitelisted in
-`check_streamable_command` (currently: `apk`/`pkg` installs).
+path.
 
 ### Root Cause
 
-`src/ssh/protocol.rs::handle_exec` tries the streaming path first:
+`src/ssh/protocol.rs::handle_exec` had a debug leftover in its buffered
+fallback branch:
 
 ```rust
-if let Some(_) = shell::execute_command_streaming_interactive(
-    trimmed, &registry, &mut exec_ctx, &mut channel_stream, None,
-).await {
-    // streamed — client gets live output
 } else {
     channel_stream.write(b"[DEBUG] Using buffered path\r\n").await; // ← debug leftover
     let result = shell::execute_command_chain(...).await;
@@ -561,58 +558,21 @@ if let Some(_) = shell::execute_command_streaming_interactive(
 }
 ```
 
-`execute_command_streaming_interactive` (`src/shell/mod.rs:323`) returns
-`None` when `check_streamable_command` doesn't recognise the command.
-That function currently only returns `StreamableCommand::External` for
-a hard-coded whitelist; any other binary falls through to the buffered
-path.
+The buffered path itself was correct — output was collected and sent.
+The `[DEBUG]` write before it was the only corruption.
 
-The buffered path collects all output in a `Vec` then writes it in one
-SSH data packet after the process exits — the output is correct, but it
-arrives *after* the `[DEBUG]` line, which the client (and any LLM
-agent) treats as the actual response.
+`check_streamable_command` (`crates/akuma-shell/src/exec.rs`) already
+returns `StreamableCommand::External` for any binary resolved via
+`find_executable`, so Fix 2 (whitelist expansion) was already in place;
+only the debug print remained.
 
-### Impact
+### Fix Applied
 
-- Every external binary invoked via programmatic SSH (`git`, `tcc`,
-  `ls`, `which`, `find`, etc.) produces misleading output.
-- Acceptance tests that inspect SSH stdout fail or misinterpret results.
-- LLM agents burn large amounts of context trying to work around
-  "broken" commands, not realising the actual output followed the debug
-  string immediately.
-
-### Fix
-
-**Fix 1 — immediate (one line): remove the `[DEBUG]` print.**
-
-Delete `src/ssh/protocol.rs:921`:
-```rust
-let _ = channel_stream.write(b"[DEBUG] Using buffered path\r\n").await;
-```
-
-The buffered path still works correctly without it; the debug string is
-the only corruption. This unblocks acceptance testing immediately.
-
-**Fix 2 — proper: make all external binaries take the streaming path.**
-
-In `src/shell/mod.rs::check_streamable_command`, return
-`StreamableCommand::External(bin_path)` for any command that resolves
-to an executable on disk, not just the currently whitelisted set.
-`execute_external_interactive` already handles streaming execution for
-the whitelisted commands; extending it to all executables makes
-streaming the default and eliminates the buffered path for external
-commands entirely.
-
-**Workaround (acceptance tests):** prefix VM commands with
-`busybox sh -c '...'`. `busybox` is whitelisted, takes the streaming
-path, and its child processes inherit the correct stdout fd.
-
-### Files
-
-| File | Change |
-|------|--------|
-| `src/ssh/protocol.rs:921` | Delete the `[DEBUG] Using buffered path\r\n` write |
-| `src/shell/mod.rs::check_streamable_command` | Return `External` for any resolvable binary |
+Deleted the single `[DEBUG]` write from `handle_exec`
+(`src/ssh/protocol.rs`). Added a static regression test T9
+(`src/ssh_tests.rs::test_exec_handler_no_debug_string`) that scans the
+`handle_exec` body via `include_str!` at kernel boot and fails if any
+`[DEBUG]` string is re-introduced.
 
 ---
 
@@ -632,6 +592,7 @@ path, and its child processes inherit the correct stdout fd.
 | 2c | Concurrent session write lock | 2026-05-29 — measured: 280 rounds of concurrent writes, 0 corruption. NETWORK serialization sufficient; no fix warranted. |
 | 5 | Session counter drift on concurrent-connect handshake race | 2026-05-29 — root cause was `execute_external_interactive` (`src/shell/mod.rs`) ignoring `channel_eof` and spinning forever after the SSH client closed. Fixed: check `channel_eof()` at the loop top and break + interrupt the process. Plus belt-and-suspenders: `handle_exec` now sends `CHANNEL_CLOSE` + disconnects mirroring the StartShell path. After fix: 3 × 4-way concurrent `exec cat` runs leave `active=0 open=16 close=16`. |
 | 4 | SSH status in heartbeat | 2026-05-29 (`[SSH] listening | active=… open=… …`) |
+| 6 | SSH exec: `[DEBUG]` string corrupts output for all external binaries | 2026-05-29 (deleted debug write; T9 static regression guard in `src/ssh_tests.rs`) |
 
 ### 2026-05-29 Phase-3 empirical measurement (2b and 2c)
 

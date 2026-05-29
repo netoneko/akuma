@@ -250,6 +250,43 @@ fn test_poll_entered_exited_balanced() {
     console::print("  [PASS] test_poll_entered_exited_balanced\n");
 }
 
+/// T9: static guard on `handle_exec` in `src/ssh/protocol.rs`. Ensures that
+/// the debug leftover `[DEBUG] Using buffered path` write (Issue #6 in
+/// `docs/STABILITY_URGENT_ISSUES.md`) is never re-introduced. Any live
+/// `[DEBUG]` write in `handle_exec` corrupts SSH exec output for all external
+/// binaries.
+fn test_exec_handler_no_debug_string() {
+    const PROTO_SRC: &str = include_str!("ssh/protocol.rs");
+
+    let handle_exec_start = PROTO_SRC
+        .find("async fn handle_exec(")
+        .expect("protocol.rs must define handle_exec");
+    let handle_exec_end = PROTO_SRC[handle_exec_start..]
+        .find("\nasync fn ")
+        .map(|off| handle_exec_start + off)
+        .unwrap_or(PROTO_SRC.len());
+    let body = &PROTO_SRC[handle_exec_start..handle_exec_end];
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim_start();
+        if line.starts_with("//") {
+            continue;
+        }
+        let code = match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        assert!(
+            !code.contains("[DEBUG]"),
+            "handle_exec must not emit [DEBUG] strings; \
+             see STABILITY_URGENT_ISSUES.md Issue #6. Offending line: {:?}",
+            raw_line
+        );
+    }
+
+    console::print("  [PASS] test_exec_handler_no_debug_string\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- SSH Tests ---\n");
     test_block_on_uses_yield_now();
@@ -260,6 +297,7 @@ pub fn run_all_tests() {
     test_server_step_round_trips_through_stats();
     test_network_holder_snapshot_idle();
     test_poll_entered_exited_balanced();
+    test_exec_handler_no_debug_string();
     console::print("--- SSH tests complete ---\n");
 
     // Reset transient counters so the heartbeat in production isn't confused

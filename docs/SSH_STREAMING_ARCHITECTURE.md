@@ -100,15 +100,27 @@ impl Write for SshChannelStream<'_> {
 }
 ```
 
-#### `check_streamable_command()` (src/shell/mod.rs)
+#### `check_streamable_command()` (crates/akuma-shell/src/exec.rs)
 
 Determines if a command can use streaming (vs buffered) execution:
 
-- ✓ Single external binary in /bin
-- ✗ Pipelines (|)
-- ✗ Redirections (>, >>)
-- ✗ Command chains (;, &&)
-- ✗ Builtin commands
+- ✓ Any external binary resolvable via `find_executable` (`/usr/bin`, `/bin`, or absolute path)
+- ✓ `pkg install <packages>` — streams package install output
+- ✗ Pipelines (`|`)
+- ✗ Redirections (`>`, `>>`)
+- ✗ Command chains (`;`, `&&`)
+- ✗ Builtin commands (handled by the registry before reaching this check)
+
+All external binaries that resolve to a path take the streaming path. The
+buffered fallback in `handle_exec` is only reached for builtins and
+unresolvable commands.
+
+**Note (2026-05-29):** A debug leftover `channel_stream.write(b"[DEBUG] Using
+buffered path\r\n")` in `handle_exec`'s buffered branch was corrupting SSH exec
+output for all external binaries — the debug string preceded the actual output,
+misleading clients. Removed in the same commit that added regression test T9
+(`src/ssh_tests.rs::test_exec_handler_no_debug_string`). See
+`STABILITY_URGENT_ISSUES.md` Issue #6.
 
 ## Current Limitation: Batched Transmission
 

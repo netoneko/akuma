@@ -918,7 +918,6 @@ async fn handle_exec(
         {
             // Output was already streamed
         } else {
-            let _ = channel_stream.write(b"[DEBUG] Using buffered path\r\n").await;
             let result =
                 shell::execute_command_chain(trimmed, &registry, &mut exec_ctx, &shell::KernelShellBackend).await;
 
