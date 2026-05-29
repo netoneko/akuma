@@ -62,12 +62,12 @@ host-key conflicts across disk image rebuilds:
 ```python
 import subprocess, re
 
-def ssh(cmd):
+def ssh(cmd, timeout=120):
     r = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=no",
          "-o", "UserKnownHostsFile=/dev/null",
          "-p", "2222", "root@localhost", cmd],
-        capture_output=True, text=True, timeout=60
+        capture_output=True, text=True, timeout=timeout
     )
     out = re.sub(r'\x1b\[[0-9;]*[KmHm]', '', r.stdout).strip()
     err = '\n'.join(
@@ -93,7 +93,7 @@ print(f"rc={rc}\n{out}")
 rc, out, err = ssh("git --version")
 print(f"git version: {out}")
 
-rc, out, err = ssh("git clone https://github.com/netoneko/akuma-playground")
+rc, out, err = ssh("git clone https://github.com/netoneko/akuma-playground.git")
 print(f"clone rc={rc}\n{out}\n{err}")
 ```
 
@@ -111,6 +111,7 @@ print(f"rc={rc}\n{out}")
 ### 8. Compile hello.c with tcc
 
 ```python
+ssh("mkdir /tmp")  # /tmp may not exist; ignore error if it does
 rc, out, err = ssh("tcc -o /tmp/hello akuma-playground/hello.c")
 print(f"compile rc={rc} | out={out!r} | err={err!r}")
 # Success: rc=255 (SSH drop), out and err empty
